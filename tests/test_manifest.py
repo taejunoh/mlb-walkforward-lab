@@ -65,10 +65,30 @@ class ManifestTest(unittest.TestCase):
                 "feature_as_of",
             ),
         }
+        expected_annotations = {
+            RawArtifact: {
+                "source": str,
+                "sha256": str,
+                "data_path": Path,
+                "manifest_path": Path,
+                "retrieved_at_utc": str,
+                "row_count": int,
+            },
+            GameClock: {
+                "game_pk": int,
+                "official_date": date,
+                "scheduled_start_utc": datetime,
+                "lock_at_utc": datetime,
+                "feature_as_of": date,
+            },
+        }
         for record_type, names in expected_fields.items():
             with self.subTest(record_type=record_type.__name__):
                 self.assertEqual(
                     tuple(field.name for field in dataclasses.fields(record_type)), names
+                )
+                self.assertEqual(
+                    record_type.__annotations__, expected_annotations[record_type]
                 )
 
         artifact = RawArtifact(
@@ -89,8 +109,12 @@ class ManifestTest(unittest.TestCase):
     def test_digest_path_layout_includes_integrity_seal(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "raw"
-            artifact = RawStore(root).put("source", {}, b"row")
+            payload = b"row"
+            artifact = RawStore(root).put("source", {}, payload)
             folder = root / "source"
+            self.assertEqual(
+                artifact.sha256, hashlib.sha256(payload).hexdigest()
+            )
             self.assertEqual(artifact.data_path, folder / f"{artifact.sha256}.raw")
             self.assertEqual(
                 artifact.manifest_path,
@@ -189,6 +213,29 @@ class ManifestTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "source"):
                     RawStore(root).put("source", {}, b"row")
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlink_and_nonregular_lock_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            outside = base / "outside.lock"
+            outside.write_text("untouched", encoding="utf-8")
+
+            symlink_root = base / "symlink-root"
+            symlink_root.mkdir()
+            (symlink_root / ".source.lock").symlink_to(outside)
+            with self.subTest(kind="symlink"):
+                with self.assertRaisesRegex(ValueError, "lock"):
+                    RawStore(symlink_root).put("source", {}, b"row")
+                self.assertEqual(outside.read_text(encoding="utf-8"), "untouched")
+                self.assertFalse((symlink_root / "source").exists())
+
+            directory_root = base / "directory-root"
+            directory_root.mkdir()
+            (directory_root / ".source.lock").mkdir()
+            with self.subTest(kind="directory"):
+                with self.assertRaisesRegex(ValueError, "lock"):
+                    RawStore(directory_root).put("source", {}, b"row")
+                self.assertFalse((directory_root / "source").exists())
 
     def test_repeated_put_retains_original_timestamp_and_manifest_bytes(self):
         with tempfile.TemporaryDirectory() as td:

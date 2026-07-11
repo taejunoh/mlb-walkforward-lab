@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -93,9 +94,12 @@ class RawStore:
         row_count = sum(bool(line.strip()) for line in payload.splitlines())
         resolved_root = self._prepare_root()
         lock_path = self.root / f".{source}.lock"
-        with lock_path.open("a", encoding="utf-8") as lock_handle:
+        with self._open_lock(lock_path, resolved_root) as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             try:
+                self._validate_open_lock(
+                    lock_handle.fileno(), lock_path, resolved_root
+                )
                 if self.root.is_symlink() or self.root.resolve() != resolved_root:
                     raise ValueError("raw root changed while acquiring lock")
                 return self._put_locked(
@@ -108,6 +112,47 @@ class RawStore:
                 )
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    @classmethod
+    def _open_lock(cls, lock_path: Path, resolved_root: Path):
+        if lock_path.is_symlink():
+            raise ValueError("raw lock path cannot be a symlink")
+        if lock_path.exists() and not lock_path.is_file():
+            raise ValueError("raw lock path must be a regular file")
+
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ValueError("raw lock path cannot be opened safely") from exc
+
+        try:
+            cls._validate_open_lock(descriptor, lock_path, resolved_root)
+            return os.fdopen(descriptor, "r+", encoding="utf-8")
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _validate_open_lock(
+        descriptor: int, lock_path: Path, resolved_root: Path
+    ) -> None:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("raw lock descriptor must be a regular file")
+        try:
+            linked = os.stat(lock_path, follow_symlinks=False)
+            resolved_lock = lock_path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("raw lock path changed after opening") from exc
+        if not stat.S_ISREG(linked.st_mode):
+            raise ValueError("raw lock path must be a regular file")
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError("raw lock path changed after opening")
+        if resolved_lock.parent != resolved_root:
+            raise ValueError("raw lock path must be directly under raw root")
 
     def _put_locked(
         self,
