@@ -86,6 +86,27 @@ class ConfigTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_config(path)
 
+    def test_rejects_sum_preserving_component_weight_changes(self):
+        changed = json.loads(CONFIG_PATH.read_text())
+        changed["component_weights"]["starter"] = 0.34
+        changed["component_weights"]["offense"] = 0.26
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):
+                load_config(path)
+
+    def test_rejects_shrinkage_constant_changes(self):
+        changed = json.loads(CONFIG_PATH.read_text())
+        changed["shrinkage_constants"]["bullpen"] = 301
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):
+                load_config(path)
+
 
 if __name__ == "__main__":
     unittest.main()
