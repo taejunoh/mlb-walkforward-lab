@@ -109,10 +109,13 @@ def predicted_pick(
             "pick_probability": probability,
         }
     if probability < 0.5:
+        away_probability = 1.0 - probability
+        if away_probability <= 0.5:
+            away_probability = math.nextafter(0.5, 1.0)
         return {
             "predicted_side": "away",
             "predicted_winner": away_team,
-            "pick_probability": 1.0 - probability,
+            "pick_probability": away_probability,
         }
     return {
         "predicted_side": "none",

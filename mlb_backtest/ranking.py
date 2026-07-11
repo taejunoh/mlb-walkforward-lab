@@ -91,6 +91,8 @@ def rank_daily(
         probability = _finite_number(
             source["pick_probability"], "pick_probability", 0.5, 0.9
         )
+        if probability <= 0.5:
+            raise ValueError("pick_probability must be greater than 0.5")
         confidence = _finite_number(source["confidence"], "confidence", 0.0, 10.0)
         starter_edge = _finite_number(
             source["starter_edge_abs"], "starter_edge_abs", 0.0, math.inf

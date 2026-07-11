@@ -4,6 +4,7 @@ import math
 import unittest
 
 from mlb_backtest.ranking import rank_daily
+from mlb_backtest.scoring import predicted_pick
 
 
 def row(game_pk, probability=0.60, confidence=8.5, starter_edge=5.0, start="2025-05-01T23:00:00Z"):
@@ -42,6 +43,27 @@ class RankingTest(unittest.TestCase):
     def test_raw_precision_not_display_rounding_controls_rank(self):
         ranked = rank_daily([row(1, 0.6000001, 10), row(2, 0.6000002, 0)])
         self.assertEqual([item["game_pk"] for item in ranked], [2, 1])
+
+    def test_exact_no_pick_probability_cannot_enter_daily_ranking(self):
+        no_pick = predicted_pick("Home", "Away", 0.5)
+        self.assertEqual(no_pick["predicted_side"], "none")
+        with self.assertRaises(ValueError):
+            rank_daily([row(1, no_pick["pick_probability"])])
+
+        adjacent_picks = [
+            predicted_pick("Home", "Away", math.nextafter(0.5, 0.0)),
+            predicted_pick("Home", "Away", math.nextafter(0.5, 1.0)),
+        ]
+        self.assertTrue(
+            all(pick["pick_probability"] > 0.5 for pick in adjacent_picks)
+        )
+        ranked = rank_daily(
+            [
+                row(game_pk, pick["pick_probability"])
+                for game_pk, pick in enumerate(adjacent_picks, 1)
+            ]
+        )
+        self.assertEqual(len(ranked), 2)
 
     def test_permutations_are_deterministic_and_input_is_not_mutated(self):
         rows = [row(3), row(1), row(2)]

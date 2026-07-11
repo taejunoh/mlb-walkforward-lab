@@ -109,7 +109,7 @@ class ScoringTest(unittest.TestCase):
             {
                 "predicted_side": "away",
                 "predicted_winner": "Away",
-                "pick_probability": 1.0 - just_away,
+                "pick_probability": math.nextafter(0.5, 1.0),
             },
         )
 
