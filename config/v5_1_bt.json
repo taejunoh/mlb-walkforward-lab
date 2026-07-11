@@ -1,0 +1,37 @@
+{
+  "model_version": "v5.1-BT",
+  "protocol": "Backtest",
+  "training_window": {
+    "start": "2022-01-01",
+    "end": "2024-12-31"
+  },
+  "initial_window": {
+    "start": "2025-05-01",
+    "end": "2025-08-12"
+  },
+  "graded_target": 100,
+  "lock_minutes_before_first_pitch": 45,
+  "component_weights": {
+    "starter": 0.35,
+    "offense": 0.25,
+    "bullpen": 0.20,
+    "environment": 0.10,
+    "defense": 0.05,
+    "schedule": 0.05
+  },
+  "shrinkage_constants": {
+    "starter": 150,
+    "hitter_split": 150,
+    "recent_form": 100,
+    "bullpen": 300,
+    "defense_catcher": 500
+  },
+  "probability_clip": [0.10, 0.90],
+  "ranking": [
+    "predicted_winner_probability_desc",
+    "confidence_desc",
+    "absolute_starter_edge_desc",
+    "scheduled_start_utc_asc",
+    "gamePk_asc"
+  ]
+}
