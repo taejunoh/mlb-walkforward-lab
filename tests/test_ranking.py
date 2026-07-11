@@ -82,6 +82,7 @@ class RankingTest(unittest.TestCase):
             row(1, 0.4999),
             row(1, 0.9001),
             row(1, math.nan),
+            row(1, 10**1000),
             row(1, 0.6, -0.1),
             row(1, 0.6, 10.01),
             row(1, 0.6, True),

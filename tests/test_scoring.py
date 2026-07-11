@@ -11,7 +11,7 @@ from mlb_backtest.scoring import (
     full_agreement,
     home_probability,
     overall_completeness,
-    predicted_winner,
+    predicted_pick,
     tier,
     uncertainty,
 )
@@ -93,19 +93,41 @@ class ScoringTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 home_probability(*args)
 
-    def test_predicted_winner_and_deterministic_home_tie(self):
+    def test_predicted_pick_chooses_home_or_away_around_half(self):
+        just_home = math.nextafter(0.5, 1.0)
+        just_away = math.nextafter(0.5, 0.0)
         self.assertEqual(
-            predicted_winner("Home", "Away", 0.60),
-            {"side": "home", "name": "Home", "pick_probability": 0.60},
+            predicted_pick("Home", "Away", just_home),
+            {
+                "predicted_side": "home",
+                "predicted_winner": "Home",
+                "pick_probability": just_home,
+            },
         )
         self.assertEqual(
-            predicted_winner("Home", "Away", 0.40),
-            {"side": "away", "name": "Away", "pick_probability": 0.60},
+            predicted_pick("Home", "Away", just_away),
+            {
+                "predicted_side": "away",
+                "predicted_winner": "Away",
+                "pick_probability": 1.0 - just_away,
+            },
         )
+
+    def test_predicted_pick_exact_half_is_explicit_no_pick(self):
         self.assertEqual(
-            predicted_winner("Home", "Away", 0.50),
-            {"side": "home", "name": "Home", "pick_probability": 0.50},
+            predicted_pick("Home", "Away", 0.50),
+            {
+                "predicted_side": "none",
+                "predicted_winner": "",
+                "pick_probability": 0.50,
+            },
         )
+        edges = {"starter": 2.0, "offense": 1.0, "bullpen": 0.5}
+        self.assertEqual(component_agreement(edges, "none"), 0.0)
+        self.assertEqual(full_agreement(edges, "none", "Low"), "No")
+        self.assertEqual(tier(0.5, 10.0, "Low"), "Toss-up")
+
+    def test_predicted_pick_validates_inputs(self):
         for args in (
             ("", "Away", 0.5),
             ("Home", 1, 0.5),
@@ -113,7 +135,7 @@ class ScoringTest(unittest.TestCase):
             ("Home", "Away", 1.01),
         ):
             with self.subTest(args=args), self.assertRaises(ValueError):
-                predicted_winner(*args)
+                predicted_pick(*args)
 
     def test_agreement_fraction_uses_three_strict_signs(self):
         edges = {"starter": 2.0, "offense": 0.0, "bullpen": -1.0}
@@ -139,6 +161,10 @@ class ScoringTest(unittest.TestCase):
                 confidence_score(*args)
         with self.assertRaises(ValueError):
             confidence_score(1.01, 0, 0, 0, 0, 0, 0)
+
+    def test_numeric_conversion_overflow_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            home_probability(10**1000, 0.0, 1.0)
 
     def test_uncertainty_boundaries_and_validation(self):
         self.assertEqual(uncertainty(0.749999, False, 500, False), "High")

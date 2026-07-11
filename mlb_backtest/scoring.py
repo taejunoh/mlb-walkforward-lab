@@ -25,7 +25,10 @@ _UNCERTAINTY_LABELS = frozenset(("High", "Medium", "Low"))
 def _finite_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(converted):
         raise ValueError(f"{name} must be a finite number")
     return converted
@@ -90,25 +93,31 @@ def home_probability(edge: float, alpha: float, beta: float) -> float:
     )
 
 
-def predicted_winner(
+def predicted_pick(
     home_team: str, away_team: str, p_home: float
 ) -> dict[str, object]:
-    """Choose a predicted winner; an exact 50% tie deterministically chooses home."""
+    """Choose a predicted winner, or an explicit no-pick at exactly 50%."""
     if not isinstance(home_team, str) or not home_team.strip():
         raise ValueError("home_team must be a non-empty string")
     if not isinstance(away_team, str) or not away_team.strip():
         raise ValueError("away_team must be a non-empty string")
     probability = _bounded_number(p_home, "p_home", 0.0, 1.0)
-    if probability >= 0.5:
+    if probability > 0.5:
         return {
-            "side": "home",
-            "name": home_team,
+            "predicted_side": "home",
+            "predicted_winner": home_team,
             "pick_probability": probability,
         }
+    if probability < 0.5:
+        return {
+            "predicted_side": "away",
+            "predicted_winner": away_team,
+            "pick_probability": 1.0 - probability,
+        }
     return {
-        "side": "away",
-        "name": away_team,
-        "pick_probability": 1.0 - probability,
+        "predicted_side": "none",
+        "predicted_winner": "",
+        "pick_probability": 0.5,
     }
 
 
@@ -116,8 +125,10 @@ def component_agreement(edges: Mapping[str, object], predicted_side: str) -> flo
     validated = _validated_values(
         edges, _CORE_COMPONENTS, "edges", -100.0, 100.0
     )
-    if predicted_side not in ("home", "away"):
-        raise ValueError("predicted_side must be 'home' or 'away'")
+    if predicted_side not in ("home", "away", "none"):
+        raise ValueError("predicted_side must be 'home', 'away', or 'none'")
+    if predicted_side == "none":
+        return 0.0
     sign = 1.0 if predicted_side == "home" else -1.0
     return sum(sign * validated[key] > 0 for key in _CORE_COMPONENTS) / 3.0
 

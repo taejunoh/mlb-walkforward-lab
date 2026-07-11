@@ -1,7 +1,7 @@
 """Deterministic, market-blind daily candidate ranking."""
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timezone
 from numbers import Real
 
@@ -20,7 +20,10 @@ _RANK_FIELD_SET = frozenset(_RANK_FIELDS)
 def _finite_number(value: object, name: str, low: float, high: float) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(converted):
         raise ValueError(f"{name} must be a finite number")
     if not low <= converted <= high:
@@ -55,7 +58,9 @@ def _scheduled_start(value: object) -> datetime:
     return parsed
 
 
-def rank_daily(rows: list[dict]) -> list[dict]:
+def rank_daily(
+    rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
     """Validate and rank one official date without consulting market fields."""
     if rows is None:
         raise ValueError("rows must be iterable mappings")
