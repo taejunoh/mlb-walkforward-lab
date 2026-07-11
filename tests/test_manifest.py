@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -38,9 +39,7 @@ def _canonical_manifest_bytes(manifest):
 def _rewrite_manifest_and_seal(artifact, manifest):
     content = _canonical_manifest_bytes(manifest)
     artifact.manifest_path.write_bytes(content)
-    seal_path = artifact.manifest_path.with_name(
-        f"{artifact.sha256}.manifest.sha256"
-    )
+    seal_path = artifact.manifest_path.with_suffix(".sha256")
     seal_path.write_text(
         f"{hashlib.sha256(content).hexdigest()}\n", encoding="utf-8"
     )
@@ -116,13 +115,12 @@ class ManifestTest(unittest.TestCase):
                 artifact.sha256, hashlib.sha256(payload).hexdigest()
             )
             self.assertEqual(artifact.data_path, folder / f"{artifact.sha256}.raw")
+            query_digest = hashlib.sha256(b"{}").hexdigest()
             self.assertEqual(
                 artifact.manifest_path,
-                folder / f"{artifact.sha256}.manifest.json",
+                folder / f"{artifact.sha256}.{query_digest}.manifest.json",
             )
-            self.assertTrue(
-                (folder / f"{artifact.sha256}.manifest.sha256").is_file()
-            )
+            self.assertTrue(artifact.manifest_path.with_suffix(".sha256").is_file())
 
     def test_manifest_is_canonical_utf8_with_utc_timestamp(self):
         with tempfile.TemporaryDirectory() as td:
@@ -274,6 +272,134 @@ class ManifestTest(unittest.TestCase):
             manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["query"], {"a": True, "z": [{"a": 1, "b": 2}]})
             self.assertEqual(original_manifest, second.manifest_path.read_bytes())
+
+    def test_same_payload_with_distinct_queries_has_distinct_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            payload = b"same payload"
+            first = store.put("source", {"date": "2025-05-01"}, payload)
+            second = store.put("source", {"date": "2025-05-02"}, payload)
+            first_again = store.put("source", {"date": "2025-05-01"}, payload)
+
+            self.assertEqual(first.data_path, second.data_path)
+            self.assertNotEqual(first.manifest_path, second.manifest_path)
+            self.assertEqual(first.manifest_path, first_again.manifest_path)
+            self.assertEqual(first.retrieved_at_utc, first_again.retrieved_at_utc)
+            first_manifest = json.loads(first.manifest_path.read_text("utf-8"))
+            second_manifest = json.loads(second.manifest_path.read_text("utf-8"))
+            self.assertEqual(first_manifest["sha256"], first.sha256)
+            self.assertEqual(second_manifest["sha256"], second.sha256)
+            self.assertEqual(first_manifest["query"], {"date": "2025-05-01"})
+            self.assertEqual(second_manifest["query"], {"date": "2025-05-02"})
+
+    def test_interrupted_manifest_publish_recovers_from_sealed_pending_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            with mock.patch(
+                "mlb_backtest.manifest._publish_manifest",
+                side_effect=OSError("injected publish failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected publish failure"):
+                    store.put("source", {"date": "2025-05-01"}, b"row")
+
+            folder = Path(td) / "source"
+            self.assertEqual(list(folder.glob("*.manifest.json")), [])
+            pending = list(folder.glob("*.manifest.pending"))
+            seals = list(folder.glob("*.manifest.sha256"))
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(len(seals), 1)
+
+            recovered = store.put("source", {"date": "2025-05-01"}, b"row")
+            original = recovered.manifest_path.read_bytes()
+            repeated = store.put("source", {"date": "2025-05-01"}, b"row")
+            self.assertEqual(recovered.manifest_path, repeated.manifest_path)
+            self.assertEqual(recovered.retrieved_at_utc, repeated.retrieved_at_utc)
+            self.assertEqual(original, repeated.manifest_path.read_bytes())
+            self.assertEqual(list(folder.glob("*.manifest.pending")), [])
+
+    def test_unsealed_pending_manifest_is_removed_and_recreated(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = RawStore(root)
+            query = {"date": "2025-05-01"}
+            payload = b"row"
+            digest = hashlib.sha256(payload).hexdigest()
+            query_bytes = b'{"date":"2025-05-01"}'
+            query_digest = hashlib.sha256(query_bytes).hexdigest()
+            folder = root / "source"
+            folder.mkdir()
+            pending = folder / f"{digest}.{query_digest}.manifest.pending"
+            pending.write_bytes(b"incomplete")
+
+            artifact = store.put("source", query, payload)
+
+            self.assertTrue(artifact.manifest_path.is_file())
+            self.assertFalse(pending.exists())
+
+    def test_sealed_pending_metadata_is_validated_before_recovery_publish(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            with mock.patch(
+                "mlb_backtest.manifest._publish_manifest",
+                side_effect=OSError("injected publish failure"),
+            ):
+                with self.assertRaises(OSError):
+                    store.put("source", {"date": "2025-05-01"}, b"row")
+
+            folder = Path(td) / "source"
+            pending = next(folder.glob("*.manifest.pending"))
+            seal = next(folder.glob("*.manifest.sha256"))
+            manifest = json.loads(pending.read_text("utf-8"))
+            manifest["query"] = {"date": "2025-05-02"}
+            content = _canonical_manifest_bytes(manifest)
+            pending.write_bytes(content)
+            seal.write_bytes(
+                f"{hashlib.sha256(content).hexdigest()}\n".encode("utf-8")
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "metadata"):
+                store.put("source", {"date": "2025-05-01"}, b"row")
+            self.assertEqual(list(folder.glob("*.manifest.json")), [])
+
+    def test_symlinked_raw_manifest_and_seal_leaves_are_rejected(self):
+        for leaf in ("raw", "manifest", "seal"):
+            with self.subTest(leaf=leaf), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "store"
+                outside = Path(td) / f"outside-{leaf}"
+                store = RawStore(root)
+                artifact = store.put("source", {"date": "2025-05-01"}, b"row")
+                paths = {
+                    "raw": artifact.data_path,
+                    "manifest": artifact.manifest_path,
+                    "seal": artifact.manifest_path.with_suffix(".sha256"),
+                }
+                attacked = paths[leaf]
+                expected = attacked.read_bytes()
+                outside.write_bytes(expected)
+                attacked.unlink()
+                attacked.symlink_to(outside)
+
+                with self.assertRaisesRegex((ValueError, RuntimeError), leaf):
+                    store.put("source", {"date": "2025-05-01"}, b"row")
+                self.assertEqual(outside.read_bytes(), expected)
+                self.assertTrue(attacked.is_symlink())
+
+    def test_nonregular_raw_manifest_and_seal_leaves_are_rejected(self):
+        for leaf in ("raw", "manifest", "seal"):
+            with self.subTest(leaf=leaf), tempfile.TemporaryDirectory() as td:
+                store = RawStore(Path(td))
+                artifact = store.put("source", {}, b"row")
+                paths = {
+                    "raw": artifact.data_path,
+                    "manifest": artifact.manifest_path,
+                    "seal": artifact.manifest_path.with_suffix(".sha256"),
+                }
+                attacked = paths[leaf]
+                attacked.unlink()
+                attacked.mkdir()
+
+                with self.assertRaisesRegex((ValueError, RuntimeError), leaf):
+                    store.put("source", {}, b"row")
 
     def test_tampered_raw_artifact_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:

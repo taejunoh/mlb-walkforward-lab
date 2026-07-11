@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import hashlib
 import json
@@ -47,10 +48,77 @@ def _seal_bytes(content: bytes) -> bytes:
     return f"{hashlib.sha256(content).hexdigest()}\n".encode("utf-8")
 
 
-def _atomic_write_once(path: Path, content: bytes) -> None:
-    if path.exists():
-        if path.read_bytes() != content:
-            raise RuntimeError(f"immutable artifact differs: {path.name}")
+def _query_bytes(query: dict) -> bytes:
+    return json.dumps(
+        query,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _safe_leaf_bytes(
+    path: Path,
+    resolved_parent: Path,
+    label: str,
+    *,
+    missing_ok: bool = False,
+) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise RuntimeError(f"immutable raw {label} is missing") from None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EISDIR}:
+            raise ValueError(f"raw {label} path must be a regular file") from exc
+        raise ValueError(f"raw {label} path cannot be opened safely") from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"raw {label} path must be a regular file")
+        try:
+            linked = os.stat(path, follow_symlinks=False)
+            resolved_path = path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"raw {label} path changed after opening") from exc
+        if not stat.S_ISREG(linked.st_mode):
+            raise ValueError(f"raw {label} path must be a regular file")
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"raw {label} path changed after opening")
+        if resolved_path.parent != resolved_parent:
+            raise ValueError(f"raw {label} path must be directly under source folder")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _safe_unlink_leaf(path: Path, resolved_parent: Path, label: str) -> None:
+    content = _safe_leaf_bytes(
+        path, resolved_parent, label, missing_ok=True
+    )
+    if content is not None:
+        os.unlink(path)
+
+
+def _atomic_write_once(
+    path: Path, content: bytes, resolved_parent: Path, label: str
+) -> None:
+    existing = _safe_leaf_bytes(
+        path, resolved_parent, label, missing_ok=True
+    )
+    if existing is not None:
+        if existing != content:
+            raise RuntimeError(f"immutable raw {label} differs: {path.name}")
         return
 
     fd, temporary_name = tempfile.mkstemp(dir=path.parent)
@@ -60,13 +128,20 @@ def _atomic_write_once(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if path.exists():
-            if path.read_bytes() != content:
-                raise RuntimeError(f"immutable artifact differs: {path.name}")
-        else:
-            os.replace(temporary_path, path)
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError:
+            existing = _safe_leaf_bytes(path, resolved_parent, label)
+            if existing != content:
+                raise RuntimeError(f"immutable raw {label} differs: {path.name}")
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _publish_manifest(
+    path: Path, content: bytes, resolved_parent: Path
+) -> None:
+    _atomic_write_once(path, content, resolved_parent, "manifest")
 
 
 class RawStore:
@@ -173,33 +248,71 @@ class RawStore:
         if resolved_folder.parent != resolved_root:
             raise ValueError("source folder must be directly under raw root")
 
+        query_digest = hashlib.sha256(_query_bytes(normalized_query)).hexdigest()
+        manifest_stem = f"{digest}.{query_digest}.manifest"
         data_path = folder / f"{digest}.raw"
-        manifest_path = folder / f"{digest}.manifest.json"
-        seal_path = folder / f"{digest}.manifest.sha256"
-        if data_path.exists() and data_path.read_bytes() != payload:
+        manifest_path = folder / f"{manifest_stem}.json"
+        pending_path = folder / f"{manifest_stem}.pending"
+        seal_path = folder / f"{manifest_stem}.sha256"
+
+        existing_data = _safe_leaf_bytes(
+            data_path, resolved_folder, "raw", missing_ok=True
+        )
+        if existing_data is not None and existing_data != payload:
             raise RuntimeError("immutable raw artifact hash collision")
 
-        existing_manifest = None
-        if manifest_path.exists():
-            if not seal_path.is_file():
-                raise RuntimeError("immutable raw manifest integrity seal is missing")
-            manifest_content = manifest_path.read_bytes()
-            if seal_path.read_bytes() != _seal_bytes(manifest_content):
-                raise RuntimeError("immutable raw manifest integrity mismatch")
-            existing_manifest = self._read_manifest(manifest_content)
-            expected = {
-                "source": source,
-                "query": normalized_query,
-                "sha256": digest,
-                "row_count": row_count,
-                "schema_version": _SCHEMA_VERSION,
-            }
-            if any(existing_manifest.get(key) != value for key, value in expected.items()):
-                raise RuntimeError("immutable raw manifest metadata mismatch")
-        elif seal_path.exists():
-            raise RuntimeError("immutable raw manifest integrity seal is orphaned")
+        manifest_content = _safe_leaf_bytes(
+            manifest_path, resolved_folder, "manifest", missing_ok=True
+        )
+        seal_content = _safe_leaf_bytes(
+            seal_path, resolved_folder, "seal", missing_ok=True
+        )
+        pending_content = _safe_leaf_bytes(
+            pending_path, resolved_folder, "pending manifest", missing_ok=True
+        )
+        expected = {
+            "source": source,
+            "query": normalized_query,
+            "sha256": digest,
+            "row_count": row_count,
+            "schema_version": _SCHEMA_VERSION,
+        }
 
-        _atomic_write_once(data_path, payload)
+        existing_manifest = None
+        if manifest_content is not None:
+            if seal_content is None:
+                raise RuntimeError("immutable raw manifest integrity seal is missing")
+            if seal_content != _seal_bytes(manifest_content):
+                raise RuntimeError("immutable raw manifest integrity mismatch")
+            if pending_content is not None:
+                if pending_content != manifest_content:
+                    raise RuntimeError("immutable raw manifest pending bytes mismatch")
+                _safe_unlink_leaf(
+                    pending_path, resolved_folder, "pending manifest"
+                )
+            existing_manifest = self._read_manifest(manifest_content)
+        elif seal_content is not None:
+            if pending_content is None:
+                raise RuntimeError("immutable raw manifest integrity seal is orphaned")
+            if seal_content != _seal_bytes(pending_content):
+                raise RuntimeError("immutable raw manifest integrity mismatch")
+            existing_manifest = self._read_manifest(pending_content)
+            if any(
+                existing_manifest.get(key) != value
+                for key, value in expected.items()
+            ):
+                raise RuntimeError("immutable raw manifest metadata mismatch")
+            _publish_manifest(manifest_path, pending_content, resolved_folder)
+            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
+        elif pending_content is not None:
+            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
+
+        if existing_manifest is not None and any(
+            existing_manifest.get(key) != value for key, value in expected.items()
+        ):
+            raise RuntimeError("immutable raw manifest metadata mismatch")
+
+        _atomic_write_once(data_path, payload, resolved_folder, "raw")
         if existing_manifest is None:
             manifest = {
                 "source": source,
@@ -210,8 +323,20 @@ class RawStore:
                 "schema_version": _SCHEMA_VERSION,
             }
             manifest_content = _json_bytes(manifest)
-            _atomic_write_once(manifest_path, manifest_content)
-            _atomic_write_once(seal_path, _seal_bytes(manifest_content))
+            _atomic_write_once(
+                pending_path,
+                manifest_content,
+                resolved_folder,
+                "pending manifest",
+            )
+            _atomic_write_once(
+                seal_path,
+                _seal_bytes(manifest_content),
+                resolved_folder,
+                "seal",
+            )
+            _publish_manifest(manifest_path, manifest_content, resolved_folder)
+            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
         else:
             manifest = existing_manifest
 
