@@ -5,6 +5,9 @@ from numbers import Integral, Real
 from typing import Iterable, Sequence
 
 
+FROZEN_TRAINING_END = "2024-12-31"
+
+
 def _finite_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite number")
@@ -69,7 +72,7 @@ def _logistic_objective(
     for x_value, y_value in zip(x_values, y_values):
         linear = alpha + beta * x_value
         loss += max(linear, 0.0) - y_value * linear + math.log1p(math.exp(-abs(linear)))
-    return loss + 0.5 * l2 * beta * beta
+    return loss + l2 * beta * beta
 
 
 def fit_logistic(
@@ -117,10 +120,10 @@ def fit_logistic(
 
     for _ in range(iterations):
         gradient_alpha = 0.0
-        gradient_beta = l2 * beta
+        gradient_beta = 2.0 * l2 * beta
         hessian_aa = 0.0
         hessian_ab = 0.0
-        hessian_bb = l2
+        hessian_bb = 2.0 * l2
         for x_value, y_value in zip(x_data, y_data):
             fitted = sigmoid(alpha + beta * x_value)
             residual = fitted - y_value
@@ -170,12 +173,14 @@ def fit_logistic(
 
 def fit_frozen_calibration(
     rows: Iterable[Mapping[str, object]],
-    training_end: str = "2024-12-31",
+    training_end: str = FROZEN_TRAINING_END,
 ) -> tuple[float, float, dict[str, object]]:
     try:
         boundary = date.fromisoformat(training_end)
     except (TypeError, ValueError) as exc:
         raise ValueError("training_end must be an ISO date") from exc
+    if boundary > date.fromisoformat(FROZEN_TRAINING_END):
+        raise ValueError("training_end exceeds frozen boundary")
     try:
         row_items = list(rows)
     except TypeError as exc:

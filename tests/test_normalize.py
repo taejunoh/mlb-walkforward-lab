@@ -4,6 +4,8 @@ import unittest
 import numpy as np
 
 from mlb_backtest.normalize import (
+    FROZEN_TRAINING_END,
+    _logistic_objective,
     clip,
     fit_frozen_calibration,
     fit_logistic,
@@ -15,6 +17,33 @@ from mlb_backtest.normalize import (
 
 
 class NormalizeTest(unittest.TestCase):
+    def test_frozen_training_end_cannot_be_overridden_later(self):
+        self.assertEqual(FROZEN_TRAINING_END, "2024-12-31")
+        rows = [
+            {"official_date": "2025-01-01", "edge": -1, "home_win": 0},
+            {"official_date": "2025-01-02", "edge": 1, "home_win": 1},
+        ]
+        with self.assertRaises(ValueError):
+            fit_frozen_calibration(rows, training_end="2025-12-31")
+        with self.assertRaises(ValueError):
+            fit_frozen_calibration(
+                [
+                    {"official_date": "2024-01-01", "edge": -1, "home_win": 0},
+                    {"official_date": "2024-01-02", "edge": 1, "home_win": 1},
+                ],
+                training_end="2025-12-31",
+            )
+        alpha, beta, metadata = fit_frozen_calibration(
+            [
+                {"official_date": "2023-12-30", "edge": -1, "home_win": 0},
+                {"official_date": "2023-12-31", "edge": 1, "home_win": 1},
+            ],
+            training_end="2023-12-31",
+        )
+        self.assertTrue(math.isfinite(alpha))
+        self.assertGreater(beta, 0.0)
+        self.assertEqual(metadata["training_max_date"], "2023-12-31")
+
     def test_numeric_goldens(self):
         self.assertEqual(clip(3.0, 0.0, 2.0), 2.0)
         self.assertAlmostEqual(shrink(0.320, 150, 0.300, 150), 0.310)
@@ -71,6 +100,18 @@ class NormalizeTest(unittest.TestCase):
         alpha, beta = fit_logistic([0.0, 0.0, 0.0, 0.0], [0, 1, 1, 1], l2=100.0)
         self.assertAlmostEqual(alpha, math.log(3.0), places=8)
         self.assertAlmostEqual(beta, 0.0, places=12)
+
+    def test_logistic_objective_uses_l2_beta_squared(self):
+        beta = 3.0
+        l2 = 0.5
+        epsilon = 1e-6
+        objective = _logistic_objective([], [], 99.0, beta, l2)
+        finite_difference = (
+            _logistic_objective([], [], 99.0, beta + epsilon, l2)
+            - _logistic_objective([], [], 99.0, beta - epsilon, l2)
+        ) / (2.0 * epsilon)
+        self.assertAlmostEqual(objective, l2 * beta * beta, places=12)
+        self.assertAlmostEqual(finite_difference, 2.0 * l2 * beta, places=8)
 
     def test_logistic_rejects_invalid_inputs(self):
         invalid_calls = [
