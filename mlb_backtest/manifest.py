@@ -256,44 +256,25 @@ class RawStore:
         if existing_data is not None and existing_data != payload:
             raise RuntimeError("immutable raw artifact hash collision")
 
-        expected_common = {
+        expected = {
             "source": source,
+            "query": normalized_query,
             "sha256": digest,
             "row_count": row_count,
             "schema_version": _SCHEMA_VERSION,
         }
-        primary_stem = f"{digest}.manifest"
-        primary_path = folder / f"{primary_stem}.json"
-        primary_pending_path = folder / f"{primary_stem}.pending"
-        primary_seal_path = folder / f"{primary_stem}.sha256"
-        primary_manifest = self._load_manifest_transaction(
-            primary_path,
-            primary_pending_path,
-            primary_seal_path,
+        query_digest = hashlib.sha256(_query_bytes(normalized_query)).hexdigest()
+        manifest_stem = f"{digest}.{query_digest}.manifest"
+        manifest_path = folder / f"{manifest_stem}.json"
+        pending_path = folder / f"{manifest_stem}.pending"
+        seal_path = folder / f"{manifest_stem}.sha256"
+        existing_manifest = self._load_manifest_transaction(
+            manifest_path,
+            pending_path,
+            seal_path,
             resolved_folder,
-            expected_common,
+            expected,
         )
-
-        if primary_manifest is None or primary_manifest["query"] == normalized_query:
-            manifest_path = primary_path
-            pending_path = primary_pending_path
-            seal_path = primary_seal_path
-            existing_manifest = primary_manifest
-        else:
-            query_digest = hashlib.sha256(
-                _query_bytes(normalized_query)
-            ).hexdigest()
-            manifest_stem = f"{digest}.{query_digest}.manifest"
-            manifest_path = folder / f"{manifest_stem}.json"
-            pending_path = folder / f"{manifest_stem}.pending"
-            seal_path = folder / f"{manifest_stem}.sha256"
-            existing_manifest = self._load_manifest_transaction(
-                manifest_path,
-                pending_path,
-                seal_path,
-                resolved_folder,
-                {**expected_common, "query": normalized_query},
-            )
 
         _atomic_write_once(data_path, payload, resolved_folder, "raw")
         if existing_manifest is None:
