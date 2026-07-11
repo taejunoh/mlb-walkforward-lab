@@ -12,23 +12,26 @@
           "teams": {
             "away": {
               "team": {"id": 147, "name": "New York Yankees"},
-              "probablePitcher": {"id": 592450, "fullName": "Marcus Stroman"},
-              "lineup": [
-                {"id": 1001, "fullName": "Away Batter 1"},
-                {"id": 1002, "fullName": "Away Batter 2"},
-                {"id": 1003, "fullName": "Away Batter 3"},
-                {"id": 1004, "fullName": "Away Batter 4"},
-                {"id": 1005, "fullName": "Away Batter 5"},
-                {"id": 1006, "fullName": "Away Batter 6"},
-                {"id": 1007, "fullName": "Away Batter 7"},
-                {"id": 1008, "fullName": "Away Batter 8"},
-                {"id": 1009, "fullName": "Away Batter 9"}
-              ]
+              "probablePitcher": {"id": 592450, "fullName": "Marcus Stroman"}
             },
             "home": {
               "team": {"id": 135, "name": "San Diego Padres"},
-              "probablePitcher": {"id": 605483, "fullName": "Yu Darvish"},
-              "lineup": [
+              "probablePitcher": {"id": 605483, "fullName": "Yu Darvish"}
+            }
+          },
+          "lineups": {
+            "awayPlayers": [
+              {"id": 1001, "fullName": "Away Batter 1"},
+              {"id": 1002, "fullName": "Away Batter 2"},
+              {"id": 1003, "fullName": "Away Batter 3"},
+              {"id": 1004, "fullName": "Away Batter 4"},
+              {"id": 1005, "fullName": "Away Batter 5"},
+              {"id": 1006, "fullName": "Away Batter 6"},
+              {"id": 1007, "fullName": "Away Batter 7"},
+              {"id": 1008, "fullName": "Away Batter 8"},
+              {"id": 1009, "fullName": "Away Batter 9"}
+            ],
+            "homePlayers": [
                 {"id": 2001, "fullName": "Home Batter 1"},
                 {"id": 2002, "fullName": "Home Batter 2"},
                 {"id": 2003, "fullName": "Home Batter 3"},
@@ -38,8 +41,7 @@
                 {"id": 2007, "fullName": "Home Batter 7"},
                 {"id": 2008, "fullName": "Home Batter 8"},
                 {"id": 2009, "fullName": "Home Batter 9"}
-              ]
-            }
+            ]
           },
           "venue": {"id": 2680, "name": "Petco Park"}
         },

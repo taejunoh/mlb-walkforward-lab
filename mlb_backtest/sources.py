@@ -67,23 +67,25 @@ def _optional_person(side: dict, field: str, label: str) -> tuple[int | None, st
     )
 
 
-def _lineup(side: dict, label: str) -> list[dict]:
-    value = side.get("lineup")
+def _lineup(lineups: dict, field: str, label: str) -> list[dict]:
+    value = lineups.get(field)
     if value is None:
         return []
-    lineup = _list(value, f"{label}.lineup")
+    lineup = _list(value, f"{label}.{field}")
     if len(lineup) != 9:
-        raise ValueError(f"malformed schedule: {label}.lineup must contain 9 players")
+        raise ValueError(
+            f"malformed schedule: {label}.{field} must contain 9 players"
+        )
     result = []
     for index, raw_player in enumerate(lineup):
-        player = _mapping(raw_player, f"{label}.lineup[{index}]")
+        player = _mapping(raw_player, f"{label}.{field}[{index}]")
         result.append(
             {
                 "player_id": _required(
-                    player, "id", int, f"{label}.lineup[{index}]"
+                    player, "id", int, f"{label}.{field}[{index}]"
                 ),
                 "player_name": _required(
-                    player, "fullName", str, f"{label}.lineup[{index}]"
+                    player, "fullName", str, f"{label}.{field}[{index}]"
                 ),
             }
         )
@@ -116,6 +118,12 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     home_pitcher_id, home_pitcher_name = _optional_person(
         home, "probablePitcher", f"game[{index}].teams.home.probablePitcher"
     )
+    lineups_value = game.get("lineups")
+    lineups = (
+        {}
+        if lineups_value is None
+        else _mapping(lineups_value, f"game[{index}].lineups")
+    )
 
     venue_value = game.get("venue")
     if venue_value is None:
@@ -145,8 +153,12 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "home_probable_pitcher_name": home_pitcher_name,
         "venue_id": venue_id,
         "venue_name": venue_name,
-        "away_lineup": _lineup(away, f"game[{index}].teams.away"),
-        "home_lineup": _lineup(home, f"game[{index}].teams.home"),
+        "away_lineup": _lineup(
+            lineups, "awayPlayers", f"game[{index}].lineups"
+        ),
+        "home_lineup": _lineup(
+            lineups, "homePlayers", f"game[{index}].lineups"
+        ),
     }
 
 

@@ -82,6 +82,20 @@ class SourceTest(unittest.TestCase):
             },
         )
 
+    def test_official_top_level_lineups_normalize_nine_ids_and_names(self):
+        game = parse_schedule(FIXTURE)[0]
+
+        self.assertEqual(len(game["away_lineup"]), 9)
+        self.assertEqual(len(game["home_lineup"]), 9)
+        self.assertEqual(
+            [player["player_id"] for player in game["away_lineup"]],
+            list(range(1001, 1010)),
+        )
+        self.assertEqual(
+            [player["player_name"] for player in game["home_lineup"]],
+            [f"Home Batter {slot}" for slot in range(1, 10)],
+        )
+
     def test_nullable_hydrated_fields_are_normalized(self):
         payload = {
             "dates": [{
