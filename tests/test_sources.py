@@ -18,14 +18,38 @@ FIXTURE = Path(__file__).parent / "fixtures" / "schedule_2025_05_01.json"
 
 
 class _Response:
+    def __init__(
+        self,
+        payload=b"payload",
+        final_url="https://example.test/final",
+        content_length=None,
+    ):
+        self.payload = payload
+        self.final_url = final_url
+        self.offset = 0
+        self.read_sizes = []
+        self.headers = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+
     def __enter__(self):
         return self
 
     def __exit__(self, *_args):
         return None
 
-    def read(self):
-        return b"payload"
+    def geturl(self):
+        return self.final_url
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        if size < 0:
+            chunk = self.payload[self.offset :]
+            self.offset = len(self.payload)
+            return chunk
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
 
 
 class SourceTest(unittest.TestCase):
@@ -51,6 +75,43 @@ class SourceTest(unittest.TestCase):
         self.assertTrue(request.get_header("User-agent"))
         self.assertEqual(mocked_open.call_args.kwargs, {"timeout": 7})
 
+    def test_fetch_bytes_rejects_unsafe_initial_and_final_urls(self):
+        with mock.patch("mlb_backtest.sources.urlopen") as mocked_open:
+            for url in ("file:///etc/passwd", "ftp://example.test/data", "relative"):
+                with self.subTest(initial=url), self.assertRaises(ValueError):
+                    fetch_bytes(url)
+            mocked_open.assert_not_called()
+
+        response = _Response(final_url="file:///etc/passwd")
+        with mock.patch("mlb_backtest.sources.urlopen", return_value=response):
+            with self.assertRaises(ValueError):
+                fetch_bytes("https://example.test/redirect")
+        self.assertEqual(response.read_sizes, [])
+
+    def test_fetch_bytes_validates_timeout_and_max_bytes(self):
+        invalid_timeouts = (0, -1, float("inf"), float("nan"), True, "90")
+        for timeout in invalid_timeouts:
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                fetch_bytes("https://example.test", timeout=timeout)
+
+        invalid_limits = (0, -1, True, 1.5)
+        for max_bytes in invalid_limits:
+            with self.subTest(max_bytes=max_bytes), self.assertRaises(ValueError):
+                fetch_bytes("https://example.test", max_bytes=max_bytes)
+
+    def test_fetch_bytes_rejects_declared_and_streamed_oversize_payloads(self):
+        declared = _Response(payload=b"x", content_length=5)
+        with mock.patch("mlb_backtest.sources.urlopen", return_value=declared):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                fetch_bytes("https://example.test", max_bytes=4)
+        self.assertEqual(declared.read_sizes, [])
+
+        streamed = _Response(payload=b"12345")
+        with mock.patch("mlb_backtest.sources.urlopen", return_value=streamed):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                fetch_bytes("https://example.test", max_bytes=4)
+        self.assertTrue(streamed.read_sizes)
+
     def test_regular_season_game_is_fully_normalized(self):
         games = parse_schedule(FIXTURE)
 
@@ -58,26 +119,40 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(
             games[0],
             {
-                "game_pk": 778498,
+                "game_pk": 778100,
                 "official_date": "2025-05-01",
                 "game_type": "R",
-                "scheduled_start_utc": "2025-05-01T23:10:00Z",
+                "scheduled_start_utc": "2025-05-01T16:35:00Z",
                 "status": "Final",
-                "away_team": "New York Yankees",
-                "home_team": "San Diego Padres",
-                "away_probable_pitcher_id": 592450,
-                "away_probable_pitcher_name": "Marcus Stroman",
-                "home_probable_pitcher_id": 605483,
-                "home_probable_pitcher_name": "Yu Darvish",
-                "venue_id": 2680,
-                "venue_name": "Petco Park",
+                "away_team": "Chicago Cubs",
+                "home_team": "Pittsburgh Pirates",
+                "away_probable_pitcher_id": 607067,
+                "away_probable_pitcher_name": "Colin Rea",
+                "home_probable_pitcher_id": 694973,
+                "home_probable_pitcher_name": "Paul Skenes",
+                "venue_id": 31,
+                "venue_name": "PNC Park",
                 "away_lineup": [
-                    {"player_id": 1000 + slot, "player_name": f"Away Batter {slot}"}
-                    for slot in range(1, 10)
+                    {"player_id": 664023, "player_name": "Ian Happ"},
+                    {"player_id": 663656, "player_name": "Kyle Tucker"},
+                    {"player_id": 673548, "player_name": "Seiya Suzuki"},
+                    {"player_id": 683737, "player_name": "Michael Busch"},
+                    {"player_id": 663538, "player_name": "Nico Hoerner"},
+                    {"player_id": 691718, "player_name": "Pete Crow-Armstrong"},
+                    {"player_id": 665804, "player_name": "Miguel Amaya"},
+                    {"player_id": 621020, "player_name": "Dansby Swanson"},
+                    {"player_id": 670032, "player_name": "Nicky Lopez"},
                 ],
                 "home_lineup": [
-                    {"player_id": 2000 + slot, "player_name": f"Home Batter {slot}"}
-                    for slot in range(1, 10)
+                    {"player_id": 665833, "player_name": "Oneil Cruz"},
+                    {"player_id": 668804, "player_name": "Bryan Reynolds"},
+                    {"player_id": 457705, "player_name": "Andrew McCutchen"},
+                    {"player_id": 665839, "player_name": "Enmanuel Valdez"},
+                    {"player_id": 663647, "player_name": "Ke'Bryan Hayes"},
+                    {"player_id": 672744, "player_name": "Alexander Canario"},
+                    {"player_id": 624428, "player_name": "Adam Frazier"},
+                    {"player_id": 669707, "player_name": "Jared Triolo"},
+                    {"player_id": 680779, "player_name": "Henry Davis"},
                 ],
             },
         )
@@ -89,11 +164,31 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(len(game["home_lineup"]), 9)
         self.assertEqual(
             [player["player_id"] for player in game["away_lineup"]],
-            list(range(1001, 1010)),
+            [
+                664023,
+                663656,
+                673548,
+                683737,
+                663538,
+                691718,
+                665804,
+                621020,
+                670032,
+            ],
         )
         self.assertEqual(
             [player["player_name"] for player in game["home_lineup"]],
-            [f"Home Batter {slot}" for slot in range(1, 10)],
+            [
+                "Oneil Cruz",
+                "Bryan Reynolds",
+                "Andrew McCutchen",
+                "Enmanuel Valdez",
+                "Ke'Bryan Hayes",
+                "Alexander Canario",
+                "Adam Frazier",
+                "Jared Triolo",
+                "Henry Davis",
+            ],
         )
 
     def test_nullable_hydrated_fields_are_normalized(self):
@@ -125,6 +220,28 @@ class SourceTest(unittest.TestCase):
         self.assertIsNone(game["venue_name"])
         self.assertEqual(game["away_lineup"], [])
         self.assertEqual(game["home_lineup"], [])
+
+    def test_scheduled_start_offset_is_normalized_to_canonical_utc(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["dates"][0]["games"][0]["gameDate"] = (
+            "2025-05-01T19:10:00-04:00"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            game = parse_schedule(path)[0]
+
+        self.assertEqual(game["scheduled_start_utc"], "2025-05-01T23:10:00Z")
+
+    def test_malformed_and_naive_scheduled_starts_raise_value_error(self):
+        for start in ("not-a-time", "2025-05-01T23:10:00"):
+            payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+            payload["dates"][0]["games"][0]["gameDate"] = start
+            with self.subTest(start=start), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "schedule.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    parse_schedule(path)
 
     def test_malformed_payloads_raise_value_error_not_key_error(self):
         payloads = [

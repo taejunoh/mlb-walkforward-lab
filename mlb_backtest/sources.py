@@ -1,19 +1,73 @@
 import json
-from datetime import date
+import math
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _USER_AGENT = "mlb-v5.1-backtest/1.0"
+_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 
 
-def fetch_bytes(url: str, timeout: int = 90) -> bytes:
+def _validate_http_url(url: Any, label: str) -> None:
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"{label} must be an HTTP(S) URL")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{label} must be an HTTP(S) URL")
+
+
+def fetch_bytes(
+    url: str,
+    timeout: int | float = 90,
+    max_bytes: int = _DEFAULT_MAX_BYTES,
+) -> bytes:
+    _validate_http_url(url, "url")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a positive finite number")
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes <= 0
+    ):
+        raise ValueError("max_bytes must be a positive integer")
+
     request = Request(url, headers={"User-Agent": _USER_AGENT})
     with urlopen(request, timeout=timeout) as response:
-        return response.read()
+        _validate_http_url(response.geturl(), "final response URL")
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                declared_bytes = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("response has invalid Content-Length") from exc
+            if declared_bytes < 0:
+                raise ValueError("response has invalid Content-Length")
+            if declared_bytes > max_bytes:
+                raise ValueError("response exceeds size limit")
+
+        chunks = []
+        total = 0
+        while True:
+            chunk = response.read(_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            if not isinstance(chunk, bytes):
+                raise ValueError("response body must contain bytes")
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("response exceeds size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def schedule_url(start: str, end: str) -> str:
@@ -65,6 +119,21 @@ def _optional_person(side: dict, field: str, label: str) -> tuple[int | None, st
         _required(person, "id", int, label),
         _required(person, "fullName", str, label),
     )
+
+
+def _canonical_utc_datetime(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"malformed schedule: {label} must be an ISO datetime")
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"malformed schedule: {label} must be an ISO datetime"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"malformed schedule: {label} must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _lineup(lineups: dict, field: str, label: str) -> list[dict]:
@@ -137,8 +206,8 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "game_pk": _required(game, "gamePk", int, f"game[{index}]"),
         "official_date": official_date,
         "game_type": "R",
-        "scheduled_start_utc": _required(
-            game, "gameDate", str, f"game[{index}]"
+        "scheduled_start_utc": _canonical_utc_datetime(
+            game.get("gameDate"), f"game[{index}].gameDate"
         ),
         "status": _required(status, "detailedState", str, f"game[{index}].status"),
         "away_team": _required(
