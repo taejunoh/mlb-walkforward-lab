@@ -118,16 +118,17 @@ def leverage_pool(
             or batters_faced < 0
         ):
             raise ValueError("batters_faced must be a nonnegative integer")
-        is_reliever = event.get("is_reliever", True)
-        if not isinstance(is_reliever, bool):
-            raise ValueError("is_reliever must be boolean")
-
-        if (
+        is_candidate = (
             first_date <= game_date < target
             and inning >= 7
             and abs(margin) <= 3
-            and is_reliever
-        ):
+        )
+        if not is_candidate:
+            continue
+        is_reliever = event.get("is_reliever")
+        if not isinstance(is_reliever, bool):
+            raise ValueError("is_reliever must be boolean")
+        if is_reliever:
             totals[pitcher_id] += batters_faced
 
     ranked = sorted(

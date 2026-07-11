@@ -71,6 +71,25 @@ class BullpenFeaturesTest(unittest.TestCase):
             with self.subTest(event=event), self.assertRaises(ValueError):
                 leverage_pool([event], "2025-05-01")
 
+    def test_leverage_pool_requires_explicit_boolean_reliever_for_candidates(self):
+        candidate = self.event("candidate", "2025-04-30", 7, 0, 1, 2)
+        missing = dict(candidate)
+        del missing["is_reliever"]
+        for event in (missing, dict(candidate, is_reliever="true")):
+            with self.subTest(event=event), self.assertRaisesRegex(
+                ValueError, "is_reliever must be boolean"
+            ):
+                leverage_pool([event], "2025-05-01")
+
+        self.assertEqual(
+            leverage_pool([dict(candidate, is_reliever=False)], "2025-05-01"),
+            [],
+        )
+        self.assertEqual(
+            leverage_pool([dict(candidate, is_reliever=True)], "2025-05-01"),
+            [{"pitcher_id": 1, "batters_faced": 2}],
+        )
+
     def test_team_availability_is_bf_weighted_with_neutral_missing_usage(self):
         pool = [
             {"pitcher_id": 1, "batters_faced": 6},
