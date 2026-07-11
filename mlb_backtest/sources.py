@@ -45,6 +45,7 @@ def fetch_bytes(
     with urlopen(request, timeout=timeout) as response:
         _validate_http_url(response.geturl(), "final response URL")
         content_length = response.headers.get("Content-Length")
+        declared_bytes = None
         if content_length is not None:
             try:
                 declared_bytes = int(content_length)
@@ -67,6 +68,8 @@ def fetch_bytes(
             if total > max_bytes:
                 raise ValueError("response exceeds size limit")
             chunks.append(chunk)
+        if declared_bytes is not None and total != declared_bytes:
+            raise ValueError("incomplete response body")
         return b"".join(chunks)
 
 

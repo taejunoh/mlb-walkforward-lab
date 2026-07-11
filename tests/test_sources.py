@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
@@ -111,6 +113,31 @@ class SourceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size limit"):
                 fetch_bytes("https://example.test", max_bytes=4)
         self.assertTrue(streamed.read_sizes)
+
+    def test_fetch_bytes_rejects_short_http_body_against_content_length(self):
+        class ShortBodyHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body) + 5))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ShortBodyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            with self.assertRaisesRegex(ValueError, "incomplete response"):
+                fetch_bytes(f"http://{host}:{port}/schedule")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_regular_season_game_is_fully_normalized(self):
         games = parse_schedule(FIXTURE)
