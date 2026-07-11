@@ -11,6 +11,14 @@ CONFIG_PATH = Path(__file__).parents[1] / "config" / "v5_1_bt.json"
 
 
 class ConfigTest(unittest.TestCase):
+    def _assert_invalid_config(self, config, message):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config))
+            with self.assertRaises(ValueError) as raised:
+                load_config(path)
+            self.assertEqual(str(raised.exception), message)
+
     def test_loads_frozen_v5_1_backtest_model_card(self):
         config = load_config(CONFIG_PATH)
 
@@ -106,6 +114,25 @@ class ConfigTest(unittest.TestCase):
             path.write_text(json.dumps(changed))
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_rejects_non_object_json_root_with_specific_message(self):
+        self._assert_invalid_config([], "config must be a JSON object")
+
+    def test_rejects_invalid_component_weight_values_with_specific_messages(self):
+        cases = {
+            "non-numeric": ("starter", "0.35"),
+            "non-finite": ("offense", float("nan")),
+            "boolean": ("bullpen", True),
+        }
+
+        for label, (field, value) in cases.items():
+            with self.subTest(label=label, field=field):
+                changed = json.loads(CONFIG_PATH.read_text())
+                changed["component_weights"][field] = value
+                self._assert_invalid_config(
+                    changed,
+                    f"component_weights.{field} must be a finite number",
+                )
 
 
 if __name__ == "__main__":

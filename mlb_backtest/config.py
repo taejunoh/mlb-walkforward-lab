@@ -28,11 +28,22 @@ RANKING = [
 
 
 def load_config(path):
-    config = json.loads(Path(path).read_text())
+    config = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("config must be a JSON object")
+
     weights = config.get("component_weights")
 
     if not isinstance(weights, dict) or set(weights) != set(COMPONENT_WEIGHTS):
         raise ValueError("component set must match the frozen model card")
+    for field in COMPONENT_WEIGHTS:
+        value = weights[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"component_weights.{field} must be a finite number")
     if not math.isclose(math.fsum(weights.values()), 1.0, abs_tol=1e-12, rel_tol=0.0):
         raise ValueError("component weights must sum to 1")
     if weights != COMPONENT_WEIGHTS:
