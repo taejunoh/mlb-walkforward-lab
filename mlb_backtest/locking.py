@@ -11,6 +11,7 @@ import stat
 import tempfile
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -119,7 +120,10 @@ def _integer(value: object, label: str, *, positive: bool = False) -> int:
 def _number(value: object, label: str, low: float, high: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be a finite number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite number") from exc
     if not math.isfinite(converted):
         raise ValueError(f"{label} must be a finite number")
     if not low <= converted <= high:
@@ -189,10 +193,19 @@ def _validate_prediction(source: Mapping[str, object]) -> dict[str, object]:
     expected_winner = home if side == "home" else away
     if row["predicted_winner"] != expected_winner:
         raise ValueError("predicted_winner is inconsistent with predicted_side")
-    p_home = _number(row["p_home"], "p_home", 0.0, 1.0)
-    pick_probability = _number(row["pick_probability"], "pick_probability", 0.5, 1.0)
+    p_home = _number(row["p_home"], "p_home", 0.1, 0.9)
+    pick_probability = _number(
+        row["pick_probability"], "pick_probability", 0.5, 0.9
+    )
+    if pick_probability <= 0.5:
+        raise ValueError("pick_probability must be greater than 0.5")
     expected_probability = p_home if side == "home" else 1.0 - p_home
-    if not math.isclose(pick_probability, expected_probability, rel_tol=0.0, abs_tol=1e-12):
+    if not math.isclose(
+        pick_probability,
+        expected_probability,
+        rel_tol=0.0,
+        abs_tol=1e-10,
+    ):
         raise ValueError("pick_probability is inconsistent with p_home and predicted_side")
     if side == "home" and p_home <= 0.5 or side == "away" and p_home >= 0.5:
         raise ValueError("predicted_side is inconsistent with p_home")
@@ -203,19 +216,29 @@ def _validate_prediction(source: Mapping[str, object]) -> dict[str, object]:
     )
     if locked_pick_probability <= 0.5 or (
         side == "home" and locked_p_home <= 0.5
-    ) or (side == "away" and locked_p_home >= 0.5) or not math.isclose(
-        locked_pick_probability,
-        locked_expected_probability,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
+    ) or (side == "away" and locked_p_home >= 0.5) or abs(
+        Decimal(format(locked_pick_probability, ".10f"))
+        - Decimal(format(locked_expected_probability, ".10f"))
+    ) > Decimal("0.0000000001"):
         raise ValueError("probability loses winner-side consistency at lock precision")
 
-    _number(row["confidence"], "confidence", 0.0, 10.0)
+    confidence = _number(row["confidence"], "confidence", 0.0, 10.0)
     if row["uncertainty"] not in ("High", "Medium", "Low"):
         raise ValueError("uncertainty must be High, Medium, or Low")
     if row["tier"] not in ("S", "A", "B", "Lean", "Toss-up"):
         raise ValueError("tier is invalid")
+    if row["uncertainty"] == "High" or pick_probability < 0.54:
+        expected_tier = "Toss-up"
+    elif pick_probability >= 0.68 and confidence >= 9.0:
+        expected_tier = "S"
+    elif pick_probability >= 0.63 and confidence >= 8.5:
+        expected_tier = "A"
+    elif pick_probability >= 0.58 and confidence >= 8.0:
+        expected_tier = "B"
+    else:
+        expected_tier = "Lean"
+    if row["tier"] != expected_tier:
+        raise ValueError("tier is inconsistent with frozen probability rules")
     if row["full_agreement"] not in ("Yes", "No"):
         raise ValueError("full_agreement must be Yes or No")
     if row["model_version"] != "v5.1-BT":
@@ -267,14 +290,27 @@ def validate_lock_rows(
     game_pks = [row["game_pk"] for row in validated]
     if len(game_pks) != len(set(game_pks)):
         raise ValueError("game_pk values must be unique")
-    by_date: dict[str, list[int]] = {}
+    by_date: dict[str, list[dict[str, object]]] = {}
     for row in validated:
-        by_date.setdefault(row["official_date"], []).append(row["daily_rank"])
-    for official_date, ranks in by_date.items():
-        if sorted(ranks) != list(range(1, len(ranks) + 1)):
-            raise ValueError(f"daily_rank must be contiguous for {official_date}")
-        if ranks.count(1) != 1:
-            raise ValueError(f"exactly one Top1 is required for {official_date}")
+        by_date.setdefault(row["official_date"], []).append(row)
+    for official_date, daily_rows in by_date.items():
+        expected_order = sorted(
+            daily_rows,
+            key=lambda row: (
+                -float(row["pick_probability"]),
+                -float(row["confidence"]),
+                -float(row["starter_edge_abs"]),
+                _canonical_utc(
+                    row["scheduled_start_utc"], "scheduled_start_utc"
+                ),
+                row["game_pk"],
+            ),
+        )
+        for expected_rank, row in enumerate(expected_order, 1):
+            if row["daily_rank"] != expected_rank:
+                raise ValueError(
+                    f"daily_rank does not match frozen rank order for {official_date}"
+                )
     return sorted(
         validated,
         key=lambda row: (row["official_date"], row["daily_rank"], row["game_pk"]),

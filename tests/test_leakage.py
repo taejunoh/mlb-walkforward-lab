@@ -10,14 +10,19 @@ from mlb_backtest.outcomes import join_outcomes
 from tests.test_locking import MODEL_CARD_SHA, prediction
 
 
+def outcomes_dir(locked: Path) -> Path:
+    return locked.parent / f"{locked.name}-outcomes"
+
+
 class LeakageTest(unittest.TestCase):
     def test_outcomes_cannot_join_before_lock_manifest(self):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaisesRegex(RuntimeError, "lock manifest"):
                 join_outcomes(
-                    Path(td) / "missing.json",
+                    Path(td) / "locked" / "missing.json",
                     [{"game_pk": 1, "actual_winner": "Home", "status": "Final"}],
                     MODEL_CARD_SHA,
+                    Path(td) / "outcomes",
                 )
 
     def test_verified_outcomes_are_nested_and_predictions_unchanged(self):
@@ -65,7 +70,12 @@ class LeakageTest(unittest.TestCase):
                 "predicted_winner": "Away",
             }
             with self.assertRaisesRegex(ValueError, "unknown"):
-                join_outcomes(root / "lock_manifest.json", [bad], MODEL_CARD_SHA)
+                join_outcomes(
+                    root / "lock_manifest.json",
+                    [bad],
+                    MODEL_CARD_SHA,
+                    outcomes_dir(root),
+                )
 
     def test_rejects_duplicate_unknown_games_and_invalid_status_winner(self):
         bad_sets = (
@@ -84,7 +94,10 @@ class LeakageTest(unittest.TestCase):
                 lock_predictions([prediction()], root, MODEL_CARD_SHA)
                 with self.assertRaises(ValueError):
                     join_outcomes(
-                        root / "lock_manifest.json", outcomes, MODEL_CARD_SHA
+                        root / "lock_manifest.json",
+                        outcomes,
+                        MODEL_CARD_SHA,
+                        outcomes_dir(root),
                     )
 
     def test_void_winner_must_be_blank_and_partial_join_is_allowed(self):
@@ -95,6 +108,7 @@ class LeakageTest(unittest.TestCase):
                 root / "lock_manifest.json",
                 [{"game_pk": 1, "actual_winner": "", "status": "VOID"}],
                 MODEL_CARD_SHA,
+                outcomes_dir(root),
             )
             result = json.loads(path.read_text("utf-8"))
             self.assertEqual(result["outcome"]["status"], "VOID")
@@ -106,6 +120,7 @@ class LeakageTest(unittest.TestCase):
                 root / "lock_manifest.json",
                 [{"game_pk": 1, "actual_winner": "Home", "status": "Final"}],
                 MODEL_CARD_SHA,
+                outcomes_dir(root),
             )
             self.assertEqual(len(path.read_text("utf-8").splitlines()), 1)
 
@@ -132,6 +147,7 @@ class LeakageTest(unittest.TestCase):
                         manifest_path,
                         [{"game_pk": 1, "actual_winner": "Home", "status": "Final"}],
                         MODEL_CARD_SHA,
+                        outcomes_dir(root),
                     )
 
     def test_requires_exact_expected_model_card_digest_before_join(self):
@@ -140,9 +156,19 @@ class LeakageTest(unittest.TestCase):
             lock_predictions([prediction()], root, MODEL_CARD_SHA)
             outcome = [{"game_pk": 1, "actual_winner": "Home", "status": "Final"}]
             with self.assertRaisesRegex(RuntimeError, "model card|integrity"):
-                join_outcomes(root / "lock_manifest.json", outcome, "b" * 64)
+                join_outcomes(
+                    root / "lock_manifest.json",
+                    outcome,
+                    "b" * 64,
+                    outcomes_dir(root),
+                )
             with self.assertRaisesRegex(ValueError, "SHA-256"):
-                join_outcomes(root / "lock_manifest.json", outcome, "INVALID")
+                join_outcomes(
+                    root / "lock_manifest.json",
+                    outcome,
+                    "INVALID",
+                    outcomes_dir(root),
+                )
 
     def test_recomputed_hash_cannot_hide_noncanonical_row_order(self):
         with tempfile.TemporaryDirectory() as td:
@@ -163,7 +189,9 @@ class LeakageTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "canonical|integrity"):
-                join_outcomes(manifest_path, [], MODEL_CARD_SHA)
+                join_outcomes(
+                    manifest_path, [], MODEL_CARD_SHA, outcomes_dir(root)
+                )
 
     def test_recomputed_hash_cannot_hide_invalid_locked_row(self):
         with tempfile.TemporaryDirectory() as td:
@@ -183,7 +211,45 @@ class LeakageTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "integrity"):
-                join_outcomes(manifest_path, [], MODEL_CARD_SHA)
+                join_outcomes(
+                    manifest_path, [], MODEL_CARD_SHA, outcomes_dir(root)
+                )
+
+    def test_output_store_must_be_explicit_and_outside_locked_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            locked = Path(td) / "locked"
+            lock_predictions([prediction()], locked, MODEL_CARD_SHA)
+            outcome = [{"game_pk": 1, "actual_winner": "Home", "status": "Final"}]
+            with self.assertRaises(TypeError):
+                join_outcomes(locked / "lock_manifest.json", outcome, MODEL_CARD_SHA)
+            for output in (locked, locked / "outcomes"):
+                with self.subTest(output=output), self.assertRaisesRegex(
+                    ValueError, "outside|locked"
+                ):
+                    join_outcomes(
+                        locked / "lock_manifest.json",
+                        outcome,
+                        MODEL_CARD_SHA,
+                        output,
+                    )
+
+    def test_oversized_outcome_probability_is_a_value_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            locked = Path(td) / "locked"
+            lock_predictions([prediction()], locked, MODEL_CARD_SHA)
+            outcome = {
+                "game_pk": 1,
+                "actual_winner": "Home",
+                "status": "Final",
+                "home_no_vig_probability": 10**1000,
+            }
+            with self.assertRaises(ValueError):
+                join_outcomes(
+                    locked / "lock_manifest.json",
+                    [outcome],
+                    MODEL_CARD_SHA,
+                    outcomes_dir(locked),
+                )
 
     def test_outcomes_module_has_no_feature_scoring_or_ranking_import(self):
         source_path = Path(__file__).parents[1] / "mlb_backtest" / "outcomes.py"

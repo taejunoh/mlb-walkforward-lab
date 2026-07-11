@@ -123,7 +123,11 @@ def _validate_outcome(source: Mapping[str, object], prediction: Mapping[str, obj
             value = row[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{key} must be a finite probability")
-            if not 0.0 <= float(value) <= 1.0:
+            try:
+                converted = float(value)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a finite probability") from exc
+            if not 0.0 <= converted <= 1.0:
                 raise ValueError(f"{key} must be between 0 and 1")
     _canonical_jsonl([row])
     return row
@@ -149,13 +153,18 @@ def join_outcomes(
     lock_manifest_path: Path,
     outcome_rows: Iterable[Mapping[str, object]],
     expected_model_card_sha256: str,
-    out_dir: Path | None = None,
+    output_dir: Path,
 ) -> Path:
     """Verify a lock, validate supplied outcomes, and write nested evaluated rows."""
     expected_model_hash = _sha256(
         expected_model_card_sha256, "expected_model_card_sha256"
     )
     manifest_path = Path(lock_manifest_path)
+    locked_root = manifest_path.parent.resolve(strict=False)
+    output_root = Path(output_dir)
+    resolved_output = output_root.resolve(strict=False)
+    if resolved_output == locked_root or locked_root in resolved_output.parents:
+        raise ValueError("output directory must be outside the locked directory")
     _, predictions = _load_lock(manifest_path, expected_model_hash)
     by_game = {row["game_pk"]: row for row in predictions}
     try:
@@ -179,7 +188,6 @@ def join_outcomes(
     evaluated.sort(
         key=lambda row: (row["official_date"], row["daily_rank"], row["game_pk"])
     )
-    output_root = manifest_path.parent if out_dir is None else Path(out_dir)
     if output_root.is_symlink():
         raise RuntimeError("evaluated output directory cannot be a symlink")
     output_root.mkdir(parents=True, exist_ok=True)

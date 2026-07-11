@@ -192,12 +192,12 @@ class LockingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "precision"):
                 lock_predictions([row], Path(td), MODEL_CARD_SHA)
 
+    def test_probability_consistency_allows_frozen_one_e_minus_ten_tolerance(self):
         row = prediction()
-        row["p_home"] = 0.6123456789498
-        row["pick_probability"] = 0.6123456789502
+        row["pick_probability"] = row["p_home"] + 5e-11
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaisesRegex(ValueError, "precision"):
-                lock_predictions([row], Path(td), MODEL_CARD_SHA)
+            manifest = lock_predictions([row], Path(td), MODEL_CARD_SHA)
+            self.assertEqual(manifest["row_count"], 1)
 
     def test_requires_unique_games_and_one_top1_per_date(self):
         invalid = (
@@ -209,6 +209,34 @@ class LockingTest(unittest.TestCase):
             with self.subTest(rows=rows), tempfile.TemporaryDirectory() as td:
                 with self.assertRaises(ValueError):
                     lock_predictions(rows, Path(td), MODEL_CARD_SHA)
+
+    def test_recomputes_frozen_rank_order_instead_of_trusting_rank_fields(self):
+        lower_probability_top1 = prediction(1, 1)
+        lower_probability_top1["p_home"] = 0.60
+        lower_probability_top1["pick_probability"] = 0.60
+        higher_probability_rank2 = prediction(2, 2)
+
+        wrong_game_pk_tie_order = [prediction(2, 1), prediction(1, 2)]
+        for rows in (
+            [lower_probability_top1, higher_probability_rank2],
+            wrong_game_pk_tie_order,
+        ):
+            with self.subTest(rows=rows), tempfile.TemporaryDirectory() as td:
+                with self.assertRaisesRegex(ValueError, "rank"):
+                    lock_predictions(rows, Path(td), MODEL_CARD_SHA)
+
+    def test_rejects_probability_bounds_wrong_tier_and_oversized_numbers(self):
+        changes = (
+            {"p_home": 1.0, "pick_probability": 1.0},
+            {"tier": "A"},
+            {"p_home": 10**1000, "pick_probability": 10**1000},
+        )
+        for change in changes:
+            row = prediction()
+            row.update(change)
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(ValueError):
+                    lock_predictions([row], Path(td), MODEL_CARD_SHA)
 
     def test_symlink_and_nonregular_leaf_paths_are_rejected(self):
         for leaf in ("predictions.jsonl", "lock_manifest.json", ".lock"):
