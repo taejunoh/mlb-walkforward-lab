@@ -99,18 +99,40 @@ class RankingTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 rank_daily([bad])
 
-    def test_rejects_market_or_odds_keys_at_any_depth(self):
-        forbidden = [
+    def test_rejects_every_unknown_top_level_key(self):
+        forbidden = (
             {"market": "ML"},
             {"closing_moneyline": -120},
+            {"closing_line": -1.5},
+            {"home_price": -110},
+            {"vig": 0.05},
+            {"favorite": "home"},
+            {"arbitrary": "value"},
             {"metadata": {"sportsbook_odds": -110}},
-            {"metadata": [{"bookmaker": "example"}]},
-        ]
+            {"payload": [{"anything": "nested"}]},
+        )
         for extra in forbidden:
             bad = row(1)
             bad.update(extra)
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 rank_daily([bad])
+
+    def test_output_contains_only_safe_ranking_metadata(self):
+        ranked = rank_daily([row(1)])
+        self.assertEqual(
+            set(ranked[0]),
+            {
+                "game_pk",
+                "official_date",
+                "pick_probability",
+                "confidence",
+                "starter_edge_abs",
+                "scheduled_start_utc",
+                "daily_rank",
+                "top1",
+                "top3",
+            },
+        )
 
     def test_requires_rows_to_be_mappings(self):
         with self.assertRaises(ValueError):

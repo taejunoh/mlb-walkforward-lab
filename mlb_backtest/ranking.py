@@ -1,49 +1,20 @@
 """Deterministic, market-blind daily candidate ranking."""
 
 import math
-import re
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from numbers import Real
 
 
-_REQUIRED_KEYS = frozenset(
-    (
-        "game_pk",
-        "official_date",
-        "pick_probability",
-        "confidence",
-        "starter_edge_abs",
-        "scheduled_start_utc",
-    )
+_RANK_FIELDS = (
+    "game_pk",
+    "official_date",
+    "pick_probability",
+    "confidence",
+    "starter_edge_abs",
+    "scheduled_start_utc",
 )
-_FORBIDDEN_KEY_MARKERS = (
-    "market",
-    "moneyline",
-    "odds",
-    "sportsbook",
-    "bookmaker",
-    "betting",
-    "runline",
-    "spread",
-    "overunder",
-    "impliedprobability",
-    "americanprice",
-    "decimalprice",
-)
-
-
-def _reject_market_keys(value: object) -> None:
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            if isinstance(key, str):
-                canonical = re.sub(r"[^a-z0-9]", "", key.lower())
-                if any(marker in canonical for marker in _FORBIDDEN_KEY_MARKERS):
-                    raise ValueError(f"market-derived ranking key is forbidden: {key}")
-            _reject_market_keys(nested)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            _reject_market_keys(nested)
+_RANK_FIELD_SET = frozenset(_RANK_FIELDS)
 
 
 def _finite_number(value: object, name: str, low: float, high: float) -> float:
@@ -101,10 +72,8 @@ def rank_daily(rows: list[dict]) -> list[dict]:
     for source in items:
         if not isinstance(source, Mapping):
             raise ValueError("ranking rows must be mappings")
-        _reject_market_keys(source)
-        missing = _REQUIRED_KEYS - set(source)
-        if missing:
-            raise ValueError(f"ranking row missing required keys: {sorted(missing)}")
+        if set(source) != _RANK_FIELD_SET:
+            raise ValueError(f"ranking rows must contain exactly {list(_RANK_FIELDS)}")
 
         game_pk = source["game_pk"]
         if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
@@ -122,8 +91,9 @@ def rank_daily(rows: list[dict]) -> list[dict]:
             source["starter_edge_abs"], "starter_edge_abs", 0.0, math.inf
         )
         scheduled_start = _scheduled_start(source["scheduled_start_utc"])
+        safe_row = {field: source[field] for field in _RANK_FIELDS}
         validated.append(
-            (dict(source), probability, confidence, starter_edge, scheduled_start)
+            (safe_row, probability, confidence, starter_edge, scheduled_start)
         )
 
     if len(official_dates) != 1:
