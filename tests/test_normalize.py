@@ -4,6 +4,7 @@ import unittest
 import numpy as np
 
 from mlb_backtest.normalize import (
+    FROZEN_TRAINING_START,
     FROZEN_TRAINING_END,
     _logistic_objective,
     clip,
@@ -17,6 +18,26 @@ from mlb_backtest.normalize import (
 
 
 class NormalizeTest(unittest.TestCase):
+    def test_frozen_training_start_and_metadata(self):
+        self.assertEqual(FROZEN_TRAINING_START, "2022-01-01")
+        rows = [
+            {"official_date": "2022-01-01", "edge": -1, "home_win": 0},
+            {"official_date": "2022-01-02", "edge": 1, "home_win": 1},
+        ]
+        _, _, metadata = fit_frozen_calibration(rows)
+        self.assertEqual(metadata["training_min_date"], "2022-01-01")
+        self.assertEqual(metadata["training_max_date"], "2022-01-02")
+        self.assertEqual(metadata["training_count"], 2)
+
+        earlier_row = dict(rows[0], official_date="2021-12-31")
+        with self.assertRaises(ValueError):
+            fit_frozen_calibration([earlier_row, rows[1]])
+        with self.assertRaises(ValueError):
+            fit_frozen_calibration(
+                rows,
+                training_start="2021-01-01",
+            )
+
     def test_frozen_training_end_cannot_be_overridden_later(self):
         self.assertEqual(FROZEN_TRAINING_END, "2024-12-31")
         rows = [
@@ -52,6 +73,9 @@ class NormalizeTest(unittest.TestCase):
 
     def test_shrink_zero_sample_returns_mean(self):
         self.assertEqual(shrink(999.0, 0, 0.3, 10), 0.3)
+
+    def test_shrink_reliability_avoids_overflow(self):
+        self.assertEqual(shrink(1.0, 1e308, 0.0, 1e308), 0.5)
 
     def test_metric_score_direction_and_clipping(self):
         self.assertEqual(metric_score(1.0, 0.0, 1.0, 1), 70.0)
@@ -95,6 +119,26 @@ class NormalizeTest(unittest.TestCase):
         self.assertAlmostEqual(first[0], 0.0, places=9)
         self.assertGreater(first[1], 0.0)
         self.assertTrue(all(math.isfinite(value) for value in first))
+
+    def test_logistic_fit_is_stable_under_large_x_scaling(self):
+        x_values = [-2.0, -1.0, 1.0, 2.0]
+        y_values = [0, 1, 0, 1]
+        alpha, beta = fit_logistic(x_values, y_values)
+        scaled_x = [value * 1e20 for value in x_values]
+        scaled_alpha, scaled_beta = fit_logistic(scaled_x, y_values)
+
+        probabilities = [sigmoid(alpha + beta * value) for value in x_values]
+        scaled_probabilities = [
+            sigmoid(scaled_alpha + scaled_beta * value) for value in scaled_x
+        ]
+        self.assertTrue(any(abs(value - 0.5) > 0.05 for value in probabilities))
+        for expected, actual in zip(probabilities, scaled_probabilities):
+            self.assertAlmostEqual(actual, expected, places=5)
+        objective = _logistic_objective(x_values, y_values, alpha, beta, 1e-6)
+        scaled_objective = _logistic_objective(
+            scaled_x, y_values, scaled_alpha, scaled_beta, 1e-6
+        )
+        self.assertAlmostEqual(scaled_objective, objective, places=5)
 
     def test_logistic_does_not_penalize_intercept(self):
         alpha, beta = fit_logistic([0.0, 0.0, 0.0, 0.0], [0, 1, 1, 1], l2=100.0)
@@ -150,7 +194,12 @@ class NormalizeTest(unittest.TestCase):
         self.assertGreater(beta, 0.0)
         self.assertEqual(
             metadata,
-            {"training_max_date": "2024-12-31", "training_count": 2, "l2": 1e-6},
+            {
+                "training_min_date": "2024-12-30",
+                "training_max_date": "2024-12-31",
+                "training_count": 2,
+                "l2": 1e-6,
+            },
         )
 
         with self.assertRaisesRegex(

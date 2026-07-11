@@ -5,6 +5,7 @@ from numbers import Integral, Real
 from typing import Iterable, Sequence
 
 
+FROZEN_TRAINING_START = "2022-01-01"
 FROZEN_TRAINING_END = "2024-12-31"
 
 
@@ -37,7 +38,11 @@ def shrink(observed: float, n: float, mean: float, k: float) -> float:
         raise ValueError("k must be positive")
     if n == 0:
         return mean
-    reliability = n / (n + k)
+    if n >= k:
+        reliability = 1.0 / (1.0 + k / n)
+    else:
+        ratio = n / k
+        reliability = ratio / (1.0 + ratio)
     return reliability * observed + (1.0 - reliability) * mean
 
 
@@ -114,58 +119,75 @@ def fit_logistic(
     if len(set(y_data)) != 2:
         raise ValueError("both outcome classes must be present")
 
+    x_scale = max(1.0, max(abs(value) for value in x_data))
+    inverse_scale = 1.0 / x_scale
+    normalized_x = [value * inverse_scale for value in x_data]
+    max_normalized_x = max(abs(value) for value in normalized_x)
+    scaled_l2 = l2 * inverse_scale * inverse_scale
+
     alpha = math.log(sum(y_data) / (len(y_data) - sum(y_data)))
-    beta = 0.0
-    objective = _logistic_objective(x_data, y_data, alpha, beta, l2)
+    gamma = 0.0
+    objective = _logistic_objective(
+        normalized_x, y_data, alpha, gamma, scaled_l2
+    )
 
     for _ in range(iterations):
         gradient_alpha = 0.0
-        gradient_beta = 2.0 * l2 * beta
+        gradient_gamma = 2.0 * scaled_l2 * gamma
         hessian_aa = 0.0
-        hessian_ab = 0.0
-        hessian_bb = 2.0 * l2
-        for x_value, y_value in zip(x_data, y_data):
-            fitted = sigmoid(alpha + beta * x_value)
+        hessian_ag = 0.0
+        hessian_gg = 2.0 * scaled_l2
+        for x_value, y_value in zip(normalized_x, y_data):
+            fitted = sigmoid(alpha + gamma * x_value)
             residual = fitted - y_value
             weight = fitted * (1.0 - fitted)
             gradient_alpha += residual
-            gradient_beta += residual * x_value
+            gradient_gamma += residual * x_value
             hessian_aa += weight
-            hessian_ab += weight * x_value
-            hessian_bb += weight * x_value * x_value
+            hessian_ag += weight * x_value
+            hessian_gg += weight * x_value * x_value
 
-        determinant = hessian_aa * hessian_bb - hessian_ab * hessian_ab
+        determinant = hessian_aa * hessian_gg - hessian_ag * hessian_ag
         if determinant <= 0 or not math.isfinite(determinant):
             break
         step_alpha = (
-            hessian_bb * gradient_alpha - hessian_ab * gradient_beta
+            hessian_gg * gradient_alpha - hessian_ag * gradient_gamma
         ) / determinant
-        step_beta = (
-            hessian_aa * gradient_beta - hessian_ab * gradient_alpha
+        step_gamma = (
+            hessian_aa * gradient_gamma - hessian_ag * gradient_alpha
         ) / determinant
-        if max(abs(step_alpha), abs(step_beta)) <= tolerance:
+        step_size = max(
+            abs(step_alpha),
+            abs(step_gamma) * max_normalized_x,
+        )
+        if step_size <= tolerance:
             break
 
-        scale = 1.0
+        step_scale = 1.0
         accepted = False
-        while scale >= 2.0**-30:
-            candidate_alpha = alpha - scale * step_alpha
-            candidate_beta = beta - scale * step_beta
+        while step_scale >= 2.0**-30:
+            candidate_alpha = alpha - step_scale * step_alpha
+            candidate_gamma = gamma - step_scale * step_gamma
             candidate_objective = _logistic_objective(
-                x_data, y_data, candidate_alpha, candidate_beta, l2
+                normalized_x,
+                y_data,
+                candidate_alpha,
+                candidate_gamma,
+                scaled_l2,
             )
             if candidate_objective <= objective:
                 alpha = candidate_alpha
-                beta = candidate_beta
+                gamma = candidate_gamma
                 objective = candidate_objective
                 accepted = True
                 break
-            scale *= 0.5
+            step_scale *= 0.5
         if not accepted:
             break
-        if scale * max(abs(step_alpha), abs(step_beta)) <= tolerance:
+        if step_scale * step_size <= tolerance:
             break
 
+    beta = gamma * inverse_scale
     if not math.isfinite(alpha) or not math.isfinite(beta):
         raise ValueError("logistic calibration did not produce finite coefficients")
     return alpha, beta
@@ -174,6 +196,7 @@ def fit_logistic(
 def fit_frozen_calibration(
     rows: Iterable[Mapping[str, object]],
     training_end: str = FROZEN_TRAINING_END,
+    training_start: str = FROZEN_TRAINING_START,
 ) -> tuple[float, float, dict[str, object]]:
     try:
         boundary = date.fromisoformat(training_end)
@@ -181,6 +204,14 @@ def fit_frozen_calibration(
         raise ValueError("training_end must be an ISO date") from exc
     if boundary > date.fromisoformat(FROZEN_TRAINING_END):
         raise ValueError("training_end exceeds frozen boundary")
+    try:
+        start_boundary = date.fromisoformat(training_start)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("training_start must be an ISO date") from exc
+    if start_boundary < date.fromisoformat(FROZEN_TRAINING_START):
+        raise ValueError("training_start precedes frozen boundary")
+    if start_boundary > boundary:
+        raise ValueError("training_start must not exceed training_end")
     try:
         row_items = list(rows)
     except TypeError as exc:
@@ -201,6 +232,8 @@ def fit_frozen_calibration(
             raise ValueError("calibration row is malformed") from exc
         if official_date > boundary:
             raise ValueError("calibration data crosses frozen boundary")
+        if official_date < start_boundary:
+            raise ValueError("calibration data crosses frozen boundary")
         if "game_pk" in row:
             game_pk = row["game_pk"]
             if (
@@ -218,6 +251,7 @@ def fit_frozen_calibration(
 
     alpha, beta = fit_logistic(edges, outcomes)
     return alpha, beta, {
+        "training_min_date": min(dates).isoformat(),
         "training_max_date": max(dates).isoformat(),
         "training_count": len(row_items),
         "l2": 1e-6,
