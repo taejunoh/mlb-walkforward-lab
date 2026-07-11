@@ -53,16 +53,20 @@ def _validate_lineup(lineup: Sequence[Mapping[str, object]]) -> None:
         if not isinstance(player, Mapping):
             raise ValueError(message)
         player_id = player.get("player_id")
-        slot = player.get("batting_slot")
         if (
             isinstance(player_id, bool)
             or not isinstance(player_id, int)
             or player_id in player_ids
-            or isinstance(slot, bool)
-            or not isinstance(slot, int)
-            or slot != expected_slot
         ):
             raise ValueError(message)
+        if "batting_slot" in player:
+            slot = player["batting_slot"]
+            if (
+                isinstance(slot, bool)
+                or not isinstance(slot, int)
+                or slot != expected_slot
+            ):
+                raise ValueError(message)
         player_ids.add(player_id)
 
 
@@ -94,25 +98,29 @@ def select_prior_hitter_events(
     if isinstance(days, bool) or not isinstance(days, int) or days != 14:
         raise ValueError("hitter event window must be exactly 14 days")
     first_date = target - timedelta(days=days)
-    dated: list[tuple[date, str, Mapping[str, object]]] = []
+    dated: list[
+        tuple[date, tuple[int, int | str], Mapping[str, object]]
+    ] = []
     seen_ids: set[object] = set()
-    for position, event in enumerate(events):
+    for event in events:
         if not isinstance(event, Mapping):
             raise ValueError("each event must be a mapping")
         game_date = _date(event.get("game_date"), "game_date")
         event_id = event.get("event_id")
-        if event_id is not None:
-            try:
-                duplicate = event_id in seen_ids
-                seen_ids.add(event_id)
-            except TypeError as exc:
-                raise ValueError("event_id must be hashable") from exc
-            if duplicate:
-                raise ValueError("duplicate event_id")
+        if isinstance(event_id, bool):
+            raise ValueError("event_id must be an integer or nonempty string")
+        if isinstance(event_id, int):
+            event_key: tuple[int, int | str] = (0, event_id)
+        elif isinstance(event_id, str) and event_id:
+            event_key = (1, event_id)
+        else:
+            raise ValueError("event_id must be an integer or nonempty string")
+        if event_id in seen_ids:
+            raise ValueError("duplicate event_id")
+        seen_ids.add(event_id)
         if first_date <= game_date < target:
-            tie_key = repr(event_id) if event_id is not None else f"{position:020d}"
-            dated.append((game_date, tie_key, event))
-    dated.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            dated.append((game_date, event_key, event))
+    dated.sort(key=lambda item: (-item[0].toordinal(), item[1]))
     return [item[2] for item in dated]
 
 
@@ -180,9 +188,8 @@ def weighted_lineup_metric(
 
     weighted_score = 0.0
     weighted_quality = 0.0
-    for player in lineup:
+    for slot, player in enumerate(lineup, start=1):
         player_id = player["player_id"]
-        slot = player["batting_slot"]
         metric = player_metric_map.get(player_id)
         if metric is None:
             score = neutral_score

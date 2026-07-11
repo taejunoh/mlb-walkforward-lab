@@ -1,6 +1,7 @@
 import math
 import unittest
 from datetime import date
+from pathlib import Path
 
 from mlb_backtest.features.offense import (
     WEIGHTS,
@@ -9,6 +10,10 @@ from mlb_backtest.features.offense import (
     select_prior_hitter_events,
     weighted_lineup_metric,
 )
+from mlb_backtest.sources import parse_schedule
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "schedule_2025_05_01.json"
 
 
 def lineup():
@@ -54,6 +59,12 @@ class OffenseFeaturesTest(unittest.TestCase):
             ):
                 offense_score(rows, valid_scores)
 
+    def test_official_source_lineup_uses_sequence_position_as_batting_slot(self):
+        official_lineup = parse_schedule(FIXTURE)[0]["away_lineup"]
+        self.assertTrue(all("batting_slot" not in player for player in official_lineup))
+        metrics = {name: 50 for name in WEIGHTS}
+        self.assertEqual(offense_score(official_lineup, metrics), 50.0)
+
     def test_offense_score_validates_exact_finite_range_metrics(self):
         valid = {name: 50 for name in WEIGHTS}
         invalid_metrics = (
@@ -91,9 +102,36 @@ class OffenseFeaturesTest(unittest.TestCase):
                 ],
                 "2025-05-01",
             )
+        invalid_ids = (
+            {"game_date": "2025-04-30"},
+            {"event_id": "", "game_date": "2025-04-30"},
+            {"event_id": True, "game_date": "2025-04-30"},
+            {"event_id": 1.5, "game_date": "2025-04-30"},
+        )
+        for event in invalid_ids:
+            with self.subTest(event=event), self.assertRaises(ValueError):
+                select_prior_hitter_events([event], "2025-05-01")
         for days in (0, 1, 15, True, 1.5):
             with self.subTest(days=days), self.assertRaises(ValueError):
                 select_prior_hitter_events([], "2025-05-01", days)
+
+    def test_recent_events_sort_canonical_ids_independent_of_input_order(self):
+        events = [
+            {"event_id": "2", "game_date": "2025-04-30"},
+            {"event_id": 2, "game_date": "2025-04-30"},
+            {"event_id": "10", "game_date": "2025-04-30"},
+            {"event_id": 1, "game_date": "2025-04-30"},
+            {"event_id": 9, "game_date": "2025-04-29"},
+        ]
+        selected = select_prior_hitter_events(events, "2025-05-01")
+        reversed_selected = select_prior_hitter_events(
+            list(reversed(events)), "2025-05-01"
+        )
+        self.assertEqual(selected, reversed_selected)
+        self.assertEqual(
+            [event["event_id"] for event in selected],
+            [1, 2, "10", "2", 9],
+        )
 
     def test_derive_slot_weights_uses_only_frozen_regular_seasons(self):
         rows = [
