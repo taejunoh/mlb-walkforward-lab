@@ -248,12 +248,7 @@ class RawStore:
         if resolved_folder.parent != resolved_root:
             raise ValueError("source folder must be directly under raw root")
 
-        query_digest = hashlib.sha256(_query_bytes(normalized_query)).hexdigest()
-        manifest_stem = f"{digest}.{query_digest}.manifest"
         data_path = folder / f"{digest}.raw"
-        manifest_path = folder / f"{manifest_stem}.json"
-        pending_path = folder / f"{manifest_stem}.pending"
-        seal_path = folder / f"{manifest_stem}.sha256"
 
         existing_data = _safe_leaf_bytes(
             data_path, resolved_folder, "raw", missing_ok=True
@@ -261,56 +256,44 @@ class RawStore:
         if existing_data is not None and existing_data != payload:
             raise RuntimeError("immutable raw artifact hash collision")
 
-        manifest_content = _safe_leaf_bytes(
-            manifest_path, resolved_folder, "manifest", missing_ok=True
-        )
-        seal_content = _safe_leaf_bytes(
-            seal_path, resolved_folder, "seal", missing_ok=True
-        )
-        pending_content = _safe_leaf_bytes(
-            pending_path, resolved_folder, "pending manifest", missing_ok=True
-        )
-        expected = {
+        expected_common = {
             "source": source,
-            "query": normalized_query,
             "sha256": digest,
             "row_count": row_count,
             "schema_version": _SCHEMA_VERSION,
         }
+        primary_stem = f"{digest}.manifest"
+        primary_path = folder / f"{primary_stem}.json"
+        primary_pending_path = folder / f"{primary_stem}.pending"
+        primary_seal_path = folder / f"{primary_stem}.sha256"
+        primary_manifest = self._load_manifest_transaction(
+            primary_path,
+            primary_pending_path,
+            primary_seal_path,
+            resolved_folder,
+            expected_common,
+        )
 
-        existing_manifest = None
-        if manifest_content is not None:
-            if seal_content is None:
-                raise RuntimeError("immutable raw manifest integrity seal is missing")
-            if seal_content != _seal_bytes(manifest_content):
-                raise RuntimeError("immutable raw manifest integrity mismatch")
-            if pending_content is not None:
-                if pending_content != manifest_content:
-                    raise RuntimeError("immutable raw manifest pending bytes mismatch")
-                _safe_unlink_leaf(
-                    pending_path, resolved_folder, "pending manifest"
-                )
-            existing_manifest = self._read_manifest(manifest_content)
-        elif seal_content is not None:
-            if pending_content is None:
-                raise RuntimeError("immutable raw manifest integrity seal is orphaned")
-            if seal_content != _seal_bytes(pending_content):
-                raise RuntimeError("immutable raw manifest integrity mismatch")
-            existing_manifest = self._read_manifest(pending_content)
-            if any(
-                existing_manifest.get(key) != value
-                for key, value in expected.items()
-            ):
-                raise RuntimeError("immutable raw manifest metadata mismatch")
-            _publish_manifest(manifest_path, pending_content, resolved_folder)
-            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
-        elif pending_content is not None:
-            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
-
-        if existing_manifest is not None and any(
-            existing_manifest.get(key) != value for key, value in expected.items()
-        ):
-            raise RuntimeError("immutable raw manifest metadata mismatch")
+        if primary_manifest is None or primary_manifest["query"] == normalized_query:
+            manifest_path = primary_path
+            pending_path = primary_pending_path
+            seal_path = primary_seal_path
+            existing_manifest = primary_manifest
+        else:
+            query_digest = hashlib.sha256(
+                _query_bytes(normalized_query)
+            ).hexdigest()
+            manifest_stem = f"{digest}.{query_digest}.manifest"
+            manifest_path = folder / f"{manifest_stem}.json"
+            pending_path = folder / f"{manifest_stem}.pending"
+            seal_path = folder / f"{manifest_stem}.sha256"
+            existing_manifest = self._load_manifest_transaction(
+                manifest_path,
+                pending_path,
+                seal_path,
+                resolved_folder,
+                {**expected_common, "query": normalized_query},
+            )
 
         _atomic_write_once(data_path, payload, resolved_folder, "raw")
         if existing_manifest is None:
@@ -348,6 +331,58 @@ class RawStore:
             manifest["retrieved_at_utc"],
             manifest["row_count"],
         )
+
+    def _load_manifest_transaction(
+        self,
+        manifest_path: Path,
+        pending_path: Path,
+        seal_path: Path,
+        resolved_folder: Path,
+        expected: dict,
+    ) -> dict | None:
+        manifest_content = _safe_leaf_bytes(
+            manifest_path, resolved_folder, "manifest", missing_ok=True
+        )
+        seal_content = _safe_leaf_bytes(
+            seal_path, resolved_folder, "seal", missing_ok=True
+        )
+        pending_content = _safe_leaf_bytes(
+            pending_path, resolved_folder, "pending manifest", missing_ok=True
+        )
+
+        manifest = None
+        if manifest_content is not None:
+            if seal_content is None:
+                raise RuntimeError("immutable raw manifest integrity seal is missing")
+            if seal_content != _seal_bytes(manifest_content):
+                raise RuntimeError("immutable raw manifest integrity mismatch")
+            if pending_content is not None:
+                if pending_content != manifest_content:
+                    raise RuntimeError("immutable raw manifest pending bytes mismatch")
+                _safe_unlink_leaf(
+                    pending_path, resolved_folder, "pending manifest"
+                )
+            manifest = self._read_manifest(manifest_content)
+        elif seal_content is not None:
+            if pending_content is None:
+                raise RuntimeError("immutable raw manifest integrity seal is orphaned")
+            if seal_content != _seal_bytes(pending_content):
+                raise RuntimeError("immutable raw manifest integrity mismatch")
+            manifest = self._read_manifest(pending_content)
+            if any(
+                manifest.get(key) != value for key, value in expected.items()
+            ):
+                raise RuntimeError("immutable raw manifest metadata mismatch")
+            _publish_manifest(manifest_path, pending_content, resolved_folder)
+            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
+        elif pending_content is not None:
+            _safe_unlink_leaf(pending_path, resolved_folder, "pending manifest")
+
+        if manifest is not None and any(
+            manifest.get(key) != value for key, value in expected.items()
+        ):
+            raise RuntimeError("immutable raw manifest metadata mismatch")
+        return manifest
 
     def _prepare_root(self) -> Path:
         root = self.root

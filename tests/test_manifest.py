@@ -115,10 +115,9 @@ class ManifestTest(unittest.TestCase):
                 artifact.sha256, hashlib.sha256(payload).hexdigest()
             )
             self.assertEqual(artifact.data_path, folder / f"{artifact.sha256}.raw")
-            query_digest = hashlib.sha256(b"{}").hexdigest()
             self.assertEqual(
                 artifact.manifest_path,
-                folder / f"{artifact.sha256}.{query_digest}.manifest.json",
+                folder / f"{artifact.sha256}.manifest.json",
             )
             self.assertTrue(artifact.manifest_path.with_suffix(".sha256").is_file())
 
@@ -278,13 +277,25 @@ class ManifestTest(unittest.TestCase):
             store = RawStore(Path(td))
             payload = b"same payload"
             first = store.put("source", {"date": "2025-05-01"}, payload)
-            second = store.put("source", {"date": "2025-05-02"}, payload)
             first_again = store.put("source", {"date": "2025-05-01"}, payload)
+            second = store.put("source", {"date": "2025-05-02"}, payload)
+            second_again = store.put("source", {"date": "2025-05-02"}, payload)
 
             self.assertEqual(first.data_path, second.data_path)
-            self.assertNotEqual(first.manifest_path, second.manifest_path)
+            folder = Path(td) / "source"
+            self.assertEqual(
+                first.manifest_path,
+                folder / f"{first.sha256}.manifest.json",
+            )
             self.assertEqual(first.manifest_path, first_again.manifest_path)
             self.assertEqual(first.retrieved_at_utc, first_again.retrieved_at_utc)
+            query_digest = hashlib.sha256(b'{"date":"2025-05-02"}').hexdigest()
+            self.assertEqual(
+                second.manifest_path,
+                folder / f"{second.sha256}.{query_digest}.manifest.json",
+            )
+            self.assertEqual(second.manifest_path, second_again.manifest_path)
+            self.assertEqual(second.retrieved_at_utc, second_again.retrieved_at_utc)
             first_manifest = json.loads(first.manifest_path.read_text("utf-8"))
             second_manifest = json.loads(second.manifest_path.read_text("utf-8"))
             self.assertEqual(first_manifest["sha256"], first.sha256)
@@ -310,6 +321,11 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(len(seals), 1)
 
             recovered = store.put("source", {"date": "2025-05-01"}, b"row")
+            digest = hashlib.sha256(b"row").hexdigest()
+            self.assertEqual(
+                recovered.manifest_path,
+                folder / f"{digest}.manifest.json",
+            )
             original = recovered.manifest_path.read_bytes()
             repeated = store.put("source", {"date": "2025-05-01"}, b"row")
             self.assertEqual(recovered.manifest_path, repeated.manifest_path)
@@ -324,17 +340,51 @@ class ManifestTest(unittest.TestCase):
             query = {"date": "2025-05-01"}
             payload = b"row"
             digest = hashlib.sha256(payload).hexdigest()
-            query_bytes = b'{"date":"2025-05-01"}'
-            query_digest = hashlib.sha256(query_bytes).hexdigest()
             folder = root / "source"
             folder.mkdir()
-            pending = folder / f"{digest}.{query_digest}.manifest.pending"
+            pending = folder / f"{digest}.manifest.pending"
             pending.write_bytes(b"incomplete")
 
             artifact = store.put("source", query, payload)
 
             self.assertTrue(artifact.manifest_path.is_file())
             self.assertFalse(pending.exists())
+
+    def test_other_query_recovers_primary_pending_before_using_composite(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            first_query = {"date": "2025-05-01"}
+            second_query = {"date": "2025-05-02"}
+            with mock.patch(
+                "mlb_backtest.manifest._publish_manifest",
+                side_effect=OSError("injected publish failure"),
+            ):
+                with self.assertRaises(OSError):
+                    store.put("source", first_query, b"row")
+
+            folder = Path(td) / "source"
+            pending = next(folder.glob("*.manifest.pending"))
+            primary_manifest = json.loads(pending.read_text("utf-8"))
+            primary_timestamp = primary_manifest["retrieved_at_utc"]
+
+            second = store.put("source", second_query, b"row")
+
+            digest = hashlib.sha256(b"row").hexdigest()
+            query_digest = hashlib.sha256(
+                b'{"date":"2025-05-02"}'
+            ).hexdigest()
+            primary_path = folder / f"{digest}.manifest.json"
+            self.assertTrue(primary_path.is_file())
+            self.assertEqual(
+                json.loads(primary_path.read_text("utf-8"))["query"], first_query
+            )
+            self.assertEqual(
+                second.manifest_path,
+                folder / f"{digest}.{query_digest}.manifest.json",
+            )
+            first = store.put("source", first_query, b"row")
+            self.assertEqual(first.manifest_path, primary_path)
+            self.assertEqual(first.retrieved_at_utc, primary_timestamp)
 
     def test_sealed_pending_metadata_is_validated_before_recovery_publish(self):
         with tempfile.TemporaryDirectory() as td:
@@ -350,7 +400,7 @@ class ManifestTest(unittest.TestCase):
             pending = next(folder.glob("*.manifest.pending"))
             seal = next(folder.glob("*.manifest.sha256"))
             manifest = json.loads(pending.read_text("utf-8"))
-            manifest["query"] = {"date": "2025-05-02"}
+            manifest["source"] = "other"
             content = _canonical_manifest_bytes(manifest)
             pending.write_bytes(content)
             seal.write_bytes(
