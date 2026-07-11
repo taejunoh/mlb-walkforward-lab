@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,7 +38,47 @@ def prediction(game_pk=1, rank=1, *, official_date="2025-05-01"):
     }
 
 
+def _concurrent_lock(root, start_event, ready_queue, result_queue):
+    ready_queue.put(True)
+    if not start_event.wait(timeout=10):
+        result_queue.put(("error", "start timeout"))
+        return
+    try:
+        manifest = lock_predictions([prediction()], Path(root), MODEL_CARD_SHA)
+        result_queue.put(
+            ("ok", manifest["sha256"], manifest["created_at_utc"])
+        )
+    except Exception as exc:
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
 class LockingTest(unittest.TestCase):
+    def test_concurrent_identical_writers_share_one_stable_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            context = multiprocessing.get_context("spawn")
+            start_event = context.Event()
+            ready_queue = context.Queue()
+            result_queue = context.Queue()
+            processes = [
+                context.Process(
+                    target=_concurrent_lock,
+                    args=(td, start_event, ready_queue, result_queue),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            for _ in processes:
+                self.assertTrue(ready_queue.get(timeout=10))
+            start_event.set()
+            results = [result_queue.get(timeout=10) for _ in processes]
+            for process in processes:
+                process.join(timeout=10)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+            self.assertEqual(results[0][0], "ok", results)
+            self.assertEqual(results[0], results[1])
+
     def test_required_schema_is_explicit_and_lock_writes_integrity_manifest(self):
         self.assertEqual(set(prediction()), set(LOCK_REQUIRED_FIELDS))
         with tempfile.TemporaryDirectory() as td:

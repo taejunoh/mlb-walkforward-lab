@@ -10,7 +10,12 @@ import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-from .locking import _canonical_jsonl, _parse_manifest
+from .locking import (
+    _canonical_jsonl,
+    _parse_manifest,
+    _sha256,
+    validate_lock_rows,
+)
 
 
 _REQUIRED = frozenset(("game_pk", "actual_winner", "status"))
@@ -50,10 +55,14 @@ def _read_regular(path: Path, label: str) -> bytes:
             os.close(descriptor)
 
 
-def _load_lock(manifest_path: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+def _load_lock(
+    manifest_path: Path, expected_model_card_sha256: str
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     try:
         manifest_bytes = _read_regular(manifest_path, "lock manifest")
         manifest = _parse_manifest(manifest_bytes)
+        if manifest["model_card_sha256"] != expected_model_card_sha256:
+            raise RuntimeError("lock manifest model card integrity failure")
         predictions_path = manifest_path.parent / "predictions.jsonl"
         predictions_bytes = _read_regular(predictions_path, "lock predictions")
         if hashlib.sha256(predictions_bytes).hexdigest() != manifest["sha256"]:
@@ -61,7 +70,8 @@ def _load_lock(manifest_path: Path) -> tuple[dict[str, object], list[dict[str, o
         lines = predictions_bytes.splitlines()
         if len(lines) != manifest["row_count"]:
             raise RuntimeError("lock manifest row_count integrity failure")
-        predictions = [json.loads(line.decode("utf-8")) for line in lines]
+        parsed_predictions = [json.loads(line.decode("utf-8")) for line in lines]
+        predictions = validate_lock_rows(parsed_predictions)
         if _canonical_jsonl(predictions) != predictions_bytes:
             raise RuntimeError("lock manifest canonical predictions integrity failure")
         if any(
@@ -138,11 +148,15 @@ def _atomic_write(path: Path, content: bytes) -> None:
 def join_outcomes(
     lock_manifest_path: Path,
     outcome_rows: Iterable[Mapping[str, object]],
+    expected_model_card_sha256: str,
     out_dir: Path | None = None,
 ) -> Path:
     """Verify a lock, validate supplied outcomes, and write nested evaluated rows."""
+    expected_model_hash = _sha256(
+        expected_model_card_sha256, "expected_model_card_sha256"
+    )
     manifest_path = Path(lock_manifest_path)
-    _, predictions = _load_lock(manifest_path)
+    _, predictions = _load_lock(manifest_path, expected_model_hash)
     by_game = {row["game_pk"]: row for row in predictions}
     try:
         outcomes = list(outcome_rows)

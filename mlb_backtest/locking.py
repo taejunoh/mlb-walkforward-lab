@@ -253,7 +253,10 @@ def _validate_prediction(source: Mapping[str, object]) -> dict[str, object]:
     return row
 
 
-def _validate_rows(rows: Iterable[Mapping[str, object]]) -> list[dict[str, object]]:
+def validate_lock_rows(
+    rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Validate lock schema/invariants and return canonical row order."""
     if rows is None:
         raise ValueError("rows must be iterable mappings")
     try:
@@ -383,7 +386,7 @@ def lock_predictions(
 ) -> dict[str, object]:
     """Validate and immutably publish canonical prediction rows and a manifest."""
     model_hash = _sha256(model_card_sha256, "model_card_sha256")
-    ordered = _validate_rows(rows)
+    ordered = validate_lock_rows(rows)
     payload = _canonical_jsonl(ordered)
     digest = hashlib.sha256(payload).hexdigest()
     root = Path(out_dir)
@@ -437,4 +440,9 @@ def lock_predictions(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-__all__ = ["LOCK_OPTIONAL_FIELDS", "LOCK_REQUIRED_FIELDS", "lock_predictions"]
+__all__ = [
+    "LOCK_OPTIONAL_FIELDS",
+    "LOCK_REQUIRED_FIELDS",
+    "lock_predictions",
+    "validate_lock_rows",
+]
