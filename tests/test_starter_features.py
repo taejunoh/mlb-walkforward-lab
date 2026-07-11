@@ -46,12 +46,11 @@ class StarterFeaturesTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 starter_score(invalid)
 
-    def test_prior_starts_exclude_target_day_dedupe_and_order_ties(self):
+    def test_prior_starts_exclude_target_day_and_order_ties(self):
         events = [
             {"game_pk": 1, "game_date": "2025-04-27", "is_starter": True},
             {"game_pk": 2, "game_date": "2025-04-30", "is_starter": True},
             {"game_pk": 3, "game_date": "2025-04-30", "is_starter": True},
-            {"game_pk": 3, "game_date": "2025-04-29", "is_starter": True},
             {"game_pk": 4, "game_date": "2025-05-01", "is_starter": True},
             {"game_pk": 5, "game_date": "2025-04-28", "is_starter": False},
             {"game_pk": 6, "game_date": "2025-04-26", "is_starter": True},
@@ -60,6 +59,25 @@ class StarterFeaturesTest(unittest.TestCase):
         ]
         selected = select_prior_starts(events, date(2025, 5, 1), limit=10)
         self.assertEqual([row["game_pk"] for row in selected], [3, 2, 1, 6, 7])
+        reversed_selected = select_prior_starts(
+            list(reversed(events)), date(2025, 5, 1), limit=10
+        )
+        self.assertEqual(reversed_selected, selected)
+
+    def test_prior_starts_reject_duplicate_game_pk_before_sorting(self):
+        events = [
+            {"game_pk": 3, "game_date": "2025-04-30", "is_starter": True},
+            {"game_pk": 3, "game_date": "2025-04-29", "is_starter": True},
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate game_pk"):
+            select_prior_starts(events, "2025-05-01")
+
+        same_date = [
+            {"game_pk": 9, "game_date": "2025-04-30", "is_starter": True},
+            {"game_pk": 9, "game_date": "2025-04-30", "is_starter": True},
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate game_pk"):
+            select_prior_starts(list(reversed(same_date)), "2025-05-01")
 
     def test_prior_starts_validate_dates_and_limit(self):
         with self.assertRaises(ValueError):

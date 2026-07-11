@@ -91,8 +91,8 @@ def select_prior_hitter_events(
     """Return hitter events in ``[target-days, target-1]``, newest first."""
 
     target = _date(target_date, "target_date")
-    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
-        raise ValueError("days must be a positive integer")
+    if isinstance(days, bool) or not isinstance(days, int) or days != 14:
+        raise ValueError("hitter event window must be exactly 14 days")
     first_date = target - timedelta(days=days)
     dated: list[tuple[date, str, Mapping[str, object]]] = []
     seen_ids: set[object] = set()
@@ -160,13 +160,20 @@ def weighted_lineup_metric(
 
     _validate_lineup(lineup)
     neutral_score = _bounded(neutral, "neutral", 0.0, 100.0)
-    if not isinstance(slot_weights, Mapping) or set(slot_weights) != set(range(1, 10)):
+    if (
+        not isinstance(slot_weights, Mapping)
+        or len(slot_weights) != 9
+        or any(isinstance(slot, bool) or not isinstance(slot, int) for slot in slot_weights)
+        or set(slot_weights) != set(range(1, 10))
+    ):
         raise ValueError("slot weights must have exactly slots 1 through 9")
     weights = {
         slot: _bounded(slot_weights[slot], f"slot weight {slot}", 0.0, 1.0)
         for slot in range(1, 10)
     }
-    if not math.isclose(sum(weights.values()), 1.0, abs_tol=1e-12):
+    if not math.isclose(
+        sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
         raise ValueError("slot weights must sum to 1")
     if not isinstance(player_metric_map, Mapping):
         raise ValueError("player_metric_map must be a mapping")

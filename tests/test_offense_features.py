@@ -91,7 +91,7 @@ class OffenseFeaturesTest(unittest.TestCase):
                 ],
                 "2025-05-01",
             )
-        for days in (0, True, 1.5):
+        for days in (0, 1, 15, True, 1.5):
             with self.subTest(days=days), self.assertRaises(ValueError):
                 select_prior_hitter_events([], "2025-05-01", days)
 
@@ -136,10 +136,17 @@ class OffenseFeaturesTest(unittest.TestCase):
 
     def test_weighted_lineup_metric_rejects_bad_scores_weights_and_neutral(self):
         weights = {slot: 1 / 9 for slot in range(1, 10)}
+        bool_key_weights = {slot: 1 / 9 for slot in range(2, 10)}
+        bool_key_weights[True] = 1 / 9
+        string_key_weights = {slot: 1 / 9 for slot in range(2, 10)}
+        string_key_weights["1"] = 1 / 9
         invalid_calls = (
             ({101: {"score": True, "quality": 1}}, weights, 50),
             ({101: {"score": 50, "quality": math.nan}}, weights, 50),
             ({}, {**weights, 9: 0.5}, 50),
+            ({}, {**weights, 9: weights[9] + 5e-10}, 50),
+            ({}, bool_key_weights, 50),
+            ({}, string_key_weights, 50),
             ({}, weights, False),
         )
         for metrics, slot_weights, neutral in invalid_calls:

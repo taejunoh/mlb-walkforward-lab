@@ -79,6 +79,7 @@ def select_prior_starts(
         raise ValueError("limit must be a positive integer")
 
     eligible: list[tuple[date, int, Mapping[str, object]]] = []
+    seen_game_pks: set[int] = set()
     for event in events:
         if not isinstance(event, Mapping):
             raise ValueError("each event must be a mapping")
@@ -86,6 +87,9 @@ def select_prior_starts(
         game_pk = event.get("game_pk")
         if isinstance(game_pk, bool) or not isinstance(game_pk, int):
             raise ValueError("game_pk must be an integer")
+        if game_pk in seen_game_pks:
+            raise ValueError("duplicate game_pk")
+        seen_game_pks.add(game_pk)
         is_starter = event.get("is_starter")
         if not isinstance(is_starter, bool):
             raise ValueError("is_starter must be boolean")
@@ -94,11 +98,7 @@ def select_prior_starts(
 
     eligible.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selected: list[Mapping[str, object]] = []
-    seen: set[int] = set()
-    for _, game_pk, event in eligible:
-        if game_pk in seen:
-            continue
-        seen.add(game_pk)
+    for _, _, event in eligible:
         selected.append(event)
         if len(selected) == min(limit, 5):
             break
