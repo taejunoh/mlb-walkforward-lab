@@ -119,9 +119,11 @@ def fit_logistic(
     if len(set(y_data)) != 2:
         raise ValueError("both outcome classes must be present")
 
-    x_scale = max(1.0, max(abs(value) for value in x_data))
+    center = math.fsum(value / len(x_data) for value in x_data)
+    centered_x = [value - center for value in x_data]
+    x_scale = max(1.0, max(abs(value) for value in centered_x))
     inverse_scale = 1.0 / x_scale
-    normalized_x = [value * inverse_scale for value in x_data]
+    normalized_x = [value * inverse_scale for value in centered_x]
     max_normalized_x = max(abs(value) for value in normalized_x)
     scaled_l2 = l2 * inverse_scale * inverse_scale
 
@@ -188,6 +190,7 @@ def fit_logistic(
             break
 
     beta = gamma * inverse_scale
+    alpha -= beta * center
     if not math.isfinite(alpha) or not math.isfinite(beta):
         raise ValueError("logistic calibration did not produce finite coefficients")
     return alpha, beta

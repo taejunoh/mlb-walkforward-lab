@@ -140,6 +140,31 @@ class NormalizeTest(unittest.TestCase):
         )
         self.assertAlmostEqual(scaled_objective, objective, places=5)
 
+    def test_logistic_fit_is_stable_under_large_x_translation(self):
+        x_values = [-2.0, -1.0, 1.0, 2.0]
+        y_values = [0, 1, 0, 1]
+        alpha, beta = fit_logistic(x_values, y_values)
+        translated_x = [value + 1e10 for value in x_values]
+        translated_alpha, translated_beta = fit_logistic(translated_x, y_values)
+
+        probabilities = [sigmoid(alpha + beta * value) for value in x_values]
+        translated_probabilities = [
+            sigmoid(translated_alpha + translated_beta * value)
+            for value in translated_x
+        ]
+        self.assertTrue(any(abs(value - 0.5) > 0.05 for value in probabilities))
+        for expected, actual in zip(probabilities, translated_probabilities):
+            self.assertAlmostEqual(actual, expected, places=5)
+        objective = _logistic_objective(x_values, y_values, alpha, beta, 1e-6)
+        translated_objective = _logistic_objective(
+            translated_x,
+            y_values,
+            translated_alpha,
+            translated_beta,
+            1e-6,
+        )
+        self.assertAlmostEqual(translated_objective, objective, places=5)
+
     def test_logistic_does_not_penalize_intercept(self):
         alpha, beta = fit_logistic([0.0, 0.0, 0.0, 0.0], [0, 1, 1, 1], l2=100.0)
         self.assertAlmostEqual(alpha, math.log(3.0), places=8)
