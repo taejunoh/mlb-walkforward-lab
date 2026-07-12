@@ -107,6 +107,41 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(len(optional["queries"]), 1)
             self.assertEqual(set(optional["queries"][0]), QUERY_EVIDENCE_KEYS)
 
+    def test_optional_present_valid_rejects_legacy_query_and_null_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            make_optional_inventory(root, "market_odds")
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
+        query = report["optional_sources"]["market_odds"]["queries"][0]
+        query["evidence_kind"] = "LEGACY_MANIFEST_ONLY"
+        query["parent_logical_query_id"] = None
+        query["logical_query_id"] = (
+            f"legacy:{query['manifest_sha256']}:{query['query']['season']}:market_odds"
+        )
+        with self.assertRaisesRegex(ValueError, "optional query evidence"):
+            parse_preflight(report)
+
+    def test_optional_query_schema_requires_v52_evidence_and_parent_identity(self):
+        schema = preflight_schema_document()
+        optional_query = schema["$defs"]["optional_query_evidence"]
+        self.assertEqual(
+            schema["properties"]["optional_sources"]["properties"]["market_odds"]
+            ["properties"]["queries"]["items"],
+            {"$ref": "#/$defs/optional_query_evidence"},
+        )
+        self.assertEqual(
+            optional_query["properties"]["evidence_kind"],
+            {"const": "V52_MANIFEST_SIDECAR"},
+        )
+        self.assertEqual(
+            optional_query["properties"]["parent_logical_query_id"],
+            {"$ref": "#/$defs/sha256"},
+        )
+        self.assertNotIn(
+            "LEGACY_MANIFEST_ONLY",
+            json.dumps(optional_query, sort_keys=True),
+        )
+
     def test_malformed_optional_evidence_is_separate_and_never_blocks_ready(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_complete_inventory(Path(directory))

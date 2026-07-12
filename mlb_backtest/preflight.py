@@ -1257,9 +1257,18 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
 
 
 def _validate_query_evidence(
-    raw: object, source: str, year: int | None, path: str
+    raw: object,
+    source: str,
+    year: int | None,
+    path: str,
+    *,
+    allow_legacy: bool = True,
 ) -> dict[str, object]:
     item = require_exact_keys(raw, QUERY_EVIDENCE_KEYS, path)
+    if not allow_legacy and item["evidence_kind"] != "V52_MANIFEST_SIDECAR":
+        raise ValueError(
+            f"{path} optional query evidence must be V52_MANIFEST_SIDECAR"
+        )
     if item["source"] != source or item["evidence_kind"] not in {
         "V52_MANIFEST_SIDECAR",
         "LEGACY_MANIFEST_ONLY",
@@ -1317,7 +1326,11 @@ def _validate_optional_sources(raw: object) -> None:
             raise ValueError("optional queries must be a list")
         queries = [
             _validate_query_evidence(
-                value, source, None, f"optional_sources.{source}.queries[{index}]"
+                value,
+                source,
+                None,
+                f"optional_sources.{source}.queries[{index}]",
+                allow_legacy=False,
             )
             for index, value in enumerate(queries_raw)
         ]
@@ -1498,7 +1511,7 @@ def preflight_schema_document() -> dict[str, object]:
                 "fallback_status": {"enum": [status, None]},
                 "queries": {
                     "type": "array",
-                    "items": {"$ref": "#/$defs/query_evidence"},
+                    "items": {"$ref": "#/$defs/optional_query_evidence"},
                 },
                 "errors": {
                     "type": "array",
@@ -1604,6 +1617,7 @@ def preflight_schema_document() -> dict[str, object]:
         "properties": top_properties,
         "additionalProperties": False,
         "$defs": {
+            "sha256": hash_schema,
             "season": {
                 "type": "object",
                 "required": sorted(SEASON_KEYS),
@@ -1654,6 +1668,21 @@ def preflight_schema_document() -> dict[str, object]:
                     "parent_logical_query_id": {
                         "anyOf": [hash_schema, {"type": "null"}]
                     },
+                    "query": {"$ref": "#/$defs/query"},
+                    "child_range": {"$ref": "#/$defs/date_range"},
+                },
+                "additionalProperties": False,
+            },
+            "optional_query_evidence": {
+                "type": "object",
+                "required": sorted(QUERY_EVIDENCE_KEYS),
+                "properties": {
+                    "evidence_kind": {"const": "V52_MANIFEST_SIDECAR"},
+                    "source": {"enum": list(OPTIONAL_SOURCE_CONTRACT)},
+                    "manifest_path": path_schema,
+                    "manifest_sha256": {"$ref": "#/$defs/sha256"},
+                    "logical_query_id": {"type": "string", "minLength": 1},
+                    "parent_logical_query_id": {"$ref": "#/$defs/sha256"},
                     "query": {"$ref": "#/$defs/query"},
                     "child_range": {"$ref": "#/$defs/date_range"},
                 },
