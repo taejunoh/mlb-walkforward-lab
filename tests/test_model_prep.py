@@ -1,11 +1,17 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
 from mlb_backtest.manifest import RawStore
+from mlb_backtest.career_bf import (
+    fetch_prior_career_bf_records,
+    load_prior_career_bf_records,
+)
 from mlb_backtest.mlb_stats import league_era_url
 from mlb_backtest.model_prep import (
+    eligible_starter_ids,
     build_result_free_schedule_history,
     load_league_era_from_raw,
     load_pitcher_bf_range,
@@ -25,6 +31,55 @@ ERA = ROOT / "tests" / "fixtures" / "mlb_pitching_stats.json"
 
 
 class ModelPreparationSourceTest(unittest.TestCase):
+    def test_training_career_sources_include_only_eligible_training_starters(self):
+        raw = [
+            {
+                "eligible": True,
+                "away": {"starter": {"pitcher_id": 10}},
+                "home": {"starter": {"pitcher_id": 20}},
+            },
+            {
+                "eligible": False,
+                "away": {"starter": {"pitcher_id": 30}},
+                "home": {"starter": {"pitcher_id": 40}},
+            },
+        ]
+
+        self.assertEqual(eligible_starter_ids(raw), [10, 20])
+
+    def test_extra_target_career_manifest_cannot_change_frozen_training_bytes(self):
+        payload = b'{"stats":[]}'
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = RawStore(root)
+            fetch_prior_career_bf_records(
+                store, [10, 20], fetcher=lambda _url: payload, sleeper=lambda _delay: None
+            )
+            catalog = store.verify_manifests()
+            records, hashes = load_prior_career_bf_records(
+                root, [10, 20], catalog=catalog
+            )
+            before = json.dumps(
+                {"records": records, "source_manifest_sha256s": hashes},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+
+            fetch_prior_career_bf_records(
+                store, [30], fetcher=lambda _url: payload, sleeper=lambda _delay: None
+            )
+            catalog = store.verify_manifests()
+            records, hashes = load_prior_career_bf_records(
+                root, [10, 20], catalog=catalog
+            )
+            after = json.dumps(
+                {"records": records, "source_manifest_sha256s": hashes},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+
+        self.assertEqual(before, after)
+
     def test_target_projection_never_reads_result_or_status_fields(self):
         safe = {
             "game_pk": 1,

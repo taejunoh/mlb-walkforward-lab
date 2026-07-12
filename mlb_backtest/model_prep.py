@@ -23,6 +23,20 @@ _TARGET_PARTICIPANT_FIELDS = (
 )
 
 
+def eligible_starter_ids(
+    raw_features: Iterable[Mapping[str, object]],
+) -> list[int]:
+    """Return the exact starter set whose eligible rows feed model artifacts."""
+    return sorted(
+        {
+            int(raw[side]["starter"]["pitcher_id"])
+            for raw in raw_features
+            if raw.get("eligible") is True
+            for side in ("away", "home")
+        }
+    )
+
+
 def project_target_participant_inputs(
     games: Iterable[Mapping[str, object]],
 ) -> list[dict[str, object]]:
@@ -460,26 +474,9 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     )
     raw_features = []
     outcomes = {}
-    career_hashes = [
-        item["manifest_sha256"]
-        for item in raw_catalog
-        if item["manifest"].get("source") == "mlb_stats_pitcher_bf"
-    ]
-    if not career_hashes:
-        raise RuntimeError("missing frozen prior career BF manifests")
-    career_ids = sorted(
-        int(item["manifest"]["query"]["pitcher_id"])
-        for item in raw_catalog
-        if item["manifest"].get("source") == "mlb_stats_pitcher_bf"
-    )
-    career_records, verified_career_hashes = load_prior_career_bf_records(
-        raw_root, career_ids, catalog=raw_catalog
-    )
-    if sorted(career_hashes) != verified_career_hashes:
-        raise RuntimeError("prior career BF provenance is incomplete")
     source_hashes = [
         evidence.manifest_sha256 for evidence in schedule_evidence.values()
-    ] + list(compact.manifest_sha256s) + career_hashes
+    ] + list(compact.manifest_sha256s)
     season_open_by_year = {year: start for year, (start, _end) in zip((2022, 2023, 2024), seasons)}
     completed_bf_by_year = {}
     for year, (start, end) in zip((2022, 2023, 2024), seasons):
@@ -520,7 +517,6 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
                 starter["career_bf"] += prior_completed.get(
                     starter["pitcher_id"], 0
                 )
-        apply_prior_career_bf(season_raw, career_records)
         raw_features.extend(season_raw)
         completed_bf_by_year[year] = dict(
             Counter(int(row["pitcher_id"]) for row in statcast.plate_appearances)
@@ -528,6 +524,13 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
         outcomes.update(_training_outcomes(evidence.games))
         source_hashes.extend(hashes)
         source_hashes.extend(era_hashes)
+    career_records, career_hashes = load_prior_career_bf_records(
+        raw_root, eligible_starter_ids(raw_features), catalog=raw_catalog
+    )
+    if not career_hashes:
+        raise RuntimeError("missing frozen prior career BF manifests")
+    apply_prior_career_bf(raw_features, career_records)
+    source_hashes.extend(career_hashes)
     normalization = compute_normalization(raw_features)
     edges = build_training_edges(raw_features, normalization, outcomes)
     calibration = _stage(root, "calibration")
@@ -775,14 +778,7 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         for side in ("away", "home"):
             starter = raw[side]["starter"]
             starter["career_bf"] += prior_bf.get(starter["pitcher_id"], 0)
-    starter_ids = sorted(
-        {
-            int(raw[side]["starter"]["pitcher_id"])
-            for raw in raw_features
-            if raw.get("eligible") is True
-            for side in ("away", "home")
-        }
-    )
+    starter_ids = eligible_starter_ids(raw_features)
     career_records, career_hashes = load_prior_career_bf_records(
         raw_root, starter_ids, catalog=raw_catalog
     )
