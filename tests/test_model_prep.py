@@ -231,6 +231,21 @@ class ModelPreparationSourceTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            blank_event_hbp = STATCAST.read_text("utf-8-sig").replace(
+                "hit_by_pitch,hit_by_pitch", ",hit_by_pitch", 1
+            ).encode("utf-8-sig")
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {"start": "2024-04-01", "end": "2024-04-02", "game_type": "R", "url": statcast_url("2024-04-01", "2024-04-02")},
+                blank_event_hbp,
+            )
+            counts, _hashes = load_pitcher_bf_range(
+                root, "2024-04-01", "2024-04-02"
+            )
+            self.assertEqual(counts[23], 1)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
             RawStore(root).put(
                 "baseball_savant_statcast",
                 {"start": "2024-04-01", "end": "2024-04-02", "game_type": "R", "url": "https://example.invalid/noncanonical"},

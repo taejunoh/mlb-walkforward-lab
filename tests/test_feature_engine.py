@@ -15,7 +15,7 @@ from mlb_backtest.feature_engine import (
 )
 from mlb_backtest.sources import parse_schedule
 from mlb_backtest.scoring_prep import build_raw_features_by_date
-from mlb_backtest.statcast import StatcastData
+from mlb_backtest.statcast import StatcastData, parse_statcast
 
 
 def pa(
@@ -1113,6 +1113,51 @@ class FeatureEngineTest(unittest.TestCase):
             )
         )
         self.assertIsNone(pa_expected_woba(dict(base, woba_denom=0)))
+
+    def test_blank_event_hbp_is_canonical_for_downstream_batting_metrics(self):
+        fixture = Path(__file__).parent / "fixtures" / "statcast_mini.csv"
+        payload = fixture.read_text("utf-8-sig").replace(
+            "hit_by_pitch,hit_by_pitch", ",hit_by_pitch", 1
+        ).encode("utf-8-sig")
+
+        parsed = parse_statcast(payload)
+        hbp = next(
+            row
+            for row in parsed.plate_appearances
+            if row["game_pk"] == 1002 and row["at_bat_number"] == 2
+        )
+
+        self.assertEqual(hbp["events"], "hit_by_pitch")
+        self.assertEqual(pa_expected_woba(hbp), 0.72)
+        history_data = StatcastData(
+            tuple(dict(row, outs_recorded=0) for row in parsed.pitches),
+            tuple(dict(row, outs_recorded=0) for row in parsed.plate_appearances),
+        )
+        target = game(
+            official_date="2024-04-03",
+            scheduled_start_utc="2024-04-03T23:00:00Z",
+            away_probable_pitcher_id=23,
+            home_probable_pitcher_id=13,
+            away_actual_starter_id=23,
+            home_actual_starter_id=13,
+            home_lineup=[{"player_id": 203, "player_name": "HBP"}]
+            + [
+                {"player_id": 400 + slot, "player_name": str(slot)}
+                for slot in range(2, 10)
+            ],
+        )
+        team_map = mapping()
+        team_map.update({"Home": "AAA", "Away": "BBB"})
+        raw = build_raw_game_features(
+            target,
+            FeatureHistory(
+                history_data, slot_weights={slot: 1 / 9 for slot in range(1, 10)}
+            ),
+            team_map,
+            {"2024-04-02": era_record(as_of="2024-04-02")},
+        )
+        hitter = raw["home"]["offense"]["players"][0]
+        self.assertEqual(hitter["iso"], {"value": None, "sample_size": 0, "quality": 0.0})
 
     def test_history_exposes_canonical_date_game_player_team_indexes(self):
         rows = [

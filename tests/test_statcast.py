@@ -262,7 +262,7 @@ class StatcastTest(unittest.TestCase):
                 for row in parsed.plate_appearances
                 if row["game_pk"] == 1002 and row["at_bat_number"] == 2
             )
-            self.assertEqual(pa["events"], "")
+            self.assertEqual(pa["events"], "hit_by_pitch")
             self.assertEqual(pa["description"], "hit_by_pitch")
             self.assertEqual(len(parsed.plate_appearances), 6)
         finally:

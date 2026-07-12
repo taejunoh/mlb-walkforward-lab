@@ -391,6 +391,9 @@ def iter_statcast_pitches(
             for row_number, raw in enumerate(reader, 2):
                 game_date = raw["game_date"]
                 _iso(game_date, f"statcast row {row_number} game_date")
+                event = raw["events"]
+                if not event and raw["description"] == "hit_by_pitch":
+                    event = "hit_by_pitch"
                 half = raw["inning_topbot"]
                 if half not in {"Top", "Bot"}:
                     raise ValueError(
@@ -421,7 +424,7 @@ def iter_statcast_pitches(
                     "batter_id": _integer(
                         raw["batter"], "batter", row_number, positive=True
                     ),
-                    "events": raw["events"],
+                    "events": event,
                     "description": raw["description"],
                     "p_throws": hand,
                     "home_team": raw["home_team"],
