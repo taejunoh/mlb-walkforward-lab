@@ -225,6 +225,7 @@ def _require_raw_schedule(
         "role": role,
         "start": window["start"],
         "end": window["end"],
+        "gameType": "R",
         "url": schedule_url(window["start"], window["end"]),
     }
     folder = root / "raw" / "mlb_schedule"
@@ -392,7 +393,13 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
         artifacts.append(
             store.put(
                 "mlb_schedule",
-                {"role": role, "start": window["start"], "end": window["end"], "url": url},
+                {
+                    "role": role,
+                    "start": window["start"],
+                    "end": window["end"],
+                    "gameType": "R",
+                    "url": url,
+                },
                 fetch_bytes(url),
             )
         )
@@ -804,6 +811,7 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
                 "role": role,
                 "start": window["start"],
                 "end": window["end"],
+                "gameType": "R",
                 "url": schedule_url(window["start"], window["end"]),
             },
             schedule_payload,

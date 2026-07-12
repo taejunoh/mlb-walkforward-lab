@@ -305,10 +305,11 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     }
 
 
-def parse_schedule(path: str | Path) -> list[dict]:
+def parse_schedule(path: str | Path | bytes) -> list[dict]:
     """Read a UTF-8 MLB schedule JSON file and normalize regular-season games."""
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = path if isinstance(path, bytes) else Path(path).read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("malformed schedule: expected UTF-8 JSON") from exc
 

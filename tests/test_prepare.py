@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,15 +9,20 @@ from mlb_backtest.prepare import (
     ParticipantBuild,
     ScheduleHistoryBuild,
     TeamCodeBuild,
+    VerifiedScheduleEvidence,
+    VerifiedStatcastEvidence,
+    _aggregate_training_slot_rows,
     assert_pregame_history,
     build_actual_participants,
     build_pregame_history,
     build_source_manifest_index,
     derive_team_code_map,
     derive_training_slot_rows,
+    load_verified_schedule_evidence,
+    load_verified_statcast_evidence,
     schedule_history_rows,
 )
-from mlb_backtest.statcast import StatcastData, parse_statcast
+from mlb_backtest.statcast import StatcastData, parse_statcast, statcast_url
 
 
 ROOT = Path(__file__).parents[1]
@@ -244,22 +250,30 @@ class PrepareBoundaryTest(unittest.TestCase):
                             "event_id": f'{scheduled["game_pk"]}:{half}:{slot}:{pa_number}',
                         })
             pas.append(dict(pas[-1], batter_id=999999, at_bat_number=999, event_id=f'{scheduled["game_pk"]}:pinch'))
-        rows = derive_training_slot_rows(games, pas)
+        with self.assertRaisesRegex(ValueError, "verified full-season"):
+            derive_training_slot_rows(games, pas)
+        rows = _aggregate_training_slot_rows(games, pas, full_season_mode=False)
         self.assertEqual({row["season"] for row in rows}, {2022, 2023, 2024})
         self.assertEqual(sum(row["pa"] for row in rows), 2 * 45 * 3)
         self.assertEqual(len(rows), 27)
         self.assertEqual(
-            derive_training_slot_rows(list(reversed(games)), list(reversed(pas))),
+            _aggregate_training_slot_rows(
+                list(reversed(games)),
+                list(reversed(pas)),
+                full_season_mode=False,
+            ),
             rows,
         )
         weights = derive_slot_weights(rows)
         self.assertAlmostEqual(sum(weights.values()), 1.0)
         self.assertGreater(weights[1], weights[9])
         with self.assertRaisesRegex(ValueError, "duplicate plate appearance"):
-            derive_training_slot_rows(games, pas + [dict(pas[0])])
+            _aggregate_training_slot_rows(
+                games, pas + [dict(pas[0])], full_season_mode=False
+            )
         wrong_day = [dict(row, game_date="2024-12-31") if row["game_pk"] == 24 else row for row in pas]
         with self.assertRaisesRegex(ValueError, "date"):
-            derive_training_slot_rows(games, wrong_day)
+            _aggregate_training_slot_rows(games, wrong_day, full_season_mode=False)
         missing_cell = [
             row
             for row in pas
@@ -270,7 +284,52 @@ class PrepareBoundaryTest(unittest.TestCase):
             )
         ]
         with self.assertRaisesRegex(ValueError, "missing training slot"):
-            derive_training_slot_rows(games, missing_cell)
+            _aggregate_training_slot_rows(
+                games, missing_cell, full_season_mode=False
+            )
+
+    def test_verified_schedule_evidence_comes_only_from_rawstore_manifest(self):
+        payload = (ROOT / "tests" / "fixtures" / "schedule_2025_05_01.json").read_bytes()
+        query = {
+            "role": "backtest",
+            "start": "2025-05-01",
+            "end": "2025-05-01",
+            "gameType": "R",
+            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2025-05-01&endDate=2025-05-01&hydrate=probablePitcher%2Clineups%2Cvenue",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            artifact = store.put_unique_query("mlb_schedule", query, payload)
+            evidence = load_verified_schedule_evidence(td, artifact.manifest_path)
+            self.assertIsInstance(evidence, VerifiedScheduleEvidence)
+            self.assertEqual(evidence.game_pks, (778100,))
+            self.assertEqual(evidence.coverage_start, "2025-05-01")
+            self.assertEqual(evidence.coverage_end, "2025-05-01")
+            self.assertRegex(evidence.manifest_sha256, r"^[0-9a-f]{64}$")
+            fake = artifact.manifest_path.with_name(f'{"a" * 64}.manifest.json')
+            with self.assertRaises(ValueError):
+                load_verified_schedule_evidence(td, fake)
+            with self.assertRaises(TypeError):
+                VerifiedScheduleEvidence()
+
+    def test_verified_statcast_evidence_comes_only_from_rawstore_manifests(self):
+        payload = STATCAST.read_bytes()
+        query = {
+            "start": "2024-04-01",
+            "end": "2024-04-02",
+            "game_type": "R",
+            "url": statcast_url("2024-04-01", "2024-04-02"),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            artifact = RawStore(Path(td)).put_unique_query(
+                "baseball_savant_statcast", query, payload
+            )
+            evidence = load_verified_statcast_evidence(td, [artifact.manifest_path])
+            self.assertIsInstance(evidence, VerifiedStatcastEvidence)
+            self.assertEqual(len(evidence.plate_appearances), 6)
+            self.assertEqual(evidence.coverage_ranges, (("2024-04-01", "2024-04-02"),))
+            with self.assertRaises(TypeError):
+                VerifiedStatcastEvidence()
 
     def test_schedule_history_build_has_codes_markers_venue_and_coverage(self):
         games = [
@@ -298,18 +357,48 @@ class PrepareBoundaryTest(unittest.TestCase):
             },
         ]
         venues = {31: {"venue_city": "Pittsburgh", "venue_latitude": 40.4469, "venue_longitude": -80.0057, "time_zone": "America/New_York"}}
-        evidence = {
-            "coverage_start": "2024-04-01",
-            "coverage_end": "2024-04-02",
-            "source_manifest_sha256": "a" * 64,
-            "expected_game_pks": {1, 2},
+        payload_games = []
+        for game in games:
+            payload_games.append({
+                "gamePk": game["game_pk"],
+                "gameType": "R",
+                "officialDate": game["official_date"],
+                "gameDate": f'{game["official_date"]}T17:00:00Z',
+                "status": {"detailedState": "Scheduled"},
+                "teams": {
+                    "away": {"team": {"id": 1, "name": "Away"}},
+                    "home": {"team": {"id": 2, "name": "Home"}},
+                },
+                "venue": {"id": 31, "name": "PNC Park"},
+                **({"scheduledInnings": 7} if game["game_pk"] == 2 else {}),
+                **({"doubleHeader": "Y", "gameNumber": 1} if game["game_pk"] == 1 else {}),
+            })
+        payload = json.dumps({"dates": [{"date": "2024-04-01", "games": payload_games}]}).encode()
+        query = {
+            "role": "training",
+            "start": "2024-04-01",
+            "end": "2024-04-02",
+            "gameType": "R",
+            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2024-04-01&endDate=2024-04-02&hydrate=probablePitcher%2Clineups%2Cvenue",
         }
-        built = schedule_history_rows(games, venues, **evidence)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        artifact = RawStore(Path(temporary.name)).put_unique_query(
+            "mlb_schedule", query, payload
+        )
+        evidence = load_verified_schedule_evidence(
+            temporary.name, artifact.manifest_path
+        )
+        evidence_games = [
+            dict(game, away_team_code="AWY", home_team_code="HOM")
+            for game in evidence.games
+        ]
+        built = schedule_history_rows(evidence_games, venues, evidence)
         self.assertIsInstance(built, ScheduleHistoryBuild)
         self.assertEqual(built.coverage_start, "2024-04-01")
         self.assertEqual(built.coverage_end, "2024-04-02")
         self.assertTrue(built.coverage_complete)
-        self.assertEqual(built.source_manifest_sha256, "a" * 64)
+        self.assertEqual(built.source_manifest_sha256, evidence.manifest_sha256)
         self.assertEqual(built.expected_game_pks, (1, 2))
         self.assertEqual(built.rows[0]["team_codes"], ["AWY", "HOM"])
         self.assertEqual(built.rows[0]["home_team_code"], "HOM")
@@ -317,33 +406,24 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertEqual(built.rows[1]["innings"], 7)
         self.assertEqual(built.rows[0]["venue_city"], "Pittsburgh")
         with self.assertRaises(ValueError):
-            schedule_history_rows(games + [dict(games[0])], venues, **evidence)
-        with self.assertRaisesRegex(ValueError, "expected game_pk"):
+            schedule_history_rows(evidence_games + [dict(evidence_games[0], game_pk=9)], venues, evidence)
+        with self.assertRaisesRegex(ValueError, "verified schedule"):
+            schedule_history_rows(evidence_games[:-1], venues, evidence)
+        with self.assertRaisesRegex(ValueError, "verified schedule"):
             schedule_history_rows(
-                games[:-1],
+                [dict(evidence_games[0], official_date="2024-04-02"), evidence_games[1]],
                 venues,
-                coverage_start="2024-04-01",
-                coverage_end="2024-04-02",
-                source_manifest_sha256="a" * 64,
-                expected_game_pks={1, 2},
+                evidence,
             )
-        unproven = schedule_history_rows(
-            games,
-            venues,
-            coverage_start="2024-04-01",
-            coverage_end="2024-04-02",
-            source_manifest_sha256=None,
-            expected_game_pks={1, 2},
-        )
-        self.assertFalse(unproven.coverage_complete)
-        with self.assertRaisesRegex(ValueError, "manifest SHA"):
+        missing_null = dict(evidence_games[0])
+        missing_null.pop("scheduled_innings")
+        with self.assertRaisesRegex(ValueError, "verified schedule"):
+            schedule_history_rows([missing_null, evidence_games[1]], venues, evidence)
+        with self.assertRaisesRegex(ValueError, "verified schedule"):
             schedule_history_rows(
-                games,
+                [dict(evidence_games[0], forged=True), evidence_games[1]],
                 venues,
-                coverage_start="2024-04-01",
-                coverage_end="2024-04-02",
-                source_manifest_sha256="bad",
-                expected_game_pks={1, 2},
+                evidence,
             )
 
     def test_schedule_history_build_rejects_forged_complete_evidence(self):

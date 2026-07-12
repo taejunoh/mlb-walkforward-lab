@@ -8,11 +8,66 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
-from .manifest import RawStore
+from .manifest import RawStore, _safe_leaf_bytes
+from .sources import parse_schedule, schedule_url
+
+
+_EVIDENCE_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedScheduleEvidence:
+    raw_root: Path
+    manifest_path: Path
+    manifest_sha256: str
+    payload_sha256: str
+    query: Mapping[str, object]
+    coverage_start: str
+    coverage_end: str
+    game_pks: tuple[int, ...]
+    games: tuple[dict[str, object], ...]
+    normalized_games_sha256: str
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        raise TypeError("VerifiedScheduleEvidence is created only by its loader")
+
+    @classmethod
+    def _from_verified(cls, token: object, **values):
+        if token is not _EVIDENCE_TOKEN:
+            raise TypeError("verified schedule evidence requires loader authority")
+        instance = object.__new__(cls)
+        for field, value in values.items():
+            object.__setattr__(instance, field, value)
+        return instance
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedStatcastEvidence:
+    raw_root: Path
+    manifest_paths: tuple[Path, ...]
+    manifest_sha256s: tuple[str, ...]
+    payload_sha256s: tuple[str, ...]
+    coverage_ranges: tuple[tuple[str, str], ...]
+    pitches: tuple[dict[str, object], ...]
+    plate_appearances: tuple[dict[str, object], ...]
+    normalized_statcast_sha256: str
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        raise TypeError("VerifiedStatcastEvidence is created only by its loader")
+
+    @classmethod
+    def _from_verified(cls, token: object, **values):
+        if token is not _EVIDENCE_TOKEN:
+            raise TypeError("verified Statcast evidence requires loader authority")
+        instance = object.__new__(cls)
+        for field, value in values.items():
+            object.__setattr__(instance, field, value)
+        return instance
 
 
 @dataclass(frozen=True)
@@ -127,6 +182,215 @@ def build_source_manifest_index(raw_root: str | Path) -> list[dict[str, object]]
         )
     )
     return rows
+
+
+def _safe_verified_bytes(path: Path, label: str) -> bytes:
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError(f"verified {label} parent must be a real directory")
+    return _safe_leaf_bytes(path, parent.resolve(strict=True), label)
+
+
+def _canonical_games_bytes(games: Iterable[Mapping[str, object]]) -> bytes:
+    return json.dumps(
+        list(games),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def load_verified_schedule_evidence(
+    raw_root: str | Path, manifest_path: str | Path
+) -> VerifiedScheduleEvidence:
+    """Bind one canonical schedule query to its verified payload and normalized games."""
+    requested = Path(manifest_path)
+    if requested.is_symlink():
+        raise ValueError("schedule manifest path cannot be a symlink")
+    requested_absolute = requested.absolute()
+    matches = [
+        verified
+        for verified in RawStore(Path(raw_root)).verify_manifests()
+        if Path(verified["manifest_path"]).absolute() == requested_absolute
+    ]
+    if len(matches) != 1:
+        raise ValueError("manifest_path must identify one verified RawStore manifest")
+    verified = matches[0]
+    manifest = verified["manifest"]
+    if manifest.get("source") != "mlb_schedule":
+        raise ValueError("verified schedule evidence requires mlb_schedule source")
+    query = manifest.get("query")
+    if not isinstance(query, dict):
+        raise ValueError("verified schedule query must be an object")
+    base_query_fields = {"start", "end", "gameType", "url"}
+    if set(query) != base_query_fields | {"role"}:
+        raise ValueError("verified schedule query fields are not canonical")
+    if query["role"] not in {"training", "backtest"}:
+        raise ValueError("verified schedule query role is invalid")
+    start = _canonical_day(query.get("start"), "schedule query start")
+    end = _canonical_day(query.get("end"), "schedule query end")
+    if start > end or query.get("gameType") != "R":
+        raise ValueError("verified schedule query must be an ordered regular-season range")
+    if query.get("url") != schedule_url(start, end):
+        raise ValueError("verified schedule query URL is not canonical")
+    payload_path = Path(verified["payload_path"])
+    payload = _safe_verified_bytes(payload_path, "raw")
+    if hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
+        raise RuntimeError("verified schedule payload digest changed")
+    games = tuple(parse_schedule(payload))
+    if any(not start <= str(game["official_date"]) <= end for game in games):
+        raise ValueError("verified schedule payload contains a game outside its query")
+    game_pks = tuple(sorted(_positive_id(game.get("game_pk"), "schedule game_pk") for game in games))
+    if len(set(game_pks)) != len(game_pks):
+        raise ValueError("verified schedule payload contains duplicate game_pk")
+    canonical = _canonical_games_bytes(games)
+    return VerifiedScheduleEvidence._from_verified(
+        _EVIDENCE_TOKEN,
+        raw_root=Path(raw_root).absolute(),
+        manifest_path=Path(verified["manifest_path"]),
+        manifest_sha256=str(verified["manifest_sha256"]),
+        payload_sha256=str(manifest["sha256"]),
+        query=MappingProxyType(dict(query)),
+        coverage_start=start,
+        coverage_end=end,
+        game_pks=game_pks,
+        games=tuple(dict(game) for game in games),
+        normalized_games_sha256=hashlib.sha256(canonical).hexdigest(),
+    )
+
+
+def load_verified_statcast_evidence(
+    raw_root: str | Path, manifest_paths: Iterable[str | Path]
+) -> VerifiedStatcastEvidence:
+    """Bind verified Statcast manifests to one immutable normalized snapshot."""
+    from .statcast import parse_statcast, statcast_url
+
+    if isinstance(manifest_paths, (str, bytes, Path)):
+        raise ValueError("manifest_paths must be an iterable of manifest paths")
+    requested = tuple(Path(path) for path in manifest_paths)
+    if not requested or len(set(map(str, requested))) != len(requested):
+        raise ValueError("manifest_paths must be a nonempty unique collection")
+    if any(path.is_symlink() for path in requested):
+        raise ValueError("Statcast manifest paths cannot be symlinks")
+    requested_by_absolute = {path.absolute(): path for path in requested}
+    selected = [
+        verified
+        for verified in RawStore(Path(raw_root)).verify_manifests()
+        if Path(verified["manifest_path"]).absolute() in requested_by_absolute
+    ]
+    if len(selected) != len(requested):
+        raise ValueError("every Statcast manifest path must be verified by RawStore")
+    ranges = []
+    pitches = []
+    plate_appearances = []
+    manifest_shas = []
+    payload_shas = []
+    verified_paths = []
+    for verified in sorted(selected, key=lambda item: str(item["manifest_path"])):
+        manifest = verified["manifest"]
+        if manifest.get("source") != "baseball_savant_statcast":
+            raise ValueError("verified Statcast evidence has the wrong source")
+        query = manifest.get("query")
+        if not isinstance(query, dict):
+            raise ValueError("verified Statcast query must be an object")
+        if set(query) != {"start", "end", "game_type", "url"}:
+            raise ValueError("verified Statcast query fields are not canonical")
+        start = _canonical_day(query.get("start"), "Statcast query start")
+        end = _canonical_day(query.get("end"), "Statcast query end")
+        if start > end or query.get("game_type") != "R":
+            raise ValueError("verified Statcast query must be an ordered regular-season range")
+        if query.get("url") != statcast_url(start, end):
+            raise ValueError("verified Statcast query URL is not canonical")
+        payload = _safe_verified_bytes(Path(verified["payload_path"]), "raw")
+        if hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
+            raise RuntimeError("verified Statcast payload digest changed")
+        parsed = parse_statcast(payload)
+        if any(
+            not start <= str(row["game_date"]) <= end for row in parsed.pitches
+        ):
+            raise ValueError("verified Statcast row is outside its query range")
+        ranges.append((start, end))
+        pitches.extend(parsed.pitches)
+        plate_appearances.extend(parsed.plate_appearances)
+        verified_paths.append(Path(verified["manifest_path"]))
+        manifest_shas.append(str(verified["manifest_sha256"]))
+        payload_shas.append(str(manifest["sha256"]))
+    pitch_keys = [
+        (int(row["game_pk"]), int(row["at_bat_number"]), int(row["pitch_number"]))
+        for row in pitches
+    ]
+    pa_keys = [
+        (int(row["game_pk"]), int(row["at_bat_number"]))
+        for row in plate_appearances
+    ]
+    if len(set(pitch_keys)) != len(pitch_keys) or len(set(pa_keys)) != len(pa_keys):
+        raise ValueError("verified Statcast manifests overlap or duplicate events")
+    pitches.sort(
+        key=lambda row: (
+            row["game_date"],
+            row["game_pk"],
+            row["at_bat_number"],
+            row["pitch_number"],
+        )
+    )
+    plate_appearances.sort(
+        key=lambda row: (row["game_date"], row["game_pk"], row["at_bat_number"])
+    )
+    canonical = json.dumps(
+        {"pitches": pitches, "plate_appearances": plate_appearances},
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return VerifiedStatcastEvidence._from_verified(
+        _EVIDENCE_TOKEN,
+        raw_root=Path(raw_root).absolute(),
+        manifest_paths=tuple(verified_paths),
+        manifest_sha256s=tuple(manifest_shas),
+        payload_sha256s=tuple(payload_shas),
+        coverage_ranges=tuple(sorted(ranges)),
+        pitches=tuple(dict(row) for row in pitches),
+        plate_appearances=tuple(dict(row) for row in plate_appearances),
+        normalized_statcast_sha256=hashlib.sha256(canonical).hexdigest(),
+    )
+
+
+def _rebind_schedule_evidence(
+    evidence: VerifiedScheduleEvidence,
+) -> VerifiedScheduleEvidence:
+    if not isinstance(evidence, VerifiedScheduleEvidence):
+        raise ValueError("verified schedule evidence is required")
+    fresh = load_verified_schedule_evidence(evidence.raw_root, evidence.manifest_path)
+    identity = (
+        "manifest_sha256",
+        "payload_sha256",
+        "coverage_start",
+        "coverage_end",
+        "game_pks",
+        "normalized_games_sha256",
+    )
+    if any(getattr(evidence, field, None) != getattr(fresh, field) for field in identity):
+        raise ValueError("verified schedule evidence no longer matches RawStore")
+    return fresh
+
+
+def _rebind_statcast_evidence(
+    evidence: VerifiedStatcastEvidence,
+) -> VerifiedStatcastEvidence:
+    if not isinstance(evidence, VerifiedStatcastEvidence):
+        raise ValueError("verified Statcast evidence is required")
+    fresh = load_verified_statcast_evidence(evidence.raw_root, evidence.manifest_paths)
+    identity = (
+        "manifest_sha256s",
+        "payload_sha256s",
+        "coverage_ranges",
+        "normalized_statcast_sha256",
+    )
+    if any(getattr(evidence, field, None) != getattr(fresh, field) for field in identity):
+        raise ValueError("verified Statcast evidence no longer matches RawStore")
+    return fresh
 
 
 def _statcast_rows(statcast_data: object, *, plate_appearances: bool = False) -> tuple:
@@ -341,9 +605,11 @@ def derive_team_code_map(
     return TeamCodeBuild(frozen_mapping, tuple(unmatched), provenance)
 
 
-def derive_training_slot_rows(
+def _aggregate_training_slot_rows(
     schedule_games: Iterable[Mapping[str, object]],
     statcast_plate_appearances: object,
+    *,
+    full_season_mode: bool = False,
 ) -> list[dict[str, object]]:
     """Count 2022-2024 PA by each target game's official starting lineup slot."""
     lineups = {}
@@ -422,31 +688,171 @@ def derive_training_slot_rows(
     ]
 
 
+def derive_training_slot_rows(
+    schedule_evidence_by_year: Mapping[int, VerifiedScheduleEvidence],
+    statcast_evidence: VerifiedStatcastEvidence,
+) -> list[dict[str, object]]:
+    """Derive production slot rows only from verified full-season sources."""
+    if (
+        not isinstance(schedule_evidence_by_year, Mapping)
+        or set(schedule_evidence_by_year) != {2022, 2023, 2024}
+        or not isinstance(statcast_evidence, VerifiedStatcastEvidence)
+    ):
+        raise ValueError("verified full-season schedule and Statcast evidence is required")
+    frozen = {
+        2022: ("2022-04-07", "2022-10-05"),
+        2023: ("2023-03-30", "2023-10-01"),
+        2024: ("2024-03-20", "2024-09-30"),
+    }
+    schedule_games_by_pk = {}
+    for year, (season_open, season_close) in frozen.items():
+        evidence = _rebind_schedule_evidence(schedule_evidence_by_year[year])
+        if (
+            evidence.query.get("role") != "training"
+            or evidence.coverage_start != season_open
+            or evidence.coverage_end != season_close
+        ):
+            raise ValueError(f"schedule evidence query must equal frozen {year} season")
+        season_games = [
+            game
+            for game in evidence.games
+            if date.fromisoformat(str(game["official_date"])).year == year
+        ]
+        if len(season_games) != 2430:
+            raise ValueError(f"frozen {year} schedule must contain exactly 2430 games")
+        teams_by_id = {}
+        for game in season_games:
+            if (
+                game.get("game_type") != "R"
+                or game.get("status") != "Final"
+                or not season_open <= str(game.get("official_date")) <= season_close
+            ):
+                raise ValueError(f"frozen {year} schedule games must be Final regular games")
+            for side in ("away", "home"):
+                team_id = _positive_id(game.get(f"{side}_team_id"), "schedule team id")
+                name = game.get(f"{side}_team")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("schedule team name must be nonempty")
+                if team_id in teams_by_id and teams_by_id[team_id] != name:
+                    raise ValueError("schedule team id maps to conflicting names")
+                teams_by_id[team_id] = name
+                lineup = game.get(f"{side}_lineup")
+                if (
+                    not isinstance(lineup, Sequence)
+                    or len(lineup) != 9
+                    or len({player.get("player_id") for player in lineup if isinstance(player, Mapping)}) != 9
+                ):
+                    raise ValueError("full-season schedule requires official nine-player lineups")
+            game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
+            if game_pk in schedule_games_by_pk:
+                raise ValueError("full-season schedule evidence duplicates game_pk")
+            schedule_games_by_pk[game_pk] = game
+        if len(teams_by_id) != 30 or len(set(teams_by_id.values())) != 30:
+            raise ValueError(f"frozen {year} schedule must contain exactly 30 teams")
+
+    statcast_evidence = _rebind_statcast_evidence(statcast_evidence)
+    statcast_snapshot = json.dumps(
+        {
+            "pitches": list(statcast_evidence.pitches),
+            "plate_appearances": list(statcast_evidence.plate_appearances),
+        },
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if hashlib.sha256(statcast_snapshot).hexdigest() != statcast_evidence.normalized_statcast_sha256:
+        raise ValueError("verified Statcast evidence snapshot is invalid")
+    expected_dates = set()
+    for first, last in frozen.values():
+        cursor = date.fromisoformat(first)
+        end = date.fromisoformat(last)
+        while cursor <= end:
+            expected_dates.add(cursor)
+            cursor += timedelta(days=1)
+    from .statcast import monthly_ranges
+
+    expected_ranges = tuple(
+        chunk
+        for first, last in frozen.values()
+        for chunk in monthly_ranges(first, last)
+    )
+    if statcast_evidence.coverage_ranges != expected_ranges:
+        raise ValueError("verified Statcast manifest partitions are not frozen monthly ranges")
+    covered_dates = set()
+    for first, last in statcast_evidence.coverage_ranges:
+        cursor = date.fromisoformat(first)
+        end = date.fromisoformat(last)
+        while cursor <= end:
+            if cursor in covered_dates:
+                raise ValueError("verified Statcast query ranges overlap")
+            covered_dates.add(cursor)
+            cursor += timedelta(days=1)
+    if covered_dates != expected_dates:
+        raise ValueError("verified Statcast evidence does not cover frozen seasons")
+    if any(
+        int(row["game_pk"]) not in schedule_games_by_pk
+        for row in statcast_evidence.plate_appearances
+    ):
+        raise ValueError("verified Statcast plate appearance lacks a schedule game")
+    rows = _aggregate_training_slot_rows(
+        schedule_games_by_pk.values(),
+        statcast_evidence.plate_appearances,
+        full_season_mode=True,
+    )
+    totals_by_year = defaultdict(int)
+    for row in rows:
+        totals_by_year[int(row["season"])] += int(row["pa"])
+    if any(totals_by_year[year] < 40_000 for year in frozen):
+        raise ValueError("each frozen season requires at least 40000 starting-lineup PA")
+    if len(rows) != 27:
+        raise ValueError("frozen slot aggregation must contain exactly 27 rows")
+    return rows
+
+
 def schedule_history_rows(
     normalized_games: Iterable[Mapping[str, object]],
     venue_reference: Mapping[int, Mapping[str, object]],
-    *,
-    coverage_start: str,
-    coverage_end: str,
-    source_manifest_sha256: str | None,
-    expected_game_pks: Iterable[int],
+    evidence: VerifiedScheduleEvidence,
 ) -> ScheduleHistoryBuild:
     """Convert normalized schedules into source-backed ScheduleHistory rows."""
     if not isinstance(venue_reference, Mapping):
         raise ValueError("venue_reference must be a mapping")
-    first = _canonical_day(coverage_start, "schedule coverage_start")
-    last = _canonical_day(coverage_end, "schedule coverage_end")
-    if first > last:
-        raise ValueError("schedule coverage_start must not be after coverage_end")
-    if isinstance(expected_game_pks, (str, bytes)):
-        raise ValueError("expected_game_pks must be an iterable of positive integers")
-    try:
-        expected = {_positive_id(value, "expected game_pk") for value in expected_game_pks}
-    except TypeError as exc:
-        raise ValueError("expected_game_pks must be iterable") from exc
+    evidence = _rebind_schedule_evidence(evidence)
+    first, last = evidence.coverage_start, evidence.coverage_end
+    expected = set(evidence.game_pks)
+    supplied = tuple(normalized_games)
+    supplied_by_pk = {}
+    for game in supplied:
+        if not isinstance(game, Mapping):
+            raise ValueError("normalized schedule games must be mappings")
+        game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
+        if game_pk in supplied_by_pk:
+            raise ValueError("duplicate schedule game_pk")
+        supplied_by_pk[game_pk] = game
+    if set(supplied_by_pk) != expected:
+        raise ValueError("passed games do not equal verified schedule game_pks")
+    for verified_game in evidence.games:
+        supplied_game = supplied_by_pk[int(verified_game["game_pk"])]
+        if any(
+            key not in supplied_game or supplied_game[key] != value
+            for key, value in verified_game.items()
+        ):
+            raise ValueError("passed games do not equal verified schedule games")
+        allowed_enrichment = {
+            "away_team_code",
+            "home_team_code",
+            "away_actual_starter_id",
+            "home_actual_starter_id",
+            "away_probable_starter_mismatch",
+            "home_probable_starter_mismatch",
+            "starter_provenance",
+        }
+        if set(supplied_game) - set(verified_game) - allowed_enrichment:
+            raise ValueError("passed games contain unverified schedule fields")
     rows = []
     seen = set()
-    for game in normalized_games:
+    for game in supplied:
         if not isinstance(game, Mapping):
             raise ValueError("normalized schedule games must be mappings")
         if game.get("game_type") != "R":
@@ -529,16 +935,12 @@ def schedule_history_rows(
             f"expected game_pk set differs; missing={sorted(expected - actual)}, "
             f"unexpected={sorted(actual - expected)}"
         )
-    valid_source_hash = bool(
-        isinstance(source_manifest_sha256, str)
-        and re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256)
-    )
     return ScheduleHistoryBuild(
         tuple(rows),
         first,
         last,
-        valid_source_hash,
-        source_manifest_sha256,
+        True,
+        evidence.manifest_sha256,
         tuple(sorted(expected)),
     )
 
@@ -605,11 +1007,16 @@ __all__ = [
     "ParticipantBuild",
     "ScheduleHistoryBuild",
     "TeamCodeBuild",
+    "VerifiedScheduleEvidence",
+    "VerifiedStatcastEvidence",
+    "_aggregate_training_slot_rows",
     "assert_pregame_history",
     "build_actual_participants",
     "build_source_manifest_index",
     "build_pregame_history",
     "derive_team_code_map",
     "derive_training_slot_rows",
+    "load_verified_schedule_evidence",
+    "load_verified_statcast_evidence",
     "schedule_history_rows",
 ]

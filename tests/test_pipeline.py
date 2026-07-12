@@ -48,6 +48,7 @@ def _copy_raw_schedule(root):
                 "role": role,
                 "start": window["start"],
                 "end": window["end"],
+                "gameType": "R",
                 "url": schedule_url(window["start"], window["end"]),
             },
             payload,
@@ -56,6 +57,7 @@ def _copy_raw_schedule(root):
         "role": "backtest",
         "start": config["initial_window"]["start"],
         "end": config["extension_end"],
+        "gameType": "R",
         "url": schedule_url(
             config["initial_window"]["start"], config["extension_end"]
         ),
@@ -258,7 +260,15 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch(
             "mlb_backtest.pipeline.fetch_bytes", return_value=b'{"dates":[]}'
         ) as mocked_fetch:
-            fetch_stage(CONFIG, Path(td))
+            root = Path(td)
+            fetch_stage(CONFIG, root)
+            schedule_queries = [
+                row["manifest"]["query"]
+                for row in RawStore(root / "raw").verify_manifests()
+                if row["manifest"]["source"] == "mlb_schedule"
+            ]
+            self.assertTrue(schedule_queries)
+            self.assertTrue(all(query["gameType"] == "R" for query in schedule_queries))
 
         config = load_config(CONFIG)
         self.assertEqual(
