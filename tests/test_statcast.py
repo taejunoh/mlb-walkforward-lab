@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlsplit
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.statcast import (
     MAX_STATCAST_BYTES,
+    StatcastData,
+    derive_outs_recorded,
     fetch_monthly,
     fetch_statcast_stage,
     identify_pitcher_roles,
@@ -93,9 +95,24 @@ class StatcastTest(unittest.TestCase):
         pa = next(row for row in parsed.plate_appearances if row["event_id"] == "1001:1")
         self.assertEqual(pa["events"], "strikeout")
         self.assertEqual(pa["pitch_number"], 2)
-        self.assertEqual(pa["outs_on_play"], 1)
+        self.assertEqual(pa["outs_when_up"], 0)
         self.assertEqual(pa["home_score"], 0)
         self.assertEqual(pa["away_score"], 0)
+
+    def test_truncated_pa_records_a_pitch_event_but_not_a_completed_pa(self):
+        text = FIXTURE.read_text("utf-8-sig").replace(
+            "strikeout,swinging_strike", "truncated_pa,swinging_strike", 1
+        )
+        malformed = FIXTURE.parent / "statcast_truncated.tmp.csv"
+        try:
+            malformed.write_text(text, encoding="utf-8")
+            parsed = parse_statcast(malformed)
+            self.assertTrue(any(row["events"] == "truncated_pa" for row in parsed.pitches))
+            self.assertFalse(
+                any(row["events"] == "truncated_pa" for row in parsed.plate_appearances)
+            )
+        finally:
+            malformed.unlink(missing_ok=True)
 
     def test_roles_use_first_pitcher_for_each_fielding_side(self):
         parsed = parse_statcast(FIXTURE)
@@ -145,25 +162,127 @@ class StatcastTest(unittest.TestCase):
         finally:
             malformed.unlink(missing_ok=True)
 
-    def test_outs_on_play_is_a_required_nonnegative_integer(self):
+    def test_outs_when_up_is_a_required_pre_pitch_state(self):
         text = FIXTURE.read_text("utf-8-sig")
         malformed = FIXTURE.parent / "statcast_bad.tmp.csv"
         try:
             malformed.write_text(
-                text.replace("outs_on_play", "outs_on_play_x", 1), encoding="utf-8"
+                text.replace("outs_when_up", "outs_when_up_x", 1), encoding="utf-8"
             )
             with self.assertRaisesRegex(
-                ValueError, "missing required fields.*outs_on_play"
+                ValueError, "missing required fields.*outs_when_up"
             ):
                 parse_statcast(malformed)
-            malformed.write_text(text.replace(",1,R\n", ",-1,R\n", 1), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "outs_on_play must be nonnegative"):
+            malformed.write_text(text.replace(",0,R\n", ",-1,R\n", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outs_when_up must be nonnegative"):
                 parse_statcast(malformed)
-            malformed.write_text(text.replace(",1,R\n", ",4,R\n", 1), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "outs_on_play must be at most 3"):
+            malformed.write_text(text.replace(",0,R\n", ",3,R\n", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outs_when_up must be at most 2"):
                 parse_statcast(malformed)
         finally:
             malformed.unlink(missing_ok=True)
+
+    def test_outs_are_derived_from_every_pitch_state_not_event_labels(self):
+        def pitch(
+            number,
+            *,
+            at_bat,
+            pitcher,
+            outs,
+            event="",
+            inning=1,
+            half="Top",
+        ):
+            return {
+                "game_date": "2025-05-01",
+                "game_pk": 778098,
+                "pitcher_id": pitcher,
+                "batter_id": 100 + at_bat,
+                "events": event,
+                "inning": inning,
+                "inning_topbot": half,
+                "at_bat_number": at_bat,
+                "pitch_number": number,
+                "outs_when_up": outs,
+                "event_id": f"778098:{at_bat}",
+            }
+
+        rows = (
+            pitch(1, at_bat=1, pitcher=10, outs=0, event="single"),
+            # A caught stealing between pitches is credited to pitcher 20.
+            pitch(1, at_bat=2, pitcher=20, outs=0),
+            pitch(2, at_bat=2, pitcher=20, outs=1, event="single"),
+            # A hit can also record a runner out; labels are not authoritative.
+            pitch(1, at_bat=3, pitcher=20, outs=2, event="single"),
+            pitch(1, at_bat=4, pitcher=20, outs=0, event="field_out", half="Bot"),
+        )
+        statcast = StatcastData(rows, tuple(row for row in rows if row["events"]))
+
+        derived = derive_outs_recorded(statcast, {778098: 1})
+
+        self.assertEqual(
+            [row["outs_recorded"] for row in derived.pitches], [0, 1, 1, 1, 1]
+        )
+        self.assertEqual(
+            sum(
+                row["outs_recorded"]
+                for row in derived.pitches
+                if row["pitcher_id"] == 20
+            ),
+            4,
+        )
+
+    def test_final_pitch_uses_linescore_outs_for_walkoff_and_requires_it(self):
+        row = {
+            "game_date": "2025-05-01",
+            "game_pk": 778108,
+            "pitcher_id": 10,
+            "batter_id": 20,
+            "events": "single",
+            "inning": 10,
+            "inning_topbot": "Bot",
+            "at_bat_number": 86,
+            "pitch_number": 1,
+            "outs_when_up": 1,
+            "event_id": "778108:86",
+        }
+        statcast = StatcastData((row,), (row,))
+        self.assertEqual(
+            derive_outs_recorded(statcast, {778108: 1}).pitches[0][
+                "outs_recorded"
+            ],
+            0,
+        )
+        with self.assertRaisesRegex(ValueError, "final linescore outs"):
+            derive_outs_recorded(statcast, {})
+
+    def test_out_state_regression_and_illegal_half_transition_are_rejected(self):
+        base = {
+            "game_date": "2025-05-01",
+            "game_pk": 1,
+            "pitcher_id": 10,
+            "batter_id": 20,
+            "events": "",
+            "inning": 1,
+            "inning_topbot": "Top",
+            "at_bat_number": 1,
+            "pitch_number": 1,
+            "outs_when_up": 2,
+            "event_id": "1:1",
+        }
+        regressed = dict(base, pitch_number=2, outs_when_up=1)
+        with self.assertRaisesRegex(ValueError, "regressed"):
+            derive_outs_recorded(StatcastData((base, regressed), ()), {1: 3})
+        skipped = dict(
+            base,
+            inning=2,
+            inning_topbot="Top",
+            at_bat_number=2,
+            pitch_number=1,
+            outs_when_up=0,
+        )
+        with self.assertRaisesRegex(ValueError, "illegal half-inning"):
+            derive_outs_recorded(StatcastData((base, skipped), ()), {1: 3})
 
     def test_pre_pa_scores_are_required_nonnegative_integers(self):
         text = FIXTURE.read_text("utf-8-sig")

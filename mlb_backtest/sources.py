@@ -254,6 +254,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         else _mapping(lineups_value, f"game[{index}].lineups")
     )
     completed_innings = None
+    final_outs = None
     linescore_value = game.get("linescore")
     if linescore_value is not None:
         linescore = _mapping(linescore_value, f"game[{index}].linescore")
@@ -262,8 +263,16 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
             if type(current_inning) is not int or current_inning <= 0:
                 raise ValueError("malformed schedule: linescore.currentInning must be positive")
             completed_innings = current_inning
+        outs = linescore.get("outs")
+        if outs is not None:
+            if type(outs) is not int or not 0 <= outs <= 3:
+                raise ValueError(
+                    "malformed schedule: linescore.outs must be an integer from 0 to 3"
+                )
+            final_outs = outs
     if status_name not in {"Final", "Completed Early"}:
         completed_innings = None
+        final_outs = None
 
     venue_value = game.get("venue")
     if venue_value is None:
@@ -310,6 +319,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
             game, "scheduledInnings", f"game[{index}]", positive=True
         ),
         "completed_innings": completed_innings,
+        "final_outs": final_outs,
         "doubleheader_marker": _doubleheader_marker(game, f"game[{index}]"),
         "away_lineup": _lineup(
             lineups, "awayPlayers", f"game[{index}].lineups"

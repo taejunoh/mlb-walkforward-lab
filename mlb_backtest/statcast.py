@@ -45,9 +45,10 @@ REQUIRED_FIELDS = (
     "away_score",
     "post_home_score",
     "post_away_score",
-    "outs_on_play",
+    "outs_when_up",
     "game_type",
 )
+NON_PA_EVENTS = frozenset({"truncated_pa"})
 
 
 @dataclass(frozen=True)
@@ -435,11 +436,11 @@ def iter_statcast_pitches(
                     "post_away_score": _integer(
                         raw["post_away_score"], "post_away_score", row_number
                     ),
-                    "outs_on_play": _integer(
-                        raw["outs_on_play"],
-                        "outs_on_play",
+                    "outs_when_up": _integer(
+                        raw["outs_when_up"],
+                        "outs_when_up",
                         row_number,
-                        maximum=3,
+                        maximum=2,
                     ),
                     "game_type": "R",
                 }
@@ -478,7 +479,7 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
     )
     terminal: dict[str, dict[str, object]] = {}
     for row in pitches:
-        if row["events"]:
+        if row["events"] and row["events"] not in NON_PA_EVENTS:
             event_id = str(row["event_id"])
             prior = terminal.get(event_id)
             if prior is not None and prior != row:
@@ -489,6 +490,101 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
         for key in sorted(terminal, key=lambda key: tuple(map(int, key.split(":"))))
     )
     return StatcastData(tuple(pitches), plate_appearances)
+
+
+def derive_outs_recorded(
+    statcast: StatcastData, final_outs_by_game: Mapping[int, int]
+) -> StatcastData:
+    """Derive pitcher outs from official pre-pitch states and final linescores.
+
+    Baseball Savant exposes ``outs_when_up`` (the pre-pitch state), not an
+    outs-on-play field.  Consecutive pitch states therefore carry the exact
+    state transition, including outs made between pitches or on the bases.
+    The final pitch of each game is closed by MLB's hydrated linescore outs.
+    """
+    if not isinstance(statcast, StatcastData) or not isinstance(
+        final_outs_by_game, Mapping
+    ):
+        raise ValueError("statcast and final_outs_by_game are required")
+    by_game: dict[int, list[dict[str, object]]] = {}
+    for raw in statcast.pitches:
+        row = dict(raw)
+        game_pk = int(row["game_pk"])
+        by_game.setdefault(game_pk, []).append(row)
+
+    derived: list[dict[str, object]] = []
+    for game_pk, rows in sorted(by_game.items()):
+        final_outs = final_outs_by_game.get(game_pk)
+        if type(final_outs) is not int or not 0 <= final_outs <= 3:
+            raise ValueError(
+                f"game {game_pk}: final linescore outs must be an integer from 0 to 3"
+            )
+        rows.sort(
+            key=lambda row: (
+                int(row["inning"]),
+                0 if row["inning_topbot"] == "Top" else 1,
+                int(row["at_bat_number"]),
+                int(row["pitch_number"]),
+            )
+        )
+        for index, row in enumerate(rows):
+            pre = row.get("outs_when_up")
+            if type(pre) is not int or not 0 <= pre <= 2:
+                raise ValueError(
+                    f"game {game_pk}: outs_when_up must be an integer from 0 to 2"
+                )
+            next_row = rows[index + 1] if index + 1 < len(rows) else None
+            current_half = (int(row["inning"]), str(row["inning_topbot"]))
+            if next_row is None:
+                post = final_outs
+            else:
+                next_half = (
+                    int(next_row["inning"]),
+                    str(next_row["inning_topbot"]),
+                )
+                if next_half == current_half:
+                    post = next_row.get("outs_when_up")
+                    if type(post) is not int or not 0 <= post <= 2:
+                        raise ValueError(
+                            f"game {game_pk}: outs_when_up must be an integer from 0 to 2"
+                        )
+                else:
+                    legal_next = (
+                        (current_half[1] == "Top" and next_half == (current_half[0], "Bot"))
+                        or (
+                            current_half[1] == "Bot"
+                            and next_half == (current_half[0] + 1, "Top")
+                        )
+                    )
+                    if not legal_next:
+                        raise ValueError(f"game {game_pk}: illegal half-inning transition")
+                    post = 3
+            outs = post - pre
+            if not 0 <= outs <= 3:
+                raise ValueError(f"game {game_pk}: outs state regressed or jumped")
+            row["outs_recorded"] = outs
+            derived.append(row)
+
+    derived.sort(
+        key=lambda row: (
+            row["game_date"],
+            row["game_pk"],
+            row["at_bat_number"],
+            row["pitch_number"],
+            row["pitcher_id"],
+            row["batter_id"],
+        )
+    )
+    terminals = {
+        str(row["event_id"]): dict(row)
+        for row in derived
+        if row.get("events") and row["events"] not in NON_PA_EVENTS
+    }
+    plate_appearances = tuple(
+        terminals[key]
+        for key in sorted(terminals, key=lambda key: tuple(map(int, key.split(":"))))
+    )
+    return StatcastData(tuple(derived), plate_appearances)
 
 
 def identify_pitcher_roles(
@@ -524,9 +620,11 @@ def identify_pitcher_roles(
 
 __all__ = [
     "MAX_STATCAST_BYTES",
+    "NON_PA_EVENTS",
     "REQUIRED_FIELDS",
     "SAVANT_CSV",
     "StatcastData",
+    "derive_outs_recorded",
     "fetch_monthly",
     "fetch_statcast_stage",
     "identify_pitcher_roles",
