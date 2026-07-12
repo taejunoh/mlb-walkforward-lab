@@ -1,7 +1,7 @@
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
 import hashlib
@@ -78,7 +78,11 @@ class V51Evidence:
     summary: Mapping[str, FrozenJson]
     lock_audit: Mapping[str, FrozenJson]
     model_card: Mapping[str, FrozenJson]
+    candidate_rows: tuple[Mapping[str, FrozenJson], ...]
+    locked_prediction_rows: tuple[Mapping[str, FrozenJson], ...]
+    manual_audit_text: str
     verified_file_sha256: Mapping[str, str]
+    source_file_sha256: Mapping[str, str]
     predictions_content_sha256: str
     evaluated_content_sha256: str
 
@@ -168,9 +172,13 @@ def sha256_file(path: Path) -> str:
 
 
 def read_jsonl(path: Path) -> tuple[dict[str, object], ...]:
+    return _read_jsonl_bytes(path.read_bytes())
+
+
+def _read_jsonl_bytes(contents: bytes) -> tuple[dict[str, object], ...]:
     return tuple(
         json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
+        for line in contents.decode("utf-8").splitlines()
         if line.strip()
     )
 
@@ -205,20 +213,22 @@ def audited_digest_map(audit: Mapping[str, object]) -> dict[str, str]:
 
 
 def load_v51_evidence(root: Path) -> V51Evidence:
-    evaluated_path = (
-        root / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl"
-    )
-    audit = json.loads(
-        (root / "audit/v5_1_bt/lock_manifest.json").read_text(encoding="utf-8")
-    )
+    root = root.resolve()
+    audit_path = "audit/v5_1_bt/lock_manifest.json"
+    audit_bytes = (root / audit_path).read_bytes()
+    audit = json.loads(audit_bytes)
     expected = audited_digest_map(audit)
-    verified = {
-        name: sha256_file(root / relative)
+    captured = {
+        name: (root / relative).read_bytes()
         for name, relative in AUDITED_DIGEST_PATHS.items()
+    }
+    verified = {
+        name: hashlib.sha256(captured[name]).hexdigest()
+        for name in AUDITED_DIGEST_PATHS
     }
     if verified != expected:
         raise ValueError("authoritative v5.1 evidence hash differs")
-    rows = read_jsonl(evaluated_path)
+    rows = _read_jsonl_bytes(captured["evaluated_predictions"])
     if (
         len(rows) != 1340
         or len({row["game_pk"] for row in rows}) != 1340
@@ -228,30 +238,64 @@ def load_v51_evidence(root: Path) -> V51Evidence:
     top1_dates = [row["official_date"] for row in rows if row["top1"] == "Yes"]
     if len(top1_dates) != 100 or len(set(top1_dates)) != 100:
         raise ValueError("Daily Top 1 population differs")
-    baseline_raw = json.loads(
-        (root / "data/v5_1_bt/outcomes/baseline.json").read_text(encoding="utf-8")
-    )
+    baseline_raw = json.loads(captured["baseline"])
     baseline = MappingProxyType(
         {int(game_pk): str(team) for game_pk, team in baseline_raw.items()}
     )
+    model_card = json.loads(captured["audit_model_card_file_sha256"])
+    extra_paths = {
+        audit_path: audit_bytes,
+        "audit/v5_1_bt/manual_audit.md": (
+            root / "audit/v5_1_bt/manual_audit.md"
+        ).read_bytes(),
+        "config/v5_1_bt.json": (root / "config/v5_1_bt.json").read_bytes(),
+    }
+    if (
+        hashlib.sha256(extra_paths["config/v5_1_bt.json"]).hexdigest()
+        != model_card["sha256"]["config_file"]
+    ):
+        raise ValueError("authoritative v5.1 config hash differs")
+    relative_to_key = {relative: name for name, relative in AUDITED_DIGEST_PATHS.items()}
+    source_paths = (
+        "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl",
+        "data/v5_1_bt/reports/summary.json",
+        "data/v5_1_bt/outcomes/baseline.json",
+        "data/v5_1_bt/locked/predictions.jsonl",
+        "data/v5_1_bt/locked/lock_manifest.json",
+        audit_path,
+        "audit/v5_1_bt/model_card.json",
+        "audit/v5_1_bt/manual_audit.md",
+        "config/v5_1_bt.json",
+        "data/v5_1_bt/features/candidate_raw_features.jsonl",
+    )
+    source_digests = {}
+    for relative in source_paths:
+        contents = (
+            captured[relative_to_key[relative]]
+            if relative in relative_to_key
+            else extra_paths[relative]
+        )
+        source_digests[relative] = hashlib.sha256(contents).hexdigest()
     return V51Evidence(
-        root.resolve(),
+        root,
         tuple(deep_freeze(row) for row in rows),
         baseline,
         deep_freeze(
-            json.loads(
-                (root / "data/v5_1_bt/reports/summary.json").read_text(
-                    encoding="utf-8"
-                )
-            )
+            json.loads(captured["summary"])
         ),
         deep_freeze(audit),
-        deep_freeze(
-            json.loads(
-                (root / "audit/v5_1_bt/model_card.json").read_text(encoding="utf-8")
-            )
+        deep_freeze(model_card),
+        tuple(
+            deep_freeze(row)
+            for row in _read_jsonl_bytes(captured["candidate_raw_features"])
         ),
+        tuple(
+            deep_freeze(row)
+            for row in _read_jsonl_bytes(captured["predictions_contents_sha256"])
+        ),
+        extra_paths["audit/v5_1_bt/manual_audit.md"].decode("utf-8"),
         MappingProxyType(verified),
+        MappingProxyType(source_digests),
         verified["predictions_contents_sha256"],
         verified["evaluated_predictions"],
     )
@@ -567,10 +611,60 @@ def temporal_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
     }
 
 
+def calibration_diagnostic(calibration: Mapping[str, object]) -> dict[str, object]:
+    source_bins = calibration["bins"]
+    total = sum(int(row["N"]) for row in source_bins)
+    if total <= 0:
+        raise ValueError("calibration diagnostic requires graded rows")
+    bins = []
+    for source in source_bins:
+        mean_brier = source["brier_contribution"]
+        contribution = (
+            float(mean_brier) * int(source["N"]) / total
+            if mean_brier is not None
+            else 0.0
+        )
+        bins.append(
+            {
+                **source,
+                "mean_brier": mean_brier,
+                "brier_contribution": contribution,
+            }
+        )
+    return {"bins": bins, "ece": calibration["ece"]}
+
+
 def quality_diagnostic(
-    rows: Sequence[Mapping[str, object]], card: Mapping[str, object]
+    rows: Sequence[Mapping[str, object]],
+    all_candidates: Sequence[Mapping[str, object]],
+    card: Mapping[str, object],
 ) -> dict[str, object]:
     completeness = [float(row["overall_completeness"]) for row in rows]
+    all_candidate_states = {
+        "N": len(all_candidates),
+        "INCOMPLETE": sum(
+            row["data_status"] == "INCOMPLETE" for row in all_candidates
+        ),
+        "High": sum(row["uncertainty"] == "High" for row in all_candidates),
+        "Toss-up": sum(row["tier"] == "Toss-up" for row in all_candidates),
+    }
+    neutral_components = {}
+    for component in ("defense", "environment"):
+        neutral_components[component] = {
+            "N": len(all_candidates),
+            "away_score_50": sum(
+                float(row[f"away_{component}_score"]) == 50.0
+                for row in all_candidates
+            ),
+            "home_score_50": sum(
+                float(row[f"home_{component}_score"]) == 50.0
+                for row in all_candidates
+            ),
+            "quality_zero": sum(
+                float(row[f"{component}_quality"]) == 0.0
+                for row in all_candidates
+            ),
+        }
     return {
         "top1_states": {
             "INCOMPLETE": sum(row["data_status"] == "INCOMPLETE" for row in rows),
@@ -582,6 +676,8 @@ def quality_diagnostic(
             "max": max(completeness),
             "mean": statistics.fmean(completeness),
         },
+        "all_candidate_states": all_candidate_states,
+        "neutral_components": neutral_components,
         "training_eligible_rows": card["counts"]["training_eligible_rows"],
     }
 
@@ -590,6 +686,10 @@ def audit_leakage_evidence(
     candidate_rows: Sequence[Mapping[str, object]],
     card: Mapping[str, object],
     manual_text: str,
+    *,
+    locked_prediction_rows: Sequence[Mapping[str, object]],
+    evaluated_rows: Sequence[Mapping[str, object]],
+    lock_audit: Mapping[str, object],
 ) -> dict[str, object]:
     if len(candidate_rows) != int(card["counts"]["candidate_rows"]):
         raise ValueError("leakage evidence candidate count differs")
@@ -623,6 +723,52 @@ def audit_leakage_evidence(
         card["counts"]["calibration_rows"]
     ):
         raise ValueError("calibration pool evidence differs")
+    try:
+        sealed_lock = lock_audit["sealed_lock"]
+        lock_created_at = str(sealed_lock["created_at_utc"])
+        sealed_row_count = int(sealed_lock["row_count"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("lock sequencing evidence is incomplete") from exc
+    try:
+        parsed_lock_time = datetime.fromisoformat(lock_created_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("lock sequencing evidence is invalid") from exc
+    if parsed_lock_time.tzinfo is None or sealed_row_count != len(
+        locked_prediction_rows
+    ):
+        raise ValueError("lock sequencing evidence is invalid")
+    forbidden_outcome_fields = {
+        "outcome",
+        "actual_winner",
+        "status",
+        "market_snapshot_at",
+        "market_source",
+        "market_favorite",
+        "away_no_vig_probability",
+        "home_no_vig_probability",
+    }
+    if any(forbidden_outcome_fields & set(row) for row in locked_prediction_rows):
+        raise ValueError("locked prediction outcome isolation differs")
+    if len(locked_prediction_rows) != len(evaluated_rows):
+        raise ValueError("locked/evaluated prediction binding differs")
+    for locked, evaluated in zip(
+        locked_prediction_rows, evaluated_rows, strict=True
+    ):
+        prediction = {key: value for key, value in evaluated.items() if key != "outcome"}
+        if canonical_json_bytes(locked) != canonical_json_bytes(prediction):
+            raise ValueError("locked/evaluated prediction binding differs")
+    joined_at = lock_audit.get("outcome_joined_at_utc")
+    sequence_status = "NOT_TIMESTAMP_PROVEN"
+    if joined_at is not None:
+        try:
+            parsed_join_time = datetime.fromisoformat(
+                str(joined_at).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("lock sequencing evidence is invalid") from exc
+        if parsed_join_time.tzinfo is None or parsed_join_time <= parsed_lock_time:
+            raise ValueError("lock sequencing evidence is invalid")
+        sequence_status = "PASS"
     later_revision_rows = sum(
         str(row["provenance"]["raw_source_max_date"])
         > str(row["official_date"])
@@ -630,7 +776,7 @@ def audit_leakage_evidence(
     )
     return {
         "statistical_as_of_safety": {
-            "status": "PASS",
+            "status": "PASS" if sequence_status == "PASS" else "LIMITATION",
             "candidate_rows": len(candidate_rows),
             "rule": (
                 "max_history_date and schedule_used_max_date < target; "
@@ -639,6 +785,14 @@ def audit_leakage_evidence(
             "calibration_status": "IN_SAMPLE_NOT_OOF",
             "training_eligible_rows": card["counts"]["training_eligible_rows"],
             "calibration_rows": card["counts"]["calibration_rows"],
+            "d1_feature_isolation_status": "PASS",
+            "locked_prediction_outcome_fields_status": "PASS",
+            "lock_to_outcome_join_sequence_status": sequence_status,
+            "sequence_limitation": (
+                None
+                if sequence_status == "PASS"
+                else "sealed artifacts contain no outcome-join execution timestamp"
+            ),
         },
         "participant_time_limitation": {
             "status": "LIMITATION",
@@ -657,16 +811,16 @@ def audit_leakage_evidence(
 
 
 def leakage_diagnostic(
-    root: Path,
-    rows: Sequence[Mapping[str, object]],
-    card: Mapping[str, object],
+    evidence: V51Evidence,
 ) -> dict[str, object]:
-    del rows
-    candidate_rows = read_jsonl(
-        root / "data/v5_1_bt/features/candidate_raw_features.jsonl"
+    return audit_leakage_evidence(
+        evidence.candidate_rows,
+        evidence.model_card,
+        evidence.manual_audit_text,
+        locked_prediction_rows=evidence.locked_prediction_rows,
+        evaluated_rows=evidence.evaluated_rows,
+        lock_audit=evidence.lock_audit,
     )
-    manual = (root / "audit/v5_1_bt/manual_audit.md").read_text(encoding="utf-8")
-    return audit_leakage_evidence(candidate_rows, card, manual)
 
 
 def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
@@ -686,7 +840,7 @@ def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
         {
             "id": path.replace("/", "-").replace(".", "-"),
             "path": path,
-            "sha256": sha256_file(evidence.root / path),
+            "sha256": evidence.source_file_sha256[path],
         }
         for path in paths
     ]
@@ -716,7 +870,7 @@ def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
             "max_losing_streak": base_primary["max_losing_streak"],
         },
         "baselines": baseline_diagnostics(top1, evidence.baseline_by_game),
-        "calibration": base["calibration"],
+        "calibration": calibration_diagnostic(base["calibration"]),
         "discrimination": discrimination(top1),
         "thresholds": threshold_results(top1),
         "rank": rank_diagnostic(all_graded),
@@ -727,10 +881,10 @@ def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
         "teams": team_diagnostic(top1),
         "team_concentration": team_concentration(top1),
         "components": component_diagnostic(top1),
-        "data_quality": quality_diagnostic(top1, evidence.model_card),
-        "leakage": leakage_diagnostic(
-            evidence.root, top1, evidence.model_card
+        "data_quality": quality_diagnostic(
+            top1, evidence.locked_prediction_rows, evidence.model_card
         ),
+        "leakage": leakage_diagnostic(evidence),
         "interpretation": {
             "incremental_value": "NOT_ESTABLISHED",
             "live_reproducibility": "NOT_ESTABLISHED",

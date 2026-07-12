@@ -1,6 +1,8 @@
 from pathlib import Path
 import copy
 import json
+import shutil
+import tempfile
 import unittest
 
 from mlb_backtest.diagnostics import (
@@ -9,6 +11,7 @@ from mlb_backtest.diagnostics import (
     audit_leakage_evidence,
     audited_digest_map,
     build_diagnostic,
+    canonical_json_bytes,
     chosen_side_edge,
     component_summary,
     exact_mcnemar,
@@ -173,6 +176,35 @@ class DiagnosticGoldenTest(unittest.TestCase):
             self.result["data_quality"]["completeness"]["mean"], 0.4602764334, places=10
         )
 
+    def test_calibration_separates_conditional_mean_from_overall_contribution(self):
+        bins = self.result["calibration"]["bins"]
+        self.assertTrue(all("mean_brier" in row for row in bins))
+        self.assertTrue(all("brier_contribution" in row for row in bins))
+        self.assertEqual(bins[0]["mean_brier"], None)
+        self.assertEqual(bins[0]["brier_contribution"], 0.0)
+        for row in bins:
+            expected = (row["mean_brier"] or 0.0) * row["N"] / 100
+            self.assertAlmostEqual(row["brier_contribution"], expected)
+        self.assertAlmostEqual(
+            sum(row["brier_contribution"] for row in bins),
+            self.result["primary"]["brier"],
+        )
+
+    def test_all_candidate_quality_and_neutral_component_evidence(self):
+        quality = self.result["data_quality"]
+        self.assertEqual(
+            quality["all_candidate_states"],
+            {"N": 1340, "INCOMPLETE": 1340, "High": 1340, "Toss-up": 1340},
+        )
+        expected = {
+            "N": 1340,
+            "away_score_50": 1340,
+            "home_score_50": 1340,
+            "quality_zero": 1340,
+        }
+        self.assertEqual(quality["neutral_components"]["defense"], expected)
+        self.assertEqual(quality["neutral_components"]["environment"], expected)
+
     def test_exact_secondary_statistics(self):
         self.assertEqual(
             self.result["sides"],
@@ -240,22 +272,31 @@ class DiagnosticGoldenTest(unittest.TestCase):
             set(self.result["leakage"]),
             {"statistical_as_of_safety", "participant_time_limitation", "source_revision_limitation"},
         )
-        self.assertEqual(self.result["leakage"]["statistical_as_of_safety"]["status"], "PASS")
+        safety = self.result["leakage"]["statistical_as_of_safety"]
+        self.assertEqual(safety["status"], "LIMITATION")
+        self.assertEqual(safety["d1_feature_isolation_status"], "PASS")
+        self.assertEqual(safety["locked_prediction_outcome_fields_status"], "PASS")
+        self.assertEqual(safety["lock_to_outcome_join_sequence_status"], "NOT_TIMESTAMP_PROVEN")
         self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
         self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
 
     def test_leakage_evidence_tampering_fails(self):
         evidence = load_v51_evidence(ROOT)
-        raw = jsonable(
-            json.loads(
-                (ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()[0]
-            )
-        )
+        raw = jsonable(evidence.candidate_rows[0])
         card = jsonable(evidence.model_card)
         card["counts"]["candidate_rows"] = 1
-        manual = (ROOT / "audit/v5_1_bt/manual_audit.md").read_text(encoding="utf-8")
+        manual = evidence.manual_audit_text
+
+        def audit(candidate_rows, *, locked=None, evaluated=None, audit=None):
+            return audit_leakage_evidence(
+                candidate_rows,
+                card,
+                manual,
+                locked_prediction_rows=(locked or evidence.locked_prediction_rows),
+                evaluated_rows=(evaluated or evidence.evaluated_rows),
+                lock_audit=(audit or evidence.lock_audit),
+            )
+
         for mutate in (
             lambda x: x["provenance"].__setitem__("max_history_date", x["official_date"]),
             lambda x: x["provenance"].__setitem__("statcast_target_excluded", False),
@@ -264,9 +305,55 @@ class DiagnosticGoldenTest(unittest.TestCase):
             changed = copy.deepcopy(raw)
             mutate(changed)
             with self.assertRaisesRegex(ValueError, "leakage evidence"):
-                audit_leakage_evidence((changed,), card, manual)
+                audit((changed,))
         with self.assertRaisesRegex(ValueError, "manual audit evidence"):
-            audit_leakage_evidence((raw,), card, manual.replace("2025-06-15", "missing"))
+            audit_leakage_evidence(
+                (raw,),
+                card,
+                manual.replace("2025-06-15", "missing"),
+                locked_prediction_rows=evidence.locked_prediction_rows,
+                evaluated_rows=evidence.evaluated_rows,
+                lock_audit=evidence.lock_audit,
+            )
+
+        locked = jsonable(evidence.locked_prediction_rows)
+        locked[0]["outcome"] = {"actual_winner": "forbidden"}
+        with self.assertRaisesRegex(ValueError, "locked prediction outcome isolation"):
+            audit((raw,), locked=locked)
+
+        mismatched = jsonable(evidence.evaluated_rows)
+        mismatched[0]["predicted_winner"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "locked/evaluated prediction binding"):
+            audit((raw,), evaluated=mismatched)
+
+        malformed_audit = jsonable(evidence.lock_audit)
+        del malformed_audit["sealed_lock"]["created_at_utc"]
+        with self.assertRaisesRegex(ValueError, "lock sequencing evidence"):
+            audit((raw,), audit=malformed_audit)
+
+    def test_loaded_evidence_is_snapshot_bound_after_source_mutation(self):
+        paths = set(AUDITED_DIGEST_PATHS.values()) | {
+            "audit/v5_1_bt/lock_manifest.json",
+            "audit/v5_1_bt/manual_audit.md",
+            "config/v5_1_bt.json",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            copied_root = Path(td)
+            for relative in paths:
+                target = copied_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            evidence = load_v51_evidence(copied_root)
+            before = canonical_json_bytes(build_diagnostic(evidence))
+            for relative in (
+                "data/v5_1_bt/features/candidate_raw_features.jsonl",
+                "data/v5_1_bt/locked/predictions.jsonl",
+                "audit/v5_1_bt/manual_audit.md",
+                "config/v5_1_bt.json",
+            ):
+                (copied_root / relative).write_text("tampered\n", encoding="utf-8")
+            after = canonical_json_bytes(build_diagnostic(evidence))
+            self.assertEqual(after, before)
 
     def test_all_chosen_side_means_team_intervals_and_training_count(self):
         self.assertEqual(
