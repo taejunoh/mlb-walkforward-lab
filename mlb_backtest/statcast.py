@@ -605,19 +605,26 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
 
 
 def derive_outs_recorded(
-    statcast: StatcastData, final_outs_by_game: Mapping[int, int]
+    statcast: StatcastData,
+    final_outs_by_game: Mapping[int, int],
+    *,
+    final_half_by_game: Mapping[int, tuple[int, str]] | None = None,
 ) -> StatcastData:
     """Derive pitcher outs from official pre-pitch states and final linescores.
 
     Baseball Savant exposes ``outs_when_up`` (the pre-pitch state), not an
     outs-on-play field.  Consecutive pitch states therefore carry the exact
     state transition, including outs made between pitches or on the bases.
-    The final pitch of each game is closed by MLB's hydrated linescore outs.
+    The final pitch is closed by MLB's hydrated inning, half, and outs state.
+    A legal advance to the next half-inning means the prior half reached three
+    outs even when the final linescore has already reset its outs counter.
     """
     if not isinstance(statcast, StatcastData) or not isinstance(
         final_outs_by_game, Mapping
     ):
         raise ValueError("statcast and final_outs_by_game are required")
+    if final_half_by_game is not None and not isinstance(final_half_by_game, Mapping):
+        raise ValueError("final_half_by_game must be a mapping")
     by_game: dict[int, list[dict[str, object]]] = {}
     for raw in statcast.pitches:
         row = dict(raw)
@@ -648,7 +655,29 @@ def derive_outs_recorded(
             next_row = rows[index + 1] if index + 1 < len(rows) else None
             current_half = (int(row["inning"]), str(row["inning_topbot"]))
             if next_row is None:
-                post = final_outs
+                final_half = (
+                    final_half_by_game.get(game_pk)
+                    if final_half_by_game is not None
+                    else None
+                )
+                if final_half is None or final_half == current_half:
+                    post = final_outs
+                else:
+                    legal_next = (
+                        (
+                            current_half[1] == "Top"
+                            and final_half == (current_half[0], "Bot")
+                        )
+                        or (
+                            current_half[1] == "Bot"
+                            and final_half == (current_half[0] + 1, "Top")
+                        )
+                    )
+                    if not legal_next:
+                        raise ValueError(
+                            f"game {game_pk}: illegal final half-inning transition"
+                        )
+                    post = 3
             else:
                 next_half = (
                     int(next_row["inning"]),

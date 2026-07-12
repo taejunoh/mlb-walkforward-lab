@@ -111,6 +111,7 @@ def load_statcast_range(
     *,
     catalog=None,
     final_outs_by_game: Mapping[int, int] | None = None,
+    final_half_by_game: Mapping[int, tuple[int, str]] | None = None,
 ) -> tuple[StatcastData, list[str]]:
     """Load exactly one verified, gap-free Statcast partition for a date range."""
     expected = _days(start, end)
@@ -143,7 +144,11 @@ def load_statcast_range(
     if final_outs_by_game is not None:
         from .statcast import derive_outs_recorded
 
-        statcast = derive_outs_recorded(statcast, final_outs_by_game)
+        statcast = derive_outs_recorded(
+            statcast,
+            final_outs_by_game,
+            final_half_by_game=final_half_by_game,
+        )
     return statcast, hashes
 
 
@@ -158,6 +163,22 @@ def _final_outs_by_game(*schedule_sets) -> dict[int, int]:
             if game_pk in result and result[game_pk] != final_outs:
                 raise ValueError("conflicting schedule final outs")
             result[game_pk] = int(final_outs)
+    return result
+
+
+def _final_half_by_game(*schedule_sets) -> dict[int, tuple[int, str]]:
+    result = {}
+    for games in schedule_sets:
+        for game in games:
+            inning = game.get("completed_innings")
+            half = game.get("final_inning_topbot")
+            if type(inning) is not int or half not in {"Top", "Bot"}:
+                continue
+            game_pk = int(game["game_pk"])
+            value = (inning, str(half))
+            if game_pk in result and result[game_pk] != value:
+                raise ValueError("conflicting schedule final half-inning")
+            result[game_pk] = value
     return result
 
 
@@ -540,6 +561,7 @@ def prepare_training_stage(
             end,
             catalog=raw_catalog,
             final_outs_by_game=_final_outs_by_game(evidence.games),
+            final_half_by_game=_final_half_by_game(evidence.games),
         )
         team_map = derive_team_code_map(
             evidence.games,
@@ -798,6 +820,9 @@ def prepare_candidates_stage(
         config["extension_end"],
         catalog=raw_catalog,
         final_outs_by_game=_final_outs_by_game(
+            history_evidence.games, backtest_evidence.games
+        ),
+        final_half_by_game=_final_half_by_game(
             history_evidence.games, backtest_evidence.games
         ),
     )

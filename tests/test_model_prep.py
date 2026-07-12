@@ -33,6 +33,33 @@ ERA = ROOT / "tests" / "fixtures" / "mlb_pitching_stats.json"
 
 
 class ModelPreparationSourceTest(unittest.TestCase):
+    def test_statcast_loader_closes_terminal_half_from_schedule_state(self):
+        payload = (
+            Path(__file__).parent / "fixtures" / "statcast_preparation_e2e.csv"
+        ).read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-02",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-02", "2024-04-02"),
+                },
+                payload,
+            )
+
+            loaded, _hashes = load_statcast_range(
+                root,
+                "2024-04-02",
+                "2024-04-02",
+                final_outs_by_game={1002: 0},
+                final_half_by_game={1002: (2, "Top")},
+            )
+
+        self.assertEqual(loaded.pitches[-1]["outs_recorded"], 1)
+
     def test_statcast_loader_ignores_sealed_capped_parent_when_children_cover_range(self):
         lines = STATCAST.read_bytes().splitlines()
 

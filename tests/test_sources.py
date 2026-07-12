@@ -168,6 +168,7 @@ class SourceTest(unittest.TestCase):
                 "scheduled_innings": None,
                 "completed_innings": None,
                 "final_outs": None,
+                "final_inning_topbot": None,
                 "doubleheader_marker": None,
                 "away_lineup": [
                     {"player_id": 664023, "player_name": "Ian Happ"},
@@ -372,6 +373,24 @@ class SourceTest(unittest.TestCase):
             path = Path(td) / "schedule.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "linescore.outs"):
+                parse_schedule(path)
+
+    def test_completed_game_preserves_and_validates_final_half_inning(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        linescore = payload["dates"][0]["games"][0]["linescore"] = {
+            "currentInning": 5,
+            "inningHalf": "Bottom",
+            "isTopInning": False,
+            "outs": 0,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(parse_schedule(path)[0]["final_inning_topbot"], "Bot")
+
+            linescore["isTopInning"] = True
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "linescore.*half-inning"):
                 parse_schedule(path)
 
     def test_rescheduled_duplicate_game_pk_prefers_played_record_but_rejects_conflicts(self):

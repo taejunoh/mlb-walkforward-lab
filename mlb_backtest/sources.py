@@ -255,6 +255,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     )
     completed_innings = None
     final_outs = None
+    final_inning_topbot = None
     linescore_value = game.get("linescore")
     if linescore_value is not None:
         linescore = _mapping(linescore_value, f"game[{index}].linescore")
@@ -263,6 +264,28 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
             if type(current_inning) is not int or current_inning <= 0:
                 raise ValueError("malformed schedule: linescore.currentInning must be positive")
             completed_innings = current_inning
+        inning_half = linescore.get("inningHalf")
+        if inning_half is not None:
+            if inning_half not in {"Top", "Bottom"}:
+                raise ValueError(
+                    "malformed schedule: linescore half-inning must be Top or Bottom"
+                )
+            final_inning_topbot = "Top" if inning_half == "Top" else "Bot"
+        is_top_inning = linescore.get("isTopInning")
+        if is_top_inning is not None:
+            if type(is_top_inning) is not bool:
+                raise ValueError(
+                    "malformed schedule: linescore.isTopInning must be a boolean"
+                )
+            boolean_half = "Top" if is_top_inning else "Bot"
+            if (
+                final_inning_topbot is not None
+                and final_inning_topbot != boolean_half
+            ):
+                raise ValueError(
+                    "malformed schedule: linescore half-inning fields conflict"
+                )
+            final_inning_topbot = boolean_half
         outs = linescore.get("outs")
         if outs is not None:
             if type(outs) is not int or not 0 <= outs <= 3:
@@ -273,6 +296,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     if status_name not in {"Final", "Completed Early"}:
         completed_innings = None
         final_outs = None
+        final_inning_topbot = None
 
     venue_value = game.get("venue")
     if venue_value is None:
@@ -320,6 +344,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         ),
         "completed_innings": completed_innings,
         "final_outs": final_outs,
+        "final_inning_topbot": final_inning_topbot,
         "doubleheader_marker": _doubleheader_marker(game, f"game[{index}]"),
         "away_lineup": _lineup(
             lineups, "awayPlayers", f"game[{index}].lineups"

@@ -407,8 +407,45 @@ class StatcastTest(unittest.TestCase):
             ],
             0,
         )
+        self.assertEqual(
+            derive_outs_recorded(
+                statcast,
+                {778108: 1},
+                final_half_by_game={778108: (10, "Bot")},
+            ).pitches[0]["outs_recorded"],
+            0,
+        )
         with self.assertRaisesRegex(ValueError, "final linescore outs"):
             derive_outs_recorded(statcast, {})
+
+    def test_final_pitch_closes_half_when_linescore_has_advanced(self):
+        row = {
+            "game_date": "2022-08-04",
+            "game_pk": 661565,
+            "pitcher_id": 592789,
+            "batter_id": 641943,
+            "events": "double_play",
+            "inning": 5,
+            "inning_topbot": "Top",
+            "at_bat_number": 44,
+            "pitch_number": 5,
+            "outs_when_up": 1,
+            "event_id": "661565:44",
+        }
+
+        derived = derive_outs_recorded(
+            StatcastData((row,), (row,)),
+            {661565: 0},
+            final_half_by_game={661565: (5, "Bot")},
+        )
+
+        self.assertEqual(derived.pitches[0]["outs_recorded"], 2)
+        with self.assertRaisesRegex(ValueError, "illegal final half-inning"):
+            derive_outs_recorded(
+                StatcastData((row,), (row,)),
+                {661565: 0},
+                final_half_by_game={661565: (6, "Top")},
+            )
 
     def test_out_state_regression_and_illegal_half_transition_are_rejected(self):
         base = {
