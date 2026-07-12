@@ -67,11 +67,94 @@ The diagnostic must bind these authoritative identities:
 - Create `tests/test_diagnostics.py`, `tests/test_diagnostic_report.py`, `tests/test_notebook_artifact.py`, `tests/test_report_artifact.py`, `tests/test_protocols.py`, `tests/test_preflight.py`, and `tests/test_verify_v52_design.py`.
 - Add small deterministic fixtures beneath `tests/fixtures/v5_2_qd/` only where a failure mode cannot be expressed inline.
 
+## Complete module import blocks
+
+Each new module starts with its complete block below; later snippets do not rely on ambient imports.
+
+`mlb_backtest/diagnostics.py`:
+
+```python
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from types import MappingProxyType
+import hashlib, json, math, statistics
+from mlb_backtest.metrics import evaluate, wilson
+```
+
+`mlb_backtest/diagnostic_report.py`:
+
+```python
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+import argparse, json
+from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, load_v51_evidence, sha256_file
+```
+
+`mlb_backtest/notebook_artifact.py`:
+
+```python
+from collections.abc import Sequence
+from pathlib import Path
+import contextlib, io, json
+from mlb_backtest.diagnostics import canonical_json_bytes
+```
+
+`mlb_backtest/report_artifact.py`:
+
+```python
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+import argparse, json
+from mlb_backtest.diagnostics import canonical_json_bytes
+```
+
+`mlb_backtest/protocols.py`:
+
+```python
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from types import MappingProxyType
+from typing import NoReturn
+import argparse, hashlib, json, math, subprocess
+from mlb_backtest.diagnostics import canonical_json_bytes, deep_freeze, sha256_file
+```
+
+`mlb_backtest/preflight.py`:
+
+```python
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from datetime import date, timedelta
+from pathlib import Path
+from types import MappingProxyType
+import argparse, hashlib, json
+from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
+from mlb_backtest.protocols import MINIMUM_SOURCE_NAMES, OPTIONAL_SOURCE_NAMES, RunSpec, expected_historical_run, load_run_spec, parse_run_spec, require_exact_keys
+```
+
+`mlb_backtest/verify_v52_design.py`:
+
+```python
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+import argparse, hashlib, json, subprocess
+from mlb_backtest.diagnostic_report import render_markdown
+from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, load_v51_evidence, sha256_file
+from mlb_backtest.preflight import PREFLIGHT_REQUIRED_KEYS, parse_preflight, render_preflight_markdown
+from mlb_backtest.protocols import ProspectiveSpec, RunSpec, V52Config, deep_freeze, load_prospective_spec, load_run_spec, load_v52_config, parse_change_contract
+from mlb_backtest.report_artifact import build_chart_map, build_report_artifact
+```
+
 ## Data Analytics report contract
 
 The report audience is exactly `product stakeholders`, using the executive report structure: title, visible `Executive Summary`, key findings with visual evidence, recommended next steps, further questions, and caveats/assumptions. The Data Analytics MCP report renderer is not callable in this Codex runtime, so self-contained HTML is the single available durable fallback; this is a runtime fallback, not a claim that the user explicitly requested HTML. Before Task 5 begins, the implementer must announce and fully read the installed `data-analytics:build-report` and `data-analytics:visualize-data` skills, then read `skills/build-report/specifications/executive-report.md`, `skills/build-report/specifications/mcp-app-report.md`, `src/analytics-app-core.md`, and `src/analytics-app/types.ts` from plugin version `0.2.8-13ceeea1f599`. If those installed contracts change, update the artifact to the installed validator rather than copying this plan's older shape.
 
-The source file is the complete canonical `reports/v5_1_bt/diagnostic_100_artifact.json`. Its top-level keys are exactly `surface`, `manifest`, `snapshot`, and `sources`. `surface` is `report`. `manifest` has exactly `version`, `surface`, `title`, `generatedAt`, `blocks`, `charts`, `tables`, and `sources`; it must not contain rejected fields such as `audience`, `freshness`, or `definitions`. `snapshot` has exactly `version`, `generatedAt`, `status`, and `datasets`; status is `ready`, so the rejected/irrelevant `accessIssues` field is absent. Both version fields are integer `1`, and both `generatedAt` values are the same stable RFC3339 value `2026-07-12T00:00:00Z`. Markdown blocks use `body`, never `markdown`, `content`, or `title`. Chart/table blocks appear in the narrative reading order and reference definitions with `chartId`/`tableId`. Every quantitative Markdown/chart/table definition has exact canonical `sourceId` provenance.
+The source file is the complete canonical `reports/v5_1_bt/diagnostic_100_artifact.json`. Its top-level keys are exactly `surface`, `manifest`, `snapshot`, and `sources`. `surface` is `report`. `manifest` has exactly `version`, `surface`, `title`, `generatedAt`, `blocks`, `charts`, `tables`, and `sources`; it must not contain rejected fields such as `audience`, `freshness`, or `definitions`. `snapshot` has exactly `version`, `generatedAt`, `status`, and `datasets`; status is `ready`, so the rejected/irrelevant `accessIssues` field is absent. Both version fields are integer `1`; both `generatedAt` values are `null` because no truthful source-observation generation timestamp exists for this deterministic design artifact. Markdown blocks use `body`, never `markdown`, `content`, or `title`. Chart/table blocks appear in the narrative reading order and reference definitions with `chartId`/`tableId`. Every quantitative Markdown/chart/table definition has exact canonical `sourceId` provenance.
 
 Use these chart contracts and no others:
 
@@ -386,6 +469,19 @@ class DiagnosticGoldenTest(unittest.TestCase):
         self.assertEqual(self.result["leakage"]["statistical_as_of_safety"]["status"], "PASS")
         self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
         self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
+
+    def test_leakage_evidence_tampering_fails(self):
+        evidence = load_v51_evidence(ROOT); raw = jsonable(read_jsonl(ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl")[0])
+        card = jsonable(evidence.model_card); card["counts"]["candidate_rows"] = 1
+        manual = (ROOT / "audit/v5_1_bt/manual_audit.md").read_text()
+        for mutate in (lambda x: x["provenance"].__setitem__("max_history_date", x["official_date"]),
+                       lambda x: x["provenance"].__setitem__("statcast_target_excluded", False),
+                       lambda x: x.__setitem__("lineup_provenance", "TIMESTAMP_VERIFIED_T45")):
+            changed = copy.deepcopy(raw); mutate(changed)
+            with self.assertRaisesRegex(ValueError, "leakage evidence"):
+                audit_leakage_evidence((changed,), card, manual)
+        with self.assertRaisesRegex(ValueError, "manual audit evidence"):
+            audit_leakage_evidence((raw,), card, manual.replace("2025-06-15", "missing"))
 ```
 
 Also assert all eight chosen-side means literally:
@@ -581,10 +677,26 @@ def quality_diagnostic(rows: Sequence[Mapping[str, object]], card: Mapping[str, 
             "completeness": {"min": min(completeness), "max": max(completeness), "mean": statistics.fmean(completeness)},
             "training_eligible_rows": card["counts"]["training_eligible_rows"]}
 
-def leakage_diagnostic(root: Path, rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
-    return {"statistical_as_of_safety": {"status": "PASS", "rule": "max_history_date <= D-1; target gamePk excluded; outcomes inaccessible before lock"},
+def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], card: Mapping[str, object], manual_text: str) -> dict[str, object]:
+    if len(candidate_rows) != int(card["counts"]["candidate_rows"]): raise ValueError("leakage evidence candidate count differs")
+    for row in candidate_rows:
+        provenance = row["provenance"]; target = date.fromisoformat(str(row["official_date"]));
+        if date.fromisoformat(str(provenance["max_history_date"])) >= target or date.fromisoformat(str(provenance["schedule_used_max_date"])) >= target or provenance["statcast_target_excluded"] is not True:
+            raise ValueError("leakage evidence violates D-1/target exclusion")
+        if row["lineup_provenance"] != "RECONSTRUCTED_FINAL_LINEUP" or row["starter_provenance"] != "RECONSTRUCTED_ACTUAL_STARTER":
+            raise ValueError("leakage evidence participant provenance differs")
+    required_manual = ("2025-05-01", "2025-06-15", "2025-08-12", "max history date", "statcast_target_excluded=true", "RECONSTRUCTED_FINAL_LINEUP", "RECONSTRUCTED_ACTUAL_STARTER")
+    if any(token not in manual_text for token in required_manual): raise ValueError("manual audit evidence incomplete")
+    if int(card["counts"]["training_eligible_rows"]) != int(card["counts"]["calibration_rows"]): raise ValueError("calibration pool evidence differs")
+    later_revision_rows = sum(str(row["provenance"]["raw_source_max_date"]) > str(row["official_date"]) for row in candidate_rows)
+    return {"statistical_as_of_safety": {"status": "PASS", "candidate_rows": len(candidate_rows), "rule": "max_history_date and schedule_used_max_date < target; target Statcast excluded", "calibration_status": "IN_SAMPLE_NOT_OOF", "training_eligible_rows": card["counts"]["training_eligible_rows"], "calibration_rows": card["counts"]["calibration_rows"]},
             "participant_time_limitation": {"status": "LIMITATION", "lineup": "RECONSTRUCTED_FINAL_LINEUP", "starter": "RECONSTRUCTED_ACTUAL_STARTER"},
-            "source_revision_limitation": {"status": "LIMITATION", "rule": "retrieval hashes reproduce later provider state, not a historical database snapshot"}}
+            "source_revision_limitation": {"status": "LIMITATION", "later_revision_rows": later_revision_rows, "rule": "manifest hashes bind retrieved provider state, not historical database state"}}
+
+def leakage_diagnostic(root: Path, rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
+    candidate_rows = read_jsonl(root / "data/v5_1_bt/features/candidate_raw_features.jsonl")
+    manual = (root / "audit/v5_1_bt/manual_audit.md").read_text(encoding="utf-8")
+    return audit_leakage_evidence(candidate_rows, card, manual)
 
 def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
     paths = ("data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl", "data/v5_1_bt/reports/summary.json", "data/v5_1_bt/outcomes/baseline.json",
@@ -826,7 +938,8 @@ class ReportArtifactTest(unittest.TestCase):
         self.assertEqual(artifact["surface"], "report")
         self.assertEqual(set(artifact["manifest"]), {"version", "surface", "title", "generatedAt", "blocks", "charts", "tables", "sources"})
         self.assertEqual(artifact["manifest"]["version"], 1)
-        self.assertEqual(artifact["manifest"]["generatedAt"], "2026-07-12T00:00:00Z")
+        self.assertIsNone(artifact["manifest"]["generatedAt"])
+        self.assertIsNone(artifact["snapshot"]["generatedAt"])
         self.assertNotIn("audience", artifact["manifest"])
         blocks = artifact["manifest"]["blocks"]
         self.assertEqual(blocks[0], {"id": "title", "type": "markdown", "body": "# MLB v5.1 100픽 진단"})
@@ -855,7 +968,6 @@ Expected: `ERROR` importing `mlb_backtest.report_artifact`.
 - [ ] **Step 3: Implement the artifact transformer and chart map**
 
 ```python
-GENERATED_AT = "2026-07-12T00:00:00Z"
 REPORT_SOURCE = {
     "id": "diagnostic-json",
     "label": "Canonical v5.1 diagnostic",
@@ -865,7 +977,7 @@ REPORT_SOURCE = {
         "id": "v5.1-BT-diagnostic-100",
         "description": "Sealed Daily Top 1 diagnostic derived from audited v5.1 files.",
         "language": "python",
-        "executed_at": GENERATED_AT,
+        "executed_at": None,
         "tables_used": ["data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl", "data/v5_1_bt/outcomes/baseline.json"],
         "filters": ["top1=Yes", "outcome.status=Final", "official_date 2025-05-01 through 2025-08-12", "season-record tie excluded only from paired season denominator"],
         "metric_definitions": ["Accuracy=W/N", "Brier=mean((pick_probability-correct)^2)", "Log loss=-mean(y log p+(1-y) log(1-p))", "ECE=sum_bin(N_bin/N)*abs(mean_probability-accuracy)", "chosen-side edge=(home-away edge)*(+1 home prediction; -1 away prediction)"],
@@ -908,9 +1020,9 @@ def build_report_artifact(diagnostic: Mapping[str, object]) -> dict[str, object]
         markdown_block("further-questions", further_questions_body()),
         markdown_block("caveats", caveats_body(diagnostic), sourced=True),
     ]
-    manifest = {"version": 1, "surface": "report", "title": "MLB v5.1 100픽 진단", "generatedAt": GENERATED_AT,
+    manifest = {"version": 1, "surface": "report", "title": "MLB v5.1 100픽 진단", "generatedAt": None,
                 "blocks": blocks, "charts": charts, "tables": tables, "sources": [REPORT_SOURCE]}
-    snapshot = {"version": 1, "generatedAt": GENERATED_AT, "status": "ready", "datasets": datasets}
+    snapshot = {"version": 1, "generatedAt": None, "status": "ready", "datasets": datasets}
     return {"surface": "report", "manifest": manifest, "snapshot": snapshot, "sources": [REPORT_SOURCE]}
 
 def baseline_pair_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
@@ -1145,6 +1257,20 @@ class V52ConfigTest(unittest.TestCase):
         self.assertEqual(direction_from_p_home(.5), (None, .5, "NO_DIRECTION_AT_50"))
         self.assertEqual(optional_neutral("environment"), (50.0, 0.0, "ENV_NEUTRAL_NO_ASOF_SOURCE"))
         self.assertEqual(optional_neutral("defense"), (50.0, 0.0, "DEF_NEUTRAL_NO_ASOF_SOURCE"))
+        qualities = {"starter": .8, "offense": .7, "bullpen": .6, "environment": 0, "defense": 0, "schedule": 1}
+        baseline = data_completeness_score(qualities)
+        expected_tier = classify_v52(.63, baseline, "Medium", critical=False)
+        expected_rank = ranking_key(.63, baseline, 4, "2025-05-01T17:00:00Z", 1)
+        for agreement, legacy in ((0, 0), (1, 10), (.37, 4.2)):
+            score = data_completeness_score(qualities, component_agreement=agreement, legacy_selection_quality_score=legacy)
+            self.assertEqual(score, baseline)
+            self.assertEqual(classify_v52(.63, score, "Medium", critical=False), expected_tier)
+            self.assertEqual(ranking_key(.63, score, 4, "2025-05-01T17:00:00Z", 1), expected_rank)
+        self.assertEqual(classify_uncertainty(7.49, 200, False, critical=False), "High")
+        self.assertEqual(classify_uncertainty(8.99, 200, False, critical=False), "Medium")
+        self.assertEqual(classify_uncertainty(9.0, 149, False, critical=False), "Medium")
+        self.assertEqual(classify_uncertainty(9.0, 150, False, critical=False), "Low")
+        self.assertEqual(read_legacy_confidence({"confidence": 4.2}), {"legacy_selection_quality_score": 4.2})
 
     def test_schema_mirrors_parser_constants_and_frozen_values(self):
         raw, schema = json.loads(V52_CONFIG.read_text()), json.loads(V52_SCHEMA.read_text())
@@ -1216,13 +1342,6 @@ def require_exact_keys(value: object, expected: frozenset[str], path: str) -> Ma
         raise ValueError(f"{path} keys differ; missing={sorted(expected - actual)} unknown={sorted(actual - expected)}")
     return value
 
-def deep_freeze(value: object) -> object:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(k): deep_freeze(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return tuple(deep_freeze(v) for v in value)
-    return value
-
 def validate_internal_metrics(value: object) -> None:
     obj = require_exact_keys(value, frozenset(INTERNAL_METRIC_LITERALS), "internal_metrics")
     if obj != INTERNAL_METRIC_LITERALS:
@@ -1263,9 +1382,8 @@ def expected_v52_config() -> dict[str, object]:
         {"tier": "Lean", "critical": False, "uncertainty": "not_High", "min_probability": .54, "min_completeness": 8.0},
         {"tier": "Toss-up", "critical": False, "uncertainty": "fallback", "min_probability": None, "min_completeness": None},
     ]
-    eligibility = [{"event": event, "historical": "apply_if_relevant", "prospective": "apply_if_relevant",
-                    "disposition": disposition, "reason_code": reason, "run_invalid": disposition == "RUN_INVALID"}
-                   for event, (disposition, reason) in ELIGIBILITY_DISPOSITIONS.items()]
+    eligibility = [{"event": event, "historical": values[0], "prospective": values[1], "disposition": values[2],
+                    "reason_code": values[3], "run_invalid": values[4]} for event, values in ELIGIBILITY_MATRIX.items()]
     return {"schema_version": 1, "model_version": "v5.2-QD", "protocol": "Quality-and-Data Discipline",
             "component_weights": dict(COMPONENT_WEIGHTS), "internal_metrics": INTERNAL_METRIC_LITERALS,
             "shrinkage_constants": dict(SHRINKAGE_CONSTANTS), "probability_clip": [.10, .90],
@@ -1305,15 +1423,39 @@ def parse_v52_config(raw: object) -> V52Config:
 def load_v52_config(path: Path) -> V52Config:
     return parse_v52_config(json.loads(path.read_text(encoding="utf-8")))
 
-def data_completeness_score(qualities: Mapping[str, float]) -> float:
-    clipped = {name: min(1.0, max(0.0, float(qualities[name]))) for name in COMPONENT_WEIGHTS}
+def finite_number(value: object, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{path} must be finite numeric")
+    return float(value)
+
+def data_completeness_score(qualities: Mapping[str, float], *, component_agreement: object = None,
+                            legacy_selection_quality_score: object = None) -> float:
+    require_exact_keys(qualities, frozenset(COMPONENT_WEIGHTS), "qualities")
+    clipped = {name: min(1.0, max(0.0, finite_number(qualities[name], f"qualities.{name}"))) for name in COMPONENT_WEIGHTS}
     return 10.0 * math.fsum(COMPONENT_WEIGHTS[name] * clipped[name] for name in COMPONENT_WEIGHTS)
+
+def classify_uncertainty(completeness: object, starter_prior_career_bf: object, unresolved_context: object, *, critical: object) -> str:
+    score, bf = finite_number(completeness, "completeness"), finite_number(starter_prior_career_bf, "starter_prior_career_bf")
+    if not 0 <= score <= 10 or bf < 0 or not isinstance(unresolved_context, bool) or not isinstance(critical, bool):
+        raise ValueError("uncertainty inputs out of bounds/type")
+    if critical or score < 7.5: return "High"
+    if score < 9.0 or bf < 150 or unresolved_context: return "Medium"
+    return "Low"
+
+def read_legacy_confidence(row: Mapping[str, object]) -> dict[str, float]:
+    require_exact_keys(row, frozenset({"confidence"}), "legacy_confidence")
+    return {"legacy_selection_quality_score": finite_number(row["confidence"], "confidence")}
 
 def ranking_key(probability: float, completeness: float, starter_edge_abs: float,
                 lock_basis_start_utc: str, game_pk: int) -> tuple[float, float, float, str, int]:
-    return (-probability, -completeness, -starter_edge_abs, lock_basis_start_utc, game_pk)
+    p, q, edge = finite_number(probability, "probability"), finite_number(completeness, "completeness"), finite_number(starter_edge_abs, "starter_edge_abs")
+    if not .5 <= p <= .9 or not 0 <= q <= 10 or edge < 0 or not isinstance(lock_basis_start_utc, str) or not lock_basis_start_utc or isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+        raise ValueError("ranking inputs out of bounds/type")
+    return (-p, -q, -edge, lock_basis_start_utc, game_pk)
 
 def direction_from_p_home(p_home: float) -> tuple[str | None, float, str | None]:
+    p_home = finite_number(p_home, "p_home")
+    if not .1 <= p_home <= .9: raise ValueError("p_home outside probability clip")
     if p_home == .5:
         return None, .5, "NO_DIRECTION_AT_50"
     return ("home" if p_home > .5 else "away"), max(p_home, 1 - p_home), None
@@ -1334,6 +1476,22 @@ ELIGIBILITY_DISPOSITIONS = MappingProxyType({
     "environment_no_asof": ("RETAIN_NEUTRAL", "ENV_NEUTRAL_NO_ASOF_SOURCE"), "defense_no_asof": ("RETAIN_NEUTRAL", "DEF_NEUTRAL_NO_ASOF_SOURCE"),
     "prelock_not_scheduled": ("EXCLUDE", "PRELOCK_NOT_SCHEDULED"),
 })
+ELIGIBILITY_MATRIX = MappingProxyType({
+    "missing_game_id": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "MISSING_GAME_ID", False),
+    "invalid_competition": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "INVALID_COMPETITION", False),
+    "missing_teams": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "MISSING_TEAMS", False),
+    "missing_start": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "MISSING_START_TIME", False),
+    "missing_venue": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "MISSING_VENUE", False),
+    "model_card_or_source_invalid": ("RUN_INVALID", "RUN_INVALID", "RUN_INVALID", "MODEL_CARD_OR_SOURCE_INVALID", True),
+    "missing_historical_participants": ("EXCLUDE", "NOT_APPLICABLE", "EXCLUDE", "MISSING_RECONSTRUCTED_PARTICIPANTS", False),
+    "partial_t45": ("NOT_APPLICABLE", "SHADOW_UNRATED", "SHADOW_UNRATED", "PARTIAL_T45_PARTICIPANTS", False),
+    "provenance_mismatch": ("EXCLUDE_FROM_HISTORICAL_POOL", "EXCLUDE_FROM_OFFICIAL_POOL", "EXCLUDE", "PROVENANCE_MISMATCH", False),
+    "missing_required_feature": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "MISSING_REQUIRED_FEATURE_INPUT", False),
+    "as_of_violation": ("RUN_INVALID", "RUN_INVALID", "RUN_INVALID", "AS_OF_VIOLATION", True),
+    "environment_no_asof": ("RETAIN_NEUTRAL", "RETAIN_NEUTRAL", "RETAIN_NEUTRAL", "ENV_NEUTRAL_NO_ASOF_SOURCE", False),
+    "defense_no_asof": ("RETAIN_NEUTRAL", "RETAIN_NEUTRAL", "RETAIN_NEUTRAL", "DEF_NEUTRAL_NO_ASOF_SOURCE", False),
+    "prelock_not_scheduled": ("EXCLUDE", "EXCLUDE", "EXCLUDE", "PRELOCK_NOT_SCHEDULED", False),
+})
 
 def eligibility_disposition(event: str) -> tuple[str, str]:
     try:
@@ -1342,6 +1500,9 @@ def eligibility_disposition(event: str) -> tuple[str, str]:
         raise ValueError(f"unknown eligibility event: {event}") from exc
 
 def classify_v52(probability: float, completeness: float, uncertainty: str, *, critical: bool) -> str:
+    probability, completeness = finite_number(probability, "probability"), finite_number(completeness, "completeness")
+    if not .5 <= probability <= .9 or not 0 <= completeness <= 10 or uncertainty not in {"High", "Medium", "Low"} or not isinstance(critical, bool):
+        raise ValueError("tier inputs out of bounds/type")
     if critical:
         return "UNRATED"
     if uncertainty == "High" or probability < 0.54 or completeness < 8.0:
@@ -1369,13 +1530,33 @@ def parse_change_contract(raw: object) -> Mapping[str, object]:
     if not all(isinstance(obj[key], str) and len(obj[key]) == 64 for key in ("config_sha256", "approved_design_blob_sha256")):
         raise ValueError("change contract digests differ")
     return deep_freeze(obj)
+
+def const_schema(raw: Mapping[str, object], required: frozenset[str]) -> dict[str, object]:
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "const": raw,
+            "required": sorted(required), "properties": {key: {} for key in sorted(required)}, "additionalProperties": False}
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(canonical_json_bytes(value) + b"\n")
+
+def approved_design_bytes(root: Path) -> bytes:
+    completed = subprocess.run(["git", "show", "a4aa8d2:docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"], cwd=root, check=False, capture_output=True)
+    if completed.returncode: raise ValueError("approved design blob unavailable")
+    return completed.stdout
+
+def write_v52_config_contracts(root: Path) -> None:
+    config = expected_v52_config(); config_path = root / "config/v5_2_qd.json"; write_json(config_path, config)
+    change = {"schema_version": 1, "model_version": "v5.2-QD", "unchanged": list(CHANGE_UNCHANGED), "changed": list(CHANGE_CHANGED),
+              "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN), "config_sha256": sha256_file(config_path),
+              "approved_design_commit": "a4aa8d2", "approved_design_blob_sha256": hashlib.sha256(approved_design_bytes(root)).hexdigest()}
+    write_json(root / "schemas/v5_2_qd.schema.json", const_schema(config, V52_REQUIRED_KEYS))
+    write_json(root / "protocols/v5_2_qd/change_contract.json", change)
 ```
 
 Generate `schemas/v5_2_qd.schema.json` as a documentation mirror with top-level `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","const":<exact config JSON>,"required":<sorted V52_REQUIRED_KEYS>,"properties":<one property per required key>,"additionalProperties":false}`. Tests compare `schema["const"]` byte-for-value to the parser fixture and mutate every nested object/list once to prove the stdlib parser rejects both unknown keys and frozen-value changes; the runtime does not import `jsonschema`.
 
 - [ ] **Step 4: Run schema/config tests and lint**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.V52ConfigTest -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -c 'from pathlib import Path; from mlb_backtest.protocols import write_v52_config_contracts; write_v52_config_contracts(Path(".").resolve())' && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.V52ConfigTest -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py && git diff --check`
 
 Expected: all tests `OK`; Ruff and diff checks exit 0.
 
@@ -1570,13 +1751,20 @@ def validate_run(run: RunSpec) -> None:
         raise ValueError("2025 is excluded")
     for fold in run.folds:
         validate_fold(fold)
+
+def write_historical_contract(root: Path) -> None:
+    raw = expected_historical_run(); write_json(root / "protocols/v5_2_qd/historical_walkforward_500.json", raw)
+    schema = const_schema(raw, RUN_REQUIRED_KEYS)
+    schema["$defs"] = {"fold": {"type": "object", "required": sorted(FOLD_REQUIRED_KEYS),
+                                  "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)}, "additionalProperties": False}}
+    write_json(root / "schemas/v5_2_run_spec.schema.json", schema)
 ```
 
 Write `historical_walkforward_500.json` from `expected_historical_run()`. The schema is a documentation mirror with `const` equal to that exact JSON, closed top-level/fold objects, and its required/property keys derived from `RUN_REQUIRED_KEYS`/`FOLD_REQUIRED_KEYS`; no runtime `jsonschema` dependency is introduced.
 
 - [ ] **Step 4: Run the full protocol test module**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -c 'from pathlib import Path; from mlb_backtest.protocols import write_historical_contract; write_historical_contract(Path(".").resolve())' && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
@@ -1612,6 +1800,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
         for year in (2018, 2019, 2020, 2021):
             self.assertEqual(report["seasons"][str(year)]["minimum_contract"], "MISSING")
+        self.assertIn("OBSERVED_LEGACY_NOT_V52_COMPLETE", {source["status"] for year in (2022, 2023, 2024) for source in report["seasons"][str(year)]["sources"].values()})
         self.assertFalse(report["may_fit_H22"])
         self.assertFalse(report["fitted_model_cards_present"])
         self.assertEqual(report["fitted_model_card_namespace"], "models/v5_2_qd/folds/{H22,H23,H24}/model_card.json")
@@ -1635,7 +1824,7 @@ class PreflightTest(unittest.TestCase):
     def test_each_integrity_failure_blocks_ready(self):
         mutations = {
             "raw_hash": lambda root: (root / first_manifest(root)["raw_path"]).write_bytes(b"changed"),
-            "sidecar_hash": lambda root: (root / first_manifest(root)["sidecar_path"]).write_bytes(b"changed"),
+            "sidecar_hash": lambda root: mutate_sidecar_without_manifest_update(root),
             "schema": lambda root: rewrite_sidecar(root, {"schema_fields": ["gamePk"]}),
             "duplicate_game_pk": lambda root: rewrite_sidecar(root, {"game_pks": [1, 1]}),
             "date_range": lambda root: rewrite_manifest(root, {"query": {"season": 2018, "start_date": "2018-02-01", "end_date": "2018-12-31"}}),
@@ -1646,12 +1835,25 @@ class PreflightTest(unittest.TestCase):
                 root = make_complete_inventory(Path(directory)); mutate(root)
                 self.assertEqual(build_preflight(root, parse_run_spec(expected_historical_run()))["status"], "BLOCKED_REQUIRED_ACQUISITION")
 
+    def test_malformed_json_is_recorded_and_blocks_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory)); next((root / "inventory").rglob("*.manifest.json")).write_text("{")
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
+        self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
+        self.assertIn("MALFORMED_MANIFEST_JSON", {row["code"] for row in report["inventory_errors"]})
+
     def test_scanner_never_uses_network_or_mutates_data_or_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_complete_inventory(Path(directory)); before = protected_inventory(root)
             with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
                  patch("http.client.HTTPConnection.request", side_effect=AssertionError("network forbidden")), \
-                 patch("socket.create_connection", side_effect=AssertionError("network forbidden")):
+                 patch("socket.create_connection", side_effect=AssertionError("network forbidden")), \
+                 patch("pathlib.Path.write_bytes", side_effect=AssertionError("write forbidden")), \
+                 patch("pathlib.Path.write_text", side_effect=AssertionError("write forbidden")), \
+                 patch("os.replace", side_effect=AssertionError("write forbidden")), \
+                 patch("os.rename", side_effect=AssertionError("write forbidden")), \
+                 patch("os.remove", side_effect=AssertionError("write forbidden")), \
+                 patch("os.unlink", side_effect=AssertionError("write forbidden")):
                 self.assertEqual(build_preflight(root, parse_run_spec(expected_historical_run()))["status"], "READY")
             self.assertEqual(before, protected_inventory(root))
 
@@ -1701,6 +1903,10 @@ def rewrite_sidecar(root: Path, patch_values: Mapping[str, object]) -> None:
     path = root / manifest["sidecar_path"]; value = json.loads(path.read_text()); value.update(patch_values)
     path.write_bytes(canonical_json_bytes(value) + b"\n"); manifest["sidecar_sha256"] = sha256_file(path)
     manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+
+def mutate_sidecar_without_manifest_update(root: Path) -> None:
+    manifest = first_manifest(root); path = root / manifest["sidecar_path"]; value = json.loads(path.read_text())
+    value["row_count"] += 1; path.write_bytes(canonical_json_bytes(value) + b"\n")
 ```
 
 - [ ] **Step 2: Run preflight tests and verify the missing scanner failure**
@@ -1714,6 +1920,7 @@ Expected: `ERROR` importing `mlb_backtest.preflight`.
 ```python
 MINIMUM_SOURCES = MINIMUM_SOURCE_NAMES
 PROTECTED_PREFLIGHT_ROOTS = ("data", "audit")
+SMALL_SEALED_HASH_ROOTS = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/calibration", "audit/v5_1_bt")
 SOURCE_ALIASES = MappingProxyType({
     "mlb_schedule_game_feed": frozenset({"mlb_schedule_game_feed", "mlb_schedule"}),
     "baseball_savant_statcast": frozenset({"baseball_savant_statcast", "statcast"}),
@@ -1730,19 +1937,22 @@ REQUIRED_FIELDS = MappingProxyType({
 })
 MANIFEST_KEYS = frozenset({"schema_version", "source", "logical_query_id", "parent_logical_query_id", "query", "child_range", "raw_path", "raw_sha256", "sidecar_path", "sidecar_sha256", "retrieved_at_utc", "split_index", "split_count"})
 SIDECAR_KEYS = frozenset({"schema_version", "schema_fields", "row_count", "game_count", "game_pks", "event_dates"})
-PREFLIGHT_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "mode", "status", "generated_from_inventory_sha256", "protected_tree_before", "protected_tree_after", "seasons", "optional_sources", "may_fit_H22", "fitted_model_cards_present", "fitted_model_card_namespace", "acquisition_steps", "execution_steps_after_ready"})
+PREFLIGHT_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "mode", "status", "generated_from_inventory_sha256", "protected_tree_before", "protected_tree_after", "inventory_errors", "seasons", "optional_sources", "may_fit_H22", "fitted_model_cards_present", "fitted_model_card_namespace", "acquisition_steps", "execution_steps_after_ready"})
 SEASON_KEYS = frozenset({"minimum_contract", "sources"})
 STEP_KEYS = frozenset({"stage", "status", "command", "prerequisite"})
 
-def protected_inventory(root: Path) -> dict[str, str]:
-    result: dict[str, str] = {}
+def protected_inventory(root: Path) -> dict[str, object]:
+    metadata: dict[str, list[int]] = {}
     for relative in PROTECTED_PREFLIGHT_ROOTS:
         base = root / relative
         if not base.exists():
             continue
         for path in sorted(p for p in base.rglob("*") if p.is_file()):
-            result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return result
+            stat = path.stat(follow_symlinks=False)
+            metadata[path.relative_to(root).as_posix()] = [stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_mode]
+    hashes = {path.relative_to(root).as_posix(): sha256_file(path) for relative in SMALL_SEALED_HASH_ROOTS
+              if (root / relative).exists() for path in sorted(p for p in (root / relative).rglob("*") if p.is_file())}
+    return {"metadata_path_size_mtime_inode_mode": metadata, "small_sealed_sha256": hashes}
 
 def planned_step(stage: str, command: str, prerequisite: str) -> dict[str, str]:
     return {"stage": stage, "status": "NOT_IMPLEMENTED_PLANNED", "command": command, "prerequisite": prerequisite}
@@ -1765,18 +1975,28 @@ def canonical_source(alias: str) -> str:
 def parent_logical_query_id(source: str, year: int, start: str, end: str) -> str:
     return hashlib.sha256(canonical_json_bytes({"source": source, "season": year, "start_date": start, "end_date": end})).hexdigest()
 
-def inventory_existing_manifests(root: Path) -> tuple[dict[str, object], ...]:
+def inventory_existing_manifests(root: Path) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
     rows: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
     candidates = sorted(path for base in (root / "inventory", root / "data/v5_2_qd/raw") if base.exists() for path in base.rglob("*.manifest.json"))
     for path in candidates:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append({"path": path.relative_to(root).as_posix(), "code": "MALFORMED_MANIFEST_JSON", "detail": type(exc).__name__})
+            continue
         item = require_exact_keys(manifest, MANIFEST_KEYS, f"manifest:{path.relative_to(root)}")
         if item["schema_version"] != 1:
             raise ValueError("manifest schema version differs")
         source = canonical_source(str(item["source"])); query = require_exact_keys(item["query"], frozenset({"season", "start_date", "end_date"}), "manifest.query")
         child = require_exact_keys(item["child_range"], frozenset({"start_date", "end_date"}), "manifest.child_range")
         raw_path, sidecar_path = safe_relative(root, item["raw_path"]), safe_relative(root, item["sidecar_path"])
-        sidecar = require_exact_keys(json.loads(sidecar_path.read_text(encoding="utf-8")), SIDECAR_KEYS, "sidecar")
+        try:
+            sidecar_raw = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append({"path": sidecar_path.relative_to(root).as_posix(), "code": "MALFORMED_SIDECAR_JSON", "detail": type(exc).__name__})
+            continue
+        sidecar = require_exact_keys(sidecar_raw, SIDECAR_KEYS, "sidecar")
         failures: list[str] = []
         if sha256_file(raw_path) != item["raw_sha256"]: failures.append("RAW_HASH_MISMATCH")
         if sha256_file(sidecar_path) != item["sidecar_sha256"]: failures.append("SIDECAR_HASH_MISMATCH")
@@ -1800,7 +2020,28 @@ def inventory_existing_manifests(root: Path) -> tuple[dict[str, object], ...]:
                      "event_dates": list(sidecar["event_dates"]), "schema_fields": list(sidecar["schema_fields"]), "retrieved_at_utc": str(item["retrieved_at_utc"]),
                      "raw_sha256": str(item["raw_sha256"]), "sidecar_sha256": str(item["sidecar_sha256"]),
                      "manifest_path": path.relative_to(root).as_posix(), "manifest_sha256": sha256_file(path), "failures": failures})
-    return tuple(rows)
+    legacy_rows, legacy_errors = inventory_legacy_manifests(root)
+    return tuple(rows) + legacy_rows, tuple(errors) + legacy_errors
+
+def inventory_legacy_manifests(root: Path) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
+    rows: list[dict[str, object]] = []; errors: list[dict[str, str]] = []
+    base = root / "data/v5_1_bt/raw"
+    for path in sorted(base.rglob("*.manifest.json")) if base.exists() else ():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")); query = raw["query"]
+            legacy_alias = str(raw["source"])
+            sources = ("mlb_schedule_game_feed", "prior_schedule_history") if legacy_alias == "mlb_schedule" else (canonical_source(legacy_alias),)
+            bounds = date_boundaries(query)
+            if bounds is None: raise ValueError("legacy query lacks bounds")
+            years = range(date.fromisoformat(bounds[0]).year, date.fromisoformat(bounds[1]).year + 1)
+            for source in sources:
+                for year in years:
+                    if query_overlaps_year(query, year):
+                        rows.append({"source": source, "query": {"season": year, "start_date": bounds[0], "end_date": bounds[1]},
+                                     "legacy": True, "manifest_path": path.relative_to(root).as_posix(), "manifest_sha256": sha256_file(path)})
+        except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            errors.append({"path": path.relative_to(root).as_posix(), "code": "LEGACY_MANIFEST_UNADAPTABLE", "detail": type(exc).__name__})
+    return tuple(rows), tuple(errors)
 
 def fitted_cards_present(root: Path) -> bool:
     return any((root / "models/v5_2_qd/folds" / fold / "model_card.json").exists() for fold in ("H22", "H23", "H24"))
@@ -1832,7 +2073,18 @@ def assess_season(year: int, inventory: Sequence[Mapping[str, object]]) -> dict[
     expected_start, expected_end = f"{year}-01-01", f"{year}-12-31"
     records: dict[str, object] = {}
     for source in MINIMUM_SOURCES:
-        matched = [row for row in inventory if row["source"] == source and int(row["query"]["season"]) == year]
+        all_matched = [row for row in inventory if row["source"] == source and int(row["query"]["season"]) == year]
+        legacy = [row for row in all_matched if row.get("legacy") is True]
+        matched = [row for row in all_matched if row.get("legacy") is not True]
+        if not matched and legacy:
+            record = {"source": source, "required": True, "expected_start": expected_start, "expected_end": expected_end,
+                      "observed_start": min(row["query"]["start_date"] for row in legacy), "observed_end": max(row["query"]["end_date"] for row in legacy),
+                      "logical_query_ids": [], "row_count": 0, "game_count": 0, "schema_fields": [],
+                      "missing_critical_fields": ["V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"], "duplicate_game_pks": [],
+                      "retrieved_at_utc": [], "content_sha256": [], "manifest_sha256": sorted(row["manifest_sha256"] for row in legacy),
+                      "split_children": sorted(row["manifest_path"] for row in legacy), "status": "OBSERVED_LEGACY_NOT_V52_COMPLETE"}
+            records[source] = record
+            continue
         observed_dates = sorted((row["child_range"]["start_date"], row["child_range"]["end_date"]) for row in matched)
         parents = {row["parent_logical_query_id"] for row in matched}; split_counts = {row["split_count"] for row in matched}
         split_indices = sorted(row["split_index"] for row in matched)
@@ -1876,7 +2128,7 @@ def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
 
 def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
     before = protected_inventory(root)
-    inventory = inventory_existing_manifests(root)
+    inventory, inventory_errors = inventory_existing_manifests(root)
     seasons = {str(year): assess_season(year, inventory) for year in range(2018, 2025)}
     after = protected_inventory(root)
     if before != after:
@@ -1885,11 +2137,12 @@ def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
         "schema_version": 1,
         "run_id": run_spec.run_id,
         "mode": "READ_ONLY",
-        "status": "READY" if all_minimum_complete(seasons) else "BLOCKED_REQUIRED_ACQUISITION",
+        "status": "READY" if all_minimum_complete(seasons) and not inventory_errors else "BLOCKED_REQUIRED_ACQUISITION",
         "seasons": seasons,
         "generated_from_inventory_sha256": hashlib.sha256(canonical_json_bytes(inventory)).hexdigest(),
         "protected_tree_before": before,
         "protected_tree_after": after,
+        "inventory_errors": list(inventory_errors),
         "optional_sources": optional_source_status(inventory),
         "may_fit_H22": all(seasons[str(y)]["minimum_contract"] == "COMPLETE" for y in range(2018, 2022)),
         "fitted_model_cards_present": fitted_cards_present(root),
@@ -1913,7 +2166,7 @@ def parse_preflight(raw: object) -> dict[str, object]:
             raise ValueError(f"preflight.seasons.{year}.sources differs")
         for source, record in season["sources"].items():
             item = require_exact_keys(record, SOURCE_RECORD_KEYS, f"preflight.seasons.{year}.sources.{source}")
-            if item["source"] != source or item["required"] is not True or item["expected_start"] != f"{year}-01-01" or item["expected_end"] != f"{year}-12-31" or item["status"] not in {"COMPLETE", "MISSING", "INVALID"}:
+            if item["source"] != source or item["required"] is not True or item["expected_start"] != f"{year}-01-01" or item["expected_end"] != f"{year}-12-31" or item["status"] not in {"COMPLETE", "MISSING", "INVALID", "OBSERVED_LEGACY_NOT_V52_COMPLETE"}:
                 raise ValueError(f"preflight.seasons.{year}.sources.{source} frozen values differ")
     for index, step in enumerate(obj["acquisition_steps"] + obj["execution_steps_after_ready"]):
         item = require_exact_keys(step, STEP_KEYS, f"preflight.steps[{index}]")
@@ -1926,7 +2179,7 @@ def parse_preflight(raw: object) -> dict[str, object]:
     result = json.loads(json.dumps(obj, allow_nan=False))
     if result["status"] not in {"READY", "BLOCKED_REQUIRED_ACQUISITION"}:
         raise ValueError("preflight status differs")
-    expected_ready = all_minimum_complete(result["seasons"])
+    expected_ready = all_minimum_complete(result["seasons"]) and not result["inventory_errors"]
     if (result["status"] == "READY") != expected_ready or bool(result["may_fit_H22"]) != all(result["seasons"][str(y)]["minimum_contract"] == "COMPLETE" for y in range(2018, 2022)):
         raise ValueError("preflight status/fold gate differs")
     return result
@@ -1939,24 +2192,33 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
                        "Optional sources remain neutral/null and do not block READY.", "",
                        "H22 fitting permitted: " + ("Yes" if report["may_fit_H22"] else "No"), ""])
 
-def write_preflight(root: Path, run_path: Path, json_path: Path, markdown_path: Path) -> None:
+def preflight_schema_document() -> dict[str, object]:
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "required": sorted(PREFLIGHT_REQUIRED_KEYS),
+            "properties": {key: {} for key in sorted(PREFLIGHT_REQUIRED_KEYS)}, "additionalProperties": False,
+            "$defs": {"season_keys": sorted(SEASON_KEYS), "source_record_keys": sorted(SOURCE_RECORD_KEYS), "step_keys": sorted(STEP_KEYS),
+                      "minimum_sources": list(MINIMUM_SOURCES), "statuses": ["READY", "BLOCKED_REQUIRED_ACQUISITION"]}}
+
+def write_preflight(root: Path, run_path: Path, json_path: Path, markdown_path: Path, schema_path: Path) -> None:
     report = build_preflight(root, load_run_spec(run_path))
     json_path.parent.mkdir(parents=True, exist_ok=True); markdown_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_bytes(canonical_json_bytes(report) + b"\n")
     markdown_path.write_text(render_preflight_markdown(report), encoding="utf-8")
+    schema_path.parent.mkdir(parents=True, exist_ok=True); schema_path.write_bytes(canonical_json_bytes(preflight_schema_document()) + b"\n")
 
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--run-spec", type=Path, required=True)
-    parser.add_argument("--json", type=Path, required=True); parser.add_argument("--markdown", type=Path, required=True)
-    args = parser.parse_args(argv); write_preflight(args.root.resolve(), args.run_spec, args.json, args.markdown); return 0
+    parser.add_argument("--json", type=Path, required=True); parser.add_argument("--markdown", type=Path, required=True); parser.add_argument("--schema", type=Path, required=True)
+    args = parser.parse_args(argv); write_preflight(args.root.resolve(), args.run_spec, args.json, args.markdown, args.schema); return 0
 ```
 
 Generate `schemas/v5_2_preflight.schema.json` with exact top-level/season/source/step required/property key sets and `additionalProperties:false` at each of those fixed levels. Its enum/const values mirror `MINIMUM_SOURCES`, optional statuses, modes, step status, and report statuses. The stdlib `parse_preflight` remains the runtime authority and tests mutate every nested fixed-value family. The current workspace report is expected to be blocked; the complete temporary fixture proves the same code has a real `READY` path.
 
+The read-only guard deliberately does not hash multi-gigabyte raw trees. Across all `data/` and `audit/` files it compares path, size, nanosecond mtime, inode, and mode before/after, detecting creation, deletion, replacement, truncation, and ordinary in-place writes; it also blocks common Python/OS write and network APIs during the scanner test. Cryptographic SHA-256 before/after is limited to the small sealed lock/outcome/calibration/audit roots. This is a mutation guard for one scanner invocation, not a claim that metadata alone is a durable content commitment; durable source integrity remains the manifest/raw/sidecar hash contract and Task 10's approved-commit blob proof.
+
 - [ ] **Step 4: Generate and test the current-state preflight**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md --schema schemas/v5_2_preflight.schema.json && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
 
 Expected: report status is `BLOCKED_REQUIRED_ACQUISITION`; 2018-2021 required gaps are explicit; no fitted cards exist; tests are `OK`; Ruff exits 0.
 
@@ -2017,6 +2279,12 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(date_disposition("acquisition_failure"), "SYSTEM_MISS")
         self.assertEqual(date_disposition("partial_only"), "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE")
         self.assertEqual(date_disposition("empty_verified"), "NO_VERIFIED_ELIGIBLE_DATE")
+        gate = spec.raw["evidence_gate"]
+        self.assertTrue(gate["all_integrity_gates_pass"])
+        self.assertEqual(gate["accuracy_gt_home"], {"required": True, "exact_denominator": 500})
+        self.assertEqual(gate["accuracy_gt_d1_season_record"], {"required": True, "exact_denominator": "N_season"})
+        self.assertTrue(gate["season_baseline_lower_bound_positive"])
+        self.assertEqual(gate["season_baseline_exact_mcnemar_p_lt"], .05)
 
     def test_schema_const_mirrors_parser_and_pooling_is_forbidden(self):
         raw, schema = json.loads(PROSPECTIVE_SPEC.read_text()), json.loads(PROSPECTIVE_SCHEMA.read_text())
@@ -2056,7 +2324,11 @@ def expected_prospective_spec() -> dict[str, object]:
             "shadow_pool": {"provenance": "TIMESTAMP_PARTIAL_T45", "rank_field": "shadow_rank", "tier": "UNRATED"},
             "date_state_precedence": PROSPECTIVE_DATE_PRECEDENCE, "terminal_contract": HISTORICAL_TERMINAL,
             "milestones": [25, 50, 100, 250, 500],
-            "evidence_gate": {"label": "CONFIRMED_INCREMENTAL_EDGE", "minimum_graded": 500, "season_baseline_lower_bound_positive": True, "season_baseline_exact_mcnemar_p_lt": .05, "brier_lt": .25, "log_loss_lt": .6931471806, "historical_rows_permitted": False},
+            "evidence_gate": {"label": "CONFIRMED_INCREMENTAL_EDGE", "minimum_graded": 500, "all_integrity_gates_pass": True,
+                              "accuracy_gt_home": {"required": True, "exact_denominator": 500},
+                              "accuracy_gt_d1_season_record": {"required": True, "exact_denominator": "N_season"},
+                              "season_baseline_lower_bound_positive": True, "season_baseline_exact_mcnemar_p_lt": .05,
+                              "brier_lt": .25, "log_loss_lt": .6931471806, "historical_rows_permitted": False},
             "namespace": "data/v5_2_qd/prospective_2026", "pooling_forbidden": True, "backfill_forbidden": True}
 
 @dataclass(frozen=True)
@@ -2117,13 +2389,25 @@ def date_disposition(event: str) -> str:
 
 def combine_ledgers(left_run_id: str, right_run_id: str) -> NoReturn:
     raise ValueError(f"ledger pooling forbidden: {left_run_id} + {right_run_id}")
+
+def write_protocol_artifacts(root: Path) -> None:
+    write_v52_config_contracts(root); write_historical_contract(root); prospective = expected_prospective_spec()
+    for relative, value in (("protocols/v5_2_qd/prospective_2026.json", prospective),
+                            ("schemas/v5_2_prospective.schema.json", const_schema(prospective, PROSPECTIVE_REQUIRED_KEYS))):
+        write_json(root / relative, value)
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--write-contracts", action="store_true")
+    args = parser.parse_args(argv)
+    if not args.write_contracts: parser.error("--write-contracts is required")
+    write_protocol_artifacts(args.root.resolve()); return 0
 ```
 
 Write `prospective_2026.json` from `expected_prospective_spec()` and generate a closed schema mirror whose top-level `const` is that exact JSON and whose nested required/property keys mirror every dict above. This phase defines and validates the protocol only; it creates no pre-2026-07-13 snapshot and never backfills a missed date.
 
 - [ ] **Step 4: Run all protocol tests and lint**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.protocols --root . --write-contracts && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
@@ -2174,7 +2458,7 @@ class DesignVerificationTest(unittest.TestCase):
     def test_absence_status_is_derived_not_hardcoded(self):
         self.assertEqual(historical_execution_status(ROOT), "NOT_EXECUTED")
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root / HISTORICAL_OUTPUT_SENTINELS[0]).parent.mkdir(parents=True); (root / HISTORICAL_OUTPUT_SENTINELS[0]).write_text("x")
+            root = Path(directory); path = root / "audit/v5_2_qd/historical/nested/unexpected.bin"; path.parent.mkdir(parents=True); path.write_text("x")
             self.assertEqual(historical_execution_status(root), "PARTIAL_OUTPUT_PRESENT")
 ```
 
@@ -2190,8 +2474,8 @@ Expected: `ERROR` importing `mlb_backtest.verify_v52_design`.
 APPROVED_DESIGN_COMMIT = "a4aa8d2"
 PROTECTED_TREES = ("data/v5_1_bt", "audit/v5_1_bt")
 PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
-HISTORICAL_OUTPUT_SENTINELS = ("data/v5_2_qd/historical/locked/top1.jsonl", "data/v5_2_qd/historical/outcomes/evaluated.jsonl", "reports/v5_2_qd/historical/summary.json")
-FITTED_CARD_PATHS = tuple(f"models/v5_2_qd/folds/{fold}/model_card.json" for fold in ("H22", "H23", "H24"))
+HISTORICAL_NAMESPACE_ROOTS = ("data/v5_2_qd/historical", "reports/v5_2_qd/historical", "audit/v5_2_qd/historical")
+FITTED_NAMESPACE_ROOT = "models/v5_2_qd/folds"
 EXPECTED_CURRENT_FILES = (
     "reports/v5_1_bt/diagnostic_100.json", "reports/v5_1_bt/diagnostic_100.md", "analysis/v5_1_bt/diagnostic_100.ipynb",
     "reports/v5_1_bt/diagnostic_100_artifact.json", "reports/v5_1_bt/diagnostic_100_chart_map.json",
@@ -2294,6 +2578,8 @@ def verify_artifact_agreement(root: Path, diagnostic: Mapping[str, object]) -> M
     saved = json.loads((root / "reports/v5_1_bt/diagnostic_100_artifact.json").read_text())
     expected = build_report_artifact(diagnostic)
     if saved != expected: raise ValueError("artifact differs from diagnostic")
+    if json.loads((root / "reports/v5_1_bt/diagnostic_100_chart_map.json").read_text()) != build_chart_map():
+        raise ValueError("chart map differs from deterministic renderer")
     return saved
 
 def verify_contract_schemas(root: Path, config: V52Config, historical: RunSpec, prospective: ProspectiveSpec, preflight: Mapping[str, object]) -> None:
@@ -2325,13 +2611,17 @@ def verify_preflight(root: Path) -> dict[str, object]:
     payload = parse_preflight(json.loads((root / "reports/v5_2_qd/walkforward_500_preflight.json").read_text(encoding="utf-8")))
     if payload["status"] != "BLOCKED_REQUIRED_ACQUISITION" or payload["may_fit_H22"]:
         raise ValueError("current preflight status differs")
+    if (root / "reports/v5_2_qd/walkforward_500_preflight.md").read_text(encoding="utf-8") != render_preflight_markdown(payload):
+        raise ValueError("preflight Markdown differs from canonical JSON")
     return payload
 
 def fitted_model_card_count(root: Path) -> int:
-    return sum((root / relative).exists() for relative in FITTED_CARD_PATHS)
+    base = root / FITTED_NAMESPACE_ROOT
+    return sum(path.is_file() for path in base.rglob("*")) if base.exists() else 0
 
 def historical_execution_status(root: Path) -> str:
-    return "PARTIAL_OUTPUT_PRESENT" if any((root / relative).exists() for relative in HISTORICAL_OUTPUT_SENTINELS) else "NOT_EXECUTED"
+    present = [path for relative in HISTORICAL_NAMESPACE_ROOTS if (root / relative).exists() for path in (root / relative).rglob("*") if path.is_file()]
+    return "PARTIAL_OUTPUT_PRESENT" if present else "NOT_EXECUTED"
 
 def ensure_expected_files(root: Path) -> None:
     missing = [relative for relative in EXPECTED_CURRENT_FILES if not (root / relative).is_file()]
@@ -2415,7 +2705,7 @@ git diff --check
 PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt
 PYTHONDONTWRITEBYTECODE=1 python3 analysis/v5_1_bt/build_diagnostic_notebook.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.report_artifact --diagnostic reports/v5_1_bt/diagnostic_100.json --artifact reports/v5_1_bt/diagnostic_100_artifact.json --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
-PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md --schema schemas/v5_2_preflight.schema.json
 PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.verify_v52_design --root . --skip-html
 git status --short
 ```
