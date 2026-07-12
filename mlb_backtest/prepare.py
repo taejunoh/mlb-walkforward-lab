@@ -304,8 +304,13 @@ def load_verified_schedule_evidence(
     if hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
         raise RuntimeError("verified schedule payload digest changed")
     games = tuple(parse_schedule(payload))
-    if any(not start <= str(game["official_date"]) <= end for game in games):
-        raise ValueError("verified schedule payload contains a game outside its query")
+    schedule_payload = json.loads(payload.decode("utf-8"))
+    for index, date_entry in enumerate(schedule_payload["dates"]):
+        query_date = _canonical_day(
+            date_entry.get("date"), f"schedule payload dates[{index}].date"
+        )
+        if not start <= query_date <= end:
+            raise ValueError("verified schedule payload contains a game outside its query")
     game_pks = tuple(sorted(_positive_id(game.get("game_pk"), "schedule game_pk") for game in games))
     if len(set(game_pks)) != len(game_pks):
         raise ValueError("verified schedule payload contains duplicate game_pk")
