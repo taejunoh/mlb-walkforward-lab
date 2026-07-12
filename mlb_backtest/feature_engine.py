@@ -457,7 +457,10 @@ class FeatureHistory:
         )
 
     @staticmethod
-    def _league_fip(rows: Sequence[Mapping[str, object]]) -> tuple[float | None, int]:
+    def _league_fip(
+        rows: Sequence[Mapping[str, object]],
+        pitch_rows: Sequence[Mapping[str, object]] | None = None,
+    ) -> tuple[float | None, int]:
         numerator = (
             13 * sum(row["events"] == "home_run" for row in rows)
             + 3 * sum(row["events"] in WALK_EVENTS | {"hit_by_pitch"} for row in rows)
@@ -466,7 +469,7 @@ class FeatureHistory:
                 row["events"] in {"strikeout", "strikeout_double_play"} for row in rows
             )
         )
-        outs = sum(int(row["outs_on_play"]) for row in rows)
+        outs = sum(_recorded_outs(row) for row in (pitch_rows or rows))
         return ((numerator / (outs / 3.0)) if outs else None, len(rows))
 
     @staticmethod
@@ -485,6 +488,14 @@ class FeatureHistory:
 def _rate(rows: Sequence[Mapping[str, object]]) -> tuple[float | None, int]:
     values = [value for row in rows if (value := pa_expected_woba(row)) is not None]
     return ((math.fsum(values) / len(values)) if values else None, len(values))
+
+
+def _recorded_outs(row: Mapping[str, object]) -> int:
+    """Read production pitch-state outs, retaining old synthetic fixture support."""
+    value = row.get("outs_recorded", row.get("outs_on_play"))
+    if type(value) is not int or not 0 <= value <= 3:
+        raise ValueError("history pitch row requires derived outs_recorded")
+    return value
 
 
 def _k_minus_bb(
@@ -512,6 +523,14 @@ def _starter_component(
         for r in pitcher_pas
         if _day(r["game_date"], "game_date").year == target.year
     ]
+    pitcher_pitches = history.rows_before(
+        history.pitches_by_pitcher.get(pitcher_id, ()), target
+    )
+    season_pitches = [
+        r
+        for r in pitcher_pitches
+        if _day(r["game_date"], "game_date").year == target.year
+    ]
     xwoba, bf = _rate(season)
     season_bf = len(season)
     kbb, kbb_bf = _k_minus_bb(season)
@@ -520,9 +539,16 @@ def _starter_component(
         + 3 * sum(r["events"] in WALK_EVENTS | {"hit_by_pitch"} for r in season)
         - 2 * sum(r["events"] in {"strikeout", "strikeout_double_play"} for r in season)
     )
-    outs = sum(int(r["outs_on_play"]) for r in season)
+    outs = sum(_recorded_outs(r) for r in season_pitches)
     league_rows = history.rows_before(history.pa_by_year.get(target.year, ()), target)
-    league_raw_fip, league_bf = history._league_fip(league_rows)
+    league_pitch_rows = [
+        row
+        for row in history.rows_before(history.pitches, target)
+        if _day(row["game_date"], "game_date").year == target.year
+    ]
+    league_raw_fip, league_bf = history._league_fip(
+        league_rows, league_pitch_rows
+    )
     cfip = league_era - league_raw_fip if league_raw_fip is not None else None
     pitcher_raw_fip = numerator / (outs / 3.0) if outs else None
     fip = (
@@ -541,7 +567,7 @@ def _starter_component(
             {
                 "game_pk": game_pk,
                 "game_date": rows[0]["game_date"],
-                "outs": sum(int(r["outs_on_play"]) for r in rows),
+                "outs": sum(_recorded_outs(r) for r in game_pitches),
                 "pitch_count": len(game_pitches),
                 "rows": rows,
             }
@@ -556,7 +582,6 @@ def _starter_component(
         else 5
     )
     innings = expected_innings(latest, rest)
-    pitcher_pitches = history.pitches_by_pitcher.get(pitcher_id, ())
     recent_game_ids = {s["game_pk"] for s in latest}
     recent_velos = [
         float(r["release_speed"])

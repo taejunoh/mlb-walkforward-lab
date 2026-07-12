@@ -1166,6 +1166,7 @@ def schedule_history_rows(
             "home_team_code": home_code,
             "venue_name": venue_name,
             "innings": innings,
+            "final_outs": game.get("final_outs"),
             "doubleheader_marker": game.get("doubleheader_marker"),
         }
         if row["doubleheader_marker"] not in {None, "GAME1", "GAME2"}:

@@ -134,6 +134,24 @@ def build(target, history, team_map=None, league_era=None):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_fip_numerator_uses_completed_pas_but_outs_use_every_pitch(self):
+        terminal = pa(1, "2025-04-30", 10, 101, "strikeout")
+        terminal["outs_recorded"] = 0
+        runner_out = dict(
+            terminal,
+            events="",
+            at_bat_number=2,
+            event_id="1:2",
+            outs_recorded=1,
+        )
+
+        raw_fip, bf = FeatureHistory._league_fip(
+            [terminal], [terminal, runner_out]
+        )
+
+        self.assertEqual(bf, 1)
+        self.assertEqual(raw_fip, -6.0)
+
     def test_full_season_history_is_strictly_bounded_as_of_target_date(self):
         prior = [
             pa(1, "2025-04-30", 10, 101, "strikeout", xwoba=0.1, outs=1),

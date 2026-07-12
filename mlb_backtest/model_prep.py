@@ -105,6 +105,7 @@ def load_statcast_range(
     end: str,
     *,
     catalog=None,
+    final_outs_by_game: Mapping[int, int] | None = None,
 ) -> tuple[StatcastData, list[str]]:
     """Load exactly one verified, gap-free Statcast partition for a date range."""
     expected = _days(start, end)
@@ -133,7 +134,26 @@ def load_statcast_range(
         hashes.append(str(verified["manifest_sha256"]))
     if observed != expected:
         raise RuntimeError("missing verified Statcast coverage")
-    return StatcastData(tuple(pitches), tuple(plate_appearances)), hashes
+    statcast = StatcastData(tuple(pitches), tuple(plate_appearances))
+    if final_outs_by_game is not None:
+        from .statcast import derive_outs_recorded
+
+        statcast = derive_outs_recorded(statcast, final_outs_by_game)
+    return statcast, hashes
+
+
+def _final_outs_by_game(*schedule_sets) -> dict[int, int]:
+    result = {}
+    for games in schedule_sets:
+        for game in games:
+            final_outs = game.get("final_outs")
+            if final_outs is None:
+                continue
+            game_pk = int(game["game_pk"])
+            if game_pk in result and result[game_pk] != final_outs:
+                raise ValueError("conflicting schedule final outs")
+            result[game_pk] = int(final_outs)
+    return result
 
 
 def load_pitcher_bf_range(
@@ -480,10 +500,14 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     season_open_by_year = {year: start for year, (start, _end) in zip((2022, 2023, 2024), seasons)}
     completed_bf_by_year = {}
     for year, (start, end) in zip((2022, 2023, 2024), seasons):
-        statcast, hashes = load_statcast_range(
-            raw_root, start, end, catalog=raw_catalog
-        )
         evidence = schedule_evidence[year]
+        statcast, hashes = load_statcast_range(
+            raw_root,
+            start,
+            end,
+            catalog=raw_catalog,
+            final_outs_by_game=_final_outs_by_game(evidence.games),
+        )
         team_map = derive_team_code_map(evidence.games, statcast, year)
         participants = _safe_participants(evidence.games, statcast)
         history = _history_build(evidence, team_map, catalog=raw_catalog)
@@ -723,6 +747,9 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         "2025-03-18",
         config["extension_end"],
         catalog=raw_catalog,
+        final_outs_by_game=_final_outs_by_game(
+            history_evidence.games, backtest_evidence.games
+        ),
     )
     team_map = derive_team_code_map(history_evidence.games, statcast, 2025)
     participants = _safe_participants(
