@@ -342,6 +342,56 @@ def _write_once(path: Path, content: bytes, label: str, root: Path) -> Path:
     return path
 
 
+def _write_jsonl_once(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    label: str,
+    root: Path,
+) -> tuple[Path, str]:
+    """Atomically stream canonical JSONL and return its incremental SHA-256."""
+    try:
+        relative_parent = path.parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under the data directory") from exc
+    safe_parent = _safe_descendant_dir(root, relative_parent)
+    if safe_parent != path.parent:
+        raise ValueError(f"{label} parent path alias is forbidden")
+    if path.is_symlink() or path.exists() and not path.is_file():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent)
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            for row in rows:
+                chunk = (
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                handle.write(chunk)
+                digest.update(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        expected = digest.hexdigest()
+        if path.exists():
+            if hashlib.sha256(_regular_bytes(path, label)).hexdigest() != expected:
+                raise RuntimeError(f"immutable {label} differs")
+            return path, expected
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if hashlib.sha256(_regular_bytes(path, label)).hexdigest() != expected:
+                raise RuntimeError(f"immutable {label} differs")
+        return path, expected
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _load_model_card(
     root: Path, config_path: str | Path, *, verified_catalog=None
 ) -> tuple[dict[str, object], str]:

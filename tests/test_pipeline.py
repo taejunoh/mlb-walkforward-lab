@@ -10,6 +10,7 @@ from unittest import mock
 from mlb_backtest.pipeline import (
     _load_model_card,
     _verify_candidate_provenance,
+    _write_jsonl_once,
     calibrate_stage,
     features_stage,
     fetch_stage,
@@ -123,6 +124,25 @@ def _prepare_through_lock(root, candidates=None):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_canonical_jsonl_is_streamed_atomically_with_incremental_digest(self):
+        rows = [{"b": 2, "a": 1}, {"text": "한글"}]
+        expected = (
+            '{"a":1,"b":2}\n{"text":"한글"}\n'.encode("utf-8")
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path, digest = _write_jsonl_once(
+                root / "features" / "rows.jsonl", rows, "rows", root
+            )
+            repeated, repeated_digest = _write_jsonl_once(
+                path, rows, "rows", root
+            )
+            self.assertEqual(path.read_bytes(), expected)
+
+        self.assertEqual(repeated, path)
+        self.assertEqual(digest, hashlib.sha256(expected).hexdigest())
+        self.assertEqual(repeated_digest, digest)
+
     def test_production_shaped_source_preparation_reaches_lock(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

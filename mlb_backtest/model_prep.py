@@ -455,7 +455,14 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     from .career_bf import apply_prior_career_bf, load_prior_career_bf_records
     from .config import load_config
     from .features.offense import derive_slot_weights
-    from .pipeline import _canonical_json, _canonical_jsonl, _safe_data_dir, _stage, _write_once
+    from .pipeline import (
+        _canonical_json,
+        _canonical_jsonl,
+        _safe_data_dir,
+        _stage,
+        _write_jsonl_once,
+        _write_once,
+    )
     from .prepare import (
         derive_team_code_map,
         derive_training_slot_rows,
@@ -558,10 +565,9 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     normalization = compute_normalization(raw_features)
     edges = build_training_edges(raw_features, normalization, outcomes)
     calibration = _stage(root, "calibration")
-    raw_bytes = _canonical_jsonl(raw_features)
-    _write_once(
+    _, raw_sha256 = _write_jsonl_once(
         calibration / "training_raw_features.jsonl",
-        raw_bytes,
+        raw_features,
         "training raw features",
         root,
     )
@@ -576,7 +582,7 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
         "normalization": normalization,
         "slot_weights": {str(key): value for key, value in slot_weights.items()},
         "source_manifest_sha256s": sorted(set(source_hashes)),
-        "normalization_input_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "normalization_input_sha256": raw_sha256,
         "training_raw_count": len(raw_features),
         "max_training_date": max(row["official_date"] for row in edges),
     }
@@ -706,10 +712,10 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
     from .config import load_config
     from .pipeline import (
         _canonical_json,
-        _canonical_jsonl,
         _load_model_card,
         _safe_data_dir,
         _stage,
+        _write_jsonl_once,
         _write_once,
     )
     from .prepare import derive_team_code_map
@@ -814,24 +820,22 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         participants, raw_features, card["normalization"]
     )
     features = _stage(root, "features")
-    raw_bytes = _canonical_jsonl(raw_features)
-    component_bytes = _canonical_jsonl(rows)
-    _write_once(
+    _, raw_sha256 = _write_jsonl_once(
         features / "candidate_raw_features.jsonl",
-        raw_bytes,
+        raw_features,
         "candidate raw features",
         root,
     )
-    component_path = _write_once(
+    component_path, component_sha256 = _write_jsonl_once(
         features / "candidate_components.jsonl",
-        component_bytes,
+        rows,
         "candidate components",
         root,
     )
     provenance = {
         "schema_version": 1,
-        "candidate_raw_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-        "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
+        "candidate_raw_sha256": raw_sha256,
+        "candidate_components_sha256": component_sha256,
         "source_manifest_sha256s": sorted(
             {
                 history_evidence.manifest_sha256,
