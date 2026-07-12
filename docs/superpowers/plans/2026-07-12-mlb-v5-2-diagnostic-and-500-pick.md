@@ -473,12 +473,18 @@ class DiagnosticGoldenTest(unittest.TestCase):
         self.assertEqual(set(self.result["leakage"]), {
             "statistical_as_of_safety", "participant_time_limitation", "source_revision_limitation"
         })
-        self.assertEqual(self.result["leakage"]["statistical_as_of_safety"]["status"], "PASS")
+        statistical = self.result["leakage"]["statistical_as_of_safety"]
+        self.assertEqual(statistical["status"], "LIMITATION")
+        self.assertEqual(statistical["d1_feature_isolation_status"], "PASS")
+        self.assertEqual(statistical["locked_row_outcome_field_isolation_status"], "PASS")
+        self.assertEqual(statistical["lock_to_outcome_join_sequence_status"], "NOT_TIMESTAMP_PROVEN")
         self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
         self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
 
     def test_leakage_evidence_tampering_fails(self):
         evidence = load_v51_evidence(ROOT); raw = jsonable(read_jsonl(ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl")[0])
+        locked = jsonable(read_jsonl(ROOT / "data/v5_1_bt/locked/predictions.jsonl")[0])
+        evaluated = jsonable(read_jsonl(ROOT / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl")[0])
         card = jsonable(evidence.model_card); card["counts"]["candidate_rows"] = 1
         manual = (ROOT / "audit/v5_1_bt/manual_audit.md").read_text()
         for mutate in (lambda x: x["provenance"].__setitem__("max_history_date", x["official_date"]),
@@ -486,9 +492,15 @@ class DiagnosticGoldenTest(unittest.TestCase):
                        lambda x: x.__setitem__("lineup_provenance", "TIMESTAMP_VERIFIED_T45")):
             changed = copy.deepcopy(raw); mutate(changed)
             with self.assertRaisesRegex(ValueError, "leakage evidence"):
-                audit_leakage_evidence((changed,), card, manual)
+                audit_leakage_evidence((changed,), (locked,), (evaluated,), card, manual)
+        outcome_in_lock = copy.deepcopy(locked); outcome_in_lock["outcome"] = evaluated["outcome"]
+        with self.assertRaisesRegex(ValueError, "locked-row outcome isolation"):
+            audit_leakage_evidence((raw,), (outcome_in_lock,), (evaluated,), card, manual)
+        changed_evaluated = copy.deepcopy(evaluated); changed_evaluated["predicted_winner"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "evaluated prediction binding"):
+            audit_leakage_evidence((raw,), (locked,), (changed_evaluated,), card, manual)
         with self.assertRaisesRegex(ValueError, "manual audit evidence"):
-            audit_leakage_evidence((raw,), card, manual.replace("2025-06-15", "missing"))
+            audit_leakage_evidence((raw,), (locked,), (evaluated,), card, manual.replace("2025-06-15", "missing"))
 ```
 
 Also assert all eight chosen-side means literally:
@@ -680,8 +692,10 @@ def quality_diagnostic(rows: Sequence[Mapping[str, object]], card: Mapping[str, 
             "completeness": {"min": min(completeness), "max": max(completeness), "mean": statistics.fmean(completeness)},
             "training_eligible_rows": card["counts"]["training_eligible_rows"]}
 
-def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], card: Mapping[str, object], manual_text: str) -> dict[str, object]:
+def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], locked_rows: Sequence[Mapping[str, object]],
+                           evaluated_rows: Sequence[Mapping[str, object]], card: Mapping[str, object], manual_text: str) -> dict[str, object]:
     if len(candidate_rows) != int(card["counts"]["candidate_rows"]): raise ValueError("leakage evidence candidate count differs")
+    if len(locked_rows) != len(candidate_rows) or len(evaluated_rows) != len(locked_rows): raise ValueError("leakage evidence row count differs")
     for row in candidate_rows:
         provenance = row["provenance"]; target = date.fromisoformat(str(row["official_date"]));
         if date.fromisoformat(str(provenance["max_history_date"])) >= target or date.fromisoformat(str(provenance["schedule_used_max_date"])) >= target or provenance["statcast_target_excluded"] is not True:
@@ -691,15 +705,26 @@ def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], card:
     required_manual = ("2025-05-01", "2025-06-15", "2025-08-12", "max history date", "statcast_target_excluded=true", "RECONSTRUCTED_FINAL_LINEUP", "RECONSTRUCTED_ACTUAL_STARTER")
     if any(token not in manual_text for token in required_manual): raise ValueError("manual audit evidence incomplete")
     if int(card["counts"]["training_eligible_rows"]) != int(card["counts"]["calibration_rows"]): raise ValueError("calibration pool evidence differs")
+    outcome_fields = {"outcome", "actual_winner", "correct", "result", "home_score", "away_score"}
+    locked_by_key = {(int(row["game_pk"]), str(row["official_date"]), int(row["daily_rank"])): row for row in locked_rows}
+    evaluated_by_key = {(int(row["game_pk"]), str(row["official_date"]), int(row["daily_rank"])): row for row in evaluated_rows}
+    if len(locked_by_key) != len(locked_rows) or set(locked_by_key) != set(evaluated_by_key): raise ValueError("evaluated prediction binding differs")
+    for key, locked in locked_by_key.items():
+        if outcome_fields & set(locked): raise ValueError("locked-row outcome isolation violated")
+        evaluated = evaluated_by_key[key]
+        if set(evaluated) != set(locked) | {"outcome"} or any(evaluated.get(field) != value for field, value in locked.items()):
+            raise ValueError("evaluated prediction binding differs")
     later_revision_rows = sum(str(row["provenance"]["raw_source_max_date"]) > str(row["official_date"]) for row in candidate_rows)
-    return {"statistical_as_of_safety": {"status": "PASS", "candidate_rows": len(candidate_rows), "rule": "max_history_date and schedule_used_max_date < target; target Statcast excluded", "calibration_status": "IN_SAMPLE_NOT_OOF", "training_eligible_rows": card["counts"]["training_eligible_rows"], "calibration_rows": card["counts"]["calibration_rows"]},
+    return {"statistical_as_of_safety": {"status": "LIMITATION", "d1_feature_isolation_status": "PASS", "locked_row_outcome_field_isolation_status": "PASS", "lock_to_outcome_join_sequence_status": "NOT_TIMESTAMP_PROVEN", "candidate_rows": len(candidate_rows), "rule": "D-1 feature history and target Statcast exclusion are proven; locked prediction fields bind to evaluated rows without outcome fields; outcome-join execution timestamp is absent", "calibration_status": "IN_SAMPLE_NOT_OOF", "training_eligible_rows": card["counts"]["training_eligible_rows"], "calibration_rows": card["counts"]["calibration_rows"]},
             "participant_time_limitation": {"status": "LIMITATION", "lineup": "RECONSTRUCTED_FINAL_LINEUP", "starter": "RECONSTRUCTED_ACTUAL_STARTER"},
             "source_revision_limitation": {"status": "LIMITATION", "later_revision_rows": later_revision_rows, "rule": "manifest hashes bind retrieved provider state, not historical database state"}}
 
 def leakage_diagnostic(root: Path, rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
     candidate_rows = read_jsonl(root / "data/v5_1_bt/features/candidate_raw_features.jsonl")
+    locked_rows = read_jsonl(root / "data/v5_1_bt/locked/predictions.jsonl")
+    evaluated_rows = read_jsonl(root / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl")
     manual = (root / "audit/v5_1_bt/manual_audit.md").read_text(encoding="utf-8")
-    return audit_leakage_evidence(candidate_rows, card, manual)
+    return audit_leakage_evidence(candidate_rows, locked_rows, evaluated_rows, card, manual)
 
 def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
     paths = ("data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl", "data/v5_1_bt/reports/summary.json", "data/v5_1_bt/outcomes/baseline.json",
@@ -1075,7 +1100,7 @@ def component_body(d: Mapping[str, object]) -> str:
     return "## 컴포넌트 차이는 다음 검증의 가설입니다\n\n불펜과 일정 엣지는 승패 그룹에서 예상과 다른 방향을 보였습니다. 이 결과로 가중치·부호·임계값을 바꾸지 않고 과거 시즌에서 사전 선언대로 검사합니다."
 
 def quality_leakage_body(d: Mapping[str, object]) -> str:
-    return "## 데이터 품질은 실전 재현성을 제한합니다\n\n모든 Top 1은 INCOMPLETE·High·Toss-up이고, 참가자는 최종 라인업/실제 선발로 재구성됐습니다. D-1 통계 안전성 통과는 참가자 시점과 공급자 수정 이력을 해결하지 않습니다."
+    return "## 데이터 품질은 실전 재현성을 제한합니다\n\n모든 Top 1은 INCOMPLETE·High·Toss-up이고, 참가자는 최종 라인업/실제 선발로 재구성됐습니다. D-1 특성 격리와 잠금 행의 결과 필드 부재는 확인됐지만, 결과 결합 실행 시각이 없어 잠금 후 결합 순서는 입증되지 않았습니다(`NOT_TIMESTAMP_PROVEN`). 통계 as-of 집계 상태는 `LIMITATION`이며 참가자 시점과 공급자 수정 이력도 별도 한계로 남습니다."
 
 def next_steps_body() -> str:
     return "## Recommended Next Steps\n\n1. v5.2-QD 규칙과 해시를 동결합니다.\n2. 2018-2021 필수 소스를 확보한 뒤 H22/H23/H24를 적합합니다.\n3. 역사 500과 전향 T-45 장부를 절대 합치지 않습니다."
@@ -1143,6 +1168,9 @@ blocks = artifact["manifest"]["blocks"]
 self.assertEqual([blocks[1]["id"], blocks[2]["id"]], ["executive-summary", "definitions"])
 self.assertIn("모집단", blocks[2]["body"])
 self.assertIn("분모", blocks[2]["body"])
+quality = next(block for block in blocks if block["id"] == "quality-leakage")
+self.assertIn("`NOT_TIMESTAMP_PROVEN`", quality["body"])
+self.assertIn("`LIMITATION`", quality["body"])
 ```
 
 The six snapshot datasets contain only JSON scalar values. `component_edges` stores raw score-point edges (not proportions), with `wins_mean/losses_mean` numeric, `wins_N=67`, and `losses_N=33`. Each chart is immediately preceded by its finding Markdown block; each table follows the finding it substantiates.

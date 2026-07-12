@@ -81,11 +81,11 @@ Lineups are `RECONSTRUCTED_FINAL_LINEUP` and starters are `RECONSTRUCTED_ACTUAL_
 
 The leakage audit must separately report:
 
-- statistical as-of safety: `max_history_date <= D-1`, target `gamePk` Statcast excluded, outcomes inaccessible before lock;
+- statistical as-of safety, with three distinct evidence claims: feature history is D-1 isolated (`max_history_date <= D-1` and target `gamePk` Statcast excluded), locked prediction rows contain no outcome fields and bind exactly to the prediction fields later evaluated, but lock-to-outcome-join execution order is `NOT_TIMESTAMP_PROVEN` because no outcome-join execution timestamp was preserved;
 - participant-time limitation: final participants were reconstructed after the event and are not a timestamped T-45 snapshot;
 - source-revision limitation: later provider corrections are reproducible by retrieval hash but are not a historical database snapshot.
 
-Passing the first category does not cure the latter two. The diagnostic conclusion must not claim live reproducibility.
+The canonical aggregate `statistical_as_of_safety.status` is therefore `LIMITATION`, even though its D-1 feature-isolation and locked-row outcome-field-isolation subchecks are `PASS`; its sequence subcheck remains `NOT_TIMESTAMP_PROVEN` until timestamp evidence exists. Those proven subchecks do not establish that the outcome join executed after lock, and they do not cure the participant-time or source-revision limitations. The diagnostic conclusion must not claim live reproducibility or outcome-join chronology that the sealed evidence cannot prove.
 
 ## 4. Frozen v5.2-QD change specification
 
@@ -361,7 +361,7 @@ The design is implemented only when all of the following are proven by current a
 - The historical run contains exactly 500 unique graded Daily Top 1 dates from 2022-2024, follows the fixed H22/H23/H24 chronology, applies the frozen terminal deadline, extends only for documented VOID/no-eligible/system-miss dates, and never enters 2025.
 - The historical report carries every baseline, metric, limitation, and the label `Historical Walk-forward Robustness`; it never claims official independent 500-pick confirmation.
 - The prospective ledger begins no earlier than 2026-07-13, uses the exact 2019-2024 OOF calibration contract, satisfies the frozen clock/cadence/freshness rules, seals an immutable observable-at-lock start basis, never re-locks after schedule revision, ranks only timestamp-verified T-45 candidates, stays separate, never backfills misses, and labels interim results as incomplete.
-- Leakage, replay, hash, error-handling, paired-metric, workbook, and visual verification gates all pass with preserved evidence.
+- Leakage evidence gates preserve the two proven `PASS` subchecks, the aggregate `LIMITATION`, and `NOT_TIMESTAMP_PROVEN` lock-to-outcome-join sequence without promotion; replay, hash, error-handling, paired-metric, workbook, and visual verification gates pass with preserved evidence.
 - No unsupported market, ROI, CLV, profitability, actionable-betting, or predictive-improvement claim appears in any artifact.
 
 Failure of any hard integrity criterion invalidates the affected run; it cannot be repaired by favorable results or presentation changes.
