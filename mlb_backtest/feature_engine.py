@@ -30,6 +30,7 @@ OUT_EVENTS = frozenset(
         "sac_bunt",
         "strikeout",
         "strikeout_double_play",
+        "other_out",
     }
 )
 WALK_EVENTS = frozenset({"walk", "intent_walk", "intentional_walk"})
@@ -101,9 +102,66 @@ class ScheduleHistory:
     """Canonical schedule rows indexed once by team and team/date."""
 
     def __init__(self, rows: Iterable[Mapping[str, object]] = ()) -> None:
+        validated = []
+        seen_game_pks = set()
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                raise ValueError("schedule history rows must be mappings")
+            row = dict(raw)
+            game_pk = row.get("game_pk")
+            if type(game_pk) is not int or game_pk <= 0 or game_pk in seen_game_pks:
+                raise ValueError(
+                    "schedule history game_pk must be unique positive integers"
+                )
+            seen_game_pks.add(game_pk)
+            raw_date = row.get("official_date", row.get("game_date"))
+            scheduled = _day(raw_date, "schedule date")
+            if not isinstance(raw_date, str) or scheduled.isoformat() != raw_date:
+                raise ValueError("schedule history date must be canonical ISO")
+            team_codes = row.get("team_codes")
+            if (
+                isinstance(team_codes, (str, bytes))
+                or not isinstance(team_codes, Sequence)
+                or not team_codes
+                or any(not isinstance(code, str) or not code for code in team_codes)
+                or len(set(team_codes)) != len(team_codes)
+            ):
+                raise ValueError("schedule history team_codes must be unique strings")
+            innings = row.get("innings")
+            if innings is not None and (type(innings) is not int or innings < 0):
+                raise ValueError(
+                    "schedule history innings must be a nonnegative integer"
+                )
+            home_code = row.get("home_team_code")
+            if home_code is not None and (
+                not isinstance(home_code, str) or home_code not in team_codes
+            ):
+                raise ValueError("schedule history home_team_code is invalid")
+            venue_name = row.get("venue_name")
+            if venue_name is not None and (
+                not isinstance(venue_name, str) or not venue_name
+            ):
+                raise ValueError("schedule history venue_name is invalid")
+            for field in ("venue_city", "time_zone"):
+                value = row.get(field)
+                if value is not None and (not isinstance(value, str) or not value):
+                    raise ValueError(f"schedule history {field} is invalid")
+            for field, low, high in (
+                ("venue_latitude", -90.0, 90.0),
+                ("venue_longitude", -180.0, 180.0),
+            ):
+                value = row.get(field)
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not low <= float(value) <= high
+                ):
+                    raise ValueError(f"schedule history {field} is invalid")
+            validated.append(row)
         canonical = tuple(
             sorted(
-                (dict(row) for row in rows),
+                validated,
                 key=lambda row: (
                     str(row.get("official_date", row.get("game_date", ""))),
                     int(row.get("game_pk", 0)),
@@ -130,6 +188,15 @@ class ScheduleHistory:
             {key: tuple(value) for key, value in sorted(by_team_date.items())}
         )
         self._dates = tuple(dated)
+        self.game_dates = MappingProxyType(
+            {
+                int(row["game_pk"]): _day(
+                    row.get("official_date", row.get("game_date")), "schedule date"
+                )
+                for row in canonical
+            }
+        )
+        self.input_max_date = self._dates[-1] if self._dates else None
 
     def __iter__(self):
         return iter(self.rows)
@@ -144,6 +211,16 @@ class ScheduleHistory:
             return self._dates[-1]
         index = bisect_left(self._dates, target)
         return self._dates[index - 1] if index else None
+
+    def has_date(self, target: date) -> bool:
+        index = bisect_left(self._dates, target)
+        return index < len(self._dates) and self._dates[index] == target
+
+    def has_game(self, game_pk: int, target: date) -> bool:
+        return self.game_dates.get(game_pk) == target
+
+    def has_future(self, target: date) -> bool:
+        return bool(self._dates and self._dates[-1] > target)
 
 
 class FeatureHistory:
@@ -639,10 +716,23 @@ def _schedule_component(
         reverse=True,
     )
     latest = prior[0] if prior else None
-    rest = latest is None or _day(
-        latest.get("official_date", latest.get("game_date")), "schedule date"
-    ) < target - timedelta(days=1)
-    prior_innings = int(latest.get("innings", 0)) if latest and not rest else 0
+    d1_rows = history.schedule_history.by_team_date.get(
+        (team_code, target - timedelta(days=1)), ()
+    )
+    rest_supported = latest is not None
+    rest = rest_supported and not d1_rows
+    if d1_rows:
+        prior_innings_supported = all(
+            type(row.get("innings")) is int for row in d1_rows
+        )
+        prior_innings = (
+            max(int(row["innings"]) for row in d1_rows)
+            if prior_innings_supported
+            else 0
+        )
+    else:
+        prior_innings_supported = latest is not None
+        prior_innings = 0
     home_days = 0
     destination = _venue(game, history)
     target_venue = game.get("venue_name")
@@ -661,23 +751,44 @@ def _schedule_component(
             prior_home_games = []
             break
         prior_home_games.append(matching[0])
+    home_city_supported = latest is not None
     if len(prior_home_games) == 3:
         home_days = 3
-    doubleheader = game.get("doubleheader_marker") in {"GAME1", "GAME2"} or bool(
-        game.get("doubleheader", False)
-    )
+    if isinstance(game.get("doubleheader"), bool):
+        doubleheader = bool(game["doubleheader"])
+        doubleheader_supported = True
+    elif game.get("doubleheader_marker") in {"GAME1", "GAME2"}:
+        doubleheader = True
+        doubleheader_supported = True
+    else:
+        doubleheader = False
+        doubleheader_supported = False
     travel = (
         _travel_fields(_venue(latest, history), destination, game) if latest else None
     )
     flags = []
     if travel is None:
         miles, time_zones = 0.0, 0
-        flags = [
-            "travel_neutral_missing_venue_coordinates",
-            "time_zones_neutral_missing_venue_coordinates",
-        ]
+        travel_supported = False
+        time_zone_supported = False
+        flags.extend(
+            [
+                "travel_neutral_missing_venue_coordinates",
+                "time_zones_neutral_missing_venue_coordinates",
+            ]
+        )
     else:
         miles, time_zones = travel
+        travel_supported = True
+        time_zone_supported = True
+    if not rest_supported:
+        flags.append("rest_unsupported")
+    if not prior_innings_supported:
+        flags.append("prior_innings_unsupported")
+    if not home_city_supported:
+        flags.append("home_city_unsupported")
+    if not doubleheader_supported:
+        flags.append("doubleheader_unsupported")
     value = schedule_score(
         rest_day=rest,
         home_days=home_days,
@@ -686,7 +797,16 @@ def _schedule_component(
         time_zones=time_zones,
         doubleheader=doubleheader,
     )
-    supported = 4 + (2 if travel is not None else 0)
+    supported = sum(
+        (
+            rest_supported,
+            prior_innings_supported,
+            home_city_supported,
+            travel_supported,
+            time_zone_supported,
+            doubleheader_supported,
+        )
+    )
     return _metric(value, len(prior), supported / 6.0, flags=flags)
 
 
@@ -776,7 +896,7 @@ def _league_era_record(
 
 
 def _eligibility(
-    game: Mapping[str, object], league_era_source: object
+    game: Mapping[str, object], league_era_source: object, history: FeatureHistory
 ) -> tuple[list[str], date | None, float | None, dict[str, object] | None]:
     reasons = []
     if game.get("game_type") != "R":
@@ -818,11 +938,20 @@ def _eligibility(
         pitcher_id = game.get(f"{side}_probable_pitcher_id")
         if type(pitcher_id) is not int or pitcher_id <= 0:
             reasons.append(f"missing_{side}_starter")
+        actual_id = game.get(f"{side}_actual_starter_id")
+        if type(actual_id) is not int or actual_id <= 0:
+            reasons.append(f"missing_{side}_actual_starter")
+        elif type(pitcher_id) is int and pitcher_id > 0 and actual_id != pitcher_id:
+            reasons.append(f"{side}_starter_id_mismatch")
         lineup = game.get(f"{side}_lineup")
         if not lineup:
             reasons.append(f"missing_{side}_lineup")
         elif not _valid_lineup(lineup):
             reasons.append(f"invalid_{side}_lineup")
+    if game.get("starter_provenance") != "RECONSTRUCTED_ACTUAL_STARTER":
+        reasons.append("invalid_starter_provenance")
+    if not history.statcast_coverage_complete:
+        reasons.append("incomplete_statcast_coverage")
     league_era = None
     league_era_provenance = None
     if target is not None:
@@ -872,7 +1001,7 @@ def build_raw_game_features(
     ):
         raise ValueError("team_code_by_name must be an explicit frozen 30-team mapping")
     reasons, target, resolved_league_era, league_era_provenance = _eligibility(
-        game, league_era_by_asof
+        game, league_era_by_asof, history
     )
     target_identity_valid = (
         target is not None and type(game.get("game_pk")) is int and game["game_pk"] > 0
@@ -894,13 +1023,44 @@ def build_raw_game_features(
             and _valid_lineup(game.get("away_lineup"))
             else "MISSING_OR_INVALID_LINEUP"
         ),
+        "starter_provenance": (
+            "RECONSTRUCTED_ACTUAL_STARTER"
+            if game.get("starter_provenance") == "RECONSTRUCTED_ACTUAL_STARTER"
+            and all(
+                type(game.get(f"{side}_actual_starter_id")) is int
+                and game[f"{side}_actual_starter_id"] > 0
+                and game.get(f"{side}_actual_starter_id")
+                == game.get(f"{side}_probable_pitcher_id")
+                for side in ("home", "away")
+            )
+            else "MISSING_OR_INVALID_ACTUAL_STARTER"
+        ),
     }
     raw_source_max_date = _max_history_date(history, target)
+    schedule_input_max = history.schedule_history.input_max_date
+    schedule_used_max = (
+        history.schedule_history.max_before(target) if target is not None else None
+    )
     provenance = {
         "max_history_date": raw_source_max_date,
         "raw_source_max_date": raw_source_max_date,
-        "target_excluded": target_identity_valid,
+        "statcast_target_excluded": target_identity_valid,
         "history_validation": history_validation,
+        "statcast_coverage_complete": history.statcast_coverage_complete,
+        "schedule_input_max_date": (
+            schedule_input_max.isoformat() if schedule_input_max is not None else None
+        ),
+        "schedule_used_max_date": (
+            schedule_used_max.isoformat() if schedule_used_max is not None else None
+        ),
+        "target_schedule_present": (
+            history.schedule_history.has_game(int(game["game_pk"]), target)
+            if target_identity_valid
+            else False
+        ),
+        "future_schedule_present": (
+            history.schedule_history.has_future(target) if target is not None else False
+        ),
     }
     if league_era_provenance is not None:
         provenance["league_era"] = league_era_provenance
@@ -910,7 +1070,7 @@ def build_raw_game_features(
     assert target is not None and resolved_league_era is not None
     hands = {}
     for side in ("home", "away"):
-        pid = int(game[f"{side}_probable_pitcher_id"])
+        pid = int(game[f"{side}_actual_starter_id"])
         pitcher_rows = history.pitches_by_pitcher.get(pid, ())
         hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else None
     for side, opponent in (("home", "away"), ("away", "home")):
@@ -922,7 +1082,7 @@ def build_raw_game_features(
             "team_code": code,
             "starter": _starter_component(
                 history,
-                int(game[f"{side}_probable_pitcher_id"]),
+                int(game[f"{side}_actual_starter_id"]),
                 target,
                 resolved_league_era,
             ),

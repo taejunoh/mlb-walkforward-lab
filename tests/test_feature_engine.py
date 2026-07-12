@@ -90,6 +90,9 @@ def game(**changes):
         "venue_name": "Park",
         "away_probable_pitcher_id": 20,
         "home_probable_pitcher_id": 10,
+        "away_actual_starter_id": 20,
+        "home_actual_starter_id": 10,
+        "starter_provenance": "RECONSTRUCTED_ACTUAL_STARTER",
         "away_lineup": [
             {"player_id": 200 + i, "player_name": str(i)} for i in range(1, 10)
         ],
@@ -208,7 +211,7 @@ class FeatureEngineTest(unittest.TestCase):
             with self.subTest(target=target):
                 result = build(target, history)
                 self.assertFalse(result["eligible"])
-                self.assertFalse(result["provenance"]["target_excluded"])
+                self.assertFalse(result["provenance"]["statcast_target_excluded"])
                 self.assertEqual(
                     result["provenance"]["history_validation"],
                     "NOT_RUN_INVALID_TARGET",
@@ -236,6 +239,9 @@ class FeatureEngineTest(unittest.TestCase):
             ({"venue_name": ""}, "missing_venue"),
             ({"away_team": "Home"}, "invalid_teams"),
             ({"home_probable_pitcher_id": 0}, "missing_home_starter"),
+            ({"home_actual_starter_id": None}, "missing_home_actual_starter"),
+            ({"home_actual_starter_id": 30}, "home_starter_id_mismatch"),
+            ({"starter_provenance": "PROBABLE"}, "invalid_starter_provenance"),
             ({"home_lineup": duplicate_lineup}, "invalid_home_lineup"),
             ({"away_lineup": game()["away_lineup"][:8]}, "invalid_away_lineup"),
         )
@@ -244,6 +250,49 @@ class FeatureEngineTest(unittest.TestCase):
                 result = build(game(**changes), history)
                 self.assertFalse(result["eligible"])
                 self.assertIn(reason, result["reasons"])
+
+    def test_actual_starter_ids_drive_raw_starter_and_handedness_features(self):
+        rows = [
+            pa(1, "2025-04-30", 30, 201, "field_out", hand="L", xwoba=0.1, outs=1),
+            pa(
+                1,
+                "2025-04-30",
+                40,
+                101,
+                "field_out",
+                hand="R",
+                xwoba=0.2,
+                outs=1,
+                top="Bot",
+                at_bat=2,
+            ),
+        ]
+        result = build(
+            game(
+                home_probable_pitcher_id=30,
+                home_actual_starter_id=30,
+                away_probable_pitcher_id=40,
+                away_actual_starter_id=40,
+            ),
+            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        self.assertEqual(result["home"]["starter"]["pitcher_id"], 30)
+        self.assertEqual(result["away"]["starter"]["pitcher_id"], 40)
+        self.assertEqual(result["starter_provenance"], "RECONSTRUCTED_ACTUAL_STARTER")
+
+    def test_incomplete_statcast_coverage_is_ineligible_and_explicit(self):
+        result = build(
+            game(),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                statcast_coverage_complete=False,
+            ),
+        )
+        self.assertFalse(result["eligible"])
+        self.assertIn("incomplete_statcast_coverage", result["reasons"])
+        self.assertNotIn("home", result)
+        self.assertFalse(result["provenance"]["statcast_coverage_complete"])
 
     def test_asserts_pregame_boundary_for_plate_appearances_and_provenance(self):
         pitch = pa(1, "2025-04-28", 10, 101, "field_out", xwoba=0.1)
@@ -274,7 +323,7 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(result["lineup_provenance"], "RECONSTRUCTED_FINAL_LINEUP")
         self.assertEqual(result["provenance"]["raw_source_max_date"], "2025-04-30")
         self.assertEqual(result["provenance"]["history_validation"], "PASSED")
-        self.assertTrue(result["provenance"]["target_excluded"])
+        self.assertTrue(result["provenance"]["statcast_target_excluded"])
 
     def test_rate_denominators_and_frozen_reliability_qualities(self):
         rows = [
@@ -348,7 +397,7 @@ class FeatureEngineTest(unittest.TestCase):
     def test_unknown_opposing_starter_hand_neutralizes_only_platoon_metric(self):
         rows = [pa(1, "2025-04-30", 30, 101, "field_out", hand="R", xwoba=0.4, outs=1)]
         result = build(
-            game(away_probable_pitcher_id=999),
+            game(away_probable_pitcher_id=999, away_actual_starter_id=999),
             FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
         )
         offense = result["home"]["offense"]
@@ -510,15 +559,11 @@ class FeatureEngineTest(unittest.TestCase):
         ]
         result = build(
             game(),
-            FeatureHistory(
-                data(rows),
-                slot_weights={i: 1 / 9 for i in range(1, 10)},
-                statcast_coverage_complete=False,
-            ),
+            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
         )
         availability = result["home"]["bullpen"]["availability"]
-        self.assertEqual(availability["value"], 75.0)
-        self.assertEqual(availability["quality"], 0.5)
+        self.assertEqual(availability["value"], 100.0)
+        self.assertEqual(availability["quality"], 1.0)
 
         complete_rows = [row for row in rows if row["pitcher_id"] != 12]
         complete = build(
@@ -542,17 +587,6 @@ class FeatureEngineTest(unittest.TestCase):
         )["home"]["bullpen"]["availability"]
         self.assertEqual(complete["value"], 100.0)
         self.assertEqual(complete["quality"], 1.0)
-
-        incomplete = build(
-            game(),
-            FeatureHistory(
-                data(rows),
-                slot_weights={i: 1 / 9 for i in range(1, 10)},
-                statcast_coverage_complete=False,
-            ),
-        )["home"]["bullpen"]["availability"]
-        self.assertEqual(incomplete["value"], 50.0)
-        self.assertEqual(incomplete["quality"], 0.0)
 
     def test_home_city_bonus_requires_home_games_at_same_venue_on_d1_d2_d3(self):
         def schedule(home_codes):
@@ -619,6 +653,75 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(rows.iterations, 1)
         self.assertLess(elapsed, 5.0)
 
+    def test_schedule_provenance_separates_input_from_strictly_prior_used_rows(self):
+        schedule = [
+            {
+                "game_pk": 1,
+                "official_date": "2025-04-30",
+                "team_codes": ["HOM"],
+                "home_team_code": "HOM",
+                "venue_name": "Park",
+                "innings": 9,
+            },
+            {
+                "game_pk": 900,
+                "official_date": "2025-05-01",
+                "team_codes": ["HOM", "AWY"],
+                "home_team_code": "HOM",
+                "venue_name": "Park",
+            },
+            {
+                "game_pk": 901,
+                "official_date": "2025-05-02",
+                "team_codes": ["HOM"],
+                "home_team_code": "HOM",
+                "venue_name": "Park",
+            },
+        ]
+        result = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                schedule_history=schedule,
+            ),
+        )
+        provenance = result["provenance"]
+        self.assertEqual(provenance["schedule_input_max_date"], "2025-05-02")
+        self.assertEqual(provenance["schedule_used_max_date"], "2025-04-30")
+        self.assertTrue(provenance["target_schedule_present"])
+        self.assertTrue(provenance["future_schedule_present"])
+        self.assertEqual(result["home"]["schedule"]["value"], 50.0)
+
+    def test_missing_prior_schedule_is_neutral_except_known_doubleheader_rule(self):
+        result = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(data([]), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        schedule = result["home"]["schedule"]
+        self.assertEqual(schedule["value"], 50.0)
+        self.assertAlmostEqual(schedule["quality"], 1 / 6)
+        self.assertIn("rest_unsupported", schedule["flags"])
+
+    def test_schedule_history_rejects_malformed_rows(self):
+        valid = {
+            "game_pk": 1,
+            "official_date": "2025-04-30",
+            "team_codes": ["HOM"],
+            "innings": 9,
+        }
+        invalid = (
+            dict(valid, game_pk=True),
+            dict(valid, official_date="bad"),
+            dict(valid, team_codes="HOM"),
+            dict(valid, innings=-1),
+            dict(valid, venue_latitude="north"),
+            dict(valid, time_zone=""),
+        )
+        for row in invalid:
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                ScheduleHistory([row])
+
     def test_large_statcast_history_repeated_builds_use_indexes_reasonably(self):
         rows = [
             pa(
@@ -643,6 +746,28 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 5.0)
         self.assertEqual(len(history.pitches_by_pitcher_game), 20000)
 
+    def test_dense_relevant_history_repeated_builds_remain_reasonable(self):
+        rows = [
+            pa(
+                1000 + i // 100,
+                f"2025-04-{1 + (i // 100) % 30:02d}",
+                10 if i % 100 < 50 else 11,
+                101 + i % 9,
+                "field_out",
+                xwoba=0.2,
+                outs=1,
+                at_bat=i % 100 + 1,
+            )
+            for i in range(20000)
+        ]
+        started = time.perf_counter()
+        history = FeatureHistory(
+            data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}
+        )
+        for _ in range(10):
+            build(game(), history)
+        self.assertLess(time.perf_counter() - started, 5.0)
+
     def test_expected_woba_uses_expected_then_source_backed_deterministic_fallbacks(
         self,
     ):
@@ -654,6 +779,7 @@ class FeatureEngineTest(unittest.TestCase):
             ("hit_by_pitch", 0.72),
             ("strikeout", 0.0),
             ("field_out", 0.0),
+            ("other_out", 0.0),
         ):
             self.assertEqual(
                 pa_expected_woba(
@@ -773,7 +899,7 @@ class FeatureEngineTest(unittest.TestCase):
             },
         )
         self.assertEqual(result["provenance"]["max_history_date"], "2025-04-30")
-        self.assertTrue(result["provenance"]["target_excluded"])
+        self.assertTrue(result["provenance"]["statcast_target_excluded"])
         self.assertTrue(all(math.isfinite(x) for x in self._numbers(result)))
 
     def test_one_start_is_insufficient_for_velocity_change(self):
@@ -822,8 +948,10 @@ class FeatureEngineTest(unittest.TestCase):
         )
         result = build(game(doubleheader_marker=None), history)
         self.assertEqual(result["home"]["schedule"]["value"], 34.0)
-        self.assertEqual(result["home"]["schedule"]["quality"], 1.0)
-        self.assertEqual(result["home"]["schedule"]["flags"], [])
+        self.assertEqual(result["home"]["schedule"]["quality"], 5 / 6)
+        self.assertEqual(
+            result["home"]["schedule"]["flags"], ["doubleheader_unsupported"]
+        )
 
     def test_missing_participants_are_ineligible_with_explicit_reasons(self):
         history = FeatureHistory(
