@@ -6,6 +6,8 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -339,10 +341,10 @@ def iter_statcast_pitches(
     source: str | Path | bytes,
 ) -> Iterable[dict[str, object]]:
     """Validate and stream normalized pitches without retaining the CSV as text."""
-    raw_bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
+    raw_stream = io.BytesIO(source) if isinstance(source, bytes) else Path(source).open("rb")
     try:
-        with io.TextIOWrapper(
-            io.BytesIO(raw_bytes), encoding="utf-8-sig", newline=""
+        with raw_stream, io.TextIOWrapper(
+            raw_stream, encoding="utf-8-sig", newline=""
         ) as stream:
             reader = csv.DictReader(stream)
             fields = set(reader.fieldnames or ())
@@ -450,27 +452,90 @@ def iter_statcast_pitches(
         raise ValueError("statcast CSV must be UTF-8-sig") from exc
 
 
+def _statcast_pitch_identity(row: Mapping[str, object]) -> tuple[int, int, int]:
+    return (
+        int(row["game_pk"]),
+        int(row["at_bat_number"]),
+        int(row["pitch_number"]),
+    )
+
+
+def _statcast_pitch_fingerprint(row: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        row,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _conflicting_duplicate_pitch(key: tuple[int, int, int]) -> ValueError:
+    return ValueError(f"conflicting duplicate pitch {key[0]}:{key[1]}:{key[2]}")
+
+
 def iter_unique_statcast_pitches(
     pitches: Iterable[dict[str, object]],
 ) -> Iterable[dict[str, object]]:
     """Yield one row per canonical pitch identity and reject conflicts."""
-    seen: dict[tuple[int, int, int], tuple[tuple[str, object], ...]] = {}
+    seen: dict[tuple[int, int, int], bytes] = {}
     for row in pitches:
-        key = (
-            int(row["game_pk"]),
-            int(row["at_bat_number"]),
-            int(row["pitch_number"]),
-        )
-        fingerprint = tuple((field, row[field]) for field in sorted(row))
+        key = _statcast_pitch_identity(row)
+        fingerprint = _statcast_pitch_fingerprint(row)
         prior = seen.get(key)
         if prior is not None:
             if prior != fingerprint:
-                raise ValueError(
-                    f"conflicting duplicate pitch {key[0]}:{key[1]}:{key[2]}"
-                )
+                raise _conflicting_duplicate_pitch(key)
             continue
         seen[key] = fingerprint
         yield row
+
+
+def iter_unique_statcast_pitches_on_disk(
+    pitches: Iterable[dict[str, object]],
+) -> Iterable[dict[str, object]]:
+    """Deduplicate pitches with a fixed-size SQLite cache instead of row RAM."""
+    with tempfile.TemporaryDirectory(prefix="mlb-statcast-unique-") as temp_dir:
+        database = Path(temp_dir) / "pitches.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA cache_size=-1024")
+            connection.execute(
+                """
+                CREATE TABLE pitches (
+                    game_pk INTEGER NOT NULL,
+                    at_bat_number INTEGER NOT NULL,
+                    pitch_number INTEGER NOT NULL,
+                    fingerprint BLOB NOT NULL,
+                    PRIMARY KEY (game_pk, at_bat_number, pitch_number)
+                ) WITHOUT ROWID
+                """
+            )
+            cursor = connection.cursor()
+            for row in pitches:
+                key = _statcast_pitch_identity(row)
+                fingerprint = _statcast_pitch_fingerprint(row)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO pitches VALUES (?, ?, ?, ?)",
+                    (*key, fingerprint),
+                )
+                if cursor.rowcount:
+                    yield row
+                    continue
+                prior = cursor.execute(
+                    """
+                    SELECT fingerprint FROM pitches
+                    WHERE game_pk = ? AND at_bat_number = ? AND pitch_number = ?
+                    """,
+                    key,
+                ).fetchone()
+                if prior is None or bytes(prior[0]) != fingerprint:
+                    raise _conflicting_duplicate_pitch(key)
+        finally:
+            connection.close()
 
 
 def parse_statcast(source: str | Path | bytes) -> StatcastData:
@@ -639,6 +704,7 @@ __all__ = [
     "identify_pitcher_roles",
     "iter_statcast_pitches",
     "iter_unique_statcast_pitches",
+    "iter_unique_statcast_pitches_on_disk",
     "monthly_ranges",
     "parse_statcast",
     "regular_season_ranges",

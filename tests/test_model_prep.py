@@ -229,6 +229,30 @@ class ModelPreparationSourceTest(unittest.TestCase):
 
         self.assertEqual(counts[11], 1)
 
+    def test_pitcher_career_bf_does_not_use_in_memory_pitch_uniqueness(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-01",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-01", "2024-04-02"),
+                },
+                STATCAST.read_bytes(),
+            )
+
+            with mock.patch(
+                "mlb_backtest.statcast.iter_unique_statcast_pitches",
+                side_effect=AssertionError("BF uniqueness must be disk-backed"),
+            ):
+                counts, _hashes = load_pitcher_bf_range(
+                    root, "2024-04-01", "2024-04-02"
+                )
+
+        self.assertEqual(counts[11], 1)
+
     def test_pitcher_career_bf_rejects_conflicting_duplicate_pitch_rows(self):
         lines = STATCAST.read_text("utf-8-sig").splitlines()
         conflicting = lines[2].replace("86.0", "85.9")

@@ -168,7 +168,7 @@ def load_pitcher_bf_range(
     from .statcast import (
         NON_PA_EVENTS,
         iter_statcast_pitches,
-        iter_unique_statcast_pitches,
+        iter_unique_statcast_pitches_on_disk,
     )
 
     counts: defaultdict[int, int] = defaultdict(int)
@@ -183,7 +183,7 @@ def load_pitcher_bf_range(
         query = verified["manifest"]["query"]
         first, last = date.fromisoformat(query["start"]), date.fromisoformat(query["end"])
         rows = iter_statcast_pitches(Path(verified["payload_path"]))
-        for row in iter_unique_statcast_pitches(rows):
+        for row in iter_unique_statcast_pitches_on_disk(rows):
             if not first <= date.fromisoformat(str(row["game_date"])) <= last:
                 raise ValueError("Statcast row is outside manifest query range")
             if row.get("events") and row["events"] not in NON_PA_EVENTS:
