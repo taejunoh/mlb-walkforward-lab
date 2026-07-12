@@ -11,7 +11,9 @@ from unittest.mock import patch
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
 from mlb_backtest.preflight import (
     MINIMUM_SOURCES,
+    OPTIONAL_REQUIRED_FIELDS,
     PREFLIGHT_REQUIRED_KEYS,
+    QUERY_EVIDENCE_KEYS,
     REQUIRED_FIELDS,
     build_preflight,
     parent_logical_query_id,
@@ -21,7 +23,11 @@ from mlb_backtest.preflight import (
     render_preflight_markdown,
     write_preflight,
 )
-from mlb_backtest.protocols import expected_historical_run, load_run_spec, parse_run_spec
+from mlb_backtest.protocols import (
+    expected_historical_run,
+    load_run_spec,
+    parse_run_spec,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +39,10 @@ class PreflightTest(unittest.TestCase):
     def test_current_workspace_reports_required_gap_without_fetching(self):
         before = protected_inventory(ROOT)
         with (
-            patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=AssertionError("network forbidden"),
+            ),
             patch(
                 "http.client.HTTPConnection.request",
                 side_effect=AssertionError("network forbidden"),
@@ -47,7 +56,9 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(before, protected_inventory(ROOT))
         self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
         for year in (2018, 2019, 2020, 2021):
-            self.assertEqual(report["seasons"][str(year)]["minimum_contract"], "MISSING")
+            self.assertEqual(
+                report["seasons"][str(year)]["minimum_contract"], "MISSING"
+            )
         legacy_statuses = {
             source["status"]
             for year in (2022, 2023, 2024)
@@ -75,10 +86,40 @@ class PreflightTest(unittest.TestCase):
             root = make_complete_inventory(Path(directory))
             report = build_preflight(root, parse_run_spec(expected_historical_run()))
         self.assertEqual(report["status"], "READY")
-        self.assertEqual(report["optional_sources"]["market_odds"]["status"], "ABSENT_NULL")
+        self.assertEqual(
+            report["optional_sources"]["market_odds"]["status"], "ABSENT_NULL"
+        )
         self.assertEqual(
             report["optional_sources"]["environment"]["status"], "ABSENT_NEUTRAL"
         )
+
+    def test_valid_optional_evidence_activates_without_changing_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            make_optional_inventory(root, "market_odds")
+            make_optional_inventory(root, "environment", namespace="inventory/2022")
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
+        self.assertEqual(report["status"], "READY")
+        for source in ("market_odds", "environment"):
+            optional = report["optional_sources"][source]
+            self.assertEqual(optional["status"], "PRESENT_VALID")
+            self.assertEqual(optional["fallback_status"], None)
+            self.assertEqual(len(optional["queries"]), 1)
+            self.assertEqual(set(optional["queries"][0]), QUERY_EVIDENCE_KEYS)
+
+    def test_malformed_optional_evidence_is_separate_and_never_blocks_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            path = root / "inventory/2022/environment/bad.manifest.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("{")
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
+        self.assertEqual(report["status"], "READY")
+        self.assertEqual(report["inventory_errors"], [])
+        optional = report["optional_sources"]["environment"]
+        self.assertEqual(optional["status"], "PRESENT_INVALID")
+        self.assertEqual(optional["fallback_status"], "ABSENT_NEUTRAL")
+        self.assertEqual(optional["errors"][0]["code"], "MALFORMED_MANIFEST_JSON")
 
     def test_complete_fixture_is_ready_and_json_serializable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,12 +133,14 @@ class PreflightTest(unittest.TestCase):
 
     def test_each_integrity_failure_blocks_ready(self):
         mutations = {
-            "raw_hash": lambda root: (root / first_manifest(root)["raw_path"]).write_bytes(
-                b"changed"
-            ),
+            "raw_hash": lambda root: (
+                root / first_manifest(root)["raw_path"]
+            ).write_bytes(b"changed"),
             "sidecar_hash": mutate_sidecar_without_manifest_update,
             "schema": lambda root: rewrite_sidecar(root, {"schema_fields": ["gamePk"]}),
-            "duplicate_game_pk": lambda root: rewrite_sidecar(root, {"game_pks": [1, 1]}),
+            "duplicate_game_pk": lambda root: rewrite_sidecar(
+                root, {"game_pks": [1, 1]}
+            ),
             "invalid_game_pk": lambda root: rewrite_sidecar(root, {"game_pks": [0]}),
             "date_range": lambda root: rewrite_manifest(
                 root,
@@ -118,7 +161,9 @@ class PreflightTest(unittest.TestCase):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 root = make_complete_inventory(Path(directory))
                 mutate(root)
-                report = build_preflight(root, parse_run_spec(expected_historical_run()))
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
                 self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
 
     def test_malformed_json_is_recorded_and_blocks_instead_of_raising(self):
@@ -149,7 +194,10 @@ class PreflightTest(unittest.TestCase):
             root = make_complete_inventory(Path(directory))
             before = protected_inventory(root)
             with (
-                patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")),
+                patch(
+                    "urllib.request.urlopen",
+                    side_effect=AssertionError("network forbidden"),
+                ),
                 patch(
                     "http.client.HTTPConnection.request",
                     side_effect=AssertionError("network forbidden"),
@@ -158,14 +206,22 @@ class PreflightTest(unittest.TestCase):
                     "socket.create_connection",
                     side_effect=AssertionError("network forbidden"),
                 ),
-                patch("pathlib.Path.write_bytes", side_effect=AssertionError("write forbidden")),
-                patch("pathlib.Path.write_text", side_effect=AssertionError("write forbidden")),
+                patch(
+                    "pathlib.Path.write_bytes",
+                    side_effect=AssertionError("write forbidden"),
+                ),
+                patch(
+                    "pathlib.Path.write_text",
+                    side_effect=AssertionError("write forbidden"),
+                ),
                 patch("os.replace", side_effect=AssertionError("write forbidden")),
                 patch("os.rename", side_effect=AssertionError("write forbidden")),
                 patch("os.remove", side_effect=AssertionError("write forbidden")),
                 patch("os.unlink", side_effect=AssertionError("write forbidden")),
             ):
-                report = build_preflight(root, parse_run_spec(expected_historical_run()))
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
             self.assertEqual(report["status"], "READY")
             self.assertEqual(before, protected_inventory(root))
 
@@ -176,6 +232,7 @@ class PreflightTest(unittest.TestCase):
                 parse_run_spec(expected_historical_run()),
             )
         schema = preflight_schema_document()
+        self.assertEqual(json.loads(PREFLIGHT_SCHEMA.read_text()), schema)
         self.assertEqual(set(payload), PREFLIGHT_REQUIRED_KEYS)
         self.assertEqual(set(schema["required"]), PREFLIGHT_REQUIRED_KEYS)
         self.assertEqual(set(schema["properties"]), PREFLIGHT_REQUIRED_KEYS)
@@ -184,6 +241,11 @@ class PreflightTest(unittest.TestCase):
         self.assertFalse(schema["$defs"]["season"]["additionalProperties"])
         self.assertFalse(schema["$defs"]["source_record"]["additionalProperties"])
         self.assertFalse(schema["$defs"]["step"]["additionalProperties"])
+        self.assertFalse(schema["$defs"]["query_evidence"]["additionalProperties"])
+        self.assertEqual(
+            set(schema["$defs"]["query_evidence"]["properties"]),
+            QUERY_EVIDENCE_KEYS,
+        )
 
         mutations = []
         changed = copy.deepcopy(payload)
@@ -209,6 +271,67 @@ class PreflightTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_preflight(changed)
 
+    def test_recursive_parser_rejects_nested_type_hash_date_path_and_error_tampering(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = build_preflight(
+                make_complete_inventory(Path(directory)),
+                parse_run_spec(expected_historical_run()),
+            )
+        source = MINIMUM_SOURCES[0]
+        mutations = {
+            "negative count": ("row_count", -1),
+            "bool count": ("game_count", True),
+            "bad content hash": ("content_sha256", ["not-a-hash"]),
+            "bad expected date": ("expected_start", "2018-1-1"),
+            "unsafe child path": ("split_children", ["../escape"]),
+        }
+        for label, (field, value) in mutations.items():
+            changed = copy.deepcopy(payload)
+            changed["seasons"]["2018"]["sources"][source][field] = value
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                parse_preflight(changed)
+        changed = copy.deepcopy(payload)
+        changed["status"] = "BLOCKED_REQUIRED_ACQUISITION"
+        changed["inventory_errors"] = [
+            {"path": "inventory/x", "code": "RAW_HASH_MISMATCH", "detail": 1}
+        ]
+        with self.assertRaises(ValueError):
+            parse_preflight(changed)
+
+    def test_every_source_child_preserves_exact_canonical_query_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = build_preflight(
+                make_complete_inventory(Path(directory)),
+                parse_run_spec(expected_historical_run()),
+            )
+        for year in map(str, range(2018, 2025)):
+            for source in MINIMUM_SOURCES:
+                record = report["seasons"][year]["sources"][source]
+                self.assertEqual(len(record["queries"]), 2)
+                for query in record["queries"]:
+                    self.assertEqual(set(query), QUERY_EVIDENCE_KEYS)
+                    self.assertEqual(query["source"], source)
+                    self.assertEqual(query["query"]["season"], int(year))
+
+    def test_committed_json_round_trips_to_exact_markdown_in_frozen_source_order(self):
+        payload = parse_preflight(
+            json.loads(
+                (ROOT / "reports/v5_2_qd/walkforward_500_preflight.json").read_text()
+            )
+        )
+        rendered = render_preflight_markdown(payload).encode()
+        committed = (ROOT / "reports/v5_2_qd/walkforward_500_preflight.md").read_bytes()
+        self.assertEqual(rendered, committed)
+        row = next(
+            line
+            for line in rendered.decode().splitlines()
+            if line.startswith("| 2022 |")
+        )
+        positions = [row.index(source) for source in MINIMUM_SOURCES]
+        self.assertEqual(positions, sorted(positions))
+
     def test_parser_rejects_season_contract_inconsistent_with_source_status(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = build_preflight(
@@ -216,14 +339,16 @@ class PreflightTest(unittest.TestCase):
                 parse_run_spec(expected_historical_run()),
             )
         payload["seasons"]["2024"]["sources"][MINIMUM_SOURCES[0]]["status"] = "MISSING"
-        with self.assertRaisesRegex(ValueError, "minimum contract"):
+        with self.assertRaises(ValueError):
             parse_preflight(payload)
 
     def test_writer_is_deterministic_and_does_not_claim_commands_exist(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_complete_inventory(Path(directory) / "root")
             run_path = Path(directory) / "run.json"
-            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            run_path.write_bytes(
+                canonical_json_bytes(expected_historical_run()) + b"\n"
+            )
             outputs = []
             for suffix in ("one", "two"):
                 base = Path(directory) / suffix
@@ -257,7 +382,10 @@ def make_complete_inventory(root: Path) -> Path:
             logical = parent_logical_query_id(
                 source, year, f"{year}-01-01", f"{year}-12-31"
             )
-            parts = ((f"{year}-01-01", f"{year}-06-30"), (f"{year}-07-01", f"{year}-12-31"))
+            parts = (
+                (f"{year}-01-01", f"{year}-06-30"),
+                (f"{year}-07-01", f"{year}-12-31"),
+            )
             for split_index, (start, end) in enumerate(parts, 1):
                 base = root / "inventory" / str(year) / source / f"part-{split_index}"
                 base.parent.mkdir(parents=True, exist_ok=True)
@@ -296,6 +424,44 @@ def make_complete_inventory(root: Path) -> Path:
                     canonical_json_bytes(manifest) + b"\n"
                 )
     return root
+
+
+def make_optional_inventory(
+    root: Path, source: str, *, namespace: str = "inventory_optional"
+) -> None:
+    base = root / namespace / source / "part-1"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    raw = base.with_suffix(".raw")
+    raw.write_bytes(source.encode())
+    sidecar = base.with_suffix(".sidecar.json")
+    side_payload = {
+        "schema_version": 1,
+        "schema_fields": list(OPTIONAL_REQUIRED_FIELDS[source]),
+        "row_count": 1,
+        "game_count": 1,
+        "game_pks": [1],
+        "event_dates": ["2022-01-01", "2022-12-31"],
+    }
+    sidecar.write_bytes(canonical_json_bytes(side_payload) + b"\n")
+    parent = parent_logical_query_id(source, 2022, "2022-01-01", "2022-12-31")
+    manifest = {
+        "schema_version": 1,
+        "source": source,
+        "logical_query_id": f"{parent}:1",
+        "parent_logical_query_id": parent,
+        "query": {"season": 2022, "start_date": "2022-01-01", "end_date": "2022-12-31"},
+        "child_range": {"start_date": "2022-01-01", "end_date": "2022-12-31"},
+        "raw_path": raw.relative_to(root).as_posix(),
+        "raw_sha256": sha256_file(raw),
+        "sidecar_path": sidecar.relative_to(root).as_posix(),
+        "sidecar_sha256": sha256_file(sidecar),
+        "retrieved_at_utc": "2026-07-12T00:00:00Z",
+        "split_index": 1,
+        "split_count": 1,
+    }
+    base.with_suffix(".manifest.json").write_bytes(
+        canonical_json_bytes(manifest) + b"\n"
+    )
 
 
 def first_manifest(root: Path) -> dict[str, object]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -31,15 +31,9 @@ SMALL_SEALED_HASH_ROOTS = (
 )
 SOURCE_ALIASES = MappingProxyType(
     {
-        "mlb_schedule_game_feed": frozenset(
-            {"mlb_schedule_game_feed", "mlb_schedule"}
-        ),
-        "baseball_savant_statcast": frozenset(
-            {"baseball_savant_statcast", "statcast"}
-        ),
-        "mlb_stats_pitching": frozenset(
-            {"mlb_stats_pitching", "mlb_stats_pitcher_bf"}
-        ),
+        "mlb_schedule_game_feed": frozenset({"mlb_schedule_game_feed", "mlb_schedule"}),
+        "baseball_savant_statcast": frozenset({"baseball_savant_statcast", "statcast"}),
+        "mlb_stats_pitching": frozenset({"mlb_stats_pitching", "mlb_stats_pitcher_bf"}),
         "venue_team_timezone_table": frozenset(
             {
                 "venue_team_timezone_table",
@@ -156,6 +150,7 @@ SOURCE_RECORD_KEYS = frozenset(
         "content_sha256",
         "manifest_sha256",
         "split_children",
+        "queries",
         "status",
     }
 )
@@ -168,7 +163,56 @@ OPTIONAL_SOURCE_CONTRACT = MappingProxyType(
         "injury_restriction": "ABSENT_NULL",
     }
 )
+OPTIONAL_REQUIRED_FIELDS = MappingProxyType(
+    {
+        "market_odds": (
+            "gamePk",
+            "observed_at_utc",
+            "away_no_vig_probability",
+            "home_no_vig_probability",
+        ),
+        "environment": (
+            "gamePk",
+            "observed_at_utc",
+            "temperature_f",
+            "wind_mph",
+            "roof_status",
+        ),
+        "defense": ("gamePk", "observed_at_utc", "team_id", "oaa", "opportunities"),
+        "catcher": (
+            "gamePk",
+            "observed_at_utc",
+            "player_id",
+            "framing",
+            "opportunities",
+        ),
+        "injury_restriction": (
+            "gamePk",
+            "observed_at_utc",
+            "player_id",
+            "restriction_status",
+        ),
+    }
+)
+QUERY_EVIDENCE_KEYS = frozenset(
+    {
+        "evidence_kind",
+        "source",
+        "manifest_path",
+        "manifest_sha256",
+        "logical_query_id",
+        "parent_logical_query_id",
+        "query",
+        "child_range",
+    }
+)
+QUERY_KEYS = frozenset({"season", "start_date", "end_date"})
+RANGE_KEYS = frozenset({"start_date", "end_date"})
+OPTIONAL_RECORD_KEYS = frozenset({"status", "fallback_status", "queries", "errors"})
 INVENTORY_ERROR_KEYS = frozenset({"path", "code", "detail"})
+PROTECTED_SNAPSHOT_KEYS = frozenset(
+    {"metadata_path_size_mtime_inode_mode", "small_sealed_sha256"}
+)
 
 
 def protected_inventory(root: Path) -> dict[str, object]:
@@ -189,7 +233,9 @@ def protected_inventory(root: Path) -> dict[str, object]:
         path.relative_to(root).as_posix(): sha256_file(path)
         for relative in SMALL_SEALED_HASH_ROOTS
         if (root / relative).exists()
-        for path in sorted(item for item in (root / relative).rglob("*") if item.is_file())
+        for path in sorted(
+            item for item in (root / relative).rglob("*") if item.is_file()
+        )
     }
     return {
         "metadata_path_size_mtime_inode_mode": metadata,
@@ -256,16 +302,20 @@ def inventory_existing_manifests(
 ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
-    candidates = sorted(
-        path
-        for base in (root / "inventory", root / "data/v5_2_qd/raw")
-        if base.exists()
-        for path in base.rglob("*.manifest.json")
-    )
+    candidates = _manifest_candidates(root)
     for path in candidates:
+        inferred_optional = _optional_source_from_path(root, path)
+        if inferred_optional is not None:
+            continue
         try:
+            raw_manifest = _read_json(path)
+            if (
+                isinstance(raw_manifest, Mapping)
+                and raw_manifest.get("source") in OPTIONAL_SOURCE_CONTRACT
+            ) or inferred_optional is not None:
+                continue
             manifest = require_exact_keys(
-                _read_json(path),
+                raw_manifest,
                 MANIFEST_KEYS,
                 f"manifest:{path.relative_to(root)}",
             )
@@ -279,7 +329,13 @@ def inventory_existing_manifests(
             continue
         try:
             row = _validate_manifest(root, path, manifest)
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             code = (
                 "MALFORMED_SIDECAR_JSON"
                 if str(exc).startswith("sidecar unreadable:")
@@ -293,12 +349,23 @@ def inventory_existing_manifests(
 
 
 def _validate_manifest(
-    root: Path, path: Path, item: Mapping[str, object]
+    root: Path,
+    path: Path,
+    item: Mapping[str, object],
+    *,
+    optional_source: str | None = None,
 ) -> dict[str, object]:
     failures: list[str] = []
     if item["schema_version"] != 1:
         failures.append("MANIFEST_SCHEMA_VERSION")
-    source = canonical_source(str(item["source"]))
+    if optional_source is None:
+        source = canonical_source(str(item["source"]))
+        required_fields = REQUIRED_FIELDS[source]
+    else:
+        if item["source"] != optional_source:
+            raise ValueError("optional manifest source/path mismatch")
+        source = optional_source
+        required_fields = OPTIONAL_REQUIRED_FIELDS[source]
     query = require_exact_keys(
         item["query"],
         frozenset({"season", "start_date", "end_date"}),
@@ -315,9 +382,9 @@ def _validate_manifest(
     child_start = _iso_date(child["start_date"], "child_range.start_date")
     child_end = _iso_date(child["end_date"], "child_range.end_date")
     if start != f"{year}-01-01" or end != f"{year}-12-31":
-        failures.append("QUERY_DATE_RANGE_MISMATCH")
+        raise ValueError("QUERY_DATE_RANGE_MISMATCH")
     if start > end or child_start > child_end or child_start < start or child_end > end:
-        failures.append("INVALID_DATE_RANGE")
+        raise ValueError("INVALID_DATE_RANGE")
     raw_path = safe_relative(root, item["raw_path"])
     sidecar_path = safe_relative(root, item["sidecar_path"])
     try:
@@ -343,7 +410,7 @@ def _validate_manifest(
         failures.append("INVALID_EVENT_DATE_RANGE")
     elif event_dates != [child_start, child_end]:
         failures.append("EVENT_DATE_RANGE_MISMATCH")
-    missing = sorted(set(REQUIRED_FIELDS[source]) - set(schema_fields))
+    missing = sorted(set(required_fields) - set(schema_fields))
     if missing:
         failures.append("MISSING_CRITICAL_FIELDS")
     if len(game_pks) != len(set(game_pks)):
@@ -352,7 +419,7 @@ def _validate_manifest(
         failures.append("INVALID_GAME_PK")
     expected_parent = parent_logical_query_id(source, year, start, end)
     if item["parent_logical_query_id"] != expected_parent:
-        failures.append("SPLIT_PARENT_ID_MISMATCH")
+        raise ValueError("SPLIT_PARENT_ID_MISMATCH")
     split_index = _strict_int(item["split_index"], "split_index", minimum=1)
     split_count = _strict_int(item["split_count"], "split_count", minimum=1)
     if split_index > split_count:
@@ -361,7 +428,9 @@ def _validate_manifest(
         "source": source,
         "query": {"season": year, "start_date": start, "end_date": end},
         "child_range": {"start_date": child_start, "end_date": child_end},
-        "logical_query_id": _strict_string(item["logical_query_id"], "logical_query_id"),
+        "logical_query_id": _strict_string(
+            item["logical_query_id"], "logical_query_id"
+        ),
         "parent_logical_query_id": _strict_string(
             item["parent_logical_query_id"], "parent_logical_query_id"
         ),
@@ -372,15 +441,198 @@ def _validate_manifest(
         "game_pks": game_pks,
         "event_dates": event_dates,
         "schema_fields": schema_fields,
-        "retrieved_at_utc": _strict_string(
-            item["retrieved_at_utc"], "retrieved_at_utc"
-        ),
+        "retrieved_at_utc": _iso_datetime(item["retrieved_at_utc"], "retrieved_at_utc"),
         "raw_sha256": _sha256(item["raw_sha256"], "raw_sha256"),
         "sidecar_sha256": _sha256(item["sidecar_sha256"], "sidecar_sha256"),
         "manifest_path": path.relative_to(root).as_posix(),
         "manifest_sha256": sha256_file(path),
         "failures": sorted(set(failures)),
     }
+
+
+def inventory_optional_manifests(
+    root: Path,
+) -> tuple[
+    dict[str, tuple[dict[str, object], ...]], dict[str, tuple[dict[str, str], ...]]
+]:
+    rows: dict[str, list[dict[str, object]]] = {
+        source: [] for source in OPTIONAL_SOURCE_CONTRACT
+    }
+    errors: dict[str, list[dict[str, str]]] = {
+        source: [] for source in OPTIONAL_SOURCE_CONTRACT
+    }
+    candidates = _manifest_candidates(root)
+    for source in OPTIONAL_SOURCE_CONTRACT:
+        for path in candidates:
+            inferred = _optional_source_from_path(root, path)
+            if inferred is not None and inferred != source:
+                continue
+            try:
+                raw_manifest = _read_json(path)
+                declared = (
+                    raw_manifest.get("source")
+                    if isinstance(raw_manifest, Mapping)
+                    else None
+                )
+                if declared != source and inferred != source:
+                    continue
+                manifest = require_exact_keys(
+                    raw_manifest,
+                    MANIFEST_KEYS,
+                    f"optional_manifest:{path.relative_to(root)}",
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                errors[source].append(
+                    _error(path, root, "MALFORMED_MANIFEST_JSON", type(exc).__name__)
+                )
+                continue
+            except ValueError as exc:
+                errors[source].append(
+                    _error(path, root, "INVALID_MANIFEST_CONTRACT", str(exc))
+                )
+                continue
+            try:
+                row = _validate_manifest(root, path, manifest, optional_source=source)
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                code = (
+                    "MALFORMED_SIDECAR_JSON"
+                    if str(exc).startswith("sidecar unreadable:")
+                    else "INVALID_MANIFEST_EVIDENCE"
+                )
+                errors[source].append(_error(path, root, code, str(exc)))
+                continue
+            rows[source].append(row)
+            for failure in row["failures"]:
+                errors[source].append(
+                    _error(
+                        path,
+                        root,
+                        str(failure),
+                        "optional evidence failed integrity validation",
+                    )
+                )
+        _validate_optional_split_sets(root, source, rows[source], errors[source])
+    return (
+        {source: tuple(items) for source, items in rows.items()},
+        {source: tuple(items) for source, items in errors.items()},
+    )
+
+
+def _manifest_candidates(root: Path) -> tuple[Path, ...]:
+    return tuple(
+        sorted(
+            {
+                path
+                for base in (
+                    root / "inventory",
+                    root / "data/v5_2_qd/raw",
+                    root / "inventory_optional",
+                )
+                if base.exists()
+                for path in base.rglob("*.manifest.json")
+            }
+        )
+    )
+
+
+def _optional_source_from_path(root: Path, path: Path) -> str | None:
+    parts = set(path.relative_to(root).parts)
+    matches = [source for source in OPTIONAL_SOURCE_CONTRACT if source in parts]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validate_optional_split_sets(
+    root: Path,
+    source: str,
+    rows: Sequence[Mapping[str, object]],
+    errors: list[dict[str, str]],
+) -> None:
+    grouped: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["parent_logical_query_id"]), []).append(row)
+    for group in grouped.values():
+        first = group[0]
+        split_counts = {int(row["split_count"]) for row in group}
+        split_indices = sorted(int(row["split_index"]) for row in group)
+        ranges = sorted(
+            (
+                str(row["child_range"]["start_date"]),
+                str(row["child_range"]["end_date"]),
+            )
+            for row in group
+        )
+        query = first["query"]
+        valid = (
+            len(split_counts) == 1
+            and split_indices == list(range(1, next(iter(split_counts)) + 1))
+            and ranges_cover(ranges, str(query["start_date"]), str(query["end_date"]))
+        )
+        if not valid:
+            errors.append(
+                _error(
+                    root / str(first["manifest_path"]),
+                    root,
+                    "INVALID_SPLIT_SET",
+                    f"optional {source} split set is incomplete",
+                )
+            )
+    duplicates = sorted(
+        game_pk
+        for game_pk, count in Counter(
+            game_pk for row in rows for game_pk in row["game_pks"]
+        ).items()
+        if count > 1
+    )
+    if duplicates:
+        first = rows[0]
+        errors.append(
+            _error(
+                root / str(first["manifest_path"]),
+                root,
+                "DUPLICATE_GAME_PK",
+                f"optional {source} duplicate gamePk values: {duplicates}",
+            )
+        )
+
+
+def query_evidence(row: Mapping[str, object]) -> dict[str, object]:
+    legacy = row.get("legacy") is True
+    query = dict(row["query"])
+    child = (
+        dict(row["child_range"])
+        if not legacy
+        else {
+            "start_date": max(str(query["start_date"]), f"{query['season']}-01-01"),
+            "end_date": min(str(query["end_date"]), f"{query['season']}-12-31"),
+        }
+    )
+    manifest_sha256 = str(row["manifest_sha256"])
+    source = str(row["source"])
+    logical = (
+        f"legacy:{manifest_sha256}:{query['season']}:{source}"
+        if legacy
+        else str(row["logical_query_id"])
+    )
+    result = {
+        "evidence_kind": "LEGACY_MANIFEST_ONLY" if legacy else "V52_MANIFEST_SIDECAR",
+        "source": source,
+        "manifest_path": str(row["manifest_path"]),
+        "manifest_sha256": manifest_sha256,
+        "logical_query_id": logical,
+        "parent_logical_query_id": None
+        if legacy
+        else str(row["parent_logical_query_id"]),
+        "query": query,
+        "child_range": child,
+    }
+    require_exact_keys(result, QUERY_EVIDENCE_KEYS, "query_evidence")
+    return result
 
 
 def _strict_int(value: object, field: str, minimum: int) -> int:
@@ -397,7 +649,9 @@ def _strict_string(value: object, field: str) -> str:
 
 def _sha256(value: object, field: str) -> str:
     text = _strict_string(value, field)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise ValueError(f"{field} must be a lowercase SHA-256")
     return text
 
@@ -410,6 +664,17 @@ def _iso_date(value: object, field: str) -> str:
         raise ValueError(f"{field} must be an ISO date") from exc
     if parsed.isoformat() != text:
         raise ValueError(f"{field} must be a canonical ISO date")
+    return text
+
+
+def _iso_datetime(value: object, field: str) -> str:
+    text = _strict_string(value, field)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"{field} must be an aware UTC timestamp")
     return text
 
 
@@ -433,7 +698,9 @@ def inventory_legacy_manifests(
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
     base = root / "data/v5_1_bt/raw"
-    candidates: Sequence[Path] = sorted(base.rglob("*.manifest.json")) if base.exists() else ()
+    candidates: Sequence[Path] = (
+        sorted(base.rglob("*.manifest.json")) if base.exists() else ()
+    )
     for path in candidates:
         try:
             raw = _read_json(path)
@@ -467,7 +734,13 @@ def inventory_legacy_manifests(
                                 "manifest_sha256": sha256_file(path),
                             }
                         )
-        except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            KeyError,
+            OSError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             errors.append(
                 _error(path, root, "LEGACY_MANIFEST_UNADAPTABLE", type(exc).__name__)
             )
@@ -488,7 +761,11 @@ def date_boundaries(query: object) -> tuple[str, str] | None:
 
 def query_overlaps_year(query: object, year: int) -> bool:
     bounds = date_boundaries(query)
-    return bounds is not None and bounds[0] <= f"{year}-12-31" and bounds[1] >= f"{year}-01-01"
+    return (
+        bounds is not None
+        and bounds[0] <= f"{year}-12-31"
+        and bounds[1] >= f"{year}-01-01"
+    )
 
 
 def fitted_cards_present(root: Path) -> bool:
@@ -563,23 +840,32 @@ def assess_season(
                 "required": True,
                 "expected_start": expected_start,
                 "expected_end": expected_end,
-                "observed_start": min(row["query"]["start_date"] for row in legacy),
-                "observed_end": max(row["query"]["end_date"] for row in legacy),
+                "observed_start": max(
+                    expected_start,
+                    min(str(row["query"]["start_date"]) for row in legacy),
+                ),
+                "observed_end": min(
+                    expected_end, max(str(row["query"]["end_date"]) for row in legacy)
+                ),
                 "logical_query_ids": [],
                 "row_count": 0,
                 "game_count": 0,
                 "schema_fields": [],
-                "missing_critical_fields": [
-                    "V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"
-                ],
+                "missing_critical_fields": ["V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"],
                 "duplicate_game_pks": [],
                 "retrieved_at_utc": [],
                 "content_sha256": [],
                 "manifest_sha256": sorted(
                     {str(row["manifest_sha256"]) for row in legacy}
                 ),
-                "split_children": sorted(
-                    {str(row["manifest_path"]) for row in legacy}
+                "split_children": sorted({str(row["manifest_path"]) for row in legacy}),
+                "queries": sorted(
+                    (query_evidence(row) for row in legacy),
+                    key=lambda item: (
+                        int(item["query"]["season"]),
+                        str(item["child_range"]["start_date"]),
+                        str(item["manifest_path"]),
+                    ),
                 ),
                 "status": "OBSERVED_LEGACY_NOT_V52_COMPLETE",
             }
@@ -613,7 +899,13 @@ def assess_season(
             set(REQUIRED_FIELDS[source])
             - {str(field) for row in matched for field in row["schema_fields"]}
         )
-        complete = coverage_ok and split_ok and not failures and not duplicates and not missing_fields
+        complete = (
+            coverage_ok
+            and split_ok
+            and not failures
+            and not duplicates
+            and not missing_fields
+        )
         blockers = missing_fields + failures
         if not matched:
             blockers = ["manifest-bound full-season evidence"]
@@ -639,17 +931,23 @@ def assess_season(
             ),
             "missing_critical_fields": sorted(set(blockers)),
             "duplicate_game_pks": duplicates,
-            "retrieved_at_utc": sorted(
-                str(row["retrieved_at_utc"]) for row in matched
-            ),
+            "retrieved_at_utc": sorted(str(row["retrieved_at_utc"]) for row in matched),
             "content_sha256": sorted(str(row["raw_sha256"]) for row in matched),
-            "manifest_sha256": sorted(
-                str(row["manifest_sha256"]) for row in matched
+            "manifest_sha256": sorted(str(row["manifest_sha256"]) for row in matched),
+            "split_children": sorted(str(row["manifest_path"]) for row in matched),
+            "queries": sorted(
+                (query_evidence(row) for row in matched),
+                key=lambda item: (
+                    int(item["query"]["season"]),
+                    str(item["child_range"]["start_date"]),
+                    str(item["manifest_path"]),
+                ),
             ),
-            "split_children": sorted(
-                str(row["manifest_path"]) for row in matched
-            ),
-            "status": "COMPLETE" if complete else "MISSING" if not matched else "INVALID",
+            "status": "COMPLETE"
+            if complete
+            else "MISSING"
+            if not matched
+            else "INVALID",
         }
         require_exact_keys(record, SOURCE_RECORD_KEYS, f"season.{year}.{source}")
         records[source] = record
@@ -680,10 +978,34 @@ def ranges_cover(
 
 
 def optional_source_status(
-    inventory: Sequence[Mapping[str, object]],
-) -> dict[str, dict[str, str]]:
-    del inventory
-    return {name: {"status": status} for name, status in OPTIONAL_SOURCE_CONTRACT.items()}
+    rows: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
+    errors: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+) -> dict[str, dict[str, object]]:
+    rows = rows or {}
+    errors = errors or {}
+    result: dict[str, dict[str, object]] = {}
+    for source, absent_status in OPTIONAL_SOURCE_CONTRACT.items():
+        source_rows = list(rows.get(source, ()))
+        source_errors = [dict(item) for item in errors.get(source, ())]
+        if source_errors:
+            status, fallback = "PRESENT_INVALID", absent_status
+        elif source_rows:
+            status, fallback = "PRESENT_VALID", None
+        else:
+            status, fallback = absent_status, absent_status
+        result[source] = {
+            "status": status,
+            "fallback_status": fallback,
+            "queries": sorted(
+                (query_evidence(row) for row in source_rows),
+                key=lambda item: (
+                    str(item["manifest_path"]),
+                    str(item["logical_query_id"]),
+                ),
+            ),
+            "errors": source_errors,
+        }
+    return result
 
 
 def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
@@ -693,6 +1015,7 @@ def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
 def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
     before = protected_inventory(root)
     inventory, inventory_errors = inventory_existing_manifests(root)
+    optional_rows, optional_errors = inventory_optional_manifests(root)
     seasons = {str(year): assess_season(year, inventory) for year in range(2018, 2025)}
     after = protected_inventory(root)
     if before != after:
@@ -708,12 +1031,18 @@ def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
         ),
         "seasons": seasons,
         "generated_from_inventory_sha256": hashlib.sha256(
-            canonical_json_bytes(inventory)
+            canonical_json_bytes(
+                {
+                    "minimum": inventory,
+                    "optional": optional_rows,
+                    "optional_errors": optional_errors,
+                }
+            )
         ).hexdigest(),
         "protected_tree_before": before,
         "protected_tree_after": after,
         "inventory_errors": list(inventory_errors),
-        "optional_sources": optional_source_status(inventory),
+        "optional_sources": optional_source_status(optional_rows, optional_errors),
         "may_fit_H22": all(
             seasons[str(year)]["minimum_contract"] == "COMPLETE"
             for year in range(2018, 2022)
@@ -731,19 +1060,22 @@ def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
 def parse_preflight(raw: object) -> dict[str, object]:
     obj = require_exact_keys(raw, PREFLIGHT_REQUIRED_KEYS, "preflight")
     if (
-        obj["schema_version"] != 1
+        type(obj["schema_version"]) is not int
+        or obj["schema_version"] != 1
         or obj["mode"] != "READ_ONLY"
         or obj["run_id"] != "historical_walkforward_500"
     ):
         raise ValueError("preflight identity differs")
+    _sha256(obj["generated_from_inventory_sha256"], "generated_from_inventory_sha256")
     if obj["fitted_model_card_namespace"] != (
         "models/v5_2_qd/folds/{H22,H23,H24}/model_card.json"
     ):
         raise ValueError("preflight fitted-card namespace differs")
-    if not isinstance(obj["fitted_model_cards_present"], bool):
+    if type(obj["fitted_model_cards_present"]) is not bool:
         raise ValueError("preflight fitted-card presence must be boolean")
-    if obj["optional_sources"] != optional_source_status(()):
-        raise ValueError("preflight optional-source neutral/null contract differs")
+    _validate_protected_snapshot(obj["protected_tree_before"], "protected_tree_before")
+    _validate_protected_snapshot(obj["protected_tree_after"], "protected_tree_after")
+    _validate_optional_sources(obj["optional_sources"])
     seasons = require_exact_keys(
         obj["seasons"], frozenset(map(str, range(2018, 2025))), "preflight.seasons"
     )
@@ -764,22 +1096,7 @@ def parse_preflight(raw: object) -> dict[str, object]:
                 SOURCE_RECORD_KEYS,
                 f"preflight.seasons.{year}.sources.{source}",
             )
-            if (
-                item["source"] != source
-                or item["required"] is not True
-                or item["expected_start"] != f"{year}-01-01"
-                or item["expected_end"] != f"{year}-12-31"
-                or item["status"]
-                not in {
-                    "COMPLETE",
-                    "MISSING",
-                    "INVALID",
-                    "OBSERVED_LEGACY_NOT_V52_COMPLETE",
-                }
-            ):
-                raise ValueError(
-                    f"preflight.seasons.{year}.sources.{source} frozen values differ"
-                )
+            _validate_source_record(item, source, int(year))
         expected_minimum = (
             "COMPLETE"
             if all(record["status"] == "COMPLETE" for record in sources.values())
@@ -791,7 +1108,7 @@ def parse_preflight(raw: object) -> dict[str, object]:
     if not isinstance(errors, list):
         raise ValueError("preflight.inventory_errors must be a list")
     for index, error in enumerate(errors):
-        require_exact_keys(error, INVENTORY_ERROR_KEYS, f"preflight.errors[{index}]")
+        _validate_inventory_error(error, f"preflight.errors[{index}]")
     acquisition = _step_list(obj["acquisition_steps"], "preflight.acquisition_steps")
     execution = _step_list(
         obj["execution_steps_after_ready"], "preflight.execution_steps_after_ready"
@@ -809,20 +1126,307 @@ def parse_preflight(raw: object) -> dict[str, object]:
         raise ValueError("preflight must be finite JSON") from exc
     if result["status"] not in {"READY", "BLOCKED_REQUIRED_ACQUISITION"}:
         raise ValueError("preflight status differs")
-    expected_ready = all_minimum_complete(result["seasons"]) and not result[
-        "inventory_errors"
-    ]
+    expected_ready = (
+        all_minimum_complete(result["seasons"]) and not result["inventory_errors"]
+    )
     expected_fit = all(
         result["seasons"][str(year)]["minimum_contract"] == "COMPLETE"
         for year in range(2018, 2022)
     )
-    if (result["status"] == "READY") != expected_ready or result[
-        "may_fit_H22"
-    ] is not expected_fit:
+    if (
+        type(result["may_fit_H22"]) is not bool
+        or (result["status"] == "READY") != expected_ready
+        or result["may_fit_H22"] is not expected_fit
+    ):
         raise ValueError("preflight status/fold gate differs")
     if result["protected_tree_before"] != result["protected_tree_after"]:
         raise ValueError("preflight protected-tree snapshots differ")
     return result
+
+
+def _validate_source_record(item: Mapping[str, object], source: str, year: int) -> None:
+    expected_start, expected_end = f"{year}-01-01", f"{year}-12-31"
+    if (
+        item["source"] != source
+        or item["required"] is not True
+        or item["expected_start"] != expected_start
+        or item["expected_end"] != expected_end
+        or item["status"]
+        not in {"COMPLETE", "MISSING", "INVALID", "OBSERVED_LEGACY_NOT_V52_COMPLETE"}
+    ):
+        raise ValueError(f"season {year} source {source} frozen values differ")
+    _iso_date(item["expected_start"], "expected_start")
+    _iso_date(item["expected_end"], "expected_end")
+    observed = (item["observed_start"], item["observed_end"])
+    if (observed[0] is None) != (observed[1] is None):
+        raise ValueError("observed date range must be both null or both present")
+    if observed[0] is not None:
+        start = _iso_date(observed[0], "observed_start")
+        end = _iso_date(observed[1], "observed_end")
+        if start > end or start < expected_start or end > expected_end:
+            raise ValueError("observed date range differs")
+    for field in ("row_count", "game_count"):
+        _strict_int(item[field], field, 0)
+    if int(item["game_count"]) > int(item["row_count"]):
+        raise ValueError("game_count exceeds row_count")
+    logical_ids = _strict_sorted_strings(item["logical_query_ids"], "logical_query_ids")
+    for index, logical_id in enumerate(logical_ids):
+        _sha256(logical_id, f"logical_query_ids[{index}]")
+    schema_fields = _strict_sorted_strings(item["schema_fields"], "schema_fields")
+    missing = _strict_sorted_strings(
+        item["missing_critical_fields"], "missing_critical_fields"
+    )
+    retrieved = _string_list(item["retrieved_at_utc"], "retrieved_at_utc")
+    if any(not value for value in retrieved) or retrieved != sorted(retrieved):
+        raise ValueError("retrieved_at_utc must be sorted non-empty strings")
+    for index, value in enumerate(retrieved):
+        _iso_datetime(value, f"retrieved_at_utc[{index}]")
+    content_hashes = _strict_hash_list(item["content_sha256"], "content_sha256")
+    manifest_hashes = _strict_hash_list(item["manifest_sha256"], "manifest_sha256")
+    children = _strict_path_list(item["split_children"], "split_children")
+    duplicates = _integer_list(item["duplicate_game_pks"], "duplicate_game_pks")
+    if any(value <= 0 for value in duplicates) or duplicates != sorted(set(duplicates)):
+        raise ValueError("duplicate_game_pks must be sorted unique positive integers")
+    queries_raw = item["queries"]
+    if not isinstance(queries_raw, list):
+        raise ValueError("queries must be a list")
+    queries = [
+        _validate_query_evidence(value, source, year, f"queries[{index}]")
+        for index, value in enumerate(queries_raw)
+    ]
+    if queries != sorted(
+        queries,
+        key=lambda value: (
+            int(value["query"]["season"]),
+            str(value["child_range"]["start_date"]),
+            str(value["manifest_path"]),
+        ),
+    ):
+        raise ValueError("queries are not canonical")
+    if set(children) != {str(value["manifest_path"]) for value in queries}:
+        raise ValueError("split_children/query paths differ")
+    if set(manifest_hashes) != {str(value["manifest_sha256"]) for value in queries}:
+        raise ValueError("manifest/query hashes differ")
+    status = str(item["status"])
+    kinds = {str(value["evidence_kind"]) for value in queries}
+    if status == "MISSING":
+        if (
+            queries
+            or observed != (None, None)
+            or item["row_count"] != 0
+            or item["game_count"] != 0
+            or not missing
+            or logical_ids
+            or schema_fields
+            or retrieved
+            or content_hashes
+            or manifest_hashes
+            or children
+            or duplicates
+        ):
+            raise ValueError("missing source state differs")
+    elif status == "OBSERVED_LEGACY_NOT_V52_COMPLETE":
+        if (
+            kinds != {"LEGACY_MANIFEST_ONLY"}
+            or logical_ids
+            or schema_fields
+            or retrieved
+            or content_hashes
+            or item["row_count"] != 0
+            or item["game_count"] != 0
+            or missing != ["V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"]
+        ):
+            raise ValueError("legacy source state differs")
+    else:
+        if kinds != {"V52_MANIFEST_SIDECAR"} or not queries:
+            raise ValueError("v5.2 source query state differs")
+        parents = sorted({str(value["parent_logical_query_id"]) for value in queries})
+        if logical_ids != parents:
+            raise ValueError("logical query parent summary differs")
+        if status == "COMPLETE" and (
+            observed != (expected_start, expected_end)
+            or missing
+            or duplicates
+            or not set(REQUIRED_FIELDS[source]).issubset(schema_fields)
+            or len(retrieved) != len(queries)
+            or len(content_hashes) != len(queries)
+        ):
+            raise ValueError("complete source state differs")
+        if status == "INVALID" and not (missing or duplicates):
+            raise ValueError("invalid source lacks blocker")
+
+
+def _validate_query_evidence(
+    raw: object, source: str, year: int | None, path: str
+) -> dict[str, object]:
+    item = require_exact_keys(raw, QUERY_EVIDENCE_KEYS, path)
+    if item["source"] != source or item["evidence_kind"] not in {
+        "V52_MANIFEST_SIDECAR",
+        "LEGACY_MANIFEST_ONLY",
+    }:
+        raise ValueError(f"{path} identity differs")
+    _relative_path(item["manifest_path"], f"{path}.manifest_path")
+    manifest_hash = _sha256(item["manifest_sha256"], f"{path}.manifest_sha256")
+    logical = _strict_string(item["logical_query_id"], f"{path}.logical_query_id")
+    query = require_exact_keys(item["query"], QUERY_KEYS, f"{path}.query")
+    query_year = _strict_int(query["season"], f"{path}.query.season", 2018)
+    if query_year > 2024 or (year is not None and query_year != year):
+        raise ValueError(f"{path}.query.season differs")
+    query_start = _iso_date(query["start_date"], f"{path}.query.start_date")
+    query_end = _iso_date(query["end_date"], f"{path}.query.end_date")
+    child = require_exact_keys(item["child_range"], RANGE_KEYS, f"{path}.child_range")
+    child_start = _iso_date(child["start_date"], f"{path}.child_range.start_date")
+    child_end = _iso_date(child["end_date"], f"{path}.child_range.end_date")
+    if (
+        query_start > query_end
+        or child_start > child_end
+        or child_start < query_start
+        or child_end > query_end
+    ):
+        raise ValueError(f"{path} date ranges differ")
+    if item["evidence_kind"] == "V52_MANIFEST_SIDECAR":
+        parent = _sha256(
+            item["parent_logical_query_id"], f"{path}.parent_logical_query_id"
+        )
+        if parent != parent_logical_query_id(
+            source, query_year, query_start, query_end
+        ):
+            raise ValueError(f"{path} parent query hash differs")
+    else:
+        if (
+            item["parent_logical_query_id"] is not None
+            or logical != f"legacy:{manifest_hash}:{query_year}:{source}"
+        ):
+            raise ValueError(f"{path} legacy identity differs")
+    return json.loads(json.dumps(dict(item), allow_nan=False))
+
+
+def _validate_optional_sources(raw: object) -> None:
+    sources = require_exact_keys(
+        raw, frozenset(OPTIONAL_SOURCE_CONTRACT), "optional_sources"
+    )
+    for source, absent in OPTIONAL_SOURCE_CONTRACT.items():
+        item = require_exact_keys(
+            sources[source], OPTIONAL_RECORD_KEYS, f"optional_sources.{source}"
+        )
+        status = item["status"]
+        if status not in {absent, "PRESENT_VALID", "PRESENT_INVALID"}:
+            raise ValueError(f"optional_sources.{source}.status differs")
+        queries_raw = item["queries"]
+        if not isinstance(queries_raw, list):
+            raise ValueError("optional queries must be a list")
+        queries = [
+            _validate_query_evidence(
+                value, source, None, f"optional_sources.{source}.queries[{index}]"
+            )
+            for index, value in enumerate(queries_raw)
+        ]
+        if queries != sorted(
+            queries,
+            key=lambda value: (
+                str(value["manifest_path"]),
+                str(value["logical_query_id"]),
+            ),
+        ):
+            raise ValueError("optional queries are not canonical")
+        errors = item["errors"]
+        if not isinstance(errors, list):
+            raise ValueError("optional errors must be a list")
+        for index, error in enumerate(errors):
+            _validate_inventory_error(
+                error, f"optional_sources.{source}.errors[{index}]"
+            )
+        if status == absent and (
+            item["fallback_status"] != absent or queries or errors
+        ):
+            raise ValueError("absent optional state differs")
+        if status == "PRESENT_VALID" and (
+            item["fallback_status"] is not None or not queries or errors
+        ):
+            raise ValueError("valid optional state differs")
+        if status == "PRESENT_INVALID" and (
+            item["fallback_status"] != absent or not errors
+        ):
+            raise ValueError("invalid optional state differs")
+
+
+def _validate_protected_snapshot(raw: object, path: str) -> None:
+    item = require_exact_keys(raw, PROTECTED_SNAPSHOT_KEYS, path)
+    metadata = item["metadata_path_size_mtime_inode_mode"]
+    hashes = item["small_sealed_sha256"]
+    if not isinstance(metadata, Mapping) or not isinstance(hashes, Mapping):
+        raise ValueError(f"{path} maps differ")
+    for relative, values in metadata.items():
+        _relative_path(relative, f"{path}.metadata path")
+        if not isinstance(values, list) or len(values) != 4:
+            raise ValueError(f"{path} metadata tuple differs")
+        for index, value in enumerate(values):
+            _strict_int(value, f"{path}.metadata[{index}]", 0)
+    for relative, digest in hashes.items():
+        _relative_path(relative, f"{path}.hash path")
+        _sha256(digest, f"{path}.hash")
+
+
+def _validate_inventory_error(raw: object, path: str) -> None:
+    item = require_exact_keys(raw, INVENTORY_ERROR_KEYS, path)
+    _relative_path(item["path"], f"{path}.path")
+    allowed_codes = {
+        "MALFORMED_MANIFEST_JSON",
+        "MALFORMED_SIDECAR_JSON",
+        "INVALID_MANIFEST_CONTRACT",
+        "INVALID_MANIFEST_EVIDENCE",
+        "LEGACY_MANIFEST_UNADAPTABLE",
+        "RAW_HASH_MISMATCH",
+        "RAW_MISSING",
+        "SIDECAR_HASH_MISMATCH",
+        "MANIFEST_SCHEMA_VERSION",
+        "SIDECAR_SCHEMA_VERSION",
+        "INVALID_COUNTS",
+        "INVALID_EVENT_DATE_RANGE",
+        "EVENT_DATE_RANGE_MISMATCH",
+        "MISSING_CRITICAL_FIELDS",
+        "DUPLICATE_GAME_PK",
+        "INVALID_GAME_PK",
+        "QUERY_DATE_RANGE_MISMATCH",
+        "INVALID_DATE_RANGE",
+        "SPLIT_PARENT_ID_MISMATCH",
+        "INVALID_SPLIT_SET",
+    }
+    if item["code"] not in allowed_codes or not isinstance(item["detail"], str):
+        raise ValueError(f"{path} fields differ")
+
+
+def _relative_path(value: object, field: str) -> str:
+    text = _strict_string(value, field)
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts or path.as_posix() != text:
+        raise ValueError(f"{field} must be a canonical relative path")
+    return text
+
+
+def _strict_sorted_strings(value: object, field: str) -> list[str]:
+    values = _string_list(value, field)
+    if any(not item for item in values) or values != sorted(set(values)):
+        raise ValueError(f"{field} must be sorted unique non-empty strings")
+    return values
+
+
+def _strict_hash_list(value: object, field: str) -> list[str]:
+    values = _string_list(value, field)
+    for index, digest in enumerate(values):
+        _sha256(digest, f"{field}[{index}]")
+    if values != sorted(set(values)):
+        raise ValueError(f"{field} must be sorted unique hashes")
+    return values
+
+
+def _strict_path_list(value: object, field: str) -> list[str]:
+    values = _string_list(value, field)
+    for index, path in enumerate(values):
+        _relative_path(path, f"{field}[{index}]")
+    if values != sorted(set(values)):
+        raise ValueError(f"{field} must be sorted unique paths")
+    return values
 
 
 def _step_list(value: object, path: str) -> list[dict[str, str]]:
@@ -843,12 +1447,19 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
     rows = [
         f"| {year} | {record['minimum_contract']} | "
         + ", ".join(
-            f"{name}={source['status']}"
-            for name, source in record["sources"].items()
-            if source["status"] != "COMPLETE"
+            f"{name}={record['sources'][name]['status']}"
+            for name in MINIMUM_SOURCES
+            if record["sources"][name]["status"] != "COMPLETE"
         )
         + " |"
         for year, record in sorted(report["seasons"].items())
+    ]
+    optional_rows = [
+        f"| {source} | {report['optional_sources'][source]['status']} | "
+        f"{report['optional_sources'][source]['fallback_status'] or 'none'} | "
+        f"{len(report['optional_sources'][source]['queries'])} | "
+        f"{len(report['optional_sources'][source]['errors'])} |"
+        for source in OPTIONAL_SOURCE_CONTRACT
     ]
     return "\n".join(
         [
@@ -860,7 +1471,13 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
             "|---|---|---|",
             *rows,
             "",
-            "Optional sources remain neutral/null and do not block READY.",
+            "## Optional source evidence",
+            "",
+            "| Source | Status | Fallback | Queries | Errors |",
+            "|---|---|---|---:|---:|",
+            *optional_rows,
+            "",
+            "Optional evidence never blocks minimum-source READY; absent or invalid evidence uses the frozen neutral/null fallback.",
             "",
             "H22 fitting permitted: " + ("Yes" if report["may_fit_H22"] else "No"),
             "",
@@ -869,11 +1486,25 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
 
 
 def preflight_schema_document() -> dict[str, object]:
+    hash_schema = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    date_schema = {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+    path_schema = {"type": "string", "minLength": 1, "pattern": "^[^/].*$"}
     optional_properties = {
         name: {
             "type": "object",
-            "required": ["status"],
-            "properties": {"status": {"const": status}},
+            "required": sorted(OPTIONAL_RECORD_KEYS),
+            "properties": {
+                "status": {"enum": [status, "PRESENT_VALID", "PRESENT_INVALID"]},
+                "fallback_status": {"enum": [status, None]},
+                "queries": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/query_evidence"},
+                },
+                "errors": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/inventory_error"},
+                },
+            },
             "additionalProperties": False,
         }
         for name, status in OPTIONAL_SOURCE_CONTRACT.items()
@@ -881,10 +1512,10 @@ def preflight_schema_document() -> dict[str, object]:
     source_properties = {
         "source": {"enum": list(MINIMUM_SOURCES)},
         "required": {"const": True},
-        "expected_start": {"type": "string"},
-        "expected_end": {"type": "string"},
-        "observed_start": {"type": ["string", "null"]},
-        "observed_end": {"type": ["string", "null"]},
+        "expected_start": date_schema,
+        "expected_end": date_schema,
+        "observed_start": {"anyOf": [date_schema, {"type": "null"}]},
+        "observed_end": {"anyOf": [date_schema, {"type": "null"}]},
         "logical_query_ids": {"type": "array", "items": {"type": "string"}},
         "row_count": {"type": "integer", "minimum": 0},
         "game_count": {"type": "integer", "minimum": 0},
@@ -893,11 +1524,15 @@ def preflight_schema_document() -> dict[str, object]:
             "type": "array",
             "items": {"type": "string"},
         },
-        "duplicate_game_pks": {"type": "array", "items": {"type": "integer"}},
+        "duplicate_game_pks": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+        },
         "retrieved_at_utc": {"type": "array", "items": {"type": "string"}},
-        "content_sha256": {"type": "array", "items": {"type": "string"}},
-        "manifest_sha256": {"type": "array", "items": {"type": "string"}},
-        "split_children": {"type": "array", "items": {"type": "string"}},
+        "content_sha256": {"type": "array", "items": hash_schema},
+        "manifest_sha256": {"type": "array", "items": hash_schema},
+        "split_children": {"type": "array", "items": path_schema},
+        "queries": {"type": "array", "items": {"$ref": "#/$defs/query_evidence"}},
         "status": {
             "enum": [
                 "COMPLETE",
@@ -930,10 +1565,13 @@ def preflight_schema_document() -> dict[str, object]:
         "run_id": {"const": "historical_walkforward_500"},
         "mode": {"const": "READ_ONLY"},
         "status": {"enum": ["READY", "BLOCKED_REQUIRED_ACQUISITION"]},
-        "generated_from_inventory_sha256": {"type": "string"},
-        "protected_tree_before": {"type": "object"},
-        "protected_tree_after": {"type": "object"},
-        "inventory_errors": {"type": "array"},
+        "generated_from_inventory_sha256": hash_schema,
+        "protected_tree_before": {"$ref": "#/$defs/protected_snapshot"},
+        "protected_tree_after": {"$ref": "#/$defs/protected_snapshot"},
+        "inventory_errors": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/inventory_error"},
+        },
         "seasons": {
             "type": "object",
             "required": list(map(str, range(2018, 2025))),
@@ -984,8 +1622,73 @@ def preflight_schema_document() -> dict[str, object]:
                 "properties": step_properties,
                 "additionalProperties": False,
             },
-            "minimum_sources": list(MINIMUM_SOURCES),
-            "statuses": ["READY", "BLOCKED_REQUIRED_ACQUISITION"],
+            "query": {
+                "type": "object",
+                "required": sorted(QUERY_KEYS),
+                "properties": {
+                    "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+                    "start_date": date_schema,
+                    "end_date": date_schema,
+                },
+                "additionalProperties": False,
+            },
+            "date_range": {
+                "type": "object",
+                "required": sorted(RANGE_KEYS),
+                "properties": {"start_date": date_schema, "end_date": date_schema},
+                "additionalProperties": False,
+            },
+            "query_evidence": {
+                "type": "object",
+                "required": sorted(QUERY_EVIDENCE_KEYS),
+                "properties": {
+                    "evidence_kind": {
+                        "enum": ["V52_MANIFEST_SIDECAR", "LEGACY_MANIFEST_ONLY"]
+                    },
+                    "source": {
+                        "enum": list(MINIMUM_SOURCES) + list(OPTIONAL_SOURCE_CONTRACT)
+                    },
+                    "manifest_path": path_schema,
+                    "manifest_sha256": hash_schema,
+                    "logical_query_id": {"type": "string", "minLength": 1},
+                    "parent_logical_query_id": {
+                        "anyOf": [hash_schema, {"type": "null"}]
+                    },
+                    "query": {"$ref": "#/$defs/query"},
+                    "child_range": {"$ref": "#/$defs/date_range"},
+                },
+                "additionalProperties": False,
+            },
+            "inventory_error": {
+                "type": "object",
+                "required": sorted(INVENTORY_ERROR_KEYS),
+                "properties": {
+                    "path": path_schema,
+                    "code": {"type": "string", "minLength": 1},
+                    "detail": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            "protected_snapshot": {
+                "type": "object",
+                "required": sorted(PROTECTED_SNAPSHOT_KEYS),
+                "properties": {
+                    "metadata_path_size_mtime_inode_mode": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "array",
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "items": {"type": "integer", "minimum": 0},
+                        },
+                    },
+                    "small_sealed_sha256": {
+                        "type": "object",
+                        "additionalProperties": hash_schema,
+                    },
+                },
+                "additionalProperties": False,
+            },
         },
     }
 

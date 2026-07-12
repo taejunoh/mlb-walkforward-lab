@@ -2106,7 +2106,7 @@ def exact_execution_steps(run_spec: RunSpec) -> list[dict[str, str]]:
             planned_step("join-outcomes", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --resume outcomes", "all candidate/date locks sealed"),
             planned_step("report-and-verify", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_verify_run --run-id historical_walkforward_500", "exactly 500 graded dates resolved")]
 
-SOURCE_RECORD_KEYS = frozenset({"source", "required", "expected_start", "expected_end", "observed_start", "observed_end", "logical_query_ids", "row_count", "game_count", "schema_fields", "missing_critical_fields", "duplicate_game_pks", "retrieved_at_utc", "content_sha256", "manifest_sha256", "split_children", "status"})
+SOURCE_RECORD_KEYS = frozenset({"source", "required", "expected_start", "expected_end", "observed_start", "observed_end", "logical_query_ids", "row_count", "game_count", "schema_fields", "missing_critical_fields", "duplicate_game_pks", "retrieved_at_utc", "content_sha256", "manifest_sha256", "split_children", "queries", "status"})
 
 def date_boundaries(query: object) -> tuple[str, str] | None:
     if not isinstance(query, Mapping):
@@ -2264,6 +2264,8 @@ if __name__ == "__main__":
 ```
 
 Generate `schemas/v5_2_preflight.schema.json` with exact top-level/season/source/step required/property key sets and `additionalProperties:false` at each of those fixed levels. Its enum/const values mirror `MINIMUM_SOURCES`, optional statuses, modes, step status, and report statuses. The stdlib `parse_preflight` remains the runtime authority and tests mutate every nested fixed-value family. The current workspace report is expected to be blocked; the complete temporary fixture proves the same code has a real `READY` path.
+
+Each minimum and optional source record preserves a canonical `queries` entry per manifest child, including the logical and parent query identities, exact query and child ranges, manifest path/hash, source, and evidence kind. Optional manifests are scanned into a separate evidence/error channel: valid evidence activates `PRESENT_VALID`, malformed or invalid evidence records `PRESENT_INVALID` plus the frozen neutral/null fallback, and neither optional state enters `inventory_errors` nor changes minimum-source READY.
 
 The read-only guard deliberately does not hash multi-gigabyte raw trees. Across all `data/` and `audit/` files it compares path, size, nanosecond mtime, inode, and mode before/after, detecting creation, deletion, replacement, truncation, and ordinary in-place writes; it also blocks common Python/OS write and network APIs during the scanner test. Cryptographic SHA-256 before/after is limited to the small sealed lock/outcome/calibration/audit roots. This is a mutation guard for one scanner invocation, not a claim that metadata alone is a durable content commitment; durable source integrity remains the manifest/raw/sidecar hash contract and Task 10's approved-commit blob proof.
 
