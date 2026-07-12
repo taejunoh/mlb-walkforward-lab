@@ -450,23 +450,32 @@ def iter_statcast_pitches(
         raise ValueError("statcast CSV must be UTF-8-sig") from exc
 
 
-def parse_statcast(source: str | Path | bytes) -> StatcastData:
-    """Parse compact pitch rows and one terminal event row per plate appearance."""
-    pitches = list(iter_statcast_pitches(source))
-    unique_pitches: dict[tuple[int, int, int], dict[str, object]] = {}
+def iter_unique_statcast_pitches(
+    pitches: Iterable[dict[str, object]],
+) -> Iterable[dict[str, object]]:
+    """Yield one row per canonical pitch identity and reject conflicts."""
+    seen: dict[tuple[int, int, int], tuple[tuple[str, object], ...]] = {}
     for row in pitches:
         key = (
             int(row["game_pk"]),
             int(row["at_bat_number"]),
             int(row["pitch_number"]),
         )
-        prior = unique_pitches.get(key)
-        if prior is not None and prior != row:
-            raise ValueError(
-                f"conflicting duplicate pitch {key[0]}:{key[1]}:{key[2]}"
-            )
-        unique_pitches[key] = row
-    pitches = list(unique_pitches.values())
+        fingerprint = tuple((field, row[field]) for field in sorted(row))
+        prior = seen.get(key)
+        if prior is not None:
+            if prior != fingerprint:
+                raise ValueError(
+                    f"conflicting duplicate pitch {key[0]}:{key[1]}:{key[2]}"
+                )
+            continue
+        seen[key] = fingerprint
+        yield row
+
+
+def parse_statcast(source: str | Path | bytes) -> StatcastData:
+    """Parse compact pitch rows and one terminal event row per plate appearance."""
+    pitches = list(iter_unique_statcast_pitches(iter_statcast_pitches(source)))
     pitches.sort(
         key=lambda r: (
             r["game_date"],
@@ -629,6 +638,7 @@ __all__ = [
     "fetch_statcast_stage",
     "identify_pitcher_roles",
     "iter_statcast_pitches",
+    "iter_unique_statcast_pitches",
     "monthly_ranges",
     "parse_statcast",
     "regular_season_ranges",

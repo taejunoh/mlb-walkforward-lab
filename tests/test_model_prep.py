@@ -207,6 +207,48 @@ class ModelPreparationSourceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "canonical"):
                 load_pitcher_bf_range(root, "2024-04-01", "2024-04-02")
 
+    def test_pitcher_career_bf_collapses_exact_duplicate_pitch_rows(self):
+        lines = STATCAST.read_text("utf-8-sig").splitlines()
+        payload = ("\n".join(lines + [lines[2]]) + "\n").encode("utf-8-sig")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-01",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-01", "2024-04-02"),
+                },
+                payload,
+            )
+
+            counts, _hashes = load_pitcher_bf_range(
+                root, "2024-04-01", "2024-04-02"
+            )
+
+        self.assertEqual(counts[11], 1)
+
+    def test_pitcher_career_bf_rejects_conflicting_duplicate_pitch_rows(self):
+        lines = STATCAST.read_text("utf-8-sig").splitlines()
+        conflicting = lines[2].replace("86.0", "85.9")
+        payload = ("\n".join(lines + [conflicting]) + "\n").encode("utf-8-sig")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-01",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-01", "2024-04-02"),
+                },
+                payload,
+            )
+
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate pitch"):
+                load_pitcher_bf_range(root, "2024-04-01", "2024-04-02")
+
     def test_safe_targets_strip_every_outcome_field_and_neutralize_final_status(self):
         games = [{
             "game_pk": 1,

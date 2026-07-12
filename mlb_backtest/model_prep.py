@@ -165,7 +165,11 @@ def load_pitcher_bf_range(
 ) -> tuple[dict[int, int], list[str]]:
     """Stream terminal PA rows into compact prior-career BF counts."""
     from collections import defaultdict
-    from .statcast import NON_PA_EVENTS, iter_statcast_pitches
+    from .statcast import (
+        NON_PA_EVENTS,
+        iter_statcast_pitches,
+        iter_unique_statcast_pitches,
+    )
 
     counts: defaultdict[int, int] = defaultdict(int)
     hashes = []
@@ -178,7 +182,8 @@ def load_pitcher_bf_range(
         verified = verified_by_path[path]
         query = verified["manifest"]["query"]
         first, last = date.fromisoformat(query["start"]), date.fromisoformat(query["end"])
-        for row in iter_statcast_pitches(Path(verified["payload_path"])):
+        rows = iter_statcast_pitches(Path(verified["payload_path"]))
+        for row in iter_unique_statcast_pitches(rows):
             if not first <= date.fromisoformat(str(row["game_date"])) <= last:
                 raise ValueError("Statcast row is outside manifest query range")
             if row.get("events") and row["events"] not in NON_PA_EVENTS:
