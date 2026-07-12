@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest import mock
 
+import mlb_backtest.statcast as statcast_module
+
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.career_bf import (
     fetch_prior_career_bf_records,
@@ -31,6 +33,36 @@ ERA = ROOT / "tests" / "fixtures" / "mlb_pitching_stats.json"
 
 
 class ModelPreparationSourceTest(unittest.TestCase):
+    def test_statcast_loader_ignores_sealed_capped_parent_when_children_cover_range(self):
+        lines = STATCAST.read_bytes().splitlines()
+
+        def payload(day, rows):
+            row = lines[1].replace(b"2024-04-01", day.encode("ascii"))
+            return b"\n".join([lines[0], *([row] * rows)]) + b"\n"
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            statcast_module, "STATCAST_ROW_CAP", 2
+        ):
+            root = Path(td)
+            store = RawStore(root)
+            store.put(
+                "baseball_savant_statcast",
+                {"start": "2024-04-01", "end": "2024-04-02", "game_type": "R", "url": statcast_url("2024-04-01", "2024-04-02")},
+                payload("2024-04-01", 2),
+            )
+            for day in ("2024-04-01", "2024-04-02"):
+                store.put(
+                    "baseball_savant_statcast",
+                    {"start": day, "end": day, "game_type": "R", "url": statcast_url(day, day)},
+                    payload(day, 1),
+                )
+            loaded, hashes = load_statcast_range(
+                root, "2024-04-01", "2024-04-02"
+            )
+
+        self.assertEqual(len(loaded.pitches), 2)
+        self.assertEqual(len(hashes), 2)
+
     def test_training_career_sources_include_only_eligible_training_starters(self):
         raw = [
             {

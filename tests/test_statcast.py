@@ -28,6 +28,99 @@ FIXTURE = Path(__file__).parent / "fixtures" / "statcast_mini.csv"
 
 
 class StatcastTest(unittest.TestCase):
+    @staticmethod
+    def _payload_with_rows(day, row_count):
+        lines = FIXTURE.read_bytes().splitlines()
+        row = lines[1].replace(b"2024-04-01", day.encode("ascii"))
+        return b"\n".join([lines[0], *([row] * row_count)]) + b"\n"
+
+    def test_silent_row_capped_range_is_split_before_publication(self):
+        calls = []
+
+        def fetcher(url, **_kwargs):
+            query = parse_qs(urlsplit(url).query)
+            start = query["game_date_gt"][0]
+            end = query["game_date_lt"][0]
+            calls.append((start, end))
+            if start != end:
+                return self._payload_with_rows(start, 2)
+            return self._payload_with_rows(start, 1)
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            statcast_module, "STATCAST_ROW_CAP", 2, create=True
+        ):
+            artifacts = fetch_monthly(
+                RawStore(Path(td)),
+                "2024-04-01",
+                "2024-04-02",
+                fetcher=fetcher,
+            )
+            queries = [
+                row["manifest"]["query"]
+                for row in RawStore(Path(td)).verify_manifests()
+            ]
+
+        self.assertEqual(
+            calls,
+            [
+                ("2024-04-01", "2024-04-02"),
+                ("2024-04-01", "2024-04-01"),
+                ("2024-04-02", "2024-04-02"),
+            ],
+        )
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(
+            sorted((row["start"], row["end"]) for row in queries),
+            [("2024-04-01", "2024-04-01"), ("2024-04-02", "2024-04-02")],
+        )
+
+    def test_resume_splits_sealed_capped_exact_manifest_without_refetching_parent(self):
+        parent_query = {
+            "start": "2024-04-01",
+            "end": "2024-04-02",
+            "game_type": "R",
+            "url": statcast_url("2024-04-01", "2024-04-02"),
+        }
+        calls = []
+
+        def fetcher(url, **_kwargs):
+            query = parse_qs(urlsplit(url).query)
+            start = query["game_date_gt"][0]
+            end = query["game_date_lt"][0]
+            calls.append((start, end))
+            self.assertEqual(start, end)
+            return self._payload_with_rows(start, 1)
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            statcast_module, "STATCAST_ROW_CAP", 2, create=True
+        ):
+            store = RawStore(Path(td))
+            sealed_parent = store.put_unique_query(
+                "baseball_savant_statcast",
+                parent_query,
+                self._payload_with_rows("2024-04-01", 2),
+            )
+            known = {
+                json.dumps(parent_query, separators=(",", ":"), sort_keys=True):
+                    sealed_parent.sha256
+            }
+            artifacts = fetch_monthly(
+                store,
+                "2024-04-01",
+                "2024-04-02",
+                known_queries=known,
+                fetcher=fetcher,
+            )
+            catalog = store.verify_manifests()
+
+        self.assertEqual(
+            calls,
+            [("2024-04-01", "2024-04-01"), ("2024-04-02", "2024-04-02")],
+        )
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(len(catalog), 3)
+        self.assertIn(sealed_parent.sha256, [row["manifest"]["sha256"] for row in catalog])
+
     def test_oversized_month_is_split_deterministically_until_chunks_fit(self):
         payload = FIXTURE.read_bytes()
         calls = []

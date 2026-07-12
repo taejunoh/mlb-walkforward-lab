@@ -23,6 +23,7 @@ from .sources import fetch_bytes
 
 SAVANT_CSV = "https://baseballsavant.mlb.com/statcast_search/csv"
 MAX_STATCAST_BYTES = 256 * 1024 * 1024
+STATCAST_ROW_CAP = 25_000
 REQUIRED_FIELDS = (
     "pitch_type",
     "game_date",
@@ -57,6 +58,16 @@ NON_PA_EVENTS = frozenset({"truncated_pa"})
 class StatcastData:
     pitches: tuple[dict[str, object], ...]
     plate_appearances: tuple[dict[str, object], ...]
+
+
+def is_statcast_row_capped_manifest(manifest: Mapping[str, object]) -> bool:
+    """Return whether Savant stopped this raw CSV at its silent data-row cap."""
+    row_count = manifest.get("row_count")
+    return (
+        isinstance(row_count, int)
+        and not isinstance(row_count, bool)
+        and row_count == STATCAST_ROW_CAP + 1
+    )
 
 
 def _iso(value: str, label: str) -> date:
@@ -146,6 +157,7 @@ def fetch_monthly(
         known_queries = {}
     artifacts = []
     known_artifacts = {}
+    known_capped_queries = set()
     if known_queries:
         from .models import RawArtifact
 
@@ -156,6 +168,9 @@ def fetch_monthly(
                 continue
             key = json.dumps(manifest["query"], separators=(",", ":"), sort_keys=True)
             if known_queries.get(key) != manifest["sha256"]:
+                continue
+            if is_statcast_row_capped_manifest(manifest):
+                known_capped_queries.add(key)
                 continue
             known_artifacts[key] = RawArtifact(
                 source=manifest["source"],
@@ -206,6 +221,27 @@ def fetch_monthly(
         if reuse_range(chunk_start, chunk_end):
             return
         url = statcast_url(chunk_start, chunk_end)
+        query = {
+            "start": chunk_start,
+            "end": chunk_end,
+            "game_type": "R",
+            "url": url,
+        }
+        query_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
+
+        def split_range() -> None:
+            first, last = _iso(chunk_start, "chunk start"), _iso(
+                chunk_end, "chunk end"
+            )
+            if first >= last:
+                raise ValueError("single-day Statcast response reached row limit")
+            midpoint = first + timedelta(days=(last - first).days // 2)
+            fetch_range(first.isoformat(), midpoint.isoformat())
+            fetch_range((midpoint + timedelta(days=1)).isoformat(), last.isoformat())
+
+        if query_key in known_capped_queries:
+            split_range()
+            return
         for attempt in range(len(retries) + 1):
             try:
                 payload = fetcher(url, max_bytes=MAX_STATCAST_BYTES)
@@ -216,18 +252,13 @@ def fetch_monthly(
                     "size" in message or "byte" in message
                 ):
                     raise
-                first, last = _iso(chunk_start, "chunk start"), _iso(
+                if _iso(chunk_start, "chunk start") >= _iso(
                     chunk_end, "chunk end"
-                )
-                if first >= last:
+                ):
                     raise ValueError(
                         "single-day Statcast response exceeds size limit"
                     ) from exc
-                midpoint = first + timedelta(days=(last - first).days // 2)
-                fetch_range(first.isoformat(), midpoint.isoformat())
-                fetch_range(
-                    (midpoint + timedelta(days=1)).isoformat(), last.isoformat()
-                )
+                split_range()
                 return
             except HTTPError as exc:
                 transient = exc.code == 429 or 500 <= exc.code < 600
@@ -237,6 +268,9 @@ def fetch_monthly(
                 if attempt == len(retries):
                     raise
             sleeper(retries[attempt])
+        if sum(bool(line.strip()) for line in payload.splitlines()) - 1 >= STATCAST_ROW_CAP:
+            split_range()
+            return
         parsed = parse_statcast(payload)
         if not parsed.pitches:
             raise ValueError("Statcast chunk must contain at least one data row")
@@ -247,14 +281,7 @@ def fetch_monthly(
             for row in parsed.pitches
         ):
             raise ValueError("Statcast row game_date is outside inclusive query range")
-        query = {
-            "start": chunk_start,
-            "end": chunk_end,
-            "game_type": "R",
-            "url": url,
-        }
         digest = hashlib.sha256(payload).hexdigest()
-        query_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
         known_digest = known_queries.get(query_key)
         if known_digest is not None and known_digest != digest:
             raise RuntimeError("ambiguous raw payload for canonical Statcast query")
@@ -702,6 +729,7 @@ __all__ = [
     "fetch_monthly",
     "fetch_statcast_stage",
     "identify_pitcher_roles",
+    "is_statcast_row_capped_manifest",
     "iter_statcast_pitches",
     "iter_unique_statcast_pitches",
     "iter_unique_statcast_pitches_on_disk",

@@ -9,7 +9,12 @@ from typing import Iterable, Mapping, Sequence
 
 from .manifest import RawStore
 from .mlb_stats import fetch_league_era_records
-from .statcast import StatcastData, parse_statcast, statcast_url
+from .statcast import (
+    StatcastData,
+    is_statcast_row_capped_manifest,
+    parse_statcast,
+    statcast_url,
+)
 
 
 _OUTCOME_TOKENS = ("score", "winner", "outcome", "result", "market", "odds")
@@ -274,6 +279,8 @@ def _statcast_manifest_paths(
         manifest = verified["manifest"]
         query = manifest.get("query")
         if manifest.get("source") != "baseball_savant_statcast" or not isinstance(query, dict):
+            continue
+        if is_statcast_row_capped_manifest(manifest):
             continue
         try:
             covered = _days(str(query["start"]), str(query["end"]))
