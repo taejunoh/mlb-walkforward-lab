@@ -312,6 +312,30 @@ def load_verified_schedule_evidence(
         )
         if not start <= query_date <= end:
             raise ValueError("verified schedule payload contains a game outside its query")
+        for raw_game in date_entry["games"]:
+            if raw_game.get("gameType") != "R":
+                continue
+            official_date = raw_game.get("officialDate", query_date)
+            if start <= official_date <= end:
+                continue
+            status = raw_game["status"]["detailedState"]
+            away = raw_game["teams"]["away"]
+            home = raw_game["teams"]["home"]
+            linescore = raw_game.get("linescore") or {}
+            raw_result_fields = (
+                away.get("score"),
+                home.get("score"),
+                away.get("isWinner"),
+                home.get("isWinner"),
+                linescore.get("currentInning"),
+                linescore.get("outs"),
+            )
+            if status not in OUT_OF_RANGE_UNPLAYED_STATUSES or any(
+                value is not None for value in raw_result_fields
+            ):
+                raise ValueError(
+                    "verified schedule payload contains a game outside its query"
+                )
     result_fields = (
         "away_score",
         "home_score",
