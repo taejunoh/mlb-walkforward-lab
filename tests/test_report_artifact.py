@@ -1,13 +1,16 @@
 from pathlib import Path
+import copy
 import json
 import tempfile
 import unittest
 
 from mlb_backtest.report_artifact import (
+    FROZEN_DIAGNOSTIC_SHA256,
     MATERIALIZE_DATASETS_SQL,
     baseline_pair_rows,
     build_chart_map,
     build_report_artifact,
+    calibration_rows,
     component_rows,
     materialize_datasets,
     month_rows,
@@ -94,7 +97,9 @@ class ReportArtifactTest(unittest.TestCase):
     def test_installed_chart_and_table_contract_is_canonical(self):
         artifact = self.artifact
         charts = artifact["manifest"]["charts"]
-        self.assertFalse(any("series" in chart or "xField" in chart for chart in charts))
+        self.assertFalse(
+            any("series" in chart or "xField" in chart for chart in charts)
+        )
         self.assertTrue(all("field" in chart["encodings"]["x"] for chart in charts))
         self.assertTrue(
             all(
@@ -149,14 +154,102 @@ class ReportArtifactTest(unittest.TestCase):
                 "teams",
             },
         )
-        self.assertEqual(datasets["baseline_pairs"], baseline_pair_rows(self.diagnostic))
         self.assertEqual(
-            datasets["calibration_bins"], self.diagnostic["calibration"]["bins"]
+            datasets["baseline_pairs"], baseline_pair_rows(self.diagnostic)
+        )
+        self.assertEqual(
+            datasets["calibration_bins"], calibration_rows(self.diagnostic)
         )
         self.assertEqual(datasets["monthly"], month_rows(self.diagnostic))
         self.assertEqual(datasets["component_edges"], component_rows(self.diagnostic))
         self.assertEqual(datasets["paired_table"], paired_table_rows(self.diagnostic))
         self.assertEqual(datasets["teams"], team_rows(self.diagnostic))
+
+    def test_report_rejects_any_diagnostic_content_or_source_identity_drift(self):
+        for path, value in (
+            (("primary", "record", "W"), 66),
+            (("monthly", "2025-08", "record", "N"), 13),
+            (("components", "bullpen", "win_mean"), 999.0),
+        ):
+            with self.subTest(path=path):
+                changed = copy.deepcopy(self.diagnostic)
+                target = changed
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaisesRegex(ValueError, "frozen diagnostic"):
+                    build_report_artifact(changed)
+
+        source = self.artifact["sources"][0]
+        self.assertEqual(source["path"], "reports/v5_1_bt/diagnostic_100.json")
+        self.assertEqual(source["sha256"], FROZEN_DIAGNOSTIC_SHA256)
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "diagnostic_100.json"
+            copied.write_bytes(DIAGNOSTIC.read_bytes())
+            with self.assertRaisesRegex(ValueError, "canonical diagnostic path"):
+                write_report_artifact(
+                    copied,
+                    Path(directory) / "artifact.json",
+                    Path(directory) / "chart-map.json",
+                )
+
+    def test_chart_series_categories_and_numeric_formats_are_reader_facing(self):
+        charts = {chart["id"]: chart for chart in self.artifact["manifest"]["charts"]}
+        self.assertEqual(
+            charts["paired-baselines"]["encodings"]["y"]["fields"],
+            ["모델 적중률", "기준선 적중률"],
+        )
+        self.assertEqual(
+            charts["calibration"]["encodings"]["y"]["fields"],
+            ["평균 예측 확률", "실제 적중률"],
+        )
+        self.assertEqual(
+            charts["components"]["encodings"]["y"]["fields"],
+            ["승리 평균 엣지", "패배 평균 엣지"],
+        )
+        self.assertEqual(
+            [
+                row["component"]
+                for row in self.artifact["snapshot"]["datasets"]["component_edges"]
+            ],
+            ["선발", "타선", "불펜", "일정"],
+        )
+        for chart_id in ("paired-baselines", "calibration", "monthly"):
+            with self.subTest(chart=chart_id):
+                chart = charts[chart_id]
+                self.assertEqual(chart["valueFormat"], "percent")
+                self.assertEqual(chart["unit"], "%")
+                self.assertEqual(chart["encodings"]["y"]["format"], "percent")
+                self.assertEqual(chart["encodings"]["y"]["unit"], "%")
+        component_chart = charts["components"]
+        self.assertEqual(component_chart["valueFormat"], "number")
+        self.assertEqual(component_chart["unit"], "점")
+        self.assertEqual(component_chart["encodings"]["y"]["format"], "number")
+        self.assertEqual(component_chart["encodings"]["y"]["unit"], "점")
+
+        tables = {table["id"]: table for table in self.artifact["manifest"]["tables"]}
+        paired_columns = {
+            column["field"]: column
+            for column in tables["paired-baseline-table"]["columns"]
+        }
+        self.assertEqual(paired_columns["delta"]["format"], "percent")
+        self.assertIn("%p", paired_columns["delta"]["label"])
+        self.assertEqual(paired_columns["mcnemar_p"]["format"], "number")
+        team_columns = {
+            column["field"]: column for column in tables["team-table"]["columns"]
+        }
+        for field in ("accuracy", "wilson_low", "wilson_high"):
+            self.assertEqual(team_columns[field]["format"], "percent")
+            self.assertIn("%", team_columns[field]["label"])
+
+    def test_august_partial_period_is_explicit_in_adjacent_narrative(self):
+        body = next(
+            block["body"]
+            for block in self.artifact["manifest"]["blocks"]
+            if block["id"] == "stability-finding"
+        )
+        self.assertIn("8월 12일까지", body)
+        self.assertIn("N=12", body)
 
     def test_charts_have_rich_data_and_immediately_adjacent_narratives(self):
         artifact = self.artifact

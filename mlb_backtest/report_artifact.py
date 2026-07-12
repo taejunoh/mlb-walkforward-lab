@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from mlb_backtest.diagnostics import canonical_json_bytes
+
+
+FROZEN_DIAGNOSTIC_SHA256 = (
+    "9ac9279a18212ad9a82d5e8792001ba0fc068ff34c9a92a2cd0d4d35ab42dd91"
+)
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_FROZEN_DIAGNOSTIC_PATH = _REPOSITORY_ROOT / "reports/v5_1_bt/diagnostic_100.json"
 
 
 MATERIALIZE_DATASETS_SQL = """\
@@ -25,8 +33,8 @@ baseline_rows AS (
         ordinal,
         json_object(
             'comparison', label,
-            'model_accuracy', json_extract(document, '$.baselines.' || baseline_key || '.model_accuracy'),
-            'baseline_accuracy', json_extract(document, '$.baselines.' || baseline_key || '.baseline_accuracy'),
+            '모델 적중률', json_extract(document, '$.baselines.' || baseline_key || '.model_accuracy'),
+            '기준선 적중률', json_extract(document, '$.baselines.' || baseline_key || '.baseline_accuracy'),
             'N', json_extract(document, '$.baselines.' || baseline_key || '.paired.N'),
             'model_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.model_only'),
             'baseline_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.baseline_only'),
@@ -39,7 +47,15 @@ calibration_rows AS (
     SELECT
         'calibration_bins' AS dataset,
         CAST(bin.key AS INTEGER) AS ordinal,
-        json(bin.value) AS row_json
+        json_object(
+            'bin', json_extract(bin.value, '$.bin'),
+            '평균 예측 확률', json_extract(bin.value, '$.mean_probability'),
+            '실제 적중률', json_extract(bin.value, '$.actual_accuracy'),
+            'N', json_extract(bin.value, '$.N'),
+            'gap', json_extract(bin.value, '$.gap'),
+            'mean_brier', json_extract(bin.value, '$.mean_brier'),
+            'brier_contribution', json_extract(bin.value, '$.brier_contribution')
+        ) AS row_json
     FROM input, json_each(json_extract(document, '$.calibration.bins')) AS bin
 ),
 monthly_rows AS (
@@ -48,24 +64,28 @@ monthly_rows AS (
         row_number() OVER (ORDER BY month.key) - 1 AS ordinal,
         json_object(
             'month', month.key,
-            'accuracy', json_extract(month.value, '$.accuracy'),
+            '적중률', json_extract(month.value, '$.accuracy'),
             'W', json_extract(month.value, '$.record.W'),
             'L', json_extract(month.value, '$.record.L'),
             'N', json_extract(month.value, '$.record.N')
         ) AS row_json
     FROM input, json_each(json_extract(document, '$.monthly')) AS month
 ),
-component_keys(component, ordinal) AS (
-    VALUES ('starter', 0), ('offense', 1), ('bullpen', 2), ('schedule', 3)
+component_keys(component_key, component_label, ordinal) AS (
+    VALUES
+        ('starter', '선발', 0),
+        ('offense', '타선', 1),
+        ('bullpen', '불펜', 2),
+        ('schedule', '일정', 3)
 ),
 component_rows AS (
     SELECT
         'component_edges' AS dataset,
         ordinal,
         json_object(
-            'component', component,
-            'wins_mean', json_extract(document, '$.components.' || component || '.win_mean'),
-            'losses_mean', json_extract(document, '$.components.' || component || '.loss_mean'),
+            'component', component_label,
+            '승리 평균 엣지', json_extract(document, '$.components.' || component_key || '.win_mean'),
+            '패배 평균 엣지', json_extract(document, '$.components.' || component_key || '.loss_mean'),
             'wins_N', json_extract(document, '$.primary.record.W'),
             'losses_N', json_extract(document, '$.primary.record.L'),
             'unit', 'score points'
@@ -141,6 +161,7 @@ REPORT_SOURCE: dict[str, object] = {
     "id": "diagnostic-json",
     "label": "Canonical v5.1 diagnostic",
     "path": "reports/v5_1_bt/diagnostic_100.json",
+    "sha256": FROZEN_DIAGNOSTIC_SHA256,
     "query": {
         "engine": "sqlite-json1",
         "id": "v5.1-BT-diagnostic-100",
@@ -184,6 +205,14 @@ def markdown_block(
     if sourced:
         block["sourceId"] = "diagnostic-json"
     return block
+
+
+def require_frozen_diagnostic(diagnostic: Mapping[str, object]) -> None:
+    digest = hashlib.sha256(canonical_json_bytes(diagnostic) + b"\n").hexdigest()
+    if digest != FROZEN_DIAGNOSTIC_SHA256:
+        raise ValueError(
+            "report input does not match the frozen diagnostic_100.json identity"
+        )
 
 
 def materialize_datasets(
@@ -230,8 +259,8 @@ def baseline_pair_rows(diagnostic: Mapping[str, object]) -> list[dict[str, objec
         rows.append(
             {
                 "comparison": label,
-                "model_accuracy": value["model_accuracy"],
-                "baseline_accuracy": value["baseline_accuracy"],
+                "모델 적중률": value["model_accuracy"],
+                "기준선 적중률": value["baseline_accuracy"],
                 "N": paired["N"],
                 "model_only": paired["model_only"],
                 "baseline_only": paired["baseline_only"],
@@ -240,6 +269,25 @@ def baseline_pair_rows(diagnostic: Mapping[str, object]) -> list[dict[str, objec
             }
         )
     return rows
+
+
+def calibration_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
+    calibration = diagnostic["calibration"]
+    assert isinstance(calibration, Mapping)
+    bins = calibration["bins"]
+    assert isinstance(bins, list)
+    return [
+        {
+            "bin": value["bin"],
+            "평균 예측 확률": value["mean_probability"],
+            "실제 적중률": value["actual_accuracy"],
+            "N": value["N"],
+            "gap": value["gap"],
+            "mean_brier": value["mean_brier"],
+            "brier_contribution": value["brier_contribution"],
+        }
+        for value in bins
+    ]
 
 
 def month_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
@@ -253,7 +301,7 @@ def month_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
         rows.append(
             {
                 "month": month,
-                "accuracy": value["accuracy"],
+                "적중률": value["accuracy"],
                 "W": record["W"],
                 "L": record["L"],
                 "N": record["N"],
@@ -270,14 +318,19 @@ def component_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
     record = primary["record"]
     assert isinstance(record, Mapping)
     rows: list[dict[str, object]] = []
-    for name in ("starter", "offense", "bullpen", "schedule"):
+    for name, label in (
+        ("starter", "선발"),
+        ("offense", "타선"),
+        ("bullpen", "불펜"),
+        ("schedule", "일정"),
+    ):
         value = components[name]
         assert isinstance(value, Mapping)
         rows.append(
             {
-                "component": name,
-                "wins_mean": value["win_mean"],
-                "losses_mean": value["loss_mean"],
+                "component": label,
+                "승리 평균 엣지": value["win_mean"],
+                "패배 평균 엣지": value["loss_mean"],
                 "wins_N": record["W"],
                 "losses_N": record["L"],
                 "unit": "score points",
@@ -380,7 +433,8 @@ def stability_body(diagnostic: Mapping[str, object]) -> str:
     return (
         "## 월별 변동과 팀 집중도가 큽니다\n\n"
         "7월은 14/27이었고 상위 6개 선택 팀이 전체 픽의 57%였습니다. "
-        "이는 불안정성 진단이지 월/팀 효과의 증거가 아닙니다."
+        "8월은 8월 12일까지 N=12인 부분 기간입니다. 이는 불안정성 "
+        "진단이지 월/팀 효과의 증거가 아닙니다."
     )
 
 
@@ -438,9 +492,12 @@ def exact_chart_specs() -> list[dict[str, object]]:
         title: str,
         dataset: str,
         x: str,
+        x_label: str,
         y_fields: tuple[str, ...],
+        y_label: str,
         value_format: str,
-        tooltip_fields: tuple[str, ...],
+        unit: str,
+        tooltip_fields: tuple[tuple[str, str, str], ...],
     ) -> dict[str, object]:
         return {
             "id": chart_id,
@@ -450,12 +507,24 @@ def exact_chart_specs() -> list[dict[str, object]]:
             "sourceId": "diagnostic-json",
             "layout": "full",
             "valueFormat": value_format,
+            "unit": unit,
             "encodings": {
-                "x": {"field": x, "type": "nominal"},
-                "y": {"fields": list(y_fields), "type": "quantitative"},
+                "x": {"field": x, "type": "nominal", "label": x_label},
+                "y": {
+                    "fields": list(y_fields),
+                    "type": "quantitative",
+                    "label": y_label,
+                    "format": value_format,
+                    "unit": unit,
+                },
                 "tooltip": [
-                    {"field": field, "type": "quantitative"}
-                    for field in tooltip_fields
+                    {
+                        "field": field,
+                        "type": "quantitative",
+                        "label": label,
+                        "format": tooltip_format,
+                    }
+                    for field, label, tooltip_format in tooltip_fields
                 ],
             },
         }
@@ -466,36 +535,56 @@ def exact_chart_specs() -> list[dict[str, object]]:
             "동일 경기 기준선 비교",
             "baseline_pairs",
             "comparison",
-            ("model_accuracy", "baseline_accuracy"),
+            "비교 기준",
+            ("모델 적중률", "기준선 적중률"),
+            "적중률",
             "percent",
-            ("N", "delta", "mcnemar_p"),
+            "%",
+            (
+                ("N", "짝지은 경기 수", "number"),
+                ("delta", "차이 (%p)", "percent"),
+                ("mcnemar_p", "McNemar p", "number"),
+            ),
         ),
         chart(
             "calibration",
             "예측 확률과 실제 적중률",
             "calibration_bins",
             "bin",
-            ("mean_probability", "actual_accuracy"),
+            "예측 확률 구간",
+            ("평균 예측 확률", "실제 적중률"),
+            "확률·적중률",
             "percent",
-            ("N", "gap", "mean_brier"),
+            "%",
+            (
+                ("N", "픽 수", "number"),
+                ("gap", "보정 차이", "percent"),
+                ("mean_brier", "평균 Brier", "number"),
+            ),
         ),
         chart(
             "monthly",
             "월별 Top 1 적중률",
             "monthly",
             "month",
-            ("accuracy",),
+            "월",
+            ("적중률",),
+            "적중률",
             "percent",
-            ("N", "W", "L"),
+            "%",
+            (("N", "픽 수", "number"), ("W", "승", "number"), ("L", "패", "number")),
         ),
         chart(
             "components",
             "승패별 선택 측 컴포넌트 엣지",
             "component_edges",
             "component",
-            ("wins_mean", "losses_mean"),
+            "컴포넌트",
+            ("승리 평균 엣지", "패배 평균 엣지"),
+            "선택 측 평균 엣지",
             "number",
-            ("wins_N", "losses_N"),
+            "점",
+            (("wins_N", "승리 표본", "number"), ("losses_N", "패배 표본", "number")),
         ),
     ]
 
@@ -511,15 +600,16 @@ def exact_table_specs() -> list[dict[str, object]]:
             "density": "spacious",
             "defaultSort": {"field": "N", "direction": "desc"},
             "columns": [
-                {"field": field, "label": label}
-                for field, label in (
-                    ("comparison", "비교"),
-                    ("N", "N"),
-                    ("model_only", "모델만 정답"),
-                    ("baseline_only", "기준선만 정답"),
-                    ("delta", "차이"),
-                    ("mcnemar_p", "McNemar p"),
-                )
+                {"field": "comparison", "label": "비교", "type": "text"},
+                {"field": "N", "label": "짝지은 경기 수", "format": "number"},
+                {"field": "model_only", "label": "모델만 정답", "format": "number"},
+                {
+                    "field": "baseline_only",
+                    "label": "기준선만 정답",
+                    "format": "number",
+                },
+                {"field": "delta", "label": "차이 (%p)", "format": "percent"},
+                {"field": "mcnemar_p", "label": "McNemar p", "format": "number"},
             ],
         },
         {
@@ -531,22 +621,28 @@ def exact_table_specs() -> list[dict[str, object]]:
             "density": "comfortable",
             "defaultSort": {"field": "N", "direction": "desc"},
             "columns": [
-                {"field": field, "label": label}
-                for field, label in (
-                    ("team", "팀"),
-                    ("W", "승"),
-                    ("L", "패"),
-                    ("N", "N"),
-                    ("accuracy", "적중률"),
-                    ("wilson_low", "Wilson 하한"),
-                    ("wilson_high", "Wilson 상한"),
-                )
+                {"field": "team", "label": "팀", "type": "text"},
+                {"field": "W", "label": "승", "format": "number"},
+                {"field": "L", "label": "패", "format": "number"},
+                {"field": "N", "label": "픽 수", "format": "number"},
+                {"field": "accuracy", "label": "적중률 (%)", "format": "percent"},
+                {
+                    "field": "wilson_low",
+                    "label": "Wilson 하한 (%)",
+                    "format": "percent",
+                },
+                {
+                    "field": "wilson_high",
+                    "label": "Wilson 상한 (%)",
+                    "format": "percent",
+                },
             ],
         },
     ]
 
 
 def build_report_artifact(diagnostic: Mapping[str, object]) -> dict[str, object]:
+    require_frozen_diagnostic(diagnostic)
     datasets = materialize_datasets(diagnostic)
     charts = exact_chart_specs()
     tables = exact_table_specs()
@@ -642,7 +738,14 @@ def build_chart_map() -> dict[str, object]:
 def write_report_artifact(
     diagnostic_path: Path, artifact_path: Path, chart_map_path: Path
 ) -> None:
-    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    if diagnostic_path.resolve() != _FROZEN_DIAGNOSTIC_PATH.resolve():
+        raise ValueError("--diagnostic must use the canonical diagnostic path")
+    diagnostic_bytes = diagnostic_path.read_bytes()
+    if hashlib.sha256(diagnostic_bytes).hexdigest() != FROZEN_DIAGNOSTIC_SHA256:
+        raise ValueError(
+            "canonical diagnostic file does not match frozen diagnostic identity"
+        )
+    diagnostic = json.loads(diagnostic_bytes.decode("utf-8"))
     artifact = build_report_artifact(diagnostic)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     chart_map_path.parent.mkdir(parents=True, exist_ok=True)
