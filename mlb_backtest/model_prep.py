@@ -453,7 +453,12 @@ def _training_outcomes(games: Iterable[Mapping[str, object]]) -> dict[int, int]:
     return outcomes
 
 
-def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+def prepare_training_stage(
+    config_path: str | Path,
+    data_dir: str | Path,
+    *,
+    validation_policy=None,
+) -> Path:
     """Build frozen normalization inputs and training edges from verified raw data."""
     from collections import Counter
 
@@ -469,6 +474,8 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
         _write_once,
     )
     from .prepare import (
+        PRODUCTION_VALIDATION_POLICY,
+        PreparationValidationPolicy,
         derive_team_code_map,
         derive_training_slot_rows,
         load_verified_statcast_evidence,
@@ -477,6 +484,10 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     from .statcast import regular_season_ranges
 
     config = load_config(config_path)
+    if validation_policy is None:
+        validation_policy = PRODUCTION_VALIDATION_POLICY
+    if not isinstance(validation_policy, PreparationValidationPolicy):
+        raise ValueError("validation_policy must be a PreparationValidationPolicy")
     root = _safe_data_dir(data_dir)
     if not (root / "raw").is_dir():
         raise RuntimeError("missing verified raw sources")
@@ -501,7 +512,10 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     )
     slot_weights = derive_slot_weights(
         derive_training_slot_rows(
-            schedule_evidence, compact, verified_catalog=raw_catalog
+            schedule_evidence,
+            compact,
+            verified_catalog=raw_catalog,
+            validation_policy=validation_policy,
         )
     )
     raw_features = []
@@ -520,7 +534,12 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
             catalog=raw_catalog,
             final_outs_by_game=_final_outs_by_game(evidence.games),
         )
-        team_map = derive_team_code_map(evidence.games, statcast, year)
+        team_map = derive_team_code_map(
+            evidence.games,
+            statcast,
+            year,
+            validation_policy=validation_policy,
+        )
         participants = _safe_participants(evidence.games, statcast)
         history = _history_build(evidence, team_map, catalog=raw_catalog)
         target_games = [game for game in participants if game.get("status") == "Scheduled"]
@@ -711,7 +730,12 @@ def fetch_prior_career_bf_stage(
     )
 
 
-def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+def prepare_candidates_stage(
+    config_path: str | Path,
+    data_dir: str | Path,
+    *,
+    validation_policy=None,
+) -> Path:
     """Build result-free 2025 candidate components from the frozen v2 card."""
     from .career_bf import apply_prior_career_bf, load_prior_career_bf_records
     from .config import load_config
@@ -723,10 +747,18 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         _write_jsonl_once,
         _write_once,
     )
-    from .prepare import derive_team_code_map
+    from .prepare import (
+        PRODUCTION_VALIDATION_POLICY,
+        PreparationValidationPolicy,
+        derive_team_code_map,
+    )
     from .scoring_prep import build_candidate_components
 
     config = load_config(config_path)
+    if validation_policy is None:
+        validation_policy = PRODUCTION_VALIDATION_POLICY
+    if not isinstance(validation_policy, PreparationValidationPolicy):
+        raise ValueError("validation_policy must be a PreparationValidationPolicy")
     root = _safe_data_dir(data_dir)
     if (root / "outcomes").exists():
         raise ValueError("prepare-candidates refuses an outcomes stage")
@@ -762,7 +794,12 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
             history_evidence.games, backtest_evidence.games
         ),
     )
-    team_map = derive_team_code_map(history_evidence.games, statcast, 2025)
+    team_map = derive_team_code_map(
+        history_evidence.games,
+        statcast,
+        2025,
+        validation_policy=validation_policy,
+    )
     participants = _safe_participants(
         backtest_evidence.games, statcast, target=True
     )

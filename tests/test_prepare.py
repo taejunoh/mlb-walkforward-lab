@@ -7,6 +7,7 @@ from unittest import mock
 from mlb_backtest.features.offense import derive_slot_weights
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.prepare import (
+    PreparationValidationPolicy,
     ParticipantBuild,
     ScheduleHistoryBuild,
     SlotPA,
@@ -226,6 +227,16 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertEqual(built.unmatched_schedule_games[0]["game_pk"], 999)
         self.assertEqual(built.provenance["unmatched_game_count"], 1)
         self.assertRegex(built.provenance["mapping_sha256"], r"^[0-9a-f]{64}$")
+        tiny = PreparationValidationPolicy(
+            minimum_played_games=1,
+            expected_team_count=2,
+            minimum_lineup_games=1,
+            minimum_starting_lineup_pa=18,
+        )
+        tiny_built = derive_team_code_map(
+            games[:1], rows[:1], 2024, validation_policy=tiny
+        )
+        self.assertEqual(tiny_built.mapping, {"Team 00": "T00", "Team 01": "T01"})
         conflict = rows + [dict(rows[0], away_team="BAD")]
         with self.assertRaises(ValueError):
             derive_team_code_map(games, conflict, 2024)
@@ -497,6 +508,23 @@ class PrepareBoundaryTest(unittest.TestCase):
             _validate_played_schedule_season(
                 games[:2399], 2024, "2024-03-20", "2024-09-30"
             )
+
+        tiny = PreparationValidationPolicy(
+            minimum_played_games=1,
+            expected_team_count=2,
+            minimum_lineup_games=1,
+            minimum_starting_lineup_pa=18,
+        )
+        self.assertEqual(
+            _validate_played_schedule_season(
+                [scheduled_game(0)],
+                2024,
+                "2024-03-20",
+                "2024-09-30",
+                validation_policy=tiny,
+            ),
+            (scheduled_game(0),),
+        )
 
     def test_verified_schedule_evidence_comes_only_from_rawstore_manifest(self):
         payload = (ROOT / "tests" / "fixtures" / "schedule_2025_05_01.json").read_bytes()

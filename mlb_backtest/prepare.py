@@ -21,6 +21,30 @@ _EVIDENCE_TOKEN = object()
 PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
 
 
+@dataclass(frozen=True, slots=True)
+class PreparationValidationPolicy:
+    """Production source-completeness thresholds, injectable for tiny replays."""
+
+    minimum_played_games: int = 2400
+    expected_team_count: int = 30
+    minimum_lineup_games: int = 2400
+    minimum_starting_lineup_pa: int = 40_000
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "minimum_played_games",
+            "expected_team_count",
+            "minimum_lineup_games",
+            "minimum_starting_lineup_pa",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer")
+
+
+PRODUCTION_VALIDATION_POLICY = PreparationValidationPolicy()
+
+
 @dataclass(frozen=True, init=False)
 class VerifiedScheduleEvidence:
     raw_root: Path
@@ -641,6 +665,8 @@ def derive_team_code_map(
     schedule_games: Iterable[Mapping[str, object]],
     statcast_data: object,
     year: int,
+    *,
+    validation_policy: PreparationValidationPolicy = PRODUCTION_VALIDATION_POLICY,
 ) -> TeamCodeBuild:
     """Join schedule names to in-season Statcast codes with a strict 30-team bijection."""
     if type(year) is not int or year < 1900:
@@ -715,8 +741,13 @@ def derive_team_code_map(
                 raise ValueError(f"team code {code} maps to multiple names")
             mapping[name] = code
             reverse[code] = name
-    if len(mapping) != 30 or len(reverse) != 30:
-        raise ValueError("team code map must contain exactly 30 names and codes")
+    if not isinstance(validation_policy, PreparationValidationPolicy):
+        raise ValueError("validation_policy must be a PreparationValidationPolicy")
+    expected_teams = validation_policy.expected_team_count
+    if len(mapping) != expected_teams or len(reverse) != expected_teams:
+        raise ValueError(
+            f"team code map must contain exactly {expected_teams} names and codes"
+        )
     frozen_mapping = dict(sorted(mapping.items()))
     mapping_bytes = json.dumps(
         frozen_mapping, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -874,6 +905,8 @@ def _validate_played_schedule_season(
     year: int,
     season_open: str,
     season_close: str,
+    *,
+    validation_policy: PreparationValidationPolicy = PRODUCTION_VALIDATION_POLICY,
 ) -> tuple[Mapping[str, object], ...]:
     """Return lineup-valid played games after enforcing live season sanity."""
     played_statuses = PLAYED_STATUSES
@@ -947,13 +980,22 @@ def _validate_played_schedule_season(
             )
         if valid_lineups:
             lineup_valid.append(game)
-    if len(played) < 2400:
-        raise ValueError(f"frozen {year} schedule requires at least 2400 played games")
-    if len(teams_by_id) != 30 or len(set(teams_by_id.values())) != 30:
-        raise ValueError(f"frozen {year} schedule must contain exactly 30 teams")
-    if len(lineup_valid) < 2400:
+    if not isinstance(validation_policy, PreparationValidationPolicy):
+        raise ValueError("validation_policy must be a PreparationValidationPolicy")
+    if len(played) < validation_policy.minimum_played_games:
         raise ValueError(
-            f"frozen {year} schedule requires at least 2400 valid 9+9 lineup games"
+            f"frozen {year} schedule requires at least "
+            f"{validation_policy.minimum_played_games} played games"
+        )
+    expected_teams = validation_policy.expected_team_count
+    if len(teams_by_id) != expected_teams or len(set(teams_by_id.values())) != expected_teams:
+        raise ValueError(
+            f"frozen {year} schedule must contain exactly {expected_teams} teams"
+        )
+    if len(lineup_valid) < validation_policy.minimum_lineup_games:
+        raise ValueError(
+            f"frozen {year} schedule requires at least "
+            f"{validation_policy.minimum_lineup_games} valid 9+9 lineup games"
         )
     return tuple(lineup_valid)
 
@@ -963,6 +1005,7 @@ def derive_training_slot_rows(
     statcast_evidence: VerifiedStatcastEvidence,
     *,
     verified_catalog=None,
+    validation_policy: PreparationValidationPolicy = PRODUCTION_VALIDATION_POLICY,
 ) -> list[dict[str, object]]:
     """Derive production slot rows only from verified full-season sources."""
     if (
@@ -1009,8 +1052,13 @@ def derive_training_slot_rows(
                 if game_pk in played_game_dates:
                     raise ValueError("full-season schedule evidence duplicates played game_pk")
                 played_game_dates[game_pk] = str(game["official_date"])
+        validation_kwargs = (
+            {}
+            if validation_policy is PRODUCTION_VALIDATION_POLICY
+            else {"validation_policy": validation_policy}
+        )
         for game in _validate_played_schedule_season(
-            season_games, year, season_open, season_close
+            season_games, year, season_open, season_close, **validation_kwargs
         ):
             game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
             if game_pk in schedule_games_by_pk:
@@ -1058,8 +1106,11 @@ def derive_training_slot_rows(
     totals_by_year = defaultdict(int)
     for row in rows:
         totals_by_year[int(row["season"])] += int(row["pa"])
-    if any(totals_by_year[year] < 40_000 for year in frozen):
-        raise ValueError("each frozen season requires at least 40000 starting-lineup PA")
+    minimum_pa = validation_policy.minimum_starting_lineup_pa
+    if any(totals_by_year[year] < minimum_pa for year in frozen):
+        raise ValueError(
+            f"each frozen season requires at least {minimum_pa} starting-lineup PA"
+        )
     if len(rows) != 27:
         raise ValueError("frozen slot aggregation must contain exactly 27 rows")
     return rows
