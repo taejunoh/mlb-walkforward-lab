@@ -2,12 +2,16 @@ import json
 import math
 import time
 import unittest
+from pathlib import Path
 from mlb_backtest.feature_engine import (
     FeatureHistory,
     ScheduleHistory,
+    actual_starter_index,
     build_raw_game_features,
+    enrich_schedule_game_participants,
     pa_expected_woba,
 )
+from mlb_backtest.sources import parse_schedule
 from mlb_backtest.statcast import StatcastData
 
 
@@ -130,6 +134,95 @@ def build(target, history, team_map=None, league_era=None):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_schedule_coverage_window_controls_supported_subrules(self):
+        with self.assertRaises(TypeError):
+            ScheduleHistory([])
+
+        stale_row = {
+            "game_pk": 1,
+            "official_date": "2025-04-01",
+            "team_codes": ["HOM"],
+            "home_team_code": "HOM",
+            "venue_name": "Park",
+            "innings": 9,
+        }
+        stale = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                schedule_history=[stale_row],
+                schedule_coverage_start="2025-04-01",
+                schedule_coverage_end="2025-04-01",
+                schedule_coverage_complete=True,
+            ),
+        )
+        self.assertEqual(stale["home"]["schedule"]["value"], 50.0)
+        self.assertEqual(stale["home"]["schedule"]["quality"], 1 / 6)
+
+        full = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                schedule_coverage_start="2025-04-28",
+                schedule_coverage_end="2025-04-30",
+                schedule_coverage_complete=True,
+            ),
+        )
+        self.assertEqual(full["home"]["schedule"]["value"], 62.0)
+        self.assertEqual(full["home"]["schedule"]["quality"], 1.0)
+        self.assertEqual(full["provenance"]["schedule_coverage_start"], "2025-04-28")
+        self.assertEqual(full["provenance"]["schedule_coverage_end"], "2025-04-30")
+        self.assertTrue(full["provenance"]["schedule_coverage_complete"])
+
+        partial = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                schedule_coverage_start="2025-04-28",
+                schedule_coverage_end="2025-04-30",
+                schedule_coverage_complete=False,
+            ),
+        )
+        self.assertEqual(partial["home"]["schedule"]["value"], 50.0)
+        self.assertEqual(partial["home"]["schedule"]["quality"], 1 / 6)
+
+    def test_participant_index_and_schedule_enrichment_make_actual_starter_authoritative(
+        self,
+    ):
+        schedule_game = parse_schedule(
+            Path(__file__).parent / "fixtures" / "schedule_2025_05_01.json"
+        )[0]
+        target_rows = [
+            pa(778100, "2025-05-01", 694973, 1, "field_out", outs=1),
+            pa(778100, "2025-05-01", 999999, 2, "field_out", top="Bot", at_bat=2),
+        ]
+        index = actual_starter_index(
+            StatcastData(tuple(target_rows), tuple(target_rows))
+        )
+        enriched = enrich_schedule_game_participants(schedule_game, index)
+        self.assertEqual(enriched["home_actual_starter_id"], 694973)
+        self.assertEqual(enriched["away_actual_starter_id"], 999999)
+        self.assertFalse(enriched["home_probable_starter_mismatch"])
+        self.assertTrue(enriched["away_probable_starter_mismatch"])
+        self.assertEqual(enriched["starter_provenance"], "RECONSTRUCTED_ACTUAL_STARTER")
+
+        team_map = mapping()
+        del team_map["Home"]
+        del team_map["Away"]
+        team_map["Chicago Cubs"] = "CHC"
+        team_map["Pittsburgh Pirates"] = "PIT"
+        result = build(
+            enriched,
+            FeatureHistory(data([]), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+            team_map=team_map,
+        )
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["away_probable_starter_mismatch"])
+        self.assertEqual(result["away"]["starter"]["pitcher_id"], 999999)
+
     def test_source_backed_league_era_produces_cfip_and_final_starter_fip(self):
         rows = [
             pa(1, "2025-04-01", 10, 201, "strikeout", xwoba=0.1, outs=1),
@@ -238,9 +331,7 @@ class FeatureEngineTest(unittest.TestCase):
             ({"venue_id": None}, "missing_venue"),
             ({"venue_name": ""}, "missing_venue"),
             ({"away_team": "Home"}, "invalid_teams"),
-            ({"home_probable_pitcher_id": 0}, "missing_home_starter"),
             ({"home_actual_starter_id": None}, "missing_home_actual_starter"),
-            ({"home_actual_starter_id": 30}, "home_starter_id_mismatch"),
             ({"starter_provenance": "PROBABLE"}, "invalid_starter_provenance"),
             ({"home_lineup": duplicate_lineup}, "invalid_home_lineup"),
             ({"away_lineup": game()["away_lineup"][:8]}, "invalid_away_lineup"),
@@ -609,6 +700,9 @@ class FeatureEngineTest(unittest.TestCase):
                 data([]),
                 slot_weights={i: 1 / 9 for i in range(1, 10)},
                 schedule_history=schedule(home_codes),
+                schedule_coverage_start="2025-04-28",
+                schedule_coverage_end="2025-04-30",
+                schedule_coverage_complete=True,
             )
             return build(game(doubleheader_marker=None), history)["home"]["schedule"][
                 "value"
@@ -641,7 +735,12 @@ class FeatureEngineTest(unittest.TestCase):
             ]
         )
         started = time.perf_counter()
-        schedule = ScheduleHistory(rows)
+        schedule = ScheduleHistory(
+            rows,
+            coverage_start="2024-01-01",
+            coverage_end="2024-12-31",
+            coverage_complete=True,
+        )
         history = FeatureHistory(
             data([]),
             slot_weights={i: 1 / 9 for i in range(1, 10)},
@@ -684,6 +783,9 @@ class FeatureEngineTest(unittest.TestCase):
                 data([]),
                 slot_weights={i: 1 / 9 for i in range(1, 10)},
                 schedule_history=schedule,
+                schedule_coverage_start="2025-04-28",
+                schedule_coverage_end="2025-04-30",
+                schedule_coverage_complete=True,
             ),
         )
         provenance = result["provenance"]
@@ -720,7 +822,12 @@ class FeatureEngineTest(unittest.TestCase):
         )
         for row in invalid:
             with self.subTest(row=row), self.assertRaises(ValueError):
-                ScheduleHistory([row])
+                ScheduleHistory(
+                    [row],
+                    coverage_start="2025-04-01",
+                    coverage_end="2025-04-30",
+                    coverage_complete=True,
+                )
 
     def test_large_statcast_history_repeated_builds_use_indexes_reasonably(self):
         rows = [
@@ -876,6 +983,9 @@ class FeatureEngineTest(unittest.TestCase):
                     "time_zone": "America/New_York",
                 }
             ],
+            schedule_coverage_start="2025-04-28",
+            schedule_coverage_end="2025-04-30",
+            schedule_coverage_complete=True,
         )
         result = build(game(), history)
         self.assertTrue(result["eligible"])
@@ -931,6 +1041,9 @@ class FeatureEngineTest(unittest.TestCase):
                     "innings": 9,
                 }
             ],
+            schedule_coverage_start="2025-04-28",
+            schedule_coverage_end="2025-04-30",
+            schedule_coverage_complete=True,
             venue_by_name={
                 "West": {
                     "city": "Los Angeles",
@@ -959,9 +1072,8 @@ class FeatureEngineTest(unittest.TestCase):
         )
         result = build(game(home_probable_pitcher_id=None, away_lineup=[]), history)
         self.assertFalse(result["eligible"])
-        self.assertEqual(
-            result["reasons"], ["missing_home_starter", "missing_away_lineup"]
-        )
+        self.assertEqual(result["reasons"], ["missing_away_lineup"])
+        self.assertTrue(result["home_probable_starter_mismatch"])
         self.assertEqual(result["lineup_provenance"], "MISSING_OR_INVALID_LINEUP")
 
         duplicate = [dict(player) for player in game()["home_lineup"]]

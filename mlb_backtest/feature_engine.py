@@ -101,7 +101,37 @@ def pa_expected_woba(row: Mapping[str, object]) -> float | None:
 class ScheduleHistory:
     """Canonical schedule rows indexed once by team and team/date."""
 
-    def __init__(self, rows: Iterable[Mapping[str, object]] = ()) -> None:
+    def __init__(
+        self,
+        rows: Iterable[Mapping[str, object]],
+        *,
+        coverage_start: str | None,
+        coverage_end: str | None,
+        coverage_complete: bool,
+    ) -> None:
+        if not isinstance(coverage_complete, bool):
+            raise ValueError("schedule coverage_complete must be boolean")
+        try:
+            start = (
+                date.fromisoformat(coverage_start)
+                if coverage_start is not None
+                else None
+            )
+            end = date.fromisoformat(coverage_end) if coverage_end is not None else None
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "schedule coverage bounds must be canonical ISO dates"
+            ) from exc
+        if (
+            (start is not None and start.isoformat() != coverage_start)
+            or (end is not None and end.isoformat() != coverage_end)
+            or (start is not None and end is not None and start > end)
+            or (coverage_complete and (start is None or end is None))
+        ):
+            raise ValueError("schedule coverage bounds are invalid")
+        self.coverage_start = start
+        self.coverage_end = end
+        self.coverage_complete = coverage_complete
         validated = []
         seen_game_pks = set()
         for raw in rows:
@@ -222,6 +252,73 @@ class ScheduleHistory:
     def has_future(self, target: date) -> bool:
         return bool(self._dates and self._dates[-1] > target)
 
+    def covers(self, first: date, last: date) -> bool:
+        return bool(
+            self.coverage_complete
+            and self.coverage_start is not None
+            and self.coverage_end is not None
+            and self.coverage_start <= first <= last <= self.coverage_end
+        )
+
+
+def actual_starter_index(
+    statcast_or_pitches: StatcastData | Iterable[Mapping[str, object]],
+) -> dict[int, dict[str, int]]:
+    """Reduce target-game pitches to authoritative first-pitcher identities only."""
+    pitches = (
+        statcast_or_pitches.pitches
+        if isinstance(statcast_or_pitches, StatcastData)
+        else tuple(statcast_or_pitches)
+    )
+    ordered = sorted(
+        pitches,
+        key=lambda row: (
+            str(row["game_date"]),
+            int(row["game_pk"]),
+            int(row["inning"]),
+            0 if row["inning_topbot"] == "Top" else 1,
+            int(row["at_bat_number"]),
+            int(row.get("pitch_number", 0)),
+        ),
+    )
+    indexed: defaultdict[int, dict[str, int]] = defaultdict(dict)
+    for row in ordered:
+        game_pk = int(row["game_pk"])
+        side = "home" if row["inning_topbot"] == "Top" else "away"
+        indexed[game_pk].setdefault(f"{side}_actual_starter_id", int(row["pitcher_id"]))
+    return {game_pk: dict(values) for game_pk, values in sorted(indexed.items())}
+
+
+def enrich_schedule_game_participants(
+    normalized_game: Mapping[str, object],
+    starter_index: Mapping[int, Mapping[str, int]],
+) -> dict[str, object]:
+    """Return a schedule-game copy enriched only with reconstructed participants."""
+    if not isinstance(normalized_game, Mapping) or not isinstance(
+        starter_index, Mapping
+    ):
+        raise ValueError("normalized game and starter index must be mappings")
+    enriched = dict(normalized_game)
+    game_pk = enriched.get("game_pk")
+    participants = starter_index.get(game_pk, {}) if type(game_pk) is int else {}
+    complete = True
+    for side in ("away", "home"):
+        actual = participants.get(f"{side}_actual_starter_id")
+        if type(actual) is not int or actual <= 0:
+            actual = None
+            complete = False
+        enriched[f"{side}_actual_starter_id"] = actual
+        probable = enriched.get(f"{side}_probable_pitcher_id")
+        enriched[f"{side}_probable_starter_mismatch"] = (
+            actual is not None and probable != actual
+        )
+    enriched["starter_provenance"] = (
+        "RECONSTRUCTED_ACTUAL_STARTER"
+        if complete
+        else "MISSING_ACTUAL_STARTER_ENRICHMENT"
+    )
+    return enriched
+
 
 class FeatureHistory:
     """Canonical, indexed Statcast and schedule history used by raw feature builds."""
@@ -232,6 +329,9 @@ class FeatureHistory:
         *,
         slot_weights: Mapping[int, float],
         schedule_history: Iterable[Mapping[str, object]] | ScheduleHistory = (),
+        schedule_coverage_start: str | None = None,
+        schedule_coverage_end: str | None = None,
+        schedule_coverage_complete: bool = False,
         venue_by_name: Mapping[str, Mapping[str, object]] | None = None,
         statcast_coverage_complete: bool = True,
     ) -> None:
@@ -256,7 +356,12 @@ class FeatureHistory:
         self.schedule_history = (
             schedule_history
             if isinstance(schedule_history, ScheduleHistory)
-            else ScheduleHistory(schedule_history)
+            else ScheduleHistory(
+                schedule_history,
+                coverage_start=schedule_coverage_start,
+                coverage_end=schedule_coverage_end,
+                coverage_complete=schedule_coverage_complete,
+            )
         )
         self.venue_by_name = MappingProxyType(dict(venue_by_name or {}))
         self.pa_by_pitcher = self._index(self.plate_appearances, "pitcher_id")
@@ -719,9 +824,12 @@ def _schedule_component(
     d1_rows = history.schedule_history.by_team_date.get(
         (team_code, target - timedelta(days=1)), ()
     )
-    rest_supported = latest is not None
+    schedule_window_supported = history.schedule_history.covers(
+        target - timedelta(days=3), target - timedelta(days=1)
+    )
+    rest_supported = schedule_window_supported
     rest = rest_supported and not d1_rows
-    if d1_rows:
+    if schedule_window_supported and d1_rows:
         prior_innings_supported = all(
             type(row.get("innings")) is int for row in d1_rows
         )
@@ -730,8 +838,11 @@ def _schedule_component(
             if prior_innings_supported
             else 0
         )
+    elif schedule_window_supported:
+        prior_innings_supported = True
+        prior_innings = 0
     else:
-        prior_innings_supported = latest is not None
+        prior_innings_supported = False
         prior_innings = 0
     home_days = 0
     destination = _venue(game, history)
@@ -751,7 +862,7 @@ def _schedule_component(
             prior_home_games = []
             break
         prior_home_games.append(matching[0])
-    home_city_supported = latest is not None
+    home_city_supported = schedule_window_supported
     if len(prior_home_games) == 3:
         home_days = 3
     if isinstance(game.get("doubleheader"), bool):
@@ -763,9 +874,16 @@ def _schedule_component(
     else:
         doubleheader = False
         doubleheader_supported = False
-    travel = (
-        _travel_fields(_venue(latest, history), destination, game) if latest else None
-    )
+    if not schedule_window_supported:
+        travel = None
+    elif rest:
+        travel = (0.0, 0)
+    else:
+        travel = (
+            _travel_fields(_venue(latest, history), destination, game)
+            if latest
+            else None
+        )
     flags = []
     if travel is None:
         miles, time_zones = 0.0, 0
@@ -935,14 +1053,9 @@ def _eligibility(
     ):
         reasons.append("invalid_teams")
     for side in ("home", "away"):
-        pitcher_id = game.get(f"{side}_probable_pitcher_id")
-        if type(pitcher_id) is not int or pitcher_id <= 0:
-            reasons.append(f"missing_{side}_starter")
         actual_id = game.get(f"{side}_actual_starter_id")
         if type(actual_id) is not int or actual_id <= 0:
             reasons.append(f"missing_{side}_actual_starter")
-        elif type(pitcher_id) is int and pitcher_id > 0 and actual_id != pitcher_id:
-            reasons.append(f"{side}_starter_id_mismatch")
         lineup = game.get(f"{side}_lineup")
         if not lineup:
             reasons.append(f"missing_{side}_lineup")
@@ -985,7 +1098,7 @@ def build_raw_game_features(
     team_code_by_name: Mapping[str, str],
     league_era_by_asof: Mapping[str, Mapping[str, object]],
 ) -> dict:
-    """Build raw, unnormalized features for one normalized schedule game."""
+    """Build raw features for a normalized game enriched with actual starters."""
     if not isinstance(history, FeatureHistory):
         raise ValueError("history must be FeatureHistory")
     if (
@@ -1029,11 +1142,19 @@ def build_raw_game_features(
             and all(
                 type(game.get(f"{side}_actual_starter_id")) is int
                 and game[f"{side}_actual_starter_id"] > 0
-                and game.get(f"{side}_actual_starter_id")
-                == game.get(f"{side}_probable_pitcher_id")
                 for side in ("home", "away")
             )
             else "MISSING_OR_INVALID_ACTUAL_STARTER"
+        ),
+        "away_probable_starter_mismatch": bool(
+            game.get("away_probable_starter_mismatch")
+            or game.get("away_probable_pitcher_id")
+            != game.get("away_actual_starter_id")
+        ),
+        "home_probable_starter_mismatch": bool(
+            game.get("home_probable_starter_mismatch")
+            or game.get("home_probable_pitcher_id")
+            != game.get("home_actual_starter_id")
         ),
     }
     raw_source_max_date = _max_history_date(history, target)
@@ -1061,6 +1182,17 @@ def build_raw_game_features(
         "future_schedule_present": (
             history.schedule_history.has_future(target) if target is not None else False
         ),
+        "schedule_coverage_start": (
+            history.schedule_history.coverage_start.isoformat()
+            if history.schedule_history.coverage_start is not None
+            else None
+        ),
+        "schedule_coverage_end": (
+            history.schedule_history.coverage_end.isoformat()
+            if history.schedule_history.coverage_end is not None
+            else None
+        ),
+        "schedule_coverage_complete": history.schedule_history.coverage_complete,
     }
     if league_era_provenance is not None:
         provenance["league_era"] = league_era_provenance
@@ -1101,6 +1233,8 @@ def build_raw_game_features(
 __all__ = [
     "FeatureHistory",
     "ScheduleHistory",
+    "actual_starter_index",
     "build_raw_game_features",
+    "enrich_schedule_game_participants",
     "pa_expected_woba",
 ]
