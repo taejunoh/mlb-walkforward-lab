@@ -192,6 +192,169 @@ CHANGE_FORBIDDEN = (
     "any_predictive_change_selected_from_2025",
 )
 
+RUN_REQUIRED_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "model_version",
+        "label",
+        "target_count",
+        "allowed_target_years",
+        "forbidden_target_years",
+        "folds",
+        "date_queue",
+        "selection",
+        "terminal_contract",
+        "date_state_precedence",
+        "outcome_isolation",
+        "paired_denominators",
+        "evidence_labels",
+        "source_requirements",
+        "namespaces",
+        "model_card_status",
+    }
+)
+FOLD_REQUIRED_KEYS = frozenset(
+    {
+        "fold_id",
+        "target_year",
+        "target_dates",
+        "normalization_years",
+        "oof_calibration",
+        "latest_training_date",
+        "model_card_path",
+        "model_card_status",
+    }
+)
+OOF_ROW_KEYS = frozenset({"target_year", "normalization_years"})
+TERMINAL_KEYS = frozenset(
+    {
+        "timezone",
+        "deadline_days",
+        "deadline_time",
+        "status_mapping",
+        "doubleheader_order",
+        "replacement_rule",
+        "late_result_rule",
+    }
+)
+NAMESPACE_KEYS = frozenset(
+    {"raw", "features", "locked", "outcomes", "reports", "audit"}
+)
+MINIMUM_SOURCE_NAMES = (
+    "mlb_schedule_game_feed",
+    "baseball_savant_statcast",
+    "mlb_stats_pitching",
+    "venue_team_timezone_table",
+    "prior_schedule_history",
+)
+OPTIONAL_SOURCE_NAMES = (
+    "environment",
+    "defense",
+    "catcher",
+    "injury_restriction",
+    "market_odds",
+)
+HISTORICAL_DATE_QUEUE = {
+    "order": "official_date_ascending",
+    "start": "2022-opening-day",
+    "end": "2024-regular-season-end",
+    "exclude": ["spring", "exhibition", "all-star", "postseason", "2025"],
+}
+HISTORICAL_SELECTION = {
+    "eligible_top1_per_date": 1,
+    "graded_target": 500,
+    "same_date_rank2_replacement": False,
+    "void_replacement": "next_later_regular_season_date_with_newly_graded_top1",
+}
+HISTORICAL_TERMINAL = {
+    "timezone": "America/New_York",
+    "deadline_days": 7,
+    "deadline_time": "23:59:59",
+    "status_mapping": {
+        "Final_unequal_with_winner": "GRADED",
+        "Completed_Early_unequal_with_winner": "GRADED",
+        "postlock_canceled_unresolved": "VOID:POSTLOCK_CANCELED",
+        "postlock_postponed_unresolved": "VOID:POSTLOCK_POSTPONED",
+        "suspended_or_delayed_before_deadline": "PENDING",
+        "pending_at_deadline": "VOID:DEADLINE_UNRESOLVED",
+        "official_tie": "VOID:TIE",
+        "abandoned": "VOID:ABANDONED",
+        "no_contest": "VOID:NO_CONTEST",
+        "missing_winner": "VOID:MISSING_WINNER",
+        "equal_terminal_scores": "VOID:EQUAL_TERMINAL_SCORE",
+    },
+    "doubleheader_order": ["lock_basis_start_utc", "gamePk"],
+    "replacement_rule": "strictly_later_date_never_same_date_rank2_never_2025",
+    "late_result_rule": "audit_annotation_only_never_restore_membership",
+}
+HISTORICAL_DENOMINATORS = {
+    "model": 500,
+    "home": 500,
+    "brier": 500,
+    "log_loss": 500,
+    "wilson": 500,
+    "streak": 500,
+    "season": "N_season",
+    "market": "N_market",
+}
+HISTORICAL_OUTCOME_ISOLATION = {
+    "feature_and_lock_import_outcomes": False,
+    "lock_namespace": "data/v5_2_qd/historical/locked",
+    "outcome_namespace": "data/v5_2_qd/historical/outcomes",
+    "join_after_all_date_locks_sealed": True,
+}
+FOLD_LITERALS = (
+    {
+        "fold_id": "H22",
+        "target_year": 2022,
+        "target_dates": {"start": "2022-04-07", "end": "2022-10-05"},
+        "normalization_years": [2018, 2019, 2020, 2021],
+        "oof_calibration": [
+            {"target_year": 2019, "normalization_years": [2018]},
+            {"target_year": 2020, "normalization_years": [2018, 2019]},
+            {
+                "target_year": 2021,
+                "normalization_years": [2018, 2019, 2020],
+            },
+        ],
+        "latest_training_date": "2021-12-31",
+        "model_card_path": "models/v5_2_qd/folds/H22/model_card.json",
+        "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT",
+    },
+    {
+        "fold_id": "H23",
+        "target_year": 2023,
+        "target_dates": {"start": "2023-03-30", "end": "2023-10-01"},
+        "normalization_years": [2018, 2019, 2020, 2021, 2022],
+        "oof_calibration": [
+            {"target_year": year, "normalization_years": list(range(2018, year))}
+            for year in range(2019, 2023)
+        ],
+        "latest_training_date": "2022-12-31",
+        "model_card_path": "models/v5_2_qd/folds/H23/model_card.json",
+        "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT",
+    },
+    {
+        "fold_id": "H24",
+        "target_year": 2024,
+        "target_dates": {"start": "2024-03-20", "end": "2024-09-30"},
+        "normalization_years": [2018, 2019, 2020, 2021, 2022, 2023],
+        "oof_calibration": [
+            {"target_year": year, "normalization_years": list(range(2018, year))}
+            for year in range(2019, 2024)
+        ],
+        "latest_training_date": "2023-12-31",
+        "model_card_path": "models/v5_2_qd/folds/H24/model_card.json",
+        "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT",
+    },
+)
+HISTORICAL_DATE_QUEUE = deep_freeze(HISTORICAL_DATE_QUEUE)
+HISTORICAL_SELECTION = deep_freeze(HISTORICAL_SELECTION)
+HISTORICAL_TERMINAL = deep_freeze(HISTORICAL_TERMINAL)
+HISTORICAL_DENOMINATORS = deep_freeze(HISTORICAL_DENOMINATORS)
+HISTORICAL_OUTCOME_ISOLATION = deep_freeze(HISTORICAL_OUTCOME_ISOLATION)
+
 WEIGHT_KEYS = frozenset(COMPONENT_WEIGHTS)
 SHRINKAGE_KEYS = frozenset(SHRINKAGE_CONSTANTS)
 SCORE_RULE_KEYS = frozenset(
@@ -366,6 +529,31 @@ class V52Config:
     raw: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class FoldSpec:
+    fold_id: str
+    target_year: int
+    target_dates: tuple[str, str]
+    normalization_years: tuple[int, ...]
+    oof_calibration: tuple[tuple[int, tuple[int, ...]], ...]
+    latest_training_date: str
+    model_card_path: str
+    model_card_status: str
+    raw: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    run_id: str
+    target_count: int
+    allowed_target_years: tuple[int, ...]
+    forbidden_target_years: tuple[int, ...]
+    folds: tuple[FoldSpec, ...]
+    terminal_contract: Mapping[str, object]
+    date_state_precedence: tuple[str, ...]
+    raw: Mapping[str, object]
+
+
 def require_exact_keys(
     value: object, expected: frozenset[str], path: str
 ) -> Mapping[str, object]:
@@ -390,11 +578,153 @@ def _validate_literal(value: object, expected: object, path: str) -> None:
     if isinstance(expected, list):
         if not isinstance(value, list) or len(value) != len(expected):
             raise ValueError(f"{path} list shape differs")
-        for index, (item, expected_item) in enumerate(zip(value, expected, strict=True)):
+        for index, (item, expected_item) in enumerate(
+            zip(value, expected, strict=True)
+        ):
             _validate_literal(item, expected_item, f"{path}[{index}]")
         return
     if type(value) is not type(expected) or value != expected:
         raise ValueError(f"{path} frozen value differs")
+
+
+def parse_fold(raw: object) -> FoldSpec:
+    obj = require_exact_keys(raw, FOLD_REQUIRED_KEYS, "fold")
+    if not isinstance(obj["oof_calibration"], list):
+        raise ValueError("fold.oof_calibration must be a list")
+    oof: list[tuple[int, tuple[int, ...]]] = []
+    for index, row in enumerate(obj["oof_calibration"]):
+        item = require_exact_keys(row, OOF_ROW_KEYS, f"fold.oof_calibration[{index}]")
+        if not isinstance(item["normalization_years"], list):
+            raise ValueError(
+                f"fold.oof_calibration[{index}].normalization_years must be a list"
+            )
+        oof.append(
+            (
+                int(item["target_year"]),
+                tuple(int(year) for year in item["normalization_years"]),
+            )
+        )
+    target_dates = require_exact_keys(
+        obj["target_dates"], frozenset({"start", "end"}), "fold.target_dates"
+    )
+    if not isinstance(obj["normalization_years"], list):
+        raise ValueError("fold.normalization_years must be a list")
+    fold = FoldSpec(
+        fold_id=str(obj["fold_id"]),
+        target_year=int(obj["target_year"]),
+        target_dates=(str(target_dates["start"]), str(target_dates["end"])),
+        normalization_years=tuple(int(year) for year in obj["normalization_years"]),
+        oof_calibration=tuple(oof),
+        latest_training_date=str(obj["latest_training_date"]),
+        model_card_path=str(obj["model_card_path"]),
+        model_card_status=str(obj["model_card_status"]),
+        raw=deep_freeze(obj),
+    )
+    if (
+        obj["model_card_status"] != "UNFITTED_BLOCKED_BY_PREFLIGHT"
+        or Path(str(obj["model_card_path"])).name != "model_card.json"
+    ):
+        raise ValueError("fold model-card path/status differs")
+    validate_fold(fold)
+    return fold
+
+
+def parse_run_spec(raw: object) -> RunSpec:
+    obj = require_exact_keys(raw, RUN_REQUIRED_KEYS, "run")
+    require_exact_keys(obj["terminal_contract"], TERMINAL_KEYS, "terminal_contract")
+    require_exact_keys(obj["namespaces"], NAMESPACE_KEYS, "namespaces")
+    if not isinstance(obj["folds"], list):
+        raise ValueError("run.folds must be a list")
+    folds = tuple(parse_fold(row) for row in obj["folds"])
+    try:
+        _validate_literal(obj, expected_historical_run(), "run")
+    except ValueError as exc:
+        raise ValueError("historical run differs from frozen values") from exc
+    run = RunSpec(
+        run_id=str(obj["run_id"]),
+        target_count=int(obj["target_count"]),
+        allowed_target_years=tuple(int(year) for year in obj["allowed_target_years"]),
+        forbidden_target_years=tuple(
+            int(year) for year in obj["forbidden_target_years"]
+        ),
+        folds=folds,
+        terminal_contract=deep_freeze(obj["terminal_contract"]),
+        date_state_precedence=tuple(
+            str(state) for state in obj["date_state_precedence"]
+        ),
+        raw=deep_freeze(obj),
+    )
+    validate_run(run)
+    return run
+
+
+def load_run_spec(path: Path) -> RunSpec:
+    return parse_run_spec(json.loads(path.read_text(encoding="utf-8")))
+
+
+def validate_fold(fold: FoldSpec) -> None:
+    if any(year >= fold.target_year for year in fold.normalization_years):
+        raise ValueError("normalization contains target or future season")
+    for target_year, normalization_years in fold.oof_calibration:
+        if any(year >= target_year for year in normalization_years):
+            raise ValueError("OOF normalization contains target or future season")
+
+
+def expected_historical_run() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": "historical_walkforward_500",
+        "model_version": "v5.2-QD",
+        "label": "Historical Walk-forward Robustness 500",
+        "target_count": 500,
+        "allowed_target_years": [2022, 2023, 2024],
+        "forbidden_target_years": [2025],
+        "folds": json.loads(canonical_json_bytes(FOLD_LITERALS)),
+        "date_queue": json.loads(canonical_json_bytes(HISTORICAL_DATE_QUEUE)),
+        "selection": json.loads(canonical_json_bytes(HISTORICAL_SELECTION)),
+        "terminal_contract": json.loads(canonical_json_bytes(HISTORICAL_TERMINAL)),
+        "date_state_precedence": [
+            "RUN_INVALID",
+            "SYSTEM_MISS",
+            "NO_ELIGIBLE_DATE",
+            "LOCK_TOP1",
+        ],
+        "outcome_isolation": json.loads(
+            canonical_json_bytes(HISTORICAL_OUTCOME_ISOLATION)
+        ),
+        "paired_denominators": json.loads(
+            canonical_json_bytes(HISTORICAL_DENOMINATORS)
+        ),
+        "evidence_labels": [
+            "RUN_INVALID",
+            "ROBUSTNESS_NOT_SUPPORTED",
+            "ROBUSTNESS_SUPPORTED_NOT_CONFIRMED",
+        ],
+        "source_requirements": {
+            "minimum": list(MINIMUM_SOURCE_NAMES),
+            "optional": list(OPTIONAL_SOURCE_NAMES),
+        },
+        "namespaces": {
+            "raw": "data/v5_2_qd/historical/raw",
+            "features": "data/v5_2_qd/historical/features",
+            "locked": "data/v5_2_qd/historical/locked",
+            "outcomes": "data/v5_2_qd/historical/outcomes",
+            "reports": "reports/v5_2_qd/historical",
+            "audit": "audit/v5_2_qd/historical",
+        },
+        "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT",
+    }
+
+
+def validate_run(run: RunSpec) -> None:
+    if 2025 in run.allowed_target_years or run.forbidden_target_years != (2025,):
+        raise ValueError("2025 is excluded")
+    if run.raw != deep_freeze(expected_historical_run()):
+        raise ValueError("historical run differs from frozen values")
+    if tuple(fold.target_year for fold in run.folds) != run.allowed_target_years:
+        raise ValueError("fold targets differ")
+    for fold in run.folds:
+        validate_fold(fold)
 
 
 def expected_v52_config() -> dict[str, object]:
@@ -472,9 +802,7 @@ def expected_v52_config() -> dict[str, object]:
             "neutral_score": 50,
             "missing_weight_redistribution": False,
             "probability_transform": "sigmoid(alpha+beta*D/10)",
-            "predicted_side": (
-                "home if p_home>.5; away if p_home<.5; none if equal"
-            ),
+            "predicted_side": ("home if p_home>.5; away if p_home<.5; none if equal"),
         },
         "ranking": list(V52_RANKING),
         "completeness": {
@@ -526,14 +854,18 @@ def parse_v52_config(raw: object) -> V52Config:
     expected = expected_v52_config()
     _validate_literal(obj, expected, "config")
     serialized = canonical_json_bytes(obj)
-    forbidden_keys = {"normalization", "slot_weights", "alpha", "beta", "fitted_model_cards"}
+    forbidden_keys = {
+        "normalization",
+        "slot_weights",
+        "alpha",
+        "beta",
+        "fitted_model_cards",
+    }
 
     def collect_keys(value: object) -> set[str]:
         if isinstance(value, Mapping):
             return set(value) | {
-                nested
-                for child in value.values()
-                for nested in collect_keys(child)
+                nested for child in value.values() for nested in collect_keys(child)
             }
         if isinstance(value, list):
             return {nested for child in value for nested in collect_keys(child)}
@@ -634,17 +966,19 @@ def ranking_key(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
         lock_basis_start_utc,
     ):
-        raise ValueError("lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
-    try:
-        parsed_start = datetime.strptime(
-            lock_basis_start_utc, "%Y-%m-%dT%H:%M:%SZ"
+        raise ValueError(
+            "lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ"
         )
+    try:
+        parsed_start = datetime.strptime(lock_basis_start_utc, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as exc:
         raise ValueError(
             "lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ"
         ) from exc
     if parsed_start.strftime("%Y-%m-%dT%H:%M:%SZ") != lock_basis_start_utc:
-        raise ValueError("lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
+        raise ValueError(
+            "lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ"
+        )
     if (
         not 0.5 <= p <= 0.9
         or not 0 <= q <= 10
@@ -769,6 +1103,25 @@ def write_json(path: Path, value: object) -> None:
     path.write_bytes(canonical_json_bytes(value) + b"\n")
 
 
+def write_historical_contract(root: Path) -> None:
+    raw = expected_historical_run()
+    parse_run_spec(raw)
+    write_json(
+        root / "protocols/v5_2_qd/historical_walkforward_500.json",
+        raw,
+    )
+    schema = const_schema(raw, RUN_REQUIRED_KEYS)
+    schema["$defs"] = {
+        "fold": {
+            "type": "object",
+            "required": sorted(FOLD_REQUIRED_KEYS),
+            "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)},
+            "additionalProperties": False,
+        }
+    }
+    write_json(root / "schemas/v5_2_run_spec.schema.json", schema)
+
+
 def _write_fsynced_temp(path: Path, contents: bytes, *, mode: int) -> Path:
     descriptor, temporary = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
@@ -863,7 +1216,9 @@ def _publish_bundle(entries: tuple[tuple[Path, bytes], ...]) -> None:
             except BaseException as error:
                 rollback_error = rollback_error or error
         if rollback_error is not None:
-            raise RuntimeError("v5.2-QD protocol bundle rollback failed") from rollback_error
+            raise RuntimeError(
+                "v5.2-QD protocol bundle rollback failed"
+            ) from rollback_error
         raise
     finally:
         for temporary_path in (*temporary_paths, *backups.values()):
@@ -913,13 +1268,11 @@ def write_v52_config_contracts(
         "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
         "config_sha256": hashlib.sha256(config_contents).hexdigest(),
         "approved_design_commit": "a4aa8d2",
-        "approved_design_blob_sha256": hashlib.sha256(
-            design_contents
-        ).hexdigest(),
+        "approved_design_blob_sha256": hashlib.sha256(design_contents).hexdigest(),
     }
-    schema_contents = canonical_json_bytes(
-        const_schema(config, V52_REQUIRED_KEYS)
-    ) + b"\n"
+    schema_contents = (
+        canonical_json_bytes(const_schema(config, V52_REQUIRED_KEYS)) + b"\n"
+    )
     contract_contents = canonical_json_bytes(change) + b"\n"
     _publish_bundle(
         (

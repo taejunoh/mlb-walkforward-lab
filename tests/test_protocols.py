@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 import copy
 import json
@@ -13,6 +14,13 @@ from mlb_backtest.protocols import (
     CHANGE_FORBIDDEN,
     CHANGE_UNCHANGED,
     INTERNAL_METRIC_LITERALS,
+    FOLD_REQUIRED_KEYS,
+    HISTORICAL_DATE_QUEUE,
+    HISTORICAL_DENOMINATORS,
+    HISTORICAL_OUTCOME_ISOLATION,
+    HISTORICAL_SELECTION,
+    HISTORICAL_TERMINAL,
+    RUN_REQUIRED_KEYS,
     V52_REQUIRED_KEYS,
     classify_uncertainty,
     classify_v52,
@@ -20,13 +28,18 @@ from mlb_backtest.protocols import (
     direction_from_p_home,
     eligibility_disposition,
     expected_v52_config,
+    load_run_spec,
     load_change_contract,
     load_v52_config,
     optional_neutral,
     parse_change_contract,
+    parse_run_spec,
     parse_v52_config,
     ranking_key,
     read_legacy_confidence,
+    validate_fold,
+    validate_run,
+    write_historical_contract,
     write_v52_config_contracts,
 )
 
@@ -35,6 +48,119 @@ ROOT = Path(__file__).resolve().parents[1]
 V52_CONFIG = ROOT / "config/v5_2_qd.json"
 V52_SCHEMA = ROOT / "schemas/v5_2_qd.schema.json"
 CHANGE_CONTRACT = ROOT / "protocols/v5_2_qd/change_contract.json"
+HISTORICAL_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+RUN_SCHEMA = ROOT / "schemas/v5_2_run_spec.schema.json"
+
+
+class HistoricalRunSpecTest(unittest.TestCase):
+    def test_exact_folds_and_oof_sequences(self):
+        run = load_run_spec(HISTORICAL_SPEC)
+        self.assertEqual(run.target_count, 500)
+        self.assertEqual(run.allowed_target_years, (2022, 2023, 2024))
+        self.assertEqual(run.forbidden_target_years, (2025,))
+        self.assertEqual(run.folds[0].fold_id, "H22")
+        self.assertEqual(run.folds[0].normalization_years, (2018, 2019, 2020, 2021))
+        self.assertEqual(
+            run.folds[0].oof_calibration,
+            (
+                (2019, (2018,)),
+                (2020, (2018, 2019)),
+                (2021, (2018, 2019, 2020)),
+            ),
+        )
+        self.assertEqual(
+            run.folds[2].normalization_years,
+            (2018, 2019, 2020, 2021, 2022, 2023),
+        )
+
+    def test_future_and_2025_injections_fail_closed(self):
+        run = load_run_spec(HISTORICAL_SPEC)
+        with self.assertRaisesRegex(ValueError, "future season"):
+            validate_fold(replace(run.folds[0], normalization_years=(2018, 2022)))
+        with self.assertRaisesRegex(ValueError, "2025 is excluded"):
+            validate_run(
+                replace(
+                    run,
+                    allowed_target_years=(2022, 2023, 2024, 2025),
+                )
+            )
+
+    def test_run_and_fold_schema_keys_mirror_strict_parser(self):
+        schema = json.loads(RUN_SCHEMA.read_text())
+        self.assertEqual(set(schema["required"]), RUN_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), RUN_REQUIRED_KEYS)
+        fold_schema = schema["$defs"]["fold"]
+        self.assertEqual(set(fold_schema["required"]), FOLD_REQUIRED_KEYS)
+        self.assertEqual(set(fold_schema["properties"]), FOLD_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertFalse(fold_schema["additionalProperties"])
+
+    def test_run_contract_literals(self):
+        run = load_run_spec(HISTORICAL_SPEC)
+        self.assertEqual(run.raw["date_queue"], HISTORICAL_DATE_QUEUE)
+        self.assertEqual(run.raw["selection"], HISTORICAL_SELECTION)
+        self.assertEqual(run.raw["terminal_contract"], HISTORICAL_TERMINAL)
+        self.assertEqual(
+            run.raw["date_state_precedence"],
+            ("RUN_INVALID", "SYSTEM_MISS", "NO_ELIGIBLE_DATE", "LOCK_TOP1"),
+        )
+        self.assertEqual(
+            run.raw["evidence_labels"],
+            (
+                "RUN_INVALID",
+                "ROBUSTNESS_NOT_SUPPORTED",
+                "ROBUSTNESS_SUPPORTED_NOT_CONFIRMED",
+            ),
+        )
+        self.assertEqual(run.raw["paired_denominators"], HISTORICAL_DENOMINATORS)
+        self.assertEqual(run.raw["outcome_isolation"], HISTORICAL_OUTCOME_ISOLATION)
+
+    def test_schema_const_and_parser_reject_every_frozen_change(self):
+        raw = json.loads(HISTORICAL_SPEC.read_text())
+        schema = json.loads(RUN_SCHEMA.read_text())
+        self.assertEqual(schema["const"], raw)
+        changed = copy.deepcopy(raw)
+        changed["selection"]["graded_target"] = 499
+        with self.assertRaisesRegex(ValueError, "historical run differs"):
+            parse_run_spec(changed)
+        changed = copy.deepcopy(raw)
+        changed["folds"][0]["oof_calibration"][0]["normalization_years"] = [2017]
+        with self.assertRaisesRegex(ValueError, "historical run differs"):
+            parse_run_spec(changed)
+
+    def test_writer_is_canonical_and_byte_deterministic(self):
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
+            root_a, root_b = Path(first), Path(second)
+            write_historical_contract(root_a)
+            write_historical_contract(root_b)
+            for relative in (
+                "protocols/v5_2_qd/historical_walkforward_500.json",
+                "schemas/v5_2_run_spec.schema.json",
+            ):
+                first_bytes = (root_a / relative).read_bytes()
+                self.assertEqual(first_bytes, (root_b / relative).read_bytes())
+                self.assertEqual(
+                    first_bytes,
+                    canonical_json_bytes(json.loads(first_bytes)) + b"\n",
+                )
+
+    def test_parser_rejects_unknown_missing_and_type_confusion(self):
+        raw = json.loads(HISTORICAL_SPEC.read_text())
+        changed = copy.deepcopy(raw)
+        changed["unknown"] = None
+        with self.assertRaisesRegex(ValueError, "keys"):
+            parse_run_spec(changed)
+        changed = copy.deepcopy(raw)
+        changed["folds"][0].pop("latest_training_date")
+        with self.assertRaisesRegex(ValueError, "keys"):
+            parse_run_spec(changed)
+        changed = copy.deepcopy(raw)
+        changed["target_count"] = True
+        with self.assertRaisesRegex(ValueError, "historical run differs"):
+            parse_run_spec(changed)
 
 
 class V52ConfigTest(unittest.TestCase):
@@ -173,9 +299,7 @@ class V52ConfigTest(unittest.TestCase):
         }
         baseline = data_completeness_score(qualities)
         expected_tier = classify_v52(0.63, baseline, "Medium", critical=False)
-        expected_rank = ranking_key(
-            0.63, baseline, 4, "2025-05-01T17:00:00Z", 1
-        )
+        expected_rank = ranking_key(0.63, baseline, 4, "2025-05-01T17:00:00Z", 1)
         for agreement, legacy in ((0, 0), (1, 10), (0.37, 4.2)):
             score = data_completeness_score(
                 qualities,
@@ -293,7 +417,10 @@ class V52ConfigTest(unittest.TestCase):
                 load_change_contract(root, approved_design_root=ROOT)
 
     def test_generated_contracts_are_byte_deterministic(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             root_a, root_b = Path(first), Path(second)
             write_v52_config_contracts(root_a, approved_design_root=ROOT)
             write_v52_config_contracts(root_b, approved_design_root=ROOT)
@@ -303,7 +430,9 @@ class V52ConfigTest(unittest.TestCase):
                 "protocols/v5_2_qd/change_contract.json",
             )
             for relative in paths:
-                self.assertEqual((root_a / relative).read_bytes(), (root_b / relative).read_bytes())
+                self.assertEqual(
+                    (root_a / relative).read_bytes(), (root_b / relative).read_bytes()
+                )
 
     def test_bundle_resolves_design_before_creating_output_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -325,7 +454,10 @@ class V52ConfigTest(unittest.TestCase):
             (False, False, False),
             (True, False, True),
         ):
-            with self.subTest(initial_state=initial_state), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(initial_state=initial_state),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary).resolve()
                 old = {}
                 modes = {}
@@ -344,7 +476,9 @@ class V52ConfigTest(unittest.TestCase):
 
                 def fail_second_final(source, destination):
                     nonlocal final_replacements
-                    if Path(destination) in tuple(root / item for item in relative_paths):
+                    if Path(destination) in tuple(
+                        root / item for item in relative_paths
+                    ):
                         final_replacements += 1
                         if final_replacements == 2:
                             raise OSError("second bundle replace failed")
@@ -353,7 +487,9 @@ class V52ConfigTest(unittest.TestCase):
                 with patch(
                     "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
                 ):
-                    with self.assertRaisesRegex(OSError, "second bundle replace failed"):
+                    with self.assertRaisesRegex(
+                        OSError, "second bundle replace failed"
+                    ):
                         write_v52_config_contracts(root, approved_design_root=ROOT)
                 for relative, preexisting in zip(
                     relative_paths, initial_state, strict=True
