@@ -542,13 +542,95 @@ def _verify_candidate_provenance(root: Path) -> str:
         "schema_version",
         "candidate_raw_sha256",
         "candidate_components_sha256",
+        "schedule_history",
         "source_manifest_sha256s",
-    } or provenance["schema_version"] != 1:
+    } or provenance["schema_version"] != 2:
         raise ValueError("candidate provenance fields are invalid")
+    schedule = provenance["schedule_history"]
+    schedule_fields = {
+        "coverage_start",
+        "coverage_end",
+        "coverage_complete",
+        "source_manifest_sha256s",
+        "children",
+    }
+    child_fields = {
+        "role",
+        "coverage_start",
+        "coverage_end",
+        "coverage_complete",
+        "source_manifest_sha256",
+        "played_game_count",
+        "excluded_schedule_date_count",
+        "excluded_schedule_date_game_pks",
+        "excluded_statcast_date_count",
+        "excluded_statcast_date_game_pks",
+    }
+    if not isinstance(schedule, dict) or set(schedule) != schedule_fields:
+        raise ValueError("candidate schedule history fields are invalid")
+    try:
+        coverage_start = date.fromisoformat(schedule["coverage_start"]).isoformat()
+        coverage_end = date.fromisoformat(schedule["coverage_end"]).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate schedule history coverage is invalid") from exc
+    children = schedule["children"]
+    if (
+        coverage_start != schedule["coverage_start"]
+        or coverage_end != schedule["coverage_end"]
+        or coverage_start > coverage_end
+        or type(schedule["coverage_complete"]) is not bool
+        or not isinstance(children, list)
+        or [child.get("role") for child in children if isinstance(child, dict)]
+        != ["history", "backtest"]
+    ):
+        raise ValueError("candidate schedule history coverage is invalid")
+    child_hashes = []
+    child_completeness = []
+    for child in children:
+        if set(child) != child_fields:
+            raise ValueError("candidate schedule history child fields are invalid")
+        try:
+            child_start = date.fromisoformat(child["coverage_start"]).isoformat()
+            child_end = date.fromisoformat(child["coverage_end"]).isoformat()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate schedule history child coverage is invalid") from exc
+        if (
+            child_start != child["coverage_start"]
+            or child_end != child["coverage_end"]
+            or not coverage_start <= child_start <= child_end <= coverage_end
+            or type(child["coverage_complete"]) is not bool
+            or type(child["played_game_count"]) is not int
+            or child["played_game_count"] <= 0
+        ):
+            raise ValueError("candidate schedule history child coverage is invalid")
+        for prefix in ("excluded_schedule_date", "excluded_statcast_date"):
+            count = child[f"{prefix}_count"]
+            game_pks = child[f"{prefix}_game_pks"]
+            if (
+                type(count) is not int
+                or count < 0
+                or not isinstance(game_pks, list)
+                or any(type(game_pk) is not int or game_pk <= 0 for game_pk in game_pks)
+                or game_pks != sorted(set(game_pks))
+                or count != len(game_pks)
+            ):
+                raise ValueError("candidate schedule history exclusions are invalid")
+        if child["coverage_complete"] != (
+            child["excluded_statcast_date_count"] == 0
+        ):
+            raise ValueError("candidate schedule history completeness is invalid")
+        child_hashes.append(child["source_manifest_sha256"])
+        child_completeness.append(child["coverage_complete"])
+    if (
+        schedule["source_manifest_sha256s"] != child_hashes
+        or schedule["coverage_complete"] != all(child_completeness)
+    ):
+        raise ValueError("candidate schedule history aggregation is invalid")
     hashes = [
         provenance["candidate_raw_sha256"],
         provenance["candidate_components_sha256"],
         *provenance["source_manifest_sha256s"],
+        *schedule["source_manifest_sha256s"],
     ] if isinstance(provenance["source_manifest_sha256s"], list) else []
     if not hashes or any(
         not isinstance(value, str)

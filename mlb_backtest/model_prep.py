@@ -368,6 +368,9 @@ def build_result_free_schedule_history(
         raise ValueError("verified schedule evidence is required")
     if not isinstance(statcast, StatcastData):
         raise ValueError("verified Statcast data is required")
+    role = evidence.query.get("role")
+    if role not in {"history", "backtest"}:
+        raise ValueError("result-free schedule evidence role is invalid")
     statcast_dates_by_game: dict[int, set[str]] = {}
     for row in (*statcast.pitches, *statcast.plate_appearances):
         game_pk = int(row["game_pk"])
@@ -430,10 +433,11 @@ def build_result_free_schedule_history(
         tuple(rows),
         evidence.coverage_start,
         evidence.coverage_end,
-        True,
+        not excluded_statcast_date_game_pks,
         evidence.manifest_sha256,
         expected,
         {
+            "role": role,
             "source_manifest_sha256": evidence.manifest_sha256,
             "played_game_count": len(rows),
             "played_game_pks": expected,
@@ -441,9 +445,11 @@ def build_result_free_schedule_history(
             "excluded_schedule_date_game_pks": tuple(
                 sorted(excluded_schedule_date_game_pks)
             ),
+            "excluded_schedule_date_count": len(excluded_schedule_date_game_pks),
             "excluded_statcast_date_game_pks": tuple(
                 sorted(excluded_statcast_date_game_pks)
             ),
+            "excluded_statcast_date_count": len(excluded_statcast_date_game_pks),
             "result_fields_accessed": False,
         },
     )
@@ -458,14 +464,48 @@ def _combined_history(builds):
     aggregate = hashlib.sha256(
         "".join(build.source_manifest_sha256 or "" for build in builds).encode("ascii")
     ).hexdigest()
+    coverage_start = min(build.coverage_start for build in builds)
+    coverage_end = max(build.coverage_end for build in builds)
+    coverage_complete = all(build.coverage_complete for build in builds)
+    children = tuple(
+        {
+            "role": build.provenance["role"],
+            "coverage_start": build.coverage_start,
+            "coverage_end": build.coverage_end,
+            "coverage_complete": build.coverage_complete,
+            "source_manifest_sha256": build.source_manifest_sha256,
+            "played_game_count": build.provenance["played_game_count"],
+            "excluded_schedule_date_count": build.provenance[
+                "excluded_schedule_date_count"
+            ],
+            "excluded_schedule_date_game_pks": build.provenance[
+                "excluded_schedule_date_game_pks"
+            ],
+            "excluded_statcast_date_count": build.provenance[
+                "excluded_statcast_date_count"
+            ],
+            "excluded_statcast_date_game_pks": build.provenance[
+                "excluded_statcast_date_game_pks"
+            ],
+        }
+        for build in builds
+    )
     return ScheduleHistoryBuild(
         tuple(sorted(rows, key=lambda row: (row["official_date"], row["game_pk"]))),
-        min(build.coverage_start for build in builds),
-        max(build.coverage_end for build in builds),
-        all(build.coverage_complete for build in builds),
+        coverage_start,
+        coverage_end,
+        coverage_complete,
         aggregate,
         expected,
-        {"source_manifest_sha256s": [build.source_manifest_sha256 for build in builds]},
+        {
+            "coverage_start": coverage_start,
+            "coverage_end": coverage_end,
+            "coverage_complete": coverage_complete,
+            "source_manifest_sha256s": [
+                build.source_manifest_sha256 for build in builds
+            ],
+            "children": children,
+        },
     )
 
 
@@ -930,9 +970,10 @@ def prepare_candidates_stage(
         root,
     )
     provenance = {
-        "schema_version": 1,
+        "schema_version": 2,
         "candidate_raw_sha256": raw_sha256,
         "candidate_components_sha256": component_sha256,
+        "schedule_history": history.provenance,
         "source_manifest_sha256s": sorted(
             {
                 history_evidence.manifest_sha256,

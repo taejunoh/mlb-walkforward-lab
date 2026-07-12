@@ -13,6 +13,7 @@ from mlb_backtest.career_bf import (
 )
 from mlb_backtest.mlb_stats import league_era_url
 from mlb_backtest.model_prep import (
+    _combined_history,
     eligible_starter_ids,
     build_result_free_schedule_history,
     load_league_era_from_raw,
@@ -184,6 +185,7 @@ class ModelPreparationSourceTest(unittest.TestCase):
         object.__setattr__(evidence, "coverage_start", "2025-05-01")
         object.__setattr__(evidence, "coverage_end", "2025-05-01")
         object.__setattr__(evidence, "manifest_sha256", "c" * 64)
+        object.__setattr__(evidence, "query", {"role": "backtest"})
         object.__setattr__(evidence, "games", (first,))
         played = StatcastData(
             ({"game_pk": 1, "game_date": "2025-05-01", "inning": 11},),
@@ -204,6 +206,7 @@ class ModelPreparationSourceTest(unittest.TestCase):
         object.__setattr__(evidence, "coverage_start", "2025-04-01")
         object.__setattr__(evidence, "coverage_end", "2025-04-30")
         object.__setattr__(evidence, "manifest_sha256", "c" * 64)
+        object.__setattr__(evidence, "query", {"role": "history"})
         valid = {
             "game_pk": 100,
             "official_date": "2025-04-10",
@@ -256,14 +259,34 @@ class ModelPreparationSourceTest(unittest.TestCase):
         self.assertEqual(
             history.provenance["excluded_statcast_date_game_pks"], (200,)
         )
+        self.assertFalse(history.coverage_complete)
+
+        object.__setattr__(evidence, "games", (valid, rescheduled_original))
+        stale_duplicate_only = build_result_free_schedule_history(
+            evidence, team_codes, statcast
+        )
+        self.assertTrue(stale_duplicate_only.coverage_complete)
 
         object.__setattr__(evidence, "coverage_start", "2025-05-01")
         object.__setattr__(evidence, "coverage_end", "2025-09-28")
+        object.__setattr__(evidence, "query", {"role": "backtest"})
         object.__setattr__(evidence, "games", (rescheduled_original,))
         actual_makeup = build_result_free_schedule_history(
             evidence, team_codes, statcast
         )
         self.assertEqual([row["game_pk"] for row in actual_makeup.rows], [778372])
+        self.assertTrue(actual_makeup.coverage_complete)
+
+        combined = _combined_history((stale_duplicate_only, actual_makeup))
+        children = combined.provenance["children"]
+        self.assertEqual([child["role"] for child in children], ["history", "backtest"])
+        self.assertEqual(children[0]["excluded_schedule_date_count"], 1)
+        self.assertEqual(
+            children[0]["excluded_schedule_date_game_pks"], (778372,)
+        )
+        self.assertEqual(children[0]["excluded_statcast_date_count"], 0)
+        self.assertEqual(children[1]["excluded_schedule_date_count"], 0)
+        self.assertTrue(combined.provenance["coverage_complete"])
 
     def test_verified_catalog_prevents_reauditing_bulk_statcast_payloads(self):
         with tempfile.TemporaryDirectory() as td:

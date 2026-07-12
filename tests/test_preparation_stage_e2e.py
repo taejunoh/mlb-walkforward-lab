@@ -334,7 +334,18 @@ class PreparationStageE2ETest(unittest.TestCase):
             first_bytes["features/candidate_provenance.json"]
         )
         self.assertEqual(frozen["schema_version"], 1)
-        self.assertEqual(candidate_provenance["schema_version"], 1)
+        self.assertEqual(candidate_provenance["schema_version"], 2)
+        schedule_history = candidate_provenance["schedule_history"]
+        self.assertTrue(schedule_history["coverage_complete"])
+        self.assertEqual(
+            [child["role"] for child in schedule_history["children"]],
+            ["history", "backtest"],
+        )
+        for child in schedule_history["children"]:
+            self.assertEqual(child["excluded_schedule_date_count"], 0)
+            self.assertEqual(child["excluded_schedule_date_game_pks"], [])
+            self.assertEqual(child["excluded_statcast_date_count"], 0)
+            self.assertEqual(child["excluded_statcast_date_game_pks"], [])
         self.assertEqual(
             frozen["normalization_input_sha256"],
             hashlib.sha256(

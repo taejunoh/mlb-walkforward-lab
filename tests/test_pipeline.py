@@ -494,6 +494,32 @@ class PipelineTest(unittest.TestCase):
                     },
                 ),
             )
+            combined_history = SimpleNamespace(
+                provenance={
+                    "coverage_start": "2025-03-18",
+                    "coverage_end": config["extension_end"],
+                    "coverage_complete": True,
+                    "source_manifest_sha256s": [schedule_digest, schedule_digest],
+                    "children": tuple(
+                        {
+                            "role": role,
+                            "coverage_start": start,
+                            "coverage_end": end,
+                            "coverage_complete": True,
+                            "source_manifest_sha256": schedule_digest,
+                            "played_game_count": 1,
+                            "excluded_schedule_date_count": 0,
+                            "excluded_schedule_date_game_pks": (),
+                            "excluded_statcast_date_count": 0,
+                            "excluded_statcast_date_game_pks": (),
+                        }
+                        for role, start, end in (
+                            ("history", "2025-03-18", "2025-04-30"),
+                            ("backtest", "2025-05-01", config["extension_end"]),
+                        )
+                    ),
+                }
+            )
             with (
                 mock.patch(
                     "mlb_backtest.model_prep._schedule_evidence",
@@ -513,7 +539,7 @@ class PipelineTest(unittest.TestCase):
                 ),
                 mock.patch(
                     "mlb_backtest.model_prep._combined_history",
-                    return_value=object(),
+                    return_value=combined_history,
                 ),
                 mock.patch(
                     "mlb_backtest.model_prep.load_league_era_from_raw",
@@ -547,15 +573,53 @@ class PipelineTest(unittest.TestCase):
             (features / "candidate_raw_features.jsonl").write_bytes(raw_bytes)
             (features / "candidate_components.jsonl").write_bytes(component_bytes)
             provenance = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "candidate_raw_sha256": hashlib.sha256(raw_bytes).hexdigest(),
                 "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
                 "source_manifest_sha256s": [manifest_hash],
+                "schedule_history": {
+                    "coverage_start": "2025-03-18",
+                    "coverage_end": "2025-09-28",
+                    "coverage_complete": True,
+                    "source_manifest_sha256s": [manifest_hash, manifest_hash],
+                    "children": [
+                        {
+                            "role": role,
+                            "coverage_start": start,
+                            "coverage_end": end,
+                            "coverage_complete": True,
+                            "source_manifest_sha256": manifest_hash,
+                            "played_game_count": 1,
+                            "excluded_schedule_date_count": 0,
+                            "excluded_schedule_date_game_pks": [],
+                            "excluded_statcast_date_count": 0,
+                            "excluded_statcast_date_game_pks": [],
+                        }
+                        for role, start, end in (
+                            ("history", "2025-03-18", "2025-04-30"),
+                            ("backtest", "2025-05-01", "2025-09-28"),
+                        )
+                    ],
+                },
             }
             (features / "candidate_provenance.json").write_text(
                 json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
             )
             self.assertRegex(_verify_candidate_provenance(root), r"^[0-9a-f]{64}$")
+            provenance["schedule_history"]["children"][0][
+                "excluded_statcast_date_count"
+            ] = 1
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule history"):
+                _verify_candidate_provenance(root)
+            provenance["schedule_history"]["children"][0][
+                "excluded_statcast_date_count"
+            ] = 0
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
             (features / "candidate_components.jsonl").write_bytes(b"tampered\n")
             with self.assertRaisesRegex(ValueError, "components hash"):
                 _verify_candidate_provenance(root)
