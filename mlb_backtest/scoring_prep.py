@@ -393,6 +393,16 @@ def prepare_locked_outcomes(
                     f"ambiguous duplicate schedule records for game_pk {game_pk}"
                 )
         reconciled_games.append(final)
+    reconciled_by_game = {game["game_pk"]: game for game in reconciled_games}
+    for game_pk, locked_row in locked.items():
+        schedule_row = reconciled_by_game.get(game_pk)
+        if schedule_row is None:
+            continue
+        identity_keys = ("official_date", "away_team", "home_team")
+        locked_identity = tuple(locked_row.get(key) for key in identity_keys)
+        schedule_identity = tuple(schedule_row.get(key) for key in identity_keys)
+        if schedule_identity != locked_identity:
+            raise ValueError(f"schedule identity differs from lock for game_pk {game_pk}")
     games_by_day: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     for game in reconciled_games:
         games_by_day[str(game.get("official_date"))].append(game)

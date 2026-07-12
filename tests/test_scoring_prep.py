@@ -186,9 +186,9 @@ class ScoringPreparationTest(unittest.TestCase):
             {"game_pk": 4, "official_date": "2025-05-02", "away_team": "A", "home_team": "B", "status": "Postponed", "away_is_winner": None, "home_is_winner": None},
         ]
         locked = [
-            {"game_pk": 2, "away_team": "A", "home_team": "B"},
-            {"game_pk": 3, "away_team": "A", "home_team": "B"},
-            {"game_pk": 4, "away_team": "A", "home_team": "B"},
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B"},
+            {"game_pk": 3, "official_date": "2025-05-01", "away_team": "A", "home_team": "B"},
+            {"game_pk": 4, "official_date": "2025-05-02", "away_team": "A", "home_team": "B"},
         ]
         outcomes, baseline = prepare_locked_outcomes(locked, schedule)
         self.assertEqual([row["status"] for row in outcomes], ["Final", "Final", "VOID"])
@@ -205,8 +205,8 @@ class ScoringPreparationTest(unittest.TestCase):
             {"game_pk": 3, "official_date": "2025-05-02", "away_team": "A", "home_team": "C", "status": "Final", "away_is_winner": True, "home_is_winner": False},
         ]
         locked = [
-            {"game_pk": 2, "away_team": "A", "home_team": "B"},
-            {"game_pk": 3, "away_team": "A", "home_team": "C"},
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B"},
+            {"game_pk": 3, "official_date": "2025-05-02", "away_team": "A", "home_team": "C"},
         ]
 
         outcomes, baseline = prepare_locked_outcomes(locked, schedule)
@@ -237,6 +237,28 @@ class ScoringPreparationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "ambiguous duplicate schedule records"):
             prepare_locked_outcomes([{"game_pk": 2}], schedule)
+
+    def test_outcomes_reject_schedule_date_that_differs_from_locked_identity(self):
+        schedule = [
+            {"game_pk": 2, "official_date": "2025-05-02", "away_team": "A", "home_team": "B", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+        ]
+        locked = [
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "schedule identity differs from lock"):
+            prepare_locked_outcomes(locked, schedule)
+
+    def test_outcomes_reject_opponent_mismatch_even_when_winner_is_a_locked_team(self):
+        schedule = [
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "C", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+        ]
+        locked = [
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "schedule identity differs from lock"):
+            prepare_locked_outcomes(locked, schedule)
 
 
 if __name__ == "__main__":
