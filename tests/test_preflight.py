@@ -16,6 +16,7 @@ from mlb_backtest.preflight import (
     QUERY_EVIDENCE_KEYS,
     REQUIRED_FIELDS,
     build_preflight,
+    child_logical_query_id,
     parent_logical_query_id,
     parse_preflight,
     preflight_schema_document,
@@ -137,10 +138,117 @@ class PreflightTest(unittest.TestCase):
             optional_query["properties"]["parent_logical_query_id"],
             {"$ref": "#/$defs/sha256"},
         )
+        self.assertEqual(
+            optional_query["properties"]["split_index"],
+            {"type": "integer", "minimum": 1},
+        )
+        self.assertEqual(
+            optional_query["properties"]["split_count"],
+            {"type": "integer", "minimum": 1},
+        )
+        self.assertEqual(
+            optional_query["properties"]["logical_query_id"]["pattern"],
+            "^[0-9a-f]{64}:[1-9][0-9]*$",
+        )
+        common_query = schema["$defs"]["query_evidence"]
+        self.assertEqual(
+            common_query["properties"]["logical_query_id"]["anyOf"][0]["pattern"],
+            "^[0-9a-f]{64}:[1-9][0-9]*$",
+        )
+        self.assertIn("split_index", common_query["properties"])
+        self.assertIn("split_count", common_query["properties"])
+        self.assertEqual(
+            common_query["allOf"][0]["if"]["properties"]["evidence_kind"],
+            {"const": "V52_MANIFEST_SIDECAR"},
+        )
+        self.assertEqual(
+            common_query["allOf"][0]["then"]["properties"]["split_index"],
+            {"type": "integer", "minimum": 1},
+        )
+        self.assertEqual(
+            common_query["allOf"][1]["then"]["properties"]["split_index"],
+            {"type": "null"},
+        )
         self.assertNotIn(
             "LEGACY_MANIFEST_ONLY",
             json.dumps(optional_query, sort_keys=True),
         )
+
+    def test_required_complete_rejects_serialized_query_coverage_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = build_preflight(
+                make_complete_inventory(Path(directory)),
+                parse_run_spec(expected_historical_run()),
+            )
+        source = MINIMUM_SOURCES[0]
+        record = payload["seasons"]["2018"]["sources"][source]
+
+        narrowed = copy.deepcopy(payload)
+        narrowed_record = narrowed["seasons"]["2018"]["sources"][source]
+        narrowed_record["queries"][0]["child_range"]["end_date"] = "2018-06-29"
+
+        rebound = copy.deepcopy(payload)
+        rebound_record = rebound["seasons"]["2018"]["sources"][source]
+        parent = parent_logical_query_id(source, 2018, "2018-02-01", "2018-12-31")
+        for index, query in enumerate(rebound_record["queries"], 1):
+            query["query"]["start_date"] = "2018-02-01"
+            query["parent_logical_query_id"] = parent
+            query["logical_query_id"] = f"{parent}:{index}"
+        rebound_record["queries"][0]["child_range"]["start_date"] = "2018-02-01"
+        rebound_record["logical_query_ids"] = [parent]
+
+        tampered = copy.deepcopy(payload)
+        tampered["seasons"]["2018"]["sources"][source]["queries"][0][
+            "logical_query_id"
+        ] = "tampered"
+
+        duplicated = copy.deepcopy(payload)
+        duplicate_queries = duplicated["seasons"]["2018"]["sources"][source][
+            "queries"
+        ]
+        duplicate_queries[1]["logical_query_id"] = duplicate_queries[0][
+            "logical_query_id"
+        ]
+
+        wrong_count = copy.deepcopy(payload)
+        wrong_count["seasons"]["2018"]["sources"][source]["queries"][0][
+            "split_count"
+        ] = 3
+
+        wrong_order = copy.deepcopy(payload)
+        ordered_queries = wrong_order["seasons"]["2018"]["sources"][source][
+            "queries"
+        ]
+        for query, split_index in zip(ordered_queries, (2, 1), strict=True):
+            query["split_index"] = split_index
+            query["logical_query_id"] = child_logical_query_id(
+                query["parent_logical_query_id"], split_index
+            )
+
+        self.assertEqual(record["status"], "COMPLETE")
+        for label, changed in {
+            "narrowed child": narrowed,
+            "rebound full set": rebound,
+            "tampered logical id": tampered,
+            "duplicated logical id": duplicated,
+            "wrong split count": wrong_count,
+            "wrong split order": wrong_order,
+        }.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                parse_preflight(changed)
+
+    def test_optional_present_valid_rejects_narrowed_child_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            make_optional_inventory(root, "market_odds")
+            payload = build_preflight(
+                root, parse_run_spec(expected_historical_run())
+            )
+        payload["optional_sources"]["market_odds"]["queries"][0]["child_range"][
+            "start_date"
+        ] = "2022-02-01"
+        with self.assertRaisesRegex(ValueError, "optional query coverage"):
+            parse_preflight(payload)
 
     def test_malformed_optional_evidence_is_separate_and_never_blocks_ready(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -202,6 +202,8 @@ QUERY_EVIDENCE_KEYS = frozenset(
         "manifest_sha256",
         "logical_query_id",
         "parent_logical_query_id",
+        "split_index",
+        "split_count",
         "query",
         "child_range",
     }
@@ -283,6 +285,10 @@ def parent_logical_query_id(source: str, year: int, start: str, end: str) -> str
             }
         )
     ).hexdigest()
+
+
+def child_logical_query_id(parent: str, split_index: int) -> str:
+    return f"{parent}:{split_index}"
 
 
 def _error(path: Path, root: Path, code: str, detail: str) -> dict[str, str]:
@@ -424,6 +430,10 @@ def _validate_manifest(
     split_count = _strict_int(item["split_count"], "split_count", minimum=1)
     if split_index > split_count:
         failures.append("INVALID_SPLIT_SET")
+    if item["logical_query_id"] != child_logical_query_id(
+        expected_parent, split_index
+    ):
+        raise ValueError("SPLIT_LOGICAL_QUERY_ID_MISMATCH")
     return {
         "source": source,
         "query": {"season": year, "start_date": start, "end_date": end},
@@ -628,6 +638,8 @@ def query_evidence(row: Mapping[str, object]) -> dict[str, object]:
         "parent_logical_query_id": None
         if legacy
         else str(row["parent_logical_query_id"]),
+        "split_index": None if legacy else int(row["split_index"]),
+        "split_count": None if legacy else int(row["split_count"]),
         "query": query,
         "child_range": child,
     }
@@ -1252,6 +1264,15 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
             or len(content_hashes) != len(queries)
         ):
             raise ValueError("complete source state differs")
+        if status == "COMPLETE":
+            aggregate = _validate_v52_query_set(
+                queries,
+                source,
+                year,
+                f"season.{year}.{source}",
+            )
+            if observed != aggregate:
+                raise ValueError("complete source observed/query range differs")
         if status == "INVALID" and not (missing or duplicates):
             raise ValueError("invalid source lacks blocker")
 
@@ -1301,13 +1322,62 @@ def _validate_query_evidence(
             source, query_year, query_start, query_end
         ):
             raise ValueError(f"{path} parent query hash differs")
+        split_index = _strict_int(item["split_index"], f"{path}.split_index", 1)
+        split_count = _strict_int(item["split_count"], f"{path}.split_count", 1)
+        if (
+            split_index > split_count
+            or logical != child_logical_query_id(parent, split_index)
+        ):
+            raise ValueError(f"{path} split identity differs")
     else:
         if (
             item["parent_logical_query_id"] is not None
+            or item["split_index"] is not None
+            or item["split_count"] is not None
             or logical != f"legacy:{manifest_hash}:{query_year}:{source}"
         ):
             raise ValueError(f"{path} legacy identity differs")
     return json.loads(json.dumps(dict(item), allow_nan=False))
+
+
+def _validate_v52_query_set(
+    queries: Sequence[Mapping[str, object]],
+    source: str,
+    year: int,
+    path: str,
+) -> tuple[str, str]:
+    expected_start, expected_end = f"{year}-01-01", f"{year}-12-31"
+    if not queries:
+        raise ValueError(f"{path} query coverage is empty")
+    split_counts = {int(query["split_count"]) for query in queries}
+    split_indices = [int(query["split_index"]) for query in queries]
+    logical_ids = [str(query["logical_query_id"]) for query in queries]
+    parents = {str(query["parent_logical_query_id"]) for query in queries}
+    if (
+        split_counts != {len(queries)}
+        or split_indices != list(range(1, len(queries) + 1))
+        or len(logical_ids) != len(set(logical_ids))
+        or len(parents) != 1
+    ):
+        raise ValueError(f"{path} split identity/count/order differs")
+    ranges: list[tuple[str, str]] = []
+    for query in queries:
+        query_contract = query["query"]
+        if (
+            query_contract["season"] != year
+            or query_contract["start_date"] != expected_start
+            or query_contract["end_date"] != expected_end
+        ):
+            raise ValueError(f"{path} query must cover the exact season")
+        ranges.append(
+            (
+                str(query["child_range"]["start_date"]),
+                str(query["child_range"]["end_date"]),
+            )
+        )
+    if not ranges_cover(ranges, expected_start, expected_end):
+        raise ValueError(f"{path} query coverage is not contiguous")
+    return ranges[0][0], ranges[-1][1]
 
 
 def _validate_optional_sources(raw: object) -> None:
@@ -1357,6 +1427,21 @@ def _validate_optional_sources(raw: object) -> None:
             item["fallback_status"] is not None or not queries or errors
         ):
             raise ValueError("valid optional state differs")
+        if status == "PRESENT_VALID":
+            grouped: dict[int, list[Mapping[str, object]]] = {}
+            for query in queries:
+                grouped.setdefault(int(query["query"]["season"]), []).append(query)
+            for year, group in grouped.items():
+                ordered = sorted(group, key=lambda value: int(value["split_index"]))
+                try:
+                    _validate_v52_query_set(
+                        ordered,
+                        source,
+                        year,
+                        f"optional_sources.{source}",
+                    )
+                except ValueError as exc:
+                    raise ValueError("optional query coverage differs") from exc
         if status == "PRESENT_INVALID" and (
             item["fallback_status"] != absent or not errors
         ):
@@ -1664,13 +1749,90 @@ def preflight_schema_document() -> dict[str, object]:
                     },
                     "manifest_path": path_schema,
                     "manifest_sha256": hash_schema,
-                    "logical_query_id": {"type": "string", "minLength": 1},
+                    "logical_query_id": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}:[1-9][0-9]*$",
+                            },
+                            {
+                                "type": "string",
+                                "pattern": (
+                                    "^legacy:[0-9a-f]{64}:[0-9]{4}:"
+                                    "[a-z0-9_]+$"
+                                ),
+                            },
+                        ]
+                    },
                     "parent_logical_query_id": {
                         "anyOf": [hash_schema, {"type": "null"}]
+                    },
+                    "split_index": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 1},
+                            {"type": "null"},
+                        ]
+                    },
+                    "split_count": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 1},
+                            {"type": "null"},
+                        ]
                     },
                     "query": {"$ref": "#/$defs/query"},
                     "child_range": {"$ref": "#/$defs/date_range"},
                 },
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "evidence_kind": {
+                                    "const": "V52_MANIFEST_SIDECAR"
+                                }
+                            }
+                        },
+                        "then": {
+                            "properties": {
+                                "logical_query_id": {
+                                    "type": "string",
+                                    "pattern": "^[0-9a-f]{64}:[1-9][0-9]*$",
+                                },
+                                "parent_logical_query_id": {
+                                    "$ref": "#/$defs/sha256"
+                                },
+                                "split_index": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                                "split_count": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "evidence_kind": {"const": "LEGACY_MANIFEST_ONLY"}
+                            }
+                        },
+                        "then": {
+                            "properties": {
+                                "logical_query_id": {
+                                    "type": "string",
+                                    "pattern": (
+                                        "^legacy:[0-9a-f]{64}:[0-9]{4}:"
+                                        "[a-z0-9_]+$"
+                                    ),
+                                },
+                                "parent_logical_query_id": {"type": "null"},
+                                "split_index": {"type": "null"},
+                                "split_count": {"type": "null"},
+                            }
+                        },
+                    },
+                ],
                 "additionalProperties": False,
             },
             "optional_query_evidence": {
@@ -1681,8 +1843,13 @@ def preflight_schema_document() -> dict[str, object]:
                     "source": {"enum": list(OPTIONAL_SOURCE_CONTRACT)},
                     "manifest_path": path_schema,
                     "manifest_sha256": {"$ref": "#/$defs/sha256"},
-                    "logical_query_id": {"type": "string", "minLength": 1},
+                    "logical_query_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}:[1-9][0-9]*$",
+                    },
                     "parent_logical_query_id": {"$ref": "#/$defs/sha256"},
+                    "split_index": {"type": "integer", "minimum": 1},
+                    "split_count": {"type": "integer", "minimum": 1},
                     "query": {"$ref": "#/$defs/query"},
                     "child_range": {"$ref": "#/$defs/date_range"},
                 },
