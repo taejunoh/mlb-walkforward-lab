@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -26,6 +27,50 @@ class ScheduleHistoryBuild:
     coverage_start: str
     coverage_end: str
     coverage_complete: bool
+    source_manifest_sha256: str | None
+    expected_game_pks: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.coverage_complete) is not bool:
+            raise ValueError("schedule coverage_complete must be boolean")
+        first = _canonical_day(self.coverage_start, "schedule coverage_start")
+        last = _canonical_day(self.coverage_end, "schedule coverage_end")
+        if first > last:
+            raise ValueError("schedule coverage_start must not be after coverage_end")
+        if (
+            not isinstance(self.expected_game_pks, tuple)
+            or any(type(value) is not int or value <= 0 for value in self.expected_game_pks)
+            or tuple(sorted(set(self.expected_game_pks))) != self.expected_game_pks
+        ):
+            raise ValueError("expected_game_pks must be sorted unique positive integers")
+        actual = set()
+        for row in self.rows:
+            if not isinstance(row, Mapping):
+                raise ValueError("schedule history rows must be mappings")
+            game_pk = _positive_id(row.get("game_pk"), "schedule history game_pk")
+            official = _canonical_day(
+                row.get("official_date"), "schedule history official_date"
+            )
+            if not first <= official <= last:
+                raise ValueError("schedule history row is outside coverage bounds")
+            actual.add(game_pk)
+        if actual != set(self.expected_game_pks):
+            raise ValueError("schedule history rows do not match expected_game_pks")
+        valid_hash = bool(
+            isinstance(self.source_manifest_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", self.source_manifest_sha256)
+        )
+        if self.source_manifest_sha256 is not None and not valid_hash:
+            raise ValueError("source manifest SHA must be lowercase SHA-256")
+        if self.coverage_complete and not valid_hash:
+            raise ValueError("complete schedule coverage requires a valid manifest SHA")
+
+
+@dataclass(frozen=True)
+class TeamCodeBuild:
+    mapping: dict[str, str]
+    unmatched_schedule_games: tuple[dict[str, object], ...]
+    provenance: dict[str, object]
 
 
 def _date(value: object) -> date:
@@ -203,7 +248,7 @@ def derive_team_code_map(
     schedule_games: Iterable[Mapping[str, object]],
     statcast_data: object,
     year: int,
-) -> dict[str, str]:
+) -> TeamCodeBuild:
     """Join schedule names to in-season Statcast codes with a strict 30-team bijection."""
     if type(year) is not int or year < 1900:
         raise ValueError("year must be an integer season")
@@ -211,10 +256,10 @@ def derive_team_code_map(
     for game in schedule_games:
         if not isinstance(game, Mapping):
             raise ValueError("schedule games must be mappings")
-        try:
-            game_year = date.fromisoformat(str(game.get("official_date"))).year
-        except ValueError as exc:
-            raise ValueError("schedule official_date must be an ISO date") from exc
+        official_date = _canonical_day(
+            game.get("official_date"), "schedule official_date"
+        )
+        game_year = date.fromisoformat(official_date).year
         if game_year != year:
             continue
         game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
@@ -222,19 +267,51 @@ def derive_team_code_map(
             raise ValueError("duplicate schedule game_pk")
         schedule_by_pk[game_pk] = game
     codes_by_pk: defaultdict[int, list] = defaultdict(list)
+    statcast_game_pks = set()
     for row in _statcast_rows(statcast_data):
         game_pk = _positive_id(row.get("game_pk"), "Statcast game_pk")
+        row_date = _canonical_day(row.get("game_date"), "Statcast game_date")
+        if date.fromisoformat(row_date).year == year:
+            statcast_game_pks.add(game_pk)
         if game_pk in schedule_by_pk:
-            game_date = _canonical_day(row.get("game_date"), "Statcast game_date")
-            if game_date != schedule_by_pk[game_pk].get("official_date"):
+            if row_date != schedule_by_pk[game_pk].get("official_date"):
                 raise ValueError("Statcast game_date must match schedule season and date")
             codes_by_pk[game_pk].append(row)
     mapping = {}
     reverse = {}
+    unmatched = []
+    matched_game_count = 0
     for game_pk, game in sorted(schedule_by_pk.items()):
         codes = _game_codes(codes_by_pk.get(game_pk, ()))
         if codes is None:
-            raise ValueError(f"missing Statcast team codes for game_pk {game_pk}")
+            status = game.get("status")
+            status_text = status if isinstance(status, str) else ""
+            lowered = status_text.lower()
+            has_result = any(
+                game.get(field) is not None
+                for field in (
+                    "away_score",
+                    "home_score",
+                    "away_is_winner",
+                    "home_is_winner",
+                )
+            )
+            if lowered not in {"canceled", "cancelled", "postponed"} or has_result:
+                label = status_text or "unknown status"
+                raise ValueError(
+                    f"unmatched {label} schedule game_pk {game_pk} is not proven unplayed"
+                )
+            unmatched.append(
+                {
+                    "game_pk": game_pk,
+                    "official_date": game.get("official_date"),
+                    "status": status_text,
+                    "away_team": game.get("away_team"),
+                    "home_team": game.get("home_team"),
+                }
+            )
+            continue
+        matched_game_count += 1
         for side, code in zip(("away", "home"), codes):
             name = game.get(f"{side}_team")
             if not isinstance(name, str) or not name:
@@ -247,7 +324,21 @@ def derive_team_code_map(
             reverse[code] = name
     if len(mapping) != 30 or len(reverse) != 30:
         raise ValueError("team code map must contain exactly 30 names and codes")
-    return dict(sorted(mapping.items()))
+    frozen_mapping = dict(sorted(mapping.items()))
+    mapping_bytes = json.dumps(
+        frozen_mapping, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    provenance = {
+        "source": "mlb_schedule+baseball_savant_statcast",
+        "season": year,
+        "schedule_game_count": len(schedule_by_pk),
+        "statcast_game_count": len(statcast_game_pks),
+        "matched_game_count": matched_game_count,
+        "unmatched_game_count": len(unmatched),
+        "unmatched_statcast_game_pks": sorted(statcast_game_pks - set(schedule_by_pk)),
+        "mapping_sha256": hashlib.sha256(mapping_bytes).hexdigest(),
+    }
+    return TeamCodeBuild(frozen_mapping, tuple(unmatched), provenance)
 
 
 def derive_training_slot_rows(
@@ -317,6 +408,14 @@ def derive_training_slot_rows(
         slot = sides[side].get(batter_id)
         if slot is not None:
             totals[(season, slot)] += 1
+    expected = {
+        (season, slot)
+        for season in (2022, 2023, 2024)
+        for slot in range(1, 10)
+    }
+    missing = sorted(expected - set(totals))
+    if missing:
+        raise ValueError(f"missing training slot cells: {missing}")
     return [
         {"season": season, "game_type": "R", "slot": slot, "pa": pa}
         for (season, slot), pa in sorted(totals.items())
@@ -326,10 +425,25 @@ def derive_training_slot_rows(
 def schedule_history_rows(
     normalized_games: Iterable[Mapping[str, object]],
     venue_reference: Mapping[int, Mapping[str, object]],
+    *,
+    coverage_start: str,
+    coverage_end: str,
+    source_manifest_sha256: str | None,
+    expected_game_pks: Iterable[int],
 ) -> ScheduleHistoryBuild:
     """Convert normalized schedules into source-backed ScheduleHistory rows."""
     if not isinstance(venue_reference, Mapping):
         raise ValueError("venue_reference must be a mapping")
+    first = _canonical_day(coverage_start, "schedule coverage_start")
+    last = _canonical_day(coverage_end, "schedule coverage_end")
+    if first > last:
+        raise ValueError("schedule coverage_start must not be after coverage_end")
+    if isinstance(expected_game_pks, (str, bytes)):
+        raise ValueError("expected_game_pks must be an iterable of positive integers")
+    try:
+        expected = {_positive_id(value, "expected game_pk") for value in expected_game_pks}
+    except TypeError as exc:
+        raise ValueError("expected_game_pks must be iterable") from exc
     rows = []
     seen = set()
     for game in normalized_games:
@@ -341,7 +455,12 @@ def schedule_history_rows(
         if game_pk in seen:
             raise ValueError("duplicate schedule game_pk")
         seen.add(game_pk)
-        official = _date(game.get("official_date"))
+        official_text = _canonical_day(
+            game.get("official_date"), "schedule official_date"
+        )
+        if not first <= official_text <= last:
+            raise ValueError("schedule row is outside explicit coverage bounds")
+        official = date.fromisoformat(official_text)
         away_code, home_code = game.get("away_team_code"), game.get("home_team_code")
         if (
             not isinstance(away_code, str)
@@ -404,17 +523,92 @@ def schedule_history_rows(
     if not rows:
         raise ValueError("schedule history requires at least one regular-season game")
     rows.sort(key=lambda row: (row["official_date"], row["game_pk"]))
-    return ScheduleHistoryBuild(
-        tuple(rows), rows[0]["official_date"], rows[-1]["official_date"], True
+    actual = {int(row["game_pk"]) for row in rows}
+    if actual != expected:
+        raise ValueError(
+            f"expected game_pk set differs; missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+    valid_source_hash = bool(
+        isinstance(source_manifest_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256)
     )
+    return ScheduleHistoryBuild(
+        tuple(rows),
+        first,
+        last,
+        valid_source_hash,
+        source_manifest_sha256,
+        tuple(sorted(expected)),
+    )
+
+
+def build_pregame_history(
+    statcast_data: object,
+    target_game: Mapping[str, object],
+    slot_weights: Mapping[int, float],
+    schedule_build: ScheduleHistoryBuild,
+):
+    """Construct FeatureHistory only after removing target/same-day/future events."""
+    from .feature_engine import FeatureHistory
+    from .statcast import StatcastData
+
+    if not isinstance(target_game, Mapping):
+        raise ValueError("target_game must be a mapping")
+    target_pk = _positive_id(target_game.get("game_pk"), "target game_pk")
+    target_date = _canonical_day(
+        target_game.get("official_date"), "target official_date"
+    )
+    if not isinstance(schedule_build, ScheduleHistoryBuild):
+        raise ValueError("schedule_build must be a ScheduleHistoryBuild")
+    if not isinstance(statcast_data, StatcastData):
+        raise ValueError("statcast_data must be StatcastData")
+
+    def eligible(row: Mapping[str, object]) -> bool:
+        row_pk = _positive_id(row.get("game_pk"), "Statcast game_pk")
+        row_date = _canonical_day(row.get("game_date"), "Statcast game_date")
+        return row_date < target_date and row_pk != target_pk
+
+    filtered = StatcastData(
+        tuple(row for row in statcast_data.pitches if eligible(row)),
+        tuple(row for row in statcast_data.plate_appearances if eligible(row)),
+    )
+    venue_by_name = {}
+    for row in schedule_build.rows:
+        name = row.get("venue_name")
+        if isinstance(name, str) and name:
+            venue_by_name[name] = {
+                field: row[field]
+                for field in (
+                    "venue_city",
+                    "venue_latitude",
+                    "venue_longitude",
+                    "time_zone",
+                )
+                if field in row
+            }
+    history = FeatureHistory(
+        filtered,
+        slot_weights=slot_weights,
+        schedule_history=schedule_build.rows,
+        schedule_coverage_start=schedule_build.coverage_start,
+        schedule_coverage_end=schedule_build.coverage_end,
+        schedule_coverage_complete=schedule_build.coverage_complete,
+        venue_by_name=venue_by_name,
+    )
+    assert_pregame_history(target_game, history.pitches)
+    assert_pregame_history(target_game, history.plate_appearances)
+    return history
 
 
 __all__ = [
     "ParticipantBuild",
     "ScheduleHistoryBuild",
+    "TeamCodeBuild",
     "assert_pregame_history",
     "build_actual_participants",
     "build_source_manifest_index",
+    "build_pregame_history",
     "derive_team_code_map",
     "derive_training_slot_rows",
     "schedule_history_rows",

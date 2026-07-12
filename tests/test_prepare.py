@@ -7,8 +7,10 @@ from mlb_backtest.manifest import RawStore
 from mlb_backtest.prepare import (
     ParticipantBuild,
     ScheduleHistoryBuild,
+    TeamCodeBuild,
     assert_pregame_history,
     build_actual_participants,
+    build_pregame_history,
     build_source_manifest_index,
     derive_team_code_map,
     derive_training_slot_rows,
@@ -179,10 +181,21 @@ class PrepareBoundaryTest(unittest.TestCase):
                 "away_team": f"T{away_number:02d}",
                 "home_team": f"T{home_number:02d}",
             })
-        mapping = derive_team_code_map(games, rows, 2024)
-        self.assertEqual(len(mapping), 30)
-        self.assertEqual(mapping["Team 00"], "T00")
-        self.assertEqual(mapping["Team 29"], "T29")
+        canceled = {
+            "game_pk": 999,
+            "official_date": "2024-06-02",
+            "status": "Canceled",
+            "away_team": "Canceled Away",
+            "home_team": "Canceled Home",
+        }
+        built = derive_team_code_map(games + [canceled], rows, 2024)
+        self.assertIsInstance(built, TeamCodeBuild)
+        self.assertEqual(len(built.mapping), 30)
+        self.assertEqual(built.mapping["Team 00"], "T00")
+        self.assertEqual(built.mapping["Team 29"], "T29")
+        self.assertEqual(built.unmatched_schedule_games[0]["game_pk"], 999)
+        self.assertEqual(built.provenance["unmatched_game_count"], 1)
+        self.assertRegex(built.provenance["mapping_sha256"], r"^[0-9a-f]{64}$")
         conflict = rows + [dict(rows[0], away_team="BAD")]
         with self.assertRaises(ValueError):
             derive_team_code_map(games, conflict, 2024)
@@ -194,6 +207,16 @@ class PrepareBoundaryTest(unittest.TestCase):
                 [dict(row, game_date="2025-06-01") for row in rows],
                 2024,
             )
+        played_unmatched = dict(canceled, status="Final", away_score=1, home_score=2, away_is_winner=False, home_is_winner=True)
+        with self.assertRaisesRegex(ValueError, "Final"):
+            derive_team_code_map(games + [played_unmatched], rows, 2024)
+        for unsafe in (
+            dict(canceled, status="Scheduled"),
+            dict(canceled, status="Final - Postponed"),
+            dict(canceled, official_date="20240602"),
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                derive_team_code_map(games + [unsafe], rows, 2024)
 
     def test_training_slot_rows_count_official_starters_and_exclude_2025_and_pinch_hitters(self):
         def game(game_pk, year):
@@ -225,6 +248,10 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertEqual({row["season"] for row in rows}, {2022, 2023, 2024})
         self.assertEqual(sum(row["pa"] for row in rows), 2 * 45 * 3)
         self.assertEqual(len(rows), 27)
+        self.assertEqual(
+            derive_training_slot_rows(list(reversed(games)), list(reversed(pas))),
+            rows,
+        )
         weights = derive_slot_weights(rows)
         self.assertAlmostEqual(sum(weights.values()), 1.0)
         self.assertGreater(weights[1], weights[9])
@@ -233,6 +260,17 @@ class PrepareBoundaryTest(unittest.TestCase):
         wrong_day = [dict(row, game_date="2024-12-31") if row["game_pk"] == 24 else row for row in pas]
         with self.assertRaisesRegex(ValueError, "date"):
             derive_training_slot_rows(games, wrong_day)
+        missing_cell = [
+            row
+            for row in pas
+            if not (
+                row["game_pk"] == 22
+                and row["batter_id"]
+                in {games[0]["away_lineup"][8]["player_id"], games[0]["home_lineup"][8]["player_id"]}
+            )
+        ]
+        with self.assertRaisesRegex(ValueError, "missing training slot"):
+            derive_training_slot_rows(games, missing_cell)
 
     def test_schedule_history_build_has_codes_markers_venue_and_coverage(self):
         games = [
@@ -260,18 +298,115 @@ class PrepareBoundaryTest(unittest.TestCase):
             },
         ]
         venues = {31: {"venue_city": "Pittsburgh", "venue_latitude": 40.4469, "venue_longitude": -80.0057, "time_zone": "America/New_York"}}
-        built = schedule_history_rows(games, venues)
+        evidence = {
+            "coverage_start": "2024-04-01",
+            "coverage_end": "2024-04-02",
+            "source_manifest_sha256": "a" * 64,
+            "expected_game_pks": {1, 2},
+        }
+        built = schedule_history_rows(games, venues, **evidence)
         self.assertIsInstance(built, ScheduleHistoryBuild)
         self.assertEqual(built.coverage_start, "2024-04-01")
         self.assertEqual(built.coverage_end, "2024-04-02")
         self.assertTrue(built.coverage_complete)
+        self.assertEqual(built.source_manifest_sha256, "a" * 64)
+        self.assertEqual(built.expected_game_pks, (1, 2))
         self.assertEqual(built.rows[0]["team_codes"], ["AWY", "HOM"])
         self.assertEqual(built.rows[0]["home_team_code"], "HOM")
         self.assertEqual(built.rows[0]["innings"], 9)
         self.assertEqual(built.rows[1]["innings"], 7)
         self.assertEqual(built.rows[0]["venue_city"], "Pittsburgh")
         with self.assertRaises(ValueError):
-            schedule_history_rows(games + [dict(games[0])], venues)
+            schedule_history_rows(games + [dict(games[0])], venues, **evidence)
+        with self.assertRaisesRegex(ValueError, "expected game_pk"):
+            schedule_history_rows(
+                games[:-1],
+                venues,
+                coverage_start="2024-04-01",
+                coverage_end="2024-04-02",
+                source_manifest_sha256="a" * 64,
+                expected_game_pks={1, 2},
+            )
+        unproven = schedule_history_rows(
+            games,
+            venues,
+            coverage_start="2024-04-01",
+            coverage_end="2024-04-02",
+            source_manifest_sha256=None,
+            expected_game_pks={1, 2},
+        )
+        self.assertFalse(unproven.coverage_complete)
+        with self.assertRaisesRegex(ValueError, "manifest SHA"):
+            schedule_history_rows(
+                games,
+                venues,
+                coverage_start="2024-04-01",
+                coverage_end="2024-04-02",
+                source_manifest_sha256="bad",
+                expected_game_pks={1, 2},
+            )
+
+    def test_schedule_history_build_rejects_forged_complete_evidence(self):
+        row = {
+            "game_pk": 1,
+            "official_date": "2024-04-01",
+            "team_codes": ["AWY", "HOM"],
+            "home_team_code": "HOM",
+            "venue_name": "Park",
+            "innings": 9,
+        }
+        invalid = (
+            {"source_manifest_sha256": None, "expected_game_pks": (1,)},
+            {"source_manifest_sha256": "a" * 64, "expected_game_pks": (2,)},
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                ScheduleHistoryBuild(
+                    rows=(row,),
+                    coverage_start="2024-04-01",
+                    coverage_end="2024-04-02",
+                    coverage_complete=True,
+                    **changes,
+                )
+
+    def test_build_pregame_history_is_the_target_event_filtering_boundary(self):
+        parsed = parse_statcast(STATCAST)
+        target_game = {"game_pk": 1002, "official_date": "2024-04-02"}
+        prior_target_pitch = dict(parsed.pitches[0], game_pk=1002, game_date="2024-04-01")
+        prior_target_pa = dict(parsed.plate_appearances[0], game_pk=1002, game_date="2024-04-01")
+        source = StatcastData(
+            parsed.pitches + (prior_target_pitch,),
+            parsed.plate_appearances + (prior_target_pa,),
+        )
+        schedule_build = ScheduleHistoryBuild(
+            rows=(
+                {
+                    "game_pk": 1001,
+                    "official_date": "2024-04-01",
+                    "team_codes": ["AWY", "HOM"],
+                    "home_team_code": "HOM",
+                    "venue_name": "Park",
+                    "innings": 9,
+                },
+            ),
+            coverage_start="2024-04-01",
+            coverage_end="2024-04-02",
+            coverage_complete=True,
+            source_manifest_sha256="b" * 64,
+            expected_game_pks=(1001,),
+        )
+        history = build_pregame_history(
+            source,
+            target_game,
+            {slot: 1 / 9 for slot in range(1, 10)},
+            schedule_build,
+        )
+        self.assertEqual(history.pitch_game_pks, {1001})
+        self.assertEqual(history.pa_game_pks, {1001})
+        self.assertTrue(all(row["game_date"] < "2024-04-02" for row in history.pitches))
+        self.assertNotIn(1002, history.pitch_game_pks)
+        self.assertNotIn(1002, history.pa_game_pks)
+        self.assertTrue(history.schedule_history.coverage_complete)
 
 
 if __name__ == "__main__":

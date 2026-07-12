@@ -332,6 +332,15 @@ class SourceTest(unittest.TestCase):
 
         self.assertEqual(game["scheduled_start_utc"], "2025-05-01T23:10:00Z")
 
+    def test_official_date_requires_canonical_extended_iso_format(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["dates"][0]["games"][0]["officialDate"] = "20250501"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "official date"):
+                parse_schedule(path)
+
     def test_malformed_and_naive_scheduled_starts_raise_value_error(self):
         for start in ("not-a-time", "2025-05-01T23:10:00"):
             payload = json.loads(FIXTURE.read_text(encoding="utf-8"))

@@ -207,9 +207,11 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     if not isinstance(official_date, str) or not official_date:
         raise ValueError("malformed schedule: regular game official date is required")
     try:
-        date.fromisoformat(official_date)
+        parsed_official_date = date.fromisoformat(official_date)
     except ValueError as exc:
         raise ValueError("malformed schedule: official date must be ISO format") from exc
+    if parsed_official_date.isoformat() != official_date:
+        raise ValueError("malformed schedule: official date must be canonical YYYY-MM-DD")
 
     teams = _mapping(game.get("teams"), f"game[{index}].teams")
     away = _mapping(teams.get("away"), f"game[{index}].teams.away")
