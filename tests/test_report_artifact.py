@@ -214,6 +214,12 @@ class ReportArtifactTest(unittest.TestCase):
             ],
             ["선발", "타선", "불펜", "일정"],
         )
+        for row in self.artifact["snapshot"]["datasets"]["component_edges"]:
+            with self.subTest(component=row["component"]):
+                self.assertIsInstance(row["wins_mean"], (int, float))
+                self.assertIsInstance(row["losses_mean"], (int, float))
+                self.assertEqual(row["wins_mean"], row["승리 평균 엣지"])
+                self.assertEqual(row["losses_mean"], row["패배 평균 엣지"])
         for chart_id in ("paired-baselines", "calibration", "monthly"):
             with self.subTest(chart=chart_id):
                 chart = charts[chart_id]

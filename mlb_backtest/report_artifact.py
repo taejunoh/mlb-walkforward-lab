@@ -84,6 +84,8 @@ component_rows AS (
         ordinal,
         json_object(
             'component', component_label,
+            'wins_mean', json_extract(document, '$.components.' || component_key || '.win_mean'),
+            'losses_mean', json_extract(document, '$.components.' || component_key || '.loss_mean'),
             '승리 평균 엣지', json_extract(document, '$.components.' || component_key || '.win_mean'),
             '패배 평균 엣지', json_extract(document, '$.components.' || component_key || '.loss_mean'),
             'wins_N', json_extract(document, '$.primary.record.W'),
@@ -329,6 +331,8 @@ def component_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
         rows.append(
             {
                 "component": label,
+                "wins_mean": value["win_mean"],
+                "losses_mean": value["loss_mean"],
                 "승리 평균 엣지": value["win_mean"],
                 "패배 평균 엣지": value["loss_mean"],
                 "wins_N": record["W"],
