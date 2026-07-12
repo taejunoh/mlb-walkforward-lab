@@ -27,12 +27,15 @@ def assert_pregame_history(
         target_pk = game["game_pk"]
     except KeyError as exc:
         raise ValueError("target game requires official_date and game_pk") from exc
-    if isinstance(target_pk, bool) or not isinstance(target_pk, int) or target_pk <= 0:
+    if type(target_pk) is not int or target_pk <= 0:
         raise ValueError("target game_pk must be a positive integer")
     for row in rows:
         if not isinstance(row, Mapping):
             raise ValueError("history rows must be mappings")
-        if row.get("game_pk") == target_pk:
+        history_pk = row.get("game_pk")
+        if type(history_pk) is not int or history_pk <= 0:
+            raise ValueError("history game_pk must be a positive integer")
+        if history_pk == target_pk:
             raise ValueError("feature history contains target game_pk")
         if _date(row.get("game_date")) >= target:
             raise ValueError(
