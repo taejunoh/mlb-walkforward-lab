@@ -145,6 +145,7 @@ def fetch_league_era_records(
     fetcher=None,
     retries: tuple[float, ...] = (1, 2, 4, 8, 16),
     sleeper=None,
+    verified_catalog=None,
 ) -> dict[str, dict[str, object]]:
     """Fetch one validated cumulative query per unique D-1 as-of date."""
     if not isinstance(store, RawStore):
@@ -177,7 +178,10 @@ def fetch_league_era_records(
         queries[as_of] = _query(open_day.isoformat(), as_of)
 
     existing = {}
-    for verified in store.verify_manifests():
+    catalog = (
+        store.verify_manifests() if verified_catalog is None else verified_catalog
+    )
+    for verified in catalog:
         manifest = verified["manifest"]
         if manifest["source"] == "mlb_stats_pitching":
             existing[json.dumps(manifest["query"], sort_keys=True)] = verified

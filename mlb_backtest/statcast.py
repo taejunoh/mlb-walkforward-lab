@@ -132,6 +132,7 @@ def fetch_monthly(
     fetcher=None,
     sleeper=None,
     known_queries: dict[str, str] | None = None,
+    verified_catalog: list[dict[str, object]] | None = None,
 ) -> list[object]:
     """Fetch and manifest inclusive monthly chunks, retrying transient failures."""
     if fetcher is None:
@@ -141,12 +142,90 @@ def fetch_monthly(
     if known_queries is None:
         known_queries = {}
     artifacts = []
-    for chunk_start, chunk_end in monthly_ranges(start, end):
+    known_artifacts = {}
+    if known_queries:
+        from .models import RawArtifact
+
+        catalog = store.verify_manifests() if verified_catalog is None else verified_catalog
+        for verified in catalog:
+            manifest = verified["manifest"]
+            if manifest["source"] != "baseball_savant_statcast":
+                continue
+            key = json.dumps(manifest["query"], separators=(",", ":"), sort_keys=True)
+            if known_queries.get(key) != manifest["sha256"]:
+                continue
+            known_artifacts[key] = RawArtifact(
+                source=manifest["source"],
+                sha256=manifest["sha256"],
+                data_path=Path(verified["payload_path"]),
+                manifest_path=Path(verified["manifest_path"]),
+                retrieved_at_utc=manifest["retrieved_at_utc"],
+                row_count=manifest["row_count"],
+            )
+
+    def reuse_range(chunk_start: str, chunk_end: str) -> bool:
+        query = {
+            "start": chunk_start,
+            "end": chunk_end,
+            "game_type": "R",
+            "url": statcast_url(chunk_start, chunk_end),
+        }
+        exact_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
+        if exact_key in known_artifacts:
+            artifacts.append(known_artifacts[exact_key])
+            return True
+        first, last = _iso(chunk_start, "chunk start"), _iso(chunk_end, "chunk end")
+        expected = {
+            first + timedelta(days=offset)
+            for offset in range((last - first).days + 1)
+        }
+        covered = set()
+        children = []
+        for key, artifact in known_artifacts.items():
+            child = json.loads(key)
+            child_first = _iso(child["start"], "child start")
+            child_last = _iso(child["end"], "child end")
+            dates = {
+                child_first + timedelta(days=offset)
+                for offset in range((child_last - child_first).days + 1)
+            }
+            if dates < expected:
+                if covered & dates:
+                    raise RuntimeError("overlapping resumed Statcast child ranges")
+                covered.update(dates)
+                children.append((child_first, child_last, artifact))
+        if covered == expected:
+            artifacts.extend(item[2] for item in sorted(children))
+            return True
+        return False
+
+    def fetch_range(chunk_start: str, chunk_end: str) -> None:
+        if reuse_range(chunk_start, chunk_end):
+            return
         url = statcast_url(chunk_start, chunk_end)
         for attempt in range(len(retries) + 1):
             try:
                 payload = fetcher(url, max_bytes=MAX_STATCAST_BYTES)
                 break
+            except ValueError as exc:
+                message = str(exc).lower()
+                if "exceed" not in message or not (
+                    "size" in message or "byte" in message
+                ):
+                    raise
+                first, last = _iso(chunk_start, "chunk start"), _iso(
+                    chunk_end, "chunk end"
+                )
+                if first >= last:
+                    raise ValueError(
+                        "single-day Statcast response exceeds size limit"
+                    ) from exc
+                midpoint = first + timedelta(days=(last - first).days // 2)
+                fetch_range(first.isoformat(), midpoint.isoformat())
+                fetch_range(
+                    (midpoint + timedelta(days=1)).isoformat(), last.isoformat()
+                )
+                return
             except HTTPError as exc:
                 transient = exc.code == 429 or 500 <= exc.code < 600
                 if not transient or attempt == len(retries):
@@ -184,6 +263,9 @@ def fetch_monthly(
             )
         )
         known_queries[query_key] = digest
+
+    for chunk_start, chunk_end in monthly_ranges(start, end):
+        fetch_range(chunk_start, chunk_end)
     return artifacts
 
 
@@ -197,7 +279,8 @@ def fetch_statcast_stage(
     root = _safe_data_dir(data_dir)
     store = RawStore(_stage(root, "raw"))
     known_queries = {}
-    for verified in store.verify_manifests():
+    verified_catalog = store.verify_manifests()
+    for verified in verified_catalog:
         manifest = verified["manifest"]
         if manifest["source"] == "baseball_savant_statcast":
             key = json.dumps(
@@ -207,7 +290,13 @@ def fetch_statcast_stage(
     artifacts = []
     for start, end in regular_season_ranges(config["extension_end"]):
         artifacts.extend(
-            fetch_monthly(store, start, end, known_queries=known_queries)
+            fetch_monthly(
+                store,
+                start,
+                end,
+                known_queries=known_queries,
+                verified_catalog=verified_catalog,
+            )
         )
     return artifacts
 

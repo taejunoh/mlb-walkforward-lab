@@ -235,16 +235,24 @@ def _canonical_games_bytes(games: Iterable[Mapping[str, object]]) -> bytes:
 
 
 def load_verified_schedule_evidence(
-    raw_root: str | Path, manifest_path: str | Path
+    raw_root: str | Path,
+    manifest_path: str | Path,
+    *,
+    verified_catalog=None,
 ) -> VerifiedScheduleEvidence:
     """Bind one canonical schedule query to its verified payload and normalized games."""
     requested = Path(manifest_path)
     if requested.is_symlink():
         raise ValueError("schedule manifest path cannot be a symlink")
     requested_absolute = requested.absolute()
+    catalog = (
+        RawStore(Path(raw_root)).verify_manifests()
+        if verified_catalog is None
+        else verified_catalog
+    )
     matches = [
         verified
-        for verified in RawStore(Path(raw_root)).verify_manifests()
+        for verified in catalog
         if Path(verified["manifest_path"]).absolute() == requested_absolute
     ]
     if len(matches) != 1:
@@ -259,7 +267,7 @@ def load_verified_schedule_evidence(
     base_query_fields = {"start", "end", "gameType", "url"}
     if set(query) != base_query_fields | {"role"}:
         raise ValueError("verified schedule query fields are not canonical")
-    if query["role"] not in {"training", "backtest"}:
+    if query["role"] not in {"training", "history", "backtest"}:
         raise ValueError("verified schedule query role is invalid")
     start = _canonical_day(query.get("start"), "schedule query start")
     end = _canonical_day(query.get("end"), "schedule query end")
@@ -294,7 +302,10 @@ def load_verified_schedule_evidence(
 
 
 def load_verified_statcast_evidence(
-    raw_root: str | Path, manifest_paths: Iterable[str | Path]
+    raw_root: str | Path,
+    manifest_paths: Iterable[str | Path],
+    *,
+    verified_catalog=None,
 ) -> VerifiedStatcastEvidence:
     """Bind verified Statcast manifests to one immutable normalized snapshot."""
     from .statcast import iter_statcast_pitches, statcast_url
@@ -307,9 +318,14 @@ def load_verified_statcast_evidence(
     if any(path.is_symlink() for path in requested):
         raise ValueError("Statcast manifest paths cannot be symlinks")
     requested_by_absolute = {path.absolute(): path for path in requested}
+    catalog = (
+        RawStore(Path(raw_root)).verify_manifests()
+        if verified_catalog is None
+        else verified_catalog
+    )
     selected = [
         verified
-        for verified in RawStore(Path(raw_root)).verify_manifests()
+        for verified in catalog
         if Path(verified["manifest_path"]).absolute() in requested_by_absolute
     ]
     if len(selected) != len(requested):
@@ -401,10 +417,15 @@ def load_verified_statcast_evidence(
 
 def _rebind_schedule_evidence(
     evidence: VerifiedScheduleEvidence,
+    verified_catalog=None,
 ) -> VerifiedScheduleEvidence:
     if not isinstance(evidence, VerifiedScheduleEvidence):
         raise ValueError("verified schedule evidence is required")
-    fresh = load_verified_schedule_evidence(evidence.raw_root, evidence.manifest_path)
+    fresh = load_verified_schedule_evidence(
+        evidence.raw_root,
+        evidence.manifest_path,
+        verified_catalog=verified_catalog,
+    )
     identity = (
         "manifest_sha256",
         "payload_sha256",
@@ -420,13 +441,19 @@ def _rebind_schedule_evidence(
 
 def _rebind_statcast_evidence(
     evidence: VerifiedStatcastEvidence,
+    verified_catalog=None,
 ) -> VerifiedStatcastEvidence:
     if not isinstance(evidence, VerifiedStatcastEvidence):
         raise ValueError("verified Statcast evidence is required")
     requested = {path.absolute() for path in evidence.manifest_paths}
+    catalog = (
+        RawStore(evidence.raw_root).verify_manifests()
+        if verified_catalog is None
+        else verified_catalog
+    )
     selected = [
         verified
-        for verified in RawStore(evidence.raw_root).verify_manifests()
+        for verified in catalog
         if Path(verified["manifest_path"]).absolute() in requested
     ]
     if len(selected) != len(requested):
@@ -934,6 +961,8 @@ def _validate_played_schedule_season(
 def derive_training_slot_rows(
     schedule_evidence_by_year: Mapping[int, VerifiedScheduleEvidence],
     statcast_evidence: VerifiedStatcastEvidence,
+    *,
+    verified_catalog=None,
 ) -> list[dict[str, object]]:
     """Derive production slot rows only from verified full-season sources."""
     if (
@@ -951,7 +980,13 @@ def derive_training_slot_rows(
     played_game_pks = set()
     played_game_dates = {}
     for year, (season_open, season_close) in frozen.items():
-        evidence = _rebind_schedule_evidence(schedule_evidence_by_year[year])
+        evidence = (
+            _rebind_schedule_evidence(schedule_evidence_by_year[year])
+            if verified_catalog is None
+            else _rebind_schedule_evidence(
+                schedule_evidence_by_year[year], verified_catalog
+            )
+        )
         if (
             evidence.query.get("role") != "training"
             or evidence.coverage_start != season_open
@@ -982,7 +1017,11 @@ def derive_training_slot_rows(
                 raise ValueError("full-season schedule evidence duplicates game_pk")
             schedule_games_by_pk[game_pk] = game
 
-    statcast_evidence = _rebind_statcast_evidence(statcast_evidence)
+    statcast_evidence = (
+        _rebind_statcast_evidence(statcast_evidence)
+        if verified_catalog is None
+        else _rebind_statcast_evidence(statcast_evidence, verified_catalog)
+    )
     expected_dates = set()
     for first, last in frozen.values():
         cursor = date.fromisoformat(first)
@@ -990,15 +1029,6 @@ def derive_training_slot_rows(
         while cursor <= end:
             expected_dates.add(cursor)
             cursor += timedelta(days=1)
-    from .statcast import monthly_ranges
-
-    expected_ranges = tuple(
-        chunk
-        for first, last in frozen.values()
-        for chunk in monthly_ranges(first, last)
-    )
-    if statcast_evidence.coverage_ranges != expected_ranges:
-        raise ValueError("verified Statcast manifest partitions are not frozen monthly ranges")
     covered_dates = set()
     for first, last in statcast_evidence.coverage_ranges:
         cursor = date.fromisoformat(first)
@@ -1039,11 +1069,17 @@ def schedule_history_rows(
     normalized_games: Iterable[Mapping[str, object]],
     venue_reference: Mapping[int, Mapping[str, object]],
     evidence: VerifiedScheduleEvidence,
+    *,
+    verified_catalog=None,
 ) -> ScheduleHistoryBuild:
     """Convert normalized schedules into source-backed ScheduleHistory rows."""
     if not isinstance(venue_reference, Mapping):
         raise ValueError("venue_reference must be a mapping")
-    evidence = _rebind_schedule_evidence(evidence)
+    evidence = (
+        _rebind_schedule_evidence(evidence)
+        if verified_catalog is None
+        else _rebind_schedule_evidence(evidence, verified_catalog)
+    )
     first, last = evidence.coverage_start, evidence.coverage_end
     expected = set(evidence.game_pks)
     supplied = tuple(normalized_games)

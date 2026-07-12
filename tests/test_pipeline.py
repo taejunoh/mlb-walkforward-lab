@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import tempfile
@@ -6,6 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 from mlb_backtest.pipeline import (
+    _load_model_card,
+    _verify_candidate_provenance,
     calibrate_stage,
     features_stage,
     fetch_stage,
@@ -19,6 +22,7 @@ from mlb_backtest.config import load_config
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.sources import schedule_url
 from mlb_backtest.statcast import regular_season_ranges
+from mlb_backtest.scoring_prep import METRIC_SPECS
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini_replay"
@@ -80,6 +84,74 @@ def _prepare_through_lock(root, candidates=None):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_candidate_provenance_binds_components_raw_and_source_manifests(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            artifact = RawStore(root / "raw").put("source", {"x": 1}, b"raw\n")
+            manifest_hash = hashlib.sha256(artifact.manifest_path.read_bytes()).hexdigest()
+            features = root / "features"
+            features.mkdir()
+            raw_bytes = b'{"raw":1}\n'
+            component_bytes = b'{"component":1}\n'
+            (features / "candidate_raw_features.jsonl").write_bytes(raw_bytes)
+            (features / "candidate_components.jsonl").write_bytes(component_bytes)
+            provenance = {
+                "schema_version": 1,
+                "candidate_raw_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
+                "source_manifest_sha256s": [manifest_hash],
+            }
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            self.assertRegex(_verify_candidate_provenance(root), r"^[0-9a-f]{64}$")
+            (features / "candidate_components.jsonl").write_bytes(b"tampered\n")
+            with self.assertRaisesRegex(ValueError, "components hash"):
+                _verify_candidate_provenance(root)
+
+    def test_calibration_freezes_normalization_slots_and_source_hashes_in_v2_card(self):
+        calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
+        frozen = {
+            "schema_version": 1,
+            "normalization": {
+                component: {
+                    metric: {"mean": 0.0, "sd": 1.0, "direction": direction, "n": 6}
+                    for metric, direction in specs.items()
+                }
+                for component, specs in METRIC_SPECS.items()
+            },
+            "slot_weights": {str(i): 1 / 9 for i in range(1, 10)},
+            "source_manifest_sha256s": ["a" * 64, "b" * 64],
+            "normalization_input_sha256": "c" * 64,
+            "training_raw_count": 3,
+            "max_training_date": "2024-09-30",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _copy_raw_schedule(root)
+            _write_jsonl(root / "calibration" / "training_edges.jsonl", calibration)
+            raw_training = b'{"raw":"training"}\n'
+            (root / "calibration" / "training_raw_features.jsonl").write_bytes(raw_training)
+            source_hashes = sorted(
+                item["manifest_sha256"]
+                for item in RawStore(root / "raw").verify_manifests()
+            )
+            frozen["normalization_input_sha256"] = hashlib.sha256(raw_training).hexdigest()
+            frozen["source_manifest_sha256s"] = source_hashes
+            (root / "calibration" / "frozen_inputs.json").write_text(
+                json.dumps(frozen, sort_keys=True) + "\n", "utf-8"
+            )
+            path = calibrate_stage(CONFIG, root)
+            card = json.loads(path.read_text("utf-8"))
+            self.assertEqual(card["schema_version"], 2)
+            self.assertEqual(card["normalization"], frozen["normalization"])
+            self.assertEqual(card["slot_weights"], frozen["slot_weights"])
+            self.assertEqual(card["source_manifest_sha256s"], frozen["source_manifest_sha256s"])
+            self.assertLessEqual(card["max_training_date"], "2024-12-31")
+            _load_model_card(root, CONFIG)
+            (root / "calibration" / "training_raw_features.jsonl").write_bytes(b"tampered\n")
+            with self.assertRaisesRegex(ValueError, "normalization input hash"):
+                _load_model_card(root, CONFIG)
     def _replay(self, output):
         return run_fixture_replay(FIXTURE, Path(output))
 
@@ -256,10 +328,23 @@ class PipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink"):
                 main(["features", "--config", str(CONFIG), "--data-dir", str(root)])
 
+    def test_preparation_cli_commands_enforce_source_and_lock_boundaries(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                main(["prepare-training", "--config", str(CONFIG), "--data-dir", str(root)])
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                main(["fetch-era", "--config", str(CONFIG), "--data-dir", str(root)])
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                main(["prepare-features", "--config", str(CONFIG), "--data-dir", str(root)])
+            with self.assertRaisesRegex(RuntimeError, "lock"):
+                main(["prepare-outcomes", "--config", str(CONFIG), "--data-dir", str(root)])
+
     def test_fetch_covers_frozen_extension_end(self):
         config = load_config(CONFIG)
         expected_ranges = [
             *regular_season_ranges(config["extension_end"])[:3],
+            ("2025-03-18", "2025-04-30"),
             (config["initial_window"]["start"], config["extension_end"]),
         ]
         with tempfile.TemporaryDirectory() as td, mock.patch(
@@ -272,11 +357,16 @@ class PipelineTest(unittest.TestCase):
                 for row in RawStore(root / "raw").verify_manifests()
                 if row["manifest"]["source"] == "mlb_schedule"
             ]
-            self.assertEqual(len(schedule_queries), 4)
+            self.assertEqual(len(schedule_queries), 5)
             self.assertTrue(all(query["gameType"] == "R" for query in schedule_queries))
             self.assertEqual(
                 sorted((query["start"], query["end"]) for query in schedule_queries),
                 sorted(expected_ranges),
+            )
+            history = [query for query in schedule_queries if query["role"] == "history"]
+            self.assertEqual(
+                [(query["start"], query["end"]) for query in history],
+                [("2025-03-18", "2025-04-30")],
             )
             self.assertNotIn(
                 (config["training_window"]["start"], config["training_window"]["end"]),
@@ -290,6 +380,7 @@ class PipelineTest(unittest.TestCase):
                     schedule_url(start, end)
                     for start, end in regular_season_ranges(config["extension_end"])[:3]
                 ],
+                schedule_url("2025-03-18", "2025-04-30"),
                 schedule_url(
                     config["initial_window"]["start"],
                     config["extension_end"],

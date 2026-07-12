@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 import threading
@@ -9,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.statcast import (
+    MAX_STATCAST_BYTES,
     fetch_monthly,
     fetch_statcast_stage,
     identify_pitcher_roles,
@@ -22,6 +24,55 @@ FIXTURE = Path(__file__).parent / "fixtures" / "statcast_mini.csv"
 
 
 class StatcastTest(unittest.TestCase):
+    def test_oversized_month_is_split_deterministically_until_chunks_fit(self):
+        payload = FIXTURE.read_bytes()
+        calls = []
+
+        def fetcher(url, *, max_bytes):
+            query = parse_qs(urlsplit(url).query)
+            start = query["game_date_gt"][0]
+            end = query["game_date_lt"][0]
+            calls.append((start, end, max_bytes))
+            if (start, end) == ("2024-04-01", "2024-04-30"):
+                raise ValueError(f"response exceeds {max_bytes} bytes")
+            return payload.replace(b"2024-04-01", start.encode("ascii")).replace(
+                b"2024-04-02", start.encode("ascii")
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            artifacts = fetch_monthly(
+                store,
+                "2024-04-01",
+                "2024-04-30",
+                fetcher=fetcher,
+            )
+            queries = sorted(
+                (
+                    row["manifest"]["query"]["start"],
+                    row["manifest"]["query"]["end"],
+                )
+                for row in RawStore(Path(td)).verify_manifests()
+            )
+            known = {
+                json.dumps(row["manifest"]["query"], separators=(",", ":"), sort_keys=True): row["manifest"]["sha256"]
+                for row in RawStore(Path(td)).verify_manifests()
+            }
+            resumed = fetch_monthly(
+                store,
+                "2024-04-01",
+                "2024-04-30",
+                known_queries=known,
+                fetcher=lambda *_args, **_kwargs: self.fail("split resume should not fetch"),
+            )
+
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(len(resumed), 2)
+        self.assertEqual(
+            queries,
+            [("2024-04-01", "2024-04-15"), ("2024-04-16", "2024-04-30")],
+        )
+        self.assertEqual(calls[0], ("2024-04-01", "2024-04-30", MAX_STATCAST_BYTES))
     def test_url_uses_official_regular_season_detail_inclusive_dates(self):
         url = statcast_url("2025-05-01", "2025-05-31")
         parsed = urlsplit(url)
@@ -159,6 +210,30 @@ class StatcastTest(unittest.TestCase):
                 len(list((Path(td) / "baseball_savant_statcast").glob("*.manifest.json"))),
                 1,
             )
+
+    def test_fetch_resumes_verified_exact_query_without_network(self):
+        payload = FIXTURE.read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            first = fetch_monthly(
+                store,
+                "2024-04-01",
+                "2024-04-02",
+                fetcher=lambda _url, **_kwargs: payload,
+            )[0]
+            query = {
+                "start": "2024-04-01", "end": "2024-04-02", "game_type": "R",
+                "url": statcast_url("2024-04-01", "2024-04-02"),
+            }
+            known = {json.dumps(query, separators=(",", ":"), sort_keys=True): first.sha256}
+            resumed = fetch_monthly(
+                store,
+                "2024-04-01",
+                "2024-04-02",
+                known_queries=known,
+                fetcher=lambda *_args, **_kwargs: self.fail("network should not run"),
+            )
+            self.assertEqual([item.sha256 for item in resumed], [first.sha256])
 
     def test_fetch_rejects_bad_payload_without_raw_publication(self):
         bad_payloads = (

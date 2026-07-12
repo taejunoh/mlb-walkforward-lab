@@ -560,6 +560,19 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(velocity["baseline_sample_size"], 50)
         self.assertEqual(velocity["sample_size"], 5)
 
+    def test_starter_career_bf_counts_all_prior_rows_not_only_current_season(self):
+        rows = [
+            pa(1, "2024-09-01", 10, 301, "field_out", xwoba=0.1, outs=1),
+            pa(2, "2025-04-01", 10, 302, "field_out", xwoba=0.1, outs=1),
+            pa(3, "2025-04-02", 20, 303, "field_out", xwoba=0.1, outs=1),
+        ]
+        result = build(
+            game(),
+            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        self.assertEqual(result["home"]["starter"]["career_bf"], 2)
+        self.assertEqual(result["away"]["starter"]["career_bf"], 1)
+
     def test_velocity_falls_back_to_current_season_strictly_before_recent_five(self):
         rows = [
             pa(

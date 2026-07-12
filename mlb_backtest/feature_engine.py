@@ -488,6 +488,7 @@ def _k_minus_bb(
 def _starter_component(
     history: FeatureHistory, pitcher_id: int, target: date, league_era: float
 ) -> dict:
+    career_bf = len(history.pa_by_pitcher.get(pitcher_id, ()))
     season = [
         r
         for r in history.pa_by_pitcher.get(pitcher_id, ())
@@ -580,6 +581,7 @@ def _starter_component(
     )
     return {
         "pitcher_id": pitcher_id,
+        "career_bf": career_bf,
         "season_xwoba": _metric(xwoba, bf, starter_quality),
         "k_minus_bb": _metric(kbb, kbb_bf, _reliability(kbb_bf, 150)),
         "fip_numerator": _metric(float(numerator), season_bf, fip_quality),

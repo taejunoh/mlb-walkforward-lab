@@ -222,6 +222,8 @@ def _require_raw_schedule(
             {"start": start, "end": end}
             for start, end in regular_season_ranges(config["extension_end"])[:3]
         ]
+    elif role == "history":
+        windows = [{"start": "2025-03-18", "end": "2025-04-30"}]
     else:
         windows = [_backtest_schedule_window(config)]
     expected_queries = [
@@ -341,7 +343,7 @@ def _write_once(path: Path, content: bytes, label: str, root: Path) -> Path:
 
 
 def _load_model_card(
-    root: Path, config_path: str | Path
+    root: Path, config_path: str | Path, *, verified_catalog=None
 ) -> tuple[dict[str, object], str]:
     path = root / "calibration" / "model_card.json"
     content = _regular_bytes(path, "model card")
@@ -360,12 +362,91 @@ def _load_model_card(
         "training",
         "training_window",
     }
-    if not isinstance(card, dict) or set(card) != required:
+    v2_fields = {
+        "frozen_inputs_sha256",
+        "max_training_date",
+        "normalization",
+        "normalization_input_sha256",
+        "slot_weights",
+        "source_manifest_sha256s",
+        "training_raw_count",
+    }
+    if not isinstance(card, dict) or (
+        card.get("schema_version") == 1
+        and set(card) != required
+        or card.get("schema_version") == 2
+        and set(card) != required | v2_fields
+        or card.get("schema_version") not in {1, 2}
+    ):
         raise ValueError("model card fields are invalid")
     if card["model_version"] != "v5.1-BT" or card["protocol_phase"] != "Backtest":
         raise ValueError("model card identity is invalid")
-    if card["schema_version"] != 1:
-        raise ValueError("model card schema version is invalid")
+    config = load_config(config_path)
+    if card["schema_version"] == 2:
+        from .scoring_prep import validate_normalization
+
+        frozen = {
+            key: card[key]
+            for key in (
+                "max_training_date",
+                "normalization",
+                "normalization_input_sha256",
+                "slot_weights",
+                "source_manifest_sha256s",
+                "training_raw_count",
+            )
+        }
+        if (
+            not isinstance(frozen["normalization"], dict)
+            or set(frozen["slot_weights"]) != {str(i) for i in range(1, 10)}
+            or not math.isclose(
+                math.fsum(float(value) for value in frozen["slot_weights"].values()),
+                1.0,
+                abs_tol=1e-12,
+            )
+            or not isinstance(frozen["source_manifest_sha256s"], list)
+            or not frozen["source_manifest_sha256s"]
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in [
+                    card["frozen_inputs_sha256"],
+                    frozen["normalization_input_sha256"],
+                    *frozen["source_manifest_sha256s"],
+                ]
+            )
+            or not isinstance(frozen["training_raw_count"], int)
+            or frozen["training_raw_count"] <= 0
+            or not isinstance(frozen["max_training_date"], str)
+            or frozen["max_training_date"] > config["training_window"]["end"]
+        ):
+            raise ValueError("model card frozen inputs are invalid")
+        validate_normalization(frozen["normalization"])
+        frozen_path = root / "calibration" / "frozen_inputs.json"
+        frozen_bytes = _regular_bytes(frozen_path, "calibration/frozen_inputs.json")
+        if hashlib.sha256(frozen_bytes).hexdigest() != card["frozen_inputs_sha256"]:
+            raise ValueError("model card frozen inputs hash mismatch")
+        frozen_file = _json_object(frozen_path, "calibration/frozen_inputs.json")
+        if any(frozen_file.get(key) != value for key, value in frozen.items()):
+            raise ValueError("model card frozen inputs content mismatch")
+        training_raw = _regular_bytes(
+            root / "calibration" / "training_raw_features.jsonl",
+            "calibration/training_raw_features.jsonl",
+        )
+        if hashlib.sha256(training_raw).hexdigest() != frozen["normalization_input_sha256"]:
+            raise ValueError("model card normalization input hash mismatch")
+        catalog = (
+            RawStore(root / "raw").verify_manifests()
+            if verified_catalog is None
+            else verified_catalog
+        )
+        raw_hashes = {
+            item["manifest_sha256"]
+            for item in catalog
+        }
+        if not set(frozen["source_manifest_sha256s"]) <= raw_hashes:
+            raise ValueError("model card source manifest hash mismatch")
     if any(
         isinstance(card[field], bool)
         or not isinstance(card[field], (int, float))
@@ -373,7 +454,6 @@ def _load_model_card(
         for field in ("alpha", "beta")
     ):
         raise ValueError("model card coefficients must be finite numbers")
-    config = load_config(config_path)
     config_digest = hashlib.sha256(
         _regular_bytes(Path(config_path), "config")
     ).hexdigest()
@@ -404,6 +484,50 @@ def _load_model_card(
     return card, hashlib.sha256(content).hexdigest()
 
 
+def _verify_candidate_provenance(root: Path) -> str:
+    path = root / "features" / "candidate_provenance.json"
+    content = _regular_bytes(path, "candidate provenance")
+    provenance = _json_object(path, "candidate provenance")
+    if set(provenance) != {
+        "schema_version",
+        "candidate_raw_sha256",
+        "candidate_components_sha256",
+        "source_manifest_sha256s",
+    } or provenance["schema_version"] != 1:
+        raise ValueError("candidate provenance fields are invalid")
+    hashes = [
+        provenance["candidate_raw_sha256"],
+        provenance["candidate_components_sha256"],
+        *provenance["source_manifest_sha256s"],
+    ] if isinstance(provenance["source_manifest_sha256s"], list) else []
+    if not hashes or any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in hashes
+    ):
+        raise ValueError("candidate provenance hashes are invalid")
+    raw = _regular_bytes(
+        root / "features" / "candidate_raw_features.jsonl",
+        "candidate raw features",
+    )
+    if hashlib.sha256(raw).hexdigest() != provenance["candidate_raw_sha256"]:
+        raise ValueError("candidate raw hash mismatch")
+    components = _regular_bytes(
+        root / "features" / "candidate_components.jsonl",
+        "candidate components",
+    )
+    if hashlib.sha256(components).hexdigest() != provenance["candidate_components_sha256"]:
+        raise ValueError("candidate components hash mismatch")
+    actual = {
+        item["manifest_sha256"]
+        for item in RawStore(root / "raw").verify_manifests()
+    }
+    if not set(provenance["source_manifest_sha256s"]) <= actual:
+        raise ValueError("candidate source manifest hash mismatch")
+    return hashlib.sha256(content).hexdigest()
+
+
 def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
@@ -413,7 +537,10 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
     windows = [
         ("training", {"start": start, "end": end})
         for start, end in regular_season_ranges(config["extension_end"])[:3]
-    ] + [("backtest", _backtest_schedule_window(config))]
+    ] + [
+        ("history", {"start": "2025-03-18", "end": "2025-04-30"}),
+        ("backtest", _backtest_schedule_window(config)),
+    ]
     for role, window in windows:
         url = schedule_url(window["start"], window["end"])
         artifacts.append(
@@ -433,7 +560,7 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
 
 
 def calibrate_stage(config_path: str | Path, data_dir: str | Path) -> Path:
-    """Fit calibration from a Task 11-prepared training_edges JSONL input."""
+    """Fit calibration from the verified prepare-training JSONL input."""
     config_bytes = _regular_bytes(Path(config_path), "config")
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
@@ -465,6 +592,29 @@ def calibrate_stage(config_path: str | Path, data_dir: str | Path) -> Path:
         "training": metadata,
         "training_window": config["training_window"],
     }
+    frozen_path = calibration / "frozen_inputs.json"
+    if frozen_path.exists():
+        frozen_bytes = _regular_bytes(frozen_path, "calibration/frozen_inputs.json")
+        frozen = _json_object(frozen_path, "calibration/frozen_inputs.json")
+        required = {
+            "schema_version",
+            "normalization",
+            "slot_weights",
+            "source_manifest_sha256s",
+            "normalization_input_sha256",
+            "training_raw_count",
+            "max_training_date",
+        }
+        if set(frozen) != required or frozen["schema_version"] != 1:
+            raise ValueError("frozen inputs fields are invalid")
+        card.update(
+            {
+                key: frozen[key]
+                for key in required - {"schema_version"}
+            }
+        )
+        card["frozen_inputs_sha256"] = hashlib.sha256(frozen_bytes).hexdigest()
+        card["schema_version"] = 2
     return _write_once(calibration / "model_card.json", _canonical_json(card), "model card", root)
 
 
@@ -575,11 +725,14 @@ def _bind_candidate_to_schedule(
 
 
 def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
-    """Score a Task 11-prepared, pregame-only candidate_components JSONL input."""
+    """Score a prepare-features pregame-only candidate-components input."""
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
     _, schedule_index = _require_raw_schedule(root, config, "backtest")
     card, _ = _load_model_card(root, config_path)
+    candidate_provenance_sha = (
+        _verify_candidate_provenance(root) if card["schema_version"] == 2 else None
+    )
     features = _stage(root, "features")
     source = features / "candidate_components.jsonl"
     candidates = [_validate_candidate(row) for row in _jsonl(source, "features/candidate_components.jsonl")]
@@ -660,7 +813,65 @@ def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
             row[f"{component}_quality"] = qualities[component]
         predictions.append(row)
     predictions.sort(key=lambda row: (row["official_date"], row["scheduled_start_utc"], row["game_pk"]))
-    return _write_once(features / "scored_candidates.jsonl", _canonical_jsonl(predictions), "scored candidates", root)
+    scored_bytes = _canonical_jsonl(predictions)
+    path = _write_once(
+        features / "scored_candidates.jsonl",
+        scored_bytes,
+        "scored candidates",
+        root,
+    )
+    if candidate_provenance_sha is not None:
+        _write_once(
+            features / "scored_candidate_provenance.json",
+            _canonical_json(
+                {
+                    "schema_version": 1,
+                    "candidate_provenance_sha256": candidate_provenance_sha,
+                    "scored_candidates_sha256": hashlib.sha256(scored_bytes).hexdigest(),
+                }
+            ),
+            "scored candidate provenance",
+            root,
+        )
+    return path
+
+
+def _verify_scored_candidate_provenance(root: Path) -> str:
+    candidate_sha = _verify_candidate_provenance(root)
+    path = root / "features" / "scored_candidate_provenance.json"
+    content = _regular_bytes(path, "scored candidate provenance")
+    value = _json_object(path, "scored candidate provenance")
+    if set(value) != {
+        "schema_version",
+        "candidate_provenance_sha256",
+        "scored_candidates_sha256",
+    } or value["schema_version"] != 1:
+        raise ValueError("scored candidate provenance fields are invalid")
+    scored = _regular_bytes(
+        root / "features" / "scored_candidates.jsonl", "scored candidates"
+    )
+    if value["candidate_provenance_sha256"] != candidate_sha:
+        raise ValueError("scored candidate provenance input hash mismatch")
+    if value["scored_candidates_sha256"] != hashlib.sha256(scored).hexdigest():
+        raise ValueError("scored candidate provenance output hash mismatch")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _verify_locked_source_provenance(root: Path, locked_sha256: str) -> None:
+    scored_sha = _verify_scored_candidate_provenance(root)
+    value = _json_object(
+        root / "locked" / "source_provenance.json", "locked source provenance"
+    )
+    if set(value) != {
+        "schema_version",
+        "scored_candidate_provenance_sha256",
+        "locked_predictions_sha256",
+    } or value["schema_version"] != 1:
+        raise ValueError("locked source provenance fields are invalid")
+    if value["scored_candidate_provenance_sha256"] != scored_sha:
+        raise ValueError("locked source provenance input hash mismatch")
+    if value["locked_predictions_sha256"] != locked_sha256:
+        raise ValueError("locked source provenance output hash mismatch")
 
 
 def _rank_and_lock(
@@ -698,7 +909,12 @@ def _rank_and_lock(
 def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
-    _, model_hash = _load_model_card(root, config_path)
+    card, model_hash = _load_model_card(root, config_path)
+    scored_provenance_sha = (
+        _verify_scored_candidate_provenance(root)
+        if card["schema_version"] == 2
+        else None
+    )
     candidates = _jsonl(
         root / "features" / "scored_candidates.jsonl",
         "features/scored_candidates.jsonl",
@@ -709,9 +925,23 @@ def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, objec
         for row in candidates
         if initial["start"] <= row["official_date"] <= initial["end"]
     ]
-    return _rank_and_lock(
+    result = _rank_and_lock(
         initial_candidates, _stage(root, "locked"), model_hash
     )
+    if scored_provenance_sha is not None:
+        _write_once(
+            root / "locked" / "source_provenance.json",
+            _canonical_json(
+                {
+                    "schema_version": 1,
+                    "scored_candidate_provenance_sha256": scored_provenance_sha,
+                    "locked_predictions_sha256": result["sha256"],
+                }
+            ),
+            "locked source provenance",
+            root,
+        )
+    return result
 
 
 def _require_complete_outcomes(
@@ -768,9 +998,14 @@ def _join_complete_outcomes(
 def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     load_config(config_path)
     root = _safe_data_dir(data_dir)
-    _, model_hash = _load_model_card(root, config_path)
+    card, model_hash = _load_model_card(root, config_path)
     locked_manifest = root / "locked" / "lock_manifest.json"
     _regular_bytes(locked_manifest, "locked/lock_manifest.json")
+    if card["schema_version"] == 2:
+        from .outcomes import _load_lock
+
+        lock_metadata, _locked = _load_lock(locked_manifest, model_hash)
+        _verify_locked_source_provenance(root, lock_metadata["sha256"])
     outcome_root = _stage(root, "outcomes")
     rows = _jsonl(outcome_root / "outcomes_input.jsonl", "outcomes/outcomes_input.jsonl")
     return _join_complete_outcomes(
@@ -786,7 +1021,14 @@ def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
 def report_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
     load_config(config_path)
     root = _safe_data_dir(data_dir)
-    _, model_hash = _load_model_card(root, config_path)
+    card, model_hash = _load_model_card(root, config_path)
+    if card["schema_version"] == 2:
+        from .outcomes import _load_lock
+
+        lock_metadata, _locked = _load_lock(
+            root / "locked" / "lock_manifest.json", model_hash
+        )
+        _verify_locked_source_provenance(root, lock_metadata["sha256"])
     evaluated_path = root / "outcomes" / "evaluated" / "evaluated_predictions.jsonl"
     evaluated = _jsonl(evaluated_path, "evaluated predictions")
     _require_complete_outcomes(
@@ -1010,17 +1252,22 @@ def _parser() -> argparse.ArgumentParser:
         description="Run deterministic backtest stages over prepared JSONL inputs.",
         epilog=(
             "calibrate and features require immutable raw schedule manifests. "
-            "Preparing training_edges.jsonl and candidate_components.jsonl is "
-            "the upstream Task 11 contract, not feature extraction performed here."
+            "Run fetch, fetch-statcast, fetch-era, prepare-training, calibrate, "
+            "prepare-features, features, lock, prepare-outcomes, outcomes, report."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in (
         "fetch",
         "fetch-statcast",
+        "fetch-era",
+        "prepare-training",
         "calibrate",
+        "prepare-candidates",
+        "prepare-features",
         "features",
         "lock",
+        "prepare-outcomes",
         "outcomes",
         "report",
     ):
@@ -1033,13 +1280,24 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     from .statcast import fetch_statcast_stage
+    from .model_prep import (
+        fetch_league_era_stage,
+        prepare_candidates_stage,
+        prepare_outcomes_stage,
+        prepare_training_stage,
+    )
 
     commands = {
         "fetch": fetch_stage,
         "fetch-statcast": fetch_statcast_stage,
+        "fetch-era": fetch_league_era_stage,
+        "prepare-training": prepare_training_stage,
         "calibrate": calibrate_stage,
+        "prepare-candidates": prepare_candidates_stage,
+        "prepare-features": prepare_candidates_stage,
         "features": features_stage,
         "lock": lock_stage,
+        "prepare-outcomes": prepare_outcomes_stage,
         "outcomes": outcomes_stage,
         "report": report_stage,
     }
