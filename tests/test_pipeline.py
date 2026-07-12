@@ -479,34 +479,52 @@ class PipelineTest(unittest.TestCase):
                 fetcher=lambda _url: b'{"stats":[]}',
                 sleeper=lambda _delay: None,
             )
-            schedule_digest = next(
-                item["manifest_sha256"]
+            store.put(
+                "mlb_schedule",
+                {
+                    "role": "history",
+                    "start": "2025-03-18",
+                    "end": "2025-04-30",
+                    "gameType": "R",
+                    "url": schedule_url("2025-03-18", "2025-04-30"),
+                },
+                b'{"dates":[]}',
+            )
+            candidate_games = (
+                {
+                    **candidate_game,
+                    "status": "Final",
+                    "final_outs": 3,
+                },
+            )
+            schedule_digests = {
+                item["manifest"]["query"]["role"]: item["manifest_sha256"]
                 for item in store.verify_manifests()
                 if item["manifest"].get("source") == "mlb_schedule"
+                and item["manifest"]["query"].get("role") in {"history", "backtest"}
+            }
+            history_evidence = SimpleNamespace(
+                manifest_sha256=schedule_digests["history"], games=candidate_games
             )
-            candidate_evidence = SimpleNamespace(
-                manifest_sha256=schedule_digest,
-                games=(
-                    {
-                        **candidate_game,
-                        "status": "Final",
-                        "final_outs": 3,
-                    },
-                ),
+            backtest_evidence = SimpleNamespace(
+                manifest_sha256=schedule_digests["backtest"], games=candidate_games
             )
             combined_history = SimpleNamespace(
                 provenance={
                     "coverage_start": "2025-03-18",
                     "coverage_end": config["extension_end"],
                     "coverage_complete": True,
-                    "source_manifest_sha256s": [schedule_digest, schedule_digest],
+                    "source_manifest_sha256s": [
+                        schedule_digests["history"],
+                        schedule_digests["backtest"],
+                    ],
                     "children": tuple(
                         {
                             "role": role,
                             "coverage_start": start,
                             "coverage_end": end,
                             "coverage_complete": True,
-                            "source_manifest_sha256": schedule_digest,
+                            "source_manifest_sha256": schedule_digests[role],
                             "played_game_count": 1,
                             "excluded_schedule_date_count": 0,
                             "excluded_schedule_date_game_pks": (),
@@ -523,7 +541,7 @@ class PipelineTest(unittest.TestCase):
             with (
                 mock.patch(
                     "mlb_backtest.model_prep._schedule_evidence",
-                    return_value=candidate_evidence,
+                    side_effect=(history_evidence, backtest_evidence),
                 ),
                 mock.patch(
                     "mlb_backtest.prepare.derive_team_code_map",
@@ -564,8 +582,40 @@ class PipelineTest(unittest.TestCase):
     def test_candidate_provenance_binds_components_raw_and_source_manifests(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            artifact = RawStore(root / "raw").put("source", {"x": 1}, b"raw\n")
-            manifest_hash = hashlib.sha256(artifact.manifest_path.read_bytes()).hexdigest()
+            store = RawStore(root / "raw")
+            schedule_sources = []
+            for role, start, end in (
+                ("history", "2025-03-18", "2025-04-30"),
+                ("backtest", "2025-05-01", "2025-09-28"),
+            ):
+                artifact = store.put(
+                    "mlb_schedule",
+                    {
+                        "role": role,
+                        "start": start,
+                        "end": end,
+                        "gameType": "R",
+                        "url": schedule_url(start, end),
+                    },
+                    f"{role}\n".encode("ascii"),
+                )
+                schedule_sources.append(
+                    hashlib.sha256(artifact.manifest_path.read_bytes()).hexdigest()
+                )
+            gapped_artifact = store.put(
+                "mlb_schedule",
+                {
+                    "role": "backtest",
+                    "start": "2025-05-02",
+                    "end": "2025-09-28",
+                    "gameType": "R",
+                    "url": schedule_url("2025-05-02", "2025-09-28"),
+                },
+                b"gapped backtest\n",
+            )
+            gapped_hash = hashlib.sha256(
+                gapped_artifact.manifest_path.read_bytes()
+            ).hexdigest()
             features = root / "features"
             features.mkdir()
             raw_bytes = b'{"raw":1}\n'
@@ -576,12 +626,12 @@ class PipelineTest(unittest.TestCase):
                 "schema_version": 2,
                 "candidate_raw_sha256": hashlib.sha256(raw_bytes).hexdigest(),
                 "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
-                "source_manifest_sha256s": [manifest_hash],
+                "source_manifest_sha256s": list(schedule_sources),
                 "schedule_history": {
                     "coverage_start": "2025-03-18",
                     "coverage_end": "2025-09-28",
                     "coverage_complete": True,
-                    "source_manifest_sha256s": [manifest_hash, manifest_hash],
+                    "source_manifest_sha256s": list(schedule_sources),
                     "children": [
                         {
                             "role": role,
@@ -595,9 +645,13 @@ class PipelineTest(unittest.TestCase):
                             "excluded_statcast_date_count": 0,
                             "excluded_statcast_date_game_pks": [],
                         }
-                        for role, start, end in (
-                            ("history", "2025-03-18", "2025-04-30"),
-                            ("backtest", "2025-05-01", "2025-09-28"),
+                        for (role, start, end), manifest_hash in zip(
+                            (
+                                ("history", "2025-03-18", "2025-04-30"),
+                                ("backtest", "2025-05-01", "2025-09-28"),
+                            ),
+                            schedule_sources,
+                            strict=True,
                         )
                     ],
                 },
@@ -606,6 +660,62 @@ class PipelineTest(unittest.TestCase):
                 json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
             )
             self.assertRegex(_verify_candidate_provenance(root), r"^[0-9a-f]{64}$")
+            provenance["schedule_history"]["children"][0][
+                "source_manifest_sha256"
+            ] = "f" * 64
+            provenance["schedule_history"]["source_manifest_sha256s"][0] = "f" * 64
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule history"):
+                _verify_candidate_provenance(root)
+            provenance["schedule_history"]["children"][0][
+                "source_manifest_sha256"
+            ] = schedule_sources[0]
+            provenance["schedule_history"]["source_manifest_sha256s"][0] = schedule_sources[0]
+            provenance["schedule_history"]["children"][0]["coverage_end"] = (
+                "2025-04-29"
+            )
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule history"):
+                _verify_candidate_provenance(root)
+            provenance["schedule_history"]["children"][0]["coverage_end"] = (
+                "2025-04-30"
+            )
+            provenance["source_manifest_sha256s"][1] = gapped_hash
+            provenance["schedule_history"]["source_manifest_sha256s"][1] = gapped_hash
+            provenance["schedule_history"]["children"][1].update(
+                coverage_start="2025-05-02",
+                source_manifest_sha256=gapped_hash,
+            )
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule history ranges"):
+                _verify_candidate_provenance(root)
+            provenance["source_manifest_sha256s"][1] = schedule_sources[1]
+            provenance["schedule_history"]["source_manifest_sha256s"][1] = (
+                schedule_sources[1]
+            )
+            provenance["schedule_history"]["children"][1].update(
+                coverage_start="2025-05-01",
+                source_manifest_sha256=schedule_sources[1],
+            )
+            provenance["schedule_history"].update(
+                coverage_start="2025-03-17",
+                coverage_end="2025-09-29",
+            )
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule history aggregation"):
+                _verify_candidate_provenance(root)
+            provenance["schedule_history"].update(
+                coverage_start="2025-03-18",
+                coverage_end="2025-09-28",
+            )
             provenance["schedule_history"]["children"][0][
                 "excluded_statcast_date_count"
             ] = 1

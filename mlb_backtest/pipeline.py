@@ -586,6 +586,7 @@ def _verify_candidate_provenance(root: Path) -> str:
         raise ValueError("candidate schedule history coverage is invalid")
     child_hashes = []
     child_completeness = []
+    child_ranges = []
     for child in children:
         if set(child) != child_fields:
             raise ValueError("candidate schedule history child fields are invalid")
@@ -621,8 +622,20 @@ def _verify_candidate_provenance(root: Path) -> str:
             raise ValueError("candidate schedule history completeness is invalid")
         child_hashes.append(child["source_manifest_sha256"])
         child_completeness.append(child["coverage_complete"])
+        child_ranges.append(
+            (date.fromisoformat(child_start), date.fromisoformat(child_end))
+        )
+    if any(
+        right_start != left_end + timedelta(days=1)
+        for (_, left_end), (right_start, _) in zip(
+            child_ranges, child_ranges[1:]
+        )
+    ):
+        raise ValueError("candidate schedule history ranges are invalid")
     if (
-        schedule["source_manifest_sha256s"] != child_hashes
+        coverage_start != child_ranges[0][0].isoformat()
+        or coverage_end != child_ranges[-1][1].isoformat()
+        or schedule["source_manifest_sha256s"] != child_hashes
         or schedule["coverage_complete"] != all(child_completeness)
     ):
         raise ValueError("candidate schedule history aggregation is invalid")
@@ -651,11 +664,29 @@ def _verify_candidate_provenance(root: Path) -> str:
     )
     if hashlib.sha256(components).hexdigest() != provenance["candidate_components_sha256"]:
         raise ValueError("candidate components hash mismatch")
-    actual = {
-        item["manifest_sha256"]
-        for item in RawStore(root / "raw").verify_manifests()
-    }
-    if not set(provenance["source_manifest_sha256s"]) <= actual:
+    verified_manifests = RawStore(root / "raw").verify_manifests()
+    manifests_by_sha: defaultdict[str, list] = defaultdict(list)
+    for item in verified_manifests:
+        manifests_by_sha[item["manifest_sha256"]].append(item["manifest"])
+    top_level_hashes = set(provenance["source_manifest_sha256s"])
+    for child in children:
+        child_hash = child["source_manifest_sha256"]
+        bound = manifests_by_sha.get(child_hash, [])
+        expected_query = {
+            "role": child["role"],
+            "start": child["coverage_start"],
+            "end": child["coverage_end"],
+            "gameType": "R",
+            "url": schedule_url(child["coverage_start"], child["coverage_end"]),
+        }
+        if (
+            child_hash not in top_level_hashes
+            or len(bound) != 1
+            or bound[0].get("source") != "mlb_schedule"
+            or bound[0].get("query") != expected_query
+        ):
+            raise ValueError("candidate schedule history manifest is invalid")
+    if not top_level_hashes <= set(manifests_by_sha):
         raise ValueError("candidate source manifest hash mismatch")
     return hashlib.sha256(content).hexdigest()
 
