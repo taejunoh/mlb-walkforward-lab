@@ -19,7 +19,7 @@ The diagnostic must be reproducible from these repository files:
 - `data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl`: all 1,340 locked candidates joined to official outcomes.
 - `data/v5_1_bt/reports/summary.json`: primary, subgroup, calibration, monthly, team, baseline, and market summaries.
 - `data/v5_1_bt/outcomes/baseline.json`: D-1 higher-season-win-percentage winner by `gamePk`.
-- `data/v5_1_bt/locked/predictions.jsonl` and `data/v5_1_bt/locked/lock_manifest.json`: sealed pre-outcome predictions and hashes.
+- `data/v5_1_bt/locked/predictions.jsonl` and `data/v5_1_bt/locked/lock_manifest.json`: sealed prediction-only rows and hashes.
 - `audit/v5_1_bt/lock_manifest.json`: audited hashes, completion counts, and outcome/result hashes.
 - `audit/v5_1_bt/model_card.json`: training boundary, normalization, calibration, weights, and immutable input hashes.
 - `data/v5_1_bt/features/candidate_raw_features.jsonl`: D-1 raw features and participant provenance.
@@ -361,7 +361,7 @@ The design is implemented only when all of the following are proven by current a
 - The historical run contains exactly 500 unique graded Daily Top 1 dates from 2022-2024, follows the fixed H22/H23/H24 chronology, applies the frozen terminal deadline, extends only for documented VOID/no-eligible/system-miss dates, and never enters 2025.
 - The historical report carries every baseline, metric, limitation, and the label `Historical Walk-forward Robustness`; it never claims official independent 500-pick confirmation.
 - The prospective ledger begins no earlier than 2026-07-13, uses the exact 2019-2024 OOF calibration contract, satisfies the frozen clock/cadence/freshness rules, seals an immutable observable-at-lock start basis, never re-locks after schedule revision, ranks only timestamp-verified T-45 candidates, stays separate, never backfills misses, and labels interim results as incomplete.
-- Leakage evidence gates preserve the two proven `PASS` subchecks, the aggregate `LIMITATION`, and `NOT_TIMESTAMP_PROVEN` lock-to-outcome-join sequence without promotion; replay, hash, error-handling, paired-metric, workbook, and visual verification gates pass with preserved evidence.
+- For the v5.1 100-pick diagnostic only, leakage evidence gates preserve the two proven `PASS` subchecks, the aggregate `LIMITATION`, and `NOT_TIMESTAMP_PROVEN` lock-to-outcome-join sequence without promotion. The historical and prospective v5.2 runs must independently prove their own pre-outcome sealing and post-lock outcome join from their run manifests and timestamps; the v5.1 limitation cannot be inherited as acceptable evidence for either run. Replay, hash, error-handling, paired-metric, workbook, and visual verification gates pass with preserved evidence.
 - No unsupported market, ROI, CLV, profitability, actionable-betting, or predictive-improvement claim appears in any artifact.
 
 Failure of any hard integrity criterion invalidates the affected run; it cannot be repaired by favorable results or presentation changes.

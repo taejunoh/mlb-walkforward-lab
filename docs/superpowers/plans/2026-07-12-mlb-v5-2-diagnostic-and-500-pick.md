@@ -478,29 +478,37 @@ class DiagnosticGoldenTest(unittest.TestCase):
         self.assertEqual(statistical["d1_feature_isolation_status"], "PASS")
         self.assertEqual(statistical["locked_row_outcome_field_isolation_status"], "PASS")
         self.assertEqual(statistical["lock_to_outcome_join_sequence_status"], "NOT_TIMESTAMP_PROVEN")
+        self.assertEqual(statistical["candidate_rows"], 1972)
+        self.assertEqual(statistical["locked_prediction_rows"], 1340)
+        self.assertEqual(statistical["evaluated_prediction_rows"], 1340)
         self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
         self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
 
     def test_leakage_evidence_tampering_fails(self):
-        evidence = load_v51_evidence(ROOT); raw = jsonable(read_jsonl(ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl")[0])
-        locked = jsonable(read_jsonl(ROOT / "data/v5_1_bt/locked/predictions.jsonl")[0])
-        evaluated = jsonable(read_jsonl(ROOT / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl")[0])
-        card = jsonable(evidence.model_card); card["counts"]["candidate_rows"] = 1
+        evidence = load_v51_evidence(ROOT)
+        candidate_rows = jsonable(read_jsonl(ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl"))
+        locked_rows = jsonable(read_jsonl(ROOT / "data/v5_1_bt/locked/predictions.jsonl"))
+        evaluated_rows = jsonable(read_jsonl(ROOT / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl"))
+        card = jsonable(evidence.model_card)
         manual = (ROOT / "audit/v5_1_bt/manual_audit.md").read_text()
         for mutate in (lambda x: x["provenance"].__setitem__("max_history_date", x["official_date"]),
                        lambda x: x["provenance"].__setitem__("statcast_target_excluded", False),
                        lambda x: x.__setitem__("lineup_provenance", "TIMESTAMP_VERIFIED_T45")):
-            changed = copy.deepcopy(raw); mutate(changed)
+            changed = copy.deepcopy(candidate_rows); mutate(changed[0])
             with self.assertRaisesRegex(ValueError, "leakage evidence"):
-                audit_leakage_evidence((changed,), (locked,), (evaluated,), card, manual)
-        outcome_in_lock = copy.deepcopy(locked); outcome_in_lock["outcome"] = evaluated["outcome"]
+                audit_leakage_evidence(changed, locked_rows, evaluated_rows, card, manual)
+        outcome_in_lock = copy.deepcopy(locked_rows); outcome_in_lock[0]["outcome"] = evaluated_rows[0]["outcome"]
         with self.assertRaisesRegex(ValueError, "locked-row outcome isolation"):
-            audit_leakage_evidence((raw,), (outcome_in_lock,), (evaluated,), card, manual)
-        changed_evaluated = copy.deepcopy(evaluated); changed_evaluated["predicted_winner"] = "tampered"
+            audit_leakage_evidence(candidate_rows, outcome_in_lock, evaluated_rows, card, manual)
+        changed_evaluated = copy.deepcopy(evaluated_rows); changed_evaluated[0]["predicted_winner"] = "tampered"
         with self.assertRaisesRegex(ValueError, "evaluated prediction binding"):
-            audit_leakage_evidence((raw,), (locked,), (changed_evaluated,), card, manual)
+            audit_leakage_evidence(candidate_rows, locked_rows, changed_evaluated, card, manual)
+        missing_candidate = [row for row in candidate_rows if int(row["game_pk"]) != int(locked_rows[0]["game_pk"])]
+        missing_card = copy.deepcopy(card); missing_card["counts"]["candidate_rows"] = len(missing_candidate)
+        with self.assertRaisesRegex(ValueError, "locked candidate binding"):
+            audit_leakage_evidence(missing_candidate, locked_rows, evaluated_rows, missing_card, manual)
         with self.assertRaisesRegex(ValueError, "manual audit evidence"):
-            audit_leakage_evidence((raw,), (locked,), (evaluated,), card, manual.replace("2025-06-15", "missing"))
+            audit_leakage_evidence(candidate_rows, locked_rows, evaluated_rows, card, manual.replace("2025-06-15", "missing"))
 ```
 
 Also assert all eight chosen-side means literally:
@@ -695,7 +703,7 @@ def quality_diagnostic(rows: Sequence[Mapping[str, object]], card: Mapping[str, 
 def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], locked_rows: Sequence[Mapping[str, object]],
                            evaluated_rows: Sequence[Mapping[str, object]], card: Mapping[str, object], manual_text: str) -> dict[str, object]:
     if len(candidate_rows) != int(card["counts"]["candidate_rows"]): raise ValueError("leakage evidence candidate count differs")
-    if len(locked_rows) != len(candidate_rows) or len(evaluated_rows) != len(locked_rows): raise ValueError("leakage evidence row count differs")
+    if len(locked_rows) != 1340 or len(evaluated_rows) != 1340: raise ValueError("leakage evidence locked/evaluated count differs")
     for row in candidate_rows:
         provenance = row["provenance"]; target = date.fromisoformat(str(row["official_date"]));
         if date.fromisoformat(str(provenance["max_history_date"])) >= target or date.fromisoformat(str(provenance["schedule_used_max_date"])) >= target or provenance["statcast_target_excluded"] is not True:
@@ -706,16 +714,20 @@ def audit_leakage_evidence(candidate_rows: Sequence[Mapping[str, object]], locke
     if any(token not in manual_text for token in required_manual): raise ValueError("manual audit evidence incomplete")
     if int(card["counts"]["training_eligible_rows"]) != int(card["counts"]["calibration_rows"]): raise ValueError("calibration pool evidence differs")
     outcome_fields = {"outcome", "actual_winner", "correct", "result", "home_score", "away_score"}
+    candidate_keys = {(int(row["game_pk"]), str(row["official_date"])) for row in candidate_rows}
+    if len(candidate_keys) != len(candidate_rows): raise ValueError("leakage evidence duplicate candidate key")
     locked_by_key = {(int(row["game_pk"]), str(row["official_date"]), int(row["daily_rank"])): row for row in locked_rows}
     evaluated_by_key = {(int(row["game_pk"]), str(row["official_date"]), int(row["daily_rank"])): row for row in evaluated_rows}
     if len(locked_by_key) != len(locked_rows) or set(locked_by_key) != set(evaluated_by_key): raise ValueError("evaluated prediction binding differs")
+    if not {(game_pk, official_date) for game_pk, official_date, _ in locked_by_key} <= candidate_keys:
+        raise ValueError("locked candidate binding differs")
     for key, locked in locked_by_key.items():
         if outcome_fields & set(locked): raise ValueError("locked-row outcome isolation violated")
         evaluated = evaluated_by_key[key]
         if set(evaluated) != set(locked) | {"outcome"} or any(evaluated.get(field) != value for field, value in locked.items()):
             raise ValueError("evaluated prediction binding differs")
     later_revision_rows = sum(str(row["provenance"]["raw_source_max_date"]) > str(row["official_date"]) for row in candidate_rows)
-    return {"statistical_as_of_safety": {"status": "LIMITATION", "d1_feature_isolation_status": "PASS", "locked_row_outcome_field_isolation_status": "PASS", "lock_to_outcome_join_sequence_status": "NOT_TIMESTAMP_PROVEN", "candidate_rows": len(candidate_rows), "rule": "D-1 feature history and target Statcast exclusion are proven; locked prediction fields bind to evaluated rows without outcome fields; outcome-join execution timestamp is absent", "calibration_status": "IN_SAMPLE_NOT_OOF", "training_eligible_rows": card["counts"]["training_eligible_rows"], "calibration_rows": card["counts"]["calibration_rows"]},
+    return {"statistical_as_of_safety": {"status": "LIMITATION", "d1_feature_isolation_status": "PASS", "locked_row_outcome_field_isolation_status": "PASS", "lock_to_outcome_join_sequence_status": "NOT_TIMESTAMP_PROVEN", "candidate_rows": len(candidate_rows), "locked_prediction_rows": len(locked_rows), "evaluated_prediction_rows": len(evaluated_rows), "rule": "D-1 feature history and target Statcast exclusion are proven; locked prediction fields bind to evaluated rows without outcome fields; outcome-join execution timestamp is absent", "calibration_status": "IN_SAMPLE_NOT_OOF", "training_eligible_rows": card["counts"]["training_eligible_rows"], "calibration_rows": card["counts"]["calibration_rows"]},
             "participant_time_limitation": {"status": "LIMITATION", "lineup": "RECONSTRUCTED_FINAL_LINEUP", "starter": "RECONSTRUCTED_ACTUAL_STARTER"},
             "source_revision_limitation": {"status": "LIMITATION", "later_revision_rows": later_revision_rows, "rule": "manifest hashes bind retrieved provider state, not historical database state"}}
 
@@ -770,6 +782,9 @@ class DiagnosticReportTest(unittest.TestCase):
             self.assertIn("4 대 3", report)
             self.assertIn("추가 예측 우위는 입증되지 않았다", report)
             self.assertIn("실제 T-45 재현성을 입증하지 않는다", report)
+            self.assertIn("통계 as-of 집계 상태는 `LIMITATION`", report)
+            self.assertIn("잠금→결과 결합 순서는 `NOT_TIMESTAMP_PROVEN`", report)
+            self.assertIn("outcome-join 실행 타임스탬프가 없다", report)
             for forbidden in ("ROI가 양수", "CLV가 양수", "수익성이 입증", "시장 대비 우위가 입증"):
                 self.assertNotIn(forbidden, report)
 
@@ -840,7 +855,7 @@ def render_markdown(d: Mapping[str, object]) -> str:
         "## 일별 순위\n\nRank 1/2/3은 67/100, 60/100, 59/100이고 Rank 1 대 2/3 exact McNemar p는 0.349/0.291이다.",
         "## 시간·팀 집중\n\n5월 21/31, 6월 22/30, 7월 14/27, 8월 10/12다. 7월 대 나머지 Fisher p=0.0589는 불안정성 증거이지 체제 발견이 아니다. 23개 팀 중 상위 6개가 57%이며 팀별 Wilson 구간은 작은 셀의 불확실성을 보인다.",
         "## 컴포넌트\n\n" + components + "\n\n불펜 절대 edge 하/상위 절반은 74%/60%, signed 불펜 edge–결과 ρ=-0.151, p=0.135다. 이는 prior-season 가설이지 재가중 근거가 아니다.",
-        "## 데이터 품질·누수\n\nTop 1 전부 INCOMPLETE/High/Toss-up이고 수비·환경은 50, quality 0이다. D-1/target-game 배제는 통과했지만 참가자는 사후 최종 기록이고 공급자 수정 상태도 과거 DB 스냅샷이 아니다. 7,265경기 동일 pool의 α/β는 rolling-origin OOF가 아니다.",
+        "## 데이터 품질·누수\n\nTop 1 전부 INCOMPLETE/High/Toss-up이고 수비·환경은 50, quality 0이다. D-1/target-game 배제와 잠금 행의 outcome 필드 부재·평가 예측 필드 결합은 확인됐다. 그러나 outcome-join 실행 타임스탬프가 없다. 따라서 v5.1 100픽 진단의 통계 as-of 집계 상태는 `LIMITATION`이고 잠금→결과 결합 순서는 `NOT_TIMESTAMP_PROVEN`이다. 참가자는 사후 최종 기록이고 공급자 수정 상태도 과거 DB 스냅샷이 아니다. 7,265경기 동일 pool의 α/β는 rolling-origin OOF가 아니다.",
         "## 권고\n\nv5.2-QD는 예측 구조를 유지하고 데이터 완전성 의미와 OOF 보정만 동결한다. 역사 500과 실제 T-45 prospective ledger를 분리한다.",
         "## 추가 질문\n\n2018–2021 원천을 동일 정의로 복구할 수 있는가? 참가자 feed가 T-45 freshness 계약을 충족하는가?",
         "## 한계와 가정\n\n독립 전향 검증, 시장 우위, ROI, CLV, 수익성, actionable betting 또는 v5.2 예측력 개선을 주장하지 않는다.",
