@@ -320,6 +320,7 @@ PROSPECTIVE_REQUIRED_KEYS = frozenset(
         "participant_provenance",
         "official_pool",
         "shadow_pool",
+        "outcome_isolation",
         "date_state_precedence",
         "terminal_contract",
         "milestones",
@@ -776,6 +777,19 @@ def expected_prospective_spec() -> dict[str, object]:
                 "TIMESTAMP_PARTIAL_T45:LATE_RESCHEDULE_UNVERIFIED"
             ),
             "postlock_mutable_field": "latest_effective_start_utc",
+            "postlock_start_change": {
+                "event": "POSTLOCK_START_CHANGE",
+                "trigger": (
+                    "latest_effective_start_utc_differs_from_"
+                    "lock_basis_start_utc"
+                ),
+                "write_mode": "append_immutable_audit_event",
+                "latest_effective_start_utc_update": (
+                    "only_by_appending_POSTLOCK_START_CHANGE"
+                ),
+                "rewrite_forbidden": True,
+                "delete_forbidden": True,
+            },
             "immutable_fields": [
                 "lock_basis_start_utc",
                 "lock_at_utc",
@@ -796,6 +810,10 @@ def expected_prospective_spec() -> dict[str, object]:
         "official_pool": {
             "provenance": "TIMESTAMP_VERIFIED_T45",
             "rank_field": "official_rank",
+            "eligible_only": True,
+            "ranking": list(V52_RANKING),
+            "ranking_after": "all_final_verified_t45_candidate_locks_sealed",
+            "incomplete_or_unverified_rows_affect_rank": False,
             "partial_rows_affect_rank": False,
             "p_home_equal_half_official": False,
         },
@@ -803,6 +821,14 @@ def expected_prospective_spec() -> dict[str, object]:
             "provenance": "TIMESTAMP_PARTIAL_T45",
             "rank_field": "shadow_rank",
             "tier": "UNRATED",
+        },
+        "outcome_isolation": {
+            "locked_namespace": "data/v5_2_qd/prospective_2026/locked",
+            "outcomes_namespace": "data/v5_2_qd/prospective_2026/outcomes",
+            "feature_and_lock_import_outcomes": False,
+            "prediction_ranking_lock_outcome_store_access": False,
+            "join_after_all_final_verified_candidate_locks_sealed": True,
+            "locked_prediction_rewrite_forbidden": True,
         },
         "date_state_precedence": list(PROSPECTIVE_DATE_PRECEDENCE),
         "terminal_contract": json.loads(canonical_json_bytes(HISTORICAL_TERMINAL)),

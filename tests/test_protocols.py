@@ -130,6 +130,82 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertTrue(spec.raw["backfill_forbidden"])
         self.assertTrue(spec.raw["pooling_forbidden"])
 
+    def test_postlock_start_change_is_append_only_and_cannot_rewrite_lock(self):
+        changes = load_prospective_spec(PROSPECTIVE_SPEC).raw["schedule_changes"]
+        event = changes["postlock_start_change"]
+        self.assertEqual(event["event"], "POSTLOCK_START_CHANGE")
+        self.assertEqual(
+            event["trigger"],
+            "latest_effective_start_utc_differs_from_lock_basis_start_utc",
+        )
+        self.assertEqual(event["write_mode"], "append_immutable_audit_event")
+        self.assertEqual(
+            event["latest_effective_start_utc_update"],
+            "only_by_appending_POSTLOCK_START_CHANGE",
+        )
+        self.assertTrue(event["rewrite_forbidden"])
+        self.assertTrue(event["delete_forbidden"])
+        self.assertTrue(changes["relock_forbidden"])
+        self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
+
+    def test_prospective_outcomes_are_inaccessible_until_all_locks_are_sealed(self):
+        isolation = load_prospective_spec(PROSPECTIVE_SPEC).raw["outcome_isolation"]
+        self.assertEqual(
+            isolation["locked_namespace"],
+            "data/v5_2_qd/prospective_2026/locked",
+        )
+        self.assertEqual(
+            isolation["outcomes_namespace"],
+            "data/v5_2_qd/prospective_2026/outcomes",
+        )
+        self.assertFalse(isolation["feature_and_lock_import_outcomes"])
+        self.assertFalse(
+            isolation["prediction_ranking_lock_outcome_store_access"]
+        )
+        self.assertTrue(
+            isolation["join_after_all_final_verified_candidate_locks_sealed"]
+        )
+        self.assertTrue(isolation["locked_prediction_rewrite_forbidden"])
+
+    def test_official_ranking_is_frozen_verified_eligible_only_and_post_lock(self):
+        pool = load_prospective_spec(PROSPECTIVE_SPEC).raw["official_pool"]
+        self.assertTrue(pool["eligible_only"])
+        self.assertEqual(
+            pool["ranking"],
+            (
+                "pick_probability_desc",
+                "data_completeness_score_desc",
+                "absolute_starter_edge_desc",
+                "lock_basis_start_utc_asc",
+                "gamePk_asc",
+            ),
+        )
+        self.assertEqual(
+            pool["ranking_after"],
+            "all_final_verified_t45_candidate_locks_sealed",
+        )
+        self.assertFalse(pool["incomplete_or_unverified_rows_affect_rank"])
+        self.assertFalse(pool["partial_rows_affect_rank"])
+
+    def test_new_isolation_ranking_and_postlock_literals_reject_tampering(self):
+        raw = json.loads(PROSPECTIVE_SPEC.read_text())
+        mutations = (
+            lambda value: value["schedule_changes"]["postlock_start_change"].__setitem__(
+                "rewrite_forbidden", False
+            ),
+            lambda value: value["outcome_isolation"].__setitem__(
+                "feature_and_lock_import_outcomes", True
+            ),
+            lambda value: value["official_pool"]["ranking"].reverse(),
+            lambda value: value["official_pool"].__setitem__("eligible_only", False),
+        )
+        for mutate in mutations:
+            changed = copy.deepcopy(raw)
+            mutate(changed)
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, "prospective spec differs"):
+                    parse_prospective_spec(changed)
+
     def test_evidence_gate_is_exact_and_historical_rows_are_forbidden(self):
         gate = load_prospective_spec(PROSPECTIVE_SPEC).raw["evidence_gate"]
         self.assertTrue(gate["all_integrity_gates_pass"])
