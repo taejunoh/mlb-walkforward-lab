@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import re
 from collections import Counter, defaultdict
@@ -54,8 +54,8 @@ class VerifiedStatcastEvidence:
     manifest_sha256s: tuple[str, ...]
     payload_sha256s: tuple[str, ...]
     coverage_ranges: tuple[tuple[str, str], ...]
-    pitches: tuple[dict[str, object], ...]
-    plate_appearances: tuple[dict[str, object], ...]
+    plate_appearances: tuple["SlotPA", ...]
+    plate_appearance_count: int
     normalized_statcast_sha256: str
 
     def __init__(self, *_args, **_kwargs) -> None:
@@ -69,6 +69,37 @@ class VerifiedStatcastEvidence:
         for field, value in values.items():
             object.__setattr__(instance, field, value)
         return instance
+
+
+@dataclass(frozen=True, slots=True)
+class SlotPA:
+    game_pk: int
+    game_date: str
+    at_bat_number: int
+    batter_id: int
+    inning_topbot: str
+    game_type: str
+
+
+def _slot_pa_digest(rows: Iterable[SlotPA]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        encoded = json.dumps(
+            {
+                "at_bat_number": row.at_bat_number,
+                "batter_id": row.batter_id,
+                "game_date": row.game_date,
+                "game_pk": row.game_pk,
+                "game_type": row.game_type,
+                "inning_topbot": row.inning_topbot,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -266,7 +297,7 @@ def load_verified_statcast_evidence(
     raw_root: str | Path, manifest_paths: Iterable[str | Path]
 ) -> VerifiedStatcastEvidence:
     """Bind verified Statcast manifests to one immutable normalized snapshot."""
-    from .statcast import parse_statcast, statcast_url
+    from .statcast import iter_statcast_pitches, statcast_url
 
     if isinstance(manifest_paths, (str, bytes, Path)):
         raise ValueError("manifest_paths must be an iterable of manifest paths")
@@ -284,12 +315,13 @@ def load_verified_statcast_evidence(
     if len(selected) != len(requested):
         raise ValueError("every Statcast manifest path must be verified by RawStore")
     ranges = []
-    pitches = []
-    plate_appearances = []
+    plate_appearances_by_key: dict[tuple[int, int], SlotPA] = {}
     manifest_shas = []
     payload_shas = []
     verified_paths = []
-    for verified in sorted(selected, key=lambda item: str(item["manifest_path"])):
+    for verified in sorted(
+        selected, key=lambda item: str(item["manifest"]["query"].get("start", ""))
+    ):
         manifest = verified["manifest"]
         if manifest.get("source") != "baseball_savant_statcast":
             raise ValueError("verified Statcast evidence has the wrong source")
@@ -307,45 +339,53 @@ def load_verified_statcast_evidence(
         payload = _safe_verified_bytes(Path(verified["payload_path"]), "raw")
         if hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
             raise RuntimeError("verified Statcast payload digest changed")
-        parsed = parse_statcast(payload)
-        if any(
-            not start <= str(row["game_date"]) <= end for row in parsed.pitches
-        ):
-            raise ValueError("verified Statcast row is outside its query range")
+        manifest_terminal_hashes = {}
+        for row in iter_statcast_pitches(payload):
+            game_date = str(row["game_date"])
+            if not start <= game_date <= end:
+                raise ValueError("verified Statcast row is outside its query range")
+            if not row["events"]:
+                continue
+            compact = SlotPA(
+                game_pk=int(row["game_pk"]),
+                game_date=game_date,
+                at_bat_number=int(row["at_bat_number"]),
+                batter_id=int(row["batter_id"]),
+                inning_topbot=str(row["inning_topbot"]),
+                game_type=str(row["game_type"]),
+            )
+            key = (compact.game_pk, compact.at_bat_number)
+            terminal_hash = hashlib.sha256(
+                json.dumps(
+                    row,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            prior_terminal_hash = manifest_terminal_hashes.get(key)
+            if prior_terminal_hash is not None:
+                if prior_terminal_hash != terminal_hash:
+                    raise ValueError(
+                        "multiple terminal events for plate appearance "
+                        f"{key[0]}:{key[1]}"
+                    )
+                continue
+            prior = plate_appearances_by_key.get(key)
+            if prior is not None:
+                raise ValueError("verified Statcast manifests overlap or duplicate events")
+            plate_appearances_by_key[key] = compact
+            manifest_terminal_hashes[key] = terminal_hash
         ranges.append((start, end))
-        pitches.extend(parsed.pitches)
-        plate_appearances.extend(parsed.plate_appearances)
         verified_paths.append(Path(verified["manifest_path"]))
         manifest_shas.append(str(verified["manifest_sha256"]))
         payload_shas.append(str(manifest["sha256"]))
-    pitch_keys = [
-        (int(row["game_pk"]), int(row["at_bat_number"]), int(row["pitch_number"]))
-        for row in pitches
-    ]
-    pa_keys = [
-        (int(row["game_pk"]), int(row["at_bat_number"]))
-        for row in plate_appearances
-    ]
-    if len(set(pitch_keys)) != len(pitch_keys) or len(set(pa_keys)) != len(pa_keys):
-        raise ValueError("verified Statcast manifests overlap or duplicate events")
-    pitches.sort(
-        key=lambda row: (
-            row["game_date"],
-            row["game_pk"],
-            row["at_bat_number"],
-            row["pitch_number"],
-        )
+    plate_appearances = sorted(
+        plate_appearances_by_key.values(),
+        key=lambda row: (row.game_date, row.game_pk, row.at_bat_number)
     )
-    plate_appearances.sort(
-        key=lambda row: (row["game_date"], row["game_pk"], row["at_bat_number"])
-    )
-    canonical = json.dumps(
-        {"pitches": pitches, "plate_appearances": plate_appearances},
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    normalized_digest = _slot_pa_digest(plate_appearances)
     return VerifiedStatcastEvidence._from_verified(
         _EVIDENCE_TOKEN,
         raw_root=Path(raw_root).absolute(),
@@ -353,9 +393,9 @@ def load_verified_statcast_evidence(
         manifest_sha256s=tuple(manifest_shas),
         payload_sha256s=tuple(payload_shas),
         coverage_ranges=tuple(sorted(ranges)),
-        pitches=tuple(dict(row) for row in pitches),
-        plate_appearances=tuple(dict(row) for row in plate_appearances),
-        normalized_statcast_sha256=hashlib.sha256(canonical).hexdigest(),
+        plate_appearances=tuple(plate_appearances),
+        plate_appearance_count=len(plate_appearances),
+        normalized_statcast_sha256=normalized_digest,
     )
 
 
@@ -383,16 +423,31 @@ def _rebind_statcast_evidence(
 ) -> VerifiedStatcastEvidence:
     if not isinstance(evidence, VerifiedStatcastEvidence):
         raise ValueError("verified Statcast evidence is required")
-    fresh = load_verified_statcast_evidence(evidence.raw_root, evidence.manifest_paths)
-    identity = (
-        "manifest_sha256s",
-        "payload_sha256s",
-        "coverage_ranges",
-        "normalized_statcast_sha256",
+    requested = {path.absolute() for path in evidence.manifest_paths}
+    selected = [
+        verified
+        for verified in RawStore(evidence.raw_root).verify_manifests()
+        if Path(verified["manifest_path"]).absolute() in requested
+    ]
+    if len(selected) != len(requested):
+        raise ValueError("verified Statcast evidence manifests are missing")
+    selected.sort(key=lambda item: str(item["manifest"]["query"].get("start", "")))
+    manifest_shas = tuple(str(item["manifest_sha256"]) for item in selected)
+    payload_shas = tuple(str(item["manifest"]["sha256"]) for item in selected)
+    ranges = tuple(
+        (str(item["manifest"]["query"].get("start")), str(item["manifest"]["query"].get("end")))
+        for item in selected
     )
-    if any(getattr(evidence, field, None) != getattr(fresh, field) for field in identity):
+    if (
+        manifest_shas != evidence.manifest_sha256s
+        or payload_shas != evidence.payload_sha256s
+        or ranges != evidence.coverage_ranges
+        or evidence.plate_appearance_count != len(evidence.plate_appearances)
+        or _slot_pa_digest(evidence.plate_appearances)
+        != evidence.normalized_statcast_sha256
+    ):
         raise ValueError("verified Statcast evidence no longer matches RawStore")
-    return fresh
+    return evidence
 
 
 def _statcast_rows(statcast_data: object, *, plate_appearances: bool = False) -> tuple:
@@ -451,7 +506,52 @@ def build_actual_participants(
     """Enrich schedules from stripped target identities without returning events."""
     from .feature_engine import actual_starter_index, enrich_schedule_game_participants
 
-    games = tuple(schedule_games)
+    participant_fields = {
+        "game_pk",
+        "official_date",
+        "game_type",
+        "scheduled_start_utc",
+        "away_team",
+        "away_team_id",
+        "home_team",
+        "home_team_id",
+        "away_probable_pitcher_id",
+        "away_probable_pitcher_name",
+        "home_probable_pitcher_id",
+        "home_probable_pitcher_name",
+        "venue_id",
+        "venue_name",
+        "scheduled_innings",
+        "doubleheader_marker",
+        "away_lineup",
+        "home_lineup",
+    }
+    games = []
+    for game in schedule_games:
+        if not isinstance(game, Mapping):
+            games.append(game)
+            continue
+        projected = {
+            key: value for key, value in game.items() if key in participant_fields
+        }
+        for field in ("away_lineup", "home_lineup"):
+            lineup = projected.get(field)
+            if lineup is None:
+                continue
+            if isinstance(lineup, (str, bytes)) or not isinstance(lineup, Sequence):
+                raise ValueError("schedule lineups must be sequences")
+            if any(not isinstance(player, Mapping) for player in lineup):
+                raise ValueError("schedule lineup players must be mappings")
+            projected[field] = [
+                {
+                    key: value
+                    for key, value in player.items()
+                    if key in {"player_id", "player_name"}
+                }
+                for player in lineup
+            ]
+        games.append(projected)
+    games = tuple(games)
     if any(not isinstance(game, Mapping) for game in games):
         raise ValueError("schedule games must be mappings")
     games_by_pk = {}
@@ -648,12 +748,27 @@ def _aggregate_training_slot_rows(
             sides[side] = player_slots
         lineups[game_pk] = (season, official_date, sides)
 
+    from .statcast import StatcastData
+
+    if isinstance(statcast_plate_appearances, StatcastData):
+        rows = statcast_plate_appearances.plate_appearances
+    elif isinstance(statcast_plate_appearances, (str, bytes, Mapping)):
+        raise ValueError("plate appearances must be an iterable of rows")
+    else:
+        rows = statcast_plate_appearances
     totals: defaultdict[tuple[int, int], int] = defaultdict(int)
     seen_pa = set()
-    rows = _statcast_rows(statcast_plate_appearances, plate_appearances=True)
+    matched_sides = set()
     for row in rows:
-        game_pk = _positive_id(row.get("game_pk"), "plate appearance game_pk")
-        at_bat = row.get("at_bat_number")
+        if not isinstance(row, (Mapping, SlotPA)):
+            raise ValueError("plate appearance rows must be mappings or SlotPA")
+        value = (
+            row.get
+            if isinstance(row, Mapping)
+            else lambda field, default=None: getattr(row, field, default)
+        )
+        game_pk = _positive_id(value("game_pk"), "plate appearance game_pk")
+        at_bat = value("at_bat_number")
         if type(at_bat) is not int or at_bat <= 0:
             raise ValueError("plate appearance at_bat_number must be positive")
         identity = (game_pk, at_bat)
@@ -663,19 +778,29 @@ def _aggregate_training_slot_rows(
         scheduled = lineups.get(game_pk)
         if scheduled is None:
             continue
-        if _canonical_day(row.get("game_date"), "plate appearance game_date") != scheduled[1]:
+        if _canonical_day(value("game_date"), "plate appearance game_date") != scheduled[1]:
             raise ValueError("plate appearance game_date does not match schedule date")
-        if row.get("game_type", "R") != "R":
+        if value("game_type", "R") != "R":
             raise ValueError("training plate appearances must be regular season")
-        half = row.get("inning_topbot")
+        half = value("inning_topbot")
         if half not in {"Top", "Bot"}:
             raise ValueError("plate appearance inning_topbot must be Top or Bot")
         side = "away" if half == "Top" else "home"
-        batter_id = _positive_id(row.get("batter_id"), "plate appearance batter_id")
+        batter_id = _positive_id(value("batter_id"), "plate appearance batter_id")
         season, _official_date, sides = scheduled
         slot = sides[side].get(batter_id)
         if slot is not None:
             totals[(season, slot)] += 1
+            matched_sides.add((game_pk, side))
+    if full_season_mode:
+        missing_sides = sorted(
+            (game_pk, side)
+            for game_pk in lineups
+            for side in ("away", "home")
+            if (game_pk, side) not in matched_sides
+        )
+        if missing_sides:
+            raise ValueError(f"played lineup games missing matched Statcast PA: {missing_sides}")
     expected = {
         (season, slot)
         for season in (2022, 2023, 2024)
@@ -688,6 +813,27 @@ def _aggregate_training_slot_rows(
         {"season": season, "game_type": "R", "slot": slot, "pa": pa}
         for (season, slot), pa in sorted(totals.items())
     ]
+
+
+def _assert_schedule_pa_completeness(
+    schedule_game_dates: Mapping[int, str],
+    plate_appearances: Iterable[Mapping[str, object] | SlotPA],
+) -> None:
+    observed = set()
+    for row in plate_appearances:
+        value = row.get if isinstance(row, Mapping) else lambda field: getattr(row, field)
+        game_pk = _positive_id(value("game_pk"), "plate appearance game_pk")
+        if game_pk not in schedule_game_dates:
+            continue
+        if (
+            _canonical_day(value("game_date"), "plate appearance game_date")
+            != schedule_game_dates[game_pk]
+        ):
+            raise ValueError("plate appearance date conflicts with schedule")
+        observed.add(game_pk)
+    missing = sorted(set(schedule_game_dates) - observed)
+    if missing:
+        raise ValueError(f"missing played game Statcast PA: {missing}")
 
 
 def _validate_played_schedule_season(
@@ -831,18 +977,6 @@ def derive_training_slot_rows(
             schedule_games_by_pk[game_pk] = game
 
     statcast_evidence = _rebind_statcast_evidence(statcast_evidence)
-    statcast_snapshot = json.dumps(
-        {
-            "pitches": list(statcast_evidence.pitches),
-            "plate_appearances": list(statcast_evidence.plate_appearances),
-        },
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if hashlib.sha256(statcast_snapshot).hexdigest() != statcast_evidence.normalized_statcast_sha256:
-        raise ValueError("verified Statcast evidence snapshot is invalid")
     expected_dates = set()
     for first, last in frozen.values():
         cursor = date.fromisoformat(first)
@@ -871,11 +1005,18 @@ def derive_training_slot_rows(
     if covered_dates != expected_dates:
         raise ValueError("verified Statcast evidence does not cover frozen seasons")
     for row in statcast_evidence.plate_appearances:
-        game_pk = int(row["game_pk"])
+        game_pk = row.game_pk
         if game_pk not in played_game_pks:
             raise ValueError("verified Statcast plate appearance lacks a schedule game")
-        if str(row["game_date"]) != played_game_dates[game_pk]:
+        if row.game_date != played_game_dates[game_pk]:
             raise ValueError("verified Statcast plate appearance date conflicts with schedule")
+    _assert_schedule_pa_completeness(
+        {
+            game_pk: str(game["official_date"])
+            for game_pk, game in schedule_games_by_pk.items()
+        },
+        statcast_evidence.plate_appearances,
+    )
     rows = _aggregate_training_slot_rows(
         schedule_games_by_pk.values(),
         statcast_evidence.plate_appearances,
@@ -973,11 +1114,9 @@ def schedule_history_rows(
             or away_code == home_code
         ):
             raise ValueError("schedule history requires distinct team codes")
-        innings = game.get("scheduled_innings")
-        if innings is None:
-            innings = 9
-        if type(innings) is not int or innings <= 0:
-            raise ValueError("scheduled innings must be positive")
+        innings = game.get("completed_innings")
+        if innings is not None and (type(innings) is not int or innings <= 0):
+            raise ValueError("completed innings must be positive when present")
         venue_name = game.get("venue_name")
         if not isinstance(venue_name, str) or not venue_name:
             raise ValueError("schedule history requires venue_name")

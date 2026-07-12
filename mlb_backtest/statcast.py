@@ -245,83 +245,124 @@ def _number(value: str | None, field: str, row_number: int) -> float | None:
     return result
 
 
-def _read_text(source: str | Path | bytes) -> str:
-    if isinstance(source, bytes):
-        raw = source
-    else:
-        raw = Path(source).read_bytes()
+def iter_statcast_pitches(
+    source: str | Path | bytes,
+) -> Iterable[dict[str, object]]:
+    """Validate and stream normalized pitches without retaining the CSV as text."""
+    raw_bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
     try:
-        return raw.decode("utf-8-sig")
+        with io.TextIOWrapper(
+            io.BytesIO(raw_bytes), encoding="utf-8-sig", newline=""
+        ) as stream:
+            reader = csv.DictReader(stream)
+            fields = set(reader.fieldnames or ())
+            missing = sorted(set(REQUIRED_FIELDS) - fields)
+            if missing:
+                raise ValueError(
+                    f"statcast CSV missing required fields: {', '.join(missing)}"
+                )
+            for row_number, raw in enumerate(reader, 2):
+                game_date = raw["game_date"]
+                _iso(game_date, f"statcast row {row_number} game_date")
+                half = raw["inning_topbot"]
+                if half not in {"Top", "Bot"}:
+                    raise ValueError(
+                        f"statcast row {row_number}: inning_topbot must be Top or Bot"
+                    )
+                hand = raw["p_throws"]
+                if hand not in {"L", "R"}:
+                    raise ValueError(
+                        f"statcast row {row_number}: p_throws must be L or R"
+                    )
+                if raw["game_type"] != "R":
+                    raise ValueError(
+                        f"statcast row {row_number}: game_type must be R"
+                    )
+                if not raw["home_team"] or not raw["away_team"]:
+                    raise ValueError(
+                        f"statcast row {row_number}: team abbreviations are required"
+                    )
+                row = {
+                    "pitch_type": raw["pitch_type"],
+                    "game_date": game_date,
+                    "game_pk": _integer(
+                        raw["game_pk"], "game_pk", row_number, positive=True
+                    ),
+                    "pitcher_id": _integer(
+                        raw["pitcher"], "pitcher", row_number, positive=True
+                    ),
+                    "batter_id": _integer(
+                        raw["batter"], "batter", row_number, positive=True
+                    ),
+                    "events": raw["events"],
+                    "description": raw["description"],
+                    "p_throws": hand,
+                    "home_team": raw["home_team"],
+                    "away_team": raw["away_team"],
+                    "inning": _integer(
+                        raw["inning"], "inning", row_number, positive=True
+                    ),
+                    "inning_topbot": half,
+                    "release_speed": _number(
+                        raw["release_speed"], "release_speed", row_number
+                    ),
+                    "woba_value": _number(
+                        raw["woba_value"], "woba_value", row_number
+                    ),
+                    "woba_denom": _number(
+                        raw["woba_denom"], "woba_denom", row_number
+                    ),
+                    "estimated_woba_using_speedangle": _number(
+                        raw["estimated_woba_using_speedangle"],
+                        "estimated_woba_using_speedangle",
+                        row_number,
+                    ),
+                    "launch_speed_angle": _number(
+                        raw["launch_speed_angle"],
+                        "launch_speed_angle",
+                        row_number,
+                    ),
+                    "at_bat_number": _integer(
+                        raw["at_bat_number"],
+                        "at_bat_number",
+                        row_number,
+                        positive=True,
+                    ),
+                    "pitch_number": _integer(
+                        raw["pitch_number"],
+                        "pitch_number",
+                        row_number,
+                        positive=True,
+                    ),
+                    "home_score": _integer(
+                        raw["home_score"], "home_score", row_number
+                    ),
+                    "away_score": _integer(
+                        raw["away_score"], "away_score", row_number
+                    ),
+                    "post_home_score": _integer(
+                        raw["post_home_score"], "post_home_score", row_number
+                    ),
+                    "post_away_score": _integer(
+                        raw["post_away_score"], "post_away_score", row_number
+                    ),
+                    "outs_on_play": _integer(
+                        raw["outs_on_play"],
+                        "outs_on_play",
+                        row_number,
+                        maximum=3,
+                    ),
+                    "game_type": "R",
+                }
+                row["event_id"] = f'{row["game_pk"]}:{row["at_bat_number"]}'
+                yield row
     except UnicodeDecodeError as exc:
         raise ValueError("statcast CSV must be UTF-8-sig") from exc
 
 
 def parse_statcast(source: str | Path | bytes) -> StatcastData:
     """Parse compact pitch rows and one terminal event row per plate appearance."""
-    reader = csv.DictReader(io.StringIO(_read_text(source), newline=""))
-    fields = set(reader.fieldnames or ())
-    missing = sorted(set(REQUIRED_FIELDS) - fields)
-    if missing:
-        raise ValueError(f"statcast CSV missing required fields: {', '.join(missing)}")
-    pitches: list[dict[str, object]] = []
-    for row_number, raw in enumerate(reader, 2):
-        game_date = raw["game_date"]
-        _iso(game_date, f"statcast row {row_number} game_date")
-        half = raw["inning_topbot"]
-        if half not in {"Top", "Bot"}:
-            raise ValueError(f"statcast row {row_number}: inning_topbot must be Top or Bot")
-        hand = raw["p_throws"]
-        if hand not in {"L", "R"}:
-            raise ValueError(f"statcast row {row_number}: p_throws must be L or R")
-        if raw["game_type"] != "R":
-            raise ValueError(f"statcast row {row_number}: game_type must be R")
-        if not raw["home_team"] or not raw["away_team"]:
-            raise ValueError(f"statcast row {row_number}: team abbreviations are required")
-        row = {
-            "pitch_type": raw["pitch_type"],
-            "game_date": game_date,
-            "game_pk": _integer(raw["game_pk"], "game_pk", row_number, positive=True),
-            "pitcher_id": _integer(raw["pitcher"], "pitcher", row_number, positive=True),
-            "batter_id": _integer(raw["batter"], "batter", row_number, positive=True),
-            "events": raw["events"],
-            "description": raw["description"],
-            "p_throws": hand,
-            "home_team": raw["home_team"],
-            "away_team": raw["away_team"],
-            "inning": _integer(raw["inning"], "inning", row_number, positive=True),
-            "inning_topbot": half,
-            "release_speed": _number(raw["release_speed"], "release_speed", row_number),
-            "woba_value": _number(raw["woba_value"], "woba_value", row_number),
-            "woba_denom": _number(raw["woba_denom"], "woba_denom", row_number),
-            "estimated_woba_using_speedangle": _number(
-                raw["estimated_woba_using_speedangle"],
-                "estimated_woba_using_speedangle",
-                row_number,
-            ),
-            "launch_speed_angle": _number(
-                raw["launch_speed_angle"], "launch_speed_angle", row_number
-            ),
-            "at_bat_number": _integer(
-                raw["at_bat_number"], "at_bat_number", row_number, positive=True
-            ),
-            "pitch_number": _integer(
-                raw["pitch_number"], "pitch_number", row_number, positive=True
-            ),
-            "home_score": _integer(raw["home_score"], "home_score", row_number),
-            "away_score": _integer(raw["away_score"], "away_score", row_number),
-            "post_home_score": _integer(
-                raw["post_home_score"], "post_home_score", row_number
-            ),
-            "post_away_score": _integer(
-                raw["post_away_score"], "post_away_score", row_number
-            ),
-            "outs_on_play": _integer(
-                raw["outs_on_play"], "outs_on_play", row_number, maximum=3
-            ),
-            "game_type": "R",
-        }
-        row["event_id"] = f'{row["game_pk"]}:{row["at_bat_number"]}'
-        pitches.append(row)
+    pitches = list(iter_statcast_pitches(source))
     unique_pitches: dict[tuple[int, int, int], dict[str, object]] = {}
     for row in pitches:
         key = (
@@ -400,6 +441,7 @@ __all__ = [
     "fetch_monthly",
     "fetch_statcast_stage",
     "identify_pitcher_roles",
+    "iter_statcast_pitches",
     "monthly_ranges",
     "parse_statcast",
     "regular_season_ranges",

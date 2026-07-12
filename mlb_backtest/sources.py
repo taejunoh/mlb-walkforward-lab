@@ -80,7 +80,7 @@ def schedule_url(start: str, end: str) -> str:
             "gameType": "R",
             "startDate": start,
             "endDate": end,
-            "hydrate": "probablePitcher,lineups,venue",
+            "hydrate": "probablePitcher,lineups,venue,linescore",
         }
     )
     return f"{MLB_BASE}/schedule?{query}"
@@ -253,6 +253,17 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         if lineups_value is None
         else _mapping(lineups_value, f"game[{index}].lineups")
     )
+    completed_innings = None
+    linescore_value = game.get("linescore")
+    if linescore_value is not None:
+        linescore = _mapping(linescore_value, f"game[{index}].linescore")
+        current_inning = linescore.get("currentInning")
+        if current_inning is not None:
+            if type(current_inning) is not int or current_inning <= 0:
+                raise ValueError("malformed schedule: linescore.currentInning must be positive")
+            completed_innings = current_inning
+    if status_name not in {"Final", "Completed Early"}:
+        completed_innings = None
 
     venue_value = game.get("venue")
     if venue_value is None:
@@ -298,6 +309,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "scheduled_innings": _optional_nonnegative_int(
             game, "scheduledInnings", f"game[{index}]", positive=True
         ),
+        "completed_innings": completed_innings,
         "doubleheader_marker": _doubleheader_marker(game, f"game[{index}]"),
         "away_lineup": _lineup(
             lineups, "awayPlayers", f"game[{index}].lineups"

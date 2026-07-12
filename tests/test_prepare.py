@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mlb_backtest.features.offense import derive_slot_weights
 from mlb_backtest.manifest import RawStore
@@ -12,6 +13,8 @@ from mlb_backtest.prepare import (
     VerifiedScheduleEvidence,
     VerifiedStatcastEvidence,
     _aggregate_training_slot_rows,
+    _assert_schedule_pa_completeness,
+    _rebind_statcast_evidence,
     _validate_played_schedule_season,
     assert_pregame_history,
     build_actual_participants,
@@ -23,7 +26,12 @@ from mlb_backtest.prepare import (
     load_verified_statcast_evidence,
     schedule_history_rows,
 )
-from mlb_backtest.statcast import StatcastData, parse_statcast, statcast_url
+from mlb_backtest.statcast import (
+    StatcastData,
+    iter_statcast_pitches,
+    parse_statcast,
+    statcast_url,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -144,7 +152,15 @@ class PrepareBoundaryTest(unittest.TestCase):
             "home_probable_pitcher_id": 902,
             "away_lineup": [{"player_id": i, "player_name": str(i)} for i in range(1, 10)],
             "home_lineup": [{"player_id": i, "player_name": str(i)} for i in range(11, 20)],
+            "status": "Final",
+            "away_score": 1,
+            "home_score": 2,
+            "away_is_winner": False,
+            "home_is_winner": True,
+            "outcome_result": {"winner": "Home"},
         }]
+        schedule[0]["away_lineup"][0]["winner"] = True
+        schedule[0]["home_lineup"][0]["outcome_result"] = "won"
         pitches = (
             {"game_date": "2025-05-01", "game_pk": 1, "inning": 1, "inning_topbot": "Top", "at_bat_number": 1, "pitch_number": 1, "pitcher_id": 222, "batter_id": 1, "home_team": "HOM", "away_team": "AWY"},
             {"game_date": "2025-05-01", "game_pk": 1, "inning": 1, "inning_topbot": "Bot", "at_bat_number": 2, "pitch_number": 1, "pitcher_id": 111, "batter_id": 11, "home_team": "HOM", "away_team": "AWY"},
@@ -160,11 +176,16 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertTrue(game["home_probable_starter_mismatch"])
         self.assertEqual(game["away_team_code"], "AWY")
         self.assertEqual(game["home_team_code"], "HOM")
-        self.assertEqual(game["away_lineup"], schedule[0]["away_lineup"])
+        self.assertEqual(
+            game["away_lineup"][0], {"player_id": 1, "player_name": "1"}
+        )
+        self.assertNotIn("outcome_result", game["home_lineup"][0])
         self.assertNotIn("pitches", built.provenance)
         self.assertNotIn("plate_appearances", built.provenance)
         self.assertEqual(built.provenance["participant_game_count"], 1)
         self.assertRegex(built.provenance["participant_sha256"], r"^[0-9a-f]{64}$")
+        forbidden = {"status", "away_score", "home_score", "away_is_winner", "home_is_winner", "outcome_result"}
+        self.assertTrue(forbidden.isdisjoint(game))
         wrong_day = StatcastData(tuple(dict(row, game_date="2025-05-02") for row in pitches), ())
         with self.assertRaisesRegex(ValueError, "date"):
             build_actual_participants(schedule, wrong_day)
@@ -352,7 +373,7 @@ class PrepareBoundaryTest(unittest.TestCase):
             "start": "2025-05-01",
             "end": "2025-05-01",
             "gameType": "R",
-            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2025-05-01&endDate=2025-05-01&hydrate=probablePitcher%2Clineups%2Cvenue",
+            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2025-05-01&endDate=2025-05-01&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore",
         }
         with tempfile.TemporaryDirectory() as td:
             store = RawStore(Path(td))
@@ -381,12 +402,50 @@ class PrepareBoundaryTest(unittest.TestCase):
             artifact = RawStore(Path(td)).put_unique_query(
                 "baseball_savant_statcast", query, payload
             )
-            evidence = load_verified_statcast_evidence(td, [artifact.manifest_path])
+            with mock.patch(
+                "mlb_backtest.statcast.parse_statcast",
+                side_effect=AssertionError(
+                    "evidence loading must stream compact PA rows without pitch retention"
+                ),
+            ), mock.patch(
+                "mlb_backtest.statcast.iter_statcast_pitches",
+                wraps=iter_statcast_pitches,
+            ) as stream_parser:
+                evidence = load_verified_statcast_evidence(
+                    td, [artifact.manifest_path]
+                )
+            stream_parser.assert_called_once_with(payload)
             self.assertIsInstance(evidence, VerifiedStatcastEvidence)
             self.assertEqual(len(evidence.plate_appearances), 6)
             self.assertEqual(evidence.coverage_ranges, (("2024-04-01", "2024-04-02"),))
+            self.assertFalse(hasattr(evidence, "pitches"))
+            with mock.patch(
+                "mlb_backtest.statcast.parse_statcast",
+                side_effect=AssertionError("rebind must not parse Statcast again"),
+            ):
+                rebound = _rebind_statcast_evidence(evidence)
+            self.assertIs(rebound, evidence)
             with self.assertRaises(TypeError):
                 VerifiedStatcastEvidence()
+
+        lines = STATCAST.read_text("utf-8-sig").splitlines()
+        duplicate_terminal = lines[2].replace("86.0", "85.9")
+        payload = ("\n".join(lines + [duplicate_terminal]) + "\n").encode()
+        with tempfile.TemporaryDirectory() as td:
+            artifact = RawStore(Path(td)).put_unique_query(
+                "baseball_savant_statcast", query, payload
+            )
+            with self.assertRaisesRegex(ValueError, "multiple terminal events"):
+                load_verified_statcast_evidence(td, [artifact.manifest_path])
+
+    def test_schedule_to_pa_completeness_rejects_one_missing_played_game(self):
+        plate_appearances = [
+            {"game_pk": 1, "game_date": "2024-04-01"},
+        ]
+        with self.assertRaisesRegex(ValueError, "missing played game"):
+            _assert_schedule_pa_completeness(
+                {1: "2024-04-01", 2: "2024-04-02"}, plate_appearances
+            )
 
     def test_schedule_history_build_has_codes_markers_venue_and_coverage(self):
         games = [
@@ -428,6 +487,7 @@ class PrepareBoundaryTest(unittest.TestCase):
                 },
                 "venue": {"id": 31, "name": "PNC Park"},
                 **({"scheduledInnings": 7} if game["game_pk"] == 2 else {}),
+                **({"linescore": {"currentInning": 12}} if game["game_pk"] == 2 else {}),
                 **({"doubleHeader": "Y", "gameNumber": 1} if game["game_pk"] == 1 else {}),
             })
         payload_games.append({
@@ -447,7 +507,7 @@ class PrepareBoundaryTest(unittest.TestCase):
             "start": "2024-04-01",
             "end": "2024-04-03",
             "gameType": "R",
-            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2024-04-01&endDate=2024-04-03&hydrate=probablePitcher%2Clineups%2Cvenue",
+            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2024-04-01&endDate=2024-04-03&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore",
         }
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -481,8 +541,8 @@ class PrepareBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(built.rows[0]["team_codes"], ["AWY", "HOM"])
         self.assertEqual(built.rows[0]["home_team_code"], "HOM")
-        self.assertEqual(built.rows[0]["innings"], 9)
-        self.assertEqual(built.rows[1]["innings"], 7)
+        self.assertIsNone(built.rows[0]["innings"])
+        self.assertEqual(built.rows[1]["innings"], 12)
         self.assertEqual(built.rows[0]["venue_city"], "Pittsburgh")
         with self.assertRaises(ValueError):
             schedule_history_rows(evidence_games + [dict(evidence_games[0], game_pk=9)], venues, evidence)

@@ -66,7 +66,7 @@ class SourceTest(unittest.TestCase):
                 "gameType": ["R"],
                 "startDate": ["2025-05-01"],
                 "endDate": ["2025-08-12"],
-                "hydrate": ["probablePitcher,lineups,venue"],
+                "hydrate": ["probablePitcher,lineups,venue,linescore"],
             },
         )
 
@@ -166,6 +166,7 @@ class SourceTest(unittest.TestCase):
                 "away_is_winner": False,
                 "home_is_winner": True,
                 "scheduled_innings": None,
+                "completed_innings": None,
                 "doubleheader_marker": None,
                 "away_lineup": [
                     {"player_id": 664023, "player_name": "Ian Happ"},
@@ -341,6 +342,17 @@ class SourceTest(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "official date"):
                 parse_schedule(path)
+
+    def test_completed_game_uses_actual_linescore_innings(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["dates"][0]["games"][0]["linescore"] = {"currentInning": 12}
+        payload["dates"][0]["games"][0]["scheduledInnings"] = 7
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            game = parse_schedule(path)[0]
+        self.assertEqual(game["completed_innings"], 12)
+        self.assertEqual(game["scheduled_innings"], 7)
 
     def test_rescheduled_duplicate_game_pk_prefers_played_record_but_rejects_conflicts(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
