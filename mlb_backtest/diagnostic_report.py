@@ -61,19 +61,53 @@ def _publish_pair(
     json_path: Path, json_contents: bytes, md_path: Path, md_contents: bytes
 ) -> None:
     temporary_paths: list[Path] = []
+    backups: dict[Path, Path | None] = {}
+    replaced: list[Path] = []
     try:
         temporary_paths.append(_write_fsynced_temp(json_path, json_contents))
         temporary_paths.append(_write_fsynced_temp(md_path, md_contents))
-        os.replace(temporary_paths[0], json_path)
-        os.replace(temporary_paths[1], md_path)
-        directory_descriptor = os.open(json_path.parent, os.O_RDONLY)
+        for final_path in (json_path, md_path):
+            backups[final_path] = (
+                _write_fsynced_temp(final_path, final_path.read_bytes())
+                if final_path.exists()
+                else None
+            )
+        for temporary_path, final_path in zip(
+            temporary_paths, (json_path, md_path), strict=True
+        ):
+            os.replace(temporary_path, final_path)
+            replaced.append(final_path)
+        _fsync_directory(json_path.parent)
+    except BaseException:
+        rollback_error: BaseException | None = None
+        for final_path in reversed(replaced):
+            backup_path = backups[final_path]
+            try:
+                if backup_path is None:
+                    final_path.unlink(missing_ok=True)
+                else:
+                    os.replace(backup_path, final_path)
+            except BaseException as error:
+                rollback_error = rollback_error or error
         try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+            _fsync_directory(json_path.parent)
+        except BaseException as error:
+            rollback_error = rollback_error or error
+        if rollback_error is not None:
+            raise RuntimeError("diagnostic pair rollback failed") from rollback_error
+        raise
     finally:
-        for temporary_path in temporary_paths:
-            temporary_path.unlink(missing_ok=True)
+        for temporary_path in (*temporary_paths, *backups.values()):
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    directory_descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 def write_diagnostic_reports(root: Path, output_dir: Path) -> dict[str, str]:

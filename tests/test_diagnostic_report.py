@@ -1,6 +1,7 @@
 from pathlib import Path
 import copy
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -176,6 +177,40 @@ class DiagnosticReportTest(unittest.TestCase):
             self.assertEqual(json_path.read_bytes(), b"old-json")
             self.assertEqual(md_path.read_bytes(), b"old-md")
             self.assertEqual(list(output.glob(".diagnostic_100.*.tmp")), [])
+
+    def test_second_final_replace_failure_rolls_back_pair_and_cleans_files(self):
+        for preexisting in (True, False):
+            with self.subTest(preexisting=preexisting), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                json_path = output / "diagnostic_100.json"
+                md_path = output / "diagnostic_100.md"
+                if preexisting:
+                    json_path.write_bytes(b"old-json")
+                    md_path.write_bytes(b"old-md")
+                original_replace = os.replace
+                final_replacements = 0
+
+                def fail_second_final(source, destination):
+                    nonlocal final_replacements
+                    if destination in (json_path, md_path):
+                        final_replacements += 1
+                        if final_replacements == 2:
+                            raise OSError("second replace failed")
+                    return original_replace(source, destination)
+
+                with patch(
+                    "mlb_backtest.diagnostic_report.os.replace",
+                    side_effect=fail_second_final,
+                ):
+                    with self.assertRaisesRegex(OSError, "second replace failed"):
+                        write_diagnostic_reports(ROOT, output)
+                if preexisting:
+                    self.assertEqual(json_path.read_bytes(), b"old-json")
+                    self.assertEqual(md_path.read_bytes(), b"old-md")
+                else:
+                    self.assertFalse(json_path.exists())
+                    self.assertFalse(md_path.exists())
+                self.assertEqual(list(output.glob(".diagnostic_100.*.tmp")), [])
 
     def test_markdown_table_escapes_backslashes_newlines_and_pipes(self):
         rendered = markdown_table(["a\\b", "c|d"], [["x\ny", "z\\|q"]])
