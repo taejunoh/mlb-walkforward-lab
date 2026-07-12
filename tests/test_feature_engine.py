@@ -510,7 +510,11 @@ class FeatureEngineTest(unittest.TestCase):
         ]
         result = build(
             game(),
-            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+            FeatureHistory(
+                data(rows),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                statcast_coverage_complete=False,
+            ),
         )
         availability = result["home"]["bullpen"]["availability"]
         self.assertEqual(availability["value"], 75.0)
@@ -524,6 +528,31 @@ class FeatureEngineTest(unittest.TestCase):
             ),
         )
         self.assertEqual(complete["home"]["bullpen"]["availability"]["quality"], 1.0)
+
+    def test_rested_leverage_pitcher_has_source_backed_zero_usage_when_coverage_complete(
+        self,
+    ):
+        rows = [
+            pa(1, "2025-04-01", 10, 201, "field_out", xwoba=0.1, outs=1),
+            pa(1, "2025-04-01", 11, 202, "field_out", xwoba=0.1, inning=8, at_bat=2),
+        ]
+        complete = build(
+            game(),
+            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )["home"]["bullpen"]["availability"]
+        self.assertEqual(complete["value"], 100.0)
+        self.assertEqual(complete["quality"], 1.0)
+
+        incomplete = build(
+            game(),
+            FeatureHistory(
+                data(rows),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                statcast_coverage_complete=False,
+            ),
+        )["home"]["bullpen"]["availability"]
+        self.assertEqual(incomplete["value"], 50.0)
+        self.assertEqual(incomplete["quality"], 0.0)
 
     def test_home_city_bonus_requires_home_games_at_same_venue_on_d1_d2_d3(self):
         def schedule(home_codes):
@@ -805,6 +834,12 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(
             result["reasons"], ["missing_home_starter", "missing_away_lineup"]
         )
+        self.assertEqual(result["lineup_provenance"], "MISSING_OR_INVALID_LINEUP")
+
+        duplicate = [dict(player) for player in game()["home_lineup"]]
+        duplicate[-1]["player_id"] = duplicate[0]["player_id"]
+        invalid = build(game(home_lineup=duplicate), history)
+        self.assertEqual(invalid["lineup_provenance"], "MISSING_OR_INVALID_LINEUP")
 
     def test_team_mapping_requires_thirty_unique_nonempty_string_pairs(self):
         history = FeatureHistory(

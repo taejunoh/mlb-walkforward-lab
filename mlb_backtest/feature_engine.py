@@ -156,9 +156,12 @@ class FeatureHistory:
         slot_weights: Mapping[int, float],
         schedule_history: Iterable[Mapping[str, object]] | ScheduleHistory = (),
         venue_by_name: Mapping[str, Mapping[str, object]] | None = None,
+        statcast_coverage_complete: bool = True,
     ) -> None:
         if not isinstance(statcast, StatcastData):
             raise ValueError("statcast must be StatcastData")
+        if not isinstance(statcast_coverage_complete, bool):
+            raise ValueError("statcast_coverage_complete must be boolean")
         if set(slot_weights) != set(range(1, 10)):
             raise ValueError("slot weights must contain slots 1 through 9")
         weights = {i: float(slot_weights[i]) for i in range(1, 10)}
@@ -167,6 +170,7 @@ class FeatureHistory:
         ) or not math.isclose(sum(weights.values()), 1.0, abs_tol=1e-12):
             raise ValueError("slot weights must be finite, nonnegative, and sum to 1")
         self.slot_weights = MappingProxyType(weights)
+        self.statcast_coverage_complete = statcast_coverage_complete
         self.pitches = tuple(sorted(statcast.pitches, key=self._pitch_key))
         self.plate_appearances = tuple(
             sorted(statcast.plate_appearances, key=self._pitch_key)
@@ -546,7 +550,7 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
             )
             for offset in (1, 2, 3)
         ]
-        if any(pitches_by_day):
+        if history.statcast_coverage_complete or any(pitches_by_day):
             usage[pid] = pitches_by_day
     availability, aq = team_availability(pool, usage)
     pool_bf = sum(r["batters_faced"] for r in pool)
@@ -884,7 +888,12 @@ def build_raw_game_features(
         else game.get("official_date"),
         "eligible": not reasons,
         "reasons": reasons,
-        "lineup_provenance": "RECONSTRUCTED_FINAL_LINEUP",
+        "lineup_provenance": (
+            "RECONSTRUCTED_FINAL_LINEUP"
+            if _valid_lineup(game.get("home_lineup"))
+            and _valid_lineup(game.get("away_lineup"))
+            else "MISSING_OR_INVALID_LINEUP"
+        ),
     }
     raw_source_max_date = _max_history_date(history, target)
     provenance = {
