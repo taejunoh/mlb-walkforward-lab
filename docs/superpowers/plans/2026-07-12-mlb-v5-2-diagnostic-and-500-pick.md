@@ -35,15 +35,18 @@ The diagnostic must bind these authoritative identities:
 - Create `mlb_backtest/diagnostic_report.py`: deterministic JSON and Markdown serialization; no independent recalculation.
 - Create `mlb_backtest/notebook_artifact.py`: execute a fixed sequence of notebook cells with the Python standard library and write valid Notebook v4 JSON with execution counts and captured output.
 - Create `mlb_backtest/report_artifact.py`: transform canonical diagnostic JSON into one bounded Data Analytics `artifact.json`; it does not author HTML.
+- Create `scripts/validate_report_artifact.mjs`: call the installed plugin's real `validate_artifact` implementation without packaging or rendering.
 - Create `mlb_backtest/protocols.py`: typed `FoldSpec`, `RunSpec`, prospective ledger contract, canonical serialization/digests, rolling-origin validation, and no-fitted-card assertions.
 - Create `mlb_backtest/preflight.py`: read-only manifest/source inventory and deterministic minimum-source coverage/gap report.
 - Create `mlb_backtest/verify_v52_design.py`: cross-artifact verification and sealed-v5.1 before/after digest guard.
+- Modify `.gitignore`: ignore Python bytecode/cache directories so tests cannot pollute evidence status.
 
 ### Frozen machine-readable contracts
 
 - Create `config/v5_2_qd.json`: predictive structure, completeness/tier/eligibility/change-control rules, but no fitted normalization, slot weights, alpha, or beta.
 - Create `schemas/v5_2_qd.schema.json`: config contract.
 - Create `schemas/v5_2_run_spec.schema.json`: run/fold contract.
+- Create `schemas/v5_2_prospective.schema.json`: prospective ledger contract.
 - Create `schemas/v5_2_preflight.schema.json`: read-only preflight contract.
 - Create `protocols/v5_2_qd/historical_walkforward_500.json`: H22/H23/H24 `RunSpec` and exact fold sequences.
 - Create `protocols/v5_2_qd/prospective_2026.json`: separate timestamp-verified T-45 ledger contract.
@@ -65,7 +68,9 @@ The diagnostic must bind these authoritative identities:
 
 ## Data Analytics report contract
 
-The report audience is exactly `product stakeholders`, using the executive report structure: title, visible `Executive Summary`, key findings with visual evidence, recommended next steps, further questions, and caveats/assumptions. Use HTML as the single delivery mode because the user explicitly requires a portable HTML file. The source file is the complete canonical `reports/v5_1_bt/diagnostic_100_artifact.json` with top-level `surface`, `manifest`, `snapshot`, `sources`, and `package_info`; `surface` is `report`, `snapshot.datasets` is an object of bounded row arrays, and every quantitative Markdown/card/chart/table block has an exact canonical `sourceId`.
+The report audience is exactly `product stakeholders`, using the executive report structure: title, visible `Executive Summary`, key findings with visual evidence, recommended next steps, further questions, and caveats/assumptions. The Data Analytics MCP report renderer is not callable in this Codex runtime, so self-contained HTML is the single available durable fallback; this is a runtime fallback, not a claim that the user explicitly requested HTML. Before Task 5 begins, the implementer must announce and fully read the installed `data-analytics:build-report` and `data-analytics:visualize-data` skills, then read `skills/build-report/specifications/executive-report.md`, `skills/build-report/specifications/mcp-app-report.md`, `src/analytics-app-core.md`, and `src/analytics-app/types.ts` from plugin version `0.2.8-13ceeea1f599`. If those installed contracts change, update the artifact to the installed validator rather than copying this plan's older shape.
+
+The source file is the complete canonical `reports/v5_1_bt/diagnostic_100_artifact.json`. Its top-level keys are exactly `surface`, `manifest`, `snapshot`, and `sources`. `surface` is `report`. `manifest` has exactly `version`, `surface`, `title`, `generatedAt`, `blocks`, `charts`, `tables`, and `sources`; it must not contain rejected fields such as `audience`, `freshness`, or `definitions`. `snapshot` has exactly `version`, `generatedAt`, `status`, and `datasets`; status is `ready`, so the rejected/irrelevant `accessIssues` field is absent. Both version fields are integer `1`, and both `generatedAt` values are the same stable RFC3339 value `2026-07-12T00:00:00Z`. Markdown blocks use `body`, never `markdown`, `content`, or `title`. Chart/table blocks appear in the narrative reading order and reference definitions with `chartId`/`tableId`. Every quantitative Markdown/chart/table definition has exact canonical `sourceId` provenance.
 
 Use these chart contracts and no others:
 
@@ -86,9 +91,46 @@ npm run report:deliver -- \
   --output "/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html"
 ```
 
-Accept only a receipt whose `stages.validation` is `passed`, `stages.packaging` is `passed`, and `stages.verification` is `passed`. If the installed Chromium is unavailable and the receipt is `structural_only`, keep the semantic fallback but do not mark the current phase complete until browser verification can be run on a compatible installed Chromium. Do not create a hand-written HTML renderer, sidecar JavaScript, screenshot-only report, MCP report, or Sites report.
+Task 5 calls the plugin's real `validate_artifact` only; it does not package or deliver HTML. After every report input is stable and reviews pass, Task 11 runs the command above exactly once. Accept only a receipt whose `stages.validation` is `passed`, `stages.packaging` is `passed`, and `stages.verification` is `passed`. If the installed Chromium is unavailable and the receipt is `structural_only`, keep the semantic fallback but do not mark the current phase complete until browser verification can be run on a compatible installed Chromium. Do not create a hand-written HTML renderer, sidecar JavaScript, screenshot-only report, MCP report, or Sites report.
 
 ---
+
+### Task 0: Make test execution cache-clean without touching evidence
+
+**Files:**
+- Modify: `.gitignore`
+
+- [ ] **Step 1: Record the cache-only dirty state**
+
+Run: `git status --short | awk '/__pycache__|\.pyc$/{print}'`
+
+Expected: only generated Python cache paths are printed; do not remove or alter any other untracked path.
+
+- [ ] **Step 2: Add exact ignore rules**
+
+```gitignore
+__pycache__/
+*.py[cod]
+```
+
+- [ ] **Step 3: Remove only generated bytecode and then empty cache directories**
+
+Run: `find mlb_backtest tests analysis -type f -name '*.py[co]' -delete 2>/dev/null || true; find mlb_backtest tests analysis -depth -type d -name '__pycache__' -empty -delete 2>/dev/null || true`
+
+Expected: generated bytecode is removed; no data, audit, config, report, protocol, or source file is touched.
+
+- [ ] **Step 4: Verify tests do not recreate cache state**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_metrics -q && test -z "$(find mlb_backtest tests analysis -type f -name '*.py[co]' -print 2>/dev/null)" && git diff --check`
+
+Expected: tests are `OK`; no bytecode file exists; diff check exits 0.
+
+- [ ] **Step 5: Commit hygiene rules**
+
+```bash
+git add .gitignore
+git commit -m "chore: ignore Python cache artifacts"
+```
 
 ### Task 1: Freeze diagnostic source identities and exact statistical primitives
 
@@ -113,11 +155,13 @@ class DiagnosticPrimitiveTest(unittest.TestCase):
         self.assertEqual(table, {"both_correct": 52, "model_only": 15, "baseline_only": 7, "both_wrong": 26, "N": 100})
         self.assertAlmostEqual(exact_mcnemar(15, 7), 0.1338005066, places=9)
         self.assertEqual(tuple(round(100 * x, 2) for x in paired_delta_interval(15, 7, 100)), (-1.10, 17.10))
+        self.assertEqual(tuple(round(100 * x, 2) for x in paired_delta_interval(4, 3, 99)), (-4.25, 6.27))
+        self.assertEqual(PAIRED_INTERVAL_LABEL, "approximate paired 95% interval (z=1.97)")
 ```
 
 - [ ] **Step 2: Run the focused tests and verify the import failure**
 
-Run: `python3 -m unittest tests.test_diagnostics.DiagnosticPrimitiveTest -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostics.DiagnosticPrimitiveTest -v`
 
 Expected: `ERROR` with `ModuleNotFoundError: No module named 'mlb_backtest.diagnostics'`.
 
@@ -126,6 +170,7 @@ Expected: `ERROR` with `ModuleNotFoundError: No module named 'mlb_backtest.diagn
 ```python
 @dataclass(frozen=True)
 class V51Evidence:
+    root: Path
     evaluated_rows: tuple[dict[str, object], ...]
     baseline_by_game: dict[int, str]
     summary: dict[str, object]
@@ -141,7 +186,9 @@ def exact_mcnemar(model_only: int, baseline_only: int) -> float:
     tail = sum(math.comb(discordant, k) for k in range(min(model_only, baseline_only) + 1)) / (2 ** discordant)
     return min(1.0, 2.0 * tail)
 
-def paired_delta_interval(model_only: int, baseline_only: int, n: int, z: float = 1.96) -> tuple[float, float]:
+PAIRED_INTERVAL_LABEL = "approximate paired 95% interval (z=1.97)"
+
+def paired_delta_interval(model_only: int, baseline_only: int, n: int, z: float = 1.97) -> tuple[float, float]:
     delta = (model_only - baseline_only) / n
     variance = ((model_only + baseline_only) / n - delta * delta) / n
     margin = z * math.sqrt(variance)
@@ -152,13 +199,35 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def read_jsonl(path: Path) -> tuple[dict[str, object], ...]:
+    return tuple(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+def load_v51_evidence(root: Path) -> V51Evidence:
+    evaluated_path = root / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl"
+    predictions_path = root / "data/v5_1_bt/locked/predictions.jsonl"
+    audit = json.loads((root / "audit/v5_1_bt/lock_manifest.json").read_text(encoding="utf-8"))
+    predictions_hash, evaluated_hash = sha256_file(predictions_path), sha256_file(evaluated_path)
+    if predictions_hash != audit["sealed_lock"]["predictions_contents_sha256"] or evaluated_hash != audit["input_and_output_sha256"]["evaluated_predictions"]:
+        raise ValueError("authoritative v5.1 evidence hash differs")
+    rows = read_jsonl(evaluated_path)
+    if len(rows) != 1340 or len({row["game_pk"] for row in rows}) != 1340 or {row["model_version"] for row in rows} != {"v5.1-BT"}:
+        raise ValueError("evaluated v5.1 population differs")
+    top1_dates = [row["official_date"] for row in rows if row["top1"] == "Yes"]
+    if len(top1_dates) != 100 or len(set(top1_dates)) != 100:
+        raise ValueError("Daily Top 1 population differs")
+    baseline_raw = json.loads((root / "data/v5_1_bt/outcomes/baseline.json").read_text(encoding="utf-8"))
+    baseline = {int(game_pk): str(team) for game_pk, team in baseline_raw.items()}
+    return V51Evidence(root.resolve(), rows, baseline,
+                       json.loads((root / "data/v5_1_bt/reports/summary.json").read_text(encoding="utf-8")), audit,
+                       json.loads((root / "audit/v5_1_bt/model_card.json").read_text(encoding="utf-8")), predictions_hash, evaluated_hash)
 ```
 
 `load_v51_evidence(root)` must read each authoritative path, reject duplicates/mixed versions/non-Top1 date counts, compare the audited byte/content digests, and return immutable copies. For the sealed prediction/evaluated files, hash the exact existing bytes; do not parse and reserialize them before comparison. Use the exported `canonical_json_bytes` only for newly generated v5.2/report JSON identities.
 
 - [ ] **Step 4: Run focused tests and lint**
 
-Run: `python3 -m unittest tests.test_diagnostics.DiagnosticPrimitiveTest -v && ruff check mlb_backtest/diagnostics.py tests/test_diagnostics.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostics.DiagnosticPrimitiveTest -v && ruff check mlb_backtest/diagnostics.py tests/test_diagnostics.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
@@ -202,11 +271,11 @@ class DiagnosticGoldenTest(unittest.TestCase):
         self.assertAlmostEqual(self.result["data_quality"]["completeness"]["mean"], 0.4602764334, places=10)
 ```
 
-Add assertions for exact home/away `52/78` and `15/22`, 23 selected teams, all six team counts and Wilson intervals, Spearman probability `rho=0.0077, p=0.939`, confidence `rho=0.0365, p=0.719`, `>=63%` `59/82`, `>=68%` `14/23`, rank McNemar `0.349/0.291`, July Fisher `0.0589`, all eight component means, bullpen split `74%/60%`, bullpen rho `-0.151, p=0.135`, completeness min/max/mean, 7,265 training rows, and all three leakage categories.
+The same test class includes `test_secondary_exact_contract`, which asserts this literal contract dictionary against the result: `{"home_side": [52,26,78], "away_side": [15,7,22], "distinct_teams": 23, "top_six_counts": {"New York Yankees":14,"Philadelphia Phillies":11,"Houston Astros":9,"San Diego Padres":9,"Los Angeles Dodgers":7,"Seattle Mariners":7}, "probability_spearman_rounded":[0.0077,0.939], "confidence_spearman_rounded":[0.0365,0.719], "ge_63":[59,82], "ge_68":[14,23], "rank_mcnemar_rounded":[0.349,0.291], "july_fisher_p_rounded":0.0589, "bullpen_halves_accuracy":[0.74,0.60], "bullpen_spearman_rounded":[-0.151,0.135], "training_eligible_rows":7265}`. It separately asserts the eight component means, each team's computed Wilson bounds, completeness `[min,max,mean]=[0.2358031605,0.5769861616,0.4602764334]`, and leakage keys exactly `statistical_as_of_safety`, `participant_time_limitation`, and `source_revision_limitation`.
 
 - [ ] **Step 2: Run the complete golden class and verify missing keys**
 
-Run: `python3 -m unittest tests.test_diagnostics.DiagnosticGoldenTest -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostics.DiagnosticGoldenTest -v`
 
 Expected: `FAIL` because `build_diagnostic` or required sections are absent.
 
@@ -216,13 +285,14 @@ Expected: `FAIL` because `build_diagnostic` or required sections are absent.
 def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
     top1 = graded_rows(evidence.evaluated_rows, top1=True)
     all_graded = graded_rows(evidence.evaluated_rows)
+    base = evaluate(evidence.evaluated_rows, baseline_by_game=evidence.baseline_by_game)
     return {
         "schema_version": 1,
         "model_version": "v5.1-BT",
         "population": {"label": "sealed Daily Top 1", "N": 100, "dates": ["2025-05-01", "2025-08-12"]},
-        "primary": primary_diagnostic(top1),
+        "primary": {"record": {k: base["primary"][k] for k in ("W", "L", "N")}, **{k: base["primary"][k] for k in ("accuracy", "wilson_95", "brier", "log_loss", "max_losing_streak")}},
         "baselines": baseline_diagnostics(top1, evidence.baseline_by_game),
-        "calibration": calibration_diagnostic(top1),
+        "calibration": base["calibration"],
         "rank": rank_diagnostic(all_graded),
         "monthly": month_diagnostic(top1),
         "sides": side_diagnostic(top1),
@@ -230,7 +300,7 @@ def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
         "team_concentration": team_concentration(top1),
         "components": component_diagnostic(top1),
         "data_quality": quality_diagnostic(top1, evidence.model_card),
-        "leakage": leakage_diagnostic(ROOT, top1, evidence.model_card),
+        "leakage": leakage_diagnostic(evidence.root, top1, evidence.model_card),
         "interpretation": {
             "incremental_value": "NOT_ESTABLISHED",
             "live_reproducibility": "NOT_ESTABLISHED",
@@ -238,13 +308,74 @@ def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
         },
         "sources": evidence_source_records(evidence),
     }
+
+def graded_rows(rows: Sequence[Mapping[str, object]], *, top1: bool = False) -> list[dict[str, object]]:
+    return [{**row, "correct": row["predicted_winner"] == row["outcome"]["actual_winner"]} for row in rows
+            if row["outcome"]["status"] == "Final" and (not top1 or row["top1"] == "Yes")]
+
+def paired_result(rows: Sequence[Mapping[str, object]], picks: Mapping[int, str]) -> dict[str, object]:
+    paired = [(row["predicted_winner"] == row["outcome"]["actual_winner"], picks[row["game_pk"]] == row["outcome"]["actual_winner"])
+              for row in rows if row["game_pk"] in picks]
+    table = paired_table([a for a, _ in paired], [b for _, b in paired])
+    model_w, baseline_w, n = sum(a for a, _ in paired), sum(b for _, b in paired), len(paired)
+    return {"paired": table, "model_accuracy": model_w / n, "baseline_accuracy": baseline_w / n, "delta": (model_w - baseline_w) / n,
+            "paired_delta_interval": list(paired_delta_interval(table["model_only"], table["baseline_only"], n)),
+            "interval_label": PAIRED_INTERVAL_LABEL, "mcnemar_p": exact_mcnemar(table["model_only"], table["baseline_only"])}
+
+def baseline_diagnostics(rows: Sequence[Mapping[str, object]], season: Mapping[int, str]) -> dict[str, object]:
+    home = {row["game_pk"]: row["home_team"] for row in rows}
+    return {"home": paired_result(rows, home), "season_record": paired_result(rows, season),
+            "market": {"N": 0, "model_accuracy": None, "market_accuracy": None, "delta": None, "roi": None, "clv": None}}
+
+def rank_diagnostic(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    return [{"rank": rank, "W": sum(row["correct"] for row in rows if row["daily_rank"] == rank), "N": sum(row["daily_rank"] == rank for row in rows)} for rank in (1, 2, 3)]
+
+def month_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    return {month: compact_record([row for row in rows if row["official_date"].startswith(month)]) for month in ("2025-05", "2025-06", "2025-07", "2025-08")}
+
+def compact_record(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    wins, n = sum(row["correct"] for row in rows), len(rows)
+    return {"record": {"W": wins, "L": n - wins, "N": n}, "accuracy": wins / n if n else None}
+
+def side_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    return {side: compact_record([row for row in rows if row["predicted_side"] == side]) for side in ("home", "away")}
+
+def team_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    result = {team: compact_record([row for row in rows if row["predicted_winner"] == team]) for team in sorted({row["predicted_winner"] for row in rows})}
+    return {team: {**values["record"], "accuracy": values["accuracy"], "wilson_95": list(wilson(values["record"]["W"], values["record"]["N"]))} for team, values in result.items()}
+
+def team_concentration(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    counts = Counter(row["predicted_winner"] for row in rows); top = counts.most_common(6)
+    return {"distinct_teams": len(counts), "top_six": dict(top), "top_six_share": sum(count for _, count in top) / len(rows)}
+
+def component_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    return {name: {"win_mean": statistics.fmean(abs(float(row[f"{name}_edge"])) for row in rows if row["correct"]),
+                   "loss_mean": statistics.fmean(abs(float(row[f"{name}_edge"])) for row in rows if not row["correct"])}
+            for name in ("starter", "offense", "bullpen", "schedule")}
+
+def quality_diagnostic(rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
+    completeness = [float(row["overall_completeness"]) for row in rows]
+    return {"top1_states": {"INCOMPLETE": sum(row["data_status"] == "INCOMPLETE" for row in rows), "High": sum(row["uncertainty"] == "High" for row in rows), "Toss-up": sum(row["tier"] == "Toss-up" for row in rows)},
+            "completeness": {"min": min(completeness), "max": max(completeness), "mean": statistics.fmean(completeness)},
+            "training_eligible_rows": card["counts"]["training_eligible_rows"]}
+
+def leakage_diagnostic(root: Path, rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
+    return {"statistical_as_of_safety": {"status": "PASS", "rule": "max_history_date <= D-1; target gamePk excluded; outcomes inaccessible before lock"},
+            "participant_time_limitation": {"status": "LIMITATION", "lineup": "RECONSTRUCTED_FINAL_LINEUP", "starter": "RECONSTRUCTED_ACTUAL_STARTER"},
+            "source_revision_limitation": {"status": "LIMITATION", "rule": "retrieval hashes reproduce later provider state, not a historical database snapshot"}}
+
+def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
+    paths = ("data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl", "data/v5_1_bt/reports/summary.json", "data/v5_1_bt/outcomes/baseline.json",
+             "data/v5_1_bt/locked/predictions.jsonl", "data/v5_1_bt/locked/lock_manifest.json", "audit/v5_1_bt/lock_manifest.json",
+             "audit/v5_1_bt/model_card.json", "audit/v5_1_bt/manual_audit.md", "config/v5_1_bt.json", "data/v5_1_bt/features/candidate_raw_features.jsonl")
+    return [{"id": path.replace("/", "-").replace(".", "-"), "path": path, "sha256": sha256_file(evidence.root / path)} for path in paths]
 ```
 
 Use unrounded row values for calculations. Use `scipy.stats.spearmanr` and `scipy.stats.fisher_exact` only behind wrappers that reject missing/nonfinite values and serialize finite floats. Fixed bins are `[0.50,0.54)`, `[0.54,0.58)`, `[0.58,0.63)`, `[0.63,0.68)`, and `[0.68,1.00]`. Every table object includes `population`, `formula`, `exclusions`, and `source_ids`.
 
 - [ ] **Step 4: Run diagnostics tests and regression metrics tests**
 
-Run: `python3 -m unittest tests.test_diagnostics tests.test_metrics -v && ruff check mlb_backtest/diagnostics.py tests/test_diagnostics.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostics tests.test_metrics -v && ruff check mlb_backtest/diagnostics.py tests/test_diagnostics.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
@@ -288,7 +419,7 @@ class DiagnosticReportTest(unittest.TestCase):
 
 - [ ] **Step 2: Run report tests and verify the missing module failure**
 
-Run: `python3 -m unittest tests.test_diagnostic_report -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostic_report -v`
 
 Expected: `ERROR` importing `mlb_backtest.diagnostic_report`.
 
@@ -309,7 +440,7 @@ def write_diagnostic_reports(root: Path, output_dir: Path) -> dict[str, str]:
 
 - [ ] **Step 4: Generate and verify repository reports**
 
-Run: `python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt && python3 -m unittest tests.test_diagnostic_report -v && git diff --check`
+Run: `python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostic_report -v && git diff --check`
 
 Expected: two files generated; all tests `OK`; `git diff --check` exits 0.
 
@@ -342,11 +473,12 @@ class NotebookArtifactTest(unittest.TestCase):
         receipt = json.loads(code[-1]["outputs"][0]["text"][0])
         self.assertEqual(receipt["diagnostic_sha256"], sha256_file(ROOT / "reports/v5_1_bt/diagnostic_100.json"))
         self.assertEqual(receipt["primary"], {"W": 67, "L": 33, "N": 100})
+        self.assertTrue(receipt["recomputed_from_sealed_inputs"])
 ```
 
 - [ ] **Step 2: Run the test and verify the notebook is absent**
 
-Run: `python3 -m unittest tests.test_notebook_artifact -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_notebook_artifact -v`
 
 Expected: `ERROR` or `FAIL` because the notebook builder/artifact does not exist.
 
@@ -366,11 +498,11 @@ def execute_notebook_cells(sources: Sequence[str], globals_dict: dict[str, objec
     return cells
 ```
 
-The fixed cells must: load `diagnostic_100.json`; print primary/baseline results; print calibration/rank/month/component views; print data-quality/leakage conclusions; and finally print one JSON line containing the diagnostic SHA-256 plus primary record. On cell failure, propagate the exception and do not replace the prior notebook.
+The first fixed cell imports `load_v51_evidence`, `build_diagnostic`, and `canonical_json_bytes`; recomputes the complete diagnostic from the sealed inputs with `build_diagnostic(load_v51_evidence(ROOT))`; loads `diagnostic_100.json`; and asserts byte equality between `canonical_json_bytes(recomputed) + b"\n"` and the saved JSON. Later cells print primary/baseline results, calibration/rank/month/component views, and data-quality/leakage conclusions. The final cell prints one JSON line containing the saved diagnostic SHA-256, primary record, and `"recomputed_from_sealed_inputs": true`. On cell failure, propagate the exception and do not replace the prior notebook.
 
 - [ ] **Step 4: Generate and validate the executed notebook**
 
-Run: `python3 analysis/v5_1_bt/build_diagnostic_notebook.py && python3 -m unittest tests.test_notebook_artifact -v && ruff check mlb_backtest/notebook_artifact.py analysis/v5_1_bt/build_diagnostic_notebook.py tests/test_notebook_artifact.py`
+Run: `python3 analysis/v5_1_bt/build_diagnostic_notebook.py && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_notebook_artifact -v && ruff check mlb_backtest/notebook_artifact.py analysis/v5_1_bt/build_diagnostic_notebook.py tests/test_notebook_artifact.py`
 
 Expected: notebook is written atomically; test is `OK`; Ruff exits 0.
 
@@ -381,63 +513,189 @@ git add mlb_backtest/notebook_artifact.py analysis/v5_1_bt/build_diagnostic_note
 git commit -m "feat: add executed v5.1 diagnostic notebook"
 ```
 
-### Task 5: Build the canonical Data Analytics artifact and one portable HTML report
+### Task 5: Build and plugin-validate the canonical Data Analytics artifact
 
 **Files:**
 - Create: `mlb_backtest/report_artifact.py`
+- Create: `scripts/validate_report_artifact.mjs`
 - Create: `tests/test_report_artifact.py`
 - Create: `reports/v5_1_bt/diagnostic_100_artifact.json`
 - Create: `reports/v5_1_bt/diagnostic_100_chart_map.json`
-- Create outside repository: `/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html`
 
 - [ ] **Step 1: Write failing canonical artifact tests**
 
 ```python
 class ReportArtifactTest(unittest.TestCase):
     def test_artifact_is_one_executive_report_with_bounded_canonical_sources(self):
-        artifact = build_report_artifact(load_json(DIAGNOSTIC))
+        artifact = build_report_artifact(json.loads(DIAGNOSTIC.read_text()))
+        self.assertEqual(set(artifact), {"surface", "manifest", "snapshot", "sources"})
         self.assertEqual(artifact["surface"], "report")
-        self.assertEqual(artifact["manifest"]["audience"], "product stakeholders")
+        self.assertEqual(set(artifact["manifest"]), {"version", "surface", "title", "generatedAt", "blocks", "charts", "tables", "sources"})
+        self.assertEqual(artifact["manifest"]["version"], 1)
+        self.assertEqual(artifact["manifest"]["generatedAt"], "2026-07-12T00:00:00Z")
+        self.assertNotIn("audience", artifact["manifest"])
         blocks = artifact["manifest"]["blocks"]
-        self.assertTrue(blocks[0]["markdown"].startswith("# "))
-        self.assertEqual(blocks[1]["title"], "Executive Summary")
+        self.assertEqual(blocks[0], {"id": "title", "type": "markdown", "body": "# MLB v5.1 100픽 진단"})
+        self.assertTrue(blocks[1]["body"].startswith("## Executive Summary"))
+        self.assertEqual([block.get("chartId") for block in blocks if block["type"] == "chart"], ["paired-baselines", "calibration", "monthly", "components"])
+        self.assertEqual([block.get("tableId") for block in blocks if block["type"] == "table"], ["paired-baseline-table", "team-table"])
         self.assertEqual([chart["id"] for chart in artifact["manifest"]["charts"]], ["paired-baselines", "calibration", "monthly", "components"])
+        self.assertEqual(set(artifact["snapshot"]), {"version", "generatedAt", "status", "datasets"})
+        self.assertEqual(artifact["snapshot"]["version"], 1)
+        self.assertEqual(artifact["snapshot"]["status"], "ready")
+        self.assertNotIn("accessIssues", artifact["snapshot"])
         self.assertLessEqual(sum(len(rows) for rows in artifact["snapshot"]["datasets"].values()), 100)
-        self.assertTrue(all_source_backed_blocks_resolve(artifact))
-        self.assertFalse(contains_absolute_or_parent_path(artifact))
+        source_ids = {source["id"] for source in artifact["sources"]} | {source["id"] for source in artifact["manifest"]["sources"]}
+        self.assertTrue(all(item["sourceId"] in source_ids for item in artifact["manifest"]["charts"] + artifact["manifest"]["tables"]))
+        serialized = json.dumps(artifact)
+        self.assertNotIn(str(ROOT), serialized)
+        self.assertNotIn("../", serialized)
 ```
 
 - [ ] **Step 2: Run the test and verify the missing builder failure**
 
-Run: `python3 -m unittest tests.test_report_artifact -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_report_artifact -v`
 
 Expected: `ERROR` importing `mlb_backtest.report_artifact`.
 
 - [ ] **Step 3: Implement the artifact transformer and chart map**
 
 ```python
+GENERATED_AT = "2026-07-12T00:00:00Z"
+REPORT_SOURCE = {"id": "diagnostic-json", "label": "Canonical v5.1 diagnostic", "path": "reports/v5_1_bt/diagnostic_100.json"}
+
+def markdown_block(block_id: str, body: str, *, sourced: bool = False) -> dict[str, object]:
+    block: dict[str, object] = {"id": block_id, "type": "markdown", "body": body}
+    if sourced:
+        block["sourceId"] = "diagnostic-json"
+    return block
+
 def build_report_artifact(diagnostic: Mapping[str, object]) -> dict[str, object]:
-    datasets = build_bounded_datasets(diagnostic)
-    sources = canonical_report_sources(diagnostic["sources"])
-    return {
-        "surface": "report",
-        "manifest": {
-            "title": "MLB v5.1 100픽 진단",
-            "audience": "product stakeholders",
-            "blocks": executive_blocks(diagnostic),
-            "charts": chart_specs(),
-            "tables": table_specs(),
-            "sources": sources,
-        },
-        "snapshot": {"status": "ready", "datasets": datasets, "access_issues": []},
-        "sources": sources,
-        "package_info": {"artifact_version": "1", "generated_from": "reports/v5_1_bt/diagnostic_100.json"},
+    datasets = {
+        "baseline_pairs": baseline_pair_rows(diagnostic),
+        "calibration_bins": list(diagnostic["calibration"]["bins"]),
+        "monthly": month_rows(diagnostic),
+        "component_edges": component_rows(diagnostic),
+        "paired_table": paired_table_rows(diagnostic),
+        "teams": team_rows(diagnostic),
     }
+    charts = exact_chart_specs()
+    tables = exact_table_specs()
+    blocks = [
+        markdown_block("title", "# MLB v5.1 100픽 진단"),
+        markdown_block("executive-summary", executive_summary_body(diagnostic), sourced=True),
+        markdown_block("baseline-finding", baseline_body(diagnostic), sourced=True),
+        {"id": "paired-baselines-block", "type": "chart", "chartId": "paired-baselines"},
+        {"id": "paired-baseline-table-block", "type": "table", "tableId": "paired-baseline-table"},
+        markdown_block("calibration-finding", calibration_body(diagnostic), sourced=True),
+        {"id": "calibration-block", "type": "chart", "chartId": "calibration"},
+        markdown_block("stability-finding", stability_body(diagnostic), sourced=True),
+        {"id": "monthly-block", "type": "chart", "chartId": "monthly"},
+        {"id": "team-table-block", "type": "table", "tableId": "team-table"},
+        markdown_block("component-finding", component_body(diagnostic), sourced=True),
+        {"id": "components-block", "type": "chart", "chartId": "components"},
+        markdown_block("quality-leakage", quality_leakage_body(diagnostic), sourced=True),
+        markdown_block("next-steps", next_steps_body()),
+        markdown_block("further-questions", further_questions_body()),
+        markdown_block("caveats", caveats_body(diagnostic), sourced=True),
+    ]
+    manifest = {"version": 1, "surface": "report", "title": "MLB v5.1 100픽 진단", "generatedAt": GENERATED_AT,
+                "blocks": blocks, "charts": charts, "tables": tables, "sources": [REPORT_SOURCE]}
+    snapshot = {"version": 1, "generatedAt": GENERATED_AT, "status": "ready", "datasets": datasets}
+    return {"surface": "report", "manifest": manifest, "snapshot": snapshot, "sources": [REPORT_SOURCE]}
+
+def baseline_pair_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
+    return [{"comparison": name, "model_accuracy": d["baselines"][key]["model_accuracy"],
+             "baseline_accuracy": d["baselines"][key]["baseline_accuracy"], "N": d["baselines"][key]["paired"]["N"],
+             "delta": d["baselines"][key]["delta"], "mcnemar_p": d["baselines"][key]["mcnemar_p"]}
+            for name, key in (("홈팀", "home"), ("D-1 시즌 승률", "season_record"))]
+
+def month_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
+    return [{"month": month, "accuracy": value["accuracy"], "W": value["record"]["W"], "L": value["record"]["L"], "N": value["record"]["N"]}
+            for month, value in sorted(d["monthly"].items())]
+
+def component_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
+    return [{"component": name, "wins_mean": d["components"][name]["win_mean"],
+             "losses_mean": d["components"][name]["loss_mean"], "wins_N": 67, "losses_N": 33}
+            for name in ("starter", "offense", "bullpen", "schedule")]
+
+def paired_table_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
+    return [{"comparison": label, **d["baselines"][key]["paired"], "delta": d["baselines"][key]["delta"],
+             "interval_low": d["baselines"][key]["paired_delta_interval"][0],
+             "interval_high": d["baselines"][key]["paired_delta_interval"][1], "mcnemar_p": d["baselines"][key]["mcnemar_p"]}
+            for label, key in (("홈팀", "home"), ("D-1 시즌 승률", "season_record"))]
+
+def team_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
+    return [{"team": team, "W": values["W"], "L": values["L"], "N": values["N"], "accuracy": values["accuracy"],
+             "wilson_low": values["wilson_95"][0], "wilson_high": values["wilson_95"][1]}
+            for team, values in sorted(d["teams"].items(), key=lambda item: (-item[1]["N"], item[0]))]
+
+def executive_summary_body(d: Mapping[str, object]) -> str:
+    return "## Executive Summary\n\n- **67%는 가능성 신호입니다.** 100픽에서 67승 33패였습니다.\n- **추가 우위는 입증되지 않았습니다.** 시즌 승률 기준선과 다른 7경기에서 4 대 3이었습니다.\n- **확률과 재현성은 미검증입니다.** 비단조 보정과 사후 참가자 재구성 한계가 남습니다."
+
+def baseline_body(d: Mapping[str, object]) -> str:
+    return "## 67% 대부분은 강팀 선택과 겹칩니다\n\n홈 기준선 대비 차이는 +8.00%p이지만 p=0.1338이고, D-1 시즌 승률 기준선 대비 차이는 +1.0101%p이며 p=1.0입니다. 따라서 독립적인 추가 예측 가치는 확립되지 않았습니다."
+
+def calibration_body(d: Mapping[str, object]) -> str:
+    return "## 높은 확률이 더 높은 적중률로 이어지지 않았습니다\n\n63-68 구간은 45/59였지만 68%+ 구간은 14/23이었습니다. 이 100픽으로 구간이나 컷을 다시 최적화하지 않습니다."
+
+def stability_body(d: Mapping[str, object]) -> str:
+    return "## 월별 변동과 팀 집중도가 큽니다\n\n7월은 14/27이었고 상위 6개 선택 팀이 전체 픽의 57%였습니다. 이는 불안정성 진단이지 월/팀 효과의 증거가 아닙니다."
+
+def component_body(d: Mapping[str, object]) -> str:
+    return "## 컴포넌트 차이는 다음 검증의 가설입니다\n\n불펜과 일정 엣지는 승패 그룹에서 예상과 다른 방향을 보였습니다. 이 결과로 가중치·부호·임계값을 바꾸지 않고 과거 시즌에서 사전 선언대로 검사합니다."
+
+def quality_leakage_body(d: Mapping[str, object]) -> str:
+    return "## 데이터 품질은 실전 재현성을 제한합니다\n\n모든 Top 1은 INCOMPLETE·High·Toss-up이고, 참가자는 최종 라인업/실제 선발로 재구성됐습니다. D-1 통계 안전성 통과는 참가자 시점과 공급자 수정 이력을 해결하지 않습니다."
+
+def next_steps_body() -> str:
+    return "## Recommended Next Steps\n\n1. v5.2-QD 규칙과 해시를 동결합니다.\n2. 2018-2021 필수 소스를 확보한 뒤 H22/H23/H24를 적합합니다.\n3. 역사 500과 전향 T-45 장부를 절대 합치지 않습니다."
+
+def further_questions_body() -> str:
+    return "## Further Questions\n\n- 사전 시점 참가자 데이터가 재구성 참가자 결과를 재현합니까?\n- 불펜/일정 신호는 2022-2024 워크포워드에서도 같은 방향입니까?"
+
+def caveats_body(d: Mapping[str, object]) -> str:
+    return "## Caveats and Assumptions\n\n시장 N=0이므로 시장 엣지나 베팅 성과를 평가하지 않습니다. 2025는 개발 진단 표본이며 향후 역사 500은 강건성 시험이지 전향 확인이 아닙니다."
+
+def exact_chart_specs() -> list[dict[str, object]]:
+    def chart(chart_id: str, title: str, dataset: str, x: str, series: tuple[tuple[str, str], ...]) -> dict[str, object]:
+        return {"id": chart_id, "title": title, "type": "bar", "dataset": dataset, "sourceId": "diagnostic-json", "layout": "full",
+                "encodings": {"x": {"field": x, "type": "nominal"}},
+                "series": [{"field": field, "label": label} for field, label in series], "valueFormat": "percent"}
+    return [
+        chart("paired-baselines", "동일 경기 기준선 비교", "baseline_pairs", "comparison", (("model_accuracy", "모델"), ("baseline_accuracy", "기준선"))),
+        chart("calibration", "예측 확률과 실제 적중률", "calibration_bins", "bin", (("mean_probability", "평균 예측 확률"), ("actual_accuracy", "실제 적중률"))),
+        chart("monthly", "월별 Top 1 적중률", "monthly", "month", (("accuracy", "적중률"),)),
+        chart("components", "승패별 선택 측 컴포넌트 엣지", "component_edges", "component", (("wins_mean", "승리"), ("losses_mean", "패배"))),
+    ]
+
+def exact_table_specs() -> list[dict[str, object]]:
+    return [
+        {"id": "paired-baseline-table", "title": "짝지은 기준선 검정", "dataset": "paired_table", "sourceId": "diagnostic-json", "layout": "full", "density": "spacious",
+         "defaultSort": {"field": "N", "direction": "desc"}, "columns": [{"field": f, "label": label} for f, label in (("comparison", "비교"), ("N", "N"), ("model_only", "모델만 정답"), ("baseline_only", "기준선만 정답"), ("delta", "차이"), ("mcnemar_p", "McNemar p"))]},
+        {"id": "team-table", "title": "선택 팀별 결과", "dataset": "teams", "sourceId": "diagnostic-json", "layout": "full", "density": "dense",
+         "defaultSort": {"field": "N", "direction": "desc"}, "columns": [{"field": f, "label": label} for f, label in (("team", "팀"), ("W", "승"), ("L", "패"), ("N", "N"), ("accuracy", "적중률"), ("wilson_low", "Wilson 하한"), ("wilson_high", "Wilson 상한"))]},
+    ]
 ```
 
-The visible sequence is: title; `Executive Summary`; paired baseline finding/chart/table; calibration finding/chart; instability/concentration finding/month chart/team table; component hypotheses/chart; data-quality and leakage; recommended next steps; further questions; caveats and assumptions. Every chart is full width, has a neutral title, an adjacent takeaway paragraph, denominator `N`, and canonical source metadata.
+`exact_chart_specs()` returns four full-width native `bar` charts with `id/title/type/dataset/sourceId/layout/encodings`: paired/calibration/components use category `x` plus quantitative `y` fields and explicit `series`; monthly uses `month` x and `accuracy` y. `exact_table_specs()` returns the paired and team tables with `id/title/dataset/sourceId/layout/density/defaultSort/columns`. The tests assert exact equality to these definitions, including every encoding field, table column, and default sort. The visible blocks above are the exact reading order, so every visualization has adjacent interpretation.
 
-- [ ] **Step 4: Generate the artifact and deliver HTML through the plugin once**
+Create `scripts/validate_report_artifact.mjs` with this complete validator wrapper:
+
+```javascript
+import fs from "node:fs";
+import { createRequire } from "node:module";
+const [pluginRoot, input] = process.argv.slice(2);
+if (!pluginRoot || !input) throw new Error("usage: validate_report_artifact.mjs PLUGIN_ROOT artifact.json");
+const require = createRequire(import.meta.url);
+const server = require(`${pluginRoot}/mcp/server.cjs`);
+const payload = JSON.parse(fs.readFileSync(input, "utf8"));
+const result = server.callTool("validate_artifact", payload);
+if (!result || result.ok !== true) throw new Error("validate_artifact did not return ok=true");
+process.stdout.write(`${JSON.stringify({ok: true, surface: result.surface})}\n`);
+```
+
+- [ ] **Step 4: Generate and plugin-validate without HTML delivery**
 
 Run from the repository first:
 
@@ -446,15 +704,18 @@ python3 -m mlb_backtest.report_artifact \
   --diagnostic reports/v5_1_bt/diagnostic_100.json \
   --artifact reports/v5_1_bt/diagnostic_100_artifact.json \
   --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
-python3 -m unittest tests.test_report_artifact -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_report_artifact -v
+node scripts/validate_report_artifact.mjs \
+  /Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599 \
+  reports/v5_1_bt/diagnostic_100_artifact.json
 ```
 
-Then run exactly the `npm run report:deliver` command specified in the Data Analytics report contract above. Expected: test `OK`; delivery receipt reports validation, packaging, and verification `passed`; the output is one self-contained HTML file with no network requests.
+Expected: test `OK`; the real installed validator prints `{"ok":true,"surface":"report"}`. Do not run `report:deliver` in this task. Apply the `data-analytics:visualize-data` QA checklist to `diagnostic_100_chart_map.json`: question/takeaway, family, row sufficiency, exact encodings, palette policy, denominator context, source ID, adjacent narrative block, and laptop/mobile footprint are all nonempty for every chart.
 
 - [ ] **Step 5: Commit canonical report inputs, not the external generated HTML**
 
 ```bash
-git add mlb_backtest/report_artifact.py tests/test_report_artifact.py reports/v5_1_bt/diagnostic_100_artifact.json reports/v5_1_bt/diagnostic_100_chart_map.json
+git add mlb_backtest/report_artifact.py scripts/validate_report_artifact.mjs tests/test_report_artifact.py reports/v5_1_bt/diagnostic_100_artifact.json reports/v5_1_bt/diagnostic_100_chart_map.json
 git commit -m "feat: package portable v5.1 diagnostic report"
 ```
 
@@ -507,19 +768,90 @@ class V52ConfigTest(unittest.TestCase):
         for event, expected in cases.items():
             with self.subTest(event=event):
                 self.assertEqual(eligibility_disposition(event), expected)
+
+    def test_parser_and_documentation_schema_have_identical_closed_keys(self):
+        raw = json.loads(V52_CONFIG.read_text())
+        schema = json.loads(V52_SCHEMA.read_text())
+        self.assertEqual(set(raw), V52_REQUIRED_KEYS)
+        self.assertEqual(set(schema["required"]), V52_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), V52_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+        for mutation in (lambda x: x.__setitem__("unknown", 1), lambda x: x.pop("tier_cascade")):
+            changed = copy.deepcopy(raw)
+            mutation(changed)
+            with self.assertRaisesRegex(ValueError, "keys"):
+                parse_v52_config(changed)
 ```
 
-Add table-driven assertions for every probability/completeness boundary, all qualities clipped `[0,1]`, absence of new user-facing `confidence`, compatibility-only mapping of an old `confidence` field to `legacy_selection_quality_score`, legacy score isolation, agreement isolation, neutral environment/defense reason codes, exact ranking order (`probability`, completeness, starter edge, lock-basis start, `gamePk`), `p_home == 0.5`, all remaining source/hash/fold reason codes, and append-only critical reason codes.
+`test_all_tier_boundaries_and_isolation` iterates the literal cases `[(.70,9.0,"Low",False,"S"),(.68,8.99,"Medium",False,"A"),(.63,8.5,"Medium",False,"A"),(.58,8.0,"Medium",False,"B"),(.54,8.0,"Medium",False,"Lean"),(.539999,10,"Low",False,"Toss-up"),(.90,7.999,"High",False,"Toss-up"),(.90,10,"Low",True,"UNRATED")]`; asserts clipped qualities `-1→0` and `2→1`; asserts agreement and `legacy_selection_quality_score` mutations do not change completeness/tier/rank; asserts environment/defense absence yields score 50, quality 0, and `ENV_NEUTRAL_NO_ASOF_SOURCE`/`DEF_NEUTRAL_NO_ASOF_SOURCE`; asserts exact ranking key tuple `(-pick_probability,-data_completeness_score,-starter_edge_abs,lock_basis_start_utc,game_pk)`; and asserts `p_home==0.5` returns no official rank plus `NO_DIRECTION_AT_50`. `test_reason_code_matrix_is_exact` compares the config rows to every reason code in Section 4.4 and rejects deletion/reordering of append-only critical reasons.
 
 - [ ] **Step 2: Run the protocol tests and verify missing contracts**
 
-Run: `python3 -m unittest tests.test_protocols.V52ConfigTest -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.V52ConfigTest -v`
 
 Expected: `ERROR` because `protocols.py` and config are absent.
 
 - [ ] **Step 3: Implement the typed config and deterministic semantics**
 
 ```python
+V52_REQUIRED_KEYS = frozenset({"schema_version", "model_version", "protocol", "component_weights", "internal_metrics", "shrinkage_constants", "probability_clip", "score_rules", "ranking", "completeness", "uncertainty", "tier_cascade", "eligibility", "provenance", "change_control"})
+WEIGHT_KEYS = frozenset({"starter", "offense", "bullpen", "environment", "defense", "schedule"})
+SHRINKAGE_KEYS = frozenset({"starter", "hitter_split", "recent_form", "bullpen", "defense_catcher"})
+SCORE_RULE_KEYS = frozenset({"neutral_score", "missing_weight_redistribution", "probability_transform", "predicted_side"})
+COMPLETENESS_KEYS = frozenset({"formula", "quality_clip", "legacy_audit_field", "agreement_affects_score"})
+UNCERTAINTY_KEYS = frozenset({"high", "medium", "low"})
+PROVENANCE_KEYS = frozenset({"historical", "prospective_official", "prospective_shadow"})
+CHANGE_CONTROL_KEYS = frozenset({"reset_fields", "presentation_only_fields", "forbidden_2025_derived_changes"})
+TIER_ROW_KEYS = frozenset({"tier", "critical", "uncertainty", "min_probability", "min_completeness"})
+ELIGIBILITY_ROW_KEYS = frozenset({"event", "historical", "prospective", "disposition", "reason_code", "run_invalid"})
+EXPECTED_DIRECTIONS = {"starter": {"season_xwoba": -1, "k_minus_bb": 1, "fip": -1, "last5_xwoba": -1, "expected_ip": 1, "velo_change": 1},
+                       "offense": {"platoon_xwoba": 1, "last14_xwoba": 1, "bb_minus_k": 1, "barrel_rate": 1, "iso": 1},
+                       "bullpen": {"season_xwoba": -1, "k_minus_bb": 1, "last14_xwoba": -1, "availability": 1}}
+
+def require_exact_keys(value: object, expected: frozenset[str], path: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be an object")
+    actual = set(value)
+    if actual != expected:
+        raise ValueError(f"{path} keys differ; missing={sorted(expected - actual)} unknown={sorted(actual - expected)}")
+    return value
+
+def deep_freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(k): deep_freeze(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(deep_freeze(v) for v in value)
+    return value
+
+def validate_internal_metrics(value: object) -> None:
+    obj = require_exact_keys(value, frozenset(EXPECTED_DIRECTIONS), "internal_metrics")
+    from mlb_backtest.features.starter import WEIGHTS as starter_weights
+    from mlb_backtest.features.offense import WEIGHTS as offense_weights
+    from mlb_backtest.features.bullpen import WEIGHTS as bullpen_weights
+    expected_weights = {"starter": dict(starter_weights), "offense": dict(offense_weights), "bullpen": dict(bullpen_weights)}
+    for component in expected_weights:
+        metrics = require_exact_keys(obj[component], frozenset(expected_weights[component]), f"internal_metrics.{component}")
+        for name, expected_weight in expected_weights[component].items():
+            row = require_exact_keys(metrics[name], frozenset({"weight", "direction"}), f"internal_metrics.{component}.{name}")
+            if row != {"weight": expected_weight, "direction": EXPECTED_DIRECTIONS[component][name]}:
+                raise ValueError(f"internal metric differs: {component}.{name}")
+
+def validate_tier_rows(value: object) -> None:
+    if not isinstance(value, list) or [row.get("tier") for row in value if isinstance(row, Mapping)] != ["UNRATED", "Toss-up", "S", "A", "B", "Lean", "Toss-up"]:
+        raise ValueError("tier cascade order differs")
+    for index, row in enumerate(value):
+        require_exact_keys(row, TIER_ROW_KEYS, f"tier_cascade[{index}]")
+
+def validate_eligibility_rows(value: object) -> None:
+    if not isinstance(value, list) or not value:
+        raise ValueError("eligibility must be a nonempty list")
+    seen: set[str] = set()
+    for index, row in enumerate(value):
+        item = require_exact_keys(row, ELIGIBILITY_ROW_KEYS, f"eligibility[{index}]")
+        if item["event"] in seen:
+            raise ValueError("duplicate eligibility event")
+        seen.add(str(item["event"]))
+
 @dataclass(frozen=True)
 class V52Config:
     model_version: str
@@ -528,6 +860,32 @@ class V52Config:
     probability_clip: tuple[float, float]
     ranking: tuple[str, ...]
     raw: Mapping[str, object]
+
+def parse_v52_config(raw: object) -> V52Config:
+    obj = require_exact_keys(raw, V52_REQUIRED_KEYS, "config")
+    weights = require_exact_keys(obj["component_weights"], WEIGHT_KEYS, "component_weights")
+    shrinkage = require_exact_keys(obj["shrinkage_constants"], SHRINKAGE_KEYS, "shrinkage_constants")
+    require_exact_keys(obj["score_rules"], SCORE_RULE_KEYS, "score_rules")
+    require_exact_keys(obj["completeness"], COMPLETENESS_KEYS, "completeness")
+    require_exact_keys(obj["uncertainty"], UNCERTAINTY_KEYS, "uncertainty")
+    require_exact_keys(obj["provenance"], PROVENANCE_KEYS, "provenance")
+    require_exact_keys(obj["change_control"], CHANGE_CONTROL_KEYS, "change_control")
+    if obj["schema_version"] != 1 or obj["model_version"] != "v5.2-QD" or obj["protocol"] != "Quality-and-Data Discipline":
+        raise ValueError("config identity differs")
+    if weights != COMPONENT_WEIGHTS or shrinkage != SHRINKAGE_CONSTANTS:
+        raise ValueError("frozen predictive structure differs")
+    if obj["probability_clip"] != [0.10, 0.90] or tuple(obj["ranking"]) != V52_RANKING:
+        raise ValueError("probability/ranking contract differs")
+    validate_internal_metrics(obj["internal_metrics"])
+    validate_tier_rows(obj["tier_cascade"])
+    validate_eligibility_rows(obj["eligibility"])
+    forbidden = {"normalization", "slot_weights", "alpha", "beta", "fitted_model_cards"}
+    if forbidden & set(obj):
+        raise ValueError("unfitted config contains fitted values")
+    return V52Config("v5.2-QD", deep_freeze(weights), deep_freeze(shrinkage), (0.10, 0.90), V52_RANKING, deep_freeze(obj))
+
+def load_v52_config(path: Path) -> V52Config:
+    return parse_v52_config(json.loads(path.read_text(encoding="utf-8")))
 
 def data_completeness_score(qualities: Mapping[str, float]) -> float:
     clipped = {name: min(1.0, max(0.0, float(qualities[name]))) for name in COMPONENT_WEIGHTS}
@@ -553,7 +911,7 @@ The config must encode all unchanged internal metric weights/signs, shrinkage, c
 
 - [ ] **Step 4: Run schema/config tests and lint**
 
-Run: `python3 -m unittest tests.test_protocols.V52ConfigTest -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.V52ConfigTest -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py && git diff --check`
 
 Expected: all tests `OK`; Ruff and diff checks exit 0.
 
@@ -568,6 +926,7 @@ git commit -m "feat: freeze unfitted v5.2-QD protocol"
 
 **Files:**
 - Modify: `mlb_backtest/protocols.py`
+- Create: `schemas/v5_2_prospective.schema.json`
 - Create: `schemas/v5_2_run_spec.schema.json`
 - Create: `protocols/v5_2_qd/historical_walkforward_500.json`
 - Modify: `tests/test_protocols.py`
@@ -581,7 +940,9 @@ class HistoricalRunSpecTest(unittest.TestCase):
         self.assertEqual(run.target_count, 500)
         self.assertEqual(run.allowed_target_years, (2022, 2023, 2024))
         self.assertEqual(run.forbidden_target_years, (2025,))
-        self.assertEqual(run.folds[0], FoldSpec("H22", 2022, (2018, 2019, 2020, 2021), ((2019, (2018,)), (2020, (2018, 2019)), (2021, (2018, 2019, 2020)))))
+        self.assertEqual(run.folds[0].fold_id, "H22")
+        self.assertEqual(run.folds[0].normalization_years, (2018, 2019, 2020, 2021))
+        self.assertEqual(run.folds[0].oof_calibration, ((2019, (2018,)), (2020, (2018, 2019)), (2021, (2018, 2019, 2020))))
         self.assertEqual(run.folds[2].normalization_years, (2018, 2019, 2020, 2021, 2022, 2023))
 
     def test_future_and_2025_injections_fail_closed(self):
@@ -590,25 +951,46 @@ class HistoricalRunSpecTest(unittest.TestCase):
             validate_fold(replace(run.folds[0], normalization_years=(2018, 2022)))
         with self.assertRaisesRegex(ValueError, "2025 is excluded"):
             validate_run(replace(run, allowed_target_years=(2022, 2023, 2024, 2025)))
+
+    def test_run_and_fold_schema_keys_mirror_strict_parser(self):
+        schema = json.loads(RUN_SCHEMA.read_text())
+        self.assertEqual(set(schema["required"]), RUN_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), RUN_REQUIRED_KEYS)
+        fold_schema = schema["$defs"]["fold"]
+        self.assertEqual(set(fold_schema["required"]), FOLD_REQUIRED_KEYS)
+        self.assertEqual(set(fold_schema["properties"]), FOLD_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertFalse(fold_schema["additionalProperties"])
 ```
 
-Add assertions for chronological date queue, one Top 1 per eligible date, exact 500 graded dates, no second-ranked same-day replacements, VOID/replacement chronology, seven-day 23:59:59 America/New_York deadline, terminal mapping, doubleheader ordering, `NO_ELIGIBLE_DATE`, `SYSTEM_MISS`, `RUN_INVALID` precedence, outcome isolation, paired denominators, and the three frozen evidence labels.
+`test_run_contract_literals` asserts `date_queue={"order":"official_date_ascending","start":"2022-opening-day","end":"2024-regular-season-end","exclude":["spring","exhibition","all-star","postseason","2025"]}`, `selection={"eligible_top1_per_date":1,"graded_target":500,"same_date_rank2_replacement":false}`, terminal timezone/deadline `America/New_York/7/23:59:59`, doubleheader ordering `["lock_basis_start_utc","gamePk"]`, date-state precedence `["RUN_INVALID","SYSTEM_MISS","NO_ELIGIBLE_DATE","LOCK_TOP1"]`, and evidence labels `["RUN_INVALID","ROBUSTNESS_NOT_SUPPORTED","ROBUSTNESS_SUPPORTED_NOT_CONFIRMED"]`. It enumerates every terminal mapping and verifies replacement date is strictly after the VOID date. `test_outcome_and_denominator_contract` asserts lock-stage namespaces cannot import outcomes and exact denominators `model/home/brier/log_loss/wilson/streak=500`, `season=N_season`, `market=N_market`.
 
 - [ ] **Step 2: Run historical protocol tests and verify missing RunSpec behavior**
 
-Run: `python3 -m unittest tests.test_protocols.HistoricalRunSpecTest -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.HistoricalRunSpecTest -v`
 
 Expected: `FAIL` because `RunSpec`/`FoldSpec` and the JSON contract are incomplete.
 
 - [ ] **Step 3: Implement typed run/fold loading and fail-closed validation**
 
 ```python
+RUN_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "model_version", "label", "target_count", "allowed_target_years", "forbidden_target_years", "folds", "date_queue", "selection", "terminal_contract", "date_state_precedence", "outcome_isolation", "paired_denominators", "evidence_labels", "source_requirements", "namespaces", "model_card_status"})
+FOLD_REQUIRED_KEYS = frozenset({"fold_id", "target_year", "target_dates", "normalization_years", "oof_calibration", "latest_training_date", "model_card_path", "model_card_status"})
+OOF_ROW_KEYS = frozenset({"target_year", "normalization_years"})
+TERMINAL_KEYS = frozenset({"timezone", "deadline_days", "deadline_time", "status_mapping", "doubleheader_order", "replacement_rule", "late_result_rule"})
+NAMESPACE_KEYS = frozenset({"raw", "features", "locked", "outcomes", "reports", "audit"})
+
 @dataclass(frozen=True)
 class FoldSpec:
     fold_id: str
     target_year: int
+    target_dates: tuple[str, str]
     normalization_years: tuple[int, ...]
     oof_calibration: tuple[tuple[int, tuple[int, ...]], ...]
+    latest_training_date: str
+    model_card_path: str
+    model_card_status: str
+    raw: Mapping[str, object]
 
 @dataclass(frozen=True)
 class RunSpec:
@@ -619,6 +1001,37 @@ class RunSpec:
     folds: tuple[FoldSpec, ...]
     terminal_contract: Mapping[str, object]
     date_state_precedence: tuple[str, ...]
+    raw: Mapping[str, object]
+
+def parse_fold(raw: object) -> FoldSpec:
+    obj = require_exact_keys(raw, FOLD_REQUIRED_KEYS, "fold")
+    oof: list[tuple[int, tuple[int, ...]]] = []
+    if not isinstance(obj["oof_calibration"], list):
+        raise ValueError("fold.oof_calibration must be a list")
+    for index, row in enumerate(obj["oof_calibration"]):
+        item = require_exact_keys(row, OOF_ROW_KEYS, f"fold.oof_calibration[{index}]")
+        oof.append((int(item["target_year"]), tuple(int(y) for y in item["normalization_years"])))
+    target_dates = require_exact_keys(obj["target_dates"], frozenset({"start", "end"}), "fold.target_dates")
+    fold = FoldSpec(str(obj["fold_id"]), int(obj["target_year"]), (str(target_dates["start"]), str(target_dates["end"])),
+                    tuple(int(y) for y in obj["normalization_years"]), tuple(oof), str(obj["latest_training_date"]),
+                    str(obj["model_card_path"]), str(obj["model_card_status"]), deep_freeze(obj))
+    if obj["model_card_status"] != "UNFITTED_BLOCKED_BY_PREFLIGHT" or Path(str(obj["model_card_path"])).name != "model_card.json":
+        raise ValueError("fold model-card path/status differs")
+    validate_fold(fold)
+    return fold
+
+def parse_run_spec(raw: object) -> RunSpec:
+    obj = require_exact_keys(raw, RUN_REQUIRED_KEYS, "run")
+    require_exact_keys(obj["terminal_contract"], TERMINAL_KEYS, "terminal_contract")
+    require_exact_keys(obj["namespaces"], NAMESPACE_KEYS, "namespaces")
+    folds = tuple(parse_fold(row) for row in obj["folds"])
+    run = RunSpec(str(obj["run_id"]), int(obj["target_count"]), tuple(obj["allowed_target_years"]), tuple(obj["forbidden_target_years"]), folds,
+                  deep_freeze(obj["terminal_contract"]), tuple(obj["date_state_precedence"]), deep_freeze(obj))
+    validate_run(run)
+    return run
+
+def load_run_spec(path: Path) -> RunSpec:
+    return parse_run_spec(json.loads(path.read_text(encoding="utf-8")))
 
 def validate_fold(fold: FoldSpec) -> None:
     if any(year >= fold.target_year for year in fold.normalization_years):
@@ -632,7 +1045,7 @@ The JSON RunSpec must include every fold row from the approved design; sample/da
 
 - [ ] **Step 4: Run the full protocol test module**
 
-Run: `python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
@@ -658,28 +1071,44 @@ git commit -m "feat: define historical walk-forward 500 contract"
 ```python
 class PreflightTest(unittest.TestCase):
     def test_current_workspace_reports_required_gap_without_fetching(self):
-        before = tree_digests(ROOT / "data/v5_1_bt/raw")
-        report = build_preflight(ROOT, load_run_spec(HISTORICAL_SPEC))
-        after = tree_digests(ROOT / "data/v5_1_bt/raw")
+        before = protected_inventory(ROOT)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
+             patch("http.client.HTTPConnection.request", side_effect=AssertionError("network forbidden")), \
+             patch("socket.create_connection", side_effect=AssertionError("network forbidden")):
+            report = build_preflight(ROOT, load_run_spec(HISTORICAL_SPEC))
+        after = protected_inventory(ROOT)
         self.assertEqual(before, after)
         self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
         for year in (2018, 2019, 2020, 2021):
             self.assertEqual(report["seasons"][str(year)]["minimum_contract"], "MISSING")
         self.assertFalse(report["may_fit_H22"])
         self.assertFalse(report["fitted_model_cards_present"])
+        self.assertEqual(report["fitted_model_card_namespace"], "models/v5_2_qd/folds/{H22,H23,H24}/model_card.json")
+        self.assertTrue(all(step["status"] == "NOT_IMPLEMENTED_PLANNED" for step in report["acquisition_steps"] + report["execution_steps_after_ready"]))
 
     def test_optional_sources_never_fail_minimum_preflight(self):
         report = build_fixture_preflight(FIXTURE_ROOT / "minimum_complete_optional_absent")
         self.assertEqual(report["status"], "READY")
         self.assertEqual(report["optional_sources"]["market"]["status"], "ABSENT_NULL")
         self.assertEqual(report["optional_sources"]["environment"]["status"], "ABSENT_NEUTRAL")
+
+    def test_preflight_parser_and_schema_reject_unknown_or_missing_fields(self):
+        payload = build_preflight(ROOT, load_run_spec(HISTORICAL_SPEC))
+        schema = json.loads(PREFLIGHT_SCHEMA.read_text())
+        self.assertEqual(set(payload), PREFLIGHT_REQUIRED_KEYS)
+        self.assertEqual(set(schema["required"]), PREFLIGHT_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), PREFLIGHT_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+        changed = copy.deepcopy(payload); changed["unknown"] = 1
+        with self.assertRaisesRegex(ValueError, "keys"):
+            parse_preflight(changed)
 ```
 
 Fixture manifests must cover query splitting, duplicate `gamePk`, missing critical schema field, incomplete date range, hash mismatch, and an oversized logical extract split across child manifests with one stable logical query ID.
 
 - [ ] **Step 2: Run preflight tests and verify the missing scanner failure**
 
-Run: `python3 -m unittest tests.test_preflight -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v`
 
 Expected: `ERROR` importing `mlb_backtest.preflight`.
 
@@ -693,29 +1122,132 @@ MINIMUM_SOURCES = (
     "venue_team_timezone_table",
     "prior_schedule_history",
 )
+PROTECTED_PREFLIGHT_ROOTS = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
+PREFLIGHT_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "mode", "status", "generated_from_inventory_sha256", "protected_tree_before", "protected_tree_after", "seasons", "optional_sources", "may_fit_H22", "fitted_model_cards_present", "fitted_model_card_namespace", "acquisition_steps", "execution_steps_after_ready"})
+SEASON_KEYS = frozenset({"minimum_contract", "sources"})
+STEP_KEYS = frozenset({"stage", "status", "command", "prerequisite"})
+
+def protected_inventory(root: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for relative in PROTECTED_PREFLIGHT_ROOTS:
+        base = root / relative
+        for path in sorted(p for p in base.rglob("*") if p.is_file()):
+            result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+def planned_step(stage: str, command: str, prerequisite: str) -> dict[str, str]:
+    return {"stage": stage, "status": "NOT_IMPLEMENTED_PLANNED", "command": command, "prerequisite": prerequisite}
+
+def inventory_existing_manifests(root: Path) -> tuple[dict[str, object], ...]:
+    rows: list[dict[str, object]] = []
+    for path in sorted((root / "data/v5_1_bt/raw").rglob("*.manifest.json")):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or set(("source", "query", "sha256", "retrieved_at_utc", "row_count", "schema_version")) - set(manifest):
+            raise ValueError(f"invalid raw manifest: {path.relative_to(root)}")
+        rows.append({**manifest, "manifest_path": path.relative_to(root).as_posix(), "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    return tuple(rows)
+
+def fitted_cards_present(root: Path) -> bool:
+    return any((root / "models/v5_2_qd/folds" / fold / "model_card.json").exists() for fold in ("H22", "H23", "H24"))
+
+def exact_acquisition_steps(seasons: Mapping[str, object]) -> list[dict[str, str]]:
+    return [planned_step("acquire-raw-2018-2024", "python3 -m mlb_backtest.v52_acquire --years 2018:2024 --output data/v5_2_qd/raw", "approved deferred execution plan"),
+            planned_step("verify-source-coverage", "python3 -m mlb_backtest.v52_verify_sources --root data/v5_2_qd/raw", "acquire-raw-2018-2024 complete")]
+
+def exact_execution_steps(run_spec: RunSpec) -> list[dict[str, str]]:
+    return [planned_step("fit-fold-cards", "python3 -m mlb_backtest.v52_fit --run-spec protocols/v5_2_qd/historical_walkforward_500.json", "preflight status READY"),
+            planned_step("lock-historical-500", "python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --stop-after lock", "H22/H23/H24 cards sealed"),
+            planned_step("join-outcomes", "python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --resume outcomes", "all candidate/date locks sealed"),
+            planned_step("report-and-verify", "python3 -m mlb_backtest.v52_verify_run --run-id historical_walkforward_500", "exactly 500 graded dates resolved")]
+
+SOURCE_ALIASES = MappingProxyType({"mlb_schedule_game_feed": {"mlb_schedule"}, "baseball_savant_statcast": {"baseball_savant_statcast"},
+                                  "mlb_stats_pitching": {"mlb_stats_pitching", "mlb_stats_pitcher_bf"},
+                                  "venue_team_timezone_table": set(), "prior_schedule_history": {"mlb_schedule"}})
+SOURCE_RECORD_KEYS = frozenset({"source", "required", "expected_start", "expected_end", "observed_start", "observed_end", "logical_query_ids", "row_count", "game_count", "schema_fields", "missing_critical_fields", "duplicate_game_pks", "retrieved_at_utc", "content_sha256", "manifest_sha256", "split_children", "status"})
+
+def date_boundaries(query: object) -> tuple[str, str] | None:
+    if not isinstance(query, Mapping):
+        return None
+    start = query.get("start") or query.get("start_date") or query.get("startDate")
+    end = query.get("end") or query.get("end_date") or query.get("endDate")
+    return (str(start), str(end)) if start and end else None
+
+def query_overlaps_year(query: object, year: int) -> bool:
+    bounds = date_boundaries(query)
+    return bounds is not None and bounds[0] <= f"{year}-12-31" and bounds[1] >= f"{year}-01-01"
+
+def assess_season(year: int, inventory: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    expected_start, expected_end = f"{year}-01-01", f"{year}-12-31"
+    records: dict[str, object] = {}
+    for source in MINIMUM_SOURCES:
+        matched = [row for row in inventory if row["source"] in SOURCE_ALIASES[source] and query_overlaps_year(row["query"], year)]
+        observed_dates = sorted(date_boundaries(row["query"]) for row in matched if date_boundaries(row["query"]) is not None)
+        record = {"source": source, "required": True, "expected_start": expected_start, "expected_end": expected_end,
+                  "observed_start": observed_dates[0][0] if observed_dates else None, "observed_end": observed_dates[-1][1] if observed_dates else None,
+                  "logical_query_ids": [hashlib.sha256(canonical_json_bytes(row["query"])).hexdigest() for row in matched],
+                  "row_count": sum(int(row["row_count"]) for row in matched), "game_count": None,
+                  "schema_fields": [], "missing_critical_fields": ["manifest-bound full-season evidence"] if not matched else [],
+                  "duplicate_game_pks": [], "retrieved_at_utc": [row["retrieved_at_utc"] for row in matched],
+                  "content_sha256": [row["sha256"] for row in matched], "manifest_sha256": [row["manifest_sha256"] for row in matched],
+                  "split_children": [row["manifest_path"] for row in matched], "status": "MISSING" if not matched else "OBSERVED_NOT_PROVEN_COMPLETE"}
+        require_exact_keys(record, SOURCE_RECORD_KEYS, f"season.{year}.{source}")
+        records[source] = record
+    return {"minimum_contract": "COMPLETE" if all(row["status"] == "COMPLETE" for row in records.values()) else "MISSING", "sources": records}
+
+def optional_source_status(inventory: Sequence[Mapping[str, object]]) -> dict[str, dict[str, str]]:
+    return {"market": {"status": "ABSENT_NULL"}, "environment": {"status": "ABSENT_NEUTRAL"},
+            "defense": {"status": "ABSENT_NEUTRAL"}, "injury": {"status": "ABSENT_NULL"}}
+
+def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
+    return all(season["minimum_contract"] == "COMPLETE" for season in seasons.values())
 
 def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
+    before = protected_inventory(root)
     inventory = inventory_existing_manifests(root)
     seasons = {str(year): assess_season(year, inventory) for year in range(2018, 2025)}
-    return {
+    after = protected_inventory(root)
+    if before != after:
+        raise RuntimeError("preflight modified protected evidence")
+    payload = {
         "schema_version": 1,
         "run_id": run_spec.run_id,
         "mode": "READ_ONLY",
         "status": "READY" if all_minimum_complete(seasons) else "BLOCKED_REQUIRED_ACQUISITION",
         "seasons": seasons,
+        "generated_from_inventory_sha256": hashlib.sha256(canonical_json_bytes(before)).hexdigest(),
+        "protected_tree_before": before,
+        "protected_tree_after": after,
         "optional_sources": optional_source_status(inventory),
         "may_fit_H22": all(seasons[str(y)]["minimum_contract"] == "COMPLETE" for y in range(2018, 2022)),
         "fitted_model_cards_present": fitted_cards_present(root),
+        "fitted_model_card_namespace": "models/v5_2_qd/folds/{H22,H23,H24}/model_card.json",
         "acquisition_steps": exact_acquisition_steps(seasons),
         "execution_steps_after_ready": exact_execution_steps(run_spec),
     }
+    return parse_preflight(payload)
+
+def parse_preflight(raw: object) -> dict[str, object]:
+    obj = require_exact_keys(raw, PREFLIGHT_REQUIRED_KEYS, "preflight")
+    if obj["schema_version"] != 1 or obj["mode"] != "READ_ONLY":
+        raise ValueError("preflight identity differs")
+    for year in map(str, range(2018, 2025)):
+        season = require_exact_keys(obj["seasons"][year], SEASON_KEYS, f"preflight.seasons.{year}")
+        if set(season["sources"]) != set(MINIMUM_SOURCES):
+            raise ValueError(f"preflight.seasons.{year}.sources differs")
+        for source, record in season["sources"].items():
+            require_exact_keys(record, SOURCE_RECORD_KEYS, f"preflight.seasons.{year}.sources.{source}")
+    for index, step in enumerate(obj["acquisition_steps"] + obj["execution_steps_after_ready"]):
+        item = require_exact_keys(step, STEP_KEYS, f"preflight.steps[{index}]")
+        if item["status"] != "NOT_IMPLEMENTED_PLANNED":
+            raise ValueError("preflight must not claim unimplemented CLI is executable")
+    return dict(deep_freeze(obj))
 ```
 
-For each source/season record expected/observed ranges, query identity, row/game counts, schema fields, missing critical fields, duplicates, min/max event date, retrieval times, content and manifest SHA-256, split-child identity, and status. The emitted commands must name exact CLI stages and destinations: fetch 2018-2024 raw manifests, verify hashes/schema/coverage, build OOF fold inputs, fit/seal H22/H23/H24 only after `READY`, score/lock chronologically, join outcomes only after locks, resolve VOID/PENDING, report, and verify. The scanner must not make network calls or write under data/audit trees.
+Each source record has the exact keys `source`, `required`, `expected_start`, `expected_end`, `observed_start`, `observed_end`, `logical_query_ids`, `row_count`, `game_count`, `schema_fields`, `missing_critical_fields`, `duplicate_game_pks`, `retrieved_at_utc`, `content_sha256`, `manifest_sha256`, `split_children`, and `status`; `assess_season` rejects any missing/unknown key. The stage records name concrete intended module commands and destinations but remain `NOT_IMPLEMENTED_PLANNED` until the deferred plan actually creates those CLI entry points. The scanner must not make network calls or write under data/audit trees.
 
 - [ ] **Step 4: Generate and test the current-state preflight**
 
-Run: `python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md && python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
+Run: `python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
 
 Expected: report status is `BLOCKED_REQUIRED_ACQUISITION`; 2018-2021 required gaps are explicit; no fitted cards exist; tests are `OK`; Ruff exits 0.
 
@@ -750,19 +1282,35 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertFalse(eligible_for_prospective_official_pool(stratum))
         self.assertRaises(ValueError, combine_ledgers, "historical_walkforward_500", "prospective_2026")
         self.assertEqual(date_disposition("acquisition_failure"), "SYSTEM_MISS")
+
+    def test_prospective_unknown_missing_and_nested_clock_keys_fail(self):
+        raw = json.loads(PROSPECTIVE_SPEC.read_text())
+        for mutate in (lambda x: x.__setitem__("unknown", 1), lambda x: x.pop("polling"), lambda x: x["polling"].pop("max_ntp_offset_seconds")):
+            changed = copy.deepcopy(raw)
+            mutate(changed)
+            with self.assertRaisesRegex(ValueError, "keys"):
+                parse_prospective_spec(changed)
+        schema = json.loads(PROSPECTIVE_SCHEMA.read_text())
+        self.assertEqual(set(schema["required"]), PROSPECTIVE_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), PROSPECTIVE_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
 ```
 
-Add assertions for qualifying closed interval, late-response rejection, NTP offset `2` accepted and `>2` rejected, pre-lock start change invalidating snapshots/restarting countdown, late reschedule shadow status, immutable `lock_basis_start_utc`, post-lock `latest_effective_start_utc`, no re-lock, verified-only rank isolation, shadow rank, exact `p_home==0.5`, partial/no-verified date precedence, milestones 25/50/100/250/500, seven-day outcome deadline, and `CONFIRMED_INCREMENTAL_EDGE` gate text.
+`test_clock_and_pool_literal_contract` asserts the qualifying receipt interval is closed `[-50,-45]`, a response after T-45 is rejected, NTP offset `2.0` passes and `2.000001` yields `SYSTEM_MISS_CLOCK`, a pre-lock start change invalidates prior snapshots/restarts countdown, a discovered-after-T-45 reschedule yields `TIMESTAMP_PARTIAL_T45/LATE_RESCHEDULE_UNVERIFIED`, and post-lock updates change only `latest_effective_start_utc` while `lock_basis_start_utc`, lock, ranks, and no-relock count stay fixed. It also asserts verified-only official rank, separate shadow rank, no-direction behavior at 0.5, date precedence `[RUN_INVALID,SYSTEM_MISS,SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE,NO_VERIFIED_ELIGIBLE_DATE,LOCK_TOP1]`, milestones `[25,50,100,250,500]`, the shared seven-day terminal contract, and the full `CONFIRMED_INCREMENTAL_EDGE` gate fields.
 
 - [ ] **Step 2: Run prospective tests and verify contract absence**
 
-Run: `python3 -m unittest tests.test_protocols.ProspectiveProtocolTest -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols.ProspectiveProtocolTest -v`
 
 Expected: `FAIL` because prospective parsing/rules are absent.
 
 - [ ] **Step 3: Implement the immutable prospective protocol parser**
 
 ```python
+PROSPECTIVE_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "model_version", "first_permitted_date", "fit_years", "excluded_fit_years", "oof_calibration", "card_seal", "polling", "clock", "schedule_changes", "participant_provenance", "official_pool", "shadow_pool", "date_state_precedence", "terminal_contract", "milestones", "evidence_gate", "namespace", "pooling_forbidden", "backfill_forbidden"})
+POLLING_KEYS = frozenset({"T-90_to_before_T-50_seconds", "T-50_to_T-45_seconds", "qualifying_window_minutes", "max_age_at_lock_minutes", "max_ntp_offset_seconds"})
+PROVENANCE_CONTRACT_KEYS = frozenset({"official", "partial", "historical_forbidden"})
+
 @dataclass(frozen=True)
 class ProspectiveSpec:
     run_id: str
@@ -772,9 +1320,41 @@ class ProspectiveSpec:
     polling: Mapping[str, object]
     official_provenance: str
     namespace: str
+    raw: Mapping[str, object]
+
+def parse_prospective_spec(raw: object) -> ProspectiveSpec:
+    obj = require_exact_keys(raw, PROSPECTIVE_REQUIRED_KEYS, "prospective")
+    polling = require_exact_keys(obj["polling"], POLLING_KEYS, "prospective.polling")
+    provenance = require_exact_keys(obj["participant_provenance"], PROVENANCE_CONTRACT_KEYS, "prospective.participant_provenance")
+    if obj["schema_version"] != 1 or obj["model_version"] != "v5.2-QD" or obj["excluded_fit_years"] != [2025]:
+        raise ValueError("prospective identity/fit exclusion differs")
+    if tuple(obj["fit_years"]) != tuple(range(2018, 2025)) or tuple(row["target_year"] for row in obj["oof_calibration"]) != tuple(range(2019, 2025)):
+        raise ValueError("prospective OOF sequence differs")
+    for index, row in enumerate(obj["oof_calibration"]):
+        require_exact_keys(row, OOF_ROW_KEYS, f"prospective.oof_calibration[{index}]")
+        if tuple(row["normalization_years"]) != tuple(range(2018, row["target_year"])):
+            raise ValueError("prospective OOF pool differs")
+    spec = ProspectiveSpec(str(obj["run_id"]), date.fromisoformat(str(obj["first_permitted_date"])), tuple(obj["fit_years"]),
+                           tuple(row["target_year"] for row in obj["oof_calibration"]), deep_freeze(polling), str(provenance["official"]),
+                           str(obj["namespace"]), deep_freeze(obj))
+    if spec.first_permitted_date != date(2026, 7, 13) or spec.official_provenance != "TIMESTAMP_VERIFIED_T45":
+        raise ValueError("prospective date/provenance differs")
+    return spec
+
+def load_prospective_spec(path: Path) -> ProspectiveSpec:
+    return parse_prospective_spec(json.loads(path.read_text(encoding="utf-8")))
 
 def eligible_for_prospective_official_pool(stratum: str) -> bool:
     return stratum == "TIMESTAMP_VERIFIED_T45"
+
+DATE_DISPOSITIONS = MappingProxyType({"acquisition_failure": "SYSTEM_MISS", "clock_failure": "SYSTEM_MISS_CLOCK",
+                                      "partial_only": "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE", "empty_verified": "NO_VERIFIED_ELIGIBLE_DATE"})
+
+def date_disposition(event: str) -> str:
+    try:
+        return DATE_DISPOSITIONS[event]
+    except KeyError as exc:
+        raise ValueError(f"unknown prospective date event: {event}") from exc
 
 def combine_ledgers(left_run_id: str, right_run_id: str) -> NoReturn:
     raise ValueError(f"ledger pooling forbidden: {left_run_id} + {right_run_id}")
@@ -784,14 +1364,14 @@ The JSON must encode the exact 2019-from-2018 through 2024-from-2018-2023 OOF se
 
 - [ ] **Step 4: Run all protocol tests and lint**
 
-Run: `python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
 
 Expected: all tests `OK`; Ruff exits 0.
 
 - [ ] **Step 5: Commit the separate prospective ledger contract**
 
 ```bash
-git add mlb_backtest/protocols.py protocols/v5_2_qd/prospective_2026.json tests/test_protocols.py
+git add mlb_backtest/protocols.py schemas/v5_2_prospective.schema.json protocols/v5_2_qd/prospective_2026.json tests/test_protocols.py
 git commit -m "feat: freeze prospective T-45 ledger protocol"
 ```
 
@@ -800,6 +1380,7 @@ git commit -m "feat: freeze prospective T-45 ledger protocol"
 **Files:**
 - Create: `mlb_backtest/verify_v52_design.py`
 - Create: `tests/test_verify_v52_design.py`
+- Create: `protocols/v5_2_qd/v51_protected_inventory.json`
 - Modify generated contracts/reports only if the verifier exposes a mismatch.
 
 - [ ] **Step 1: Write failing cross-artifact and mutation tests**
@@ -807,7 +1388,7 @@ git commit -m "feat: freeze prospective T-45 ledger protocol"
 ```python
 class DesignVerificationTest(unittest.TestCase):
     def test_current_deliverables_cross_validate(self):
-        receipt = verify_design_deliverables(ROOT, OUTPUTS)
+        receipt = verify_design_deliverables(ROOT, outputs=None)
         self.assertEqual(receipt["status"], "PASS")
         self.assertEqual(receipt["diagnostic"]["primary"], {"W": 67, "L": 33, "N": 100})
         self.assertEqual(receipt["v52"]["fitted_model_card_count"], 0)
@@ -815,52 +1396,111 @@ class DesignVerificationTest(unittest.TestCase):
         self.assertEqual(receipt["historical"]["execution_status"], "NOT_EXECUTED")
 
     def test_mutating_any_sealed_v51_artifact_fails(self):
-        with copied_workspace(ROOT) as copy:
-            path = copy / "data/v5_1_bt/locked/predictions.jsonl"
-            path.write_bytes(path.read_bytes() + b"\n")
-            with self.assertRaisesRegex(ValueError, "sealed v5.1"):
-                verify_design_deliverables(copy, OUTPUTS)
+        protected = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
+        for relative in protected:
+            with self.subTest(tree=relative), tempfile.TemporaryDirectory() as directory:
+                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy)
+                files = sorted(path for path in (copy / relative).rglob("*") if path.is_file())
+                files[0].write_bytes(files[0].read_bytes() + b"mutation")
+                with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
+                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
+            with self.subTest(tree=relative, change="add"), tempfile.TemporaryDirectory() as directory:
+                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy); (copy / relative / "added.bin").write_bytes(b"added")
+                with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
+                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
+            with self.subTest(tree=relative, change="delete"), tempfile.TemporaryDirectory() as directory:
+                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy); next(path for path in (copy / relative).rglob("*") if path.is_file()).unlink()
+                with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
+                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
 ```
 
 - [ ] **Step 2: Run verifier tests and confirm missing module failure**
 
-Run: `python3 -m unittest tests.test_verify_v52_design -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_verify_v52_design -v`
 
 Expected: `ERROR` importing `mlb_backtest.verify_v52_design`.
 
 - [ ] **Step 3: Implement requirement-by-requirement verification**
 
 ```python
-SEALED_V51 = {
-    "data/v5_1_bt/locked/predictions.jsonl": "bbe584cf0fe3d193b4ad13ee58bdf1a6f9026de7c1ad221ba09d06ff48069dcb",
-    "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl": "db2b6276396a9d5f24a512bbf684ab6bafa0285e34161a434deaf5054bf2ec76",
-}
+PROTECTED_TREES = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
+PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
 
-def verify_design_deliverables(root: Path, outputs: Path) -> dict[str, object]:
-    verify_sealed_contents(root, SEALED_V51)
+def build_protected_inventory(root: Path) -> dict[str, object]:
+    files = {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+             for relative in PROTECTED_TREES for path in sorted((root / relative).rglob("*")) if path.is_file()}
+    files.update({relative: hashlib.sha256((root / relative).read_bytes()).hexdigest() for relative in PROTECTED_FILES})
+    return {"schema_version": 1, "algorithm": "sha256-file-bytes", "protected_trees": list(PROTECTED_TREES),
+            "protected_files": list(PROTECTED_FILES), "files": dict(sorted(files.items()))}
+
+def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
+    expected = json.loads(inventory_path.read_text(encoding="utf-8"))
+    actual = build_protected_inventory(root)
+    if actual != expected:
+        raise ValueError("protected v5.1 inventory differs by mutation, addition, or deletion")
+
+def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, object]:
+    verify_protected_inventory(root, root / "protocols/v5_2_qd/v51_protected_inventory.json")
     diagnostic = verify_diagnostic(root)
     config = load_v52_config(root / "config/v5_2_qd.json")
     historical = load_run_spec(root / "protocols/v5_2_qd/historical_walkforward_500.json")
     prospective = load_prospective_spec(root / "protocols/v5_2_qd/prospective_2026.json")
     preflight = verify_preflight(root)
-    verify_html_payload(outputs / "mlb_v5_1_100_pick_diagnostic.html", root / "reports/v5_1_bt/diagnostic_100_artifact.json")
+    if outputs is not None:
+        verify_html_payload(outputs / "mlb_v5_1_100_pick_diagnostic.html", root / "reports/v5_1_bt/diagnostic_100_artifact.json")
     verify_no_fitted_cards(root)
     verify_namespaces_differ(historical, prospective)
     return build_pass_receipt(diagnostic, config, historical, prospective, preflight)
+
+def verify_diagnostic(root: Path) -> dict[str, object]:
+    saved = json.loads((root / "reports/v5_1_bt/diagnostic_100.json").read_text(encoding="utf-8"))
+    recomputed = build_diagnostic(load_v51_evidence(root))
+    if canonical_json_bytes(saved) != canonical_json_bytes(recomputed) or saved["primary"]["record"] != {"W": 67, "L": 33, "N": 100}:
+        raise ValueError("diagnostic does not match sealed inputs")
+    return saved
+
+def verify_preflight(root: Path) -> dict[str, object]:
+    payload = parse_preflight(json.loads((root / "reports/v5_2_qd/walkforward_500_preflight.json").read_text(encoding="utf-8")))
+    if payload["status"] != "BLOCKED_REQUIRED_ACQUISITION" or payload["may_fit_H22"]:
+        raise ValueError("current preflight status differs")
+    return payload
+
+def verify_no_fitted_cards(root: Path) -> None:
+    paths = [root / "models/v5_2_qd/folds" / fold / "model_card.json" for fold in ("H22", "H23", "H24")]
+    if any(path.exists() for path in paths):
+        raise ValueError("fitted fold card exists before source acquisition")
+
+def verify_namespaces_differ(historical: RunSpec, prospective: ProspectiveSpec) -> None:
+    if prospective.namespace in set(historical.raw["namespaces"].values()):
+        raise ValueError("historical and prospective namespaces overlap")
+
+def verify_html_payload(html_path: Path, artifact_path: Path) -> None:
+    plugin = Path("/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599")
+    completed = subprocess.run(["npm", "run", "report:verify", "--", "--html", str(html_path), "--artifact", str(artifact_path)],
+                               cwd=plugin, check=False, capture_output=True, text=True)
+    if completed.returncode != 0 or '"ok":true' not in completed.stdout:
+        raise ValueError(f"portable HTML verification failed: {completed.stderr}")
+
+def build_pass_receipt(diagnostic: Mapping[str, object], config: V52Config, historical: RunSpec,
+                       prospective: ProspectiveSpec, preflight: Mapping[str, object]) -> dict[str, object]:
+    return {"status": "PASS", "diagnostic": {"primary": diagnostic["primary"]["record"]},
+            "v52": {"model_version": config.model_version, "fitted_model_card_count": 0},
+            "preflight": {"status": preflight["status"]}, "historical": {"execution_status": "NOT_EXECUTED"},
+            "prospective": {"first_permitted_date": prospective.first_permitted_date.isoformat()}}
 ```
 
 Verify exact hashes, JSON/Markdown/notebook agreement, HTML embedded artifact equality, all schema identities, config/change-contract digests, no H22/H23/H24 model cards, current preflight blockers, no historical run outputs, prospective/historical namespace separation, forbidden-claim scan, and all current-scope files. A changed v5.1 sealed artifact, missing/mismatched embedded HTML artifact, or unexpectedly fitted card fails closed; browser-verification success is separately proven by the fresh Task 11 delivery receipt.
 
 - [ ] **Step 4: Run focused and full regression verification**
 
-Run: `python3 -m unittest tests.test_verify_v52_design -v && python3 -m mlb_backtest.verify_v52_design --root . --outputs /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs && python3 -m unittest discover -s tests -q && ruff check . && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_verify_v52_design -v && python3 -m mlb_backtest.verify_v52_design --root . --skip-html && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q && ruff check . && git diff --check`
 
 Expected: verifier prints `PASS`; all tests are `OK`; Ruff and diff checks exit 0.
 
 - [ ] **Step 5: Commit the integrity verifier**
 
 ```bash
-git add mlb_backtest/verify_v52_design.py tests/test_verify_v52_design.py
+git add mlb_backtest/verify_v52_design.py tests/test_verify_v52_design.py protocols/v5_2_qd/v51_protected_inventory.json
 git commit -m "test: verify v5.2 design deliverables"
 ```
 
@@ -885,28 +1525,32 @@ Expected: `APPROVED` or severity-ranked issues with file/line evidence. Fix all 
 - [ ] **Step 3: Run fresh complete verification from a clean process**
 
 ```bash
-python3 -m unittest discover -s tests -q
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
 ruff check .
 git diff --check
 python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt
 python3 analysis/v5_1_bt/build_diagnostic_notebook.py
 python3 -m mlb_backtest.report_artifact --diagnostic reports/v5_1_bt/diagnostic_100.json --artifact reports/v5_1_bt/diagnostic_100_artifact.json --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md
-python3 -m mlb_backtest.verify_v52_design --root . --outputs /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs
+python3 -m mlb_backtest.verify_v52_design --root . --skip-html
 git status --short
 ```
 
 Expected: tests `OK`; Ruff/diff/verifier pass; regeneration is byte-stable; status contains only intentional current-phase files or is clean after their commits; there are no new files under fitted-card or historical-run output namespaces.
 
-- [ ] **Step 4: Re-run the one approved HTML delivery and inspect its success receipt**
+- [ ] **Step 4: Deliver the stable artifact exactly once and inspect its success receipt**
 
-Run the exact `npm run report:deliver` command under the Data Analytics report contract once after final artifact regeneration.
+Run the exact `npm run report:deliver` command under the Data Analytics report contract once after final artifact regeneration. No earlier task invokes that command.
 
 Expected: validation, packaging, and verification all `passed`; output exists at the exact user-facing path; semantic content includes all visible executive sections, four charts, exact paired tables, caveats, and recommendations; no network dependency is present.
 
-- [ ] **Step 5: Commit review fixes and final generated inputs if changed**
+- [ ] **Step 5: Run the final HTML-aware verifier, then commit review fixes if changed**
 
 ```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.verify_v52_design \
+  --root . \
+  --outputs /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs
+shasum -a 256 /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html
 git add -u
 git commit -m "fix: satisfy v5.2 design reviews"
 ```
@@ -939,5 +1583,5 @@ The deferred plan must use TDD and subagent-driven development, must begin from 
 - [ ] Historical and prospective namespaces, provenance, clocks, date states, and evidence labels cannot be pooled.
 - [ ] Heavy acquisition, fold fitting, 500 execution, workbook creation, and live operation are confined to the deferred second plan.
 - [ ] All function/type/property names are consistent across tasks: `V51Evidence`, `V52Config`, `FoldSpec`, `RunSpec`, `ProspectiveSpec`, `build_diagnostic`, `build_preflight`, and `verify_design_deliverables`.
-- [ ] All commands use the established `python3 -m unittest` and Ruff style and include an expected result.
+- [ ] All commands use the established `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest` and Ruff style and include an expected result.
 - [ ] No current task changes any sealed v5.1 artifact.
