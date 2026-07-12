@@ -356,8 +356,45 @@ def prepare_locked_outcomes(
 ) -> tuple[list[dict[str, object]], dict[int, str]]:
     """Prepare official outcomes and D-1 win-percentage baselines after lock."""
     locked = {row["game_pk"]: row for row in locked_rows}
-    games_by_day: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    records_by_game: dict[object, list[Mapping[str, object]]] = defaultdict(list)
     for game in schedule_games:
+        records_by_game[game["game_pk"]].append(game)
+    reconciled_games = []
+    for game_pk, records in records_by_game.items():
+        if len(records) == 1:
+            reconciled_games.append(records[0])
+            continue
+        finals = [
+            game
+            for game in records
+            if game.get("status") in {"Final", "Completed Early"}
+        ]
+        if len(finals) > 1:
+            raise ValueError(f"multiple official Final records for game_pk {game_pk}")
+        if len(finals) != 1:
+            raise ValueError(f"ambiguous duplicate schedule records for game_pk {game_pk}")
+        final = finals[0]
+        identity = tuple(final.get(key) for key in ("official_date", "away_team", "home_team"))
+        for stale in records:
+            if stale is final:
+                continue
+            stale_identity = tuple(
+                stale.get(key) for key in ("official_date", "away_team", "home_team")
+            )
+            result_free_postponed = (
+                stale.get("status") == "Postponed"
+                and stale.get("away_score") is None
+                and stale.get("home_score") is None
+                and stale.get("away_is_winner") is None
+                and stale.get("home_is_winner") is None
+            )
+            if stale_identity != identity or not result_free_postponed:
+                raise ValueError(
+                    f"ambiguous duplicate schedule records for game_pk {game_pk}"
+                )
+        reconciled_games.append(final)
+    games_by_day: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    for game in reconciled_games:
         games_by_day[str(game.get("official_date"))].append(game)
     wins: defaultdict[str, int] = defaultdict(int)
     losses: defaultdict[str, int] = defaultdict(int)

@@ -196,6 +196,48 @@ class ScoringPreparationTest(unittest.TestCase):
         self.assertEqual(outcomes[2]["actual_winner"], "")
         self.assertEqual(baseline, {2: "A", 3: "A"})
 
+    def test_outcomes_reconcile_stale_postponed_snapshot_to_one_official_final(self):
+        schedule = [
+            {"game_pk": 1, "official_date": "2025-04-30", "away_team": "A", "home_team": "B", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+            {"game_pk": 10, "official_date": "2025-04-30", "away_team": "C", "home_team": "D", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+            {"game_pk": 2, "official_date": "2025-05-01", "scheduled_start_utc": "2025-04-11T23:05:00Z", "away_team": "A", "home_team": "B", "status": "Postponed", "away_score": None, "home_score": None, "away_is_winner": None, "home_is_winner": None},
+            {"game_pk": 2, "official_date": "2025-05-01", "scheduled_start_utc": "2025-05-01T17:05:00Z", "away_team": "A", "home_team": "B", "status": "Final", "away_score": 2, "home_score": 3, "away_is_winner": False, "home_is_winner": True},
+            {"game_pk": 3, "official_date": "2025-05-02", "away_team": "A", "home_team": "C", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+        ]
+        locked = [
+            {"game_pk": 2, "away_team": "A", "home_team": "B"},
+            {"game_pk": 3, "away_team": "A", "home_team": "C"},
+        ]
+
+        outcomes, baseline = prepare_locked_outcomes(locked, schedule)
+
+        self.assertEqual(
+            outcomes,
+            [
+                {"game_pk": 2, "actual_winner": "B", "status": "Final"},
+                {"game_pk": 3, "actual_winner": "A", "status": "Final"},
+            ],
+        )
+        self.assertEqual(baseline, {2: "A", 3: "C"})
+
+    def test_outcomes_reject_conflicting_multiple_official_finals(self):
+        schedule = [
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B", "status": "Final", "away_is_winner": True, "home_is_winner": False},
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B", "status": "Completed Early", "away_is_winner": False, "home_is_winner": True},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "multiple official Final records"):
+            prepare_locked_outcomes([{"game_pk": 2}], schedule)
+
+    def test_outcomes_reject_ambiguous_duplicate_nonfinal_records(self):
+        schedule = [
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B", "status": "Postponed", "away_score": None, "home_score": None, "away_is_winner": None, "home_is_winner": None},
+            {"game_pk": 2, "official_date": "2025-05-01", "away_team": "A", "home_team": "B", "status": "Cancelled", "away_score": None, "home_score": None, "away_is_winner": None, "home_is_winner": None},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "ambiguous duplicate schedule records"):
+            prepare_locked_outcomes([{"game_pk": 2}], schedule)
+
 
 if __name__ == "__main__":
     unittest.main()
