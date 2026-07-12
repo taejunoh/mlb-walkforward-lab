@@ -746,6 +746,8 @@ def _aggregate_training_slot_rows(
                     raise ValueError("official lineup contains a duplicate player")
                 player_slots[player_id] = slot
             sides[side] = player_slots
+        if set(sides["away"]) & set(sides["home"]):
+            raise ValueError("official lineups contain a player on both teams")
         lineups[game_pk] = (season, official_date, sides)
 
     from .statcast import StatcastData
@@ -758,7 +760,7 @@ def _aggregate_training_slot_rows(
         rows = statcast_plate_appearances
     totals: defaultdict[tuple[int, int], int] = defaultdict(int)
     seen_pa = set()
-    matched_sides = set()
+    matched_batters: defaultdict[tuple[int, str], set[int]] = defaultdict(set)
     for row in rows:
         if not isinstance(row, (Mapping, SlotPA)):
             raise ValueError("plate appearance rows must be mappings or SlotPA")
@@ -791,16 +793,20 @@ def _aggregate_training_slot_rows(
         slot = sides[side].get(batter_id)
         if slot is not None:
             totals[(season, slot)] += 1
-            matched_sides.add((game_pk, side))
+            matched_batters[(game_pk, side)].add(batter_id)
     if full_season_mode:
-        missing_sides = sorted(
-            (game_pk, side)
-            for game_pk in lineups
+        missing_starters = sorted(
+            (game_pk, side, slot, player_id)
+            for game_pk, (_season, _official_date, sides) in lineups.items()
             for side in ("away", "home")
-            if (game_pk, side) not in matched_sides
+            for player_id, slot in sides[side].items()
+            if player_id not in matched_batters[(game_pk, side)]
         )
-        if missing_sides:
-            raise ValueError(f"played lineup games missing matched Statcast PA: {missing_sides}")
+        if missing_starters:
+            raise ValueError(
+                "played lineup games missing official lineup batters: "
+                f"{missing_starters}"
+            )
     expected = {
         (season, slot)
         for season in (2022, 2023, 2024)
@@ -1011,10 +1017,7 @@ def derive_training_slot_rows(
         if row.game_date != played_game_dates[game_pk]:
             raise ValueError("verified Statcast plate appearance date conflicts with schedule")
     _assert_schedule_pa_completeness(
-        {
-            game_pk: str(game["official_date"])
-            for game_pk, game in schedule_games_by_pk.items()
-        },
+        played_game_dates,
         statcast_evidence.plate_appearances,
     )
     rows = _aggregate_training_slot_rows(

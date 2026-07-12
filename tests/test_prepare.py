@@ -9,6 +9,7 @@ from mlb_backtest.manifest import RawStore
 from mlb_backtest.prepare import (
     ParticipantBuild,
     ScheduleHistoryBuild,
+    SlotPA,
     TeamCodeBuild,
     VerifiedScheduleEvidence,
     VerifiedStatcastEvidence,
@@ -29,6 +30,7 @@ from mlb_backtest.prepare import (
 from mlb_backtest.statcast import (
     StatcastData,
     iter_statcast_pitches,
+    monthly_ranges,
     parse_statcast,
     statcast_url,
 )
@@ -309,6 +311,136 @@ class PrepareBoundaryTest(unittest.TestCase):
             _aggregate_training_slot_rows(
                 games, missing_cell, full_season_mode=False
             )
+
+        away_starters = {
+            player["player_id"] for player in games[0]["away_lineup"]
+        }
+        partial_starters = [
+            row
+            for row in pas
+            if row["game_pk"] != 22
+            or row["inning_topbot"] != "Top"
+            or row["batter_id"] == games[0]["away_lineup"][0]["player_id"]
+        ]
+        partial_starters.extend(
+            dict(
+                partial_starters[0],
+                batter_id=900_000 + index,
+                at_bat_number=1_000 + index,
+                event_id=f"22:substitute:{index}",
+            )
+            for index in range(8)
+        )
+        self.assertTrue(
+            away_starters
+            - {row["batter_id"] for row in partial_starters if row["game_pk"] == 22}
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"missing official lineup batters.*\(22, 'away', 2, 2202\)"
+        ):
+            _aggregate_training_slot_rows(
+                games, partial_starters, full_season_mode=True
+            )
+
+        cross_team_player = json.loads(json.dumps(games))
+        cross_team_player[0]["home_lineup"][0]["player_id"] = cross_team_player[0][
+            "away_lineup"
+        ][0]["player_id"]
+        with self.assertRaisesRegex(ValueError, "player on both teams"):
+            _aggregate_training_slot_rows(
+                cross_team_player, pas, full_season_mode=False
+            )
+
+        duplicate_lineup_player = json.loads(json.dumps(games))
+        duplicate_lineup_player[0]["away_lineup"][1]["player_id"] = (
+            duplicate_lineup_player[0]["away_lineup"][0]["player_id"]
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate player"):
+            _aggregate_training_slot_rows(
+                duplicate_lineup_player, pas, full_season_mode=False
+            )
+
+    def test_training_derivation_requires_pa_for_played_game_without_valid_lineups(self):
+        frozen = {
+            2022: ("2022-04-07", "2022-10-05"),
+            2023: ("2023-03-30", "2023-10-01"),
+            2024: ("2024-03-20", "2024-09-30"),
+        }
+
+        def evidence(year, games):
+            value = object.__new__(VerifiedScheduleEvidence)
+            object.__setattr__(value, "query", {"role": "training"})
+            object.__setattr__(value, "coverage_start", frozen[year][0])
+            object.__setattr__(value, "coverage_end", frozen[year][1])
+            object.__setattr__(value, "games", tuple(games))
+            return value
+
+        valid_games = {
+            year: {
+                "game_pk": year,
+                "official_date": f"{year}-04-01",
+                "status": "Final",
+            }
+            for year in frozen
+        }
+        missing_lineup_game = {
+            "game_pk": 9999,
+            "official_date": "2024-04-02",
+            "status": "Final",
+        }
+        schedule_evidence = {
+            year: evidence(
+                year,
+                [valid_games[year]]
+                + ([missing_lineup_game] if year == 2024 else []),
+            )
+            for year in frozen
+        }
+        statcast = object.__new__(VerifiedStatcastEvidence)
+        object.__setattr__(
+            statcast,
+            "coverage_ranges",
+            tuple(
+                chunk
+                for first, last in frozen.values()
+                for chunk in monthly_ranges(first, last)
+            ),
+        )
+        object.__setattr__(
+            statcast,
+            "plate_appearances",
+            tuple(
+                SlotPA(
+                    game_pk=year,
+                    game_date=f"{year}-04-01",
+                    at_bat_number=1,
+                    batter_id=year,
+                    inning_topbot="Top",
+                    game_type="R",
+                )
+                for year in frozen
+            ),
+        )
+        aggregate_rows = [
+            {"season": year, "game_type": "R", "slot": slot, "pa": 40_000}
+            for year in frozen
+            for slot in range(1, 10)
+        ]
+        with mock.patch(
+            "mlb_backtest.prepare._rebind_schedule_evidence",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "mlb_backtest.prepare._rebind_statcast_evidence",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "mlb_backtest.prepare._validate_played_schedule_season",
+            side_effect=lambda games, *_args: (games[0],),
+        ), mock.patch(
+            "mlb_backtest.prepare._aggregate_training_slot_rows",
+            return_value=aggregate_rows,
+        ):
+            with self.assertRaisesRegex(ValueError, "missing played game"):
+                derive_training_slot_rows(schedule_evidence, statcast)
 
     def test_played_schedule_validator_includes_completed_early_and_enforces_2400(self):
         def scheduled_game(index, status="Final"):
