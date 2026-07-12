@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import date
 from pathlib import Path
@@ -45,25 +44,16 @@ def assert_pregame_history(
 
 def build_source_manifest_index(raw_root: str | Path) -> list[dict[str, object]]:
     """Verify and index canonical manifest queries and payload hashes."""
-    root = Path(raw_root)
     rows = []
-    for manifest_path in sorted(root.glob("*/*.manifest.json")):
-        content = manifest_path.read_bytes()
-        manifest = RawStore._read_manifest(content)
-        seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
-        expected_seal = (hashlib.sha256(content).hexdigest() + "\n").encode("ascii")
-        if seal_path.read_bytes() != expected_seal:
-            raise RuntimeError("raw source manifest seal mismatch")
-        payload = manifest_path.parent / f'{manifest["sha256"]}.raw'
-        if hashlib.sha256(payload.read_bytes()).hexdigest() != manifest["sha256"]:
-            raise RuntimeError("raw source payload digest mismatch")
+    for verified in RawStore(Path(raw_root)).verify_manifests():
+        manifest = verified["manifest"]
         rows.append(
             {
                 "source": manifest["source"],
                 "query": manifest["query"],
                 "sha256": manifest["sha256"],
                 "row_count": manifest["row_count"],
-                "manifest_sha256": hashlib.sha256(content).hexdigest(),
+                "manifest_sha256": verified["manifest_sha256"],
             }
         )
     rows.sort(

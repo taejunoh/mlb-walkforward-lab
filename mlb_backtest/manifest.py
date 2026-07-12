@@ -188,6 +188,65 @@ class RawStore:
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
+    def verify_manifests(self) -> list[dict[str, Any]]:
+        """Safely verify every published manifest and reject ambiguous queries."""
+        resolved_root = self._prepare_root()
+        verified: list[dict[str, Any]] = []
+        seen_queries: set[tuple[str, str]] = set()
+        for child in sorted(self.root.iterdir(), key=lambda path: path.name):
+            if child.name.startswith(".") and child.name.endswith(".lock"):
+                continue
+            if child.is_symlink():
+                raise ValueError("raw source folder cannot be a symlink")
+            if not child.is_dir() or child.resolve(strict=True).parent != resolved_root:
+                raise ValueError("raw source folder must be directly under raw root")
+            source = child.name
+            if source in {"", ".", ".."} or "/" in source or "\\" in source:
+                raise ValueError("raw source folder name is invalid")
+            resolved_folder = child.resolve(strict=True)
+            for manifest_path in sorted(child.glob("*.manifest.json")):
+                content = _safe_leaf_bytes(
+                    manifest_path, resolved_folder, "manifest"
+                )
+                manifest = self._read_manifest(content)
+                query_digest = hashlib.sha256(
+                    _query_bytes(_canonical_query(manifest["query"]))
+                ).hexdigest()
+                expected_name = (
+                    f'{manifest["sha256"]}.{query_digest}.manifest.json'
+                )
+                if manifest_path.name != expected_name:
+                    raise RuntimeError("immutable raw manifest filename mismatch")
+                if manifest["source"] != source:
+                    raise RuntimeError("immutable raw manifest source mismatch")
+                query_key = (source, query_digest)
+                if query_key in seen_queries:
+                    raise RuntimeError("duplicate canonical raw query provenance")
+                seen_queries.add(query_key)
+                seal_path = manifest_path.with_name(
+                    manifest_path.name[:-5] + ".sha256"
+                )
+                if _safe_leaf_bytes(seal_path, resolved_folder, "seal") != _seal_bytes(
+                    content
+                ):
+                    raise RuntimeError("immutable raw manifest integrity mismatch")
+                payload_path = child / f'{manifest["sha256"]}.raw'
+                payload = _safe_leaf_bytes(payload_path, resolved_folder, "raw")
+                if hashlib.sha256(payload).hexdigest() != manifest["sha256"]:
+                    raise RuntimeError("immutable raw payload digest mismatch")
+                row_count = sum(bool(line.strip()) for line in payload.splitlines())
+                if row_count != manifest["row_count"]:
+                    raise RuntimeError("immutable raw manifest row_count mismatch")
+                verified.append(
+                    {
+                        "manifest": manifest,
+                        "manifest_path": manifest_path,
+                        "manifest_sha256": hashlib.sha256(content).hexdigest(),
+                        "payload_path": payload_path,
+                    }
+                )
+        return verified
+
     @classmethod
     def _open_lock(cls, lock_path: Path, resolved_root: Path):
         if lock_path.is_symlink():

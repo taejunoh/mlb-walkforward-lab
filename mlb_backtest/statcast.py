@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import time
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ REQUIRED_FIELDS = (
     "pitch_number",
     "post_home_score",
     "post_away_score",
+    "game_type",
 )
 
 
@@ -101,7 +103,7 @@ def regular_season_ranges(extension_end: str) -> list[tuple[str, str]]:
         2022: date(2022, 4, 7),
         2023: date(2023, 3, 30),
         2024: date(2024, 3, 20),
-        2025: date(2025, 3, 27),
+        2025: date(2025, 3, 18),
     }
     closing_days = {
         2022: date(2022, 10, 5),
@@ -123,29 +125,61 @@ def fetch_monthly(
     end: str,
     *,
     retries: tuple[float, ...] = (1, 2, 4, 8, 16),
+    fetcher=None,
+    sleeper=None,
 ) -> list[object]:
     """Fetch and manifest inclusive monthly chunks, retrying transient failures."""
+    if fetcher is None:
+        fetcher = fetch_bytes
+    if sleeper is None:
+        sleeper = time.sleep
     artifacts = []
     for chunk_start, chunk_end in monthly_ranges(start, end):
         url = statcast_url(chunk_start, chunk_end)
-        attempts = (0.0,) + retries
-        for attempt, delay in enumerate(attempts):
-            if delay:
-                time.sleep(delay)
+        for attempt in range(len(retries) + 1):
             try:
-                payload = fetch_bytes(url, max_bytes=MAX_STATCAST_BYTES)
+                payload = fetcher(url, max_bytes=MAX_STATCAST_BYTES)
                 break
             except HTTPError as exc:
                 transient = exc.code == 429 or 500 <= exc.code < 600
-                if not transient or attempt == len(attempts) - 1:
+                if not transient or attempt == len(retries):
                     raise
-            except URLError:
-                if attempt == len(attempts) - 1:
+            except (URLError, TimeoutError, ConnectionError):
+                if attempt == len(retries):
                     raise
+            sleeper(retries[attempt])
+        parsed = parse_statcast(payload)
+        if not parsed.pitches:
+            raise ValueError("Statcast chunk must contain at least one data row")
+        first = _iso(chunk_start, "chunk start")
+        last = _iso(chunk_end, "chunk end")
+        if any(
+            not first <= _iso(str(row["game_date"]), "game_date") <= last
+            for row in parsed.pitches
+        ):
+            raise ValueError("Statcast row game_date is outside inclusive query range")
+        query = {
+            "start": chunk_start,
+            "end": chunk_end,
+            "game_type": "R",
+            "url": url,
+        }
+        digest = hashlib.sha256(payload).hexdigest()
+        for existing in store.verify_manifests():
+            manifest = existing["manifest"]
+            if (
+                manifest["source"] == "baseball_savant_statcast"
+                and manifest["query"] == query
+            ):
+                if manifest["sha256"] != digest:
+                    raise RuntimeError(
+                        "ambiguous raw payload for canonical Statcast query"
+                    )
+                break
         artifacts.append(
             store.put(
                 "baseball_savant_statcast",
-                {"start": chunk_start, "end": chunk_end, "game_type": "R", "url": url},
+                query,
                 payload,
             )
         )
@@ -221,6 +255,8 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
         hand = raw["p_throws"]
         if hand not in {"L", "R"}:
             raise ValueError(f"statcast row {row_number}: p_throws must be L or R")
+        if raw["game_type"] != "R":
+            raise ValueError(f"statcast row {row_number}: game_type must be R")
         if not raw["home_team"] or not raw["away_team"]:
             raise ValueError(f"statcast row {row_number}: team abbreviations are required")
         row = {
@@ -259,9 +295,24 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
             "post_away_score": _integer(
                 raw["post_away_score"], "post_away_score", row_number
             ),
+            "game_type": "R",
         }
         row["event_id"] = f'{row["game_pk"]}:{row["at_bat_number"]}'
         pitches.append(row)
+    unique_pitches: dict[tuple[int, int, int], dict[str, object]] = {}
+    for row in pitches:
+        key = (
+            int(row["game_pk"]),
+            int(row["at_bat_number"]),
+            int(row["pitch_number"]),
+        )
+        prior = unique_pitches.get(key)
+        if prior is not None and prior != row:
+            raise ValueError(
+                f"conflicting duplicate pitch {key[0]}:{key[1]}:{key[2]}"
+            )
+        unique_pitches[key] = row
+    pitches = list(unique_pitches.values())
     pitches.sort(
         key=lambda r: (
             r["game_date"],

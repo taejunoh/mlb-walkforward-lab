@@ -67,6 +67,53 @@ class PrepareBoundaryTest(unittest.TestCase):
             self.assertEqual(index[0]["sha256"], first.sha256)
             self.assertEqual(index[1]["sha256"], second.sha256)
 
+    def test_source_manifest_index_rejects_symlinks_bad_names_and_duplicate_query(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            real = base / "real"
+            RawStore(real).put("source", {"month": 1}, b"a\n")
+            linked = base / "linked"
+            linked.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                build_source_manifest_index(linked)
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "raw"
+            root.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            (root / "source").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                build_source_manifest_index(root)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            artifact = RawStore(root).put("source", {"month": 1}, b"a\n")
+            bad = artifact.manifest_path.with_name("arbitrary.manifest.json")
+            bad.write_bytes(artifact.manifest_path.read_bytes())
+            with self.assertRaises(RuntimeError):
+                build_source_manifest_index(root)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = RawStore(root)
+            store.put("source", {"month": 1}, b"a\n")
+            store.put("source", {"month": 1}, b"different\n")
+            with self.assertRaisesRegex(RuntimeError, "duplicate canonical"):
+                build_source_manifest_index(root)
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "raw"
+            artifact = RawStore(root).put("source", {"month": 1}, b"a\n")
+            outside = base / "outside.raw"
+            outside.write_bytes(b"a\n")
+            artifact.data_path.unlink()
+            artifact.data_path.symlink_to(outside)
+            with self.assertRaises(ValueError):
+                build_source_manifest_index(root)
+
 
 if __name__ == "__main__":
     unittest.main()
