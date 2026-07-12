@@ -1,5 +1,8 @@
 import unittest
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
@@ -7,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.statcast import (
     fetch_monthly,
+    fetch_statcast_stage,
     identify_pitcher_roles,
     parse_statcast,
     regular_season_ranges,
@@ -161,6 +165,59 @@ class StatcastTest(unittest.TestCase):
                     fetcher=lambda _url, **_kwargs: changed,
                 )
 
+    def test_concurrent_query_publication_is_atomic_for_different_payloads(self):
+        original = FIXTURE.read_bytes()
+        changed = original.replace(b"95.0", b"94.9", 1)
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            barrier = threading.Barrier(2)
+
+            def publish(payload):
+                barrier.wait(timeout=5)
+                try:
+                    artifact = fetch_monthly(
+                        store,
+                        "2024-04-01",
+                        "2024-04-02",
+                        fetcher=lambda _url, **_kwargs: payload,
+                    )[0]
+                    return ("ok", artifact.sha256)
+                except RuntimeError as exc:
+                    return ("error", str(exc))
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(publish, (original, changed)))
+            self.assertEqual([item[0] for item in results].count("ok"), 1)
+            self.assertEqual([item[0] for item in results].count("error"), 1)
+            self.assertIn("ambiguous raw payload", next(item[1] for item in results if item[0] == "error"))
+            self.assertEqual(
+                len(list((Path(td) / "baseball_savant_statcast").glob("*.manifest.json"))),
+                1,
+            )
+
+    def test_concurrent_identical_query_publication_reuses_one_manifest(self):
+        payload = FIXTURE.read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            barrier = threading.Barrier(2)
+
+            def publish(_index):
+                barrier.wait(timeout=5)
+                return fetch_monthly(
+                    store,
+                    "2024-04-01",
+                    "2024-04-02",
+                    fetcher=lambda _url, **_kwargs: payload,
+                )[0]
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                artifacts = list(executor.map(publish, range(2)))
+            self.assertEqual(artifacts[0].sha256, artifacts[1].sha256)
+            self.assertEqual(
+                len(list((Path(td) / "baseball_savant_statcast").glob("*.manifest.json"))),
+                1,
+            )
+
     def test_retry_policy_covers_transient_errors_and_exhaustion(self):
         for error in (
             TimeoutError("timeout"),
@@ -185,6 +242,53 @@ class StatcastTest(unittest.TestCase):
                     )
                 self.assertEqual(len(attempts), 6)
                 self.assertEqual(delays, [1, 2, 4, 8, 16])
+
+    def test_stage_audits_once_and_does_not_reread_29_prior_chunk_payloads(self):
+        base = FIXTURE.read_bytes()
+        ranges = [
+            (f"2024-04-{day:02d}", f"2024-04-{day:02d}")
+            for day in range(1, 30)
+        ]
+        verify_calls = []
+        prior_payload_reads = []
+        original_verify = RawStore.verify_manifests
+
+        def tracking_verify(store):
+            verify_calls.append(1)
+            return original_verify(store)
+
+        import mlb_backtest.manifest as manifest_module
+
+        original_safe_read = manifest_module._safe_leaf_bytes
+
+        def tracking_safe_read(*args, **kwargs):
+            result = original_safe_read(*args, **kwargs)
+            if len(args) >= 3 and args[2] == "raw" and result is not None:
+                prior_payload_reads.append(args[0])
+            return result
+
+        def fetcher(url, **_kwargs):
+            requested = parse_qs(urlsplit(url).query)["game_date_gt"][0]
+            encoded = requested.encode("ascii")
+            return base.replace(b"2024-04-01", encoded).replace(
+                b"2024-04-02", encoded
+            )
+
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "mlb_backtest.statcast.regular_season_ranges", return_value=ranges
+        ), mock.patch(
+            "mlb_backtest.statcast.fetch_bytes", side_effect=fetcher
+        ), mock.patch.object(
+            RawStore, "verify_manifests", tracking_verify
+        ), mock.patch(
+            "mlb_backtest.manifest._safe_leaf_bytes", side_effect=tracking_safe_read
+        ):
+            artifacts = fetch_statcast_stage(
+                Path(__file__).parents[1] / "config" / "v5_1_bt.json", td
+            )
+        self.assertEqual(len(artifacts), 29)
+        self.assertEqual(len(verify_calls), 1)
+        self.assertEqual(prior_payload_reads, [])
 
 
 if __name__ == "__main__":

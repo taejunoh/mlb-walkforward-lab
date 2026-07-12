@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -127,12 +128,15 @@ def fetch_monthly(
     retries: tuple[float, ...] = (1, 2, 4, 8, 16),
     fetcher=None,
     sleeper=None,
+    known_queries: dict[str, str] | None = None,
 ) -> list[object]:
     """Fetch and manifest inclusive monthly chunks, retrying transient failures."""
     if fetcher is None:
         fetcher = fetch_bytes
     if sleeper is None:
         sleeper = time.sleep
+    if known_queries is None:
+        known_queries = {}
     artifacts = []
     for chunk_start, chunk_end in monthly_ranges(start, end):
         url = statcast_url(chunk_start, chunk_end)
@@ -165,24 +169,18 @@ def fetch_monthly(
             "url": url,
         }
         digest = hashlib.sha256(payload).hexdigest()
-        for existing in store.verify_manifests():
-            manifest = existing["manifest"]
-            if (
-                manifest["source"] == "baseball_savant_statcast"
-                and manifest["query"] == query
-            ):
-                if manifest["sha256"] != digest:
-                    raise RuntimeError(
-                        "ambiguous raw payload for canonical Statcast query"
-                    )
-                break
+        query_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
+        known_digest = known_queries.get(query_key)
+        if known_digest is not None and known_digest != digest:
+            raise RuntimeError("ambiguous raw payload for canonical Statcast query")
         artifacts.append(
-            store.put(
+            store.put_unique_query(
                 "baseball_savant_statcast",
                 query,
                 payload,
             )
         )
+        known_queries[query_key] = digest
     return artifacts
 
 
@@ -195,9 +193,19 @@ def fetch_statcast_stage(
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
     store = RawStore(_stage(root, "raw"))
+    known_queries = {}
+    for verified in store.verify_manifests():
+        manifest = verified["manifest"]
+        if manifest["source"] == "baseball_savant_statcast":
+            key = json.dumps(
+                manifest["query"], separators=(",", ":"), sort_keys=True
+            )
+            known_queries[key] = manifest["sha256"]
     artifacts = []
     for start, end in regular_season_ranges(config["extension_end"]):
-        artifacts.extend(fetch_monthly(store, start, end))
+        artifacts.extend(
+            fetch_monthly(store, start, end, known_queries=known_queries)
+        )
     return artifacts
 
 

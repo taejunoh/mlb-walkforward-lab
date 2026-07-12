@@ -149,6 +149,38 @@ class RawStore:
         self.root = root
 
     def put(self, source: str, query: dict, payload: bytes) -> RawArtifact:
+        normalized_query, digest, row_count = self._validate_put_inputs(
+            source, query, payload
+        )
+        return self._put_under_lock(
+            source,
+            normalized_query,
+            payload,
+            digest,
+            row_count,
+            unique_query=False,
+        )
+
+    def put_unique_query(
+        self, source: str, query: dict, payload: bytes
+    ) -> RawArtifact:
+        """Atomically publish at most one payload per canonical source query."""
+        normalized_query, digest, row_count = self._validate_put_inputs(
+            source, query, payload
+        )
+        return self._put_under_lock(
+            source,
+            normalized_query,
+            payload,
+            digest,
+            row_count,
+            unique_query=True,
+        )
+
+    @staticmethod
+    def _validate_put_inputs(
+        source: str, query: dict, payload: bytes
+    ) -> tuple[dict, str, int]:
         if not isinstance(source, str) or not source:
             raise ValueError("source must be a nonempty path segment")
         source_path = Path(source)
@@ -163,10 +195,21 @@ class RawStore:
             raise ValueError("query must be a dict")
         if not isinstance(payload, bytes):
             raise ValueError("payload must be bytes")
-
         normalized_query = _canonical_query(query)
         digest = hashlib.sha256(payload).hexdigest()
         row_count = sum(bool(line.strip()) for line in payload.splitlines())
+        return normalized_query, digest, row_count
+
+    def _put_under_lock(
+        self,
+        source: str,
+        normalized_query: dict,
+        payload: bytes,
+        digest: str,
+        row_count: int,
+        *,
+        unique_query: bool,
+    ) -> RawArtifact:
         resolved_root = self._prepare_root()
         lock_path = self.root / f".{source}.lock"
         with self._open_lock(lock_path, resolved_root) as lock_handle:
@@ -177,6 +220,17 @@ class RawStore:
                 )
                 if self.root.is_symlink() or self.root.resolve() != resolved_root:
                     raise ValueError("raw root changed while acquiring lock")
+                if unique_query:
+                    existing = self._load_unique_query_locked(
+                        resolved_root,
+                        source,
+                        normalized_query,
+                        payload,
+                        digest,
+                        row_count,
+                    )
+                    if existing is not None:
+                        return existing
                 return self._put_locked(
                     resolved_root,
                     source,
@@ -187,6 +241,65 @@ class RawStore:
                 )
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _load_unique_query_locked(
+        self,
+        resolved_root: Path,
+        source: str,
+        normalized_query: dict,
+        payload: bytes,
+        digest: str,
+        row_count: int,
+    ) -> RawArtifact | None:
+        folder = self.root / source
+        if folder.is_symlink():
+            raise ValueError("source folder cannot be a symlink")
+        if not folder.exists():
+            return None
+        if not folder.is_dir():
+            raise ValueError("source folder must be a real directory")
+        resolved_folder = folder.resolve(strict=True)
+        if resolved_folder.parent != resolved_root:
+            raise ValueError("source folder must be directly under raw root")
+        query_digest = hashlib.sha256(_query_bytes(normalized_query)).hexdigest()
+        matches = sorted(folder.glob(f"*.{query_digest}.manifest.json"))
+        if len(matches) > 1:
+            raise RuntimeError("duplicate canonical raw query provenance")
+        if not matches:
+            return None
+        manifest_path = matches[0]
+        content = _safe_leaf_bytes(manifest_path, resolved_folder, "manifest")
+        manifest = self._read_manifest(content)
+        expected_name = f'{manifest["sha256"]}.{query_digest}.manifest.json'
+        if manifest_path.name != expected_name:
+            raise RuntimeError("immutable raw manifest filename mismatch")
+        if manifest["source"] != source or manifest["query"] != normalized_query:
+            raise RuntimeError("immutable raw manifest canonical query mismatch")
+        seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
+        if _safe_leaf_bytes(seal_path, resolved_folder, "seal") != _seal_bytes(
+            content
+        ):
+            raise RuntimeError("immutable raw manifest integrity mismatch")
+        data_path = folder / f'{manifest["sha256"]}.raw'
+        existing_payload = _safe_leaf_bytes(data_path, resolved_folder, "raw")
+        if hashlib.sha256(existing_payload).hexdigest() != manifest["sha256"]:
+            raise RuntimeError("immutable raw payload digest mismatch")
+        if sum(bool(line.strip()) for line in existing_payload.splitlines()) != manifest[
+            "row_count"
+        ]:
+            raise RuntimeError("immutable raw manifest row_count mismatch")
+        if manifest["sha256"] != digest or existing_payload != payload:
+            raise RuntimeError("ambiguous raw payload for canonical query")
+        if manifest["row_count"] != row_count:
+            raise RuntimeError("immutable raw manifest row_count mismatch")
+        return RawArtifact(
+            source,
+            digest,
+            data_path,
+            manifest_path,
+            manifest["retrieved_at_utc"],
+            manifest["row_count"],
+        )
 
     def verify_manifests(self) -> list[dict[str, Any]]:
         """Safely verify every published manifest and reject ambiguous queries."""

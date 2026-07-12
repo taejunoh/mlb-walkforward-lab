@@ -4,9 +4,11 @@ import json
 import multiprocessing
 import tempfile
 import unittest
-from unittest import mock
 from datetime import date, datetime, timezone
 from pathlib import Path
+from unittest import mock
+
+import mlb_backtest.manifest as manifest_module
 
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.models import GameClock, RawArtifact
@@ -57,6 +59,39 @@ def _rewrite_manifest_and_seal(artifact, manifest):
 
 
 class ManifestTest(unittest.TestCase):
+    def test_unique_query_reuses_identical_and_rejects_different_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            first = store.put_unique_query("source", {"month": 1}, b"one\n")
+            repeated = store.put_unique_query("source", {"month": 1}, b"one\n")
+            self.assertEqual(first, repeated)
+            with self.assertRaisesRegex(RuntimeError, "ambiguous raw payload"):
+                store.put_unique_query("source", {"month": 1}, b"two\n")
+            self.assertEqual(
+                len(list((Path(td) / "source").glob("*.manifest.json"))), 1
+            )
+
+    def test_unique_query_does_not_reread_unrelated_payloads_quadratically(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RawStore(Path(td))
+            nonempty_raw_reads = []
+            original = manifest_module._safe_leaf_bytes
+
+            def tracking(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if len(args) >= 3 and args[2] == "raw" and result is not None:
+                    nonempty_raw_reads.append(args[0])
+                return result
+
+            with mock.patch(
+                "mlb_backtest.manifest._safe_leaf_bytes", side_effect=tracking
+            ):
+                for chunk in range(29):
+                    store.put_unique_query(
+                        "source", {"chunk": chunk}, f"payload-{chunk}\n".encode()
+                    )
+            self.assertEqual(nonempty_raw_reads, [])
+
     def test_pipeline_records_are_frozen_with_exact_fields(self):
         expected_fields = {
             RawArtifact: (
