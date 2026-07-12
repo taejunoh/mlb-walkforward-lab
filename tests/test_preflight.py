@@ -811,41 +811,103 @@ class PreflightTest(unittest.TestCase):
                 )
             self.assertEqual(concrete_raw.read_bytes(), raw_bytes)
 
-    def test_writer_post_publication_guard_detects_external_raw_change(self):
-        import mlb_backtest.preflight as preflight_module
+    def test_writer_reserves_missing_manifest_declared_raw_and_sidecar_paths(self):
+        for field, output_index in (("raw_path", 0), ("sidecar_path", 2)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory) / "root")
+                run_path = Path(directory) / "run.json"
+                run_path.write_bytes(
+                    canonical_json_bytes(expected_historical_run()) + b"\n"
+                )
+                manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+                manifest = json.loads(manifest_path.read_text())
+                original = root / manifest[field]
+                original.unlink()
+                missing = root / f"reports/missing-{field}.json"
+                manifest[field] = missing.relative_to(root).as_posix()
+                manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+                outputs = [
+                    root / "reports/preflight.json",
+                    root / "reports/preflight.md",
+                    root / "schemas/preflight.schema.json",
+                ]
+                outputs[output_index] = missing
+                with self.assertRaisesRegex(ValueError, "input evidence"):
+                    write_preflight(root, run_path, *outputs)
+                self.assertFalse(missing.exists())
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = make_complete_inventory(Path(directory) / "root")
-            run_path = Path(directory) / "run.json"
-            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
-            manifest_path = next((root / "inventory").rglob("*.manifest.json"))
-            manifest = json.loads(manifest_path.read_text())
-            original_raw = root / manifest["raw_path"]
-            external_raw = root / "reports/source.raw"
-            external_raw.parent.mkdir(parents=True, exist_ok=True)
-            original_raw.replace(external_raw)
-            manifest["raw_path"] = external_raw.relative_to(root).as_posix()
-            manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
-            original_publish = preflight_module._publish_bundle
+                alias = root / f"reports/alias-{field}.json"
+                alias.parent.mkdir(parents=True, exist_ok=True)
+                alias.symlink_to(missing.name)
+                outputs[output_index] = alias
+                with self.assertRaisesRegex(ValueError, "input evidence"):
+                    write_preflight(root, run_path, *outputs)
 
-            def publish_then_mutate(entries):
-                original_publish(entries)
-                external_raw.write_bytes(b"changed after publication")
-
-            with (
-                patch(
-                    "mlb_backtest.preflight._publish_bundle",
-                    side_effect=publish_then_mutate,
-                ),
-                self.assertRaisesRegex(RuntimeError, "concrete input evidence"),
-            ):
-                write_preflight(
-                    root,
-                    run_path,
+    def test_writer_postcondition_failure_rolls_back_every_output_state(self):
+        for initial_state in (
+            (True, True, True),
+            (False, False, False),
+            (True, False, True),
+        ):
+            with self.subTest(initial_state=initial_state), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory) / "root")
+                run_path = Path(directory) / "run.json"
+                run_path.write_bytes(
+                    canonical_json_bytes(expected_historical_run()) + b"\n"
+                )
+                manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+                manifest = json.loads(manifest_path.read_text())
+                original_raw = root / manifest["raw_path"]
+                external_raw = root / "reports/source.raw"
+                external_raw.parent.mkdir(parents=True, exist_ok=True)
+                original_raw.replace(external_raw)
+                manifest["raw_path"] = external_raw.relative_to(root).as_posix()
+                manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+                outputs = (
                     root / "reports/preflight.json",
                     root / "reports/preflight.md",
                     root / "schemas/preflight.schema.json",
                 )
+                old: dict[Path, bytes] = {}
+                modes: dict[Path, int] = {}
+                for index, (path, exists) in enumerate(
+                    zip(outputs, initial_state, strict=True)
+                ):
+                    if exists:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        old[path] = f"old-{index}".encode()
+                        modes[path] = 0o600 + index
+                        path.write_bytes(old[path])
+                        path.chmod(modes[path])
+                original_replace = os.replace
+                final_replacements = 0
+
+                def mutate_after_third_final(source, destination):
+                    nonlocal final_replacements
+                    result = original_replace(source, destination)
+                    if Path(destination) in outputs:
+                        final_replacements += 1
+                        if final_replacements == 3:
+                            external_raw.write_bytes(b"changed after publication")
+                    return result
+
+                with (
+                    patch(
+                        "mlb_backtest.protocols.os.replace",
+                        side_effect=mutate_after_third_final,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "concrete input evidence"),
+                ):
+                    write_preflight(root, run_path, *outputs)
+                for path, existed in zip(outputs, initial_state, strict=True):
+                    if existed:
+                        self.assertEqual(path.read_bytes(), old[path])
+                        self.assertEqual(
+                            stat.S_IMODE(path.stat().st_mode), modes[path]
+                        )
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertEqual(list(root.rglob(".*.tmp")), [])
 
     def test_writer_bundle_rolls_back_second_and_third_replacement(self):
         for initial_state in (

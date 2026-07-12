@@ -250,6 +250,7 @@ PROTECTED_SNAPSHOT_KEYS = frozenset(
 )
 EvidenceFingerprint = tuple[int, int, int, int, int, str]
 EvidenceSnapshot = dict[Path, EvidenceFingerprint]
+DeclaredInputs = set[Path]
 
 
 def protected_inventory(root: Path) -> dict[str, object]:
@@ -427,7 +428,9 @@ def _verified_sha256(
 
 
 def inventory_existing_manifests(
-    root: Path, evidence: EvidenceSnapshot | None = None
+    root: Path,
+    evidence: EvidenceSnapshot | None = None,
+    declared_inputs: DeclaredInputs | None = None,
 ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
@@ -464,6 +467,7 @@ def inventory_existing_manifests(
                 manifest,
                 manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
                 evidence=evidence,
+                declared_inputs=declared_inputs,
             )
         except (
             OSError,
@@ -492,6 +496,7 @@ def _validate_manifest(
     optional_source: str | None = None,
     manifest_sha256: str,
     evidence: EvidenceSnapshot | None = None,
+    declared_inputs: DeclaredInputs | None = None,
 ) -> dict[str, object]:
     failures: list[str] = []
     if item["schema_version"] != 1:
@@ -525,6 +530,10 @@ def _validate_manifest(
         raise ValueError("INVALID_DATE_RANGE")
     raw_path = safe_relative(root, item["raw_path"])
     sidecar_path = safe_relative(root, item["sidecar_path"])
+    if declared_inputs is not None:
+        declared_inputs.update(
+            {raw_path.resolve(strict=False), sidecar_path.resolve(strict=False)}
+        )
     try:
         sidecar_bytes = _verified_json_bytes(root, sidecar_path, evidence)
         sidecar = require_exact_keys(json.loads(sidecar_bytes), SIDECAR_KEYS, "sidecar")
@@ -596,7 +605,9 @@ def _validate_manifest(
 
 
 def inventory_optional_manifests(
-    root: Path, evidence: EvidenceSnapshot | None = None
+    root: Path,
+    evidence: EvidenceSnapshot | None = None,
+    declared_inputs: DeclaredInputs | None = None,
 ) -> tuple[
     dict[str, tuple[dict[str, object], ...]], dict[str, tuple[dict[str, str], ...]]
 ]:
@@ -645,6 +656,7 @@ def inventory_optional_manifests(
                     optional_source=source,
                     manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
                     evidence=evidence,
+                    declared_inputs=declared_inputs,
                 )
             except (
                 OSError,
@@ -1225,15 +1237,22 @@ def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
 
 
 def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
-    return _build_preflight(root, run_spec, {})
+    return _build_preflight(root, run_spec, {}, set())
 
 
 def _build_preflight(
-    root: Path, run_spec: RunSpec, evidence: EvidenceSnapshot
+    root: Path,
+    run_spec: RunSpec,
+    evidence: EvidenceSnapshot,
+    declared_inputs: DeclaredInputs,
 ) -> dict[str, object]:
     before = protected_inventory(root)
-    inventory, inventory_errors = inventory_existing_manifests(root, evidence)
-    optional_rows, optional_errors = inventory_optional_manifests(root, evidence)
+    inventory, inventory_errors = inventory_existing_manifests(
+        root, evidence, declared_inputs
+    )
+    optional_rows, optional_errors = inventory_optional_manifests(
+        root, evidence, declared_inputs
+    )
     seasons = {str(year): assess_season(year, inventory) for year in range(2018, 2025)}
     after = protected_inventory(root)
     if before != after:
@@ -2214,12 +2233,20 @@ def write_preflight(
     schema_path: Path,
 ) -> None:
     output_paths = (json_path, markdown_path, schema_path)
-    _validate_preflight_output_paths(root, run_path, output_paths, {})
+    _validate_preflight_output_paths(root, run_path, output_paths, {}, set())
     protected_before = protected_inventory(root)
     evidence: EvidenceSnapshot = {}
+    declared_inputs: DeclaredInputs = {run_path.resolve(strict=False)}
     run_bytes = _verified_json_bytes(run_path.parent, run_path, evidence)
-    report = _build_preflight(root, parse_run_spec(json.loads(run_bytes)), evidence)
-    _validate_preflight_output_paths(root, run_path, output_paths, evidence)
+    report = _build_preflight(
+        root,
+        parse_run_spec(json.loads(run_bytes)),
+        evidence,
+        declared_inputs,
+    )
+    _validate_preflight_output_paths(
+        root, run_path, output_paths, evidence, declared_inputs
+    )
     _verify_concrete_evidence(evidence)
     entries = (
         (json_path, canonical_json_bytes(report) + b"\n"),
@@ -2228,10 +2255,13 @@ def write_preflight(
     )
     if protected_inventory(root) != protected_before:
         raise RuntimeError("protected evidence changed before preflight publication")
-    _publish_bundle(entries)
-    if protected_inventory(root) != protected_before:
-        raise RuntimeError("preflight publication modified protected evidence")
-    _verify_concrete_evidence(evidence)
+
+    def verify_postconditions() -> None:
+        if protected_inventory(root) != protected_before:
+            raise RuntimeError("preflight publication modified protected evidence")
+        _verify_concrete_evidence(evidence)
+
+    _publish_bundle(entries, post_publish=verify_postconditions)
 
 
 def _validate_preflight_output_paths(
@@ -2239,11 +2269,12 @@ def _validate_preflight_output_paths(
     run_path: Path,
     output_paths: Sequence[Path],
     evidence: Mapping[Path, EvidenceFingerprint],
+    declared_inputs: set[Path],
 ) -> None:
     protected = tuple(
         (root / name).resolve(strict=False) for name in PROTECTED_PREFLIGHT_ROOTS
     )
-    input_evidence = {run_path.resolve(strict=False), *evidence}
+    input_evidence = {run_path.resolve(strict=False), *evidence, *declared_inputs}
     input_inodes = {(value[0], value[1]) for value in evidence.values()}
     resolved: list[Path] = []
     for path in output_paths:

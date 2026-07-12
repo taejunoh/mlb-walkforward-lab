@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -1341,7 +1341,11 @@ def _ensure_bundle_directories(final_paths: tuple[Path, ...]) -> tuple[Path, ...
     return tuple(sorted(missing, key=lambda value: len(value.parts), reverse=True))
 
 
-def _publish_bundle(entries: tuple[tuple[Path, bytes], ...]) -> None:
+def _publish_bundle(
+    entries: tuple[tuple[Path, bytes], ...],
+    *,
+    post_publish: Callable[[], None] | None = None,
+) -> None:
     final_paths = tuple(path for path, _ in entries)
     if len(set(final_paths)) != len(final_paths):
         raise ValueError("protocol bundle paths must be unique")
@@ -1371,6 +1375,8 @@ def _publish_bundle(entries: tuple[tuple[Path, bytes], ...]) -> None:
             replaced.append(final_path)
         for directory in sorted({path.parent for path in final_paths}):
             _fsync_directory(directory)
+        if post_publish is not None:
+            post_publish()
     except BaseException:
         rollback_error: BaseException | None = None
         for final_path in reversed(replaced):
