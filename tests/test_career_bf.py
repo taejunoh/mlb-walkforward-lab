@@ -19,6 +19,9 @@ from mlb_backtest.scoring import uncertainty
 EMPTY_SPLITS_FIXTURE = (
     Path(__file__).parent / "fixtures" / "mlb_career_bf_empty_splits.json"
 )
+ONE_TEAM_AGGREGATE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "mlb_career_bf_one_team_aggregate.json"
+)
 
 
 def payload(pitcher_id=10, aggregate_bf=1000):
@@ -72,6 +75,9 @@ class PriorCareerBfTest(unittest.TestCase):
         self.assertEqual(
             parse_prior_career_bf(EMPTY_SPLITS_FIXTURE, 669022), 0
         )
+        self.assertEqual(
+            parse_prior_career_bf(ONE_TEAM_AGGREGATE_FIXTURE, 477132), 9667
+        )
         malformed = json.loads(payload())
         malformed["stats"][0]["splits"].append(
             {"stat": {"battersFaced": 1000}, "sport": {"id": 0}}
@@ -109,7 +115,7 @@ class PriorCareerBfTest(unittest.TestCase):
             self.assertEqual(loaded[10]["cutoff_date"], "2021-12-31")
             self.assertEqual(hashes, [loaded[10]["manifest_sha256"]])
 
-    def test_fetch_retries_every_5xx_status(self):
+    def test_fetch_retries_only_frozen_http_statuses(self):
         with tempfile.TemporaryDirectory() as td:
             attempts = []
             delays = []
@@ -117,7 +123,7 @@ class PriorCareerBfTest(unittest.TestCase):
             def fetcher(url):
                 attempts.append(url)
                 if len(attempts) == 1:
-                    raise HTTPError(url, 501, "transient", {}, None)
+                    raise HTTPError(url, 500, "transient", {}, None)
                 return payload()
 
             records = fetch_prior_career_bf_records(
@@ -129,6 +135,24 @@ class PriorCareerBfTest(unittest.TestCase):
             self.assertEqual(records[10]["prior_bf"], 1000)
             self.assertEqual(len(attempts), 2)
             self.assertEqual(delays, [1])
+
+        with tempfile.TemporaryDirectory() as td:
+            attempts = []
+            delays = []
+
+            def unsupported(url):
+                attempts.append(url)
+                raise HTTPError(url, 501, "not frozen transient", {}, None)
+
+            with self.assertRaises(HTTPError):
+                fetch_prior_career_bf_records(
+                    RawStore(Path(td)),
+                    [10],
+                    fetcher=unsupported,
+                    sleeper=delays.append,
+                )
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(delays, [])
 
     def test_returning_veteran_adds_pre2022_bf_without_post_d1_rows(self):
         raw = [{

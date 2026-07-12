@@ -82,6 +82,7 @@ def parse_prior_career_bf(source: str | Path | bytes, pitcher_id: int) -> int:
     if group["splits"] == []:
         return 0
     team_bf = []
+    team_ids = []
     aggregates = []
     for split in group["splits"]:
         if not isinstance(split, dict):
@@ -94,20 +95,37 @@ def parse_prior_career_bf(source: str | Path | bytes, pitcher_id: int) -> int:
         if type(bf) is not int or bf < 0:
             raise ValueError("career BF split battersFaced is invalid")
         if sport["id"] == 1:
-            if not isinstance(split.get("team"), dict):
+            team = split.get("team")
+            team_id = team.get("id") if isinstance(team, dict) else None
+            if type(team_id) is not int or team_id <= 0:
                 raise ValueError("career BF MLB team split is invalid")
             team_bf.append(bf)
+            team_ids.append(team_id)
         elif sport["id"] == 0:
-            if "team" in split:
+            aggregate_team = split.get("team")
+            if aggregate_team is None:
+                aggregate_team_id = None
+            elif (
+                not isinstance(aggregate_team, dict)
+                or type(aggregate_team.get("id")) is not int
+                or aggregate_team["id"] <= 0
+            ):
                 raise ValueError("career BF aggregate split is invalid")
-            aggregates.append(bf)
+            else:
+                aggregate_team_id = aggregate_team["id"]
+            aggregates.append((bf, aggregate_team_id))
         else:
             raise ValueError("career BF split contains a non-MLB sport")
     if len(aggregates) != 1 or not team_bf:
         raise ValueError("career BF requires exactly one aggregate split")
     total = sum(team_bf)
-    if aggregates[0] != total:
+    aggregate_bf, aggregate_team_id = aggregates[0]
+    if aggregate_bf != total:
         raise ValueError("career BF aggregate does not match MLB team splits")
+    if aggregate_team_id is not None and (
+        len(set(team_ids)) != 1 or aggregate_team_id != team_ids[0]
+    ):
+        raise ValueError("career BF aggregate team is inconsistent")
     return total
 
 
@@ -167,7 +185,7 @@ def fetch_prior_career_bf_records(
                 payload = fetcher(str(query["url"]))
                 break
             except HTTPError as exc:
-                transient = exc.code == 429 or 500 <= exc.code < 600
+                transient = exc.code in {429, 500, 502, 503, 504}
                 if not transient or attempt == len(retries):
                     raise
             except (URLError, TimeoutError, ConnectionError):
