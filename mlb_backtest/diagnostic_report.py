@@ -4,11 +4,13 @@ from types import MappingProxyType
 import argparse
 import math
 import os
+import stat
 import tempfile
 
 from mlb_backtest.diagnostics import (
     build_diagnostic,
     canonical_json_bytes,
+    deep_freeze,
     load_v51_evidence,
     sha256_file,
 )
@@ -37,17 +39,24 @@ def iter_contract_tables(
         table = tables[name]
         if not isinstance(table, Mapping):
             raise ValueError("diagnostic table must be a mapping")
-        result.append(MappingProxyType(dict(table)))
+        frozen = deep_freeze(dict(table))
+        if not isinstance(frozen, Mapping):
+            raise ValueError("diagnostic table freeze failed")
+        result.append(frozen)
     return tuple(result)
 
 
-def _write_fsynced_temp(path: Path, contents: bytes) -> Path:
+def _write_fsynced_temp(
+    path: Path, contents: bytes, *, mode: int | None = None
+) -> Path:
     descriptor, temporary = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     temporary_path = Path(temporary)
     try:
         with os.fdopen(descriptor, "wb") as stream:
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
             stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
@@ -63,17 +72,32 @@ def _publish_pair(
     temporary_paths: list[Path] = []
     backups: dict[Path, Path | None] = {}
     replaced: list[Path] = []
+    final_paths = (json_path, md_path)
+    modes = {
+        final_path: (
+            stat.S_IMODE(final_path.stat().st_mode)
+            if final_path.exists()
+            else 0o644
+        )
+        for final_path in final_paths
+    }
     try:
-        temporary_paths.append(_write_fsynced_temp(json_path, json_contents))
-        temporary_paths.append(_write_fsynced_temp(md_path, md_contents))
-        for final_path in (json_path, md_path):
+        temporary_paths.append(
+            _write_fsynced_temp(json_path, json_contents, mode=modes[json_path])
+        )
+        temporary_paths.append(
+            _write_fsynced_temp(md_path, md_contents, mode=modes[md_path])
+        )
+        for final_path in final_paths:
             backups[final_path] = (
-                _write_fsynced_temp(final_path, final_path.read_bytes())
+                _write_fsynced_temp(
+                    final_path, final_path.read_bytes(), mode=modes[final_path]
+                )
                 if final_path.exists()
                 else None
             )
         for temporary_path, final_path in zip(
-            temporary_paths, (json_path, md_path), strict=True
+            temporary_paths, final_paths, strict=True
         ):
             os.replace(temporary_path, final_path)
             replaced.append(final_path)

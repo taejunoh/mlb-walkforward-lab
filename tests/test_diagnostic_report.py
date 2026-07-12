@@ -2,6 +2,7 @@ from pathlib import Path
 import copy
 import json
 import os
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -161,12 +162,12 @@ class DiagnosticReportTest(unittest.TestCase):
             original = diagnostic_report._write_fsynced_temp
             calls = 0
 
-            def fail_second(path, contents):
+            def fail_second(path, contents, mode=None):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("disk failed")
-                return original(path, contents)
+                return original(path, contents, mode=mode)
 
             with patch(
                 "mlb_backtest.diagnostic_report._write_fsynced_temp",
@@ -212,6 +213,31 @@ class DiagnosticReportTest(unittest.TestCase):
                     self.assertFalse(md_path.exists())
                 self.assertEqual(list(output.glob(".diagnostic_100.*.tmp")), [])
 
+    def test_publication_preserves_existing_modes_and_fresh_reports_are_0644(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            json_path = output / "diagnostic_100.json"
+            md_path = output / "diagnostic_100.md"
+            json_path.write_bytes(b"old-json")
+            md_path.write_bytes(b"old-md")
+            json_path.chmod(0o640)
+            md_path.chmod(0o604)
+            write_diagnostic_reports(ROOT, output)
+            self.assertEqual(stat.S_IMODE(json_path.stat().st_mode), 0o640)
+            self.assertEqual(stat.S_IMODE(md_path.stat().st_mode), 0o604)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_diagnostic_reports(ROOT, output)
+            self.assertEqual(
+                stat.S_IMODE((output / "diagnostic_100.json").stat().st_mode),
+                0o644,
+            )
+            self.assertEqual(
+                stat.S_IMODE((output / "diagnostic_100.md").stat().st_mode),
+                0o644,
+            )
+
     def test_markdown_table_escapes_backslashes_newlines_and_pipes(self):
         rendered = markdown_table(["a\\b", "c|d"], [["x\ny", "z\\|q"]])
         self.assertIn("a\\\\b", rendered)
@@ -232,6 +258,21 @@ class DiagnosticReportTest(unittest.TestCase):
                 - set(table),
                 set(),
             )
+
+    def test_contract_tables_are_recursively_frozen_without_payload_aliases(self):
+        payload = copy.deepcopy(self.payload)
+        original_n = payload["tables"]["calibration"]["rows"][0]["N"]
+        tables = iter_contract_tables(payload)
+        calibration = next(
+            table for table in tables if table["formula"].startswith("fixed-bin")
+        )
+        with self.assertRaises(TypeError):
+            calibration["rows"][0]["N"] = 999
+        with self.assertRaises(AttributeError):
+            calibration["source_ids"].append("forged")
+        self.assertEqual(
+            payload["tables"]["calibration"]["rows"][0]["N"], original_n
+        )
 
 
 if __name__ == "__main__":
