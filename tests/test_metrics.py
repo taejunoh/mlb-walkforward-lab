@@ -1,4 +1,5 @@
 import math
+import inspect
 import unittest
 from datetime import date, timedelta
 
@@ -50,6 +51,11 @@ class PrimitiveMetricsTest(unittest.TestCase):
         self.assertEqual(
             max_losing_streak([True, False, False, True, False]), 2
         )
+
+    def test_wilson_default_is_1_96_and_custom_z_is_used_exactly(self):
+        self.assertEqual(inspect.signature(wilson).parameters["z"].default, 1.96)
+        low, _ = wilson(20, 30, z=1.959963984540054)
+        self.assertAlmostEqual(low, 0.4878005164454384, places=15)
 
     def test_log_loss_clips_and_all_primitives_validate_strictly(self):
         self.assertAlmostEqual(log_loss(0.0, True), -math.log(0.001))
@@ -128,12 +134,43 @@ class EvaluationTest(unittest.TestCase):
             evaluated(4, official_date="2025-05-04", winner="Away"),
         ]
         paired = evaluate(rows)["paired_market"]
-        self.assertEqual(paired["N"], 2)
+        self.assertEqual(paired["N"], 1)
         self.assertEqual(paired["model_only"], 1)
-        self.assertEqual(paired["market_only"], 1)
-        self.assertEqual(paired["model_accuracy"], 0.5)
-        self.assertEqual(paired["market_accuracy"], 0.5)
+        self.assertEqual(paired["market_only"], 0)
+        self.assertEqual(paired["model_accuracy"], 1.0)
+        self.assertEqual(paired["market_accuracy"], 0.0)
         self.assertAlmostEqual(paired["market_brier"], 0.55**2)
+
+    def test_month_and_predicted_team_summaries_use_graded_top1_only(self):
+        rows = [
+            evaluated(1, official_date="2025-05-01", winner="Home"),
+            evaluated(2, official_date="2025-05-02", winner="Away"),
+            evaluated(3, official_date="2025-06-01", winner="Home"),
+            evaluated(4, official_date="2025-06-02", status="VOID"),
+        ]
+        rows[2]["predicted_side"] = "away"
+        rows[2]["predicted_winner"] = "Away"
+        rows[2]["p_home"] = 1.0 - rows[2]["pick_probability"]
+        rows[3]["predicted_side"] = "away"
+        rows[3]["predicted_winner"] = "Away"
+        rows[3]["p_home"] = 1.0 - rows[3]["pick_probability"]
+        summary = evaluate(rows)
+        self.assertEqual(list(summary["by_month"]), ["2025-05", "2025-06"])
+        self.assertEqual(
+            summary["by_month"],
+            {
+                "2025-05": {"W": 1, "L": 1, "N": 2, "accuracy": 0.5},
+                "2025-06": {"W": 0, "L": 1, "N": 1, "accuracy": 0.0},
+            },
+        )
+        self.assertEqual(list(summary["by_predicted_team"]), ["Away", "Home"])
+        self.assertEqual(
+            summary["by_predicted_team"],
+            {
+                "Away": {"W": 0, "L": 1, "N": 1, "accuracy": 0.0},
+                "Home": {"W": 1, "L": 1, "N": 2, "accuracy": 0.5},
+            },
+        )
 
     def test_calibration_includes_empty_bins_and_weighted_ece(self):
         rows = [
@@ -187,6 +224,13 @@ class EvaluationTest(unittest.TestCase):
             {
                 "home_no_vig_probability": 0.6,
                 "away_no_vig_probability": 0.4,
+            },
+            {
+                "market_snapshot_at": "x",
+                "market_source": "S",
+                "market_favorite": "Home",
+                "home_no_vig_probability": 1.0,
+                "away_no_vig_probability": 0.0,
             },
         )
         for market in invalid_markets:

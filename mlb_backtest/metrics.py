@@ -11,7 +11,6 @@ from .locking import _validate_prediction
 from .outcomes import _validate_outcome
 
 
-_Z_95 = 1.959963984540054
 _TIERS = ("S", "A", "B", "Lean", "Toss-up")
 _BINS = (
     ("50-54", 0.50, 0.54, False),
@@ -53,9 +52,7 @@ def log_loss(p: object, correct: object) -> float:
     return -math.log(probability if _correct(correct) else 1.0 - probability)
 
 
-def wilson(
-    wins: object, n: object, z: object = _Z_95
-) -> tuple[float, float]:
+def wilson(wins: object, n: object, z: object = 1.96) -> tuple[float, float]:
     """Return the two-sided Wilson score interval."""
     if isinstance(wins, bool) or not isinstance(wins, int):
         raise ValueError("wins must be an integer")
@@ -71,11 +68,6 @@ def wilson(
         raise ValueError("z must be a positive finite number") from exc
     if not math.isfinite(z_value) or z_value <= 0:
         raise ValueError("z must be a positive finite number")
-    # The preregistered 95% golden was calculated with the conventional
-    # display value 1.96, while retaining the exact normal quantile as the API
-    # default. Preserve that frozen result; explicit custom z values are exact.
-    if z_value == _Z_95:
-        z_value = 1.96
     proportion = wins / n
     z_squared = z_value * z_value
     denominator = 1.0 + z_squared / n
@@ -139,6 +131,8 @@ def _market_fields(outcome: Mapping[str, object], row: Mapping[str, object]) -> 
             raise ValueError("no-vig probabilities require complete market metadata")
         away = _probability(outcome["away_no_vig_probability"])
         home = _probability(outcome["home_no_vig_probability"])
+        if not 0.0 < away < 1.0 or not 0.0 < home < 1.0:
+            raise ValueError("no-vig probabilities must be strictly between zero and one")
         if not math.isclose(away + home, 1.0, rel_tol=0.0, abs_tol=1e-6):
             raise ValueError("no-vig probabilities must sum to one")
 
@@ -262,18 +256,22 @@ def _paired_market(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     for row in rows:
         outcome = row["outcome"]
         favorite = outcome.get("market_favorite")
-        if favorite is None or favorite == "Pick'em":
+        if (
+            favorite is None
+            or favorite == "Pick'em"
+            or "away_no_vig_probability" not in outcome
+            or "home_no_vig_probability" not in outcome
+        ):
             continue
         model_correct = bool(row["correct"])
         market_correct = favorite == outcome["actual_winner"]
         paired.append((model_correct, market_correct))
-        if "away_no_vig_probability" in outcome:
-            probability = outcome[
-                "away_no_vig_probability"
-                if favorite == row["away_team"]
-                else "home_no_vig_probability"
-            ]
-            probability_scores.append(brier(probability, market_correct))
+        probability = outcome[
+            "away_no_vig_probability"
+            if favorite == row["away_team"]
+            else "home_no_vig_probability"
+        ]
+        probability_scores.append(brier(probability, market_correct))
     n = len(paired)
     model_wins = sum(model for model, _ in paired)
     market_wins = sum(market for _, market in paired)
@@ -341,6 +339,26 @@ def _calibration(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     return {"bins": bins, "ece": weighted_gap / len(rows) if rows else None}
 
 
+def _compact_groups(
+    rows: Sequence[Mapping[str, object]], key
+) -> dict[str, dict[str, object]]:
+    grouped: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault(key(row), []).append(row)
+    result = {}
+    for label in sorted(grouped):
+        members = grouped[label]
+        wins = sum(bool(row["correct"]) for row in members)
+        n = len(members)
+        result[label] = {
+            "W": wins,
+            "L": n - wins,
+            "N": n,
+            "accuracy": wins / n if n else None,
+        }
+    return result
+
+
 def evaluate(
     rows: Iterable[Mapping[str, object]],
     model_version: str = "v5.1-BT",
@@ -404,6 +422,12 @@ def evaluate(
         },
         "paired_market": _paired_market(primary),
         "calibration": _calibration(primary),
+        "by_month": _compact_groups(
+            primary, lambda row: str(row["official_date"])[:7]
+        ),
+        "by_predicted_team": _compact_groups(
+            primary, lambda row: str(row["predicted_winner"])
+        ),
     }
     return summary
 
