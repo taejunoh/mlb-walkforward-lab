@@ -418,12 +418,15 @@ class PreflightTest(unittest.TestCase):
                     os.replace(replacement, manifest_path)
                 return data
 
-            with patch("mlb_backtest.preflight.os.read", side_effect=replace_after_first_chunk):
-                report = build_preflight(
-                    root, parse_run_spec(expected_historical_run())
-                )
+            with (
+                patch(
+                    "mlb_backtest.preflight.os.read",
+                    side_effect=replace_after_first_chunk,
+                ),
+                self.assertRaisesRegex(RuntimeError, "protected evidence"),
+            ):
+                build_preflight(root, parse_run_spec(expected_historical_run()))
         self.assertTrue(swapped)
-        self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
 
     def test_scanner_never_uses_network_or_mutates_data_or_audit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -694,6 +697,57 @@ class PreflightTest(unittest.TestCase):
                     root / "reports/preflight.json",
                     safe,
                     link / "preflight.schema.json",
+                )
+
+    def test_writer_rejects_manifest_run_spec_and_duplicate_output_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory) / "root")
+            run_path = Path(directory) / "run.json"
+            run_bytes = canonical_json_bytes(expected_historical_run()) + b"\n"
+            run_path.write_bytes(run_bytes)
+            manifest = next((root / "inventory").rglob("*.manifest.json"))
+            manifest_bytes = manifest.read_bytes()
+            safe_json = root / "reports/preflight.json"
+            safe_markdown = root / "reports/preflight.md"
+            safe_schema = root / "schemas/preflight.schema.json"
+
+            with self.assertRaisesRegex(ValueError, "protected|input evidence"):
+                write_preflight(
+                    root, run_path, manifest, safe_markdown, safe_schema
+                )
+            self.assertEqual(manifest.read_bytes(), manifest_bytes)
+
+            inventory_link = root / "inventory-link"
+            inventory_link.symlink_to(root / "inventory", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "protected"):
+                write_preflight(
+                    root,
+                    run_path,
+                    safe_json,
+                    inventory_link / "overwrite.md",
+                    safe_schema,
+                )
+
+            with self.assertRaisesRegex(ValueError, "input evidence"):
+                write_preflight(
+                    root, run_path, run_path, safe_markdown, safe_schema
+                )
+            self.assertEqual(run_path.read_bytes(), run_bytes)
+
+            with self.assertRaisesRegex(ValueError, "unique"):
+                write_preflight(
+                    root, run_path, safe_json, safe_json, safe_schema
+                )
+
+            alias_parent = root / "report-alias"
+            alias_parent.symlink_to(root / "reports", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "unique"):
+                write_preflight(
+                    root,
+                    run_path,
+                    safe_json,
+                    alias_parent / "preflight.json",
+                    safe_schema,
                 )
 
     def test_writer_bundle_rolls_back_second_and_third_replacement(self):

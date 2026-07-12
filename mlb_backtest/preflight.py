@@ -24,7 +24,7 @@ from mlb_backtest.protocols import (
 
 
 MINIMUM_SOURCES = MINIMUM_SOURCE_NAMES
-PROTECTED_PREFLIGHT_ROOTS = ("data", "audit")
+PROTECTED_PREFLIGHT_ROOTS = ("data", "audit", "inventory", "inventory_optional")
 SMALL_SEALED_HASH_ROOTS = (
     "data/v5_1_bt/locked",
     "data/v5_1_bt/outcomes",
@@ -2142,7 +2142,7 @@ def write_preflight(
     schema_path: Path,
 ) -> None:
     output_paths = (json_path, markdown_path, schema_path)
-    _validate_preflight_output_paths(root, output_paths)
+    _validate_preflight_output_paths(root, run_path, output_paths)
     protected_before = protected_inventory(root)
     report = build_preflight(root, load_run_spec(run_path))
     entries = (
@@ -2158,14 +2158,19 @@ def write_preflight(
 
 
 def _validate_preflight_output_paths(
-    root: Path, output_paths: Sequence[Path]
+    root: Path, run_path: Path, output_paths: Sequence[Path]
 ) -> None:
-    protected = tuple((root / name).resolve(strict=False) for name in ("data", "audit"))
+    protected = tuple(
+        (root / name).resolve(strict=False) for name in PROTECTED_PREFLIGHT_ROOTS
+    )
+    input_evidence = {run_path.resolve(strict=False)}
     resolved: list[Path] = []
     for path in output_paths:
         candidate = path.resolve(strict=False)
         if any(candidate == base or base in candidate.parents for base in protected):
-            raise ValueError("preflight output path is inside protected data or audit")
+            raise ValueError("preflight output path is inside a protected namespace")
+        if candidate in input_evidence:
+            raise ValueError("preflight output path aliases input evidence")
         resolved.append(candidate)
     if len(set(resolved)) != len(resolved):
         raise ValueError("preflight output paths must be unique")
