@@ -1,15 +1,22 @@
 from pathlib import Path
+import copy
 import json
 import unittest
 
 from mlb_backtest.diagnostics import (
     AUDITED_DIGEST_PATHS,
     PAIRED_INTERVAL_LABEL,
+    audit_leakage_evidence,
     audited_digest_map,
+    build_diagnostic,
+    chosen_side_edge,
+    component_summary,
     exact_mcnemar,
+    jsonable,
     load_v51_evidence,
     paired_delta_interval,
     paired_table,
+    wilson,
 )
 
 
@@ -121,6 +128,163 @@ class DiagnosticPrimitiveTest(unittest.TestCase):
             with self.subTest(model=model, baseline=baseline):
                 with self.assertRaises(ValueError):
                     paired_table(model, baseline)  # type: ignore[arg-type]
+
+
+class DiagnosticGoldenTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.result = build_diagnostic(load_v51_evidence(ROOT))
+
+    def test_primary_and_exact_paired_baselines(self):
+        self.assertEqual(self.result["primary"]["record"], {"W": 67, "L": 33, "N": 100})
+        self.assertEqual(
+            self.result["primary"]["wilson_95"],
+            [0.5730516033971139, 0.7543701620610456],
+        )
+        self.assertAlmostEqual(self.result["primary"]["brier"], 0.22137165792176453)
+        self.assertAlmostEqual(self.result["primary"]["log_loss"], 0.6351164919136184)
+        self.assertEqual(
+            self.result["baselines"]["home"]["paired"],
+            {"both_correct": 52, "model_only": 15, "baseline_only": 7, "both_wrong": 26, "N": 100},
+        )
+        self.assertEqual(
+            self.result["baselines"]["season_record"]["paired"],
+            {"both_correct": 62, "model_only": 4, "baseline_only": 3, "both_wrong": 30, "N": 99},
+        )
+        self.assertEqual(self.result["baselines"]["market"]["N"], 0)
+
+    def test_calibration_rank_time_team_component_and_quality(self):
+        self.assertEqual(
+            [(x["bin"], x["N"]) for x in self.result["calibration"]["bins"]],
+            [("50-54", 0), ("54-58", 1), ("58-63", 17), ("63-68", 59), ("68-100", 23)],
+        )
+        self.assertEqual(
+            [(x["rank"], x["W"], x["N"]) for x in self.result["rank"]],
+            [(1, 67, 100), (2, 60, 100), (3, 59, 100)],
+        )
+        self.assertEqual(self.result["monthly"]["2025-07"]["record"], {"W": 14, "L": 13, "N": 27})
+        self.assertEqual(self.result["team_concentration"]["top_six_share"], 0.57)
+        self.assertAlmostEqual(self.result["components"]["bullpen"]["win_mean"], 11.752, places=3)
+        self.assertEqual(
+            self.result["data_quality"]["top1_states"],
+            {"INCOMPLETE": 100, "High": 100, "Toss-up": 100},
+        )
+        self.assertAlmostEqual(
+            self.result["data_quality"]["completeness"]["mean"], 0.4602764334, places=10
+        )
+
+    def test_exact_secondary_statistics(self):
+        self.assertEqual(
+            self.result["sides"],
+            {
+                "home": {"W": 52, "L": 26, "N": 78, "accuracy": 52 / 78},
+                "away": {"W": 15, "L": 7, "N": 22, "accuracy": 15 / 22},
+            },
+        )
+        self.assertEqual(self.result["team_concentration"]["distinct_teams"], 23)
+        self.assertEqual(
+            self.result["team_concentration"]["top_six"],
+            {
+                "New York Yankees": 14,
+                "Philadelphia Phillies": 11,
+                "Houston Astros": 9,
+                "San Diego Padres": 9,
+                "Los Angeles Dodgers": 7,
+                "Seattle Mariners": 7,
+            },
+        )
+        self.assertEqual(self.result["team_concentration"]["top_six_share"], 0.57)
+        self.assertEqual(
+            [round(self.result["discrimination"]["probability_spearman"][k], 4 if k == "rho" else 3) for k in ("rho", "p")],
+            [0.0077, 0.939],
+        )
+        self.assertEqual(
+            [round(self.result["discrimination"]["legacy_confidence_spearman"][k], 4 if k == "rho" else 3) for k in ("rho", "p")],
+            [0.0365, 0.719],
+        )
+        self.assertEqual(
+            self.result["thresholds"]["ge_63"],
+            {"W": 59, "N": 82, "accuracy": 59 / 82, "post_hoc": True},
+        )
+        self.assertEqual(
+            self.result["thresholds"]["ge_68"],
+            {"W": 14, "N": 23, "accuracy": 14 / 23, "post_hoc": True},
+        )
+        self.assertEqual([round(x["p"], 3) for x in self.result["rank_comparisons"]], [0.349, 0.291])
+        self.assertEqual(round(self.result["temporal"]["july_vs_other_fisher_p"], 4), 0.0589)
+        self.assertEqual(
+            self.result["components"]["bullpen"]["absolute_edge_halves"],
+            {
+                "lower": {"W": 37, "N": 50, "accuracy": 0.74},
+                "upper": {"W": 30, "N": 50, "accuracy": 0.60},
+            },
+        )
+        self.assertEqual(
+            [round(self.result["components"]["bullpen"]["spearman"][k], 3) for k in ("rho", "p")],
+            [-0.151, 0.135],
+        )
+
+    def test_chosen_side_component_edges_are_signed_not_absolute(self):
+        synthetic = [
+            {"predicted_side": "home", "correct": True, "starter_edge": 5.0},
+            {"predicted_side": "away", "correct": False, "starter_edge": 7.0},
+        ]
+        self.assertEqual(chosen_side_edge(synthetic[0], "starter"), 5.0)
+        self.assertEqual(chosen_side_edge(synthetic[1], "starter"), -7.0)
+        summary = component_summary(synthetic, "starter")
+        self.assertEqual(summary["win_mean"], 5.0)
+        self.assertEqual(summary["loss_mean"], -7.0)
+
+    def test_leakage_categories_are_distinct_and_exact(self):
+        self.assertEqual(
+            set(self.result["leakage"]),
+            {"statistical_as_of_safety", "participant_time_limitation", "source_revision_limitation"},
+        )
+        self.assertEqual(self.result["leakage"]["statistical_as_of_safety"]["status"], "PASS")
+        self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
+        self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
+
+    def test_leakage_evidence_tampering_fails(self):
+        evidence = load_v51_evidence(ROOT)
+        raw = jsonable(
+            json.loads(
+                (ROOT / "data/v5_1_bt/features/candidate_raw_features.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+        )
+        card = jsonable(evidence.model_card)
+        card["counts"]["candidate_rows"] = 1
+        manual = (ROOT / "audit/v5_1_bt/manual_audit.md").read_text(encoding="utf-8")
+        for mutate in (
+            lambda x: x["provenance"].__setitem__("max_history_date", x["official_date"]),
+            lambda x: x["provenance"].__setitem__("statcast_target_excluded", False),
+            lambda x: x.__setitem__("lineup_provenance", "TIMESTAMP_VERIFIED_T45"),
+        ):
+            changed = copy.deepcopy(raw)
+            mutate(changed)
+            with self.assertRaisesRegex(ValueError, "leakage evidence"):
+                audit_leakage_evidence((changed,), card, manual)
+        with self.assertRaisesRegex(ValueError, "manual audit evidence"):
+            audit_leakage_evidence((raw,), card, manual.replace("2025-06-15", "missing"))
+
+    def test_all_chosen_side_means_team_intervals_and_training_count(self):
+        self.assertEqual(
+            {
+                name: (round(v["win_mean"], 3), round(v["loss_mean"], 3))
+                for name, v in self.result["components"].items()
+                if name in {"starter", "offense", "bullpen", "schedule"}
+            },
+            {
+                "starter": (14.879, 13.751),
+                "offense": (8.287, 7.049),
+                "bullpen": (11.752, 14.238),
+                "schedule": (1.313, 2.424),
+            },
+        )
+        for team, row in self.result["teams"].items():
+            self.assertEqual(row["wilson_95"], list(wilson(row["W"], row["N"])), team)
+        self.assertEqual(self.result["data_quality"]["training_eligible_rows"], 7265)
 
 
 if __name__ == "__main__":
