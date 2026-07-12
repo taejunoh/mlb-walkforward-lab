@@ -45,6 +45,30 @@ AUDITED_DIGEST_PATHS = MappingProxyType(
     }
 )
 
+SEALED_LOCK_DIGEST_KEYS = frozenset(
+    {
+        "predictions_contents_sha256",
+        "lock_manifest_file_sha256",
+        "source_provenance_file_sha256",
+    }
+)
+SEALED_LOCK_METADATA_KEYS = frozenset(
+    {
+        "created_at_utc",
+        "predictions_file",
+        "row_count",
+        "date_count",
+        "first_official_date",
+        "last_official_date",
+        "top1_count",
+        "top3_count",
+        "pipeline_model_card_sha256",
+    }
+)
+INPUT_OUTPUT_DIGEST_KEYS = frozenset(AUDITED_DIGEST_PATHS) - (
+    SEALED_LOCK_DIGEST_KEYS | {"audit_model_card_file_sha256"}
+)
+
 
 @dataclass(frozen=True)
 class V51Evidence:
@@ -60,6 +84,8 @@ class V51Evidence:
 
 
 def exact_mcnemar(model_only: int, baseline_only: int) -> float:
+    _require_nonnegative_count("model_only", model_only)
+    _require_nonnegative_count("baseline_only", baseline_only)
     discordant = model_only + baseline_only
     if discordant == 0:
         return 1.0
@@ -75,6 +101,10 @@ def paired_table(
 ) -> dict[str, int]:
     if len(model_correct) != len(baseline_correct):
         raise ValueError("paired correctness vectors differ in length")
+    if any(type(value) is not bool for value in model_correct):
+        raise ValueError("model correctness vector must contain only bool values")
+    if any(type(value) is not bool for value in baseline_correct):
+        raise ValueError("baseline correctness vector must contain only bool values")
     pairs = list(zip(model_correct, baseline_correct, strict=True))
     return {
         "both_correct": sum(a and b for a, b in pairs),
@@ -91,10 +121,28 @@ PAIRED_INTERVAL_LABEL = "approximate paired 95% interval (z=1.97)"
 def paired_delta_interval(
     model_only: int, baseline_only: int, n: int, z: float = 1.97
 ) -> tuple[float, float]:
+    _require_nonnegative_count("model_only", model_only)
+    _require_nonnegative_count("baseline_only", baseline_only)
+    if type(n) is not int or n <= 0:
+        raise ValueError("n must be a positive integer")
+    if model_only + baseline_only > n:
+        raise ValueError("discordant count cannot exceed n")
+    if (
+        isinstance(z, bool)
+        or not isinstance(z, (int, float))
+        or not math.isfinite(z)
+        or z <= 0
+    ):
+        raise ValueError("z must be a finite positive number")
     delta = (model_only - baseline_only) / n
     variance = ((model_only + baseline_only) / n - delta * delta) / n
     margin = z * math.sqrt(variance)
     return delta - margin, delta + margin
+
+
+def _require_nonnegative_count(name: str, value: object) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
 
 
 def jsonable(value: object) -> object:
@@ -128,25 +176,31 @@ def read_jsonl(path: Path) -> tuple[dict[str, object], ...]:
 
 
 def audited_digest_map(audit: Mapping[str, object]) -> dict[str, str]:
-    result = {
-        "audit_model_card_file_sha256": str(audit["audit_model_card_file_sha256"])
-    }
-    sealed_lock = audit["sealed_lock"]
-    input_and_output = audit["input_and_output_sha256"]
+    try:
+        model_card_digest = audit["audit_model_card_file_sha256"]
+        sealed_lock = audit["sealed_lock"]
+        input_and_output = audit["input_and_output_sha256"]
+    except KeyError as exc:
+        raise ValueError("audited digest registry is missing a required section") from exc
     if not isinstance(sealed_lock, Mapping) or not isinstance(input_and_output, Mapping):
         raise ValueError("audited digest registry has invalid structure")
-    result.update(
-        {k: str(v) for k, v in sealed_lock.items() if k in AUDITED_DIGEST_PATHS}
+    duplicate_digest_keys = (
+        set(sealed_lock) & set(input_and_output) & set(AUDITED_DIGEST_PATHS)
     )
-    result.update(
-        {
-            k: str(v)
-            for k, v in input_and_output.items()
-            if k in AUDITED_DIGEST_PATHS
-        }
-    )
+    if duplicate_digest_keys:
+        raise ValueError("audited digest key appears in more than one section")
+    expected_sealed_keys = SEALED_LOCK_METADATA_KEYS | SEALED_LOCK_DIGEST_KEYS
+    if set(sealed_lock) != expected_sealed_keys:
+        raise ValueError("sealed lock schema differs from the audited contract")
+    if set(input_and_output) != INPUT_OUTPUT_DIGEST_KEYS:
+        raise ValueError("input/output digest schema differs from the audited contract")
+    result = {"audit_model_card_file_sha256": model_card_digest}
+    result.update({key: sealed_lock[key] for key in SEALED_LOCK_DIGEST_KEYS})
+    result.update({key: input_and_output[key] for key in INPUT_OUTPUT_DIGEST_KEYS})
     if set(result) != set(AUDITED_DIGEST_PATHS):
         raise ValueError("audited digest registry differs from available files")
+    if any(not isinstance(value, str) for value in result.values()):
+        raise ValueError("audited digest values must be strings")
     return result
 
 

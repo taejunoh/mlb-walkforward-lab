@@ -1,9 +1,11 @@
 from pathlib import Path
+import json
 import unittest
 
 from mlb_backtest.diagnostics import (
     AUDITED_DIGEST_PATHS,
     PAIRED_INTERVAL_LABEL,
+    audited_digest_map,
     exact_mcnemar,
     load_v51_evidence,
     paired_delta_interval,
@@ -62,6 +64,63 @@ class DiagnosticPrimitiveTest(unittest.TestCase):
         self.assertEqual(
             PAIRED_INTERVAL_LABEL, "approximate paired 95% interval (z=1.97)"
         )
+
+    def test_audited_digest_registry_rejects_schema_drift(self):
+        audit_path = ROOT / "audit/v5_1_bt/lock_manifest.json"
+
+        unknown = json.loads(audit_path.read_text(encoding="utf-8"))
+        unknown["input_and_output_sha256"]["unexpected_digest"] = "0" * 64
+        with self.assertRaises(ValueError):
+            audited_digest_map(unknown)
+
+        missing = json.loads(audit_path.read_text(encoding="utf-8"))
+        del missing["input_and_output_sha256"]["summary"]
+        with self.assertRaises(ValueError):
+            audited_digest_map(missing)
+
+        duplicate = json.loads(audit_path.read_text(encoding="utf-8"))
+        duplicate["sealed_lock"]["summary"] = duplicate[
+            "input_and_output_sha256"
+        ]["summary"]
+        with self.assertRaisesRegex(ValueError, "more than one section"):
+            audited_digest_map(duplicate)
+
+    def test_statistical_counts_and_interval_parameters_are_strict(self):
+        self.assertEqual(exact_mcnemar(0, 0), 1.0)
+        self.assertEqual(paired_delta_interval(0, 0, 1), (0.0, 0.0))
+
+        invalid_counts = (True, 1.0, "1", -1)
+        for value in invalid_counts:
+            with self.subTest(function="mcnemar_model", value=value):
+                with self.assertRaises(ValueError):
+                    exact_mcnemar(value, 0)  # type: ignore[arg-type]
+            with self.subTest(function="mcnemar_baseline", value=value):
+                with self.assertRaises(ValueError):
+                    exact_mcnemar(0, value)  # type: ignore[arg-type]
+            with self.subTest(function="interval_model", value=value):
+                with self.assertRaises(ValueError):
+                    paired_delta_interval(value, 0, 1)  # type: ignore[arg-type]
+            with self.subTest(function="interval_baseline", value=value):
+                with self.assertRaises(ValueError):
+                    paired_delta_interval(0, value, 1)  # type: ignore[arg-type]
+
+        for n in (True, 0, -1, 1.0, "1"):
+            with self.subTest(n=n):
+                with self.assertRaises(ValueError):
+                    paired_delta_interval(0, 0, n)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            paired_delta_interval(1, 1, 1)
+
+        for z in (True, 0, -1, float("inf"), float("nan"), "1.97"):
+            with self.subTest(z=z):
+                with self.assertRaises(ValueError):
+                    paired_delta_interval(0, 0, 1, z)  # type: ignore[arg-type]
+
+    def test_paired_table_rejects_non_boolean_elements(self):
+        for model, baseline in (([1], [True]), ([True], [0]), ([None], [False])):
+            with self.subTest(model=model, baseline=baseline):
+                with self.assertRaises(ValueError):
+                    paired_table(model, baseline)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
