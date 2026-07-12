@@ -1,9 +1,8 @@
 import json
-import gc
 import unittest
 import tempfile
 import threading
-import weakref
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from pathlib import Path
@@ -112,34 +111,35 @@ class StatcastTest(unittest.TestCase):
 
         self.assertEqual(len(parsed.pitches), 7)
 
-    def test_disk_unique_iterator_does_not_retain_row_values_in_memory(self):
+    def test_disk_unique_iterator_peak_memory_does_not_scale_with_row_count(self):
         disk_unique = getattr(
             statcast_module, "iter_unique_statcast_pitches_on_disk", None
         )
         self.assertIsNotNone(disk_unique)
 
-        class Marker(str):
-            pass
+        def peak_bytes(row_count):
+            def rows():
+                for pitch_number in range(1, row_count + 1):
+                    yield {
+                        "game_pk": 1,
+                        "at_bat_number": pitch_number,
+                        "pitch_number": 1,
+                        "events": f"event-{pitch_number}",
+                    }
 
-        references = []
+            tracemalloc.start()
+            try:
+                for _row in disk_unique(rows()):
+                    pass
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
 
-        def rows():
-            for pitch_number in range(1, 101):
-                marker = Marker(f"event-{pitch_number}")
-                references.append(weakref.ref(marker))
-                yield {
-                    "game_pk": 1,
-                    "at_bat_number": pitch_number,
-                    "pitch_number": 1,
-                    "events": marker,
-                }
+        small_peak = peak_bytes(10_000)
+        large_peak = peak_bytes(100_000)
 
-        for row in disk_unique(rows()):
-            pass
-        del row
-        gc.collect()
-
-        self.assertEqual(sum(ref() is not None for ref in references), 0)
+        self.assertLess(large_peak - small_peak, 2 * 1024 * 1024)
+        self.assertLess(large_peak, max(4 * small_peak, 512 * 1024))
 
     def test_truncated_pa_records_a_pitch_event_but_not_a_completed_pa(self):
         text = FIXTURE.read_text("utf-8-sig").replace(
