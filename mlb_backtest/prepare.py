@@ -6,8 +6,8 @@ import json
 import hashlib
 import math
 import re
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field as dataclass_field
 from datetime import date, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -18,6 +18,7 @@ from .sources import parse_schedule, schedule_url
 
 
 _EVIDENCE_TOKEN = object()
+PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
 
 
 @dataclass(frozen=True, init=False)
@@ -84,6 +85,7 @@ class ScheduleHistoryBuild:
     coverage_complete: bool
     source_manifest_sha256: str | None
     expected_game_pks: tuple[int, ...]
+    provenance: Mapping[str, object] = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.coverage_complete) is not bool:
@@ -695,7 +697,7 @@ def _validate_played_schedule_season(
     season_close: str,
 ) -> tuple[Mapping[str, object], ...]:
     """Return lineup-valid played games after enforcing live season sanity."""
-    played_statuses = {"Final", "Completed Early"}
+    played_statuses = PLAYED_STATUSES
     unplayed_statuses = {"Postponed", "Canceled", "Cancelled"}
     played = []
     lineup_valid = []
@@ -812,10 +814,10 @@ def derive_training_slot_rows(
         played_game_pks.update(
             int(game["game_pk"])
             for game in season_games
-            if game.get("status") in {"Final", "Completed Early"}
+            if game.get("status") in PLAYED_STATUSES
         )
         for game in season_games:
-            if game.get("status") in {"Final", "Completed Early"}:
+            if game.get("status") in PLAYED_STATUSES:
                 game_pk = int(game["game_pk"])
                 if game_pk in played_game_dates:
                     raise ValueError("full-season schedule evidence duplicates played game_pk")
@@ -931,6 +933,20 @@ def schedule_history_rows(
             raise ValueError("passed games contain unverified schedule fields")
     rows = []
     seen = set()
+    status_counts = Counter(str(game.get("status")) for game in evidence.games)
+    played_expected = {
+        int(game["game_pk"])
+        for game in evidence.games
+        if game.get("status") in PLAYED_STATUSES
+    }
+    excluded = sorted(
+        (
+            int(game["game_pk"]),
+            str(game.get("status")),
+        )
+        for game in evidence.games
+        if game.get("status") not in PLAYED_STATUSES
+    )
     for game in supplied:
         if not isinstance(game, Mapping):
             raise ValueError("normalized schedule games must be mappings")
@@ -940,6 +956,8 @@ def schedule_history_rows(
         if game_pk in seen:
             raise ValueError("duplicate schedule game_pk")
         seen.add(game_pk)
+        if game.get("status") not in PLAYED_STATUSES:
+            continue
         official_text = _canonical_day(
             game.get("official_date"), "schedule official_date"
         )
@@ -1009,18 +1027,28 @@ def schedule_history_rows(
         raise ValueError("schedule history requires at least one regular-season game")
     rows.sort(key=lambda row: (row["official_date"], row["game_pk"]))
     actual = {int(row["game_pk"]) for row in rows}
-    if actual != expected:
+    if actual != played_expected:
         raise ValueError(
-            f"expected game_pk set differs; missing={sorted(expected - actual)}, "
-            f"unexpected={sorted(actual - expected)}"
+            f"expected played game_pk set differs; missing={sorted(played_expected - actual)}, "
+            f"unexpected={sorted(actual - played_expected)}"
         )
+    provenance = {
+        "source_manifest_sha256": evidence.manifest_sha256,
+        "raw_game_count": len(evidence.games),
+        "status_counts": dict(sorted(status_counts.items())),
+        "played_game_pks": tuple(sorted(played_expected)),
+        "played_game_count": len(played_expected),
+        "excluded_unplayed_game_pks": tuple(game_pk for game_pk, _status in excluded),
+        "excluded_unplayed_statuses": tuple(status for _game_pk, status in excluded),
+    }
     return ScheduleHistoryBuild(
         tuple(rows),
         first,
         last,
         True,
         evidence.manifest_sha256,
-        tuple(sorted(expected)),
+        tuple(sorted(played_expected)),
+        provenance,
     )
 
 
@@ -1084,6 +1112,7 @@ def build_pregame_history(
 
 __all__ = [
     "ParticipantBuild",
+    "PLAYED_STATUSES",
     "ScheduleHistoryBuild",
     "TeamCodeBuild",
     "VerifiedScheduleEvidence",

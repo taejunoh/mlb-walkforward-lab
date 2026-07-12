@@ -421,22 +421,33 @@ class PrepareBoundaryTest(unittest.TestCase):
                 "gameType": "R",
                 "officialDate": game["official_date"],
                 "gameDate": f'{game["official_date"]}T17:00:00Z',
-                "status": {"detailedState": "Scheduled"},
+                "status": {"detailedState": "Final"},
                 "teams": {
-                    "away": {"team": {"id": 1, "name": "Away"}},
-                    "home": {"team": {"id": 2, "name": "Home"}},
+                    "away": {"team": {"id": 1, "name": "Away"}, "score": 1, "isWinner": False},
+                    "home": {"team": {"id": 2, "name": "Home"}, "score": 2, "isWinner": True},
                 },
                 "venue": {"id": 31, "name": "PNC Park"},
                 **({"scheduledInnings": 7} if game["game_pk"] == 2 else {}),
                 **({"doubleHeader": "Y", "gameNumber": 1} if game["game_pk"] == 1 else {}),
             })
+        payload_games.append({
+            "gamePk": 3,
+            "gameType": "R",
+            "officialDate": "2024-04-03",
+            "gameDate": "2024-04-03T17:00:00Z",
+            "status": {"detailedState": "Cancelled"},
+            "teams": {
+                "away": {"team": {"id": 3, "name": "No Code Away"}},
+                "home": {"team": {"id": 4, "name": "No Code Home"}},
+            },
+        })
         payload = json.dumps({"dates": [{"date": "2024-04-01", "games": payload_games}]}).encode()
         query = {
             "role": "training",
             "start": "2024-04-01",
-            "end": "2024-04-02",
+            "end": "2024-04-03",
             "gameType": "R",
-            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2024-04-01&endDate=2024-04-02&hydrate=probablePitcher%2Clineups%2Cvenue",
+            "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2024-04-01&endDate=2024-04-03&hydrate=probablePitcher%2Clineups%2Cvenue",
         }
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -448,15 +459,26 @@ class PrepareBoundaryTest(unittest.TestCase):
         )
         evidence_games = [
             dict(game, away_team_code="AWY", home_team_code="HOM")
+            if game["status"] in {"Final", "Completed Early"}
+            else dict(game)
             for game in evidence.games
         ]
         built = schedule_history_rows(evidence_games, venues, evidence)
         self.assertIsInstance(built, ScheduleHistoryBuild)
         self.assertEqual(built.coverage_start, "2024-04-01")
-        self.assertEqual(built.coverage_end, "2024-04-02")
+        self.assertEqual(built.coverage_end, "2024-04-03")
         self.assertTrue(built.coverage_complete)
         self.assertEqual(built.source_manifest_sha256, evidence.manifest_sha256)
         self.assertEqual(built.expected_game_pks, (1, 2))
+        self.assertEqual(len(built.rows), 2)
+        self.assertEqual(built.provenance["raw_game_count"], 3)
+        self.assertEqual(built.provenance["played_game_count"], 2)
+        self.assertEqual(built.provenance["played_game_pks"], (1, 2))
+        self.assertEqual(built.provenance["excluded_unplayed_game_pks"], (3,))
+        self.assertEqual(built.provenance["excluded_unplayed_statuses"], ("Cancelled",))
+        self.assertEqual(
+            built.provenance["status_counts"], {"Cancelled": 1, "Final": 2}
+        )
         self.assertEqual(built.rows[0]["team_codes"], ["AWY", "HOM"])
         self.assertEqual(built.rows[0]["home_team_code"], "HOM")
         self.assertEqual(built.rows[0]["innings"], 9)
