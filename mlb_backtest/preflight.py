@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 from types import MappingProxyType
 
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
@@ -15,6 +16,7 @@ from mlb_backtest.protocols import (
     MINIMUM_SOURCE_NAMES,
     RunSpec,
     expected_historical_run,
+    _publish_bundle,
     load_run_spec,
     parse_run_spec,
     require_exact_keys,
@@ -143,6 +145,7 @@ SOURCE_RECORD_KEYS = frozenset(
         "logical_query_ids",
         "row_count",
         "game_count",
+        "game_pks",
         "schema_fields",
         "missing_critical_fields",
         "duplicate_game_pks",
@@ -162,6 +165,12 @@ OPTIONAL_SOURCE_CONTRACT = MappingProxyType(
         "catcher": "ABSENT_NEUTRAL",
         "injury_restriction": "ABSENT_NULL",
     }
+)
+GAME_GRAIN_SOURCES = frozenset(
+    {"mlb_schedule_game_feed", "baseball_savant_statcast", "prior_schedule_history"}
+)
+REFERENCE_GRAIN_SOURCES = frozenset(
+    {"mlb_stats_pitching", "venue_team_timezone_table"}
 )
 OPTIONAL_REQUIRED_FIELDS = MappingProxyType(
     {
@@ -212,6 +221,31 @@ QUERY_KEYS = frozenset({"season", "start_date", "end_date"})
 RANGE_KEYS = frozenset({"start_date", "end_date"})
 OPTIONAL_RECORD_KEYS = frozenset({"status", "fallback_status", "queries", "errors"})
 INVENTORY_ERROR_KEYS = frozenset({"path", "code", "detail"})
+INVENTORY_ERROR_CODES = frozenset(
+    {
+        "MALFORMED_MANIFEST_JSON",
+        "MALFORMED_SIDECAR_JSON",
+        "INVALID_MANIFEST_CONTRACT",
+        "INVALID_MANIFEST_EVIDENCE",
+        "LEGACY_MANIFEST_UNADAPTABLE",
+        "RAW_HASH_MISMATCH",
+        "RAW_MISSING",
+        "SIDECAR_HASH_MISMATCH",
+        "MANIFEST_SCHEMA_VERSION",
+        "SIDECAR_SCHEMA_VERSION",
+        "INVALID_COUNTS",
+        "GAME_COUNT_MISMATCH",
+        "INVALID_EVENT_DATE_RANGE",
+        "EVENT_DATE_RANGE_MISMATCH",
+        "MISSING_CRITICAL_FIELDS",
+        "DUPLICATE_GAME_PK",
+        "INVALID_GAME_PK",
+        "QUERY_DATE_RANGE_MISMATCH",
+        "INVALID_DATE_RANGE",
+        "SPLIT_PARENT_ID_MISMATCH",
+        "INVALID_SPLIT_SET",
+    }
+)
 PROTECTED_SNAPSHOT_KEYS = frozenset(
     {"metadata_path_size_mtime_inode_mode", "small_sealed_sha256"}
 )
@@ -260,11 +294,7 @@ def safe_relative(root: Path, raw: object) -> Path:
     relative = Path(raw)
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("manifest path escapes root")
-    result = (root / relative).resolve()
-    resolved_root = root.resolve()
-    if result != resolved_root and resolved_root not in result.parents:
-        raise ValueError("manifest path escapes root")
-    return result
+    return root / relative
 
 
 def canonical_source(alias: str) -> str:
@@ -299,8 +329,84 @@ def _error(path: Path, root: Path, code: str, detail: str) -> dict[str, str]:
     }
 
 
-def _read_json(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _assert_no_symlink_path(root: Path, path: Path) -> None:
+    root_absolute = root.absolute()
+    path_absolute = path.absolute()
+    try:
+        relative = path_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ValueError("inventory path escapes root") from exc
+    current = root_absolute
+    for part in relative.parts:
+        current /= part
+        try:
+            file_stat = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(file_stat.st_mode):
+            raise ValueError(f"inventory symlink forbidden: {current}")
+
+
+def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_mode,
+    )
+
+
+def _verified_file_read(
+    root: Path, path: Path, *, collect: bool
+) -> bytes | str:
+    _assert_no_symlink_path(root, path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    chunks: list[bytes] = []
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("inventory evidence must be a regular file")
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            if collect:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    _assert_no_symlink_path(root, path)
+    path_stat = os.lstat(path)
+    if (
+        _file_identity(before) != _file_identity(after)
+        or before.st_dev != path_stat.st_dev
+        or before.st_ino != path_stat.st_ino
+        or before.st_size != path_stat.st_size
+        or before.st_mtime_ns != path_stat.st_mtime_ns
+        or total != before.st_size
+    ):
+        raise ValueError("inventory evidence changed during read")
+    return b"".join(chunks) if collect else digest.hexdigest()
+
+
+def _verified_json_bytes(root: Path, path: Path) -> bytes:
+    value = _verified_file_read(root, path, collect=True)
+    if not isinstance(value, bytes):
+        raise AssertionError("verified JSON read did not return bytes")
+    return value
+
+
+def _verified_sha256(root: Path, path: Path) -> str:
+    value = _verified_file_read(root, path, collect=False)
+    if not isinstance(value, str):
+        raise AssertionError("verified digest read did not return text")
+    return value
 
 
 def inventory_existing_manifests(
@@ -314,7 +420,8 @@ def inventory_existing_manifests(
         if inferred_optional is not None:
             continue
         try:
-            raw_manifest = _read_json(path)
+            manifest_bytes = _verified_json_bytes(root, path)
+            raw_manifest = json.loads(manifest_bytes)
             if (
                 isinstance(raw_manifest, Mapping)
                 and raw_manifest.get("source") in OPTIONAL_SOURCE_CONTRACT
@@ -334,7 +441,12 @@ def inventory_existing_manifests(
             errors.append(_error(path, root, "INVALID_MANIFEST_CONTRACT", str(exc)))
             continue
         try:
-            row = _validate_manifest(root, path, manifest)
+            row = _validate_manifest(
+                root,
+                path,
+                manifest,
+                manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            )
         except (
             OSError,
             UnicodeError,
@@ -360,6 +472,7 @@ def _validate_manifest(
     item: Mapping[str, object],
     *,
     optional_source: str | None = None,
+    manifest_sha256: str,
 ) -> dict[str, object]:
     failures: list[str] = []
     if item["schema_version"] != 1:
@@ -394,14 +507,15 @@ def _validate_manifest(
     raw_path = safe_relative(root, item["raw_path"])
     sidecar_path = safe_relative(root, item["sidecar_path"])
     try:
-        sidecar = require_exact_keys(_read_json(sidecar_path), SIDECAR_KEYS, "sidecar")
+        sidecar_bytes = _verified_json_bytes(root, sidecar_path)
+        sidecar = require_exact_keys(json.loads(sidecar_bytes), SIDECAR_KEYS, "sidecar")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"sidecar unreadable: {type(exc).__name__}") from exc
     if not raw_path.is_file():
         failures.append("RAW_MISSING")
-    elif sha256_file(raw_path) != item["raw_sha256"]:
+    elif _verified_sha256(root, raw_path) != item["raw_sha256"]:
         failures.append("RAW_HASH_MISMATCH")
-    if sha256_file(sidecar_path) != item["sidecar_sha256"]:
+    if hashlib.sha256(sidecar_bytes).hexdigest() != item["sidecar_sha256"]:
         failures.append("SIDECAR_HASH_MISMATCH")
     if sidecar["schema_version"] != 1:
         failures.append("SIDECAR_SCHEMA_VERSION")
@@ -421,6 +535,8 @@ def _validate_manifest(
         failures.append("MISSING_CRITICAL_FIELDS")
     if len(game_pks) != len(set(game_pks)):
         failures.append("DUPLICATE_GAME_PK")
+    if game_count != len(set(game_pks)):
+        failures.append("GAME_COUNT_MISMATCH")
     if any(game_pk <= 0 for game_pk in game_pks):
         failures.append("INVALID_GAME_PK")
     expected_parent = parent_logical_query_id(source, year, start, end)
@@ -455,7 +571,7 @@ def _validate_manifest(
         "raw_sha256": _sha256(item["raw_sha256"], "raw_sha256"),
         "sidecar_sha256": _sha256(item["sidecar_sha256"], "sidecar_sha256"),
         "manifest_path": path.relative_to(root).as_posix(),
-        "manifest_sha256": sha256_file(path),
+        "manifest_sha256": manifest_sha256,
         "failures": sorted(set(failures)),
     }
 
@@ -478,7 +594,8 @@ def inventory_optional_manifests(
             if inferred is not None and inferred != source:
                 continue
             try:
-                raw_manifest = _read_json(path)
+                manifest_bytes = _verified_json_bytes(root, path)
+                raw_manifest = json.loads(manifest_bytes)
                 declared = (
                     raw_manifest.get("source")
                     if isinstance(raw_manifest, Mapping)
@@ -502,7 +619,13 @@ def inventory_optional_manifests(
                 )
                 continue
             try:
-                row = _validate_manifest(root, path, manifest, optional_source=source)
+                row = _validate_manifest(
+                    root,
+                    path,
+                    manifest,
+                    optional_source=source,
+                    manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                )
             except (
                 OSError,
                 UnicodeError,
@@ -535,15 +658,21 @@ def inventory_optional_manifests(
 
 
 def _manifest_candidates(root: Path) -> tuple[Path, ...]:
+    if root.is_symlink():
+        raise ValueError("inventory root symlink forbidden")
+    bases = (
+        root / "inventory",
+        root / "data/v5_2_qd/raw",
+        root / "inventory_optional",
+    )
+    for base in bases:
+        if base.exists() or base.is_symlink():
+            _assert_no_symlink_path(root, base)
     return tuple(
         sorted(
             {
                 path
-                for base in (
-                    root / "inventory",
-                    root / "data/v5_2_qd/raw",
-                    root / "inventory_optional",
-                )
+                for base in bases
                 if base.exists()
                 for path in base.rglob("*.manifest.json")
             }
@@ -715,7 +844,8 @@ def inventory_legacy_manifests(
     )
     for path in candidates:
         try:
-            raw = _read_json(path)
+            manifest_bytes = _verified_json_bytes(root, path)
+            raw = json.loads(manifest_bytes)
             if not isinstance(raw, Mapping):
                 raise ValueError("legacy manifest is not an object")
             query = raw["query"]
@@ -743,7 +873,9 @@ def inventory_legacy_manifests(
                                 },
                                 "legacy": True,
                                 "manifest_path": path.relative_to(root).as_posix(),
-                                "manifest_sha256": sha256_file(path),
+                                "manifest_sha256": hashlib.sha256(
+                                    manifest_bytes
+                                ).hexdigest(),
                             }
                         )
         except (
@@ -862,6 +994,7 @@ def assess_season(
                 "logical_query_ids": [],
                 "row_count": 0,
                 "game_count": 0,
+                "game_pks": [],
                 "schema_fields": [],
                 "missing_critical_fields": ["V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"],
                 "duplicate_game_pks": [],
@@ -907,6 +1040,14 @@ def assess_season(
             ).items()
             if count > 1
         )
+        game_pks = sorted(
+            {
+                game_pk
+                for row in matched
+                for game_pk in row["game_pks"]
+                if game_pk > 0
+            }
+        )
         missing_fields = sorted(
             set(REQUIRED_FIELDS[source])
             - {str(field) for row in matched for field in row["schema_fields"]}
@@ -917,6 +1058,8 @@ def assess_season(
             and not failures
             and not duplicates
             and not missing_fields
+            and sum(int(row["row_count"]) for row in matched) > 0
+            and bool(game_pks)
         )
         blockers = missing_fields + failures
         if not matched:
@@ -928,6 +1071,10 @@ def assess_season(
                 blockers.append("INVALID_SPLIT_SET")
             if duplicates:
                 blockers.append("DUPLICATE_GAME_PK_ACROSS_SPLITS")
+            if sum(int(row["row_count"]) for row in matched) == 0:
+                blockers.append("EMPTY_DATASET")
+            if not game_pks:
+                blockers.append("EMPTY_GAME_PK_COVERAGE")
         record = {
             "source": source,
             "required": True,
@@ -938,6 +1085,7 @@ def assess_season(
             "logical_query_ids": sorted(parents),
             "row_count": sum(int(row["row_count"]) for row in matched),
             "game_count": sum(int(row["game_count"]) for row in matched),
+            "game_pks": game_pks,
             "schema_fields": sorted(
                 {str(field) for row in matched for field in row["schema_fields"]}
             ),
@@ -963,6 +1111,7 @@ def assess_season(
         }
         require_exact_keys(record, SOURCE_RECORD_KEYS, f"season.{year}.{source}")
         records[source] = record
+    _apply_cross_source_game_pk_contract(records)
     return {
         "minimum_contract": (
             "COMPLETE"
@@ -971,6 +1120,37 @@ def assess_season(
         ),
         "sources": records,
     }
+
+
+def _cross_source_game_pk_failures(
+    records: Mapping[str, Mapping[str, object]],
+) -> dict[str, str]:
+    schedule = records["mlb_schedule_game_feed"]
+    if schedule["status"] != "COMPLETE":
+        return {}
+    anchor = set(schedule["game_pks"])
+    failures: dict[str, str] = {}
+    for source in GAME_GRAIN_SOURCES - {"mlb_schedule_game_feed"}:
+        record = records[source]
+        if record["status"] == "COMPLETE" and set(record["game_pks"]) != anchor:
+            failures[source] = "GAME_PK_COVERAGE_MISMATCH"
+    for source in REFERENCE_GRAIN_SOURCES:
+        record = records[source]
+        if record["status"] == "COMPLETE" and not set(record["game_pks"]).issubset(
+            anchor
+        ):
+            failures[source] = "GAME_PK_OUTSIDE_SCHEDULE"
+    return failures
+
+
+def _apply_cross_source_game_pk_contract(
+    records: Mapping[str, dict[str, object]],
+) -> None:
+    for source, blocker in _cross_source_game_pk_failures(records).items():
+        records[source]["status"] = "INVALID"
+        records[source]["missing_critical_fields"] = sorted(
+            set(records[source]["missing_critical_fields"]) | {blocker}
+        )
 
 
 def ranges_cover(
@@ -1109,6 +1289,11 @@ def parse_preflight(raw: object) -> dict[str, object]:
                 f"preflight.seasons.{year}.sources.{source}",
             )
             _validate_source_record(item, source, int(year))
+        cross_failures = _cross_source_game_pk_failures(sources)
+        if cross_failures:
+            raise ValueError(
+                f"preflight.seasons.{year} cross-source gamePk coverage differs"
+            )
         expected_minimum = (
             "COMPLETE"
             if all(record["status"] == "COMPLETE" for record in sources.values())
@@ -1181,6 +1366,9 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
         _strict_int(item[field], field, 0)
     if int(item["game_count"]) > int(item["row_count"]):
         raise ValueError("game_count exceeds row_count")
+    game_pks = _integer_list(item["game_pks"], "game_pks")
+    if any(value <= 0 for value in game_pks) or game_pks != sorted(set(game_pks)):
+        raise ValueError("game_pks must be sorted unique positive integers")
     logical_ids = _strict_sorted_strings(item["logical_query_ids"], "logical_query_ids")
     for index, logical_id in enumerate(logical_ids):
         _sha256(logical_id, f"logical_query_ids[{index}]")
@@ -1227,6 +1415,7 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
             or observed != (None, None)
             or item["row_count"] != 0
             or item["game_count"] != 0
+            or game_pks
             or not missing
             or logical_ids
             or schema_fields
@@ -1246,6 +1435,7 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
             or content_hashes
             or item["row_count"] != 0
             or item["game_count"] != 0
+            or game_pks
             or missing != ["V52_MANIFEST_SIDECAR_CONTRACT_NOT_PROVEN"]
         ):
             raise ValueError("legacy source state differs")
@@ -1257,6 +1447,9 @@ def _validate_source_record(item: Mapping[str, object], source: str, year: int) 
             raise ValueError("logical query parent summary differs")
         if status == "COMPLETE" and (
             observed != (expected_start, expected_end)
+            or item["row_count"] <= 0
+            or item["game_count"] <= 0
+            or item["game_count"] != len(game_pks)
             or missing
             or duplicates
             or not set(REQUIRED_FIELDS[source]).issubset(schema_fields)
@@ -1468,29 +1661,9 @@ def _validate_protected_snapshot(raw: object, path: str) -> None:
 def _validate_inventory_error(raw: object, path: str) -> None:
     item = require_exact_keys(raw, INVENTORY_ERROR_KEYS, path)
     _relative_path(item["path"], f"{path}.path")
-    allowed_codes = {
-        "MALFORMED_MANIFEST_JSON",
-        "MALFORMED_SIDECAR_JSON",
-        "INVALID_MANIFEST_CONTRACT",
-        "INVALID_MANIFEST_EVIDENCE",
-        "LEGACY_MANIFEST_UNADAPTABLE",
-        "RAW_HASH_MISMATCH",
-        "RAW_MISSING",
-        "SIDECAR_HASH_MISMATCH",
-        "MANIFEST_SCHEMA_VERSION",
-        "SIDECAR_SCHEMA_VERSION",
-        "INVALID_COUNTS",
-        "INVALID_EVENT_DATE_RANGE",
-        "EVENT_DATE_RANGE_MISMATCH",
-        "MISSING_CRITICAL_FIELDS",
-        "DUPLICATE_GAME_PK",
-        "INVALID_GAME_PK",
-        "QUERY_DATE_RANGE_MISMATCH",
-        "INVALID_DATE_RANGE",
-        "SPLIT_PARENT_ID_MISMATCH",
-        "INVALID_SPLIT_SET",
-    }
-    if item["code"] not in allowed_codes or not isinstance(item["detail"], str):
+    if item["code"] not in INVENTORY_ERROR_CODES or not isinstance(
+        item["detail"], str
+    ):
         raise ValueError(f"{path} fields differ")
 
 
@@ -1559,6 +1732,24 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
         f"{len(report['optional_sources'][source]['errors'])} |"
         for source in OPTIONAL_SOURCE_CONTRACT
     ]
+    inventory_errors = report["inventory_errors"]
+    error_rows = (
+        [
+            f"| {_markdown_cell(error['path'])} | {_markdown_cell(error['code'])} | "
+            f"{_markdown_cell(error['detail'])} |"
+            for error in inventory_errors
+        ]
+        if inventory_errors
+        else ["| none | none | none |"]
+    )
+
+    def step_rows(name: str) -> list[str]:
+        return [
+            f"| {_markdown_cell(step['stage'])} | {_markdown_cell(step['status'])} | "
+            f"{_markdown_cell(step['prerequisite'])} | {_markdown_cell(step['command'])} |"
+            for step in report[name]
+        ]
+
     return "\n".join(
         [
             "# v5.2-QD Historical 500 Source Preflight",
@@ -1569,6 +1760,16 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
             "|---|---|---|",
             *rows,
             "",
+            "## Required gamePk coverage contract",
+            "",
+            "Game-grain schedule, Statcast, and prior-schedule sources must expose the exact same nonempty gamePk set per season. Pitching and venue/timezone reference grains must expose a nonempty subset of that schedule set and may not contain extra gamePk values.",
+            "",
+            "## Inventory errors",
+            "",
+            "| Path | Code | Detail |",
+            "|---|---|---|",
+            *error_rows,
+            "",
             "## Optional source evidence",
             "",
             "| Source | Status | Fallback | Queries | Errors |",
@@ -1577,16 +1778,39 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
             "",
             "Optional evidence never blocks minimum-source READY; absent or invalid evidence uses the frozen neutral/null fallback.",
             "",
+            "## Acquisition steps",
+            "",
+            "| Stage | Status | Prerequisite | Command |",
+            "|---|---|---|---|",
+            *step_rows("acquisition_steps"),
+            "",
+            "## Execution steps after READY",
+            "",
+            "| Stage | Status | Prerequisite | Command |",
+            "|---|---|---|---|",
+            *step_rows("execution_steps_after_ready"),
+            "",
             "H22 fitting permitted: " + ("Yes" if report["may_fit_H22"] else "No"),
             "",
         ]
     )
 
 
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
 def preflight_schema_document() -> dict[str, object]:
     hash_schema = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-    date_schema = {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
-    path_schema = {"type": "string", "minLength": 1, "pattern": "^[^/].*$"}
+    date_schema = {
+        "type": "string",
+        "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$",
+    }
+    path_schema = {
+        "type": "string",
+        "minLength": 1,
+        "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$",
+    }
     optional_properties = {
         name: {
             "type": "object",
@@ -1614,9 +1838,18 @@ def preflight_schema_document() -> dict[str, object]:
         "expected_end": date_schema,
         "observed_start": {"anyOf": [date_schema, {"type": "null"}]},
         "observed_end": {"anyOf": [date_schema, {"type": "null"}]},
-        "logical_query_ids": {"type": "array", "items": {"type": "string"}},
+        "logical_query_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        },
         "row_count": {"type": "integer", "minimum": 0},
         "game_count": {"type": "integer", "minimum": 0},
+        "game_pks": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "uniqueItems": True,
+        },
         "schema_fields": {"type": "array", "items": {"type": "string"}},
         "missing_critical_fields": {
             "type": "array",
@@ -1627,9 +1860,21 @@ def preflight_schema_document() -> dict[str, object]:
             "items": {"type": "integer", "minimum": 1},
         },
         "retrieved_at_utc": {"type": "array", "items": {"type": "string"}},
-        "content_sha256": {"type": "array", "items": hash_schema},
-        "manifest_sha256": {"type": "array", "items": hash_schema},
-        "split_children": {"type": "array", "items": path_schema},
+        "content_sha256": {
+            "type": "array",
+            "items": hash_schema,
+            "uniqueItems": True,
+        },
+        "manifest_sha256": {
+            "type": "array",
+            "items": hash_schema,
+            "uniqueItems": True,
+        },
+        "split_children": {
+            "type": "array",
+            "items": path_schema,
+            "uniqueItems": True,
+        },
         "queries": {"type": "array", "items": {"$ref": "#/$defs/query_evidence"}},
         "status": {
             "enum": [
@@ -1860,7 +2105,7 @@ def preflight_schema_document() -> dict[str, object]:
                 "required": sorted(INVENTORY_ERROR_KEYS),
                 "properties": {
                     "path": path_schema,
-                    "code": {"type": "string", "minLength": 1},
+                    "code": {"enum": sorted(INVENTORY_ERROR_CODES)},
                     "detail": {"type": "string"},
                 },
                 "additionalProperties": False,
@@ -1896,13 +2141,34 @@ def write_preflight(
     markdown_path: Path,
     schema_path: Path,
 ) -> None:
+    output_paths = (json_path, markdown_path, schema_path)
+    _validate_preflight_output_paths(root, output_paths)
+    protected_before = protected_inventory(root)
     report = build_preflight(root, load_run_spec(run_path))
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    schema_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_bytes(canonical_json_bytes(report) + b"\n")
-    markdown_path.write_text(render_preflight_markdown(report), encoding="utf-8")
-    schema_path.write_bytes(canonical_json_bytes(preflight_schema_document()) + b"\n")
+    entries = (
+        (json_path, canonical_json_bytes(report) + b"\n"),
+        (markdown_path, render_preflight_markdown(report).encode("utf-8")),
+        (schema_path, canonical_json_bytes(preflight_schema_document()) + b"\n"),
+    )
+    if protected_inventory(root) != protected_before:
+        raise RuntimeError("protected evidence changed before preflight publication")
+    _publish_bundle(entries)
+    if protected_inventory(root) != protected_before:
+        raise RuntimeError("preflight publication modified protected evidence")
+
+
+def _validate_preflight_output_paths(
+    root: Path, output_paths: Sequence[Path]
+) -> None:
+    protected = tuple((root / name).resolve(strict=False) for name in ("data", "audit"))
+    resolved: list[Path] = []
+    for path in output_paths:
+        candidate = path.resolve(strict=False)
+        if any(candidate == base or base in candidate.parents for base in protected):
+            raise ValueError("preflight output path is inside protected data or audit")
+        resolved.append(candidate)
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("preflight output paths must be unique")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

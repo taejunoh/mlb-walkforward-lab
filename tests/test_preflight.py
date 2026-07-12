@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 import copy
 import json
+import os
 from pathlib import Path
+import re
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -274,6 +277,39 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(report["may_fit_H22"])
         self.assertEqual(json.loads(json.dumps(report)), report)
 
+    def test_ready_requires_nonempty_exact_game_counts(self):
+        mutations = {
+            "all required datasets empty": empty_all_sidecars,
+            "game count differs from unique game pks": mismatch_first_game_count,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory))
+                mutate(root)
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
+                self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
+
+    def test_game_grain_sources_match_schedule_and_reference_grains_may_subset(self):
+        for source, mutation in (
+            ("baseball_savant_statcast", remove_second_split_game),
+            ("prior_schedule_history", add_extra_first_split_game),
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory))
+                mutation(root, source, 2018)
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
+                self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            for source in ("mlb_stats_pitching", "venue_team_timezone_table"):
+                remove_second_split_game(root, source, 2018)
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
+        self.assertEqual(report["status"], "READY")
+
     def test_each_integrity_failure_blocks_ready(self):
         mutations = {
             "raw_hash": lambda root: (
@@ -331,6 +367,63 @@ class PreflightTest(unittest.TestCase):
             "MALFORMED_SIDECAR_JSON",
             {row["code"] for row in report["inventory_errors"]},
         )
+
+    def test_symlinked_inventory_evidence_is_rejected(self):
+        for leaf_kind in ("manifest", "sidecar", "raw"):
+            with self.subTest(leaf_kind=leaf_kind), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory))
+                manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+                manifest = json.loads(manifest_path.read_text())
+                path = {
+                    "manifest": manifest_path,
+                    "sidecar": root / manifest["sidecar_path"],
+                    "raw": root / manifest["raw_path"],
+                }[leaf_kind]
+                target = path.with_name(path.name + ".target")
+                path.replace(target)
+                path.symlink_to(target.name)
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
+                self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            inventory = root / "inventory"
+            target = root / "inventory-real"
+            inventory.replace(target)
+            inventory.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_preflight(root, parse_run_spec(expected_historical_run()))
+
+    def test_manifest_replacement_during_single_descriptor_read_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+            original_bytes = manifest_path.read_bytes()
+            manifest_inode = manifest_path.stat().st_ino
+            replacement = manifest_path.with_name(manifest_path.name + ".replacement")
+            replacement.write_bytes(original_bytes)
+            original_read = os.read
+            swapped = False
+
+            def replace_after_first_chunk(descriptor, count):
+                nonlocal swapped
+                data = original_read(descriptor, count)
+                if (
+                    not swapped
+                    and data
+                    and os.fstat(descriptor).st_ino == manifest_inode
+                ):
+                    swapped = True
+                    os.replace(replacement, manifest_path)
+                return data
+
+            with patch("mlb_backtest.preflight.os.read", side_effect=replace_after_first_chunk):
+                report = build_preflight(
+                    root, parse_run_spec(expected_historical_run())
+                )
+        self.assertTrue(swapped)
+        self.assertEqual(report["status"], "BLOCKED_REQUIRED_ACQUISITION")
 
     def test_scanner_never_uses_network_or_mutates_data_or_audit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -414,6 +507,47 @@ class PreflightTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_preflight(changed)
 
+    def test_schema_and_runtime_align_on_paths_codes_dates_and_uniqueness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = build_preflight(
+                make_complete_inventory(Path(directory)),
+                parse_run_spec(expected_historical_run()),
+            )
+        schema = preflight_schema_document()
+        path_schema = schema["$defs"]["inventory_error"]["properties"]["path"]
+        code_schema = schema["$defs"]["inventory_error"]["properties"]["code"]
+        date_schema = schema["$defs"]["query"]["properties"]["start_date"]
+        game_pks_schema = schema["$defs"]["source_record"]["properties"]["game_pks"]
+        self.assertIsNone(re.fullmatch(path_schema["pattern"], "../escape"))
+        self.assertNotIn("BOGUS", code_schema["enum"])
+        self.assertIsNone(re.fullmatch(date_schema["pattern"], "2022-13-40"))
+        self.assertTrue(game_pks_schema["uniqueItems"])
+
+        source = MINIMUM_SOURCES[0]
+        mutations = []
+        bad_path = copy.deepcopy(payload)
+        bad_path["seasons"]["2018"]["sources"][source]["queries"][0][
+            "manifest_path"
+        ] = "../escape"
+        mutations.append(bad_path)
+        bad_code = copy.deepcopy(payload)
+        bad_code["status"] = "BLOCKED_REQUIRED_ACQUISITION"
+        bad_code["inventory_errors"] = [
+            {"path": "inventory/x", "code": "BOGUS", "detail": "bad"}
+        ]
+        mutations.append(bad_code)
+        bad_date = copy.deepcopy(payload)
+        bad_date["seasons"]["2018"]["sources"][source]["queries"][0]["query"][
+            "start_date"
+        ] = "2022-13-40"
+        mutations.append(bad_date)
+        duplicate = copy.deepcopy(payload)
+        duplicate["seasons"]["2018"]["sources"][source]["game_pks"] = [1, 1]
+        mutations.append(duplicate)
+        for changed in mutations:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                parse_preflight(changed)
+
     def test_recursive_parser_rejects_nested_type_hash_date_path_and_error_tampering(
         self,
     ):
@@ -475,6 +609,26 @@ class PreflightTest(unittest.TestCase):
         positions = [row.index(source) for source in MINIMUM_SOURCES]
         self.assertEqual(positions, sorted(positions))
 
+    def test_markdown_discloses_errors_source_grain_and_all_planned_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            broken = next((root / "inventory").rglob("*.manifest.json"))
+            broken.write_text("{")
+            report = build_preflight(
+                root, parse_run_spec(expected_historical_run())
+            )
+        markdown = render_preflight_markdown(report)
+        self.assertIn("## Inventory errors", markdown)
+        self.assertIn("MALFORMED_MANIFEST_JSON", markdown)
+        self.assertIn(broken.relative_to(root).as_posix(), markdown)
+        self.assertIn("## Required gamePk coverage contract", markdown)
+        self.assertIn("## Acquisition steps", markdown)
+        self.assertIn("## Execution steps after READY", markdown)
+        for step in report["acquisition_steps"] + report["execution_steps_after_ready"]:
+            self.assertIn(step["stage"], markdown)
+            self.assertIn(step["status"], markdown)
+            self.assertIn(step["command"], markdown)
+
     def test_parser_rejects_season_contract_inconsistent_with_source_status(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = build_preflight(
@@ -515,6 +669,115 @@ class PreflightTest(unittest.TestCase):
                     + report["execution_steps_after_ready"]
                 )
             )
+
+    def test_writer_rejects_protected_and_symlink_resolved_output_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory) / "root")
+            run_path = Path(directory) / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            safe = root / "reports/preflight.md"
+            schema = root / "schemas/preflight.json"
+            with self.assertRaisesRegex(ValueError, "protected"):
+                write_preflight(
+                    root,
+                    run_path,
+                    root / "data/preflight.json",
+                    safe,
+                    schema,
+                )
+            link = root / "linked-output"
+            link.symlink_to(root / "audit", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "protected"):
+                write_preflight(
+                    root,
+                    run_path,
+                    root / "reports/preflight.json",
+                    safe,
+                    link / "preflight.schema.json",
+                )
+
+    def test_writer_bundle_rolls_back_second_and_third_replacement(self):
+        for initial_state in (
+            (True, True, True),
+            (False, False, False),
+            (True, False, True),
+        ):
+            for fail_at in (2, 3):
+                with (
+                    self.subTest(initial_state=initial_state, fail_at=fail_at),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = make_complete_inventory(Path(directory) / "root")
+                    run_path = Path(directory) / "run.json"
+                    run_path.write_bytes(
+                        canonical_json_bytes(expected_historical_run()) + b"\n"
+                    )
+                    paths = (
+                        root / "reports/preflight.json",
+                        root / "reports/preflight.md",
+                        root / "schemas/preflight.schema.json",
+                    )
+                    old: dict[Path, bytes] = {}
+                    modes: dict[Path, int] = {}
+                    for index, (path, exists) in enumerate(
+                        zip(paths, initial_state, strict=True)
+                    ):
+                        if exists:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            old[path] = f"old-{index}".encode()
+                            modes[path] = 0o600 + index
+                            path.write_bytes(old[path])
+                            path.chmod(modes[path])
+                    original_replace = os.replace
+                    replacements = 0
+                    failed = False
+
+                    def fail_selected_final(source, destination):
+                        nonlocal replacements, failed
+                        if Path(destination) in paths and not failed:
+                            replacements += 1
+                            if replacements == fail_at:
+                                failed = True
+                                raise OSError(f"replacement {fail_at} failed")
+                        return original_replace(source, destination)
+
+                    with patch(
+                        "mlb_backtest.protocols.os.replace",
+                        side_effect=fail_selected_final,
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError, f"replacement {fail_at} failed"
+                        ):
+                            write_preflight(root, run_path, *paths)
+                    for path, existed in zip(paths, initial_state, strict=True):
+                        if existed:
+                            self.assertEqual(path.read_bytes(), old[path])
+                            self.assertEqual(
+                                stat.S_IMODE(path.stat().st_mode), modes[path]
+                            )
+                        else:
+                            self.assertFalse(path.exists())
+                    self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_writer_bundle_preserves_modes_and_uses_0644_for_new_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory) / "root")
+            run_path = Path(directory) / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            paths = (
+                root / "reports/preflight.json",
+                root / "reports/preflight.md",
+                root / "schemas/preflight.schema.json",
+            )
+            paths[0].parent.mkdir(parents=True, exist_ok=True)
+            paths[0].write_bytes(b"old")
+            paths[0].chmod(0o600)
+            write_preflight(root, run_path, *paths)
+            self.assertEqual(
+                tuple(stat.S_IMODE(path.stat().st_mode) for path in paths),
+                (0o600, 0o644, 0o644),
+            )
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
 
 
 def make_complete_inventory(root: Path) -> Path:
@@ -635,6 +898,70 @@ def mutate_sidecar_without_manifest_update(root: Path) -> None:
     value = json.loads(path.read_text())
     value["row_count"] += 1
     path.write_bytes(canonical_json_bytes(value) + b"\n")
+
+
+def rewrite_matching_sidecars(
+    root: Path,
+    predicate,
+    transform,
+) -> None:
+    for manifest_path in (root / "inventory").rglob("*.manifest.json"):
+        manifest = json.loads(manifest_path.read_text())
+        if not predicate(manifest):
+            continue
+        sidecar_path = root / manifest["sidecar_path"]
+        sidecar = json.loads(sidecar_path.read_text())
+        transform(sidecar, manifest)
+        sidecar_path.write_bytes(canonical_json_bytes(sidecar) + b"\n")
+        manifest["sidecar_sha256"] = sha256_file(sidecar_path)
+        manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+
+
+def empty_all_sidecars(root: Path) -> None:
+    def empty(sidecar, _manifest):
+        sidecar.update({"row_count": 0, "game_count": 0, "game_pks": []})
+
+    rewrite_matching_sidecars(root, lambda _manifest: True, empty)
+
+
+def mismatch_first_game_count(root: Path) -> None:
+    target = next((root / "inventory").rglob("*.manifest.json"))
+    target_manifest = json.loads(target.read_text())
+    rewrite_matching_sidecars(
+        root,
+        lambda manifest: manifest["raw_path"] == target_manifest["raw_path"],
+        lambda sidecar, _manifest: sidecar.update({"game_count": 2}),
+    )
+
+
+def remove_second_split_game(root: Path, source: str, year: int) -> None:
+    rewrite_matching_sidecars(
+        root,
+        lambda manifest: (
+            manifest["source"] == source
+            and manifest["query"]["season"] == year
+            and manifest["split_index"] == 2
+        ),
+        lambda sidecar, _manifest: sidecar.update(
+            {"game_count": 0, "game_pks": []}
+        ),
+    )
+
+
+def add_extra_first_split_game(root: Path, source: str, year: int) -> None:
+    def add(sidecar, _manifest):
+        sidecar["game_pks"].append(999999)
+        sidecar["game_count"] += 1
+
+    rewrite_matching_sidecars(
+        root,
+        lambda manifest: (
+            manifest["source"] == source
+            and manifest["query"]["season"] == year
+            and manifest["split_index"] == 1
+        ),
+        add,
+    )
 
 
 def rebind_manifest_to_partial_query(root: Path) -> None:
