@@ -979,7 +979,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("fetch", "calibrate", "features", "lock", "outcomes", "report"):
+    for command in (
+        "fetch",
+        "fetch-statcast",
+        "calibrate",
+        "features",
+        "lock",
+        "outcomes",
+        "report",
+    ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--config", required=True)
         subparser.add_argument("--data-dir", required=True)
@@ -988,8 +996,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    from .statcast import fetch_statcast_stage
+
     commands = {
         "fetch": fetch_stage,
+        "fetch-statcast": fetch_statcast_stage,
         "calibrate": calibrate_stage,
         "features": features_stage,
         "lock": lock_stage,
