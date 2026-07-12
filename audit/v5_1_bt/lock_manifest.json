@@ -2,6 +2,7 @@
   "schema_version": 1,
   "model_version": "v5.1-BT",
   "protocol_phase": "Backtest",
+  "audit_model_card_file_sha256": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
   "sealed_lock": {
     "created_at_utc": "2026-07-12T09:51:04.927774Z",
     "predictions_file": "data/v5_1_bt/locked/predictions.jsonl",
@@ -11,7 +12,7 @@
     "last_official_date": "2025-08-12",
     "top1_count": 100,
     "top3_count": 300,
-    "model_card_sha256": "c4a8dc9f70ad29bebb741fa9096eaa850a0bdb6b0fb0fe5727cc706a97c75061",
+    "pipeline_model_card_sha256": "c4a8dc9f70ad29bebb741fa9096eaa850a0bdb6b0fb0fe5727cc706a97c75061",
     "predictions_contents_sha256": "bbe584cf0fe3d193b4ad13ee58bdf1a6f9026de7c1ad221ba09d06ff48069dcb",
     "lock_manifest_file_sha256": "f38e881d7dc3ffff523c0117fa12abebbb71bc7b35624cb14ef4412397dcd26b",
     "source_provenance_file_sha256": "0d8d1d6b7e80da7c67d8e06fb7386283cc14ef4e58ba5664a6de5632043b9a4d"

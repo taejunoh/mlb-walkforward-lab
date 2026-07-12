@@ -65,7 +65,7 @@
     "schedule": 0.05
   },
   "sha256": {
-    "model_card_file": "c4a8dc9f70ad29bebb741fa9096eaa850a0bdb6b0fb0fe5727cc706a97c75061",
+    "pipeline_model_card_file": "c4a8dc9f70ad29bebb741fa9096eaa850a0bdb6b0fb0fe5727cc706a97c75061",
     "config_file": "1bd3008a7bb95b622263c1ce73bb07182c1ffeea39ab1efd1ae38c271cc729d9",
     "frozen_inputs_file": "745448ff0fee0b1dbde02a4a43ad90fb8e36515611e6070d69d00ddf13c9e7b4",
     "training_raw_features_file": "7869a5379e7ec951d9233bd046528603bc5d7679f37ada02ee1cae9b2fe54dfc",
