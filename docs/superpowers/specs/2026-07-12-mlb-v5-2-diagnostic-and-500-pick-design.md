@@ -116,27 +116,85 @@ The historical folds are fixed:
 
 Each fold gets its own immutable model card, normalization table, slot weights, alpha/beta, source hashes, code commit, and latest permitted training date. Fold parameters may not be shared backward or refit after target outcomes are inspected.
 
-For prospective season 2026, the production card uses completed 2018-2024 data only; 2025 is excluded because it is the development diagnostic set. A new season card may be created only before that season's first counted pick, using the previously declared rolling-origin process. It remains frozen for the season.
+For prospective season 2026, the production card uses completed 2018-2024 data only; 2025 is excluded because it is the development diagnostic set. Its OOF calibration ledger is exactly: 2019 normalized from 2018, 2020 from 2018-2019, 2021 from 2018-2020, 2022 from 2018-2021, 2023 from 2018-2022, and 2024 from 2018-2023. Alpha and beta are fit on those sealed 2019-2024 OOF predictions and outcomes only. Target-game 2026 features may use 2026 events completed no later than D-1; this does not permit 2026 outcomes to refit the card. The 2026 card must be sealed before the first counted pick on or after 2026-07-13. A missed date before or after sealing is `SYSTEM_MISS` and is never reconstructed or backfilled. A later season card may be created only before that season's first counted pick, using the same declared rolling-origin process, and remains frozen for the season.
 
 ### 4.3 Confidence becomes data completeness
 
-The existing 0-10 arithmetic is retained exactly but renamed `data_completeness_score`. It describes evidence coverage, not confidence that the predicted team will win. All schemas, reports, and workbook labels must use the new name; a compatibility reader may ingest the old field but may not display it as predictive confidence.
+The new score contains component evidence coverage only:
 
-The prediction tier keeps the v5.1 probability thresholds only when all critical evidence passes. Otherwise tier is `UNRATED`, regardless of probability. Critical evidence means two identified starters, nine identified hitters per team, scheduled start, venue, D-1 cutoff checks, immutable source manifests, and provenance adequate for the claimed stratum. Missing environment or defense may be neutralized and lowers completeness, but cannot be silently presented as observed evidence. `Full Agreement` remains descriptive and cannot override `UNRATED`.
+```text
+weighted_overall_completeness
+  = 0.35*starter_quality
+  + 0.25*offense_quality
+  + 0.20*bullpen_quality
+  + 0.10*environment_quality
+  + 0.05*defense_quality
+  + 0.05*schedule_quality
 
-### 4.4 Environment, defense, and participant provenance
+data_completeness_score = 10 * weighted_overall_completeness
+```
+
+Every quality term is clipped to `[0,1]`, so the displayed score is `[0,10]`. `component_agreement` and `Full Agreement` are reported separately and never increase completeness. The old mixed arithmetic is retained only as an audit field named `legacy_selection_quality_score`:
+
+```text
+2.5*weighted_overall_completeness
++ 2.0*starter_quality
++ 1.5*offense_quality
++ 1.5*bullpen_quality
++ 1.5*component_agreement
++ (2.0*environment_quality + schedule_quality)/3.0
+```
+
+It cannot drive tier, eligibility, official ranking, or a predictive-confidence claim. A compatibility reader may ingest the old `confidence` field only into this legacy audit field.
+
+Uncertainty is also explicit: `High` for a critical-integrity failure or completeness below 7.5; `Medium` for completeness from 7.5 through below 9.0, either starter below 150 prior career batters faced, or unresolved pregame context; and `Low` for completeness at least 9.0 with no such condition. Tier evaluation is a deterministic first-match cascade using unrounded winner probability and completeness:
+
+1. `UNRATED` when any critical-integrity requirement fails for the row's claimed provenance stratum.
+2. `Toss-up` when uncertainty is `High`, winner probability is below `0.54`, or `data_completeness_score < 8.0`.
+3. `S` when winner probability is at least `0.68` and completeness is at least `9.0`.
+4. `A` when winner probability is at least `0.63` and completeness is at least `8.5`.
+5. `B` when winner probability is at least `0.58` and completeness is at least `8.0`.
+6. `Lean` when winner probability is at least `0.54` and completeness is at least `8.0`.
+7. `Toss-up` as the exhaustive fallback.
+
+The probability and 8.0/8.5/9.0 cutoffs preserve the v5.1 published cutoffs; they are not inferred from the 100 outcomes. `Full Agreement` remains descriptive and cannot override `UNRATED` or this cascade.
+
+### 4.4 Deterministic eligibility and pre-outcome status
+
+All decisions below occur before outcomes are accessible. A critical reason code is append-only; later data cannot erase it from the audit row.
+
+| Requirement or event | Historical reconstructed run | Prospective run | Pre-outcome disposition and reason code |
+|---|---|---|---|
+| Regular-season `gamePk`, two MLB teams, effective scheduled start UTC, and venue present | required | required | exclude candidate: `MISSING_GAME_ID`, `INVALID_COMPETITION`, `MISSING_TEAMS`, `MISSING_START_TIME`, or `MISSING_VENUE` |
+| Fold/season model card and all minimum-source manifests pass hash, schema, and as-of checks | required | required | exclude candidate; any hash/fold/as-of violation also makes the affected run `RUN_INVALID` |
+| Two starters and nine distinct lineup hitters per team | final official participants required | required in a timely snapshot | historical missing: exclude with `MISSING_RECONSTRUCTED_PARTICIPANTS`; prospective partial: shadow `UNRATED` with `PARTIAL_T45_PARTICIPANTS` |
+| Participant provenance matches the claimed stratum | `RECONSTRUCTED_FINAL_PARTICIPANTS` only | `TIMESTAMP_VERIFIED_T45` for official pool | mismatch: exclude from that official pool with `PROVENANCE_MISMATCH`; a timely partial row remains shadow only |
+| Starter, offense, bullpen, and schedule minimum inputs can be computed without target-date events | required | required | exclude with `MISSING_REQUIRED_FEATURE_INPUT` or `AS_OF_VIOLATION`; as-of violation makes the run `RUN_INVALID` |
+| Environment or defense strictly as-of observation missing | optional | optional | retain candidate, set component score 50 and quality 0, add `ENV_NEUTRAL_NO_ASOF_SOURCE` or `DEF_NEUTRAL_NO_ASOF_SOURCE` |
+| Pre-lock canceled/postponed status | not eligible | not eligible | exclude with `PRELOCK_NOT_SCHEDULED`; if all candidates are excluded, date status is `NO_ELIGIBLE_DATE` or prospective `NO_VERIFIED_ELIGIBLE_DATE` |
+| Acquisition failed while an official slate existed | not silently skipped | not silently skipped | date status `SYSTEM_MISS`; it is neither a pick nor a VOID and cannot be backfilled |
+| Only shadow/partial rows exist | not applicable | no official candidate | preserve shadow rows with rank only inside `shadow_rank`; date status `SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE` |
+| Calibrated `p_home` equals exactly 0.5 | no directional official candidate | no directional official candidate | set `predicted_side=none`, predicted winner empty, and `pick_probability=0.5`; retain `UNRATED` shadow row with `NO_DIRECTION_AT_50` |
+
+Historical reconstructed participants are eligible only when the final official record supplies exactly one actual starter and nine distinct starting hitters for each team, all participant IDs resolve to the scheduled clubs, and no target-game performance enters a feature. This is deterministic participant identity, not historical T-45 availability.
+
+For directional rows, `p_home > 0.5` predicts home and `p_home < 0.5` predicts away; exact equality follows the no-direction row in the table and cannot enter an official ranking. The displayed winner probability for directional rows is `max(p_home, 1-p_home)`. Equal winner probabilities among official directional candidates continue through the frozen ranking keys: completeness descending, absolute starter edge descending, effective start UTC ascending, then `gamePk` ascending. Shadow equality uses the same keys inside `shadow_rank`. A duplicate `gamePk` is `RUN_INVALID` rather than a further tie-break.
+
+Date-state precedence is also fixed: `RUN_INVALID` halts and overrides all ordinary statuses; otherwise a required acquisition/clock failure is `SYSTEM_MISS`; otherwise a prospective slate containing shadow rows but no verified eligible row is `SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE`; otherwise a prospective slate with no verified eligible row is `NO_VERIFIED_ELIGIBLE_DATE`; otherwise a historical slate with no reconstructed eligible row is `NO_ELIGIBLE_DATE`; otherwise lock one official Top 1. This prevents the same failure from being relabeled as benign no-eligibility.
+
+### 4.5 Environment, defense, and participant provenance
 
 Environment and defense contribute non-neutral values only when a manifest-bound source proves the observation was available by the game's as-of cutoff and supplies the required opportunity denominator. Later game weather, target-game fielding, or retroactively inferred conditions are forbidden. Otherwise the component remains 50, quality 0, and a reason code is emitted.
 
 Every prediction has exactly one participant provenance stratum:
 
-- `TIMESTAMP_VERIFIED_T45`: the raw snapshot was retrieved at or before `scheduled_start_utc - 45 minutes`, and both starters and all 18 lineup slots were visible in that snapshot.
+- `TIMESTAMP_VERIFIED_T45`: the raw snapshot satisfies the Section 6.1 freshness rule at or before `effective_start_utc - 45 minutes`, and both starters and all 18 lineup slots were visible in that snapshot.
 - `TIMESTAMP_PARTIAL_T45`: a timely snapshot exists but at least one required participant was unresolved; the prediction may be retained as shadow output but is `UNRATED` and cannot count in the verified prospective sample.
 - `RECONSTRUCTED_FINAL_PARTICIPANTS`: participants came from a later official record; allowed in historical robustness only and never described as T-45 reproducible.
 
-Historical and prospective metrics are always split by stratum. No relabeling based on later confirmation is permitted.
+Historical and prospective metrics are always split by stratum. No relabeling based on later confirmation is permitted. Prospective official Top 1 ranking is computed exclusively over eligible `TIMESTAMP_VERIFIED_T45` rows. Partial/shadow rows have a separate `shadow_rank` and cannot change an official candidate's rank, tie-break, Top 1 status, or sample membership. If none is verified and eligible, the official date status is `NO_VERIFIED_ELIGIBLE_DATE` (or the more specific shadow-only status from Section 4.4).
 
-### 4.5 Immutable freeze and change control
+### 4.6 Immutable freeze and change control
 
 Before outcomes open, seal canonical JSON for configuration, model card, normalization, slot weights, calibration inputs/outputs, raw manifests, candidate features, candidate predictions, daily ranks, provenance, code commit, and environment lockfile. Record SHA-256 for file bytes and canonical row content. Replaying the same source hashes must reproduce byte-equivalent locked rows.
 
@@ -148,11 +206,28 @@ Any change to a predictive/internal weight, sign, shrinkage, probability transfo
 
 Create one chronological queue of every official MLB regular-season game date from 2022 opening day through the end of the 2024 regular season. Exclude Spring Training, exhibitions, All-Star events, and postseason. Process dates strictly ascending and games with the fold-specific frozen card.
 
-For every date with at least one eligible reconstructed candidate, lock the full ranking and select exactly one `Historical Daily Top 1`. Never skip a date because probability is low, the slate is difficult, a favored team repeats, or the result is unfavorable. A date with no eligible candidate is recorded as `NO_ELIGIBLE_DATE`, with reasons, and does not count as a pick. A locked Top 1 that is canceled, suspended without a final official result, or otherwise ungradable is `VOID` and does not count toward 500. Continue through subsequent dates, including later 2024 dates, until exactly 500 graded Top 1 dates are sealed. If fewer than 500 graded dates exist by the 2024 regular-season end, the run fails acceptance rather than entering 2025.
+For every date with at least one eligible reconstructed candidate, lock the full ranking and select exactly one `Historical Daily Top 1`. Never skip a date because probability is low, the slate is difficult, a favored team repeats, or the result is unfavorable. A date with no eligible candidate is recorded as `NO_ELIGIBLE_DATE`, with reasons, and does not count as a pick. A source outage is `SYSTEM_MISS`, not no-eligibility. Continue through subsequent dates, including later 2024 dates, until exactly 500 graded Top 1 dates are sealed. If fewer than 500 graded dates exist by the 2024 regular-season end, the run fails acceptance rather than entering 2025.
 
-The final boundary date is therefore determined by the 500th chronologically graded pick, not by results. Outputs must show attempted dates, no-eligible dates, void dates, replacement dates, and the final 500 dates.
+The final boundary date is therefore determined by the 500th chronologically graded pick, not by results. Outputs must show attempted dates, no-eligible dates, system misses, pending rows, void dates, replacement dates, and the final 500 dates.
 
-### 5.2 Outcome isolation and metrics
+### 5.2 Terminal outcome and replacement contract
+
+The official MLB detailed status is mapped exactly:
+
+| Observed terminal state | Treatment |
+|---|---|
+| `Final` with unequal official scores and an official winner | `GRADED` |
+| `Completed Early` with unequal official scores and an official winner | `GRADED`; preserve the completed-early reason and innings |
+| Canceled/postponed before lock | never a locked candidate; `PRELOCK_NOT_SCHEDULED` |
+| Canceled/postponed after lock and never completed by the deadline | `VOID` with `POSTLOCK_CANCELED` or `POSTLOCK_POSTPONED` |
+| Suspended or delayed without a terminal result | `PENDING` until the deadline |
+| Official tie, abandoned/no-contest, missing winner, or equal terminal scores | `VOID` with `TIE`, `ABANDONED`, `NO_CONTEST`, `MISSING_WINNER`, or `EQUAL_TERMINAL_SCORE` |
+
+For each season the resolution deadline is 23:59:59 America/New_York on the seventh calendar day after MLB's originally published final regular-season date. Seven days permits ordinary resumptions and official corrections while providing a bounded, outcome-independent close before later historical knowledge can keep the ledger open indefinitely. A `PENDING` row that lacks a gradable terminal result at that instant becomes irrevocably `VOID`; a result posted later is retained as an audit annotation but cannot restore sample membership.
+
+Doubleheader games remain distinct by `gamePk`. Within a date they are ordered by effective start UTC and then `gamePk`; first-game outcomes or usage cannot enter the second game's pregame features. Every VOID replacement comes from the next chronological regular-season date after the original selected date that yields a newly graded Top 1. Replacement processing never reorders earlier dates, substitutes a second-ranked game from the same locked slate, or enters 2025. Multiple VOID rows consume multiple later graded dates in chronological order.
+
+### 5.3 Outcome isolation and metrics
 
 Target-season outcomes and baselines are unavailable to feature generation, calibration, eligibility, ranking, and tie-breaking. They are joined only after each date's ranked predictions and hashes are sealed.
 
@@ -165,39 +240,61 @@ Baselines are paired on the same selected `gamePk`:
 - 50:50 probability baseline for Brier and log loss;
 - market favorite only if a trustworthy as-of odds snapshot with timestamp and source manifest exists. Otherwise market `N=0` and all market/ROI/CLV fields are null.
 
-For categorical baselines report the 2x2 paired table, accuracy delta, paired 95% interval, and exact McNemar p-value. Accuracy without pairing is insufficient.
+For categorical baselines report the 2x2 paired table, accuracy delta, paired 95% interval, and exact McNemar p-value. Accuracy without pairing is insufficient. Denominators are fixed as follows:
 
-### 5.3 Interpretation and predeclared gates
+- model primary, home baseline, Brier, log loss, Wilson interval, and maximum losing streak use all 500 graded Top 1 games (`N=500`);
+- the paired home table also uses those same 500 games and recalculates model accuracy on exactly those 500;
+- the D-1 season-record table uses only Top 1 games among the 500 where both teams have a defined, unequal D-1 season win percentage; call this `N_season`, and recalculate both model and baseline accuracy on exactly that identical subset;
+- market comparison uses only games among the 500 with a manifest-bound as-of market snapshot and both predictions defined; call this `N_market`, and never compare its market accuracy with the model's 500-game accuracy;
+- rank and subgroup denominators are printed from their own explicit eligible populations and never substituted into a primary gate.
+
+### 5.4 Interpretation and predeclared gates
 
 This run is explicitly `Historical Walk-forward Robustness`, not independent confirmation: v5.2-QD was specified after inspecting the 2025 diagnostic, even though no 2025 outcome is used in its fit.
 
 Gate outcomes are fixed before the run:
 
 - `RUN_INVALID`: any leakage, chronology, hash, fold-boundary, sample-count, deterministic-replay, or source-integrity gate fails.
-- `ROBUSTNESS_NOT_SUPPORTED`: a valid run does not exceed both paired home and D-1 season-record baseline point accuracies, or fails to beat both 50:50 Brier `0.25` and log loss `0.6931471806`.
-- `ROBUSTNESS_SUPPORTED_NOT_CONFIRMED`: a valid run exceeds both paired baseline point accuracies and both probability-null metrics. A positive paired 95% lower bound and exact McNemar `p<0.05` against the D-1 season baseline is reported as stronger evidence, but the label still cannot become prospective confirmation.
+- `ROBUSTNESS_NOT_SUPPORTED`: on their explicit identical paired denominators, a valid run fails to exceed either the home baseline on `N=500` or the D-1 season-record baseline on `N_season`, or the model's `N=500` probability forecasts fail to beat either 50:50 Brier `0.25` or log loss `0.6931471806`.
+- `ROBUSTNESS_SUPPORTED_NOT_CONFIRMED`: on their explicit identical paired denominators, a valid run exceeds home on `N=500` and season record on `N_season`, and the model's 500 forecasts beat both probability-null metrics. A positive paired 95% lower bound and exact McNemar `p<0.05` against the D-1 season baseline on `N_season` is reported as stronger evidence, but the label still cannot become prospective confirmation.
 
 ECE, subgroups, components, seasons, months, and teams are diagnostic only. No historical result can trigger a v5.2-QD refit while preserving the same version.
 
 ## 6. Separate prospective validation
 
-The prospective ledger starts 2026-07-13. Its sample ID, storage tree, manifests, locks, and reports are distinct from the historical 500. Historical rows may never be appended, pooled, or used to backfill a missed prospective date.
+The prospective ledger starts 2026-07-13. Its sample ID, storage tree, manifests, locks, and reports are distinct from the historical 500. Historical rows may never be appended, pooled, or used to backfill a missed prospective date. The terminal-state, seven-day deadline, PENDING/VOID, doubleheader, and chronological replacement rules in Section 5.2 apply unchanged by season.
 
-Each game is fetched and sealed at T-45. Candidate predictions are created without outcomes. A daily observational Top 1 is ranked only from the sealed candidate predictions after the final candidate lock, while the outcome store remains inaccessible. Because some early games may already have started by that ranking time, this validates pregame prediction capture but is not automatically an executable single-bet strategy; profitability or actionability requires a separately frozen decision-time protocol and odds snapshots.
+Each game is fetched and sealed at T-45. Candidate predictions are created without outcomes. The official daily observational Top 1 is ranked exclusively from eligible, sealed `TIMESTAMP_VERIFIED_T45` predictions after the final verified candidate lock, while the outcome store remains inaccessible. Partial/shadow predictions never enter that ranking. Because some early games may already have started by the ranking time, this validates pregame prediction capture but is not automatically an executable single-bet strategy; profitability or actionability requires a separately frozen decision-time protocol and odds snapshots.
 
-Only `TIMESTAMP_VERIFIED_T45` rows count in the verified prospective sample. Partial snapshots remain shadow records. VOID replacement advances to the next regular-season date; missed collection is `SYSTEM_MISS`, never silently reconstructed or counted.
+Only `TIMESTAMP_VERIFIED_T45` rows count in the verified prospective sample. Partial snapshots remain shadow records. A date without an eligible verified row is `NO_VERIFIED_ELIGIBLE_DATE`, with `SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE` when partial rows exist. VOID replacement advances to the next chronological regular-season date; missed collection is `SYSTEM_MISS`, never silently reconstructed or counted.
 
 Publish descriptive milestone reports at 25, 50, 100, 250, and 500 graded verified dates. Every report states `N/current target`, date range, uncertainty, and that 500 is incomplete until it is actually reached. No milestone may be merged with historical results or called final confirmation.
 
-At 500, `CONFIRMED_INCREMENTAL_EDGE` requires all integrity gates, 500 verified graded dates, accuracy above both paired baseline point estimates, a positive paired 95% lower bound with exact McNemar `p<0.05` versus D-1 season record, and Brier/log loss below the 50:50 baselines. Otherwise the result is `NOT_CONFIRMED`. These are evidence labels, not promises of future profitability.
+At 500, `CONFIRMED_INCREMENTAL_EDGE` requires all integrity gates; model accuracy above home on the identical 500-game population; model accuracy above D-1 season record plus a positive paired 95% lower bound and exact McNemar `p<0.05` on the identical prospective `N_season` subset; and model Brier/log loss below the 50:50 baselines on all 500. Otherwise the result is `NOT_CONFIRMED`. These are evidence labels, not promises of future profitability.
+
+### 6.1 T-45 snapshot freshness and clock contract
+
+`effective_start_utc` is the latest scheduled start published by the authoritative MLB schedule feed. `lock_at_utc = effective_start_utc - 45 minutes`. The collector uses a host clock synchronized to UTC by NTP; before every polling window it records offset and uncertainty. Absolute offset greater than 2 seconds or missing clock evidence makes the game `SYSTEM_MISS_CLOCK`, so no timestamp-verified row can be emitted.
+
+Polling cadence is fixed: every 5 minutes from T-90 through just before T-50, then every 60 seconds from T-50 through T-45 inclusive. The locked snapshot is the latest successful complete snapshot whose client receipt time is no later than `lock_at_utc` and no earlier than T-50, so maximum age is 5 minutes. Server `Date`/provider timestamps are recorded when present, but the NTP-audited client receipt time governs. A response received after T-45 is never used, even within the 2-second clock tolerance.
+
+Every poll re-reads status and scheduled start. Before a verified lock exists, a start-time change invalidates the prior countdown and recomputes T-90/T-50/T-45 from the new `effective_start_utc`; all superseded snapshots remain in the audit log. If the new T-45 has already passed when first observed, the row is `TIMESTAMP_PARTIAL_T45` with `LATE_RESCHEDULE_UNVERIFIED`, shadow only. Pre-lock cancellation/postponement is excluded. Once a verified lock exists, a later start change cannot rewrite it: preserve the locked prediction, record `POSTLOCK_START_CHANGE`, and apply Section 5.2 to its eventual outcome.
 
 ## 7. Sources and acquisition implications
 
-Historical replay requires manifest-bound MLB schedule/game-feed and Baseball Savant Statcast data for 2018-2024, plus D-1 league ERA, venue, travel, and any strictly as-of environment/defense sources. Data acquisition must be query-specific, resumable, content-addressed, idempotent, bounded by size, and capable of splitting oversized date ranges without changing the logical query identity.
+Minimum historical sources are manifest-bound MLB schedule/game feed for competition, `gamePk`, dates, starts, teams, venue, final participants, status, and outcomes; Baseball Savant Statcast events for starter/offense/bullpen inputs; MLB Stats pitching records for D-1 league ERA and required pitcher denominators; a frozen venue/team/time-zone table; and prior schedule history for rest, travel, time zones, extra innings, and doubleheaders. All are required for H22/H23/H24 eligibility and fold fitting.
+
+Minimum prospective sources are the same D-1 feature/history inputs through the current target's D-1, the sealed 2026 model card and its 2018-2024 fit manifests, the authoritative MLB schedule feed for effective start/status, and a timestamped authoritative pregame participant feed proving both starters and all 18 lineup slots under Section 6.1. Absence of any of these prevents an official verified candidate; it cannot be repaired from the postgame feed.
+
+Environment/weather/roof, defense/OAA, catcher, injury/restriction, market, and odds feeds are optional. They activate a component or comparison only with a strict as-of timestamp, denominator, schema, and manifest. Their absence invokes the frozen neutral/null rule and cannot fail the minimum-source preflight by itself.
+
+Before any H22 feature is built, publish a preflight coverage report for every minimum source and every season 2018-2024. It records expected and observed date ranges, queries, row/game counts, schemas, missing critical fields, duplicates, maximum/minimum event date, retrieval times, and SHA-256, and proves that each fold's prior-season pool is complete enough for the declared feature contract. At design time the audited v5.1 artifact set proves acquisition beginning in 2022 but does not prove the required 2018-2021 sources. Acquiring and validating 2018-2021 is therefore an explicit implementation prerequisite and current gap; H22 cannot start by assuming it exists.
+
+Data acquisition must be query-specific, resumable, content-addressed, idempotent, bounded by size, and capable of splitting oversized date ranges without changing the logical query identity.
 
 Historical MLB feeds that show final lineups or actual starters are stored only as reconstructed participant evidence. They cannot be promoted to T-45 provenance. Strictly as-of weather, roof, defense, injury, restriction, and odds data are used only when their observation timestamp and query are preserved; otherwise neutral/null behavior applies.
 
-Prospective collection polls authoritative pregame sources before T-45, writes append-only timestamped snapshots, and seals the last snapshot at or before T-45. Clock skew, source time zone, scheduled-start changes, doubleheaders, postponements, and resumed games receive explicit normalized fields and reason codes.
+Prospective collection follows Section 6.1, writes append-only timestamped snapshots, and seals only a snapshot satisfying its maximum-age and clock rules. Clock skew, source time zone, scheduled-start changes, doubleheaders, postponements, and resumed games receive explicit normalized fields and reason codes.
 
 ## 8. Pipeline architecture and error handling
 
@@ -210,7 +307,7 @@ Errors fail closed:
 - retry transient HTTP/rate-limit failures with bounded exponential backoff and preserve attempts;
 - quarantine schema drift, malformed rows, duplicate `gamePk`, non-monotonic dates, and hash mismatches;
 - mark missing critical evidence ineligible or `UNRATED` according to the frozen rule; never impute from target outcomes;
-- mark source outage `SYSTEM_MISS`, cancellation `VOID`, and no eligible slate `NO_ELIGIBLE_DATE` distinctly;
+- mark source outage/clock failure `SYSTEM_MISS`, pre-lock cancellation `PRELOCK_NOT_SCHEDULED`, post-lock unresolved cancellation `VOID`, and no eligible slate `NO_ELIGIBLE_DATE` distinctly;
 - stop before outcome join on replay mismatch, noncanonical JSON, incomplete manifest, or fold leakage;
 - resume from the last verified immutable stage without overwriting prior snapshots.
 
@@ -219,12 +316,17 @@ Errors fail closed:
 Required automated coverage includes:
 
 - exact preservation of all final/internal weights, signs, shrinkage, clipping, neutralization, probability bounds, and ranking tie-breakers;
+- exact completeness arithmetic from component qualities alone, separation of agreement and legacy audit score, and every boundary/fallback in the complete tier cascade;
+- table-driven eligibility/reason-code tests covering exclude, official, shadow, neutral optional component, no-eligible, no-verified-eligible, shadow-only, system-miss, and run-invalid dispositions;
 - rolling-origin fold construction, including intentional future-season and 2025 injections that must fail;
-- OOF calibration isolation and model-card maximum-date assertions;
-- T-45 clock, rescheduled games, doubleheaders, postponed/resumed games, time zones, and provenance classification;
+- OOF calibration isolation, the exact 2026 OOF sequence, allowed target-year D-1 history, card sealing, and model-card maximum-date assertions;
+- T-45 polling cadence, five-minute freshness, two-second NTP tolerance, late response rejection, start-time recomputation, rescheduled games, doubleheaders, postponed/resumed games, time zones, and provenance classification;
 - target `gamePk` and same-day event exclusion, outcome-store import denial, and market-schema exclusion;
-- exactly one Top 1 per counted date, exactly 500 graded historical dates, VOID extension, no-eligible handling, and 2025 exclusion;
+- official prospective ranking isolation from shadow rows and deterministic `p_home == 0.5` side/rank behavior;
+- exact terminal mapping for Final, Completed Early, cancellation, suspension/PENDING, deadline conversion, tie/abandoned VOID, doubleheaders, chronological replacements, and late-result immutability;
+- exactly one Top 1 per counted date, exactly 500 graded historical dates, VOID extension, no-eligible/system-miss handling, and 2025 exclusion;
 - exact paired baseline tables, Wilson interval, McNemar, Brier, log loss, ECE, rank, temporal, team, and component diagnostics;
+- minimum-source preflight coverage and explicit optional-source neutralization across every required 2018-2024 season;
 - raw and derived hash verification, canonical byte replay, interruption/resume, schema drift, rate limit, and oversized extract splitting;
 - separate historical/prospective namespace and rejection of any attempted pooling;
 - a miniature multi-fold end-to-end fixture plus manual source-to-lock-to-outcome audits for at least three dates per historical fold and three prospective dates once available.
@@ -247,11 +349,12 @@ The design is implemented only when all of the following are proven by current a
 
 - The 100-pick diagnostic reproduces every exact result in Section 3 and concludes that incremental value and live reproducibility remain unproven.
 - v5.2-QD preserves the predictive/internal weights, shrinkage, and ranking; uses rolling-origin OOF calibration; and contains no 2025 outcome in fit or rule selection.
-- Confidence is absent from new user-facing semantics, completeness and `UNRATED` behavior are enforced, and environment/defense activate only from strict as-of evidence.
+- Confidence is absent from new user-facing semantics; completeness uses component qualities only; agreement and the legacy audit score cannot affect it; the full tier cascade and `UNRATED` behavior are enforced; and environment/defense activate only from strict as-of evidence.
 - Every row has an immutable provenance stratum and verified T-45 rows are never mixed with reconstructed rows.
-- The historical run contains exactly 500 unique graded Daily Top 1 dates from 2022-2024, follows the fixed H22/H23/H24 chronology, extends only for documented VOID/no-eligible dates, and never enters 2025.
+- The preflight proves every minimum 2018-2024 source; the presently missing 2018-2021 evidence is acquired and validated before H22; optional sources remain clearly separate.
+- The historical run contains exactly 500 unique graded Daily Top 1 dates from 2022-2024, follows the fixed H22/H23/H24 chronology, applies the frozen terminal deadline, extends only for documented VOID/no-eligible/system-miss dates, and never enters 2025.
 - The historical report carries every baseline, metric, limitation, and the label `Historical Walk-forward Robustness`; it never claims official independent 500-pick confirmation.
-- The prospective ledger begins no earlier than 2026-07-13, counts only timestamp-verified T-45 picks, stays separate, and labels interim results as incomplete.
+- The prospective ledger begins no earlier than 2026-07-13, uses the exact 2019-2024 OOF calibration contract, satisfies the frozen clock/cadence/freshness rules, ranks only timestamp-verified T-45 candidates, stays separate, never backfills misses, and labels interim results as incomplete.
 - Leakage, replay, hash, error-handling, paired-metric, workbook, and visual verification gates all pass with preserved evidence.
 - No unsupported market, ROI, CLV, profitability, actionable-betting, or predictive-improvement claim appears in any artifact.
 
