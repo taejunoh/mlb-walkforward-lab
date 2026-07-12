@@ -102,12 +102,27 @@ def game(**changes):
     return value
 
 
+def era_record(
+    as_of="2025-04-30", *, value=4.0, earned_runs=4, outs=27, digest="a" * 64
+):
+    return {
+        "as_of_date": as_of,
+        "value": value,
+        "earned_runs": earned_runs,
+        "outs": outs,
+        "source": "mlb_stats_api",
+        "manifest_sha256": digest,
+    }
+
+
 def build(target, history, team_map=None, league_era=None):
     return build_raw_game_features(
         target,
         history,
         mapping() if team_map is None else team_map,
-        {2025: 4.0} if league_era is None else league_era,
+        league_era_by_asof={"2025-04-30": era_record()}
+        if league_era is None
+        else league_era,
     )
 
 
@@ -132,31 +147,73 @@ class FeatureEngineTest(unittest.TestCase):
         result = build(
             game(),
             FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
-            league_era={2025: 4.25},
+            league_era={"2025-04-30": era_record(value=4.25, earned_runs=17, outs=108)},
         )
         starter = result["home"]["starter"]
         self.assertEqual(starter["league_era"]["value"], 4.25)
         self.assertAlmostEqual(starter["league_raw_fip"]["value"], 1.5)
         self.assertAlmostEqual(starter["league_cfip"]["value"], 2.75)
         self.assertAlmostEqual(starter["fip"]["value"], 5.75)
-        numeric = build_raw_game_features(
-            game(),
-            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
-            mapping(),
-            league_era=4.25,
+        self.assertEqual(
+            result["provenance"]["league_era"],
+            era_record(value=4.25, earned_runs=17, outs=108),
         )
-        self.assertEqual(numeric["home"]["starter"]["fip"]["value"], 5.75)
 
     def test_missing_or_invalid_league_era_is_explicitly_ineligible(self):
         history = FeatureHistory(
             data([]), slot_weights={i: 1 / 9 for i in range(1, 10)}
         )
         missing = build_raw_game_features(game(), history, mapping(), {})
-        invalid = build_raw_game_features(game(), history, mapping(), {2025: math.nan})
-        self.assertEqual(missing["reasons"], ["missing_league_era"])
-        self.assertEqual(invalid["reasons"], ["invalid_league_era"])
+        invalid = build_raw_game_features(
+            game(), history, mapping(), {"2025-04-30": era_record(value=4.1)}
+        )
+        future = build_raw_game_features(
+            game(), history, mapping(), {"2025-05-01": era_record(as_of="2025-05-01")}
+        )
+        full_season = build_raw_game_features(
+            game(), history, mapping(), {2025: era_record()}
+        )
+        self.assertEqual(missing["reasons"], ["missing_league_era_d1"])
+        self.assertEqual(invalid["reasons"], ["invalid_league_era_provenance"])
+        self.assertEqual(future["reasons"], ["missing_league_era_d1"])
+        self.assertEqual(full_season["reasons"], ["missing_league_era_d1"])
         self.assertFalse(missing["eligible"])
         self.assertNotIn("home", missing)
+
+        valid = era_record()
+        invalid_records = (
+            dict(valid, as_of_date="2025-04-29"),
+            dict(valid, earned_runs=-1),
+            dict(valid, earned_runs=True),
+            dict(valid, outs=0),
+            dict(valid, outs=True),
+            dict(valid, source="other"),
+            dict(valid, manifest_sha256="A" * 64),
+            dict(valid, manifest_sha256="a" * 63),
+        )
+        for record in invalid_records:
+            with self.subTest(record=record):
+                result = build_raw_game_features(
+                    game(), history, mapping(), {"2025-04-30": record}
+                )
+                self.assertEqual(result["reasons"], ["invalid_league_era_provenance"])
+
+    def test_invalid_target_never_claims_or_runs_history_validation(self):
+        poisoned = pa(900, "2025-05-01", 10, 101, "home_run", xwoba=2.0)
+        history = FeatureHistory(
+            StatcastData((poisoned,), (poisoned,)),
+            slot_weights={i: 1 / 9 for i in range(1, 10)},
+        )
+        for target in (game(game_pk=True), game(official_date="bad-date")):
+            with self.subTest(target=target):
+                result = build(target, history)
+                self.assertFalse(result["eligible"])
+                self.assertFalse(result["provenance"]["target_excluded"])
+                self.assertEqual(
+                    result["provenance"]["history_validation"],
+                    "NOT_RUN_INVALID_TARGET",
+                )
+                self.assertNotIn("home", result)
 
     def test_exact_schedule_game_eligibility_validation_reasons(self):
         history = FeatureHistory(
@@ -207,6 +264,17 @@ class FeatureEngineTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "target game_pk|strictly before"):
             build(game(), poisoned)
+
+    def test_valid_output_discloses_lineup_and_raw_source_provenance(self):
+        row = pa(1, "2025-04-30", 10, 101, "field_out", xwoba=0.1, outs=1)
+        result = build(
+            game(),
+            FeatureHistory(data([row]), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        self.assertEqual(result["lineup_provenance"], "RECONSTRUCTED_FINAL_LINEUP")
+        self.assertEqual(result["provenance"]["raw_source_max_date"], "2025-04-30")
+        self.assertEqual(result["provenance"]["history_validation"], "PASSED")
+        self.assertTrue(result["provenance"]["target_excluded"])
 
     def test_rate_denominators_and_frozen_reliability_qualities(self):
         rows = [
@@ -428,6 +496,34 @@ class FeatureEngineTest(unittest.TestCase):
         )
         members = result["home"]["bullpen"]["leverage_pool"]["members"]
         self.assertEqual(members, [{"pitcher_id": 12, "batters_faced": 1}])
+
+    def test_bullpen_availability_quality_is_usage_completeness_not_rate_shrinkage(
+        self,
+    ):
+        rows = [
+            pa(1, "2025-04-01", 10, 201, "field_out", xwoba=0.1, outs=1),
+            pa(1, "2025-04-01", 11, 202, "field_out", xwoba=0.1, inning=8, at_bat=2),
+            pa(2, "2025-04-02", 10, 201, "field_out", xwoba=0.1, outs=1),
+            pa(2, "2025-04-02", 12, 202, "field_out", xwoba=0.1, inning=8, at_bat=2),
+            pa(3, "2025-04-30", 10, 201, "field_out", xwoba=0.1, outs=1),
+            pa(3, "2025-04-30", 11, 202, "field_out", xwoba=0.1, inning=6, at_bat=2),
+        ]
+        result = build(
+            game(),
+            FeatureHistory(data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        availability = result["home"]["bullpen"]["availability"]
+        self.assertEqual(availability["value"], 75.0)
+        self.assertEqual(availability["quality"], 0.5)
+
+        complete_rows = [row for row in rows if row["pitcher_id"] != 12]
+        complete = build(
+            game(),
+            FeatureHistory(
+                data(complete_rows), slot_weights={i: 1 / 9 for i in range(1, 10)}
+            ),
+        )
+        self.assertEqual(complete["home"]["bullpen"]["availability"]["quality"], 1.0)
 
     def test_home_city_bonus_requires_home_games_at_same_venue_on_d1_d2_d3(self):
         def schedule(home_codes):

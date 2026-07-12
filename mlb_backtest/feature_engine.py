@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from bisect import bisect_left
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -537,7 +538,7 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
     usage = {}
     for reliever in pool:
         pid = reliever["pitcher_id"]
-        usage[pid] = [
+        pitches_by_day = [
             sum(
                 1
                 for p in history.pitches_by_pitcher.get(pid, ())
@@ -545,6 +546,8 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
             )
             for offset in (1, 2, 3)
         ]
+        if any(pitches_by_day):
+            usage[pid] = pitches_by_day
     availability, aq = team_availability(pool, usage)
     pool_bf = sum(r["batters_faced"] for r in pool)
     return {
@@ -554,7 +557,7 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
         "leverage_pool": _metric(
             float(pool_bf), pool_bf, _reliability(pool_bf, 300), members=pool
         ),
-        "availability": _metric(availability, pool_bf, aq * _reliability(pool_bf, 300)),
+        "availability": _metric(availability, pool_bf, aq),
     }
 
 
@@ -722,9 +725,55 @@ def _canonical_start(value: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
 
 
+def _league_era_record(
+    source: object, target: date
+) -> tuple[float | None, dict[str, object] | None, str | None]:
+    expected_as_of = (target - timedelta(days=1)).isoformat()
+    if not isinstance(source, Mapping) or expected_as_of not in source:
+        return None, None, "missing_league_era_d1"
+    record = source[expected_as_of]
+    required = {
+        "as_of_date",
+        "value",
+        "earned_runs",
+        "outs",
+        "source",
+        "manifest_sha256",
+    }
+    if not isinstance(record, Mapping) or set(record) != required:
+        return None, None, "invalid_league_era_provenance"
+    value = record["value"]
+    earned_runs = record["earned_runs"]
+    outs = record["outs"]
+    digest = record["manifest_sha256"]
+    valid = (
+        record["as_of_date"] == expected_as_of
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and value > 0
+        and type(earned_runs) is int
+        and earned_runs >= 0
+        and type(outs) is int
+        and outs > 0
+        and record["source"] == "mlb_stats_api"
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    )
+    try:
+        derived_value = 27.0 * earned_runs / outs if valid else math.nan
+    except OverflowError:
+        derived_value = math.nan
+    if not valid or not math.isclose(
+        float(value), derived_value, rel_tol=0.0, abs_tol=1e-9
+    ):
+        return None, None, "invalid_league_era_provenance"
+    return float(value), dict(record), None
+
+
 def _eligibility(
     game: Mapping[str, object], league_era_source: object
-) -> tuple[list[str], date | None, float | None]:
+) -> tuple[list[str], date | None, float | None, dict[str, object] | None]:
     reasons = []
     if game.get("game_type") != "R":
         reasons.append("invalid_game_type")
@@ -771,23 +820,14 @@ def _eligibility(
         elif not _valid_lineup(lineup):
             reasons.append(f"invalid_{side}_lineup")
     league_era = None
+    league_era_provenance = None
     if target is not None:
-        if isinstance(league_era_source, Mapping):
-            candidate = league_era_source.get(target.year)
-        else:
-            candidate = league_era_source
-        if candidate is None:
-            reasons.append("missing_league_era")
-        elif (
-            isinstance(candidate, bool)
-            or not isinstance(candidate, (int, float))
-            or not math.isfinite(float(candidate))
-            or candidate <= 0
-        ):
-            reasons.append("invalid_league_era")
-        else:
-            league_era = float(candidate)
-    return reasons, target, league_era
+        league_era, league_era_provenance, era_reason = _league_era_record(
+            league_era_source, target
+        )
+        if era_reason is not None:
+            reasons.append(era_reason)
+    return reasons, target, league_era, league_era_provenance
 
 
 def _assert_history(game: Mapping[str, object], history: FeatureHistory) -> None:
@@ -810,7 +850,7 @@ def build_raw_game_features(
     game: Mapping[str, object],
     history: FeatureHistory,
     team_code_by_name: Mapping[str, str],
-    league_era: float | Mapping[int, float],
+    league_era_by_asof: Mapping[str, Mapping[str, object]],
 ) -> dict:
     """Build raw, unnormalized features for one normalized schedule game."""
     if not isinstance(history, FeatureHistory):
@@ -827,7 +867,16 @@ def build_raw_game_features(
         )
     ):
         raise ValueError("team_code_by_name must be an explicit frozen 30-team mapping")
-    reasons, target, resolved_league_era = _eligibility(game, league_era)
+    reasons, target, resolved_league_era, league_era_provenance = _eligibility(
+        game, league_era_by_asof
+    )
+    target_identity_valid = (
+        target is not None and type(game.get("game_pk")) is int and game["game_pk"] > 0
+    )
+    history_validation = "NOT_RUN_INVALID_TARGET"
+    if target_identity_valid:
+        _assert_history(game, history)
+        history_validation = "PASSED"
     result = {
         "game_pk": game.get("game_pk"),
         "official_date": target.isoformat()
@@ -835,14 +884,19 @@ def build_raw_game_features(
         else game.get("official_date"),
         "eligible": not reasons,
         "reasons": reasons,
+        "lineup_provenance": "RECONSTRUCTED_FINAL_LINEUP",
     }
-    if target is not None and type(game.get("game_pk")) is int and game["game_pk"] > 0:
-        _assert_history(game, history)
+    raw_source_max_date = _max_history_date(history, target)
+    provenance = {
+        "max_history_date": raw_source_max_date,
+        "raw_source_max_date": raw_source_max_date,
+        "target_excluded": target_identity_valid,
+        "history_validation": history_validation,
+    }
+    if league_era_provenance is not None:
+        provenance["league_era"] = league_era_provenance
     if reasons:
-        result["provenance"] = {
-            "max_history_date": _max_history_date(history, target),
-            "target_excluded": True,
-        }
+        result["provenance"] = provenance
         return result
     assert target is not None and resolved_league_era is not None
     hands = {}
@@ -871,10 +925,7 @@ def build_raw_game_features(
             "environment": _metric(50.0, 0, 0.0, flags=["environment_unavailable"]),
             "defense": _metric(50.0, 0, 0.0, flags=["defense_unavailable"]),
         }
-    result["provenance"] = {
-        "max_history_date": _max_history_date(history, target),
-        "target_excluded": True,
-    }
+    result["provenance"] = provenance
     return result
 
 
