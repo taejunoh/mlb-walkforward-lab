@@ -264,6 +264,32 @@ class SourceTest(unittest.TestCase):
         self.assertIsNone(game["away_is_winner"])
         self.assertIsNone(game["home_is_winner"])
 
+    def test_missing_venue_uses_official_neutral_site_description_name(self):
+        payload = {
+            "dates": [{
+                "date": "2022-08-11",
+                "games": [{
+                    "gamePk": 663023,
+                    "gameType": "R",
+                    "gameDate": "2022-08-11T23:15:00Z",
+                    "status": {"detailedState": "Scheduled"},
+                    "teams": {
+                        "away": {"team": {"id": 112, "name": "Chicago Cubs"}},
+                        "home": {"team": {"id": 113, "name": "Cincinnati Reds"}},
+                    },
+                    "venue": {"link": "/api/v1/venues/null"},
+                    "description": "MLB at Field of Dreams in Dyersville, IA",
+                }],
+            }]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            game = parse_schedule(path)[0]
+
+        self.assertIsNone(game["venue_id"])
+        self.assertEqual(game["venue_name"], "Field of Dreams")
+
     def test_final_outcome_requires_scores_and_exactly_one_consistent_winner(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         game = payload["dates"][0]["games"][0]

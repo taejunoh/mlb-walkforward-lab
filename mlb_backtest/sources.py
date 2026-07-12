@@ -197,6 +197,16 @@ def _doubleheader_marker(game: dict, label: str) -> str | None:
     return f"GAME{number}"
 
 
+def _neutral_site_venue_name(game: dict) -> str | None:
+    description = game.get("description")
+    if not isinstance(description, str) or not description.startswith("MLB at "):
+        return None
+    venue_name, separator, city = description.removeprefix("MLB at ").partition(" in ")
+    if not separator or not venue_name or not city:
+        return None
+    return venue_name
+
+
 def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     game = _mapping(raw_game, f"game[{index}]")
     game_type = game.get("gameType")
@@ -300,11 +310,13 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
 
     venue_value = game.get("venue")
     if venue_value is None:
-        venue_id = venue_name = None
+        venue_id = None
+        venue_name = _neutral_site_venue_name(game)
     else:
         venue = _mapping(venue_value, f"game[{index}].venue")
         if venue.get("id") is None and venue.get("name") is None:
-            venue_id = venue_name = None
+            venue_id = None
+            venue_name = _neutral_site_venue_name(game)
         else:
             venue_id = _required(venue, "id", int, f"game[{index}].venue")
             venue_name = _required(venue, "name", str, f"game[{index}].venue")
