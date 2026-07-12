@@ -16,6 +16,8 @@ Status: **BLOCKED_REQUIRED_ACQUISITION**
 
 Game-grain schedule, Statcast, and prior-schedule sources must expose the exact same nonempty gamePk set per season. Pitching and venue/timezone reference grains must expose a nonempty subset of that schedule set and may not contain extra gamePk values.
 
+Validation authority: the JSON Schema is a structural and locally semantic mirror. parse_preflight remains authoritative for real calendar validity, ordering and contiguity, cross-source relationships, and hashes derived from file content.
+
 ## Inventory errors
 
 | Path | Code | Detail |

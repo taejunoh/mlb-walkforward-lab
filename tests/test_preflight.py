@@ -510,7 +510,7 @@ class PreflightTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_preflight(changed)
 
-    def test_schema_and_runtime_align_on_paths_codes_dates_and_uniqueness(self):
+    def test_schema_and_runtime_align_on_representative_expressible_constraints(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = build_preflight(
                 make_complete_inventory(Path(directory)),
@@ -524,7 +524,21 @@ class PreflightTest(unittest.TestCase):
         self.assertIsNone(re.fullmatch(path_schema["pattern"], "../escape"))
         self.assertNotIn("BOGUS", code_schema["enum"])
         self.assertIsNone(re.fullmatch(date_schema["pattern"], "2022-13-40"))
+        self.assertEqual(date_schema["format"], "date")
         self.assertTrue(game_pks_schema["uniqueItems"])
+        self.assertEqual(
+            schema["$defs"]["protected_snapshot"]["properties"]
+            ["metadata_path_size_mtime_inode_mode"]["propertyNames"]["pattern"],
+            path_schema["pattern"],
+        )
+        complete_then = schema["$defs"]["source_record"]["allOf"][0]["then"]
+        self.assertEqual(complete_then["properties"]["row_count"]["minimum"], 1)
+        self.assertEqual(complete_then["properties"]["game_pks"]["minItems"], 1)
+        optional_then = schema["properties"]["optional_sources"]["properties"][
+            "market_odds"
+        ]["allOf"][0]["then"]
+        self.assertEqual(optional_then["properties"]["queries"]["minItems"], 1)
+        self.assertIn("parse_preflight", schema["description"])
 
         source = MINIMUM_SOURCES[0]
         mutations = []
@@ -544,9 +558,17 @@ class PreflightTest(unittest.TestCase):
             "start_date"
         ] = "2022-13-40"
         mutations.append(bad_date)
+        invalid_calendar = copy.deepcopy(payload)
+        invalid_calendar["seasons"]["2018"]["sources"][source]["queries"][0][
+            "child_range"
+        ]["end_date"] = "2018-02-30"
+        mutations.append(invalid_calendar)
         duplicate = copy.deepcopy(payload)
         duplicate["seasons"]["2018"]["sources"][source]["game_pks"] = [1, 1]
         mutations.append(duplicate)
+        invalid_order = copy.deepcopy(payload)
+        invalid_order["seasons"]["2018"]["sources"][source]["game_pks"].reverse()
+        mutations.append(invalid_order)
         for changed in mutations:
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 parse_preflight(changed)
@@ -627,6 +649,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("## Required gamePk coverage contract", markdown)
         self.assertIn("## Acquisition steps", markdown)
         self.assertIn("## Execution steps after READY", markdown)
+        self.assertIn("parse_preflight", markdown)
         for step in report["acquisition_steps"] + report["execution_steps_after_ready"]:
             self.assertIn(step["stage"], markdown)
             self.assertIn(step["status"], markdown)
@@ -748,6 +771,80 @@ class PreflightTest(unittest.TestCase):
                     safe_json,
                     alias_parent / "preflight.json",
                     safe_schema,
+                )
+
+    def test_writer_rejects_concrete_raw_path_and_symlink_or_hardlink_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory) / "root")
+            run_path = Path(directory) / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+            manifest = json.loads(manifest_path.read_text())
+            original_raw = root / manifest["raw_path"]
+            concrete_raw = root / "reports/preflight.json"
+            concrete_raw.parent.mkdir(parents=True, exist_ok=True)
+            original_raw.replace(concrete_raw)
+            manifest["raw_path"] = concrete_raw.relative_to(root).as_posix()
+            manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+            raw_bytes = concrete_raw.read_bytes()
+            safe_markdown = root / "reports/preflight.md"
+            safe_schema = root / "schemas/preflight.schema.json"
+
+            with self.assertRaisesRegex(ValueError, "input evidence"):
+                write_preflight(
+                    root, run_path, concrete_raw, safe_markdown, safe_schema
+                )
+            self.assertEqual(concrete_raw.read_bytes(), raw_bytes)
+
+            symlink_alias = root / "reports/raw-symlink.json"
+            symlink_alias.symlink_to(concrete_raw.name)
+            with self.assertRaisesRegex(ValueError, "input evidence"):
+                write_preflight(
+                    root, run_path, symlink_alias, safe_markdown, safe_schema
+                )
+
+            hardlink_alias = root / "reports/raw-hardlink.json"
+            os.link(concrete_raw, hardlink_alias)
+            with self.assertRaisesRegex(ValueError, "input evidence"):
+                write_preflight(
+                    root, run_path, hardlink_alias, safe_markdown, safe_schema
+                )
+            self.assertEqual(concrete_raw.read_bytes(), raw_bytes)
+
+    def test_writer_post_publication_guard_detects_external_raw_change(self):
+        import mlb_backtest.preflight as preflight_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory) / "root")
+            run_path = Path(directory) / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            manifest_path = next((root / "inventory").rglob("*.manifest.json"))
+            manifest = json.loads(manifest_path.read_text())
+            original_raw = root / manifest["raw_path"]
+            external_raw = root / "reports/source.raw"
+            external_raw.parent.mkdir(parents=True, exist_ok=True)
+            original_raw.replace(external_raw)
+            manifest["raw_path"] = external_raw.relative_to(root).as_posix()
+            manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+            original_publish = preflight_module._publish_bundle
+
+            def publish_then_mutate(entries):
+                original_publish(entries)
+                external_raw.write_bytes(b"changed after publication")
+
+            with (
+                patch(
+                    "mlb_backtest.preflight._publish_bundle",
+                    side_effect=publish_then_mutate,
+                ),
+                self.assertRaisesRegex(RuntimeError, "concrete input evidence"),
+            ):
+                write_preflight(
+                    root,
+                    run_path,
+                    root / "reports/preflight.json",
+                    root / "reports/preflight.md",
+                    root / "schemas/preflight.schema.json",
                 )
 
     def test_writer_bundle_rolls_back_second_and_third_replacement(self):

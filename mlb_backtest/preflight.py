@@ -17,7 +17,6 @@ from mlb_backtest.protocols import (
     RunSpec,
     expected_historical_run,
     _publish_bundle,
-    load_run_spec,
     parse_run_spec,
     require_exact_keys,
 )
@@ -249,6 +248,8 @@ INVENTORY_ERROR_CODES = frozenset(
 PROTECTED_SNAPSHOT_KEYS = frozenset(
     {"metadata_path_size_mtime_inode_mode", "small_sealed_sha256"}
 )
+EvidenceFingerprint = tuple[int, int, int, int, int, str]
+EvidenceSnapshot = dict[Path, EvidenceFingerprint]
 
 
 def protected_inventory(root: Path) -> dict[str, object]:
@@ -358,7 +359,11 @@ def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _verified_file_read(
-    root: Path, path: Path, *, collect: bool
+    root: Path,
+    path: Path,
+    *,
+    collect: bool,
+    evidence: EvidenceSnapshot | None = None,
 ) -> bytes | str:
     _assert_no_symlink_path(root, path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -392,25 +397,37 @@ def _verified_file_read(
         or total != before.st_size
     ):
         raise ValueError("inventory evidence changed during read")
-    return b"".join(chunks) if collect else digest.hexdigest()
+    digest_text = digest.hexdigest()
+    if evidence is not None:
+        resolved = path.resolve(strict=True)
+        fingerprint = (*_file_identity(before), digest_text)
+        previous = evidence.get(resolved)
+        if previous is not None and previous != fingerprint:
+            raise ValueError("input evidence changed between reads")
+        evidence[resolved] = fingerprint
+    return b"".join(chunks) if collect else digest_text
 
 
-def _verified_json_bytes(root: Path, path: Path) -> bytes:
-    value = _verified_file_read(root, path, collect=True)
+def _verified_json_bytes(
+    root: Path, path: Path, evidence: EvidenceSnapshot | None = None
+) -> bytes:
+    value = _verified_file_read(root, path, collect=True, evidence=evidence)
     if not isinstance(value, bytes):
         raise AssertionError("verified JSON read did not return bytes")
     return value
 
 
-def _verified_sha256(root: Path, path: Path) -> str:
-    value = _verified_file_read(root, path, collect=False)
+def _verified_sha256(
+    root: Path, path: Path, evidence: EvidenceSnapshot | None = None
+) -> str:
+    value = _verified_file_read(root, path, collect=False, evidence=evidence)
     if not isinstance(value, str):
         raise AssertionError("verified digest read did not return text")
     return value
 
 
 def inventory_existing_manifests(
-    root: Path,
+    root: Path, evidence: EvidenceSnapshot | None = None
 ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
@@ -420,7 +437,7 @@ def inventory_existing_manifests(
         if inferred_optional is not None:
             continue
         try:
-            manifest_bytes = _verified_json_bytes(root, path)
+            manifest_bytes = _verified_json_bytes(root, path, evidence)
             raw_manifest = json.loads(manifest_bytes)
             if (
                 isinstance(raw_manifest, Mapping)
@@ -446,6 +463,7 @@ def inventory_existing_manifests(
                 path,
                 manifest,
                 manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                evidence=evidence,
             )
         except (
             OSError,
@@ -462,7 +480,7 @@ def inventory_existing_manifests(
             errors.append(_error(path, root, code, str(exc)))
             continue
         rows.append(row)
-    legacy_rows, legacy_errors = inventory_legacy_manifests(root)
+    legacy_rows, legacy_errors = inventory_legacy_manifests(root, evidence)
     return tuple(rows) + legacy_rows, tuple(errors) + legacy_errors
 
 
@@ -473,6 +491,7 @@ def _validate_manifest(
     *,
     optional_source: str | None = None,
     manifest_sha256: str,
+    evidence: EvidenceSnapshot | None = None,
 ) -> dict[str, object]:
     failures: list[str] = []
     if item["schema_version"] != 1:
@@ -507,13 +526,13 @@ def _validate_manifest(
     raw_path = safe_relative(root, item["raw_path"])
     sidecar_path = safe_relative(root, item["sidecar_path"])
     try:
-        sidecar_bytes = _verified_json_bytes(root, sidecar_path)
+        sidecar_bytes = _verified_json_bytes(root, sidecar_path, evidence)
         sidecar = require_exact_keys(json.loads(sidecar_bytes), SIDECAR_KEYS, "sidecar")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"sidecar unreadable: {type(exc).__name__}") from exc
     if not raw_path.is_file():
         failures.append("RAW_MISSING")
-    elif _verified_sha256(root, raw_path) != item["raw_sha256"]:
+    elif _verified_sha256(root, raw_path, evidence) != item["raw_sha256"]:
         failures.append("RAW_HASH_MISMATCH")
     if hashlib.sha256(sidecar_bytes).hexdigest() != item["sidecar_sha256"]:
         failures.append("SIDECAR_HASH_MISMATCH")
@@ -577,7 +596,7 @@ def _validate_manifest(
 
 
 def inventory_optional_manifests(
-    root: Path,
+    root: Path, evidence: EvidenceSnapshot | None = None
 ) -> tuple[
     dict[str, tuple[dict[str, object], ...]], dict[str, tuple[dict[str, str], ...]]
 ]:
@@ -594,7 +613,7 @@ def inventory_optional_manifests(
             if inferred is not None and inferred != source:
                 continue
             try:
-                manifest_bytes = _verified_json_bytes(root, path)
+                manifest_bytes = _verified_json_bytes(root, path, evidence)
                 raw_manifest = json.loads(manifest_bytes)
                 declared = (
                     raw_manifest.get("source")
@@ -625,6 +644,7 @@ def inventory_optional_manifests(
                     manifest,
                     optional_source=source,
                     manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                    evidence=evidence,
                 )
             except (
                 OSError,
@@ -834,7 +854,7 @@ def _integer_list(value: object, field: str) -> list[int]:
 
 
 def inventory_legacy_manifests(
-    root: Path,
+    root: Path, evidence: EvidenceSnapshot | None = None
 ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
@@ -844,7 +864,7 @@ def inventory_legacy_manifests(
     )
     for path in candidates:
         try:
-            manifest_bytes = _verified_json_bytes(root, path)
+            manifest_bytes = _verified_json_bytes(root, path, evidence)
             raw = json.loads(manifest_bytes)
             if not isinstance(raw, Mapping):
                 raise ValueError("legacy manifest is not an object")
@@ -1205,9 +1225,15 @@ def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
 
 
 def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
+    return _build_preflight(root, run_spec, {})
+
+
+def _build_preflight(
+    root: Path, run_spec: RunSpec, evidence: EvidenceSnapshot
+) -> dict[str, object]:
     before = protected_inventory(root)
-    inventory, inventory_errors = inventory_existing_manifests(root)
-    optional_rows, optional_errors = inventory_optional_manifests(root)
+    inventory, inventory_errors = inventory_existing_manifests(root, evidence)
+    optional_rows, optional_errors = inventory_optional_manifests(root, evidence)
     seasons = {str(year): assess_season(year, inventory) for year in range(2018, 2025)}
     after = protected_inventory(root)
     if before != after:
@@ -1764,6 +1790,8 @@ def render_preflight_markdown(report: Mapping[str, object]) -> str:
             "",
             "Game-grain schedule, Statcast, and prior-schedule sources must expose the exact same nonempty gamePk set per season. Pitching and venue/timezone reference grains must expose a nonempty subset of that schedule set and may not contain extra gamePk values.",
             "",
+            "Validation authority: the JSON Schema is a structural and locally semantic mirror. parse_preflight remains authoritative for real calendar validity, ordering and contiguity, cross-source relationships, and hashes derived from file content.",
+            "",
             "## Inventory errors",
             "",
             "| Path | Code | Detail |",
@@ -1804,6 +1832,7 @@ def preflight_schema_document() -> dict[str, object]:
     hash_schema = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
     date_schema = {
         "type": "string",
+        "format": "date",
         "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$",
     }
     path_schema = {
@@ -1821,12 +1850,25 @@ def preflight_schema_document() -> dict[str, object]:
                 "queries": {
                     "type": "array",
                     "items": {"$ref": "#/$defs/optional_query_evidence"},
+                    "uniqueItems": True,
                 },
                 "errors": {
                     "type": "array",
                     "items": {"$ref": "#/$defs/inventory_error"},
                 },
             },
+            "allOf": [
+                {
+                    "if": {"properties": {"status": {"const": "PRESENT_VALID"}}},
+                    "then": {
+                        "properties": {
+                            "fallback_status": {"type": "null"},
+                            "queries": {"minItems": 1, "uniqueItems": True},
+                            "errors": {"maxItems": 0},
+                        }
+                    },
+                }
+            ],
             "additionalProperties": False,
         }
         for name, status in OPTIONAL_SOURCE_CONTRACT.items()
@@ -1942,6 +1984,11 @@ def preflight_schema_document() -> dict[str, object]:
     }
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": (
+            "Structural and locally semantic mirror only. parse_preflight is the "
+            "authoritative validator for real calendar dates, cross-array ordering "
+            "and contiguity, cross-source coverage, and content-derived hashes."
+        ),
         "type": "object",
         "required": sorted(PREFLIGHT_REQUIRED_KEYS),
         "properties": top_properties,
@@ -1956,8 +2003,31 @@ def preflight_schema_document() -> dict[str, object]:
             },
             "source_record": {
                 "type": "object",
+                "description": (
+                    "COMPLETE positivity is mirrored locally; parse_preflight "
+                    "authoritatively enforces ordering, coverage, and derived counts."
+                ),
                 "required": sorted(SOURCE_RECORD_KEYS),
                 "properties": source_properties,
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {"status": {"const": "COMPLETE"}}
+                        },
+                        "then": {
+                            "properties": {
+                                "row_count": {"type": "integer", "minimum": 1},
+                                "game_count": {"type": "integer", "minimum": 1},
+                                "game_pks": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "uniqueItems": True,
+                                },
+                                "queries": {"minItems": 1, "uniqueItems": True},
+                            }
+                        },
+                    }
+                ],
                 "additionalProperties": False,
             },
             "step": {
@@ -2116,6 +2186,7 @@ def preflight_schema_document() -> dict[str, object]:
                 "properties": {
                     "metadata_path_size_mtime_inode_mode": {
                         "type": "object",
+                        "propertyNames": path_schema,
                         "additionalProperties": {
                             "type": "array",
                             "minItems": 4,
@@ -2125,6 +2196,7 @@ def preflight_schema_document() -> dict[str, object]:
                     },
                     "small_sealed_sha256": {
                         "type": "object",
+                        "propertyNames": path_schema,
                         "additionalProperties": hash_schema,
                     },
                 },
@@ -2142,9 +2214,13 @@ def write_preflight(
     schema_path: Path,
 ) -> None:
     output_paths = (json_path, markdown_path, schema_path)
-    _validate_preflight_output_paths(root, run_path, output_paths)
+    _validate_preflight_output_paths(root, run_path, output_paths, {})
     protected_before = protected_inventory(root)
-    report = build_preflight(root, load_run_spec(run_path))
+    evidence: EvidenceSnapshot = {}
+    run_bytes = _verified_json_bytes(run_path.parent, run_path, evidence)
+    report = _build_preflight(root, parse_run_spec(json.loads(run_bytes)), evidence)
+    _validate_preflight_output_paths(root, run_path, output_paths, evidence)
+    _verify_concrete_evidence(evidence)
     entries = (
         (json_path, canonical_json_bytes(report) + b"\n"),
         (markdown_path, render_preflight_markdown(report).encode("utf-8")),
@@ -2155,15 +2231,20 @@ def write_preflight(
     _publish_bundle(entries)
     if protected_inventory(root) != protected_before:
         raise RuntimeError("preflight publication modified protected evidence")
+    _verify_concrete_evidence(evidence)
 
 
 def _validate_preflight_output_paths(
-    root: Path, run_path: Path, output_paths: Sequence[Path]
+    root: Path,
+    run_path: Path,
+    output_paths: Sequence[Path],
+    evidence: Mapping[Path, EvidenceFingerprint],
 ) -> None:
     protected = tuple(
         (root / name).resolve(strict=False) for name in PROTECTED_PREFLIGHT_ROOTS
     )
-    input_evidence = {run_path.resolve(strict=False)}
+    input_evidence = {run_path.resolve(strict=False), *evidence}
+    input_inodes = {(value[0], value[1]) for value in evidence.values()}
     resolved: list[Path] = []
     for path in output_paths:
         candidate = path.resolve(strict=False)
@@ -2171,9 +2252,21 @@ def _validate_preflight_output_paths(
             raise ValueError("preflight output path is inside a protected namespace")
         if candidate in input_evidence:
             raise ValueError("preflight output path aliases input evidence")
+        if candidate.exists():
+            file_stat = candidate.stat()
+            if (file_stat.st_dev, file_stat.st_ino) in input_inodes:
+                raise ValueError("preflight output inode aliases input evidence")
         resolved.append(candidate)
     if len(set(resolved)) != len(resolved):
         raise ValueError("preflight output paths must be unique")
+
+
+def _verify_concrete_evidence(evidence: Mapping[Path, EvidenceFingerprint]) -> None:
+    current: EvidenceSnapshot = {}
+    for path in evidence:
+        _verified_file_read(path.parent, path, collect=False, evidence=current)
+    if dict(evidence) != current:
+        raise RuntimeError("concrete input evidence changed during preflight action")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
