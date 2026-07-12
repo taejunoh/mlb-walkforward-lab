@@ -97,7 +97,7 @@ Passing the first category does not cure the latter two. The diagnostic conclusi
 - every internal metric weight and sign documented in the v5.1 design;
 - shrinkage constants `150` for starter/hitter splits, `100` for recent form, `300` for bullpen, and `500` for defense/catcher;
 - clipping, neutral score 50, no redistribution of missing weights, score construction, probability clipping `[0.10,0.90]`, and predicted-side rule;
-- unrounded daily ranking order: winner probability, data-completeness score, absolute starter edge, scheduled start UTC, then `gamePk`;
+- unrounded daily ranking order: winner probability, data-completeness score, absolute starter edge, immutable `lock_basis_start_utc`, then `gamePk`;
 - lineup-slot opportunity weighting method, with coefficients re-estimated only from the allowed prior-season window.
 
 The 100-pick outcomes cannot justify a bullpen reduction, season-record feature, new cutoff, home adjustment, or any other predictive change. Such candidates belong to separately versioned research and cannot enter `v5.2-QD`.
@@ -165,7 +165,7 @@ All decisions below occur before outcomes are accessible. A critical reason code
 
 | Requirement or event | Historical reconstructed run | Prospective run | Pre-outcome disposition and reason code |
 |---|---|---|---|
-| Regular-season `gamePk`, two MLB teams, effective scheduled start UTC, and venue present | required | required | exclude candidate: `MISSING_GAME_ID`, `INVALID_COMPETITION`, `MISSING_TEAMS`, `MISSING_START_TIME`, or `MISSING_VENUE` |
+| Regular-season `gamePk`, two MLB teams, lock-basis scheduled start UTC, and venue present | required | required | exclude candidate: `MISSING_GAME_ID`, `INVALID_COMPETITION`, `MISSING_TEAMS`, `MISSING_START_TIME`, or `MISSING_VENUE` |
 | Fold/season model card and all minimum-source manifests pass hash, schema, and as-of checks | required | required | exclude candidate; any hash/fold/as-of violation also makes the affected run `RUN_INVALID` |
 | Two starters and nine distinct lineup hitters per team | final official participants required | required in a timely snapshot | historical missing: exclude with `MISSING_RECONSTRUCTED_PARTICIPANTS`; prospective partial: shadow `UNRATED` with `PARTIAL_T45_PARTICIPANTS` |
 | Participant provenance matches the claimed stratum | `RECONSTRUCTED_FINAL_PARTICIPANTS` only | `TIMESTAMP_VERIFIED_T45` for official pool | mismatch: exclude from that official pool with `PROVENANCE_MISMATCH`; a timely partial row remains shadow only |
@@ -178,7 +178,7 @@ All decisions below occur before outcomes are accessible. A critical reason code
 
 Historical reconstructed participants are eligible only when the final official record supplies exactly one actual starter and nine distinct starting hitters for each team, all participant IDs resolve to the scheduled clubs, and no target-game performance enters a feature. This is deterministic participant identity, not historical T-45 availability.
 
-For directional rows, `p_home > 0.5` predicts home and `p_home < 0.5` predicts away; exact equality follows the no-direction row in the table and cannot enter an official ranking. The displayed winner probability for directional rows is `max(p_home, 1-p_home)`. Equal winner probabilities among official directional candidates continue through the frozen ranking keys: completeness descending, absolute starter edge descending, effective start UTC ascending, then `gamePk` ascending. Shadow equality uses the same keys inside `shadow_rank`. A duplicate `gamePk` is `RUN_INVALID` rather than a further tie-break.
+For directional rows, `p_home > 0.5` predicts home and `p_home < 0.5` predicts away; exact equality follows the no-direction row in the table and cannot enter an official ranking. The displayed winner probability for directional rows is `max(p_home, 1-p_home)`. Equal winner probabilities among official directional candidates continue through the frozen ranking keys: completeness descending, absolute starter edge descending, immutable lock-basis start UTC ascending, then `gamePk` ascending. Shadow equality uses the same keys inside `shadow_rank`. A duplicate `gamePk` is `RUN_INVALID` rather than a further tie-break.
 
 Date-state precedence is also fixed: `RUN_INVALID` halts and overrides all ordinary statuses; otherwise a required acquisition/clock failure is `SYSTEM_MISS`; otherwise a prospective slate containing shadow rows but no verified eligible row is `SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE`; otherwise a prospective slate with no verified eligible row is `NO_VERIFIED_ELIGIBLE_DATE`; otherwise a historical slate with no reconstructed eligible row is `NO_ELIGIBLE_DATE`; otherwise lock one official Top 1. This prevents the same failure from being relabeled as benign no-eligibility.
 
@@ -188,7 +188,7 @@ Environment and defense contribute non-neutral values only when a manifest-bound
 
 Every prediction has exactly one participant provenance stratum:
 
-- `TIMESTAMP_VERIFIED_T45`: the raw snapshot satisfies the Section 6.1 freshness rule at or before `effective_start_utc - 45 minutes`, and both starters and all 18 lineup slots were visible in that snapshot.
+- `TIMESTAMP_VERIFIED_T45`: the raw snapshot satisfies the Section 6.1 freshness rule at or before `lock_basis_start_utc - 45 minutes`, and both starters and all 18 lineup slots were visible in that snapshot.
 - `TIMESTAMP_PARTIAL_T45`: a timely snapshot exists but at least one required participant was unresolved; the prediction may be retained as shadow output but is `UNRATED` and cannot count in the verified prospective sample.
 - `RECONSTRUCTED_FINAL_PARTICIPANTS`: participants came from a later official record; allowed in historical robustness only and never described as T-45 reproducible.
 
@@ -225,7 +225,7 @@ The official MLB detailed status is mapped exactly:
 
 For each season the resolution deadline is 23:59:59 America/New_York on the seventh calendar day after MLB's originally published final regular-season date. Seven days permits ordinary resumptions and official corrections while providing a bounded, outcome-independent close before later historical knowledge can keep the ledger open indefinitely. A `PENDING` row that lacks a gradable terminal result at that instant becomes irrevocably `VOID`; a result posted later is retained as an audit annotation but cannot restore sample membership.
 
-Doubleheader games remain distinct by `gamePk`. Within a date they are ordered by effective start UTC and then `gamePk`; first-game outcomes or usage cannot enter the second game's pregame features. Every VOID replacement comes from the next chronological regular-season date after the original selected date that yields a newly graded Top 1. Replacement processing never reorders earlier dates, substitutes a second-ranked game from the same locked slate, or enters 2025. Multiple VOID rows consume multiple later graded dates in chronological order.
+Doubleheader games remain distinct by `gamePk`. Within a date they are ordered by immutable lock-basis start UTC and then `gamePk`; first-game outcomes or usage cannot enter the second game's pregame features. Every VOID replacement comes from the next chronological regular-season date after the original selected date that yields a newly graded Top 1. Replacement processing never reorders earlier dates, substitutes a second-ranked game from the same locked slate, or enters 2025. Multiple VOID rows consume multiple later graded dates in chronological order.
 
 ### 5.3 Outcome isolation and metrics
 
@@ -274,11 +274,17 @@ At 500, `CONFIRMED_INCREMENTAL_EDGE` requires all integrity gates; model accurac
 
 ### 6.1 T-45 snapshot freshness and clock contract
 
-`effective_start_utc` is the latest scheduled start published by the authoritative MLB schedule feed. `lock_at_utc = effective_start_utc - 45 minutes`. The collector uses a host clock synchronized to UTC by NTP; before every polling window it records offset and uncertainty. Absolute offset greater than 2 seconds or missing clock evidence makes the game `SYSTEM_MISS_CLOCK`, so no timestamp-verified row can be emitted.
+Every poll records `observed_scheduled_start_utc` from the authoritative MLB schedule feed. The final qualifying pre-lock poll freezes its observed value as `lock_basis_start_utc`; `lock_at_utc = lock_basis_start_utc - 45 minutes`. Both fields are immutable once the prediction is sealed. This is the only clock basis used for snapshot freshness, provenance, ranking, and replay.
 
-Polling cadence is fixed: every 5 minutes from T-90 through just before T-50, then every 60 seconds from T-50 through T-45 inclusive. The locked snapshot is the latest successful complete snapshot whose client receipt time is no later than `lock_at_utc` and no earlier than T-50, so maximum age is 5 minutes. Server `Date`/provider timestamps are recorded when present, but the NTP-audited client receipt time governs. A response received after T-45 is never used, even within the 2-second clock tolerance.
+The collector uses a host clock synchronized to UTC by NTP; before every polling window it records offset and uncertainty. Absolute offset greater than 2 seconds or missing clock evidence makes the game `SYSTEM_MISS_CLOCK`, so no timestamp-verified row can be emitted. Polling cadence is fixed: every 5 minutes from T-90 through just before T-50, then every 60 seconds from T-50 through T-45 inclusive, with every boundary calculated from the then-current observed scheduled start.
 
-Every poll re-reads status and scheduled start. Before a verified lock exists, a start-time change invalidates the prior countdown and recomputes T-90/T-50/T-45 from the new `effective_start_utc`; all superseded snapshots remain in the audit log. If the new T-45 has already passed when first observed, the row is `TIMESTAMP_PARTIAL_T45` with `LATE_RESCHEDULE_UNVERIFIED`, shadow only. Pre-lock cancellation/postponement is excluded. Once a verified lock exists, a later start change cannot rewrite it: preserve the locked prediction, record `POSTLOCK_START_CHANGE`, and apply Section 5.2 to its eventual outcome.
+A qualifying lock snapshot is the latest successful complete snapshot whose client receipt time is in the closed interval `[lock_basis_start_utc - 50 minutes, lock_basis_start_utc - 45 minutes]`. Thus maximum age at lock is 5 minutes. The snapshot must itself contain the same scheduled start that becomes `lock_basis_start_utc`. Server `Date`/provider timestamps are recorded when present, but the NTP-audited client receipt time governs. A response received after the resulting `lock_at_utc` is never used, even within the 2-second clock tolerance.
+
+Before sealing, every poll re-reads status and scheduled start. Any pre-lock start change invalidates the prior countdown and all previously qualifying snapshots, recomputes T-90/T-50/T-45 from the new observed start, and requires a new complete snapshot in the new T-50..T-45 interval. Superseded snapshots remain in the audit log. If the recomputed T-45 has already passed when the change is first observed, the row is `TIMESTAMP_PARTIAL_T45` with `LATE_RESCHEDULE_UNVERIFIED`, shadow only. A cancellation or postponement observed before sealing is `PRELOCK_NOT_SCHEDULED` and no lock is created.
+
+After sealing, later schedule polls write the newest published start only to `latest_effective_start_utc`. A difference from `lock_basis_start_utc` adds `POSTLOCK_START_CHANGE`. It never changes `lock_basis_start_utc`, `lock_at_utc`, snapshot qualification, prediction, provenance, official/shadow rank, or Top 1 selection, and the same `gamePk` is never re-locked. A post-lock cancellation, postponement, or suspension preserves the sealed prediction and follows the PENDING/VOID/graded terminal contract in Section 5.2.
+
+Every prospective report displays both start fields when they differ and states that T-45 verification is relative to the schedule observable when the lock was sealed, not a later revised start time.
 
 ## 7. Sources and acquisition implications
 
@@ -320,7 +326,7 @@ Required automated coverage includes:
 - table-driven eligibility/reason-code tests covering exclude, official, shadow, neutral optional component, no-eligible, no-verified-eligible, shadow-only, system-miss, and run-invalid dispositions;
 - rolling-origin fold construction, including intentional future-season and 2025 injections that must fail;
 - OOF calibration isolation, the exact 2026 OOF sequence, allowed target-year D-1 history, card sealing, and model-card maximum-date assertions;
-- T-45 polling cadence, five-minute freshness, two-second NTP tolerance, late response rejection, start-time recomputation, rescheduled games, doubleheaders, postponed/resumed games, time zones, and provenance classification;
+- T-45 polling cadence, five-minute freshness, two-second NTP tolerance, late response rejection, pre-lock start-time recomputation with snapshot invalidation, immutable lock-basis sealing, post-lock `latest_effective_start_utc`, no re-lock invariant, rescheduled games, doubleheaders, postponed/resumed games, time zones, and provenance classification;
 - target `gamePk` and same-day event exclusion, outcome-store import denial, and market-schema exclusion;
 - official prospective ranking isolation from shadow rows and deterministic `p_home == 0.5` side/rank behavior;
 - exact terminal mapping for Final, Completed Early, cancellation, suspension/PENDING, deadline conversion, tie/abandoned VOID, doubleheaders, chronological replacements, and late-result immutability;
@@ -354,7 +360,7 @@ The design is implemented only when all of the following are proven by current a
 - The preflight proves every minimum 2018-2024 source; the presently missing 2018-2021 evidence is acquired and validated before H22; optional sources remain clearly separate.
 - The historical run contains exactly 500 unique graded Daily Top 1 dates from 2022-2024, follows the fixed H22/H23/H24 chronology, applies the frozen terminal deadline, extends only for documented VOID/no-eligible/system-miss dates, and never enters 2025.
 - The historical report carries every baseline, metric, limitation, and the label `Historical Walk-forward Robustness`; it never claims official independent 500-pick confirmation.
-- The prospective ledger begins no earlier than 2026-07-13, uses the exact 2019-2024 OOF calibration contract, satisfies the frozen clock/cadence/freshness rules, ranks only timestamp-verified T-45 candidates, stays separate, never backfills misses, and labels interim results as incomplete.
+- The prospective ledger begins no earlier than 2026-07-13, uses the exact 2019-2024 OOF calibration contract, satisfies the frozen clock/cadence/freshness rules, seals an immutable observable-at-lock start basis, never re-locks after schedule revision, ranks only timestamp-verified T-45 candidates, stays separate, never backfills misses, and labels interim results as incomplete.
 - Leakage, replay, hash, error-handling, paired-metric, workbook, and visual verification gates all pass with preserved evidence.
 - No unsupported market, ROI, CLV, profitability, actionable-betting, or predictive-improvement claim appears in any artifact.
 
