@@ -64,6 +64,19 @@
           "teams": {"away": {"team": {"id": 121, "name": "New York Mets"}}, "home": {"team": {"id": 138, "name": "St. Louis Cardinals"}}}
         }
       ]
+    },
+    {
+      "date": "2025-05-05",
+      "games": [
+        {
+          "gamePk": 5001,
+          "gameType": "R",
+          "officialDate": "2025-05-05",
+          "gameDate": "2025-05-05T22:40:00Z",
+          "status": {"detailedState": "Final"},
+          "teams": {"away": {"team": {"id": 135, "name": "San Diego Padres"}}, "home": {"team": {"id": 147, "name": "New York Yankees"}}}
+        }
+      ]
     }
   ]
 }

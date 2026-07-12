@@ -31,7 +31,7 @@ from .scoring import (
     tier,
     uncertainty,
 )
-from .sources import fetch_bytes, schedule_url
+from .sources import fetch_bytes, parse_schedule, schedule_url
 
 
 STAGES = (
@@ -40,6 +40,7 @@ STAGES = (
     "features",
     "initial_locked",
     "initial_outcomes",
+    "extension_rounds",
     "locked",
     "outcomes",
     "reports",
@@ -132,6 +133,31 @@ def _stage(root: Path, name: str, *, create: bool = True) -> Path:
     return path
 
 
+def _safe_descendant_dir(
+    root: Path, relative: str | Path, *, create: bool = True
+) -> Path:
+    """Walk and validate every directory component below a resolved data root."""
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or any(part in ("", "..") for part in relative_path.parts):
+        raise ValueError("stage descendant must be a relative path without aliases")
+    resolved_root = root.resolve(strict=True)
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"stage descendant cannot be a symlink: {relative_path}")
+        if not current.exists():
+            if not create:
+                raise RuntimeError(f"missing stage descendant: {relative_path}")
+            current.mkdir()
+        if current.is_symlink() or not current.is_dir():
+            raise ValueError(f"stage descendant must be a real directory: {relative_path}")
+        resolved = current.resolve(strict=True)
+        if resolved_root not in resolved.parents:
+            raise ValueError(f"stage descendant alias is forbidden: {relative_path}")
+    return current
+
+
 def _regular_bytes(path: Path, label: str) -> bytes:
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -183,7 +209,7 @@ def _json_object(path: Path, label: str) -> dict[str, object]:
 
 def _require_raw_schedule(
     root: Path, config: Mapping[str, object], role: str
-) -> str:
+) -> tuple[str, dict[int, dict[str, object]]]:
     """Verify the immutable schedule manifest required by a prepared input stage."""
     window_name = "training_window" if role == "training" else "initial_window"
     window = config[window_name]
@@ -197,6 +223,7 @@ def _require_raw_schedule(
     if folder.is_symlink() or not folder.is_dir():
         raise RuntimeError(f"missing prerequisite: raw/schedule manifest for {role}")
     matches: list[str] = []
+    schedule_indexes: list[dict[int, dict[str, object]]] = []
     for manifest_path in sorted(folder.glob("*.manifest.json")):
         content = _regular_bytes(manifest_path, "raw schedule manifest")
         try:
@@ -233,20 +260,31 @@ def _require_raw_schedule(
         query_digest = hashlib.sha256(query_bytes).hexdigest()
         if manifest_path.name != f"{digest}.{query_digest}.manifest.json":
             raise RuntimeError("raw schedule manifest address mismatch")
+        games = parse_schedule(folder / f"{digest}.raw")
+        index = {game["game_pk"]: game for game in games}
+        if len(index) != len(games):
+            raise RuntimeError("raw schedule contains duplicate game_pk values")
         matches.append(digest)
+        schedule_indexes.append(index)
     if len(matches) != 1:
         raise RuntimeError(
             f"missing prerequisite: raw/schedule manifest for {role}"
             if not matches
             else f"ambiguous raw/schedule manifests for {role}"
         )
-    return matches[0]
+    return matches[0], schedule_indexes[0]
 
 
-def _write_once(path: Path, content: bytes, label: str) -> Path:
+def _write_once(path: Path, content: bytes, label: str, root: Path) -> Path:
+    try:
+        relative_parent = path.parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under the data directory") from exc
+    safe_parent = _safe_descendant_dir(root, relative_parent)
+    if safe_parent != path.parent:
+        raise ValueError(f"{label} parent path alias is forbidden")
     if path.is_symlink() or path.exists() and not path.is_file():
         raise ValueError(f"{label} must be a regular non-symlink file")
-    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if _regular_bytes(path, label) != content:
             raise RuntimeError(f"immutable {label} differs")
@@ -386,7 +424,7 @@ def calibrate_stage(config_path: str | Path, data_dir: str | Path) -> Path:
         "training": metadata,
         "training_window": config["training_window"],
     }
-    return _write_once(calibration / "model_card.json", _canonical_json(card), "model card")
+    return _write_once(calibration / "model_card.json", _canonical_json(card), "model card", root)
 
 
 def _canonical_utc(value: object) -> datetime:
@@ -474,15 +512,40 @@ def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
+def _bind_candidate_to_schedule(
+    candidate: Mapping[str, object],
+    schedule_index: Mapping[int, Mapping[str, object]],
+    window: Mapping[str, str],
+) -> None:
+    official_date = candidate["official_date"]
+    if not window["start"] <= official_date <= window["end"]:
+        raise ValueError("candidate is outside the configured backtest window")
+    scheduled = schedule_index.get(candidate["game_pk"])
+    if scheduled is None:
+        raise ValueError("candidate game_pk is absent from the official schedule")
+    for field in (
+        "official_date",
+        "scheduled_start_utc",
+        "away_team",
+        "home_team",
+    ):
+        if candidate[field] != scheduled[field]:
+            raise ValueError(f"candidate {field} does not match the official schedule")
+
+
 def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     """Score a Task 11-prepared, pregame-only candidate_components JSONL input."""
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
-    _require_raw_schedule(root, config, "backtest")
+    _, schedule_index = _require_raw_schedule(root, config, "backtest")
     card, _ = _load_model_card(root, config_path)
     features = _stage(root, "features")
     source = features / "candidate_components.jsonl"
     candidates = [_validate_candidate(row) for row in _jsonl(source, "features/candidate_components.jsonl")]
+    for candidate in candidates:
+        _bind_candidate_to_schedule(
+            candidate, schedule_index, config["initial_window"]
+        )
     seen: set[int] = set()
     predictions: list[dict[str, object]] = []
     for candidate in candidates:
@@ -556,7 +619,7 @@ def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
             row[f"{component}_quality"] = qualities[component]
         predictions.append(row)
     predictions.sort(key=lambda row: (row["official_date"], row["scheduled_start_utc"], row["game_pk"]))
-    return _write_once(features / "scored_candidates.jsonl", _canonical_jsonl(predictions), "scored candidates")
+    return _write_once(features / "scored_candidates.jsonl", _canonical_jsonl(predictions), "scored candidates", root)
 
 
 def _rank_and_lock(
@@ -602,7 +665,7 @@ def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, objec
     return _rank_and_lock(candidates, _stage(root, "locked"), model_hash)
 
 
-def _require_complete_top1(
+def _require_complete_outcomes(
     lock_manifest: Path,
     outcome_rows: Sequence[Mapping[str, object]],
     model_hash: str,
@@ -617,19 +680,15 @@ def _require_complete_top1(
             if isinstance(game_pk, int) and not isinstance(game_pk, bool):
                 counts[game_pk] += 1
     missing = sorted(
-        row["game_pk"]
-        for row in predictions
-        if row["top1"] == "Yes" and counts[row["game_pk"]] == 0
+        row["game_pk"] for row in predictions if counts[row["game_pk"]] == 0
     )
     duplicate = sorted(
-        row["game_pk"]
-        for row in predictions
-        if row["top1"] == "Yes" and counts[row["game_pk"]] > 1
+        row["game_pk"] for row in predictions if counts[row["game_pk"]] > 1
     )
     if missing:
-        raise ValueError(f"missing locked Top 1 outcomes: {missing}")
+        raise ValueError(f"missing locked outcomes: {missing}")
     if duplicate:
-        raise ValueError(f"each locked Top 1 requires exactly one outcome: {duplicate}")
+        raise ValueError(f"each locked candidate requires exactly one outcome: {duplicate}")
     return predictions
 
 
@@ -639,8 +698,9 @@ def _join_complete_outcomes(
     model_hash: str,
     output_root: Path,
     label: str,
+    root: Path,
 ) -> Path:
-    _require_complete_top1(lock_manifest, rows, model_hash)
+    _require_complete_outcomes(lock_manifest, rows, model_hash)
     from .outcomes import join_outcomes
 
     with tempfile.TemporaryDirectory(dir=output_root) as temporary_dir:
@@ -652,6 +712,7 @@ def _join_complete_outcomes(
         output_root / "evaluated" / "evaluated_predictions.jsonl",
         generated_bytes,
         label,
+        root,
     )
 
 
@@ -669,6 +730,7 @@ def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
         model_hash,
         outcome_root,
         "evaluated predictions",
+        root,
     )
 
 
@@ -678,7 +740,7 @@ def report_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, obj
     _, model_hash = _load_model_card(root, config_path)
     evaluated_path = root / "outcomes" / "evaluated" / "evaluated_predictions.jsonl"
     evaluated = _jsonl(evaluated_path, "evaluated predictions")
-    _require_complete_top1(
+    _require_complete_outcomes(
         root / "locked" / "lock_manifest.json",
         [row.get("outcome", {}) for row in evaluated],
         model_hash,
@@ -695,7 +757,7 @@ def report_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, obj
     from .metrics import evaluate
 
     summary = evaluate(evaluated, baseline_by_game=baseline)
-    _write_once(_stage(root, "reports") / "summary.json", _canonical_json(summary), "summary report")
+    _write_once(_stage(root, "reports") / "summary.json", _canonical_json(summary), "summary report", root)
     return summary
 
 
@@ -735,8 +797,8 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     game_rows = _array_fixture(fixture / "games.json", "fixture games")
     calibration = _stage(root, "calibration")
     features = _stage(root, "features")
-    _write_once(calibration / "training_edges.jsonl", _canonical_jsonl(calibration_rows), "fixture calibration input")
-    _write_once(features / "candidate_components.jsonl", _canonical_jsonl(game_rows), "fixture feature input")
+    _write_once(calibration / "training_edges.jsonl", _canonical_jsonl(calibration_rows), "fixture calibration input", root)
+    _write_once(features / "candidate_components.jsonl", _canonical_jsonl(game_rows), "fixture feature input", root)
     calibrate_stage(config_path, root)
     features_stage(config_path, root)
     _, model_hash = _load_model_card(root, config_path)
@@ -770,6 +832,7 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
         initial_outcome_root / "outcomes_input.jsonl",
         _canonical_jsonl(initial_outcome_rows),
         "fixture initial outcome input",
+        root,
     )
     initial_evaluated_path = _join_complete_outcomes(
         initial_lock_path,
@@ -777,15 +840,67 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
         model_hash,
         initial_outcome_root,
         "initial evaluated predictions",
+        root,
     )
     initial_evaluated = _jsonl(initial_evaluated_path, "initial evaluated predictions")
     from .metrics import completion_status, extension_dates
 
     initial_completion = completion_status(initial_evaluated, target=3)
-    selected_extension_dates = extension_dates(
-        initial_evaluated, all_dates[3:], target=3
-    )
-    final_dates = set(initial_dates) | set(selected_extension_dates)
+    evaluated = initial_evaluated
+    accumulated_outcomes = list(initial_outcome_rows)
+    selected_dates = list(initial_dates)
+    selected_extension_dates: list[str] = []
+    round_lock_shas: list[str] = []
+    round_number = 0
+    while not completion_status(evaluated, target=3)["complete"]:
+        status = completion_status(evaluated, target=3)
+        future_dates = [day for day in all_dates if day > max(selected_dates)]
+        try:
+            batch_dates = extension_dates(evaluated, future_dates, target=3)
+        except ValueError as exc:
+            raise RuntimeError(
+                "schedule dates exhausted before graded target: "
+                f"graded={status['graded_top1']} void={status['void_top1']} "
+                f"target={status['target']}"
+            ) from exc
+        round_number += 1
+        selected_dates.extend(batch_dates)
+        selected_extension_dates.extend(batch_dates)
+        cumulative_candidates = [
+            row for row in scored_rows if row["official_date"] in selected_dates
+        ]
+        round_root = Path("extension_rounds") / f"round_{round_number:03d}"
+        round_lock_dir = _safe_descendant_dir(root, round_root / "locked")
+        round_manifest = _rank_and_lock(
+            cumulative_candidates, round_lock_dir, model_hash
+        )
+        round_lock_shas.append(round_manifest["sha256"])
+
+        # Each date's result is opened only after its cumulative round lock exists.
+        for extension_date in batch_dates:
+            accumulated_outcomes.extend(
+                _array_fixture(
+                    fixture
+                    / "extension_outcomes_by_date"
+                    / f"{extension_date}.json",
+                    f"fixture extension outcomes for {extension_date}",
+                )
+            )
+        round_outcome_dir = _safe_descendant_dir(root, round_root / "outcomes")
+        round_evaluated_path = _join_complete_outcomes(
+            round_lock_dir / "lock_manifest.json",
+            accumulated_outcomes,
+            model_hash,
+            round_outcome_dir,
+            f"extension round {round_number} evaluated predictions",
+            root,
+        )
+        evaluated = _jsonl(
+            round_evaluated_path,
+            f"extension round {round_number} evaluated predictions",
+        )
+
+    final_dates = set(selected_dates)
     final_candidates = [
         row for row in scored_rows if row["official_date"] in final_dates
     ]
@@ -795,17 +910,12 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     lock_path = root / "locked" / "lock_manifest.json"
     lock_mtime = lock_path.stat().st_mtime_ns
 
-    # Extension results are unavailable until the expanded final lock is published.
-    extension_outcome_rows = _array_fixture(
-        fixture / "extension_outcomes.json", "fixture extension outcomes"
-    )
-    outcome_rows = initial_fixture_outcomes + extension_outcome_rows
     final_game_pks = {row["game_pk"] for row in final_candidates}
     final_outcome_rows = [
-        row for row in outcome_rows if row["game_pk"] in final_game_pks
+        row for row in accumulated_outcomes if row["game_pk"] in final_game_pks
     ]
     outcome_root = _stage(root, "outcomes")
-    _write_once(outcome_root / "outcomes_input.jsonl", _canonical_jsonl(final_outcome_rows), "fixture outcome input")
+    _write_once(outcome_root / "outcomes_input.jsonl", _canonical_jsonl(final_outcome_rows), "fixture outcome input", root)
     evaluated_path = outcomes_stage(config_path, root)
     summary = report_stage(config_path, root)
     prediction_rows = _jsonl(root / "locked" / "predictions.jsonl", "locked predictions")
@@ -832,6 +942,8 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
         "initial_lock_sha": initial_manifest["sha256"],
         "initial_locked_sha256": initial_manifest["sha256"],
         "extension_dates": selected_extension_dates,
+        "round_lock_shas": round_lock_shas,
+        "round_hashes": round_lock_shas,
         "initial_completion": initial_completion,
         "final_lock_sha": lock_manifest["sha256"],
         "lock_sha256": lock_manifest["sha256"],

@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,8 +75,8 @@ class PipelineTest(unittest.TestCase):
             root = Path(td)
             result = self._replay(root)
 
-            self.assertEqual(result["selection_dates"], 4)
-            self.assertEqual(result["top1_count"], 4)
+            self.assertEqual(result["selection_dates"], 5)
+            self.assertEqual(result["top1_count"], 5)
             self.assertTrue((root / "locked" / "lock_manifest.json").is_file())
             self.assertTrue((root / "reports" / "summary.json").is_file())
             self.assertTrue(
@@ -108,7 +109,9 @@ class PipelineTest(unittest.TestCase):
                     "dates_needed": 1,
                 },
             )
-            self.assertEqual(result["extension_dates"], ["2025-05-04"])
+            self.assertEqual(
+                result["extension_dates"], ["2025-05-04", "2025-05-05"]
+            )
 
     def test_repeated_replay_has_identical_locked_sha256(self):
         with tempfile.TemporaryDirectory() as td:
@@ -120,6 +123,8 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(
                 first["initial_locked_sha256"], second["initial_locked_sha256"]
             )
+            self.assertEqual(first["round_lock_shas"], second["round_lock_shas"])
+            self.assertEqual(len(first["round_lock_shas"]), 2)
             self.assertNotEqual(
                 first["initial_locked_sha256"], first["locked_sha256"]
             )
@@ -218,11 +223,11 @@ class PipelineTest(unittest.TestCase):
             )
 
             self.assertEqual(result["graded_top1"], 3)
-            self.assertEqual(result["void_top1"], 1)
+            self.assertEqual(result["void_top1"], 2)
             self.assertEqual(summary["primary"]["N"], 3)
-            self.assertEqual(summary["void_top1"], 1)
+            self.assertEqual(summary["void_top1"], 2)
             self.assertEqual(result["graded_count"], 3)
-            self.assertEqual(result["void_count"], 1)
+            self.assertEqual(result["void_count"], 2)
             report = (root / "reports" / "summary.json").read_text("utf-8")
             self.assertEqual(report, json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
@@ -300,52 +305,120 @@ class PipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "raw/schedule"):
                 features_stage(CONFIG, root)
 
-    def test_outcomes_require_every_locked_top1_outcome(self):
+    def test_outcomes_require_every_locked_game_outcome(self):
         outcomes = json.loads((FIXTURE / "outcomes.json").read_text("utf-8"))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _prepare_through_lock(root)
             locked = _jsonl(root / "locked" / "predictions.jsonl")
-            top1_game_pks = {
-                row["game_pk"] for row in locked if row["top1"] == "Yes"
-            }
-            missing = next(iter(top1_game_pks))
+            missing = next(
+                row["game_pk"] for row in locked if row["top1"] == "No"
+            )
             _write_jsonl(
                 root / "outcomes" / "outcomes_input.jsonl",
                 [row for row in outcomes if row["game_pk"] != missing],
             )
-            with self.assertRaisesRegex(ValueError, "missing.*Top 1"):
+            with self.assertRaisesRegex(ValueError, "missing locked outcomes"):
                 outcomes_stage(CONFIG, root)
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            _prepare_through_lock(root)
-            locked = _jsonl(root / "locked" / "predictions.jsonl")
-            top1_game_pks = {
-                row["game_pk"] for row in locked if row["top1"] == "Yes"
-            }
-            _write_jsonl(
-                root / "outcomes" / "outcomes_input.jsonl",
-                [row for row in outcomes if row["game_pk"] in top1_game_pks],
-            )
-            evaluated = outcomes_stage(CONFIG, root)
-            self.assertEqual(len(_jsonl(evaluated)), len(top1_game_pks))
-
-    def test_report_requires_every_locked_top1_outcome(self):
+    def test_report_requires_every_locked_game_outcome(self):
         outcomes = json.loads((FIXTURE / "outcomes.json").read_text("utf-8"))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _prepare_through_lock(root)
+            locked = _jsonl(root / "locked" / "predictions.jsonl")
             _write_jsonl(root / "outcomes" / "outcomes_input.jsonl", outcomes)
             evaluated_path = outcomes_stage(CONFIG, root)
             evaluated = _jsonl(evaluated_path)
-            missing = next(row["game_pk"] for row in evaluated if row["top1"] == "Yes")
+            missing = next(
+                row["game_pk"] for row in locked if row["top1"] == "No"
+            )
             _write_jsonl(
                 evaluated_path,
                 [row for row in evaluated if row["game_pk"] != missing],
             )
-            with self.assertRaisesRegex(ValueError, "missing.*Top 1"):
+            with self.assertRaisesRegex(ValueError, "missing locked outcomes"):
                 report_stage(CONFIG, root)
+
+    def test_outcomes_reject_nested_evaluated_directory_symlink(self):
+        outcomes = json.loads((FIXTURE / "outcomes.json").read_text("utf-8"))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "data"
+            outside = base / "outside"
+            outside.mkdir()
+            _prepare_through_lock(root)
+            _write_jsonl(root / "outcomes" / "outcomes_input.jsonl", outcomes)
+            (root / "outcomes" / "evaluated").symlink_to(
+                outside, target_is_directory=True
+            )
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                outcomes_stage(CONFIG, root)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_features_require_candidate_to_match_raw_official_schedule(self):
+        calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
+        games = json.loads((FIXTURE / "games.json").read_text("utf-8"))
+        mutations = (
+            dict(games[0], home_team="Different Club"),
+            dict(
+                games[0],
+                game_pk=9999,
+                away_team="Arbitrary Away",
+                home_team="Arbitrary Home",
+            ),
+            dict(
+                games[0],
+                game_pk=9998,
+                official_date="2025-08-13",
+                scheduled_start_utc="2025-08-13T23:10:00Z",
+            ),
+        )
+        for candidate in mutations:
+            with self.subTest(game_pk=candidate["game_pk"]), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                _copy_raw_schedule(root)
+                _write_jsonl(
+                    root / "calibration" / "training_edges.jsonl", calibration
+                )
+                _write_jsonl(
+                    root / "features" / "candidate_components.jsonl", [candidate]
+                )
+                calibrate_stage(CONFIG, root)
+                with self.assertRaisesRegex(ValueError, "official schedule|window"):
+                    features_stage(CONFIG, root)
+
+    def test_fixture_replay_extends_past_repeated_void_until_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._replay(Path(td))
+
+            self.assertEqual(
+                result["extension_dates"], ["2025-05-04", "2025-05-05"]
+            )
+            self.assertEqual(result["graded_top1"], 3)
+            self.assertEqual(result["void_top1"], 2)
+            self.assertEqual(result["selection_dates"], 5)
+
+    def test_fixture_replay_schedule_exhaustion_is_explicit_and_writes_no_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            fixture = base / "fixture"
+            output = base / "output"
+            shutil.copytree(FIXTURE, fixture)
+            for path in sorted(
+                (fixture / "extension_outcomes_by_date").glob("*.json")
+            ):
+                extension = json.loads(path.read_text("utf-8"))
+                for row in extension:
+                    row.update(actual_winner="", status="VOID")
+                path.write_text(
+                    json.dumps(extension, indent=2) + "\n", encoding="utf-8"
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "schedule.*exhaust"):
+                run_fixture_replay(fixture, output)
+            self.assertFalse((output / "reports" / "summary.json").exists())
 
     def test_features_and_lock_do_not_require_outcomes_directory(self):
         with tempfile.TemporaryDirectory() as td:
