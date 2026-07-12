@@ -9,7 +9,7 @@
           "officialDate": "2025-05-01",
           "gameDate": "2025-05-01T23:10:00Z",
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 112, "name": "Chicago Cubs"}}, "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}}},
+          "teams": {"away": {"team": {"id": 112, "name": "Chicago Cubs"}, "score": 2, "isWinner": false}, "home": {"team": {"id": 134, "name": "Pittsburgh Pirates"}, "score": 4, "isWinner": true}},
           "venue": {"id": 31, "name": "PNC Park"}
         }
       ]
@@ -25,7 +25,7 @@
           "doubleHeader": "Y",
           "gameNumber": 1,
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 111, "name": "Boston Red Sox"}}, "home": {"team": {"id": 142, "name": "Minnesota Twins"}}}
+          "teams": {"away": {"team": {"id": 111, "name": "Boston Red Sox"}, "score": 6, "isWinner": true}, "home": {"team": {"id": 142, "name": "Minnesota Twins"}, "score": 3, "isWinner": false}}
         },
         {
           "gamePk": 2002,
@@ -35,7 +35,7 @@
           "doubleHeader": "Y",
           "gameNumber": 2,
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 111, "name": "Boston Red Sox"}}, "home": {"team": {"id": 142, "name": "Minnesota Twins"}}}
+          "teams": {"away": {"team": {"id": 111, "name": "Boston Red Sox"}, "score": 1, "isWinner": false}, "home": {"team": {"id": 142, "name": "Minnesota Twins"}, "score": 5, "isWinner": true}}
         }
       ]
     },
@@ -47,7 +47,7 @@
           "gameType": "R",
           "officialDate": "2025-05-03",
           "gameDate": "2025-05-03T20:05:00Z",
-          "status": {"detailedState": "Final"},
+          "status": {"detailedState": "Suspended"},
           "teams": {"away": {"team": {"id": 119, "name": "Los Angeles Dodgers"}}, "home": {"team": {"id": 144, "name": "Atlanta Braves"}}}
         }
       ]
@@ -60,7 +60,7 @@
           "gameType": "R",
           "officialDate": "2025-05-04",
           "gameDate": "2025-05-04T18:35:00Z",
-          "status": {"detailedState": "Final"},
+          "status": {"detailedState": "Suspended"},
           "teams": {"away": {"team": {"id": 121, "name": "New York Mets"}}, "home": {"team": {"id": 138, "name": "St. Louis Cardinals"}}}
         }
       ]
@@ -74,7 +74,7 @@
           "officialDate": "2025-05-05",
           "gameDate": "2025-05-05T22:40:00Z",
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 135, "name": "San Diego Padres"}}, "home": {"team": {"id": 147, "name": "New York Yankees"}}}
+          "teams": {"away": {"team": {"id": 135, "name": "San Diego Padres"}, "score": 2, "isWinner": false}, "home": {"team": {"id": 147, "name": "New York Yankees"}, "score": 7, "isWinner": true}}
         }
       ]
     },
@@ -87,7 +87,7 @@
           "officialDate": "2025-08-13",
           "gameDate": "2025-08-13T23:05:00Z",
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 136, "name": "Seattle Mariners"}}, "home": {"team": {"id": 110, "name": "Baltimore Orioles"}}}
+          "teams": {"away": {"team": {"id": 136, "name": "Seattle Mariners"}, "score": 3, "isWinner": false}, "home": {"team": {"id": 110, "name": "Baltimore Orioles"}, "score": 4, "isWinner": true}}
         }
       ]
     },
@@ -100,7 +100,7 @@
           "officialDate": "2025-09-29",
           "gameDate": "2025-09-29T23:05:00Z",
           "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 141, "name": "Toronto Blue Jays"}}, "home": {"team": {"id": 139, "name": "Tampa Bay Rays"}}}
+          "teams": {"away": {"team": {"id": 141, "name": "Toronto Blue Jays"}, "score": 5, "isWinner": true}, "home": {"team": {"id": 139, "name": "Tampa Bay Rays"}, "score": 2, "isWinner": false}}
         }
       ]
     }

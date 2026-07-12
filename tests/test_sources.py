@@ -152,13 +152,21 @@ class SourceTest(unittest.TestCase):
                 "scheduled_start_utc": "2025-05-01T16:35:00Z",
                 "status": "Final",
                 "away_team": "Chicago Cubs",
+                "away_team_id": 112,
                 "home_team": "Pittsburgh Pirates",
+                "home_team_id": 134,
                 "away_probable_pitcher_id": 607067,
                 "away_probable_pitcher_name": "Colin Rea",
                 "home_probable_pitcher_id": 694973,
                 "home_probable_pitcher_name": "Paul Skenes",
                 "venue_id": 31,
                 "venue_name": "PNC Park",
+                "away_score": 2,
+                "home_score": 4,
+                "away_is_winner": False,
+                "home_is_winner": True,
+                "scheduled_innings": None,
+                "doubleheader_marker": None,
                 "away_lineup": [
                     {"player_id": 664023, "player_name": "Ian Happ"},
                     {"player_id": 663656, "player_name": "Kyle Tucker"},
@@ -228,8 +236,8 @@ class SourceTest(unittest.TestCase):
                     "gameDate": "2025-05-02T17:00:00Z",
                     "status": {"detailedState": "Scheduled"},
                     "teams": {
-                        "away": {"team": {"name": "Away"}},
-                        "home": {"team": {"name": "Home"}},
+                        "away": {"team": {"id": 1, "name": "Away"}},
+                        "home": {"team": {"id": 2, "name": "Home"}},
                     },
                 }],
             }]
@@ -247,6 +255,70 @@ class SourceTest(unittest.TestCase):
         self.assertIsNone(game["venue_name"])
         self.assertEqual(game["away_lineup"], [])
         self.assertEqual(game["home_lineup"], [])
+        self.assertIsNone(game["away_score"])
+        self.assertIsNone(game["home_score"])
+        self.assertIsNone(game["away_is_winner"])
+        self.assertIsNone(game["home_is_winner"])
+
+    def test_final_outcome_requires_scores_and_exactly_one_consistent_winner(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        game = payload["dates"][0]["games"][0]
+        invalid = []
+        missing_score = json.loads(json.dumps(payload))
+        del missing_score["dates"][0]["games"][0]["teams"]["away"]["score"]
+        invalid.append(missing_score)
+        tied = json.loads(json.dumps(payload))
+        tied_game = tied["dates"][0]["games"][0]
+        tied_game["teams"]["away"]["score"] = tied_game["teams"]["home"]["score"]
+        invalid.append(tied)
+        both_winners = json.loads(json.dumps(payload))
+        both_winners["dates"][0]["games"][0]["teams"]["away"]["isWinner"] = True
+        invalid.append(both_winners)
+        wrong_winner = json.loads(json.dumps(payload))
+        wrong_game = wrong_winner["dates"][0]["games"][0]
+        wrong_game["teams"]["away"]["score"] = 9
+        invalid.append(wrong_winner)
+        bool_score = json.loads(json.dumps(payload))
+        bool_score["dates"][0]["games"][0]["teams"]["away"]["score"] = True
+        invalid.append(bool_score)
+        self.assertEqual(game["teams"]["home"]["score"], 4)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            for candidate in invalid:
+                with self.subTest(candidate=candidate):
+                    path.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        parse_schedule(path)
+
+    def test_explicit_tie_and_suspension_do_not_invent_a_winner(self):
+        tied = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        tied_game = tied["dates"][0]["games"][0]
+        tied_game["status"]["detailedState"] = "Final: Tied"
+        tied_game["teams"]["away"]["score"] = 4
+        tied_game["teams"]["away"]["isWinner"] = False
+        tied_game["teams"]["home"]["isWinner"] = False
+        suspended = json.loads(json.dumps(tied))
+        suspended_game = suspended["dates"][0]["games"][0]
+        suspended_game["status"]["detailedState"] = "Suspended"
+        for side in ("away", "home"):
+            suspended_game["teams"][side].pop("score")
+            suspended_game["teams"][side].pop("isWinner")
+        inconsistent_tie = json.loads(json.dumps(tied))
+        inconsistent_tie["dates"][0]["games"][0]["teams"]["away"]["score"] = 5
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(tied), encoding="utf-8")
+            game = parse_schedule(path)[0]
+            self.assertEqual((game["away_score"], game["home_score"]), (4, 4))
+            self.assertFalse(game["away_is_winner"])
+            self.assertFalse(game["home_is_winner"])
+            path.write_text(json.dumps(suspended), encoding="utf-8")
+            suspended_game = parse_schedule(path)[0]
+            self.assertIsNone(suspended_game["away_score"])
+            self.assertIsNone(suspended_game["home_score"])
+            path.write_text(json.dumps(inconsistent_tie), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tie"):
+                parse_schedule(path)
 
     def test_scheduled_start_offset_is_normalized_to_canonical_utc(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))

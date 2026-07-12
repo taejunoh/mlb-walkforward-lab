@@ -12,10 +12,14 @@
           "teams": {
             "away": {
               "team": {"id": 112, "name": "Chicago Cubs"},
+              "score": 2,
+              "isWinner": false,
               "probablePitcher": {"id": 607067, "fullName": "Colin Rea"}
             },
             "home": {
               "team": {"id": 134, "name": "Pittsburgh Pirates"},
+              "score": 4,
+              "isWinner": true,
               "probablePitcher": {"id": 694973, "fullName": "Paul Skenes"}
             }
           },

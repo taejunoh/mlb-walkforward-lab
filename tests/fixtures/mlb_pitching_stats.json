@@ -1,0 +1,13 @@
+{
+  "stats": [
+    {
+      "type": {"displayName": "byDateRange"},
+      "group": {"displayName": "pitching"},
+      "totalSplits": 2,
+      "splits": [
+        {"stat": {"earnedRuns": 8, "outs": 54}},
+        {"stat": {"earnedRuns": 9, "outs": 54}}
+      ]
+    }
+  ]
+}

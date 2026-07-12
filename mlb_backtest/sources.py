@@ -164,6 +164,39 @@ def _lineup(lineups: dict, field: str, label: str) -> list[dict]:
     return result
 
 
+def _optional_nonnegative_int(
+    mapping: dict, field: str, label: str, *, positive: bool = False
+) -> int | None:
+    value = mapping.get(field)
+    if value is None:
+        return None
+    if type(value) is not int or value < (1 if positive else 0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ValueError(f"malformed schedule: {label}.{field} must be a {qualifier} integer")
+    return value
+
+
+def _optional_exact_bool(mapping: dict, field: str, label: str) -> bool | None:
+    value = mapping.get(field)
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise ValueError(f"malformed schedule: {label}.{field} must be boolean")
+    return value
+
+
+def _doubleheader_marker(game: dict, label: str) -> str | None:
+    raw = game.get("doubleHeader")
+    number = game.get("gameNumber")
+    if raw in (None, "N"):
+        if number is not None and (type(number) is not int or number <= 0):
+            raise ValueError(f"malformed schedule: {label}.gameNumber must be positive")
+        return None
+    if raw not in {"Y", "S"} or type(number) is not int or number not in {1, 2}:
+        raise ValueError(f"malformed schedule: {label} has invalid doubleheader fields")
+    return f"GAME{number}"
+
+
 def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     game = _mapping(raw_game, f"game[{index}]")
     game_type = game.get("gameType")
@@ -184,12 +217,34 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     away_team = _mapping(away.get("team"), f"game[{index}].teams.away.team")
     home_team = _mapping(home.get("team"), f"game[{index}].teams.home.team")
     status = _mapping(game.get("status"), f"game[{index}].status")
+    status_name = _required(status, "detailedState", str, f"game[{index}].status")
     away_pitcher_id, away_pitcher_name = _optional_person(
         away, "probablePitcher", f"game[{index}].teams.away.probablePitcher"
     )
     home_pitcher_id, home_pitcher_name = _optional_person(
         home, "probablePitcher", f"game[{index}].teams.home.probablePitcher"
     )
+    away_score = _optional_nonnegative_int(away, "score", f"game[{index}].teams.away")
+    home_score = _optional_nonnegative_int(home, "score", f"game[{index}].teams.home")
+    away_winner = _optional_exact_bool(away, "isWinner", f"game[{index}].teams.away")
+    home_winner = _optional_exact_bool(home, "isWinner", f"game[{index}].teams.home")
+    status_lower = status_name.lower()
+    explicit_tie = "tie" in status_lower
+    explicit_exception = explicit_tie or "suspend" in status_lower
+    if explicit_tie:
+        if (
+            away_score is not None
+            and home_score is not None
+            and away_score != home_score
+        ) or (away_winner is True) or (home_winner is True):
+            raise ValueError("malformed schedule: explicit tie conflicts with outcome")
+    if "final" in status_lower and not explicit_exception:
+        if away_score is None or home_score is None:
+            raise ValueError("malformed schedule: final game requires both scores")
+        if away_winner is None or home_winner is None or away_winner == home_winner:
+            raise ValueError("malformed schedule: final game requires exactly one winner")
+        if away_score == home_score or away_winner != (away_score > home_score):
+            raise ValueError("malformed schedule: final winner is inconsistent with scores")
     lineups_value = game.get("lineups")
     lineups = (
         {}
@@ -212,12 +267,18 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "scheduled_start_utc": _canonical_utc_datetime(
             game.get("gameDate"), f"game[{index}].gameDate"
         ),
-        "status": _required(status, "detailedState", str, f"game[{index}].status"),
+        "status": status_name,
         "away_team": _required(
             away_team, "name", str, f"game[{index}].teams.away.team"
         ),
+        "away_team_id": _required(
+            away_team, "id", int, f"game[{index}].teams.away.team"
+        ),
         "home_team": _required(
             home_team, "name", str, f"game[{index}].teams.home.team"
+        ),
+        "home_team_id": _required(
+            home_team, "id", int, f"game[{index}].teams.home.team"
         ),
         "away_probable_pitcher_id": away_pitcher_id,
         "away_probable_pitcher_name": away_pitcher_name,
@@ -225,6 +286,14 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "home_probable_pitcher_name": home_pitcher_name,
         "venue_id": venue_id,
         "venue_name": venue_name,
+        "away_score": away_score,
+        "home_score": home_score,
+        "away_is_winner": away_winner,
+        "home_is_winner": home_winner,
+        "scheduled_innings": _optional_nonnegative_int(
+            game, "scheduledInnings", f"game[{index}]", positive=True
+        ),
+        "doubleheader_marker": _doubleheader_marker(game, f"game[{index}]"),
         "away_lineup": _lineup(
             lineups, "awayPlayers", f"game[{index}].lineups"
         ),
@@ -244,6 +313,7 @@ def parse_schedule(path: str | Path) -> list[dict]:
     root = _mapping(payload, "root")
     dates = _list(root.get("dates"), "dates")
     games = []
+    seen_game_pks = set()
     game_index = 0
     for date_index, raw_date_entry in enumerate(dates):
         date_entry = _mapping(raw_date_entry, f"dates[{date_index}]")
@@ -252,6 +322,9 @@ def parse_schedule(path: str | Path) -> list[dict]:
             game = _normalize_game(raw_game, date_entry, game_index)
             game_index += 1
             if game is not None:
+                if game["game_pk"] in seen_game_pks:
+                    raise ValueError("malformed schedule: duplicate regular-season gamePk")
+                seen_game_pks.add(game["game_pk"])
                 games.append(game)
     return games
 

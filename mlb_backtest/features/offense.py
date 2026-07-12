@@ -134,7 +134,9 @@ def derive_slot_weights(
         if not isinstance(row, Mapping):
             raise ValueError("each training row must be a mapping")
         season = row.get("season")
-        slot = row.get("batting_slot")
+        slot = row.get("slot", row.get("batting_slot"))
+        if "slot" in row and "batting_slot" in row and row["slot"] != row["batting_slot"]:
+            raise ValueError("slot and batting_slot must agree")
         if (
             isinstance(season, bool)
             or not isinstance(season, int)
