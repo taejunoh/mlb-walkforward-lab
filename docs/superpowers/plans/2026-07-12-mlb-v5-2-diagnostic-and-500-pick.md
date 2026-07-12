@@ -80,7 +80,10 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from types import MappingProxyType
-import hashlib, json, math, statistics
+import hashlib
+import json
+import math
+import statistics
 from mlb_backtest.metrics import evaluate, wilson
 from scipy.stats import fisher_exact, spearmanr
 ```
@@ -99,7 +102,8 @@ from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, loa
 ```python
 from collections.abc import Sequence
 from pathlib import Path
-import contextlib, io
+import contextlib
+import io
 from mlb_backtest.diagnostics import canonical_json_bytes
 ```
 
@@ -108,7 +112,8 @@ from mlb_backtest.diagnostics import canonical_json_bytes
 ```python
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-import argparse, json
+import argparse
+import json
 from mlb_backtest.diagnostics import canonical_json_bytes
 ```
 
@@ -121,7 +126,11 @@ from datetime import date
 from pathlib import Path
 from types import MappingProxyType
 from typing import NoReturn
-import argparse, hashlib, json, math, subprocess
+import argparse
+import hashlib
+import json
+import math
+import subprocess
 from mlb_backtest.diagnostics import canonical_json_bytes, deep_freeze, sha256_file
 ```
 
@@ -133,7 +142,9 @@ from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from types import MappingProxyType
-import argparse, hashlib, json
+import argparse
+import hashlib
+import json
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
 from mlb_backtest.protocols import MINIMUM_SOURCE_NAMES, RunSpec, expected_historical_run, load_run_spec, parse_run_spec, require_exact_keys
 ```
@@ -143,7 +154,10 @@ from mlb_backtest.protocols import MINIMUM_SOURCE_NAMES, RunSpec, expected_histo
 ```python
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-import argparse, hashlib, json, subprocess
+import argparse
+import hashlib
+import json
+import subprocess
 from mlb_backtest.diagnostic_report import render_markdown
 from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, load_v51_evidence, sha256_file
 from mlb_backtest.preflight import PREFLIGHT_REQUIRED_KEYS, parse_preflight, render_preflight_markdown
