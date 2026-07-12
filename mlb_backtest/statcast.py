@@ -54,6 +54,14 @@ REQUIRED_FIELDS = (
 NON_PA_EVENTS = frozenset({"truncated_pa"})
 
 
+def is_completed_pa_row(row: Mapping[str, object]) -> bool:
+    """Return whether a Statcast pitch row proves a completed plate appearance."""
+    events = row.get("events")
+    if events:
+        return events not in NON_PA_EVENTS
+    return row.get("description") == "hit_by_pitch"
+
+
 @dataclass(frozen=True)
 class StatcastData:
     pitches: tuple[dict[str, object], ...]
@@ -580,7 +588,7 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
     )
     terminal: dict[str, dict[str, object]] = {}
     for row in pitches:
-        if row["events"] and row["events"] not in NON_PA_EVENTS:
+        if is_completed_pa_row(row):
             event_id = str(row["event_id"])
             prior = terminal.get(event_id)
             if prior is not None and prior != row:
@@ -679,7 +687,7 @@ def derive_outs_recorded(
     terminals = {
         str(row["event_id"]): dict(row)
         for row in derived
-        if row.get("events") and row["events"] not in NON_PA_EVENTS
+        if is_completed_pa_row(row)
     }
     plate_appearances = tuple(
         terminals[key]
@@ -729,6 +737,7 @@ __all__ = [
     "fetch_monthly",
     "fetch_statcast_stage",
     "identify_pitcher_roles",
+    "is_completed_pa_row",
     "is_statcast_row_capped_manifest",
     "iter_statcast_pitches",
     "iter_unique_statcast_pitches",

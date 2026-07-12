@@ -249,6 +249,25 @@ class StatcastTest(unittest.TestCase):
         finally:
             malformed.unlink(missing_ok=True)
 
+    def test_blank_event_hit_by_pitch_is_still_a_completed_pa(self):
+        text = FIXTURE.read_text("utf-8-sig").replace(
+            "hit_by_pitch,hit_by_pitch", ",hit_by_pitch", 1
+        )
+        malformed = FIXTURE.parent / "statcast_blank_hbp.tmp.csv"
+        try:
+            malformed.write_text(text, encoding="utf-8")
+            parsed = parse_statcast(malformed)
+            pa = next(
+                row
+                for row in parsed.plate_appearances
+                if row["game_pk"] == 1002 and row["at_bat_number"] == 2
+            )
+            self.assertEqual(pa["events"], "")
+            self.assertEqual(pa["description"], "hit_by_pitch")
+            self.assertEqual(len(parsed.plate_appearances), 6)
+        finally:
+            malformed.unlink(missing_ok=True)
+
     def test_roles_use_first_pitcher_for_each_fielding_side(self):
         parsed = parse_statcast(FIXTURE)
         roles = identify_pitcher_roles(parsed.pitches)

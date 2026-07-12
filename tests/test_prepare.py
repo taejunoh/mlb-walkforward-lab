@@ -259,7 +259,7 @@ class PrepareBoundaryTest(unittest.TestCase):
             with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
                 derive_team_code_map(games + [unsafe], rows, 2024)
 
-    def test_training_slot_rows_count_official_starters_and_exclude_2025_and_pinch_hitters(self):
+    def test_training_slot_rows_count_every_terminal_pa_in_its_lineup_slot(self):
         def game(game_pk, year):
             return {
                 "game_pk": game_pk,
@@ -273,29 +273,33 @@ class PrepareBoundaryTest(unittest.TestCase):
         pas = []
         for scheduled in games:
             for side, half in (("away", "Top"), ("home", "Bot")):
-                for slot, player in enumerate(scheduled[f"{side}_lineup"], 1):
-                    for pa_number in range(10 - slot):
-                        pas.append({
-                            "game_pk": scheduled["game_pk"],
-                            "game_date": scheduled["official_date"],
-                            "game_type": "R",
-                            "inning_topbot": half,
-                            "batter_id": player["player_id"],
-                            "at_bat_number": (0 if half == "Top" else 100) + slot * 10 + pa_number,
-                            "event_id": f'{scheduled["game_pk"]}:{half}:{slot}:{pa_number}',
-                        })
-            pas.append(dict(pas[-1], batter_id=999999, at_bat_number=999, event_id=f'{scheduled["game_pk"]}:pinch'))
+                for pa_index in range(17):
+                    slot = pa_index % 9 + 1
+                    player_id = scheduled[f"{side}_lineup"][slot - 1]["player_id"]
+                    if pa_index == 13:
+                        player_id = 900_000 + scheduled["game_pk"] * 10 + (
+                            0 if side == "away" else 1
+                        )
+                    pas.append({
+                        "game_pk": scheduled["game_pk"],
+                        "game_date": scheduled["official_date"],
+                        "game_type": "R",
+                        "inning_topbot": half,
+                        "batter_id": player_id,
+                        "at_bat_number": (0 if half == "Top" else 100) + pa_index + 1,
+                        "event_id": f'{scheduled["game_pk"]}:{half}:{pa_index}',
+                    })
         with self.assertRaisesRegex(ValueError, "verified full-season"):
             derive_training_slot_rows(games, pas)
-        rows = _aggregate_training_slot_rows(games, pas, full_season_mode=False)
+        rows = _aggregate_training_slot_rows(games, pas, full_season_mode=True)
         self.assertEqual({row["season"] for row in rows}, {2022, 2023, 2024})
-        self.assertEqual(sum(row["pa"] for row in rows), 2 * 45 * 3)
+        self.assertEqual(sum(row["pa"] for row in rows), 2 * 17 * 3)
         self.assertEqual(len(rows), 27)
         self.assertEqual(
             _aggregate_training_slot_rows(
                 list(reversed(games)),
                 list(reversed(pas)),
-                full_season_mode=False,
+                full_season_mode=True,
             ),
             rows,
         )
@@ -309,48 +313,59 @@ class PrepareBoundaryTest(unittest.TestCase):
         wrong_day = [dict(row, game_date="2024-12-31") if row["game_pk"] == 24 else row for row in pas]
         with self.assertRaisesRegex(ValueError, "date"):
             _aggregate_training_slot_rows(games, wrong_day, full_season_mode=False)
-        missing_cell = [
-            row
-            for row in pas
-            if not (
-                row["game_pk"] == 22
-                and row["batter_id"]
-                in {games[0]["away_lineup"][8]["player_id"], games[0]["home_lineup"][8]["player_id"]}
-            )
-        ]
+        missing_cell = [row for row in pas if row["game_pk"] != 22]
         with self.assertRaisesRegex(ValueError, "missing training slot"):
             _aggregate_training_slot_rows(
                 games, missing_cell, full_season_mode=False
             )
 
-        away_starters = {
-            player["player_id"] for player in games[0]["away_lineup"]
-        }
+        zero_pa_starter = games[0]["away_lineup"][7]["player_id"]
+        replacement = 999_998
         partial_starters = [
-            row
+            dict(row, batter_id=replacement)
+            if row["game_pk"] == 22
+            and row["inning_topbot"] == "Top"
+            and row["batter_id"] == zero_pa_starter
+            else row
             for row in pas
-            if row["game_pk"] != 22
-            or row["inning_topbot"] != "Top"
-            or row["batter_id"] == games[0]["away_lineup"][0]["player_id"]
         ]
-        partial_starters.extend(
-            dict(
-                partial_starters[0],
-                batter_id=900_000 + index,
-                at_bat_number=1_000 + index,
-                event_id=f"22:substitute:{index}",
-            )
-            for index in range(8)
+        self.assertNotIn(
+            zero_pa_starter,
+            {
+                row["batter_id"]
+                for row in partial_starters
+                if row["game_pk"] == 22 and row["inning_topbot"] == "Top"
+            },
         )
-        self.assertTrue(
-            away_starters
-            - {row["batter_id"] for row in partial_starters if row["game_pk"] == 22}
-        )
-        with self.assertRaisesRegex(
-            ValueError, r"missing official lineup batters.*\(22, 'away', 2, 2202\)"
-        ):
+        self.assertEqual(
             _aggregate_training_slot_rows(
                 games, partial_starters, full_season_mode=True
+            ),
+            rows,
+        )
+
+        missing_terminal = [
+            row
+            for row in pas
+            if not (
+                row["game_pk"] == 22
+                and row["inning_topbot"] == "Top"
+                and row["at_bat_number"] == 5
+            )
+        ]
+        with self.assertRaisesRegex(ValueError, "batting order"):
+            _aggregate_training_slot_rows(
+                games, missing_terminal, full_season_mode=True
+            )
+
+        missing_side = [
+            row
+            for row in pas
+            if row["game_pk"] != 22 or row["inning_topbot"] != "Top"
+        ]
+        with self.assertRaisesRegex(ValueError, "slot opportunities"):
+            _aggregate_training_slot_rows(
+                games, missing_side, full_season_mode=True
             )
 
         cross_team_player = json.loads(json.dumps(games))
@@ -723,6 +738,38 @@ class PrepareBoundaryTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "multiple terminal events"):
                 load_verified_statcast_evidence(td, [artifact.manifest_path])
+
+    def test_verified_statcast_evidence_uses_completed_pa_semantics(self):
+        query = {
+            "start": "2024-04-01",
+            "end": "2024-04-02",
+            "game_type": "R",
+            "url": statcast_url("2024-04-01", "2024-04-02"),
+        }
+        source = STATCAST.read_text("utf-8-sig")
+        cases = (
+            (
+                source.replace(
+                    "strikeout,swinging_strike", "truncated_pa,swinging_strike", 1
+                ),
+                5,
+            ),
+            (
+                source.replace("hit_by_pitch,hit_by_pitch", ",hit_by_pitch", 1),
+                6,
+            ),
+        )
+        for payload, expected_count in cases:
+            with self.subTest(expected_count=expected_count), tempfile.TemporaryDirectory() as td:
+                artifact = RawStore(Path(td)).put_unique_query(
+                    "baseball_savant_statcast", query, payload.encode()
+                )
+                evidence = load_verified_statcast_evidence(
+                    td, [artifact.manifest_path]
+                )
+                self.assertEqual(
+                    len(evidence.plate_appearances), expected_count
+                )
 
     def test_schedule_to_pa_completeness_rejects_one_missing_played_game(self):
         plate_appearances = [

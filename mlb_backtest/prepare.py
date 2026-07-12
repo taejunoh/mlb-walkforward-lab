@@ -376,7 +376,7 @@ def load_verified_statcast_evidence(
     verified_catalog=None,
 ) -> VerifiedStatcastEvidence:
     """Bind verified Statcast manifests to one immutable normalized snapshot."""
-    from .statcast import iter_statcast_pitches, statcast_url
+    from .statcast import is_completed_pa_row, iter_statcast_pitches, statcast_url
 
     if isinstance(manifest_paths, (str, bytes, Path)):
         raise ValueError("manifest_paths must be an iterable of manifest paths")
@@ -428,7 +428,7 @@ def load_verified_statcast_evidence(
             game_date = str(row["game_date"])
             if not start <= game_date <= end:
                 raise ValueError("verified Statcast row is outside its query range")
-            if not row["events"]:
+            if not is_completed_pa_row(row):
                 continue
             compact = SlotPA(
                 game_pk=int(row["game_pk"]),
@@ -815,7 +815,7 @@ def _aggregate_training_slot_rows(
     *,
     full_season_mode: bool = False,
 ) -> list[dict[str, object]]:
-    """Count 2022-2024 PA by each target game's official starting lineup slot."""
+    """Count every 2022-2024 terminal PA in its inherited lineup slot."""
     lineups = {}
     for game in schedule_games:
         if not isinstance(game, Mapping):
@@ -862,7 +862,7 @@ def _aggregate_training_slot_rows(
         rows = statcast_plate_appearances
     totals: defaultdict[tuple[int, int], int] = defaultdict(int)
     seen_pa = set()
-    matched_batters: defaultdict[tuple[int, str], set[int]] = defaultdict(set)
+    appearances: defaultdict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
     for row in rows:
         if not isinstance(row, (Mapping, SlotPA)):
             raise ValueError("plate appearance rows must be mappings or SlotPA")
@@ -891,23 +891,39 @@ def _aggregate_training_slot_rows(
             raise ValueError("plate appearance inning_topbot must be Top or Bot")
         side = "away" if half == "Top" else "home"
         batter_id = _positive_id(value("batter_id"), "plate appearance batter_id")
-        season, _official_date, sides = scheduled
-        slot = sides[side].get(batter_id)
-        if slot is not None:
+        appearances[(game_pk, side)].append((at_bat, batter_id))
+
+    observed_slots: defaultdict[tuple[int, str], set[int]] = defaultdict(set)
+    for (game_pk, side), side_appearances in appearances.items():
+        season, _official_date, sides = lineups[game_pk]
+        official_slots = sides[side]
+        substitute_slots = {}
+        expected_slot = 1
+        for at_bat, batter_id in sorted(side_appearances):
+            slot = official_slots.get(batter_id, substitute_slots.get(batter_id))
+            if slot is None:
+                slot = expected_slot
+                substitute_slots[batter_id] = slot
+            if slot != expected_slot:
+                raise ValueError(
+                    "terminal plate appearance batting order conflicts with official "
+                    f"lineup: {(game_pk, side, at_bat, batter_id, expected_slot, slot)}"
+                )
             totals[(season, slot)] += 1
-            matched_batters[(game_pk, side)].add(batter_id)
+            observed_slots[(game_pk, side)].add(slot)
+            expected_slot = expected_slot % 9 + 1
     if full_season_mode:
-        missing_starters = sorted(
-            (game_pk, side, slot, player_id)
-            for game_pk, (_season, _official_date, sides) in lineups.items()
+        missing_opportunities = sorted(
+            (game_pk, side, slot)
+            for game_pk, (_season, _official_date, _sides) in lineups.items()
             for side in ("away", "home")
-            for player_id, slot in sides[side].items()
-            if player_id not in matched_batters[(game_pk, side)]
+            for slot in range(1, 10)
+            if slot not in observed_slots[(game_pk, side)]
         )
-        if missing_starters:
+        if missing_opportunities:
             raise ValueError(
-                "played lineup games missing official lineup batters: "
-                f"{missing_starters}"
+                "played lineup games missing terminal slot opportunities: "
+                f"{missing_opportunities}"
             )
     expected = {
         (season, slot)
@@ -1153,7 +1169,7 @@ def derive_training_slot_rows(
     minimum_pa = validation_policy.minimum_starting_lineup_pa
     if any(totals_by_year[year] < minimum_pa for year in frozen):
         raise ValueError(
-            f"each frozen season requires at least {minimum_pa} starting-lineup PA"
+            f"each frozen season requires at least {minimum_pa} terminal lineup PA"
         )
     if len(rows) != 27:
         raise ValueError("frozen slot aggregation must contain exactly 27 rows")
