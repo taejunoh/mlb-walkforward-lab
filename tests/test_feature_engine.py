@@ -2,7 +2,9 @@ import json
 import math
 import time
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 from mlb_backtest.feature_engine import (
     FeatureHistory,
     ScheduleHistory,
@@ -12,6 +14,7 @@ from mlb_backtest.feature_engine import (
     pa_expected_woba,
 )
 from mlb_backtest.sources import parse_schedule
+from mlb_backtest.scoring_prep import build_raw_features_by_date
 from mlb_backtest.statcast import StatcastData
 
 
@@ -134,6 +137,75 @@ def build(target, history, team_map=None, league_era=None):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_representative_month_builds_one_history_without_full_pitch_prefix_scans(self):
+        rows = [
+            pa(1, "2025-04-01", 10, 201, "strikeout", xwoba=0.1, outs=1),
+            pa(
+                1,
+                "2025-04-01",
+                20,
+                101,
+                "field_out",
+                hand="L",
+                xwoba=0.2,
+                outs=1,
+                top="Bot",
+                at_bat=2,
+            ),
+        ]
+        games = [
+            game(
+                game_pk=day * 100 + sequence,
+                official_date=f"2025-05-{day:02d}",
+                scheduled_start_utc=f"2025-05-{day:02d}T{18 + sequence:02d}:00:00Z",
+            )
+            for day in range(1, 32)
+            for sequence in range(3)
+        ]
+        eras = {
+            f"2025-05-{day:02d}": {
+                (date(2025, 5, day) - timedelta(days=1)).isoformat(): era_record(
+                    as_of=(date(2025, 5, day) - timedelta(days=1)).isoformat()
+                )
+            }
+            for day in range(1, 32)
+        }
+        history_builds = 0
+        full_pitch_prefix_scans = 0
+        holder = {}
+        original_rows_before = FeatureHistory.rows_before
+
+        def history_factory(_representative):
+            nonlocal history_builds
+            history_builds += 1
+            history = FeatureHistory(
+                data(rows), slot_weights={i: 1 / 9 for i in range(1, 10)}
+            )
+            holder["history"] = history
+            return history
+
+        def tracked_rows_before(indexed_rows, target):
+            nonlocal full_pitch_prefix_scans
+            if indexed_rows is holder.get("history").pitches:
+                full_pitch_prefix_scans += 1
+            return original_rows_before(indexed_rows, target)
+
+        with mock.patch.object(
+            FeatureHistory, "rows_before", side_effect=tracked_rows_before
+        ):
+            prepared = build_raw_features_by_date(
+                games,
+                history_factory,
+                lambda target, history: build_raw_game_features(
+                    target, history, mapping(), eras[target["official_date"]]
+                ),
+            )
+
+        self.assertEqual(len(prepared), 31 * 3)
+        self.assertTrue(all(row["eligible"] for row in prepared))
+        self.assertEqual(history_builds, 1)
+        self.assertEqual(full_pitch_prefix_scans, 0)
+
     def test_fip_numerator_uses_completed_pas_but_outs_use_every_pitch(self):
         terminal = pa(1, "2025-04-30", 10, 101, "strikeout")
         terminal["outs_recorded"] = 0

@@ -1,5 +1,4 @@
 import math
-import time
 import unittest
 
 from mlb_backtest.scoring_prep import (
@@ -178,31 +177,6 @@ class ScoringPreparationTest(unittest.TestCase):
         )
         self.assertEqual(calls, ["2025-05-01"])
         self.assertEqual(rows, [(1, "2025-05-01"), (2, "2025-05-01"), (3, "2025-05-01")])
-
-    def test_representative_month_reuses_one_history_without_date_rescans(self):
-        games = [
-            {"game_pk": day * 100 + game, "official_date": f"2025-05-{day:02d}"}
-            for day in range(1, 32)
-            for game in range(1, 16)
-        ]
-        calls = 0
-
-        def history_factory(_game):
-            nonlocal calls
-            calls += 1
-            return object()
-
-        started = time.perf_counter()
-        rows = build_raw_features_by_date(
-            games,
-            history_factory,
-            lambda target, _history: target["game_pk"],
-        )
-        elapsed = time.perf_counter() - started
-
-        self.assertEqual(calls, 1)
-        self.assertEqual(len(rows), 31 * 15)
-        self.assertLess(elapsed, 1.0)
 
     def test_outcomes_are_prepared_only_from_locked_games_with_d1_baseline(self):
         schedule = [
