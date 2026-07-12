@@ -32,6 +32,7 @@ class ConfigTest(unittest.TestCase):
             config["initial_window"],
             {"start": "2025-05-01", "end": "2025-08-12"},
         )
+        self.assertEqual(config["extension_end"], "2025-09-28")
         self.assertEqual(config["graded_target"], 100)
         self.assertEqual(config["lock_minutes_before_first_pitch"], 45)
         self.assertEqual(
@@ -114,6 +115,22 @@ class ConfigTest(unittest.TestCase):
             path.write_text(json.dumps(changed))
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_extension_end_is_required_and_frozen_exactly(self):
+        valid = json.loads(CONFIG_PATH.read_text())
+        mutations = {
+            "missing": lambda config: config.pop("extension_end"),
+            "earlier": lambda config: config.update(extension_end="2025-09-27"),
+            "later": lambda config: config.update(extension_end="2025-09-29"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = copy.deepcopy(valid)
+                mutate(changed)
+                self._assert_invalid_config(
+                    changed,
+                    "extension_end must match the frozen model card",
+                )
 
     def test_rejects_non_object_json_root_with_specific_message(self):
         self._assert_invalid_config([], "config must be a JSON object")

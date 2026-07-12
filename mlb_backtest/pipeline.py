@@ -81,6 +81,11 @@ _LINEUP_PROVENANCE = frozenset(
 )
 
 
+def _backtest_schedule_window(config: Mapping[str, object]) -> dict[str, str]:
+    initial = config["initial_window"]
+    return {"start": initial["start"], "end": config["extension_end"]}
+
+
 def _canonical_json(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
@@ -211,8 +216,11 @@ def _require_raw_schedule(
     root: Path, config: Mapping[str, object], role: str
 ) -> tuple[str, dict[int, dict[str, object]]]:
     """Verify the immutable schedule manifest required by a prepared input stage."""
-    window_name = "training_window" if role == "training" else "initial_window"
-    window = config[window_name]
+    window = (
+        config["training_window"]
+        if role == "training"
+        else _backtest_schedule_window(config)
+    )
     expected_query = {
         "role": role,
         "start": window["start"],
@@ -378,7 +386,7 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
     artifacts = []
     for role, window in (
         ("training", config["training_window"]),
-        ("backtest", config["initial_window"]),
+        ("backtest", _backtest_schedule_window(config)),
     ):
         url = schedule_url(window["start"], window["end"])
         artifacts.append(
@@ -544,7 +552,7 @@ def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     candidates = [_validate_candidate(row) for row in _jsonl(source, "features/candidate_components.jsonl")]
     for candidate in candidates:
         _bind_candidate_to_schedule(
-            candidate, schedule_index, config["initial_window"]
+            candidate, schedule_index, _backtest_schedule_window(config)
         )
     seen: set[int] = set()
     predictions: list[dict[str, object]] = []
@@ -655,14 +663,22 @@ def _rank_and_lock(
 
 
 def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
-    load_config(config_path)
+    config = load_config(config_path)
     root = _safe_data_dir(data_dir)
     _, model_hash = _load_model_card(root, config_path)
     candidates = _jsonl(
         root / "features" / "scored_candidates.jsonl",
         "features/scored_candidates.jsonl",
     )
-    return _rank_and_lock(candidates, _stage(root, "locked"), model_hash)
+    initial = config["initial_window"]
+    initial_candidates = [
+        row
+        for row in candidates
+        if initial["start"] <= row["official_date"] <= initial["end"]
+    ]
+    return _rank_and_lock(
+        initial_candidates, _stage(root, "locked"), model_hash
+    )
 
 
 def _require_complete_outcomes(
@@ -778,11 +794,10 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     config = load_config(config_path)
     schedule_payload = _regular_bytes(fixture / "schedule.json", "fixture schedule")
     raw_store = RawStore(_stage(root, "raw"))
-    for role, window_name in (
-        ("training", "training_window"),
-        ("backtest", "initial_window"),
+    for role, window in (
+        ("training", config["training_window"]),
+        ("backtest", _backtest_schedule_window(config)),
     ):
-        window = config[window_name]
         raw_store.put(
             "mlb_schedule",
             {

@@ -9,6 +9,7 @@
     "start": "2025-05-01",
     "end": "2025-08-12"
   },
+  "extension_end": "2025-09-28",
   "graded_target": 100,
   "lock_minutes_before_first_pitch": 45,
   "component_weights": {

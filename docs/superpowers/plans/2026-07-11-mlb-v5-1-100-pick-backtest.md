@@ -774,6 +774,10 @@ git commit -m "feat: add backtest metrics and completion rules"
 
 ## Task 10: Orchestrate acquisition, calibration, replay, lock, and evaluation
 
+The frozen acquisition window begins on `2025-05-01`; the initial lock ends on
+`2025-08-12`, while schedule-backed extensions may continue only through the
+frozen `extension_end` of `2025-09-28`.
+
 **Files:**
 - Create: `mlb_backtest/pipeline.py`
 - Create: `tests/fixtures/mini_replay/`

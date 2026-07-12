@@ -17,3 +17,5 @@ lock exists. `outcomes.json` and `extension_outcomes.json` are combined
 CLI-contract samples used by standalone stage tests. Tests
 also inject nested market/outcome keys into otherwise valid candidates to prove
 that leakage validation is recursive rather than limited to top-level fields.
+The raw schedule additionally includes August 13 (eligible only as an extension)
+and September 29 (one day beyond the frozen September 28 extension boundary).

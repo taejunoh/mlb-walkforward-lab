@@ -77,6 +77,32 @@
           "teams": {"away": {"team": {"id": 135, "name": "San Diego Padres"}}, "home": {"team": {"id": 147, "name": "New York Yankees"}}}
         }
       ]
+    },
+    {
+      "date": "2025-08-13",
+      "games": [
+        {
+          "gamePk": 8101,
+          "gameType": "R",
+          "officialDate": "2025-08-13",
+          "gameDate": "2025-08-13T23:05:00Z",
+          "status": {"detailedState": "Final"},
+          "teams": {"away": {"team": {"id": 136, "name": "Seattle Mariners"}}, "home": {"team": {"id": 110, "name": "Baltimore Orioles"}}}
+        }
+      ]
+    },
+    {
+      "date": "2025-09-29",
+      "games": [
+        {
+          "gamePk": 9901,
+          "gameType": "R",
+          "officialDate": "2025-09-29",
+          "gameDate": "2025-09-29T23:05:00Z",
+          "status": {"detailedState": "Final"},
+          "teams": {"away": {"team": {"id": 141, "name": "Toronto Blue Jays"}}, "home": {"team": {"id": 139, "name": "Tampa Bay Rays"}}}
+        }
+      ]
     }
   ]
 }

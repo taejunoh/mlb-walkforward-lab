@@ -3,10 +3,12 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mlb_backtest.pipeline import (
     calibrate_stage,
     features_stage,
+    fetch_stage,
     lock_stage,
     main,
     outcomes_stage,
@@ -50,6 +52,15 @@ def _copy_raw_schedule(root):
             },
             payload,
         )
+    extension_query = {
+        "role": "backtest",
+        "start": config["initial_window"]["start"],
+        "end": config["extension_end"],
+        "url": schedule_url(
+            config["initial_window"]["start"], config["extension_end"]
+        ),
+    }
+    store.put("mlb_schedule", extension_query, payload)
 
 
 def _prepare_through_lock(root, candidates=None):
@@ -243,6 +254,27 @@ class PipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink"):
                 main(["features", "--config", str(CONFIG), "--data-dir", str(root)])
 
+    def test_fetch_covers_frozen_extension_end(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "mlb_backtest.pipeline.fetch_bytes", return_value=b'{"dates":[]}'
+        ) as mocked_fetch:
+            fetch_stage(CONFIG, Path(td))
+
+        config = load_config(CONFIG)
+        self.assertEqual(
+            [call.args[0] for call in mocked_fetch.call_args_list],
+            [
+                schedule_url(
+                    config["training_window"]["start"],
+                    config["training_window"]["end"],
+                ),
+                schedule_url(
+                    config["initial_window"]["start"],
+                    config["extension_end"],
+                ),
+            ],
+        )
+
     def test_stage_contracts_reject_post_cutoff_and_leaky_candidate_inputs(self):
         games = json.loads((FIXTURE / "games.json").read_text("utf-8"))
         calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
@@ -388,6 +420,77 @@ class PipelineTest(unittest.TestCase):
                 calibrate_stage(CONFIG, root)
                 with self.assertRaisesRegex(ValueError, "official schedule|window"):
                     features_stage(CONFIG, root)
+
+    def test_schedule_backed_candidate_after_initial_window_is_extension_eligible(self):
+        calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
+        template = json.loads((FIXTURE / "games.json").read_text("utf-8"))[0]
+        august = dict(
+            template,
+            game_pk=8101,
+            official_date="2025-08-13",
+            scheduled_start_utc="2025-08-13T23:05:00Z",
+            away_team="Seattle Mariners",
+            home_team="Baltimore Orioles",
+        )
+        september = dict(
+            template,
+            game_pk=9901,
+            official_date="2025-09-29",
+            scheduled_start_utc="2025-09-29T23:05:00Z",
+            away_team="Toronto Blue Jays",
+            home_team="Tampa Bay Rays",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _copy_raw_schedule(root)
+            _write_jsonl(root / "calibration" / "training_edges.jsonl", calibration)
+            _write_jsonl(root / "features" / "candidate_components.jsonl", [august])
+            calibrate_stage(CONFIG, root)
+            features_stage(CONFIG, root)
+            self.assertEqual(
+                _jsonl(root / "features" / "scored_candidates.jsonl")[0]["game_pk"],
+                8101,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _copy_raw_schedule(root)
+            _write_jsonl(root / "calibration" / "training_edges.jsonl", calibration)
+            _write_jsonl(
+                root / "features" / "candidate_components.jsonl", [september]
+            )
+            calibrate_stage(CONFIG, root)
+            with self.assertRaisesRegex(ValueError, "window"):
+                features_stage(CONFIG, root)
+
+    def test_initial_lock_cutoff_excludes_post_august_12_without_outcome(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            calibration = json.loads(
+                (FIXTURE / "calibration.json").read_text("utf-8")
+            )
+            games = json.loads((FIXTURE / "games.json").read_text("utf-8"))
+            games.append(
+                dict(
+                    games[0],
+                    game_pk=8101,
+                    official_date="2025-08-13",
+                    scheduled_start_utc="2025-08-13T23:05:00Z",
+                    away_team="Seattle Mariners",
+                    home_team="Baltimore Orioles",
+                )
+            )
+            _copy_raw_schedule(root)
+            _write_jsonl(root / "calibration" / "training_edges.jsonl", calibration)
+            _write_jsonl(root / "features" / "candidate_components.jsonl", games)
+            calibrate_stage(CONFIG, root)
+            features_stage(CONFIG, root)
+            lock_stage(CONFIG, root)
+            initial = _jsonl(root / "locked" / "predictions.jsonl")
+            self.assertTrue(
+                all(row["official_date"] <= "2025-08-12" for row in initial)
+            )
+            self.assertNotIn(8101, {row["game_pk"] for row in initial})
 
     def test_fixture_replay_extends_past_repeated_void_until_target(self):
         with tempfile.TemporaryDirectory() as td:

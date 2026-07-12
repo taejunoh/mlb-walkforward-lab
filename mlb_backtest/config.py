@@ -55,6 +55,7 @@ def load_config(path):
         "lock_minutes_before_first_pitch": 45,
         "training_window": {"start": "2022-01-01", "end": "2024-12-31"},
         "initial_window": {"start": "2025-05-01", "end": "2025-08-12"},
+        "extension_end": "2025-09-28",
         "graded_target": 100,
         "shrinkage_constants": SHRINKAGE_CONSTANTS,
         "probability_clip": [0.10, 0.90],
