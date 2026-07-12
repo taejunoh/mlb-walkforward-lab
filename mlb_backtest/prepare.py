@@ -19,6 +19,7 @@ from .sources import parse_schedule, schedule_url
 
 _EVIDENCE_TOKEN = object()
 PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
+OUT_OF_RANGE_UNPLAYED_STATUSES = frozenset({"Postponed", "Canceled", "Cancelled"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +311,20 @@ def load_verified_schedule_evidence(
             date_entry.get("date"), f"schedule payload dates[{index}].date"
         )
         if not start <= query_date <= end:
+            raise ValueError("verified schedule payload contains a game outside its query")
+    result_fields = (
+        "away_score",
+        "home_score",
+        "away_is_winner",
+        "home_is_winner",
+        "completed_innings",
+        "final_outs",
+    )
+    for game in games:
+        if not start <= str(game["official_date"]) <= end and (
+            game["status"] not in OUT_OF_RANGE_UNPLAYED_STATUSES
+            or any(game[field] is not None for field in result_fields)
+        ):
             raise ValueError("verified schedule payload contains a game outside its query")
     game_pks = tuple(sorted(_positive_id(game.get("game_pk"), "schedule game_pk") for game in games))
     if len(set(game_pks)) != len(game_pks):

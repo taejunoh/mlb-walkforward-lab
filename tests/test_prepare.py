@@ -551,15 +551,73 @@ class PrepareBoundaryTest(unittest.TestCase):
                 VerifiedScheduleEvidence()
 
     def test_verified_schedule_uses_query_date_bucket_for_rescheduled_game(self):
+        for status in ("Postponed", "Canceled", "Cancelled"):
+            with self.subTest(status=status):
+                payload = json.loads(
+                    (
+                        ROOT / "tests" / "fixtures" / "schedule_2025_05_01.json"
+                    ).read_text()
+                )
+                game = payload["dates"][0]["games"][0]
+                game["officialDate"] = "2025-08-09"
+                game["status"] = {"detailedState": status}
+                for side in ("away", "home"):
+                    game["teams"][side].pop("score")
+                    game["teams"][side].pop("isWinner")
+                query = {
+                    "role": "history",
+                    "start": "2025-05-01",
+                    "end": "2025-05-01",
+                    "gameType": "R",
+                    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2025-05-01&endDate=2025-05-01&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore",
+                }
+                with tempfile.TemporaryDirectory() as td:
+                    artifact = RawStore(Path(td)).put_unique_query(
+                        "mlb_schedule", query, json.dumps(payload).encode()
+                    )
+                    evidence = load_verified_schedule_evidence(
+                        td, artifact.manifest_path
+                    )
+
+                self.assertEqual(evidence.game_pks, (778100,))
+                self.assertEqual(evidence.games[0]["official_date"], "2025-08-09")
+
+    def test_verified_schedule_rejects_playable_game_with_official_date_outside_query(self):
+        for status in ("Final", "Scheduled"):
+            with self.subTest(status=status):
+                payload = json.loads(
+                    (
+                        ROOT / "tests" / "fixtures" / "schedule_2025_05_01.json"
+                    ).read_text()
+                )
+                game = payload["dates"][0]["games"][0]
+                game["officialDate"] = "2025-08-09"
+                game["status"] = {"detailedState": status}
+                if status == "Scheduled":
+                    for side in ("away", "home"):
+                        game["teams"][side].pop("score")
+                        game["teams"][side].pop("isWinner")
+                query = {
+                    "role": "history",
+                    "start": "2025-05-01",
+                    "end": "2025-05-01",
+                    "gameType": "R",
+                    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2025-05-01&endDate=2025-05-01&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore",
+                }
+                with tempfile.TemporaryDirectory() as td:
+                    artifact = RawStore(Path(td)).put_unique_query(
+                        "mlb_schedule", query, json.dumps(payload).encode()
+                    )
+                    with self.assertRaisesRegex(ValueError, "outside its query"):
+                        load_verified_schedule_evidence(td, artifact.manifest_path)
+
+    def test_verified_schedule_out_of_range_unplayed_game_cannot_have_result(self):
         payload = json.loads(
             (ROOT / "tests" / "fixtures" / "schedule_2025_05_01.json").read_text()
         )
         game = payload["dates"][0]["games"][0]
         game["officialDate"] = "2025-08-09"
         game["status"] = {"detailedState": "Postponed"}
-        for side in ("away", "home"):
-            game["teams"][side].pop("score")
-            game["teams"][side].pop("isWinner")
         query = {
             "role": "history",
             "start": "2025-05-01",
@@ -571,10 +629,8 @@ class PrepareBoundaryTest(unittest.TestCase):
             artifact = RawStore(Path(td)).put_unique_query(
                 "mlb_schedule", query, json.dumps(payload).encode()
             )
-            evidence = load_verified_schedule_evidence(td, artifact.manifest_path)
-
-        self.assertEqual(evidence.game_pks, (778100,))
-        self.assertEqual(evidence.games[0]["official_date"], "2025-08-09")
+            with self.assertRaisesRegex(ValueError, "outside its query"):
+                load_verified_schedule_evidence(td, artifact.manifest_path)
 
     def test_verified_schedule_rejects_date_bucket_outside_query(self):
         payload = json.loads(
