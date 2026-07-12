@@ -330,7 +330,7 @@ def build_raw_features_by_date(
     history_factory: Callable[[Mapping[str, object]], object],
     feature_builder: Callable[[Mapping[str, object], object], object],
 ) -> list[object]:
-    """Build one history per date and reuse it for every same-date target game."""
+    """Build one history and reuse its as-of indexes for an entire season."""
     grouped: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     seen = set()
     for game in games:
@@ -339,10 +339,13 @@ def build_raw_features_by_date(
             raise ValueError("duplicate target game_pk")
         seen.add(game_pk)
         grouped[str(game.get("official_date"))].append(game)
+    if not grouped:
+        return []
+    first_day = min(grouped)
+    history = history_factory(min(grouped[first_day], key=lambda game: game["game_pk"]))
     output = []
     for day in sorted(grouped):
         daily = sorted(grouped[day], key=lambda game: game["game_pk"])
-        history = history_factory(daily[0])
         output.extend(feature_builder(game, history) for game in daily)
     return output
 

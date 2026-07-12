@@ -1236,30 +1236,19 @@ def build_pregame_history(
     slot_weights: Mapping[int, float],
     schedule_build: ScheduleHistoryBuild,
 ):
-    """Construct FeatureHistory only after removing target/same-day/future events."""
+    """Construct one full-source FeatureHistory for strict as-of indexed queries."""
     from .feature_engine import FeatureHistory
     from .statcast import StatcastData
 
     if not isinstance(target_game, Mapping):
         raise ValueError("target_game must be a mapping")
-    target_pk = _positive_id(target_game.get("game_pk"), "target game_pk")
-    target_date = _canonical_day(
-        target_game.get("official_date"), "target official_date"
-    )
+    _positive_id(target_game.get("game_pk"), "target game_pk")
+    _canonical_day(target_game.get("official_date"), "target official_date")
     if not isinstance(schedule_build, ScheduleHistoryBuild):
         raise ValueError("schedule_build must be a ScheduleHistoryBuild")
     if not isinstance(statcast_data, StatcastData):
         raise ValueError("statcast_data must be StatcastData")
 
-    def eligible(row: Mapping[str, object]) -> bool:
-        row_pk = _positive_id(row.get("game_pk"), "Statcast game_pk")
-        row_date = _canonical_day(row.get("game_date"), "Statcast game_date")
-        return row_date < target_date and row_pk != target_pk
-
-    filtered = StatcastData(
-        tuple(row for row in statcast_data.pitches if eligible(row)),
-        tuple(row for row in statcast_data.plate_appearances if eligible(row)),
-    )
     venue_by_name = {}
     for row in schedule_build.rows:
         name = row.get("venue_name")
@@ -1275,7 +1264,7 @@ def build_pregame_history(
                 if field in row
             }
     history = FeatureHistory(
-        filtered,
+        statcast_data,
         slot_weights=slot_weights,
         schedule_history=schedule_build.rows,
         schedule_coverage_start=schedule_build.coverage_start,
@@ -1283,8 +1272,6 @@ def build_pregame_history(
         schedule_coverage_complete=schedule_build.coverage_complete,
         venue_by_name=venue_by_name,
     )
-    assert_pregame_history(target_game, history.pitches)
-    assert_pregame_history(target_game, history.plate_appearances)
     return history
 
 

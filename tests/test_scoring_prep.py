@@ -1,4 +1,5 @@
 import math
+import time
 import unittest
 
 from mlb_backtest.scoring_prep import (
@@ -158,7 +159,7 @@ class ScoringPreparationTest(unittest.TestCase):
             },
         )
 
-    def test_history_factory_is_reused_once_for_all_games_on_date(self):
+    def test_history_factory_is_reused_once_for_an_entire_season(self):
         games = [
             {"game_pk": 1, "official_date": "2025-05-01"},
             {"game_pk": 2, "official_date": "2025-05-01"},
@@ -175,8 +176,33 @@ class ScoringPreparationTest(unittest.TestCase):
             history_factory,
             lambda game, history: (game["game_pk"], history["date"]),
         )
-        self.assertEqual(calls, ["2025-05-01", "2025-05-02"])
-        self.assertEqual(rows, [(1, "2025-05-01"), (2, "2025-05-01"), (3, "2025-05-02")])
+        self.assertEqual(calls, ["2025-05-01"])
+        self.assertEqual(rows, [(1, "2025-05-01"), (2, "2025-05-01"), (3, "2025-05-01")])
+
+    def test_representative_month_reuses_one_history_without_date_rescans(self):
+        games = [
+            {"game_pk": day * 100 + game, "official_date": f"2025-05-{day:02d}"}
+            for day in range(1, 32)
+            for game in range(1, 16)
+        ]
+        calls = 0
+
+        def history_factory(_game):
+            nonlocal calls
+            calls += 1
+            return object()
+
+        started = time.perf_counter()
+        rows = build_raw_features_by_date(
+            games,
+            history_factory,
+            lambda target, _history: target["game_pk"],
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(rows), 31 * 15)
+        self.assertLess(elapsed, 1.0)
 
     def test_outcomes_are_prepared_only_from_locked_games_with_d1_baseline(self):
         schedule = [

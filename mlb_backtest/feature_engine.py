@@ -391,6 +391,25 @@ class FeatureHistory:
         )
 
     @staticmethod
+    def rows_before(
+        rows: Sequence[Mapping[str, object]], target: date
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return the date-sorted prefix strictly before target in O(log n) lookup."""
+        boundary = bisect_left(
+            rows, target.isoformat(), key=lambda row: str(row["game_date"])
+        )
+        return tuple(rows[:boundary])
+
+    @staticmethod
+    def last_before(
+        rows: Sequence[Mapping[str, object]], target: date
+    ) -> Mapping[str, object] | None:
+        boundary = bisect_left(
+            rows, target.isoformat(), key=lambda row: str(row["game_date"])
+        )
+        return rows[boundary - 1] if boundary else None
+
+    @staticmethod
     def _pitch_key(row: Mapping[str, object]) -> tuple:
         return (
             str(row["game_date"]),
@@ -488,10 +507,13 @@ def _k_minus_bb(
 def _starter_component(
     history: FeatureHistory, pitcher_id: int, target: date, league_era: float
 ) -> dict:
-    career_bf = len(history.pa_by_pitcher.get(pitcher_id, ()))
+    pitcher_pas = history.rows_before(
+        history.pa_by_pitcher.get(pitcher_id, ()), target
+    )
+    career_bf = len(pitcher_pas)
     season = [
         r
-        for r in history.pa_by_pitcher.get(pitcher_id, ())
+        for r in pitcher_pas
         if _day(r["game_date"], "game_date").year == target.year
     ]
     xwoba, bf = _rate(season)
@@ -503,7 +525,8 @@ def _starter_component(
         - 2 * sum(r["events"] in {"strikeout", "strikeout_double_play"} for r in season)
     )
     outs = sum(int(r["outs_on_play"]) for r in season)
-    league_raw_fip, league_bf = history.league_fip_by_year.get(target.year, (None, 0))
+    league_rows = history.rows_before(history.pa_by_year.get(target.year, ()), target)
+    league_raw_fip, league_bf = history._league_fip(league_rows)
     cfip = league_era - league_raw_fip if league_raw_fip is not None else None
     pitcher_raw_fip = numerator / (outs / 3.0) if outs else None
     fip = (
@@ -618,7 +641,9 @@ def _offense_component(
         player_id = int(player["player_id"])
         rows = [
             r
-            for r in history.pa_by_batter.get(player_id, ())
+            for r in history.rows_before(
+                history.pa_by_batter.get(player_id, ()), target
+            )
             if _day(r["game_date"], "game_date").year == target.year
         ]
         platoon = [
@@ -699,7 +724,7 @@ def _offense_component(
 def _bullpen_component(history: FeatureHistory, team_code: str, target: date) -> dict:
     rows = [
         r
-        for r in history.pa_by_team.get(team_code, ())
+        for r in history.rows_before(history.pa_by_team.get(team_code, ()), target)
         if _day(r["game_date"], "game_date").year == target.year
         and history.roles.get((int(r["game_pk"]), int(r["pitcher_id"])), {}).get(
             "is_reliever"
@@ -951,9 +976,11 @@ def _schedule_component(
 
 def _max_history_date(history: FeatureHistory, target: date | None) -> str | None:
     dates = []
-    for row in (history.max_pitch_row, history.max_pa_row):
-        if row is not None:
-            dates.append(_day(row["game_date"], "game_date"))
+    if target is not None:
+        for rows in (history.pitches, history.plate_appearances):
+            row = history.last_before(rows, target)
+            if row is not None:
+                dates.append(_day(row["game_date"], "game_date"))
     schedule_max = history.schedule_history.max_before(target)
     if schedule_max is not None:
         dates.append(schedule_max)
@@ -1098,19 +1125,10 @@ def _eligibility(
 
 
 def _assert_history(game: Mapping[str, object], history: FeatureHistory) -> None:
-    game_pk = int(game["game_pk"])
-    pitch_boundary = []
-    if game_pk in history.pitch_game_pks:
-        pitch_boundary.append(history.pitches_by_game[game_pk][0])
-    if history.max_pitch_row is not None:
-        pitch_boundary.append(history.max_pitch_row)
-    assert_pregame_history(game, pitch_boundary)
-    pa_boundary = []
-    if game_pk in history.pa_game_pks:
-        pa_boundary.append(history.pa_by_game[game_pk][0])
-    if history.max_pa_row is not None:
-        pa_boundary.append(history.max_pa_row)
-    assert_pregame_history(game, pa_boundary)
+    target = _day(game["official_date"], "official_date")
+    for rows in (history.pitches, history.plate_appearances):
+        row = history.last_before(rows, target)
+        assert_pregame_history(game, (row,) if row is not None else ())
 
 
 def build_raw_game_features(
@@ -1143,7 +1161,7 @@ def build_raw_game_features(
     history_validation = "NOT_RUN_INVALID_TARGET"
     if target_identity_valid:
         _assert_history(game, history)
-        history_validation = "PASSED"
+        history_validation = "PASSED_AS_OF"
     result = {
         "game_pk": game.get("game_pk"),
         "official_date": target.isoformat()
@@ -1178,13 +1196,19 @@ def build_raw_game_features(
             != game.get("home_actual_starter_id")
         ),
     }
-    raw_source_max_date = _max_history_date(history, target)
+    raw_source_dates = [
+        _day(row["game_date"], "game_date")
+        for row in (history.max_pitch_row, history.max_pa_row)
+        if row is not None
+    ]
+    raw_source_max_date = max(raw_source_dates).isoformat() if raw_source_dates else None
+    max_history_date = _max_history_date(history, target)
     schedule_input_max = history.schedule_history.input_max_date
     schedule_used_max = (
         history.schedule_history.max_before(target) if target is not None else None
     )
     provenance = {
-        "max_history_date": raw_source_max_date,
+        "max_history_date": max_history_date,
         "raw_source_max_date": raw_source_max_date,
         "statcast_target_excluded": target_identity_valid,
         "history_validation": history_validation,
@@ -1224,7 +1248,9 @@ def build_raw_game_features(
     hands = {}
     for side in ("home", "away"):
         pid = int(game[f"{side}_actual_starter_id"])
-        pitcher_rows = history.pitches_by_pitcher.get(pid, ())
+        pitcher_rows = history.rows_before(
+            history.pitches_by_pitcher.get(pid, ()), target
+        )
         hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else None
     for side, opponent in (("home", "away"), ("away", "home")):
         name = str(game[f"{side}_team"])

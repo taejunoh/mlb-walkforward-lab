@@ -720,7 +720,7 @@ class PrepareBoundaryTest(unittest.TestCase):
                     **changes,
                 )
 
-    def test_build_pregame_history_is_the_target_event_filtering_boundary(self):
+    def test_build_pregame_history_builds_one_full_source_index_for_as_of_queries(self):
         parsed = parse_statcast(STATCAST)
         target_game = {"game_pk": 1002, "official_date": "2024-04-02"}
         prior_target_pitch = dict(parsed.pitches[0], game_pk=1002, game_date="2024-04-01")
@@ -752,11 +752,10 @@ class PrepareBoundaryTest(unittest.TestCase):
             {slot: 1 / 9 for slot in range(1, 10)},
             schedule_build,
         )
-        self.assertEqual(history.pitch_game_pks, {1001})
-        self.assertEqual(history.pa_game_pks, {1001})
-        self.assertTrue(all(row["game_date"] < "2024-04-02" for row in history.pitches))
-        self.assertNotIn(1002, history.pitch_game_pks)
-        self.assertNotIn(1002, history.pa_game_pks)
+        self.assertEqual(history.pitch_game_pks, {1001, 1002})
+        self.assertEqual(history.pa_game_pks, {1001, 1002})
+        self.assertIn(1002, history.pitch_game_pks)
+        self.assertIn(1002, history.pa_game_pks)
         self.assertTrue(history.schedule_history.coverage_complete)
 
 

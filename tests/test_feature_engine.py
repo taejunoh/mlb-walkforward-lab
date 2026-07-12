@@ -134,6 +134,55 @@ def build(target, history, team_map=None, league_era=None):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_full_season_history_is_strictly_bounded_as_of_target_date(self):
+        prior = [
+            pa(1, "2025-04-30", 10, 101, "strikeout", xwoba=0.1, outs=1),
+            pa(
+                1,
+                "2025-04-30",
+                20,
+                201,
+                "field_out",
+                hand="L",
+                xwoba=0.2,
+                outs=1,
+                top="Bot",
+                at_bat=2,
+            ),
+        ]
+        same_day = pa(
+            900,
+            "2025-05-01",
+            10,
+            101,
+            "home_run",
+            xwoba=2.0,
+            at_bat=3,
+        )
+        future = pa(
+            901,
+            "2025-05-02",
+            20,
+            201,
+            "home_run",
+            hand="L",
+            xwoba=2.0,
+            top="Bot",
+            at_bat=4,
+        )
+        weights = {i: 1 / 9 for i in range(1, 10)}
+        expected = build(game(), FeatureHistory(data(prior), slot_weights=weights))
+        actual = build(
+            game(),
+            FeatureHistory(data([*prior, same_day, future]), slot_weights=weights),
+        )
+
+        for side in ("home", "away"):
+            self.assertEqual(actual[side], expected[side])
+        self.assertEqual(actual["provenance"]["max_history_date"], "2025-04-30")
+        self.assertEqual(actual["provenance"]["raw_source_max_date"], "2025-05-02")
+        self.assertEqual(actual["provenance"]["history_validation"], "PASSED_AS_OF")
+
     def test_schedule_coverage_window_controls_supported_subrules(self):
         with self.assertRaises(TypeError):
             ScheduleHistory([])
@@ -385,7 +434,7 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertNotIn("home", result)
         self.assertFalse(result["provenance"]["statcast_coverage_complete"])
 
-    def test_asserts_pregame_boundary_for_plate_appearances_and_provenance(self):
+    def test_as_of_boundary_excludes_target_plate_appearances_and_tracks_provenance(self):
         pitch = pa(1, "2025-04-28", 10, 101, "field_out", xwoba=0.1)
         later_pa = pa(2, "2025-04-30", 10, 102, "field_out", xwoba=0.1)
         history = FeatureHistory(
@@ -402,8 +451,18 @@ class FeatureEngineTest(unittest.TestCase):
             StatcastData((pitch,), (pitch, target_pa)),
             slot_weights={i: 1 / 9 for i in range(1, 10)},
         )
-        with self.assertRaisesRegex(ValueError, "target game_pk|strictly before"):
-            build(game(), poisoned)
+        clean = build(
+            game(),
+            FeatureHistory(
+                StatcastData((pitch,), (pitch,)),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+            ),
+        )
+        bounded = build(game(), poisoned)
+        self.assertEqual(bounded["home"], clean["home"])
+        self.assertEqual(bounded["away"], clean["away"])
+        self.assertEqual(bounded["provenance"]["raw_source_max_date"], "2025-05-01")
+        self.assertEqual(bounded["provenance"]["max_history_date"], "2025-04-28")
 
     def test_valid_output_discloses_lineup_and_raw_source_provenance(self):
         row = pa(1, "2025-04-30", 10, 101, "field_out", xwoba=0.1, outs=1)
@@ -413,7 +472,7 @@ class FeatureEngineTest(unittest.TestCase):
         )
         self.assertEqual(result["lineup_provenance"], "RECONSTRUCTED_FINAL_LINEUP")
         self.assertEqual(result["provenance"]["raw_source_max_date"], "2025-04-30")
-        self.assertEqual(result["provenance"]["history_validation"], "PASSED")
+        self.assertEqual(result["provenance"]["history_validation"], "PASSED_AS_OF")
         self.assertTrue(result["provenance"]["statcast_target_excluded"])
 
     def test_rate_denominators_and_frozen_reliability_qualities(self):
@@ -1130,7 +1189,7 @@ class FeatureEngineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "30-team mapping"):
             build(game(), history, bad)
 
-    def test_rejects_target_rows_and_is_byte_deterministic_under_permutation(self):
+    def test_ignores_target_rows_and_is_byte_deterministic_under_permutation(self):
         rows = [
             pa(1, "2025-04-30", 10, 101, "field_out", xwoba=0.2, outs=1),
             pa(
@@ -1150,8 +1209,9 @@ class FeatureEngineTest(unittest.TestCase):
         b = build(game(), FeatureHistory(data(list(reversed(rows))), **kwargs))
         self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
         target = rows + [pa(900, "2025-05-01", 10, 101, "home_run", xwoba=2.0)]
-        with self.assertRaisesRegex(ValueError, "target game_pk|strictly before"):
-            build(game(), FeatureHistory(data(target), **kwargs))
+        bounded = build(game(), FeatureHistory(data(target), **kwargs))
+        self.assertEqual(bounded["home"], a["home"])
+        self.assertEqual(bounded["away"], a["away"])
 
     @staticmethod
     def _numbers(value):
