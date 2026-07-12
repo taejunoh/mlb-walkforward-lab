@@ -8,7 +8,7 @@ import stat
 import tempfile
 import unittest
 
-from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
+from mlb_backtest.diagnostics import canonical_json_bytes, deep_freeze, sha256_file
 from mlb_backtest.protocols import (
     CHANGE_CHANGED,
     CHANGE_FORBIDDEN,
@@ -22,26 +22,35 @@ from mlb_backtest.protocols import (
     HISTORICAL_SELECTION,
     HISTORICAL_TERMINAL,
     RUN_REQUIRED_KEYS,
+    PROSPECTIVE_REQUIRED_KEYS,
     V52_REQUIRED_KEYS,
     classify_uncertainty,
+    classify_snapshot,
+    combine_ledgers,
     classify_v52,
     data_completeness_score,
+    date_disposition,
     direction_from_p_home,
     eligibility_disposition,
+    eligible_for_prospective_official_pool,
     expected_v52_config,
     expected_historical_run,
+    expected_prospective_spec,
     load_run_spec,
+    load_prospective_spec,
     load_change_contract,
     load_v52_config,
     optional_neutral,
     parse_change_contract,
     parse_run_spec,
+    parse_prospective_spec,
     parse_v52_config,
     ranking_key,
     read_legacy_confidence,
     validate_fold,
     validate_run,
     write_historical_contract,
+    write_prospective_contract,
     write_v52_config_contracts,
 )
 
@@ -52,6 +61,175 @@ V52_SCHEMA = ROOT / "schemas/v5_2_qd.schema.json"
 CHANGE_CONTRACT = ROOT / "protocols/v5_2_qd/change_contract.json"
 HISTORICAL_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 RUN_SCHEMA = ROOT / "schemas/v5_2_run_spec.schema.json"
+PROSPECTIVE_SPEC = ROOT / "protocols/v5_2_qd/prospective_2026.json"
+PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
+
+
+class ProspectiveProtocolTest(unittest.TestCase):
+    def test_exact_2026_oof_and_timestamp_contract(self):
+        spec = load_prospective_spec(PROSPECTIVE_SPEC)
+        self.assertEqual(spec.first_permitted_date.isoformat(), "2026-07-13")
+        self.assertEqual(spec.fit_years, tuple(range(2018, 2025)))
+        self.assertNotIn(2025, spec.fit_years)
+        self.assertEqual(spec.oof_targets, (2019, 2020, 2021, 2022, 2023, 2024))
+        self.assertEqual(
+            spec.polling,
+            deep_freeze(
+                {
+                    "T-90_to_before_T-50_seconds": 300,
+                    "T-50_to_T-45_seconds": 60,
+                    "qualifying_window_minutes": [-50, -45],
+                    "max_age_at_lock_minutes": 5,
+                    "max_ntp_offset_seconds": 2,
+                }
+            ),
+        )
+
+    def test_historical_rows_misses_and_partial_snapshots_cannot_enter_pool(self):
+        for stratum in (
+            "RECONSTRUCTED_FINAL_PARTICIPANTS",
+            "TIMESTAMP_PARTIAL_T45",
+        ):
+            self.assertFalse(eligible_for_prospective_official_pool(stratum))
+        with self.assertRaisesRegex(ValueError, "pooling forbidden"):
+            combine_ledgers("historical_walkforward_500", "prospective_2026")
+        self.assertEqual(date_disposition("acquisition_failure"), "SYSTEM_MISS")
+
+    def test_unknown_missing_nested_and_tampered_values_fail_closed(self):
+        raw = json.loads(PROSPECTIVE_SPEC.read_text())
+        for mutate in (
+            lambda value: value.__setitem__("unknown", 1),
+            lambda value: value.pop("polling"),
+            lambda value: value["polling"].pop("max_ntp_offset_seconds"),
+        ):
+            changed = copy.deepcopy(raw)
+            mutate(changed)
+            with self.assertRaisesRegex(ValueError, "keys"):
+                parse_prospective_spec(changed)
+        changed = copy.deepcopy(raw)
+        changed["schedule_changes"]["relock_forbidden"] = False
+        with self.assertRaisesRegex(ValueError, "prospective spec differs"):
+            parse_prospective_spec(changed)
+
+    def test_clock_pool_and_postlock_immutability_literal_contract(self):
+        spec = load_prospective_spec(PROSPECTIVE_SPEC)
+        self.assertEqual(spec.raw, deep_freeze(expected_prospective_spec()))
+        self.assertEqual(classify_snapshot(-50, 2.0, True), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(-45, 2.0, True), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(-44.999, 0, True), "LATE_RESPONSE_REJECTED")
+        self.assertEqual(classify_snapshot(-47, 2.000001, True), "SYSTEM_MISS_CLOCK")
+        self.assertEqual(classify_snapshot(-47, 0, False), "TIMESTAMP_PARTIAL_T45")
+        self.assertEqual(date_disposition("run_invalid"), "RUN_INVALID")
+        self.assertEqual(date_disposition("partial_only"), "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE")
+        self.assertEqual(date_disposition("empty_verified"), "NO_VERIFIED_ELIGIBLE_DATE")
+        changes = spec.raw["schedule_changes"]
+        self.assertEqual(changes["postlock_mutable_field"], "latest_effective_start_utc")
+        self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
+        self.assertIn("top1", changes["immutable_fields"])
+        self.assertTrue(changes["relock_forbidden"])
+        self.assertTrue(spec.raw["backfill_forbidden"])
+        self.assertTrue(spec.raw["pooling_forbidden"])
+
+    def test_evidence_gate_is_exact_and_historical_rows_are_forbidden(self):
+        gate = load_prospective_spec(PROSPECTIVE_SPEC).raw["evidence_gate"]
+        self.assertTrue(gate["all_integrity_gates_pass"])
+        self.assertEqual(
+            gate["accuracy_gt_home"],
+            {"required": True, "exact_denominator": 500},
+        )
+        self.assertEqual(
+            gate["accuracy_gt_d1_season_record"],
+            {"required": True, "exact_denominator": "N_season"},
+        )
+        self.assertTrue(gate["season_baseline_lower_bound_positive"])
+        self.assertEqual(gate["season_baseline_exact_mcnemar_p_lt"], 0.05)
+        self.assertFalse(gate["historical_rows_permitted"])
+
+    def test_schema_const_and_every_nested_object_are_closed(self):
+        raw = json.loads(PROSPECTIVE_SPEC.read_text())
+        schema = json.loads(PROSPECTIVE_SCHEMA.read_text())
+        self.assertEqual(schema["const"], raw)
+        self.assertEqual(set(schema["required"]), PROSPECTIVE_REQUIRED_KEYS)
+        self.assertEqual(set(schema["properties"]), PROSPECTIVE_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+
+        def assert_closed(value, node, path):
+            if isinstance(value, dict):
+                self.assertEqual(set(node["required"]), set(value), path)
+                self.assertEqual(set(node["properties"]), set(value), path)
+                self.assertFalse(node["additionalProperties"], path)
+                for key, child in value.items():
+                    assert_closed(child, node["properties"][key], f"{path}.{key}")
+            elif isinstance(value, list) and value:
+                for index, child in enumerate(value):
+                    assert_closed(child, node["items"], f"{path}[{index}]")
+
+        assert_closed(raw, schema, "prospective")
+
+    def test_writer_is_canonical_byte_deterministic_and_preserves_modes(self):
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
+            roots = (Path(first), Path(second))
+            for index, root in enumerate(roots):
+                if index == 0:
+                    for relative in (
+                        Path("protocols/v5_2_qd/prospective_2026.json"),
+                        Path("schemas/v5_2_prospective.schema.json"),
+                    ):
+                        path = root / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(b"old")
+                        path.chmod(0o600)
+                write_prospective_contract(root)
+            for relative in (
+                "protocols/v5_2_qd/prospective_2026.json",
+                "schemas/v5_2_prospective.schema.json",
+            ):
+                first_path, second_path = roots[0] / relative, roots[1] / relative
+                self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+                self.assertEqual(
+                    first_path.read_bytes(),
+                    canonical_json_bytes(json.loads(first_path.read_bytes())) + b"\n",
+                )
+                self.assertEqual(stat.S_IMODE(first_path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(second_path.stat().st_mode), 0o644)
+
+    def test_writer_rolls_back_both_files_on_second_replace_failure(self):
+        relatives = (
+            Path("protocols/v5_2_qd/prospective_2026.json"),
+            Path("schemas/v5_2_prospective.schema.json"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            old = {}
+            for index, relative in enumerate(relatives):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                old[path] = f"old-{index}".encode()
+                path.write_bytes(old[path])
+            original_replace = os.replace
+            final_replacements = 0
+
+            def fail_second_final(source, destination):
+                nonlocal final_replacements
+                if Path(destination) in tuple(root / item for item in relatives):
+                    final_replacements += 1
+                    if final_replacements == 2:
+                        raise OSError("second prospective replace failed")
+                return original_replace(source, destination)
+
+            with patch(
+                "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "second prospective replace failed"
+                ):
+                    write_prospective_contract(root)
+            for path, contents in old.items():
+                self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
 
 
 class HistoricalRunSpecTest(unittest.TestCase):

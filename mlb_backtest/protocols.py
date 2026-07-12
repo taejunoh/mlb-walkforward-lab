@@ -304,6 +304,57 @@ HISTORICAL_OUTCOME_ISOLATION = {
     "outcome_namespace": "data/v5_2_qd/historical/outcomes",
     "join_after_all_date_locks_sealed": True,
 }
+PROSPECTIVE_REQUIRED_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "model_version",
+        "first_permitted_date",
+        "fit_years",
+        "excluded_fit_years",
+        "oof_calibration",
+        "card_seal",
+        "polling",
+        "clock",
+        "schedule_changes",
+        "participant_provenance",
+        "official_pool",
+        "shadow_pool",
+        "date_state_precedence",
+        "terminal_contract",
+        "milestones",
+        "evidence_gate",
+        "namespace",
+        "pooling_forbidden",
+        "backfill_forbidden",
+    }
+)
+POLLING_KEYS = frozenset(
+    {
+        "T-90_to_before_T-50_seconds",
+        "T-50_to_T-45_seconds",
+        "qualifying_window_minutes",
+        "max_age_at_lock_minutes",
+        "max_ntp_offset_seconds",
+    }
+)
+PROVENANCE_CONTRACT_KEYS = frozenset(
+    {"official", "partial", "historical_forbidden"}
+)
+PROSPECTIVE_POLLING = {
+    "T-90_to_before_T-50_seconds": 300,
+    "T-50_to_T-45_seconds": 60,
+    "qualifying_window_minutes": [-50, -45],
+    "max_age_at_lock_minutes": 5,
+    "max_ntp_offset_seconds": 2,
+}
+PROSPECTIVE_DATE_PRECEDENCE = [
+    "RUN_INVALID",
+    "SYSTEM_MISS",
+    "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
+    "NO_VERIFIED_ELIGIBLE_DATE",
+    "LOCK_TOP1",
+]
 FOLD_LITERALS = (
     {
         "fold_id": "H22",
@@ -555,6 +606,18 @@ class RunSpec:
     raw: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class ProspectiveSpec:
+    run_id: str
+    first_permitted_date: date
+    fit_years: tuple[int, ...]
+    oof_targets: tuple[int, ...]
+    polling: Mapping[str, object]
+    official_provenance: str
+    namespace: str
+    raw: Mapping[str, object]
+
+
 def require_exact_keys(
     value: object, expected: frozenset[str], path: str
 ) -> Mapping[str, object]:
@@ -678,6 +741,183 @@ def parse_run_spec(raw: object) -> RunSpec:
 
 def load_run_spec(path: Path) -> RunSpec:
     return parse_run_spec(json.loads(path.read_text(encoding="utf-8")))
+
+
+def expected_prospective_spec() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": "prospective_2026",
+        "model_version": "v5.2-QD",
+        "first_permitted_date": "2026-07-13",
+        "fit_years": list(range(2018, 2025)),
+        "excluded_fit_years": [2025],
+        "oof_calibration": [
+            {
+                "target_year": year,
+                "normalization_years": list(range(2018, year)),
+            }
+            for year in range(2019, 2025)
+        ],
+        "card_seal": {
+            "deadline": "before_first_counted_pick",
+            "season_frozen": True,
+            "target_year_outcomes_refit_forbidden": True,
+        },
+        "polling": dict(PROSPECTIVE_POLLING),
+        "clock": {
+            "basis": "authoritative_observed_start_and_ntp_receipt_time",
+            "qualifying_interval_closed": True,
+            "timezone_normalization": "UTC",
+            "clock_failure_status": "SYSTEM_MISS_CLOCK",
+        },
+        "schedule_changes": {
+            "prelock": "invalidate_prior_snapshots_and_restart_countdown",
+            "late_reschedule": (
+                "TIMESTAMP_PARTIAL_T45:LATE_RESCHEDULE_UNVERIFIED"
+            ),
+            "postlock_mutable_field": "latest_effective_start_utc",
+            "immutable_fields": [
+                "lock_basis_start_utc",
+                "lock_at_utc",
+                "snapshot_qualification",
+                "prediction",
+                "provenance",
+                "official_rank",
+                "shadow_rank",
+                "top1",
+            ],
+            "relock_forbidden": True,
+        },
+        "participant_provenance": {
+            "official": "TIMESTAMP_VERIFIED_T45",
+            "partial": "TIMESTAMP_PARTIAL_T45",
+            "historical_forbidden": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+        },
+        "official_pool": {
+            "provenance": "TIMESTAMP_VERIFIED_T45",
+            "rank_field": "official_rank",
+            "partial_rows_affect_rank": False,
+            "p_home_equal_half_official": False,
+        },
+        "shadow_pool": {
+            "provenance": "TIMESTAMP_PARTIAL_T45",
+            "rank_field": "shadow_rank",
+            "tier": "UNRATED",
+        },
+        "date_state_precedence": list(PROSPECTIVE_DATE_PRECEDENCE),
+        "terminal_contract": json.loads(canonical_json_bytes(HISTORICAL_TERMINAL)),
+        "milestones": [25, 50, 100, 250, 500],
+        "evidence_gate": {
+            "label": "CONFIRMED_INCREMENTAL_EDGE",
+            "minimum_graded": 500,
+            "all_integrity_gates_pass": True,
+            "accuracy_gt_home": {"required": True, "exact_denominator": 500},
+            "accuracy_gt_d1_season_record": {
+                "required": True,
+                "exact_denominator": "N_season",
+            },
+            "season_baseline_lower_bound_positive": True,
+            "season_baseline_exact_mcnemar_p_lt": 0.05,
+            "brier_lt": 0.25,
+            "log_loss_lt": 0.6931471806,
+            "historical_rows_permitted": False,
+        },
+        "namespace": "data/v5_2_qd/prospective_2026",
+        "pooling_forbidden": True,
+        "backfill_forbidden": True,
+    }
+
+
+def parse_prospective_spec(raw: object) -> ProspectiveSpec:
+    obj = require_exact_keys(raw, PROSPECTIVE_REQUIRED_KEYS, "prospective")
+    polling = require_exact_keys(obj["polling"], POLLING_KEYS, "prospective.polling")
+    provenance = require_exact_keys(
+        obj["participant_provenance"],
+        PROVENANCE_CONTRACT_KEYS,
+        "prospective.participant_provenance",
+    )
+    if not isinstance(obj["oof_calibration"], list):
+        raise ValueError("prospective.oof_calibration must be a list")
+    for index, row in enumerate(obj["oof_calibration"]):
+        require_exact_keys(
+            row, OOF_ROW_KEYS, f"prospective.oof_calibration[{index}]"
+        )
+    try:
+        _validate_literal(obj, expected_prospective_spec(), "prospective")
+    except ValueError as exc:
+        if "keys differ" in str(exc):
+            raise
+        raise ValueError("prospective spec differs from frozen values") from exc
+    spec = ProspectiveSpec(
+        run_id=str(obj["run_id"]),
+        first_permitted_date=date.fromisoformat(str(obj["first_permitted_date"])),
+        fit_years=tuple(int(year) for year in obj["fit_years"]),
+        oof_targets=tuple(
+            int(row["target_year"]) for row in obj["oof_calibration"]
+        ),
+        polling=deep_freeze(polling),
+        official_provenance=str(provenance["official"]),
+        namespace=str(obj["namespace"]),
+        raw=deep_freeze(obj),
+    )
+    if (
+        spec.first_permitted_date != date(2026, 7, 13)
+        or spec.official_provenance != "TIMESTAMP_VERIFIED_T45"
+    ):
+        raise ValueError("prospective date/provenance differs")
+    return spec
+
+
+def load_prospective_spec(path: Path) -> ProspectiveSpec:
+    return parse_prospective_spec(json.loads(path.read_text(encoding="utf-8")))
+
+
+def eligible_for_prospective_official_pool(stratum: str) -> bool:
+    return stratum == "TIMESTAMP_VERIFIED_T45"
+
+
+DATE_DISPOSITIONS = MappingProxyType(
+    {
+        "run_invalid": "RUN_INVALID",
+        "acquisition_failure": "SYSTEM_MISS",
+        "clock_failure": "SYSTEM_MISS_CLOCK",
+        "partial_only": "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
+        "empty_verified": "NO_VERIFIED_ELIGIBLE_DATE",
+    }
+)
+
+
+def classify_snapshot(
+    minutes_to_start: float,
+    ntp_offset_seconds: float,
+    complete_participants: bool,
+) -> str:
+    minutes = finite_number(minutes_to_start, "minutes_to_start")
+    offset = finite_number(ntp_offset_seconds, "ntp_offset_seconds")
+    if not isinstance(complete_participants, bool):
+        raise ValueError("complete_participants must be boolean")
+    if abs(offset) > 2:
+        return "SYSTEM_MISS_CLOCK"
+    if minutes < -50:
+        return "TOO_EARLY_NOT_QUALIFYING"
+    if minutes > -45:
+        return "LATE_RESPONSE_REJECTED"
+    return (
+        "TIMESTAMP_VERIFIED_T45"
+        if complete_participants
+        else "TIMESTAMP_PARTIAL_T45"
+    )
+
+
+def date_disposition(event: str) -> str:
+    try:
+        return DATE_DISPOSITIONS[event]
+    except KeyError as exc:
+        raise ValueError(f"unknown prospective date event: {event}") from exc
+
+
+def combine_ledgers(left_run_id: str, right_run_id: str) -> None:
+    raise ValueError(f"ledger pooling forbidden: {left_run_id} + {right_run_id}")
 
 
 def validate_fold(fold: FoldSpec) -> None:
@@ -1259,6 +1499,36 @@ def const_schema(
     }
 
 
+def _closed_shape_schema(value: object) -> dict[str, object]:
+    if isinstance(value, Mapping):
+        keys = sorted(value)
+        return {
+            "type": "object",
+            "required": keys,
+            "properties": {
+                key: _closed_shape_schema(value[key]) for key in keys
+            },
+            "additionalProperties": False,
+        }
+    if isinstance(value, list):
+        return {
+            "type": "array",
+            "items": _closed_shape_schema(value[0]) if value else {},
+        }
+    return {}
+
+
+def prospective_schema(raw: Mapping[str, object]) -> dict[str, object]:
+    schema = _closed_shape_schema(raw)
+    schema.update(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "const": raw,
+        }
+    )
+    return schema
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(value) + b"\n")
@@ -1288,6 +1558,24 @@ def write_historical_contract(root: Path) -> None:
             ),
             (
                 root / "schemas/v5_2_run_spec.schema.json",
+                canonical_json_bytes(schema) + b"\n",
+            ),
+        )
+    )
+
+
+def write_prospective_contract(root: Path) -> None:
+    raw = expected_prospective_spec()
+    parse_prospective_spec(raw)
+    schema = prospective_schema(raw)
+    _publish_bundle(
+        (
+            (
+                root / "protocols/v5_2_qd/prospective_2026.json",
+                canonical_json_bytes(raw) + b"\n",
+            ),
+            (
+                root / "schemas/v5_2_prospective.schema.json",
                 canonical_json_bytes(schema) + b"\n",
             ),
         )
@@ -1490,15 +1778,29 @@ def load_change_contract(
     return contract
 
 
+def write_protocol_artifacts(
+    root: Path, *, approved_design_root: Path | None = None
+) -> None:
+    write_v52_config_contracts(
+        root,
+        approved_design_root=approved_design_root,
+    )
+    write_historical_contract(root)
+    write_prospective_contract(root)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Write deterministic unfitted v5.2-QD protocol contracts."
     )
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--approved-design-root", type=Path)
+    parser.add_argument("--write-contracts", action="store_true")
     args = parser.parse_args(argv)
-    write_v52_config_contracts(
-        args.root,
+    if not args.write_contracts:
+        parser.error("--write-contracts is required")
+    write_protocol_artifacts(
+        args.root.resolve(),
         approved_design_root=args.approved_design_root,
     )
     return 0
