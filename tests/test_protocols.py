@@ -1,6 +1,9 @@
 from pathlib import Path
+from unittest.mock import patch
 import copy
 import json
+import os
+import stat
 import tempfile
 import unittest
 
@@ -9,12 +12,14 @@ from mlb_backtest.protocols import (
     CHANGE_CHANGED,
     CHANGE_FORBIDDEN,
     CHANGE_UNCHANGED,
+    INTERNAL_METRIC_LITERALS,
     V52_REQUIRED_KEYS,
     classify_uncertainty,
     classify_v52,
     data_completeness_score,
     direction_from_p_home,
     eligibility_disposition,
+    expected_v52_config,
     load_change_contract,
     load_v52_config,
     optional_neutral,
@@ -45,6 +50,24 @@ class V52ConfigTest(unittest.TestCase):
         self.assertNotIn('"alpha"', serialized)
         self.assertNotIn('"beta"', serialized)
         self.assertNotIn("fitted_model_cards", serialized)
+
+    def test_expected_config_cannot_mutate_the_validation_oracle(self):
+        first = expected_v52_config()
+        first["internal_metrics"]["starter"]["season_xwoba"]["weight"] = 0.99
+        second = expected_v52_config()
+        self.assertEqual(
+            second["internal_metrics"]["starter"]["season_xwoba"]["weight"],
+            0.35,
+        )
+        self.assertEqual(
+            INTERNAL_METRIC_LITERALS["starter"]["season_xwoba"]["weight"],
+            0.35,
+        )
+        with self.assertRaises(TypeError):
+            INTERNAL_METRIC_LITERALS["starter"]["season_xwoba"]["weight"] = 0.99
+        with self.assertRaisesRegex(ValueError, "frozen value"):
+            parse_v52_config(first)
+        parse_v52_config(second)
 
     def test_completeness_uncertainty_and_tier_boundaries(self):
         qualities = {
@@ -180,6 +203,39 @@ class V52ConfigTest(unittest.TestCase):
             {"legacy_selection_quality_score": 4.2},
         )
 
+    def test_ranking_timestamp_is_one_canonical_utc_representation(self):
+        early = ranking_key(0.63, 8.5, 4, "2025-05-01T07:00:00Z", 2)
+        late = ranking_key(0.63, 8.5, 4, "2025-05-01T17:00:00Z", 1)
+        self.assertLess(early, late)
+        for value in (
+            "2025-05-01T17:00:00+00:00",
+            "2025-05-01T13:00:00-04:00",
+            "2025-05-01T17:00:00",
+            "2025-05-01T17:00:00.000Z",
+            "2025-5-1T7:00:00Z",
+            "2025-02-29T17:00:00Z",
+            "not-a-time",
+            "",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "canonical UTC"):
+                    ranking_key(0.63, 8.5, 4, value, 1)
+
+    def test_huge_integer_numeric_inputs_raise_value_error(self):
+        huge = 10**10000
+        with self.assertRaisesRegex(ValueError, "finite numeric"):
+            classify_v52(huge, 8.5, "Medium", critical=False)
+        qualities = {
+            "starter": huge,
+            "offense": 1,
+            "bullpen": 1,
+            "environment": 1,
+            "defense": 1,
+            "schedule": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "finite numeric"):
+            data_completeness_score(qualities)
+
     def test_schema_mirrors_parser_constants_and_frozen_values(self):
         raw = json.loads(V52_CONFIG.read_text())
         schema = json.loads(V52_SCHEMA.read_text())
@@ -248,6 +304,97 @@ class V52ConfigTest(unittest.TestCase):
             )
             for relative in paths:
                 self.assertEqual((root_a / relative).read_bytes(), (root_b / relative).read_bytes())
+
+    def test_bundle_resolves_design_before_creating_output_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "output"
+            bad_design = Path(temporary) / "not-a-repository"
+            bad_design.mkdir()
+            with self.assertRaisesRegex(ValueError, "approved design blob unavailable"):
+                write_v52_config_contracts(root, approved_design_root=bad_design)
+            self.assertFalse(root.exists())
+
+    def test_bundle_replace_failure_rolls_back_content_presence_modes_and_temps(self):
+        relative_paths = (
+            Path("config/v5_2_qd.json"),
+            Path("schemas/v5_2_qd.schema.json"),
+            Path("protocols/v5_2_qd/change_contract.json"),
+        )
+        for initial_state in (
+            (True, True, True),
+            (False, False, False),
+            (True, False, True),
+        ):
+            with self.subTest(initial_state=initial_state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                old = {}
+                modes = {}
+                for index, (relative, preexisting) in enumerate(
+                    zip(relative_paths, initial_state, strict=True)
+                ):
+                    if preexisting:
+                        path = root / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        old[path] = f"old-{index}".encode()
+                        modes[path] = 0o600 + index
+                        path.write_bytes(old[path])
+                        path.chmod(modes[path])
+                original_replace = os.replace
+                final_replacements = 0
+
+                def fail_second_final(source, destination):
+                    nonlocal final_replacements
+                    if Path(destination) in tuple(root / item for item in relative_paths):
+                        final_replacements += 1
+                        if final_replacements == 2:
+                            raise OSError("second bundle replace failed")
+                    return original_replace(source, destination)
+
+                with patch(
+                    "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+                ):
+                    with self.assertRaisesRegex(OSError, "second bundle replace failed"):
+                        write_v52_config_contracts(root, approved_design_root=ROOT)
+                for relative, preexisting in zip(
+                    relative_paths, initial_state, strict=True
+                ):
+                    path = root / relative
+                    if preexisting:
+                        self.assertEqual(path.read_bytes(), old[path])
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), modes[path])
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_bundle_success_preserves_existing_modes_and_uses_0644_for_new_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = (
+                root / "config/v5_2_qd.json",
+                root / "schemas/v5_2_qd.schema.json",
+                root / "protocols/v5_2_qd/change_contract.json",
+            )
+            for index, path in enumerate(paths):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"old")
+                path.chmod(0o600 + index)
+            write_v52_config_contracts(root, approved_design_root=ROOT)
+            self.assertEqual(
+                tuple(stat.S_IMODE(path.stat().st_mode) for path in paths),
+                (0o600, 0o601, 0o602),
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_v52_config_contracts(root, approved_design_root=ROOT)
+            paths = (
+                root / "config/v5_2_qd.json",
+                root / "schemas/v5_2_qd.schema.json",
+                root / "protocols/v5_2_qd/change_contract.json",
+            )
+            self.assertEqual(
+                tuple(stat.S_IMODE(path.stat().st_mode) for path in paths),
+                (0o644, 0o644, 0o644),
+            )
 
     @staticmethod
     def _container_mutations(raw):

@@ -1,12 +1,17 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 import argparse
 import hashlib
 import json
 import math
+import os
+import re
+import stat
 import subprocess
+import tempfile
 
 from mlb_backtest.diagnostics import (
     canonical_json_bytes,
@@ -112,7 +117,7 @@ SCHEDULE_ADJUSTMENTS = MappingProxyType(
         "scheduled_doubleheader": -8,
     }
 )
-INTERNAL_METRIC_LITERALS = {
+_INTERNAL_METRIC_LITERAL_SOURCE = {
     component: {
         metric: {
             "weight": weight,
@@ -122,7 +127,7 @@ INTERNAL_METRIC_LITERALS = {
     }
     for component in ("starter", "offense", "bullpen")
 }
-INTERNAL_METRIC_LITERALS.update(
+_INTERNAL_METRIC_LITERAL_SOURCE.update(
     {
         "environment": {
             metric: {"weight": weight, "direction": 1}
@@ -140,6 +145,10 @@ INTERNAL_METRIC_LITERALS.update(
         },
     }
 )
+INTERNAL_METRIC_LITERALS = deep_freeze(_INTERNAL_METRIC_LITERAL_SOURCE)
+if not isinstance(INTERNAL_METRIC_LITERALS, Mapping):
+    raise TypeError("internal metric literal freeze failed")
+del _INTERNAL_METRIC_LITERAL_SOURCE
 SHRINKAGE_CONSTANTS = MappingProxyType(
     {
         "starter": 150,
@@ -456,7 +465,7 @@ def expected_v52_config() -> dict[str, object]:
         "model_version": "v5.2-QD",
         "protocol": "Quality-and-Data Discipline",
         "component_weights": dict(COMPONENT_WEIGHTS),
-        "internal_metrics": INTERNAL_METRIC_LITERALS,
+        "internal_metrics": json.loads(canonical_json_bytes(INTERNAL_METRIC_LITERALS)),
         "shrinkage_constants": dict(SHRINKAGE_CONSTANTS),
         "probability_clip": [0.10, 0.90],
         "score_rules": {
@@ -550,13 +559,15 @@ def load_v52_config(path: Path) -> V52Config:
 
 
 def finite_number(value: object, path: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{path} must be finite numeric")
-    return float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{path} must be finite numeric") from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{path} must be finite numeric")
+    return converted
 
 
 def data_completeness_score(
@@ -619,12 +630,25 @@ def ranking_key(
     p = finite_number(probability, "probability")
     q = finite_number(completeness, "completeness")
     edge = finite_number(starter_edge_abs, "starter_edge_abs")
+    if not isinstance(lock_basis_start_utc, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        lock_basis_start_utc,
+    ):
+        raise ValueError("lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        parsed_start = datetime.strptime(
+            lock_basis_start_utc, "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ"
+        ) from exc
+    if parsed_start.strftime("%Y-%m-%dT%H:%M:%SZ") != lock_basis_start_utc:
+        raise ValueError("lock_basis_start_utc must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
     if (
         not 0.5 <= p <= 0.9
         or not 0 <= q <= 10
         or edge < 0
-        or not isinstance(lock_basis_start_utc, str)
-        or not lock_basis_start_utc
         or isinstance(game_pk, bool)
         or not isinstance(game_pk, int)
         or game_pk <= 0
@@ -745,6 +769,113 @@ def write_json(path: Path, value: object) -> None:
     path.write_bytes(canonical_json_bytes(value) + b"\n")
 
 
+def _write_fsynced_temp(path: Path, contents: bytes, *, mode: int) -> Path:
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return temporary_path
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_bundle_directories(final_paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    missing: set[Path] = set()
+    for final_path in final_paths:
+        candidate = final_path.parent
+        while not candidate.exists():
+            missing.add(candidate)
+            candidate = candidate.parent
+    created: list[Path] = []
+    try:
+        for directory in sorted(missing, key=lambda value: len(value.parts)):
+            directory.mkdir(exist_ok=True)
+            created.append(directory)
+    except BaseException:
+        for directory in reversed(created):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
+    return tuple(sorted(missing, key=lambda value: len(value.parts), reverse=True))
+
+
+def _publish_bundle(entries: tuple[tuple[Path, bytes], ...]) -> None:
+    final_paths = tuple(path for path, _ in entries)
+    if len(set(final_paths)) != len(final_paths):
+        raise ValueError("protocol bundle paths must be unique")
+    created_directories = _ensure_bundle_directories(final_paths)
+    temporary_paths: list[Path] = []
+    backups: dict[Path, Path | None] = {}
+    replaced: list[Path] = []
+    try:
+        modes = {
+            path: stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+            for path in final_paths
+        }
+        for path, contents in entries:
+            temporary_paths.append(
+                _write_fsynced_temp(path, contents, mode=modes[path])
+            )
+        for path in final_paths:
+            backups[path] = (
+                _write_fsynced_temp(path, path.read_bytes(), mode=modes[path])
+                if path.exists()
+                else None
+            )
+        for temporary_path, final_path in zip(
+            temporary_paths, final_paths, strict=True
+        ):
+            os.replace(temporary_path, final_path)
+            replaced.append(final_path)
+        for directory in sorted({path.parent for path in final_paths}):
+            _fsync_directory(directory)
+    except BaseException:
+        rollback_error: BaseException | None = None
+        for final_path in reversed(replaced):
+            backup_path = backups[final_path]
+            try:
+                if backup_path is None:
+                    final_path.unlink(missing_ok=True)
+                else:
+                    os.replace(backup_path, final_path)
+            except BaseException as error:
+                rollback_error = rollback_error or error
+        for directory in sorted({path.parent for path in final_paths}):
+            try:
+                _fsync_directory(directory)
+            except BaseException as error:
+                rollback_error = rollback_error or error
+        if rollback_error is not None:
+            raise RuntimeError("v5.2-QD protocol bundle rollback failed") from rollback_error
+        raise
+    finally:
+        for temporary_path in (*temporary_paths, *backups.values()):
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        for directory in created_directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+
 def approved_design_bytes(root: Path) -> bytes:
     completed = subprocess.run(
         [
@@ -769,27 +900,37 @@ def write_v52_config_contracts(
     design_root = (
         root if approved_design_root is None else approved_design_root.resolve()
     )
+    design_contents = approved_design_bytes(design_root)
     config = expected_v52_config()
     parse_v52_config(config)
     config_path = root / "config/v5_2_qd.json"
-    write_json(config_path, config)
+    config_contents = canonical_json_bytes(config) + b"\n"
     change = {
         "schema_version": 1,
         "model_version": "v5.2-QD",
         "unchanged": list(CHANGE_UNCHANGED),
         "changed": list(CHANGE_CHANGED),
         "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
-        "config_sha256": sha256_file(config_path),
+        "config_sha256": hashlib.sha256(config_contents).hexdigest(),
         "approved_design_commit": "a4aa8d2",
         "approved_design_blob_sha256": hashlib.sha256(
-            approved_design_bytes(design_root)
+            design_contents
         ).hexdigest(),
     }
-    write_json(
-        root / "schemas/v5_2_qd.schema.json",
-        const_schema(config, V52_REQUIRED_KEYS),
+    schema_contents = canonical_json_bytes(
+        const_schema(config, V52_REQUIRED_KEYS)
+    ) + b"\n"
+    contract_contents = canonical_json_bytes(change) + b"\n"
+    _publish_bundle(
+        (
+            (config_path, config_contents),
+            (root / "schemas/v5_2_qd.schema.json", schema_contents),
+            (
+                root / "protocols/v5_2_qd/change_contract.json",
+                contract_contents,
+            ),
+        )
     )
-    write_json(root / "protocols/v5_2_qd/change_contract.json", change)
 
 
 def load_change_contract(
