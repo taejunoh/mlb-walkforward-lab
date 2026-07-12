@@ -152,6 +152,26 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(bf, 1)
         self.assertEqual(raw_fip, -6.0)
 
+    def test_game_build_never_copies_or_scans_full_season_for_league_fip(self):
+        rows = [
+            pa(day, f"2025-04-{day:02d}", 10, 101, "strikeout", outs=1)
+            for day in range(1, 29)
+        ]
+        history = FeatureHistory(
+            data(rows), slot_weights={slot: 1 / 9 for slot in range(1, 10)}
+        )
+        original = history.rows_before
+
+        def bounded_only(candidate, target):
+            if candidate is history.pitches:
+                raise AssertionError("full-season pitch prefix scanned per game")
+            return original(candidate, target)
+
+        history.rows_before = bounded_only
+        result = build(game(), history)
+
+        self.assertEqual(result["home"]["starter"]["league_raw_fip"]["sample_size"], 28)
+
     def test_full_season_history_is_strictly_bounded_as_of_target_date(self):
         prior = [
             pa(1, "2025-04-30", 10, 101, "strikeout", xwoba=0.1, outs=1),

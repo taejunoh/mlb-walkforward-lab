@@ -184,6 +184,21 @@ class ModelPreparationSourceTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            truncated = STATCAST.read_text("utf-8-sig").replace(
+                ",strikeout,", ",truncated_pa,", 1
+            ).encode("utf-8-sig")
+            RawStore(root).put(
+                "baseball_savant_statcast",
+                {"start": "2024-04-01", "end": "2024-04-02", "game_type": "R", "url": statcast_url("2024-04-01", "2024-04-02")},
+                truncated,
+            )
+            counts, _hashes = load_pitcher_bf_range(
+                root, "2024-04-01", "2024-04-02"
+            )
+            self.assertNotIn(11, counts)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
             RawStore(root).put(
                 "baseball_savant_statcast",
                 {"start": "2024-04-01", "end": "2024-04-02", "game_type": "R", "url": "https://example.invalid/noncanonical"},

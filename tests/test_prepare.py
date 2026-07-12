@@ -723,11 +723,15 @@ class PrepareBoundaryTest(unittest.TestCase):
     def test_build_pregame_history_builds_one_full_source_index_for_as_of_queries(self):
         parsed = parse_statcast(STATCAST)
         target_game = {"game_pk": 1002, "official_date": "2024-04-02"}
-        prior_target_pitch = dict(parsed.pitches[0], game_pk=1002, game_date="2024-04-01")
-        prior_target_pa = dict(parsed.plate_appearances[0], game_pk=1002, game_date="2024-04-01")
+        pitches = tuple(dict(row, outs_recorded=0) for row in parsed.pitches)
+        plate_appearances = tuple(
+            dict(row, outs_recorded=0) for row in parsed.plate_appearances
+        )
+        prior_target_pitch = dict(pitches[0], game_pk=1002, game_date="2024-04-01")
+        prior_target_pa = dict(plate_appearances[0], game_pk=1002, game_date="2024-04-01")
         source = StatcastData(
-            parsed.pitches + (prior_target_pitch,),
-            parsed.plate_appearances + (prior_target_pa,),
+            pitches + (prior_target_pitch,),
+            plate_appearances + (prior_target_pa,),
         )
         schedule_build = ScheduleHistoryBuild(
             rows=(

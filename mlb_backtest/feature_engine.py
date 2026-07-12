@@ -386,6 +386,7 @@ class FeatureHistory:
             if self.plate_appearances
             else None
         )
+        self._league_fip_cumulative = self._build_league_fip_cumulative()
     @staticmethod
     def rows_before(
         rows: Sequence[Mapping[str, object]], target: date
@@ -404,6 +405,41 @@ class FeatureHistory:
             rows, target.isoformat(), key=lambda row: str(row["game_date"])
         )
         return rows[boundary - 1] if boundary else None
+
+    def _build_league_fip_cumulative(self) -> Mapping[int, tuple]:
+        daily: defaultdict[tuple[int, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0]
+        )
+        for row in self.plate_appearances:
+            day = str(row["game_date"])
+            bucket = daily[(_day(day, "game_date").year, day)]
+            bucket[0] += (
+                13 * (row["events"] == "home_run")
+                + 3 * (row["events"] in WALK_EVENTS | {"hit_by_pitch"})
+                - 2
+                * (row["events"] in {"strikeout", "strikeout_double_play"})
+            )
+            bucket[2] += 1
+        for row in self.pitches:
+            day = str(row["game_date"])
+            daily[(_day(day, "game_date").year, day)][1] += _recorded_outs(row)
+        by_year: defaultdict[int, list] = defaultdict(list)
+        totals: defaultdict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
+        for (year, day), values in sorted(daily.items()):
+            totals[year] = [left + right for left, right in zip(totals[year], values)]
+            numerator, outs, bf = totals[year]
+            by_year[year].append((day, numerator, outs, bf))
+        return MappingProxyType(
+            {year: tuple(rows) for year, rows in sorted(by_year.items())}
+        )
+
+    def league_fip_before(self, target: date) -> tuple[float | None, int]:
+        rows = self._league_fip_cumulative.get(target.year, ())
+        boundary = bisect_left(rows, target.isoformat(), key=lambda row: row[0])
+        if not boundary:
+            return None, 0
+        _day_text, numerator, outs, bf = rows[boundary - 1]
+        return ((numerator / (outs / 3.0)) if outs else None, bf)
 
     @staticmethod
     def _pitch_key(row: Mapping[str, object]) -> tuple:
@@ -540,15 +576,7 @@ def _starter_component(
         - 2 * sum(r["events"] in {"strikeout", "strikeout_double_play"} for r in season)
     )
     outs = sum(_recorded_outs(r) for r in season_pitches)
-    league_rows = history.rows_before(history.pa_by_year.get(target.year, ()), target)
-    league_pitch_rows = [
-        row
-        for row in history.rows_before(history.pitches, target)
-        if _day(row["game_date"], "game_date").year == target.year
-    ]
-    league_raw_fip, league_bf = history._league_fip(
-        league_rows, league_pitch_rows
-    )
+    league_raw_fip, league_bf = history.league_fip_before(target)
     cfip = league_era - league_raw_fip if league_raw_fip is not None else None
     pitcher_raw_fip = numerator / (outs / 3.0) if outs else None
     fip = (
