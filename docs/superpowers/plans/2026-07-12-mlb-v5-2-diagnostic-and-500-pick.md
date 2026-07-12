@@ -82,6 +82,7 @@ from pathlib import Path
 from types import MappingProxyType
 import hashlib, json, math, statistics
 from mlb_backtest.metrics import evaluate, wilson
+from scipy.stats import fisher_exact, spearmanr
 ```
 
 `mlb_backtest/diagnostic_report.py`:
@@ -89,7 +90,7 @@ from mlb_backtest.metrics import evaluate, wilson
 ```python
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-import argparse, json
+import argparse
 from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, load_v51_evidence, sha256_file
 ```
 
@@ -98,7 +99,7 @@ from mlb_backtest.diagnostics import build_diagnostic, canonical_json_bytes, loa
 ```python
 from collections.abc import Sequence
 from pathlib import Path
-import contextlib, io, json
+import contextlib, io
 from mlb_backtest.diagnostics import canonical_json_bytes
 ```
 
@@ -134,7 +135,7 @@ from pathlib import Path
 from types import MappingProxyType
 import argparse, hashlib, json
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
-from mlb_backtest.protocols import MINIMUM_SOURCE_NAMES, OPTIONAL_SOURCE_NAMES, RunSpec, expected_historical_run, load_run_spec, parse_run_spec, require_exact_keys
+from mlb_backtest.protocols import MINIMUM_SOURCE_NAMES, RunSpec, expected_historical_run, load_run_spec, parse_run_spec, require_exact_keys
 ```
 
 `mlb_backtest/verify_v52_design.py`:
@@ -244,14 +245,6 @@ Expected: `ERROR` with `ModuleNotFoundError: No module named 'mlb_backtest.diagn
 - [ ] **Step 3: Implement strict readers, canonical byte/content hashes, and statistical helpers**
 
 ```python
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-from types import MappingProxyType
-import hashlib
-import json
-import math
-
 JsonScalar = str | int | float | bool | None
 FrozenJson = JsonScalar | tuple["FrozenJson", ...] | Mapping[str, "FrozenJson"]
 
@@ -505,8 +498,6 @@ Expected: `FAIL` because `build_diagnostic` or required sections are absent.
 - [ ] **Step 3: Implement one canonical diagnostic tree**
 
 ```python
-from mlb_backtest.metrics import evaluate, wilson
-
 def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
     top1 = graded_rows(evidence.evaluated_rows, top1=True)
     all_graded = graded_rows(evidence.evaluated_rows)
@@ -601,7 +592,6 @@ def finite_pairs(xs: Sequence[float], ys: Sequence[float]) -> tuple[list[float],
     return list(xs), list(ys)
 
 def spearman(xs: Sequence[float], ys: Sequence[float]) -> dict[str, float]:
-    from scipy.stats import spearmanr
     x, y = finite_pairs(xs, ys)
     result = spearmanr(x, y)
     if not math.isfinite(float(result.statistic)) or not math.isfinite(float(result.pvalue)):
@@ -609,7 +599,6 @@ def spearman(xs: Sequence[float], ys: Sequence[float]) -> dict[str, float]:
     return {"rho": float(result.statistic), "p": float(result.pvalue)}
 
 def fisher(table: Sequence[Sequence[int]]) -> float:
-    from scipy.stats import fisher_exact
     if len(table) != 2 or any(len(row) != 2 for row in table):
         raise ValueError("Fisher table must be 2x2")
     p = float(fisher_exact(table, alternative="two-sided").pvalue)
@@ -820,9 +809,11 @@ def render_markdown(d: Mapping[str, object]) -> str:
     return "\n\n".join(sections) + "\n"
 
 def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv); write_diagnostic_reports(args.root.resolve(), args.output); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 - [ ] **Step 4: Generate and verify repository reports**
@@ -1118,9 +1109,11 @@ def write_report_artifact(diagnostic_path: Path, artifact_path: Path, chart_map_
     artifact_path.write_bytes(canonical_json_bytes(artifact) + b"\n"); chart_map_path.write_bytes(canonical_json_bytes(build_chart_map()) + b"\n")
 
 def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
     parser = argparse.ArgumentParser(); parser.add_argument("--diagnostic", type=Path, required=True); parser.add_argument("--artifact", type=Path, required=True); parser.add_argument("--chart-map", type=Path, required=True)
     args = parser.parse_args(argv); write_report_artifact(args.diagnostic, args.artifact, args.chart_map); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 Add these literal tests; they are pinned to the installed `0.2.8-13ceeea1f599` validator contract and prevent regression to rejected legacy shapes:
@@ -2107,7 +2100,6 @@ def assess_season(year: int, inventory: Sequence[Mapping[str, object]]) -> dict[
     return {"minimum_contract": "COMPLETE" if all(row["status"] == "COMPLETE" for row in records.values()) else "MISSING", "sources": records}
 
 def ranges_cover(ranges: Sequence[tuple[str, str]], expected_start: str, expected_end: str) -> bool:
-    from datetime import date, timedelta
     if not ranges or ranges[0][0] != expected_start or ranges[-1][1] != expected_end:
         return False
     previous_end: date | None = None
@@ -2206,10 +2198,12 @@ def write_preflight(root: Path, run_path: Path, json_path: Path, markdown_path: 
     schema_path.parent.mkdir(parents=True, exist_ok=True); schema_path.write_bytes(canonical_json_bytes(preflight_schema_document()) + b"\n")
 
 def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--run-spec", type=Path, required=True)
     parser.add_argument("--json", type=Path, required=True); parser.add_argument("--markdown", type=Path, required=True); parser.add_argument("--schema", type=Path, required=True)
     args = parser.parse_args(argv); write_preflight(args.root.resolve(), args.run_spec, args.json, args.markdown, args.schema); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 Generate `schemas/v5_2_preflight.schema.json` with exact top-level/season/source/step required/property key sets and `additionalProperties:false` at each of those fixed levels. Its enum/const values mirror `MINIMUM_SOURCES`, optional statuses, modes, step status, and report statuses. The stdlib `parse_preflight` remains the runtime authority and tests mutate every nested fixed-value family. The current workspace report is expected to be blocked; the complete temporary fixture proves the same code has a real `READY` path.
@@ -2401,6 +2395,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.write_contracts: parser.error("--write-contracts is required")
     write_protocol_artifacts(args.root.resolve()); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 Write `prospective_2026.json` from `expected_prospective_spec()` and generate a closed schema mirror whose top-level `const` is that exact JSON and whose nested required/property keys mirror every dict above. This phase defines and validates the protocol only; it creates no pre-2026-07-13 snapshot and never backfills a missed date.
@@ -2648,10 +2645,12 @@ def build_pass_receipt(diagnostic: Mapping[str, object], config: V52Config, pros
             "prospective": {"first_permitted_date": prospective.first_permitted_date.isoformat()}, "html": html}
 
 def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--outputs", type=Path); parser.add_argument("--skip-html", action="store_true")
     args = parser.parse_args(argv); receipt = verify_design_deliverables(args.root.resolve(), None if args.skip_html else args.outputs)
     print(json.dumps(receipt, allow_nan=False, sort_keys=True)); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 The production inventory is generated with `build_git_inventory(ROOT, "a4aa8d2")`; never snapshot the post-Task-10 tree as the baseline.
