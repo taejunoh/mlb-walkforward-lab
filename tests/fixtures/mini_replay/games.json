@@ -11,8 +11,8 @@
     "starter_career_bf": 600,
     "critical_failure": false,
     "unresolved_context": false,
-    "lineup_provenance": "official_schedule",
-    "data_status": "complete"
+    "lineup_provenance": "TIMESTAMP_VERIFIED_LINEUP",
+    "data_status": "COMPLETE"
   },
   {
     "game_pk": 2001,
@@ -26,8 +26,9 @@
     "starter_career_bf": 400,
     "critical_failure": false,
     "unresolved_context": false,
-    "lineup_provenance": "official_schedule",
-    "data_status": {"status": "complete", "doubleheader": "game1"}
+    "lineup_provenance": "TIMESTAMP_VERIFIED_LINEUP",
+    "data_status": "COMPLETE",
+    "doubleheader_marker": "GAME1"
   },
   {
     "game_pk": 2002,
@@ -41,8 +42,9 @@
     "starter_career_bf": 800,
     "critical_failure": false,
     "unresolved_context": false,
-    "lineup_provenance": "official_schedule",
-    "data_status": {"status": "complete", "doubleheader": "game2"}
+    "lineup_provenance": "TIMESTAMP_VERIFIED_LINEUP",
+    "data_status": "COMPLETE",
+    "doubleheader_marker": "GAME2"
   },
   {
     "game_pk": 3001,
@@ -56,8 +58,8 @@
     "starter_career_bf": 700,
     "critical_failure": false,
     "unresolved_context": true,
-    "lineup_provenance": "official_schedule",
-    "data_status": "missing_environment"
+    "lineup_provenance": "TIMESTAMP_VERIFIED_LINEUP",
+    "data_status": "INCOMPLETE"
   },
   {
     "game_pk": 4001,
@@ -71,7 +73,7 @@
     "starter_career_bf": 350,
     "critical_failure": false,
     "unresolved_context": false,
-    "lineup_provenance": "reconstructed_official_boxscore",
-    "data_status": "complete"
+    "lineup_provenance": "RECONSTRUCTED_FINAL_LINEUP",
+    "data_status": "COMPLETE"
   }
 ]

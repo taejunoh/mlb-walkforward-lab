@@ -34,7 +34,16 @@ from .scoring import (
 from .sources import fetch_bytes, schedule_url
 
 
-STAGES = ("raw", "calibration", "features", "locked", "outcomes", "reports")
+STAGES = (
+    "raw",
+    "calibration",
+    "features",
+    "initial_locked",
+    "initial_outcomes",
+    "locked",
+    "outcomes",
+    "reports",
+)
 _CALIBRATION_REQUIRED = frozenset(("official_date", "edge", "home_win"))
 _CALIBRATION_ALLOWED = _CALIBRATION_REQUIRED | {"game_pk"}
 _COMPONENTS = frozenset(WEIGHTS)
@@ -55,8 +64,20 @@ _CANDIDATE_REQUIRED = frozenset(
         "data_status",
     )
 )
-_CANDIDATE_OPTIONAL = frozenset(("source_game_dates", "source_game_pks"))
+_CANDIDATE_OPTIONAL = frozenset(("doubleheader_marker",))
 _CANDIDATE_ALLOWED = _CANDIDATE_REQUIRED | _CANDIDATE_OPTIONAL
+_FORBIDDEN_TOKENS = (
+    "actual_winner",
+    "market",
+    "outcome",
+    "result",
+    "moneyline",
+    "odds",
+)
+_DATA_STATUS = frozenset(("COMPLETE", "INCOMPLETE"))
+_LINEUP_PROVENANCE = frozenset(
+    ("RECONSTRUCTED_FINAL_LINEUP", "TIMESTAMP_VERIFIED_LINEUP")
+)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -158,6 +179,68 @@ def _json_object(path: Path, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     return value
+
+
+def _require_raw_schedule(
+    root: Path, config: Mapping[str, object], role: str
+) -> str:
+    """Verify the immutable schedule manifest required by a prepared input stage."""
+    window_name = "training_window" if role == "training" else "initial_window"
+    window = config[window_name]
+    expected_query = {
+        "role": role,
+        "start": window["start"],
+        "end": window["end"],
+        "url": schedule_url(window["start"], window["end"]),
+    }
+    folder = root / "raw" / "mlb_schedule"
+    if folder.is_symlink() or not folder.is_dir():
+        raise RuntimeError(f"missing prerequisite: raw/schedule manifest for {role}")
+    matches: list[str] = []
+    for manifest_path in sorted(folder.glob("*.manifest.json")):
+        content = _regular_bytes(manifest_path, "raw schedule manifest")
+        try:
+            manifest = RawStore._read_manifest(content)
+        except RuntimeError as exc:
+            raise RuntimeError("raw schedule manifest is invalid") from exc
+        if manifest.get("query") != expected_query:
+            continue
+        digest = manifest.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError("raw schedule manifest digest is invalid")
+        seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
+        expected_seal = f"{hashlib.sha256(content).hexdigest()}\n".encode("utf-8")
+        if _regular_bytes(seal_path, "raw schedule manifest seal") != expected_seal:
+            raise RuntimeError("raw schedule manifest seal mismatch")
+        payload = _regular_bytes(folder / f"{digest}.raw", "raw schedule payload")
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeError("raw schedule payload digest mismatch")
+        if manifest["row_count"] != sum(
+            bool(line.strip()) for line in payload.splitlines()
+        ):
+            raise RuntimeError("raw schedule manifest row_count mismatch")
+        query_bytes = json.dumps(
+            expected_query,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        query_digest = hashlib.sha256(query_bytes).hexdigest()
+        if manifest_path.name != f"{digest}.{query_digest}.manifest.json":
+            raise RuntimeError("raw schedule manifest address mismatch")
+        matches.append(digest)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"missing prerequisite: raw/schedule manifest for {role}"
+            if not matches
+            else f"ambiguous raw/schedule manifests for {role}"
+        )
+    return matches[0]
 
 
 def _write_once(path: Path, content: bytes, label: str) -> Path:
@@ -271,9 +354,11 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
 
 
 def calibrate_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+    """Fit calibration from a Task 11-prepared training_edges JSONL input."""
     config_bytes = _regular_bytes(Path(config_path), "config")
     config = load_config(config_path)
     root = _safe_data_dir(data_dir)
+    _require_raw_schedule(root, config, "training")
     calibration = _stage(root, "calibration")
     source = calibration / "training_edges.jsonl"
     source_bytes = _regular_bytes(source, "calibration/training_edges.jsonl")
@@ -317,7 +402,29 @@ def _canonical_utc(value: object) -> datetime:
     return parsed
 
 
+def _reject_forbidden_nested(value: object, path: str = "candidate") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            lowered = key.lower()
+            token = next((item for item in _FORBIDDEN_TOKENS if item in lowered), None)
+            if token is not None:
+                raise ValueError(
+                    f"unknown forbidden {token} token in candidate input"
+                )
+            _reject_forbidden_nested(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _reject_forbidden_nested(nested, f"{path}[{index}]")
+
+
 def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
+    _reject_forbidden_nested(row)
+    if "source_game_dates" in row:
+        raise ValueError("same-day event provenance lists are forbidden")
+    if "source_game_pks" in row:
+        raise ValueError("target game_pk provenance lists are forbidden")
     unknown = set(row) - _CANDIDATE_ALLOWED
     missing = _CANDIDATE_REQUIRED - set(row)
     if unknown or missing:
@@ -329,7 +436,7 @@ def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
     if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
         raise ValueError("candidate game_pk must be a positive integer")
     try:
-        official = date.fromisoformat(result["official_date"])
+        date.fromisoformat(result["official_date"])
     except (TypeError, ValueError) as exc:
         raise ValueError("candidate official_date must be an ISO date") from exc
     _canonical_utc(result["scheduled_start_utc"])
@@ -349,28 +456,29 @@ def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
     bf = result["starter_career_bf"]
     if isinstance(bf, bool) or not isinstance(bf, int) or bf < 0:
         raise ValueError("starter_career_bf must be a non-negative integer")
-    for field in ("lineup_provenance", "data_status"):
-        if not isinstance(result[field], (str, dict, list)):
-            raise ValueError(f"candidate {field} must be safe JSON provenance")
-    dates = result.get("source_game_dates", [])
-    pks = result.get("source_game_pks", [])
-    if not isinstance(dates, list) or not isinstance(pks, list):
-        raise ValueError("candidate provenance lists must be lists")
-    for source_date in dates:
-        try:
-            parsed_date = date.fromisoformat(source_date)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("source_game_dates must contain ISO dates") from exc
-        if parsed_date >= official:
-            raise ValueError("same-day or future event data is forbidden")
-    if game_pk in pks:
-        raise ValueError("target game_pk data is forbidden")
+    if not isinstance(result["data_status"], str) or result["data_status"] not in _DATA_STATUS:
+        raise ValueError("data_status must be COMPLETE or INCOMPLETE")
+    if (
+        not isinstance(result["lineup_provenance"], str)
+        or result["lineup_provenance"] not in _LINEUP_PROVENANCE
+    ):
+        raise ValueError(
+            "lineup_provenance must be RECONSTRUCTED_FINAL_LINEUP or "
+            "TIMESTAMP_VERIFIED_LINEUP"
+        )
+    if "doubleheader_marker" in result and (
+        not isinstance(result["doubleheader_marker"], str)
+        or result["doubleheader_marker"] not in ("GAME1", "GAME2")
+    ):
+        raise ValueError("doubleheader_marker must be GAME1 or GAME2")
     return result
 
 
 def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
-    load_config(config_path)
+    """Score a Task 11-prepared, pregame-only candidate_components JSONL input."""
+    config = load_config(config_path)
     root = _safe_data_dir(data_dir)
+    _require_raw_schedule(root, config, "backtest")
     card, _ = _load_model_card(root, config_path)
     features = _stage(root, "features")
     source = features / "candidate_components.jsonl"
@@ -439,6 +547,8 @@ def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
             "lineup_provenance": candidate["lineup_provenance"],
             "data_status": candidate["data_status"],
         }
+        if "doubleheader_marker" in candidate:
+            row["doubleheader_marker"] = candidate["doubleheader_marker"]
         for component in sorted(_COMPONENTS):
             row[f"away_{component}_score"] = candidate["away_scores"][component]
             row[f"home_{component}_score"] = candidate["home_scores"][component]
@@ -449,17 +559,15 @@ def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     return _write_once(features / "scored_candidates.jsonl", _canonical_jsonl(predictions), "scored candidates")
 
 
-def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
-    load_config(config_path)
-    root = _safe_data_dir(data_dir)
-    _, model_hash = _load_model_card(root, config_path)
-    source = root / "features" / "scored_candidates.jsonl"
-    candidates = _jsonl(source, "features/scored_candidates.jsonl")
+def _rank_and_lock(
+    candidates: Sequence[Mapping[str, object]],
+    output_dir: Path,
+    model_hash: str,
+) -> dict[str, object]:
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     by_game: dict[int, dict[str, object]] = {}
     for row in candidates:
-        if any("market" in key.lower() or "outcome" in key.lower() for key in row):
-            raise ValueError("post-lock fields are forbidden in feature artifacts")
+        _reject_forbidden_nested(row, "scored candidate")
         game_pk = row.get("game_pk")
         if game_pk in by_game:
             raise ValueError("duplicate scored candidate game_pk")
@@ -480,7 +588,71 @@ def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, objec
             full = dict(by_game[ranked["game_pk"]])
             full.update({key: ranked[key] for key in ("daily_rank", "top1", "top3")})
             locked_rows.append(full)
-    return lock_predictions(locked_rows, _stage(root, "locked"), model_hash)
+    return lock_predictions(locked_rows, output_dir, model_hash)
+
+
+def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
+    load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    _, model_hash = _load_model_card(root, config_path)
+    candidates = _jsonl(
+        root / "features" / "scored_candidates.jsonl",
+        "features/scored_candidates.jsonl",
+    )
+    return _rank_and_lock(candidates, _stage(root, "locked"), model_hash)
+
+
+def _require_complete_top1(
+    lock_manifest: Path,
+    outcome_rows: Sequence[Mapping[str, object]],
+    model_hash: str,
+) -> list[dict[str, object]]:
+    from .outcomes import _load_lock
+
+    _, predictions = _load_lock(lock_manifest, model_hash)
+    counts: dict[object, int] = defaultdict(int)
+    for row in outcome_rows:
+        if isinstance(row, Mapping):
+            game_pk = row.get("game_pk")
+            if isinstance(game_pk, int) and not isinstance(game_pk, bool):
+                counts[game_pk] += 1
+    missing = sorted(
+        row["game_pk"]
+        for row in predictions
+        if row["top1"] == "Yes" and counts[row["game_pk"]] == 0
+    )
+    duplicate = sorted(
+        row["game_pk"]
+        for row in predictions
+        if row["top1"] == "Yes" and counts[row["game_pk"]] > 1
+    )
+    if missing:
+        raise ValueError(f"missing locked Top 1 outcomes: {missing}")
+    if duplicate:
+        raise ValueError(f"each locked Top 1 requires exactly one outcome: {duplicate}")
+    return predictions
+
+
+def _join_complete_outcomes(
+    lock_manifest: Path,
+    rows: Sequence[Mapping[str, object]],
+    model_hash: str,
+    output_root: Path,
+    label: str,
+) -> Path:
+    _require_complete_top1(lock_manifest, rows, model_hash)
+    from .outcomes import join_outcomes
+
+    with tempfile.TemporaryDirectory(dir=output_root) as temporary_dir:
+        generated = join_outcomes(
+            lock_manifest, rows, model_hash, Path(temporary_dir) / "evaluated"
+        )
+        generated_bytes = _regular_bytes(generated, f"generated {label}")
+    return _write_once(
+        output_root / "evaluated" / "evaluated_predictions.jsonl",
+        generated_bytes,
+        label,
+    )
 
 
 def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
@@ -491,31 +663,26 @@ def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     _regular_bytes(locked_manifest, "locked/lock_manifest.json")
     outcome_root = _stage(root, "outcomes")
     rows = _jsonl(outcome_root / "outcomes_input.jsonl", "outcomes/outcomes_input.jsonl")
-    from .outcomes import join_outcomes
-
-    with tempfile.TemporaryDirectory(dir=outcome_root) as temporary_dir:
-        generated = join_outcomes(
-            locked_manifest, rows, model_hash, Path(temporary_dir) / "evaluated"
-        )
-        generated_bytes = _regular_bytes(generated, "generated evaluated predictions")
-    path = _write_once(
-        outcome_root / "evaluated" / "evaluated_predictions.jsonl",
-        generated_bytes,
+    return _join_complete_outcomes(
+        locked_manifest,
+        rows,
+        model_hash,
+        outcome_root,
         "evaluated predictions",
     )
-    lock_mtime = locked_manifest.stat().st_mtime_ns
-    outcome_mtime = path.stat().st_mtime_ns
-    if outcome_mtime <= lock_mtime:
-        newer = lock_mtime + 1
-        os.utime(path, ns=(newer, newer), follow_symlinks=False)
-    return path
 
 
 def report_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
     load_config(config_path)
     root = _safe_data_dir(data_dir)
+    _, model_hash = _load_model_card(root, config_path)
     evaluated_path = root / "outcomes" / "evaluated" / "evaluated_predictions.jsonl"
     evaluated = _jsonl(evaluated_path, "evaluated predictions")
+    _require_complete_top1(
+        root / "locked" / "lock_manifest.json",
+        [row.get("outcome", {}) for row in evaluated],
+        model_hash,
+    )
     baseline_path = root / "outcomes" / "baseline.json"
     baseline_raw = _json_object(baseline_path, "baseline mapping") if baseline_path.exists() else {}
     baseline: dict[int, str] = {}
@@ -546,6 +713,24 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     fixture = Path(fixture_dir)
     root = _safe_data_dir(out_dir)
     config_path = Path(__file__).resolve().parent.parent / "config" / "v5_1_bt.json"
+    config = load_config(config_path)
+    schedule_payload = _regular_bytes(fixture / "schedule.json", "fixture schedule")
+    raw_store = RawStore(_stage(root, "raw"))
+    for role, window_name in (
+        ("training", "training_window"),
+        ("backtest", "initial_window"),
+    ):
+        window = config[window_name]
+        raw_store.put(
+            "mlb_schedule",
+            {
+                "role": role,
+                "start": window["start"],
+                "end": window["end"],
+                "url": schedule_url(window["start"], window["end"]),
+            },
+            schedule_payload,
+        )
     calibration_rows = _array_fixture(fixture / "calibration.json", "fixture calibration")
     game_rows = _array_fixture(fixture / "games.json", "fixture games")
     calibration = _stage(root, "calibration")
@@ -554,16 +739,84 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     _write_once(features / "candidate_components.jsonl", _canonical_jsonl(game_rows), "fixture feature input")
     calibrate_stage(config_path, root)
     features_stage(config_path, root)
-    lock_manifest = lock_stage(config_path, root)
+    _, model_hash = _load_model_card(root, config_path)
+    scored_rows = _jsonl(
+        root / "features" / "scored_candidates.jsonl",
+        "fixture scored candidates",
+    )
+    all_dates = sorted({row["official_date"] for row in scored_rows})
+    if len(all_dates) < 4:
+        raise ValueError("fixture replay requires three initial dates and an extension date")
+    initial_dates = all_dates[:3]
+    initial_candidates = [
+        row for row in scored_rows if row["official_date"] in initial_dates
+    ]
+    initial_manifest = _rank_and_lock(
+        initial_candidates, _stage(root, "initial_locked"), model_hash
+    )
+    initial_lock_path = root / "initial_locked" / "lock_manifest.json"
+    initial_lock_mtime = initial_lock_path.stat().st_mtime_ns
+
+    # Initial outcomes remain unopened until the immutable three-date lock exists.
+    initial_fixture_outcomes = _array_fixture(
+        fixture / "initial_outcomes.json", "fixture initial outcomes"
+    )
+    initial_game_pks = {row["game_pk"] for row in initial_candidates}
+    initial_outcome_rows = [
+        row for row in initial_fixture_outcomes if row["game_pk"] in initial_game_pks
+    ]
+    initial_outcome_root = _stage(root, "initial_outcomes")
+    _write_once(
+        initial_outcome_root / "outcomes_input.jsonl",
+        _canonical_jsonl(initial_outcome_rows),
+        "fixture initial outcome input",
+    )
+    initial_evaluated_path = _join_complete_outcomes(
+        initial_lock_path,
+        initial_outcome_rows,
+        model_hash,
+        initial_outcome_root,
+        "initial evaluated predictions",
+    )
+    initial_evaluated = _jsonl(initial_evaluated_path, "initial evaluated predictions")
+    from .metrics import completion_status, extension_dates
+
+    initial_completion = completion_status(initial_evaluated, target=3)
+    selected_extension_dates = extension_dates(
+        initial_evaluated, all_dates[3:], target=3
+    )
+    final_dates = set(initial_dates) | set(selected_extension_dates)
+    final_candidates = [
+        row for row in scored_rows if row["official_date"] in final_dates
+    ]
+    lock_manifest = _rank_and_lock(
+        final_candidates, _stage(root, "locked"), model_hash
+    )
     lock_path = root / "locked" / "lock_manifest.json"
     lock_mtime = lock_path.stat().st_mtime_ns
 
-    outcome_rows = _array_fixture(fixture / "outcomes.json", "fixture outcomes")
+    # Extension results are unavailable until the expanded final lock is published.
+    extension_outcome_rows = _array_fixture(
+        fixture / "extension_outcomes.json", "fixture extension outcomes"
+    )
+    outcome_rows = initial_fixture_outcomes + extension_outcome_rows
+    final_game_pks = {row["game_pk"] for row in final_candidates}
+    final_outcome_rows = [
+        row for row in outcome_rows if row["game_pk"] in final_game_pks
+    ]
     outcome_root = _stage(root, "outcomes")
-    _write_once(outcome_root / "outcomes_input.jsonl", _canonical_jsonl(outcome_rows), "fixture outcome input")
+    _write_once(outcome_root / "outcomes_input.jsonl", _canonical_jsonl(final_outcome_rows), "fixture outcome input")
     evaluated_path = outcomes_stage(config_path, root)
     summary = report_stage(config_path, root)
     prediction_rows = _jsonl(root / "locked" / "predictions.jsonl", "locked predictions")
+    initial_prediction_rows = _jsonl(
+        root / "initial_locked" / "predictions.jsonl", "initial locked predictions"
+    )
+    overlapping = [
+        row for row in prediction_rows if row["official_date"] in initial_dates
+    ]
+    if initial_prediction_rows != overlapping:
+        raise RuntimeError("initial locked predictions changed in the final lock")
     selected = [row for row in prediction_rows if row["top1"] == "Yes"]
     result = {
         "selection_dates": len({row["official_date"] for row in selected}),
@@ -574,6 +827,13 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
         "void_top1": summary["void_top1"],
         "lock_mtime_ns": lock_mtime,
         "outcome_mtime_ns": evaluated_path.stat().st_mtime_ns,
+        "initial_lock_mtime_ns": initial_lock_mtime,
+        "initial_outcome_mtime_ns": initial_evaluated_path.stat().st_mtime_ns,
+        "initial_lock_sha": initial_manifest["sha256"],
+        "initial_locked_sha256": initial_manifest["sha256"],
+        "extension_dates": selected_extension_dates,
+        "initial_completion": initial_completion,
+        "final_lock_sha": lock_manifest["sha256"],
         "lock_sha256": lock_manifest["sha256"],
         "locked_sha256": lock_manifest["sha256"],
         "summary": summary,
@@ -582,7 +842,15 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mlb_backtest.pipeline")
+    parser = argparse.ArgumentParser(
+        prog="mlb_backtest.pipeline",
+        description="Run deterministic backtest stages over prepared JSONL inputs.",
+        epilog=(
+            "calibrate and features require immutable raw schedule manifests. "
+            "Preparing training_edges.jsonl and candidate_components.jsonl is "
+            "the upstream Task 11 contract, not feature extraction performed here."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("fetch", "calibrate", "features", "lock", "outcomes", "report"):
         subparser = subparsers.add_parser(command)

@@ -50,7 +50,7 @@ LOCK_OPTIONAL_FIELDS = tuple(
         f"{component}_edge",
         f"{component}_quality",
     )
-) + ("lineup_provenance", "data_status")
+) + ("lineup_provenance", "data_status", "doubleheader_marker")
 _REQUIRED = frozenset(LOCK_REQUIRED_FIELDS)
 _OPTIONAL = frozenset(LOCK_OPTIONAL_FIELDS)
 _ALLOWED = _REQUIRED | _OPTIONAL
@@ -272,6 +272,11 @@ def _validate_prediction(source: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("lineup_provenance must be JSON text or structured data")
     if "data_status" in row and not isinstance(row["data_status"], (str, Mapping, list, tuple)):
         raise ValueError("data_status must be JSON text or structured data")
+    if "doubleheader_marker" in row and row["doubleheader_marker"] not in (
+        "GAME1",
+        "GAME2",
+    ):
+        raise ValueError("doubleheader_marker must be GAME1 or GAME2")
     _canonical_json(row)
     return row
 
