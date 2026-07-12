@@ -90,19 +90,6 @@
           "teams": {"away": {"team": {"id": 136, "name": "Seattle Mariners"}, "score": 3, "isWinner": false}, "home": {"team": {"id": 110, "name": "Baltimore Orioles"}, "score": 4, "isWinner": true}}
         }
       ]
-    },
-    {
-      "date": "2025-09-29",
-      "games": [
-        {
-          "gamePk": 9901,
-          "gameType": "R",
-          "officialDate": "2025-09-29",
-          "gameDate": "2025-09-29T23:05:00Z",
-          "status": {"detailedState": "Final"},
-          "teams": {"away": {"team": {"id": 141, "name": "Toronto Blue Jays"}, "score": 5, "isWinner": true}, "home": {"team": {"id": 139, "name": "Tampa Bay Rays"}, "score": 2, "isWinner": false}}
-        }
-      ]
     }
   ]
 }

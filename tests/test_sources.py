@@ -239,6 +239,7 @@ class SourceTest(unittest.TestCase):
                         "away": {"team": {"id": 1, "name": "Away"}},
                         "home": {"team": {"id": 2, "name": "Home"}},
                     },
+                    "venue": {"link": "/api/v1/venues/null"},
                 }],
             }]
         }
@@ -339,6 +340,31 @@ class SourceTest(unittest.TestCase):
             path = Path(td) / "schedule.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "official date"):
+                parse_schedule(path)
+
+    def test_rescheduled_duplicate_game_pk_prefers_played_record_but_rejects_conflicts(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        final = payload["dates"][0]["games"][0]
+        postponed = json.loads(json.dumps(final))
+        postponed["status"]["detailedState"] = "Postponed"
+        for side in ("away", "home"):
+            postponed["teams"][side].pop("score")
+            postponed["teams"][side].pop("isWinner")
+        payload["dates"][0]["games"].insert(0, postponed)
+        conflicting = json.loads(json.dumps(payload))
+        conflicting_final = json.loads(json.dumps(final))
+        conflicting_final["teams"]["away"]["score"] = 9
+        conflicting_final["teams"]["away"]["isWinner"] = True
+        conflicting_final["teams"]["home"]["isWinner"] = False
+        conflicting["dates"][0]["games"].append(conflicting_final)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "schedule.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            games = parse_schedule(path)
+            self.assertEqual(len(games), 1)
+            self.assertEqual(games[0]["status"], "Final")
+            path.write_text(json.dumps(conflicting), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
                 parse_schedule(path)
 
     def test_malformed_and_naive_scheduled_starts_raise_value_error(self):

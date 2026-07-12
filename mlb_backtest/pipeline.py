@@ -32,6 +32,7 @@ from .scoring import (
     uncertainty,
 )
 from .sources import fetch_bytes, parse_schedule, schedule_url
+from .statcast import regular_season_ranges
 
 
 STAGES = (
@@ -216,30 +217,35 @@ def _require_raw_schedule(
     root: Path, config: Mapping[str, object], role: str
 ) -> tuple[str, dict[int, dict[str, object]]]:
     """Verify the immutable schedule manifest required by a prepared input stage."""
-    window = (
-        config["training_window"]
-        if role == "training"
-        else _backtest_schedule_window(config)
-    )
-    expected_query = {
-        "role": role,
-        "start": window["start"],
-        "end": window["end"],
-        "gameType": "R",
-        "url": schedule_url(window["start"], window["end"]),
-    }
+    if role == "training":
+        windows = [
+            {"start": start, "end": end}
+            for start, end in regular_season_ranges(config["extension_end"])[:3]
+        ]
+    else:
+        windows = [_backtest_schedule_window(config)]
+    expected_queries = [
+        {
+            "role": role,
+            "start": window["start"],
+            "end": window["end"],
+            "gameType": "R",
+            "url": schedule_url(window["start"], window["end"]),
+        }
+        for window in windows
+    ]
     folder = root / "raw" / "mlb_schedule"
     if folder.is_symlink() or not folder.is_dir():
         raise RuntimeError(f"missing prerequisite: raw/schedule manifest for {role}")
-    matches: list[str] = []
-    schedule_indexes: list[dict[int, dict[str, object]]] = []
+    matches: dict[str, tuple[str, dict[int, dict[str, object]]]] = {}
     for manifest_path in sorted(folder.glob("*.manifest.json")):
         content = _regular_bytes(manifest_path, "raw schedule manifest")
         try:
             manifest = RawStore._read_manifest(content)
         except RuntimeError as exc:
             raise RuntimeError("raw schedule manifest is invalid") from exc
-        if manifest.get("query") != expected_query:
+        query = manifest.get("query")
+        if query not in expected_queries:
             continue
         digest = manifest.get("sha256")
         if (
@@ -260,7 +266,7 @@ def _require_raw_schedule(
         ):
             raise RuntimeError("raw schedule manifest row_count mismatch")
         query_bytes = json.dumps(
-            expected_query,
+            query,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -270,18 +276,37 @@ def _require_raw_schedule(
         if manifest_path.name != f"{digest}.{query_digest}.manifest.json":
             raise RuntimeError("raw schedule manifest address mismatch")
         games = parse_schedule(folder / f"{digest}.raw")
+        if any(
+            not query["start"] <= game["official_date"] <= query["end"]
+            for game in games
+        ):
+            raise RuntimeError("raw schedule game is outside manifest query window")
         index = {game["game_pk"]: game for game in games}
         if len(index) != len(games):
             raise RuntimeError("raw schedule contains duplicate game_pk values")
-        matches.append(digest)
-        schedule_indexes.append(index)
-    if len(matches) != 1:
+        query_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
+        if query_key in matches:
+            raise RuntimeError(f"ambiguous raw/schedule manifests for {role}")
+        matches[query_key] = (digest, index)
+    ordered_keys = [
+        json.dumps(query, separators=(",", ":"), sort_keys=True)
+        for query in expected_queries
+    ]
+    if any(key not in matches for key in ordered_keys):
         raise RuntimeError(
             f"missing prerequisite: raw/schedule manifest for {role}"
-            if not matches
-            else f"ambiguous raw/schedule manifests for {role}"
         )
-    return matches[0], schedule_indexes[0]
+    merged = {}
+    digests = []
+    for key in ordered_keys:
+        digest, index = matches[key]
+        digests.append(digest)
+        for game_pk, game in index.items():
+            if game_pk in merged:
+                raise RuntimeError("raw schedule manifests duplicate game_pk")
+            merged[game_pk] = game
+    aggregate_digest = hashlib.sha256("".join(digests).encode("ascii")).hexdigest()
+    return aggregate_digest, merged
 
 
 def _write_once(path: Path, content: bytes, label: str, root: Path) -> Path:
@@ -385,13 +410,14 @@ def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
     raw = _stage(root, "raw")
     store = RawStore(raw)
     artifacts = []
-    for role, window in (
-        ("training", config["training_window"]),
-        ("backtest", _backtest_schedule_window(config)),
-    ):
+    windows = [
+        ("training", {"start": start, "end": end})
+        for start, end in regular_season_ranges(config["extension_end"])[:3]
+    ] + [("backtest", _backtest_schedule_window(config))]
+    for role, window in windows:
         url = schedule_url(window["start"], window["end"])
         artifacts.append(
-            store.put(
+            store.put_unique_query(
                 "mlb_schedule",
                 {
                     "role": role,
@@ -801,10 +827,12 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
     config = load_config(config_path)
     schedule_payload = _regular_bytes(fixture / "schedule.json", "fixture schedule")
     raw_store = RawStore(_stage(root, "raw"))
-    for role, window in (
-        ("training", config["training_window"]),
-        ("backtest", _backtest_schedule_window(config)),
-    ):
+    windows = [
+        ("training", {"start": start, "end": end})
+        for start, end in regular_season_ranges(config["extension_end"])[:3]
+    ] + [("backtest", _backtest_schedule_window(config))]
+    for role, window in windows:
+        payload = schedule_payload if role == "backtest" else b'{"dates":[]}'
         raw_store.put(
             "mlb_schedule",
             {
@@ -814,7 +842,7 @@ def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str
                 "gameType": "R",
                 "url": schedule_url(window["start"], window["end"]),
             },
-            schedule_payload,
+            payload,
         )
     calibration_rows = _array_fixture(fixture / "calibration.json", "fixture calibration")
     game_rows = _array_fixture(fixture / "games.json", "fixture games")

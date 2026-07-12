@@ -18,6 +18,7 @@ from mlb_backtest.pipeline import (
 from mlb_backtest.config import load_config
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.sources import schedule_url
+from mlb_backtest.statcast import regular_season_ranges
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini_replay"
@@ -40,18 +41,17 @@ def _copy_raw_schedule(root):
     config = load_config(CONFIG)
     payload = (FIXTURE / "schedule.json").read_bytes()
     store = RawStore(root / "raw")
-    for role, window_name in (("training", "training_window"), ("backtest", "initial_window")):
-        window = config[window_name]
+    for start, end in regular_season_ranges(config["extension_end"])[:3]:
         store.put(
             "mlb_schedule",
             {
-                "role": role,
-                "start": window["start"],
-                "end": window["end"],
+                "role": "training",
+                "start": start,
+                "end": end,
                 "gameType": "R",
-                "url": schedule_url(window["start"], window["end"]),
+                "url": schedule_url(start, end),
             },
-            payload,
+            b'{"dates":[]}',
         )
     extension_query = {
         "role": "backtest",
@@ -257,6 +257,11 @@ class PipelineTest(unittest.TestCase):
                 main(["features", "--config", str(CONFIG), "--data-dir", str(root)])
 
     def test_fetch_covers_frozen_extension_end(self):
+        config = load_config(CONFIG)
+        expected_ranges = [
+            *regular_season_ranges(config["extension_end"])[:3],
+            (config["initial_window"]["start"], config["extension_end"]),
+        ]
         with tempfile.TemporaryDirectory() as td, mock.patch(
             "mlb_backtest.pipeline.fetch_bytes", return_value=b'{"dates":[]}'
         ) as mocked_fetch:
@@ -267,17 +272,24 @@ class PipelineTest(unittest.TestCase):
                 for row in RawStore(root / "raw").verify_manifests()
                 if row["manifest"]["source"] == "mlb_schedule"
             ]
-            self.assertTrue(schedule_queries)
+            self.assertEqual(len(schedule_queries), 4)
             self.assertTrue(all(query["gameType"] == "R" for query in schedule_queries))
+            self.assertEqual(
+                sorted((query["start"], query["end"]) for query in schedule_queries),
+                sorted(expected_ranges),
+            )
+            self.assertNotIn(
+                (config["training_window"]["start"], config["training_window"]["end"]),
+                expected_ranges,
+            )
 
-        config = load_config(CONFIG)
         self.assertEqual(
             [call.args[0] for call in mocked_fetch.call_args_list],
             [
-                schedule_url(
-                    config["training_window"]["start"],
-                    config["training_window"]["end"],
-                ),
+                *[
+                    schedule_url(start, end)
+                    for start, end in regular_season_ranges(config["extension_end"])[:3]
+                ],
                 schedule_url(
                     config["initial_window"]["start"],
                     config["extension_end"],

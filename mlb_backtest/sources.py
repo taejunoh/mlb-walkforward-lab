@@ -259,8 +259,11 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         venue_id = venue_name = None
     else:
         venue = _mapping(venue_value, f"game[{index}].venue")
-        venue_id = _required(venue, "id", int, f"game[{index}].venue")
-        venue_name = _required(venue, "name", str, f"game[{index}].venue")
+        if venue.get("id") is None and venue.get("name") is None:
+            venue_id = venue_name = None
+        else:
+            venue_id = _required(venue, "id", int, f"game[{index}].venue")
+            venue_name = _required(venue, "name", str, f"game[{index}].venue")
 
     return {
         "game_pk": _required(game, "gamePk", int, f"game[{index}]"),
@@ -315,8 +318,8 @@ def parse_schedule(path: str | Path | bytes) -> list[dict]:
 
     root = _mapping(payload, "root")
     dates = _list(root.get("dates"), "dates")
-    games = []
-    seen_game_pks = set()
+    games_by_pk = {}
+    game_order = []
     game_index = 0
     for date_index, raw_date_entry in enumerate(dates):
         date_entry = _mapping(raw_date_entry, f"dates[{date_index}]")
@@ -325,11 +328,37 @@ def parse_schedule(path: str | Path | bytes) -> list[dict]:
             game = _normalize_game(raw_game, date_entry, game_index)
             game_index += 1
             if game is not None:
-                if game["game_pk"] in seen_game_pks:
-                    raise ValueError("malformed schedule: duplicate regular-season gamePk")
-                seen_game_pks.add(game["game_pk"])
-                games.append(game)
-    return games
+                game_pk = game["game_pk"]
+                prior = games_by_pk.get(game_pk)
+                if prior is None:
+                    games_by_pk[game_pk] = game
+                    game_order.append(game_pk)
+                    continue
+                identity_fields = (
+                    "game_pk",
+                    "away_team_id",
+                    "away_team",
+                    "home_team_id",
+                    "home_team",
+                )
+                if any(prior[field] != game[field] for field in identity_fields):
+                    raise ValueError("malformed schedule: conflicting duplicate gamePk")
+                if prior == game:
+                    continue
+                played = {"Final", "Completed Early"}
+                prior_played = prior["status"] in played
+                game_played = game["status"] in played
+                if prior_played and game_played:
+                    comparable_fields = set(prior) | set(game)
+                    comparable_fields.discard("scheduled_start_utc")
+                    if any(prior.get(field) != game.get(field) for field in comparable_fields):
+                        raise ValueError("malformed schedule: conflicting duplicate gamePk")
+                    if game["scheduled_start_utc"] < prior["scheduled_start_utc"]:
+                        games_by_pk[game_pk] = game
+                    continue
+                if game_played or not prior_played:
+                    games_by_pk[game_pk] = game
+    return [games_by_pk[game_pk] for game_pk in game_order]
 
 
 def selection_dates(

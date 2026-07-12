@@ -12,6 +12,7 @@ from mlb_backtest.prepare import (
     VerifiedScheduleEvidence,
     VerifiedStatcastEvidence,
     _aggregate_training_slot_rows,
+    _validate_played_schedule_season,
     assert_pregame_history,
     build_actual_participants,
     build_pregame_history,
@@ -286,6 +287,62 @@ class PrepareBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing training slot"):
             _aggregate_training_slot_rows(
                 games, missing_cell, full_season_mode=False
+            )
+
+    def test_played_schedule_validator_includes_completed_early_and_enforces_2400(self):
+        def scheduled_game(index, status="Final"):
+            away = index % 30
+            home = (index + 1) % 30
+            return {
+                "game_pk": 100000 + index,
+                "official_date": "2024-06-01",
+                "game_type": "R",
+                "status": status,
+                "away_score": 1,
+                "home_score": 2,
+                "away_is_winner": False,
+                "home_is_winner": True,
+                "away_team_id": away + 1,
+                "away_team": f"Team {away:02d}",
+                "home_team_id": home + 1,
+                "home_team": f"Team {home:02d}",
+                "away_lineup": [
+                    {"player_id": 10_000_000 + index * 20 + slot}
+                    for slot in range(1, 10)
+                ],
+                "home_lineup": [
+                    {"player_id": 10_000_000 + index * 20 + 10 + slot}
+                    for slot in range(1, 10)
+                ],
+            }
+
+        games = [scheduled_game(index) for index in range(2400)]
+        games[0] = scheduled_game(0, "Completed Early")
+        games.append(scheduled_game(2400, "Postponed"))
+        games[-1].update(
+            away_score=None,
+            home_score=None,
+            away_is_winner=None,
+            home_is_winner=None,
+        )
+        cancelled = scheduled_game(2401, "Cancelled")
+        cancelled.update(
+            away_score=None,
+            home_score=None,
+            away_is_winner=None,
+            home_is_winner=None,
+        )
+        games.append(cancelled)
+        played = _validate_played_schedule_season(
+            games, 2024, "2024-03-20", "2024-09-30"
+        )
+        self.assertEqual(len(played), 2400)
+        self.assertIn(100000, {game["game_pk"] for game in played})
+        self.assertNotIn(102400, {game["game_pk"] for game in played})
+        self.assertNotIn(102401, {game["game_pk"] for game in played})
+        with self.assertRaisesRegex(ValueError, "2400"):
+            _validate_played_schedule_season(
+                games[:2399], 2024, "2024-03-20", "2024-09-30"
             )
 
     def test_verified_schedule_evidence_comes_only_from_rawstore_manifest(self):

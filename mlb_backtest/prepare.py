@@ -688,6 +688,95 @@ def _aggregate_training_slot_rows(
     ]
 
 
+def _validate_played_schedule_season(
+    games: Iterable[Mapping[str, object]],
+    year: int,
+    season_open: str,
+    season_close: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Return lineup-valid played games after enforcing live season sanity."""
+    played_statuses = {"Final", "Completed Early"}
+    unplayed_statuses = {"Postponed", "Canceled", "Cancelled"}
+    played = []
+    lineup_valid = []
+    seen_pks = set()
+    teams_by_id = {}
+    for game in games:
+        if not isinstance(game, Mapping):
+            raise ValueError("schedule games must be mappings")
+        game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
+        if game_pk in seen_pks:
+            raise ValueError("schedule season contains duplicate game_pk")
+        seen_pks.add(game_pk)
+        official = _canonical_day(game.get("official_date"), "schedule official_date")
+        if (
+            date.fromisoformat(official).year != year
+            or not season_open <= official <= season_close
+            or game.get("game_type") != "R"
+        ):
+            raise ValueError(f"schedule row is outside frozen {year} regular season")
+        status = game.get("status")
+        if status in unplayed_statuses:
+            continue
+        if status not in played_statuses:
+            raise ValueError(f"unsupported completed-season schedule status: {status}")
+        away_score, home_score = game.get("away_score"), game.get("home_score")
+        away_winner, home_winner = (
+            game.get("away_is_winner"),
+            game.get("home_is_winner"),
+        )
+        if (
+            type(away_score) is not int
+            or away_score < 0
+            or type(home_score) is not int
+            or home_score < 0
+            or away_score == home_score
+            or type(away_winner) is not bool
+            or type(home_winner) is not bool
+            or away_winner == home_winner
+            or away_winner != (away_score > home_score)
+        ):
+            raise ValueError("played schedule outcome is missing or inconsistent")
+        played.append(game)
+        valid_lineups = True
+        for side in ("away", "home"):
+            team_id = _positive_id(game.get(f"{side}_team_id"), "schedule team id")
+            name = game.get(f"{side}_team")
+            if not isinstance(name, str) or not name:
+                raise ValueError("schedule team name must be nonempty")
+            if team_id in teams_by_id and teams_by_id[team_id] != name:
+                raise ValueError("schedule team id maps to conflicting names")
+            teams_by_id[team_id] = name
+            lineup = game.get(f"{side}_lineup")
+            valid_lineups = bool(
+                valid_lineups
+                and isinstance(lineup, Sequence)
+                and not isinstance(lineup, (str, bytes))
+                and len(lineup) == 9
+                and len(
+                    {
+                        player.get("player_id")
+                        for player in lineup
+                        if isinstance(player, Mapping)
+                        and type(player.get("player_id")) is int
+                        and player["player_id"] > 0
+                    }
+                )
+                == 9
+            )
+        if valid_lineups:
+            lineup_valid.append(game)
+    if len(played) < 2400:
+        raise ValueError(f"frozen {year} schedule requires at least 2400 played games")
+    if len(teams_by_id) != 30 or len(set(teams_by_id.values())) != 30:
+        raise ValueError(f"frozen {year} schedule must contain exactly 30 teams")
+    if len(lineup_valid) < 2400:
+        raise ValueError(
+            f"frozen {year} schedule requires at least 2400 valid 9+9 lineup games"
+        )
+    return tuple(lineup_valid)
+
+
 def derive_training_slot_rows(
     schedule_evidence_by_year: Mapping[int, VerifiedScheduleEvidence],
     statcast_evidence: VerifiedStatcastEvidence,
@@ -705,6 +794,8 @@ def derive_training_slot_rows(
         2024: ("2024-03-20", "2024-09-30"),
     }
     schedule_games_by_pk = {}
+    played_game_pks = set()
+    played_game_dates = {}
     for year, (season_open, season_close) in frozen.items():
         evidence = _rebind_schedule_evidence(schedule_evidence_by_year[year])
         if (
@@ -718,37 +809,24 @@ def derive_training_slot_rows(
             for game in evidence.games
             if date.fromisoformat(str(game["official_date"])).year == year
         ]
-        if len(season_games) != 2430:
-            raise ValueError(f"frozen {year} schedule must contain exactly 2430 games")
-        teams_by_id = {}
+        played_game_pks.update(
+            int(game["game_pk"])
+            for game in season_games
+            if game.get("status") in {"Final", "Completed Early"}
+        )
         for game in season_games:
-            if (
-                game.get("game_type") != "R"
-                or game.get("status") != "Final"
-                or not season_open <= str(game.get("official_date")) <= season_close
-            ):
-                raise ValueError(f"frozen {year} schedule games must be Final regular games")
-            for side in ("away", "home"):
-                team_id = _positive_id(game.get(f"{side}_team_id"), "schedule team id")
-                name = game.get(f"{side}_team")
-                if not isinstance(name, str) or not name:
-                    raise ValueError("schedule team name must be nonempty")
-                if team_id in teams_by_id and teams_by_id[team_id] != name:
-                    raise ValueError("schedule team id maps to conflicting names")
-                teams_by_id[team_id] = name
-                lineup = game.get(f"{side}_lineup")
-                if (
-                    not isinstance(lineup, Sequence)
-                    or len(lineup) != 9
-                    or len({player.get("player_id") for player in lineup if isinstance(player, Mapping)}) != 9
-                ):
-                    raise ValueError("full-season schedule requires official nine-player lineups")
+            if game.get("status") in {"Final", "Completed Early"}:
+                game_pk = int(game["game_pk"])
+                if game_pk in played_game_dates:
+                    raise ValueError("full-season schedule evidence duplicates played game_pk")
+                played_game_dates[game_pk] = str(game["official_date"])
+        for game in _validate_played_schedule_season(
+            season_games, year, season_open, season_close
+        ):
             game_pk = _positive_id(game.get("game_pk"), "schedule game_pk")
             if game_pk in schedule_games_by_pk:
                 raise ValueError("full-season schedule evidence duplicates game_pk")
             schedule_games_by_pk[game_pk] = game
-        if len(teams_by_id) != 30 or len(set(teams_by_id.values())) != 30:
-            raise ValueError(f"frozen {year} schedule must contain exactly 30 teams")
 
     statcast_evidence = _rebind_statcast_evidence(statcast_evidence)
     statcast_snapshot = json.dumps(
@@ -790,11 +868,12 @@ def derive_training_slot_rows(
             cursor += timedelta(days=1)
     if covered_dates != expected_dates:
         raise ValueError("verified Statcast evidence does not cover frozen seasons")
-    if any(
-        int(row["game_pk"]) not in schedule_games_by_pk
-        for row in statcast_evidence.plate_appearances
-    ):
-        raise ValueError("verified Statcast plate appearance lacks a schedule game")
+    for row in statcast_evidence.plate_appearances:
+        game_pk = int(row["game_pk"])
+        if game_pk not in played_game_pks:
+            raise ValueError("verified Statcast plate appearance lacks a schedule game")
+        if str(row["game_date"]) != played_game_dates[game_pk]:
+            raise ValueError("verified Statcast plate appearance date conflicts with schedule")
     rows = _aggregate_training_slot_rows(
         schedule_games_by_pk.values(),
         statcast_evidence.plate_appearances,
