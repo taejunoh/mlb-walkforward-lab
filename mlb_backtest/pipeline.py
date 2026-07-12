@@ -31,7 +31,12 @@ from .scoring import (
     tier,
     uncertainty,
 )
-from .sources import fetch_bytes, parse_schedule, schedule_url
+from .sources import (
+    fetch_bytes,
+    parse_schedule,
+    schedule_url,
+    validate_schedule_query_coverage,
+)
 from .statcast import regular_season_ranges
 
 
@@ -277,12 +282,13 @@ def _require_raw_schedule(
         query_digest = hashlib.sha256(query_bytes).hexdigest()
         if manifest_path.name != f"{digest}.{query_digest}.manifest.json":
             raise RuntimeError("raw schedule manifest address mismatch")
-        games = parse_schedule(folder / f"{digest}.raw")
-        if any(
-            not query["start"] <= game["official_date"] <= query["end"]
-            for game in games
-        ):
-            raise RuntimeError("raw schedule game is outside manifest query window")
+        games = parse_schedule(payload)
+        try:
+            validate_schedule_query_coverage(payload, query["start"], query["end"])
+        except ValueError as exc:
+            raise RuntimeError(
+                "raw schedule game is outside manifest query window"
+            ) from exc
         index = {game["game_pk"]: game for game in games}
         if len(index) != len(games):
             raise RuntimeError("raw schedule contains duplicate game_pk values")

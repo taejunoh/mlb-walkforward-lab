@@ -11,6 +11,7 @@ from unittest import mock
 from mlb_backtest.career_bf import fetch_prior_career_bf_records
 from mlb_backtest.pipeline import (
     _load_model_card,
+    _require_raw_schedule,
     _verify_candidate_provenance,
     _write_jsonl_once,
     calibrate_stage,
@@ -1076,6 +1077,71 @@ class PipelineTest(unittest.TestCase):
             schedule_root.rename(root / "raw" / "removed_schedule")
             with self.assertRaisesRegex(RuntimeError, "raw/schedule"):
                 features_stage(CONFIG, root)
+
+    def test_raw_schedule_uses_query_bucket_for_result_free_postponement(self):
+        config = load_config(CONFIG)
+        payload = json.loads(
+            (Path(__file__).parent / "fixtures" / "schedule_2025_05_01.json").read_text()
+        )
+        payload["dates"][0]["date"] = "2025-04-30"
+        game = payload["dates"][0]["games"][0]
+        game["officialDate"] = "2025-08-09"
+        game["status"] = {"detailedState": "Postponed"}
+        game.pop("linescore", None)
+        for side in ("away", "home"):
+            game["teams"][side].pop("score")
+            game["teams"][side].pop("isWinner")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            query = {
+                "role": "history",
+                "start": "2025-03-18",
+                "end": "2025-04-30",
+                "gameType": "R",
+                "url": schedule_url("2025-03-18", "2025-04-30"),
+            }
+            RawStore(root / "raw").put_unique_query(
+                "mlb_schedule", query, json.dumps(payload).encode()
+            )
+
+            _digest, games = _require_raw_schedule(root, config, "history")
+
+        self.assertEqual(games[778100]["official_date"], "2025-08-09")
+
+    def test_raw_schedule_rejects_out_of_range_result_bearing_games(self):
+        config = load_config(CONFIG)
+        for status in ("Final", "Postponed"):
+            with self.subTest(status=status):
+                payload = json.loads(
+                    (
+                        Path(__file__).parent
+                        / "fixtures"
+                        / "schedule_2025_05_01.json"
+                    ).read_text()
+                )
+                payload["dates"][0]["date"] = "2025-04-30"
+                game = payload["dates"][0]["games"][0]
+                game["officialDate"] = "2025-08-09"
+                game["status"] = {"detailedState": status}
+
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    query = {
+                        "role": "history",
+                        "start": "2025-03-18",
+                        "end": "2025-04-30",
+                        "gameType": "R",
+                        "url": schedule_url("2025-03-18", "2025-04-30"),
+                    }
+                    RawStore(root / "raw").put_unique_query(
+                        "mlb_schedule", query, json.dumps(payload).encode()
+                    )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "outside manifest query window"
+                    ):
+                        _require_raw_schedule(root, config, "history")
 
     def test_outcomes_require_every_locked_game_outcome(self):
         outcomes = json.loads((FIXTURE / "outcomes.json").read_text("utf-8"))

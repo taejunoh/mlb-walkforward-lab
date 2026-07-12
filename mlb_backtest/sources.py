@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
+OUT_OF_RANGE_UNPLAYED_STATUSES = frozenset({"Postponed", "Canceled", "Cancelled"})
 _USER_AGENT = "mlb-v5.1-backtest/1.0"
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
@@ -418,6 +419,77 @@ def parse_schedule(path: str | Path | bytes) -> list[dict]:
                 if game_played or not prior_played:
                     games_by_pk[game_pk] = game
     return [games_by_pk[game_pk] for game_pk in game_order]
+
+
+def validate_schedule_query_coverage(
+    path: str | Path | bytes, start: str, end: str
+) -> None:
+    """Require query-date coverage, allowing only result-free moved cancellations."""
+    raw = path if isinstance(path, bytes) else Path(path).read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed schedule: expected UTF-8 JSON") from exc
+    root = _mapping(payload, "root")
+    dates = _list(root.get("dates"), "dates")
+    for date_index, raw_date_entry in enumerate(dates):
+        date_entry = _mapping(raw_date_entry, f"dates[{date_index}]")
+        query_date = date_entry.get("date")
+        try:
+            parsed_query_date = date.fromisoformat(query_date)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("malformed schedule: query date must be ISO format") from exc
+        if parsed_query_date.isoformat() != query_date or not start <= query_date <= end:
+            raise ValueError("schedule payload contains a game outside its query")
+        raw_games = _list(date_entry.get("games"), f"dates[{date_index}].games")
+        for game_index, raw_game in enumerate(raw_games):
+            game = _mapping(raw_game, f"dates[{date_index}].games[{game_index}]")
+            if game.get("gameType") != "R":
+                continue
+            official_date = game.get("officialDate", query_date)
+            if start <= official_date <= end:
+                continue
+            status = _mapping(
+                game.get("status"), f"dates[{date_index}].games[{game_index}].status"
+            )
+            status_name = _required(
+                status,
+                "detailedState",
+                str,
+                f"dates[{date_index}].games[{game_index}].status",
+            )
+            teams = _mapping(
+                game.get("teams"), f"dates[{date_index}].games[{game_index}].teams"
+            )
+            away = _mapping(
+                teams.get("away"),
+                f"dates[{date_index}].games[{game_index}].teams.away",
+            )
+            home = _mapping(
+                teams.get("home"),
+                f"dates[{date_index}].games[{game_index}].teams.home",
+            )
+            linescore_value = game.get("linescore")
+            linescore = (
+                {}
+                if linescore_value is None
+                else _mapping(
+                    linescore_value,
+                    f"dates[{date_index}].games[{game_index}].linescore",
+                )
+            )
+            raw_result_fields = (
+                away.get("score"),
+                home.get("score"),
+                away.get("isWinner"),
+                home.get("isWinner"),
+                linescore.get("currentInning"),
+                linescore.get("outs"),
+            )
+            if status_name not in OUT_OF_RANGE_UNPLAYED_STATUSES or any(
+                value is not None for value in raw_result_fields
+            ):
+                raise ValueError("schedule payload contains a game outside its query")
 
 
 def selection_dates(
