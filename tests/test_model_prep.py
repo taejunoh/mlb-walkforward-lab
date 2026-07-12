@@ -186,8 +186,8 @@ class ModelPreparationSourceTest(unittest.TestCase):
         object.__setattr__(evidence, "manifest_sha256", "c" * 64)
         object.__setattr__(evidence, "games", (first,))
         played = StatcastData(
-            ({"game_pk": 1, "inning": 11},),
-            ({"game_pk": 1},),
+            ({"game_pk": 1, "game_date": "2025-05-01", "inning": 11},),
+            ({"game_pk": 1, "game_date": "2025-05-01"},),
         )
         history = build_result_free_schedule_history(
             evidence, {"Away": "AWY", "Home": "HOM"}, played
@@ -198,6 +198,72 @@ class ModelPreparationSourceTest(unittest.TestCase):
         )
         self.assertEqual(history.rows, changed.rows)
         self.assertEqual(history.rows[0]["innings"], 11)
+
+    def test_result_free_history_binds_rescheduled_game_to_coverage_and_statcast_date(self):
+        evidence = object.__new__(VerifiedScheduleEvidence)
+        object.__setattr__(evidence, "coverage_start", "2025-04-01")
+        object.__setattr__(evidence, "coverage_end", "2025-04-30")
+        object.__setattr__(evidence, "manifest_sha256", "c" * 64)
+        valid = {
+            "game_pk": 100,
+            "official_date": "2025-04-10",
+            "away_team": "Away",
+            "home_team": "Home",
+            "venue_name": "Park",
+        }
+        rescheduled_original = {
+            "game_pk": 778372,
+            "official_date": "2025-07-29",
+            "away_team": "Toronto Blue Jays",
+            "home_team": "Baltimore Orioles",
+            "venue_name": "Oriole Park at Camden Yards",
+        }
+        wrong_statcast_date = {
+            "game_pk": 200,
+            "official_date": "2025-04-12",
+            "away_team": "Away",
+            "home_team": "Home",
+            "venue_name": "Park",
+        }
+        object.__setattr__(
+            evidence, "games", (valid, wrong_statcast_date, rescheduled_original)
+        )
+        statcast = StatcastData(
+            (
+                {"game_pk": 100, "game_date": "2025-04-10", "inning": 9},
+                {"game_pk": 200, "game_date": "2025-04-13", "inning": 9},
+                {"game_pk": 778372, "game_date": "2025-07-29", "inning": 9},
+            ),
+            (
+                {"game_pk": 100, "game_date": "2025-04-10"},
+                {"game_pk": 200, "game_date": "2025-04-13"},
+                {"game_pk": 778372, "game_date": "2025-07-29"},
+            ),
+        )
+        team_codes = {
+            "Away": "AWY",
+            "Home": "HOM",
+            "Toronto Blue Jays": "TOR",
+            "Baltimore Orioles": "BAL",
+        }
+
+        history = build_result_free_schedule_history(evidence, team_codes, statcast)
+
+        self.assertEqual([row["game_pk"] for row in history.rows], [100])
+        self.assertEqual(
+            history.provenance["excluded_schedule_date_game_pks"], (778372,)
+        )
+        self.assertEqual(
+            history.provenance["excluded_statcast_date_game_pks"], (200,)
+        )
+
+        object.__setattr__(evidence, "coverage_start", "2025-05-01")
+        object.__setattr__(evidence, "coverage_end", "2025-09-28")
+        object.__setattr__(evidence, "games", (rescheduled_original,))
+        actual_makeup = build_result_free_schedule_history(
+            evidence, team_codes, statcast
+        )
+        self.assertEqual([row["game_pk"] for row in actual_makeup.rows], [778372])
 
     def test_verified_catalog_prevents_reauditing_bulk_statcast_payloads(self):
         with tempfile.TemporaryDirectory() as td:

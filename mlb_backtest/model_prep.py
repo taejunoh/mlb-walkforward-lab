@@ -368,10 +368,15 @@ def build_result_free_schedule_history(
         raise ValueError("verified schedule evidence is required")
     if not isinstance(statcast, StatcastData):
         raise ValueError("verified Statcast data is required")
-    played_pks = {
-        int(row["game_pk"])
-        for row in (*statcast.pitches, *statcast.plate_appearances)
-    }
+    statcast_dates_by_game: dict[int, set[str]] = {}
+    for row in (*statcast.pitches, *statcast.plate_appearances):
+        game_pk = int(row["game_pk"])
+        try:
+            game_date = date.fromisoformat(str(row["game_date"])).isoformat()
+        except (KeyError, ValueError) as exc:
+            raise ValueError("result-free Statcast game_date is invalid") from exc
+        statcast_dates_by_game.setdefault(game_pk, set()).add(game_date)
+    played_pks = set(statcast_dates_by_game)
     innings_by_game: dict[int, int] = {}
     for pitch in statcast.pitches:
         game_pk = int(pitch["game_pk"])
@@ -380,9 +385,21 @@ def build_result_free_schedule_history(
             raise ValueError("result-free Statcast inning is invalid")
         innings_by_game[game_pk] = max(innings_by_game.get(game_pk, 0), inning)
     rows = []
+    excluded_schedule_date_game_pks = []
+    excluded_statcast_date_game_pks = []
     for game in evidence.games:
         game_pk = game["game_pk"]
         if game_pk not in played_pks:
+            continue
+        if not (
+            evidence.coverage_start
+            <= str(game["official_date"])
+            <= evidence.coverage_end
+        ):
+            excluded_schedule_date_game_pks.append(game_pk)
+            continue
+        if statcast_dates_by_game[game_pk] != {str(game["official_date"])}:
+            excluded_statcast_date_game_pks.append(game_pk)
             continue
         away_name, home_name = game["away_team"], game["home_team"]
         if away_name not in team_code_by_name or home_name not in team_code_by_name:
@@ -420,7 +437,13 @@ def build_result_free_schedule_history(
             "source_manifest_sha256": evidence.manifest_sha256,
             "played_game_count": len(rows),
             "played_game_pks": expected,
-            "played_evidence": "STATCAST_GAME_PK",
+            "played_evidence": "STATCAST_GAME_PK_AND_DATE",
+            "excluded_schedule_date_game_pks": tuple(
+                sorted(excluded_schedule_date_game_pks)
+            ),
+            "excluded_statcast_date_game_pks": tuple(
+                sorted(excluded_statcast_date_game_pks)
+            ),
             "result_fields_accessed": False,
         },
     )
