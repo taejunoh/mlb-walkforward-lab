@@ -847,22 +847,41 @@ def _schedule_component(
     home_days = 0
     destination = _venue(game, history)
     target_venue = game.get("venue_name")
-    prior_home_games = []
-    for offset in (1, 2, 3):
-        candidates = history.schedule_history.by_team_date.get(
+    home_city_rows = [
+        row
+        for offset in (1, 2, 3)
+        for row in history.schedule_history.by_team_date.get(
             (team_code, target - timedelta(days=offset)), ()
         )
-        matching = [
-            row
-            for row in candidates
-            if row.get("home_team_code") == team_code
-            and row.get("venue_name") == target_venue
-        ]
-        if not matching:
-            prior_home_games = []
-            break
-        prior_home_games.append(matching[0])
-    home_city_supported = schedule_window_supported
+    ]
+    home_city_supported = bool(
+        schedule_window_supported
+        and isinstance(target_venue, str)
+        and target_venue
+        and all(
+            isinstance(row.get("home_team_code"), str)
+            and row["home_team_code"]
+            and isinstance(row.get("venue_name"), str)
+            and row["venue_name"]
+            for row in home_city_rows
+        )
+    )
+    prior_home_games = []
+    if home_city_supported:
+        for offset in (1, 2, 3):
+            candidates = history.schedule_history.by_team_date.get(
+                (team_code, target - timedelta(days=offset)), ()
+            )
+            matching = [
+                row
+                for row in candidates
+                if row.get("home_team_code") == team_code
+                and row.get("venue_name") == target_venue
+            ]
+            if not matching:
+                prior_home_games = []
+                break
+            prior_home_games.append(matching[0])
     if len(prior_home_games) == 3:
         home_days = 3
     if isinstance(game.get("doubleheader"), bool):

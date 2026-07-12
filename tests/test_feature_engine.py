@@ -711,6 +711,32 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertEqual(score(("HOM", "HOM", "HOM")), 55.0)
         self.assertEqual(score(("HOM", "OPP", "HOM")), 50.0)
 
+    def test_home_city_is_unsupported_when_covered_rows_lack_location_identity(self):
+        rows = [
+            {
+                "game_pk": index,
+                "official_date": day,
+                "team_codes": ["HOM", "OPP"],
+                "innings": 9,
+            }
+            for index, day in enumerate(("2025-04-30", "2025-04-29", "2025-04-28"), 1)
+        ]
+        result = build(
+            game(doubleheader_marker=None, doubleheader=False),
+            FeatureHistory(
+                data([]),
+                slot_weights={i: 1 / 9 for i in range(1, 10)},
+                schedule_history=rows,
+                schedule_coverage_start="2025-04-28",
+                schedule_coverage_end="2025-04-30",
+                schedule_coverage_complete=True,
+            ),
+        )
+        schedule = result["home"]["schedule"]
+        self.assertEqual(schedule["value"], 50.0)
+        self.assertEqual(schedule["quality"], 0.5)
+        self.assertIn("home_city_unsupported", schedule["flags"])
+
     def test_schedule_history_indexes_once_for_reasonable_repeated_builds(self):
         class CountingRows:
             def __init__(self, rows):
@@ -1061,9 +1087,10 @@ class FeatureEngineTest(unittest.TestCase):
         )
         result = build(game(doubleheader_marker=None), history)
         self.assertEqual(result["home"]["schedule"]["value"], 34.0)
-        self.assertEqual(result["home"]["schedule"]["quality"], 5 / 6)
+        self.assertEqual(result["home"]["schedule"]["quality"], 4 / 6)
         self.assertEqual(
-            result["home"]["schedule"]["flags"], ["doubleheader_unsupported"]
+            result["home"]["schedule"]["flags"],
+            ["home_city_unsupported", "doubleheader_unsupported"],
         )
 
     def test_missing_participants_are_ineligible_with_explicit_reasons(self):
