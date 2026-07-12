@@ -275,25 +275,29 @@ class DiagnosticGoldenTest(unittest.TestCase):
         safety = self.result["leakage"]["statistical_as_of_safety"]
         self.assertEqual(safety["status"], "LIMITATION")
         self.assertEqual(safety["d1_feature_isolation_status"], "PASS")
-        self.assertEqual(safety["locked_prediction_outcome_fields_status"], "PASS")
+        self.assertEqual(safety["locked_row_outcome_field_isolation_status"], "PASS")
         self.assertEqual(safety["lock_to_outcome_join_sequence_status"], "NOT_TIMESTAMP_PROVEN")
+        self.assertEqual(safety["candidate_rows"], 1972)
+        self.assertEqual(safety["locked_prediction_rows"], 1340)
+        self.assertEqual(safety["evaluated_prediction_rows"], 1340)
         self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
         self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
 
     def test_leakage_evidence_tampering_fails(self):
         evidence = load_v51_evidence(ROOT)
-        raw = jsonable(evidence.candidate_rows[0])
+        candidate_rows = jsonable(evidence.candidate_rows)
+        locked_rows = jsonable(evidence.locked_prediction_rows)
+        evaluated_rows = jsonable(evidence.evaluated_rows)
         card = jsonable(evidence.model_card)
-        card["counts"]["candidate_rows"] = 1
         manual = evidence.manual_audit_text
 
-        def audit(candidate_rows, *, locked=None, evaluated=None, audit=None):
+        def audit(candidates, *, locked=None, evaluated=None, audit=None, model_card=None):
             return audit_leakage_evidence(
-                candidate_rows,
-                card,
+                candidates,
+                locked if locked is not None else locked_rows,
+                evaluated if evaluated is not None else evaluated_rows,
+                model_card if model_card is not None else card,
                 manual,
-                locked_prediction_rows=(locked or evidence.locked_prediction_rows),
-                evaluated_rows=(evaluated or evidence.evaluated_rows),
                 lock_audit=(audit or evidence.lock_audit),
             )
 
@@ -302,34 +306,46 @@ class DiagnosticGoldenTest(unittest.TestCase):
             lambda x: x["provenance"].__setitem__("statcast_target_excluded", False),
             lambda x: x.__setitem__("lineup_provenance", "TIMESTAMP_VERIFIED_T45"),
         ):
-            changed = copy.deepcopy(raw)
-            mutate(changed)
+            changed = copy.deepcopy(candidate_rows)
+            mutate(changed[0])
             with self.assertRaisesRegex(ValueError, "leakage evidence"):
-                audit((changed,))
+                audit(changed)
         with self.assertRaisesRegex(ValueError, "manual audit evidence"):
             audit_leakage_evidence(
-                (raw,),
+                candidate_rows,
+                locked_rows,
+                evaluated_rows,
                 card,
                 manual.replace("2025-06-15", "missing"),
-                locked_prediction_rows=evidence.locked_prediction_rows,
-                evaluated_rows=evidence.evaluated_rows,
                 lock_audit=evidence.lock_audit,
             )
 
-        locked = jsonable(evidence.locked_prediction_rows)
+        locked = copy.deepcopy(locked_rows)
         locked[0]["outcome"] = {"actual_winner": "forbidden"}
-        with self.assertRaisesRegex(ValueError, "locked prediction outcome isolation"):
-            audit((raw,), locked=locked)
+        with self.assertRaisesRegex(ValueError, "locked-row outcome isolation"):
+            audit(candidate_rows, locked=locked)
 
-        mismatched = jsonable(evidence.evaluated_rows)
+        mismatched = copy.deepcopy(evaluated_rows)
         mismatched[0]["predicted_winner"] = "tampered"
-        with self.assertRaisesRegex(ValueError, "locked/evaluated prediction binding"):
-            audit((raw,), evaluated=mismatched)
+        with self.assertRaisesRegex(ValueError, "evaluated prediction binding"):
+            audit(candidate_rows, evaluated=mismatched)
+
+        first_locked = locked_rows[0]
+        missing_candidate = [
+            row
+            for row in candidate_rows
+            if (int(row["game_pk"]), str(row["official_date"]))
+            != (int(first_locked["game_pk"]), str(first_locked["official_date"]))
+        ]
+        missing_card = copy.deepcopy(card)
+        missing_card["counts"]["candidate_rows"] = len(missing_candidate)
+        with self.assertRaisesRegex(ValueError, "locked candidate binding"):
+            audit(missing_candidate, model_card=missing_card)
 
         malformed_audit = jsonable(evidence.lock_audit)
         del malformed_audit["sealed_lock"]["created_at_utc"]
         with self.assertRaisesRegex(ValueError, "lock sequencing evidence"):
-            audit((raw,), audit=malformed_audit)
+            audit(candidate_rows, audit=malformed_audit)
 
     def test_loaded_evidence_is_snapshot_bound_after_source_mutation(self):
         paths = set(AUDITED_DIGEST_PATHS.values()) | {

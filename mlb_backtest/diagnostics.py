@@ -684,15 +684,17 @@ def quality_diagnostic(
 
 def audit_leakage_evidence(
     candidate_rows: Sequence[Mapping[str, object]],
+    locked_prediction_rows: Sequence[Mapping[str, object]],
+    evaluated_rows: Sequence[Mapping[str, object]],
     card: Mapping[str, object],
     manual_text: str,
     *,
-    locked_prediction_rows: Sequence[Mapping[str, object]],
-    evaluated_rows: Sequence[Mapping[str, object]],
-    lock_audit: Mapping[str, object],
+    lock_audit: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if len(candidate_rows) != int(card["counts"]["candidate_rows"]):
         raise ValueError("leakage evidence candidate count differs")
+    if len(locked_prediction_rows) != 1340 or len(evaluated_rows) != 1340:
+        raise ValueError("leakage evidence locked/evaluated count differs")
     for row in candidate_rows:
         provenance = row["provenance"]
         target = date.fromisoformat(str(row["official_date"]))
@@ -723,23 +725,28 @@ def audit_leakage_evidence(
         card["counts"]["calibration_rows"]
     ):
         raise ValueError("calibration pool evidence differs")
-    try:
-        sealed_lock = lock_audit["sealed_lock"]
-        lock_created_at = str(sealed_lock["created_at_utc"])
-        sealed_row_count = int(sealed_lock["row_count"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("lock sequencing evidence is incomplete") from exc
-    try:
-        parsed_lock_time = datetime.fromisoformat(lock_created_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("lock sequencing evidence is invalid") from exc
-    if parsed_lock_time.tzinfo is None or sealed_row_count != len(
-        locked_prediction_rows
-    ):
-        raise ValueError("lock sequencing evidence is invalid")
+    if lock_audit is not None:
+        try:
+            sealed_lock = lock_audit["sealed_lock"]
+            lock_created_at = str(sealed_lock["created_at_utc"])
+            sealed_row_count = int(sealed_lock["row_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("lock sequencing evidence is incomplete") from exc
+        try:
+            parsed_lock_time = datetime.fromisoformat(
+                lock_created_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("lock sequencing evidence is invalid") from exc
+        if parsed_lock_time.tzinfo is None or sealed_row_count != 1340:
+            raise ValueError("lock sequencing evidence is invalid")
     forbidden_outcome_fields = {
         "outcome",
         "actual_winner",
+        "correct",
+        "result",
+        "home_score",
+        "away_score",
         "status",
         "market_snapshot_at",
         "market_source",
@@ -747,28 +754,45 @@ def audit_leakage_evidence(
         "away_no_vig_probability",
         "home_no_vig_probability",
     }
-    if any(forbidden_outcome_fields & set(row) for row in locked_prediction_rows):
-        raise ValueError("locked prediction outcome isolation differs")
-    if len(locked_prediction_rows) != len(evaluated_rows):
-        raise ValueError("locked/evaluated prediction binding differs")
-    for locked, evaluated in zip(
-        locked_prediction_rows, evaluated_rows, strict=True
+    candidate_keys = {
+        (int(row["game_pk"]), str(row["official_date"])) for row in candidate_rows
+    }
+    if len(candidate_keys) != len(candidate_rows):
+        raise ValueError("leakage evidence duplicate candidate key")
+    locked_by_key = {
+        (
+            int(row["game_pk"]),
+            str(row["official_date"]),
+            int(row["daily_rank"]),
+        ): row
+        for row in locked_prediction_rows
+    }
+    evaluated_by_key = {
+        (
+            int(row["game_pk"]),
+            str(row["official_date"]),
+            int(row["daily_rank"]),
+        ): row
+        for row in evaluated_rows
+    }
+    if (
+        len(locked_by_key) != len(locked_prediction_rows)
+        or len(evaluated_by_key) != len(evaluated_rows)
+        or set(locked_by_key) != set(evaluated_by_key)
     ):
-        prediction = {key: value for key, value in evaluated.items() if key != "outcome"}
-        if canonical_json_bytes(locked) != canonical_json_bytes(prediction):
-            raise ValueError("locked/evaluated prediction binding differs")
-    joined_at = lock_audit.get("outcome_joined_at_utc")
-    sequence_status = "NOT_TIMESTAMP_PROVEN"
-    if joined_at is not None:
-        try:
-            parsed_join_time = datetime.fromisoformat(
-                str(joined_at).replace("Z", "+00:00")
-            )
-        except ValueError as exc:
-            raise ValueError("lock sequencing evidence is invalid") from exc
-        if parsed_join_time.tzinfo is None or parsed_join_time <= parsed_lock_time:
-            raise ValueError("lock sequencing evidence is invalid")
-        sequence_status = "PASS"
+        raise ValueError("evaluated prediction binding differs")
+    if not {
+        (game_pk, official_date) for game_pk, official_date, _ in locked_by_key
+    } <= candidate_keys:
+        raise ValueError("locked candidate binding differs")
+    for key, locked in locked_by_key.items():
+        if forbidden_outcome_fields & set(locked):
+            raise ValueError("locked-row outcome isolation violated")
+        evaluated = evaluated_by_key[key]
+        if set(evaluated) != set(locked) | {"outcome"} or any(
+            evaluated[field] != value for field, value in locked.items()
+        ):
+            raise ValueError("evaluated prediction binding differs")
     later_revision_rows = sum(
         str(row["provenance"]["raw_source_max_date"])
         > str(row["official_date"])
@@ -776,22 +800,23 @@ def audit_leakage_evidence(
     )
     return {
         "statistical_as_of_safety": {
-            "status": "PASS" if sequence_status == "PASS" else "LIMITATION",
+            "status": "LIMITATION",
             "candidate_rows": len(candidate_rows),
+            "locked_prediction_rows": len(locked_prediction_rows),
+            "evaluated_prediction_rows": len(evaluated_rows),
             "rule": (
-                "max_history_date and schedule_used_max_date < target; "
-                "target Statcast excluded"
+                "D-1 feature history and target Statcast exclusion are proven; "
+                "locked prediction fields bind to evaluated rows without outcome "
+                "fields; outcome-join execution timestamp is absent"
             ),
             "calibration_status": "IN_SAMPLE_NOT_OOF",
             "training_eligible_rows": card["counts"]["training_eligible_rows"],
             "calibration_rows": card["counts"]["calibration_rows"],
             "d1_feature_isolation_status": "PASS",
-            "locked_prediction_outcome_fields_status": "PASS",
-            "lock_to_outcome_join_sequence_status": sequence_status,
+            "locked_row_outcome_field_isolation_status": "PASS",
+            "lock_to_outcome_join_sequence_status": "NOT_TIMESTAMP_PROVEN",
             "sequence_limitation": (
-                None
-                if sequence_status == "PASS"
-                else "sealed artifacts contain no outcome-join execution timestamp"
+                "sealed artifacts contain no outcome-join execution timestamp"
             ),
         },
         "participant_time_limitation": {
@@ -815,10 +840,10 @@ def leakage_diagnostic(
 ) -> dict[str, object]:
     return audit_leakage_evidence(
         evidence.candidate_rows,
+        evidence.locked_prediction_rows,
+        evidence.evaluated_rows,
         evidence.model_card,
         evidence.manual_audit_text,
-        locked_prediction_rows=evidence.locked_prediction_rows,
-        evaluated_rows=evidence.evaluated_rows,
         lock_audit=evidence.lock_audit,
     )
 
