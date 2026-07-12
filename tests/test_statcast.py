@@ -42,6 +42,7 @@ class StatcastTest(unittest.TestCase):
         pa = next(row for row in parsed.plate_appearances if row["event_id"] == "1001:1")
         self.assertEqual(pa["events"], "strikeout")
         self.assertEqual(pa["pitch_number"], 2)
+        self.assertEqual(pa["outs_on_play"], 1)
 
     def test_roles_use_first_pitcher_for_each_fielding_side(self):
         parsed = parse_statcast(FIXTURE)
@@ -87,6 +88,23 @@ class StatcastTest(unittest.TestCase):
         try:
             malformed.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing required fields.*pitch_type"):
+                parse_statcast(malformed)
+        finally:
+            malformed.unlink(missing_ok=True)
+
+    def test_outs_on_play_is_a_required_nonnegative_integer(self):
+        text = FIXTURE.read_text("utf-8-sig")
+        malformed = FIXTURE.parent / "statcast_bad.tmp.csv"
+        try:
+            malformed.write_text(
+                text.replace("outs_on_play", "outs_on_play_x", 1), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "missing required fields.*outs_on_play"
+            ):
+                parse_statcast(malformed)
+            malformed.write_text(text.replace(",1,R\n", ",-1,R\n", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outs_on_play must be nonnegative"):
                 parse_statcast(malformed)
         finally:
             malformed.unlink(missing_ok=True)

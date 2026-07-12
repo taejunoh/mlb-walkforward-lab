@@ -43,6 +43,7 @@ REQUIRED_FIELDS = (
     "pitch_number",
     "post_home_score",
     "post_away_score",
+    "outs_on_play",
     "game_type",
 )
 
@@ -302,6 +303,9 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
             ),
             "post_away_score": _integer(
                 raw["post_away_score"], "post_away_score", row_number
+            ),
+            "outs_on_play": _integer(
+                raw["outs_on_play"], "outs_on_play", row_number
             ),
             "game_type": "R",
         }
