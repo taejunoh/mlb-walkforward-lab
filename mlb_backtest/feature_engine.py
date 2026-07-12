@@ -386,10 +386,6 @@ class FeatureHistory:
             if self.plate_appearances
             else None
         )
-        self.league_fip_by_year = MappingProxyType(
-            {year: self._league_fip(rows) for year, rows in self.pa_by_year.items()}
-        )
-
     @staticmethod
     def rows_before(
         rows: Sequence[Mapping[str, object]], target: date
