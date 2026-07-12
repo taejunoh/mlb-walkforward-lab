@@ -25,12 +25,15 @@ from mlb_backtest.pipeline import (
 from mlb_backtest.config import load_config
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.feature_engine import FeatureHistory, build_raw_game_features
-from mlb_backtest.model_prep import load_statcast_range, prepare_training_stage
+from mlb_backtest.model_prep import (
+    load_statcast_range,
+    prepare_candidates_stage,
+    prepare_training_stage,
+)
 from mlb_backtest.sources import schedule_url
 from mlb_backtest.statcast import parse_statcast, regular_season_ranges, statcast_url
 from mlb_backtest.scoring_prep import (
     METRIC_SPECS,
-    build_candidate_components,
     build_training_edges,
     compute_normalization,
 )
@@ -455,27 +458,77 @@ class PipelineTest(unittest.TestCase):
                 game_pk=game["game_pk"], official_date=game["official_date"]
             )
             candidate_raw["lineup_provenance"] = "RECONSTRUCTED_FINAL_LINEUP"
-            components = build_candidate_components(
-                [candidate_game], [candidate_raw], normalization
+            store = RawStore(root / "raw")
+            config = load_config(CONFIG)
+            payload = statcast_fixture.read_text("utf-8").replace(
+                "2024-04-02", game["official_date"]
+            ).replace(",1002,", f',{game["game_pk"]},')
+            store.put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2025-03-18",
+                    "end": config["extension_end"],
+                    "game_type": "R",
+                    "url": statcast_url("2025-03-18", config["extension_end"]),
+                },
+                payload.encode("utf-8"),
             )
-            features = root / "features"
-            _write_jsonl(features / "candidate_raw_features.jsonl", [candidate_raw])
-            _write_jsonl(features / "candidate_components.jsonl", components)
-            candidate_raw_bytes = (features / "candidate_raw_features.jsonl").read_bytes()
-            component_bytes = (features / "candidate_components.jsonl").read_bytes()
-            (features / "candidate_provenance.json").write_text(
-                json.dumps(
+            fetch_prior_career_bf_records(
+                store,
+                [13, 23],
+                fetcher=lambda _url: b'{"stats":[]}',
+                sleeper=lambda _delay: None,
+            )
+            schedule_digest = next(
+                item["manifest_sha256"]
+                for item in store.verify_manifests()
+                if item["manifest"].get("source") == "mlb_schedule"
+            )
+            candidate_evidence = SimpleNamespace(
+                manifest_sha256=schedule_digest,
+                games=(
                     {
-                        "schema_version": 1,
-                        "candidate_raw_sha256": hashlib.sha256(candidate_raw_bytes).hexdigest(),
-                        "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
-                        "source_manifest_sha256s": source_hashes,
+                        **candidate_game,
+                        "status": "Final",
+                        "final_outs": 3,
                     },
-                    sort_keys=True,
-                )
-                + "\n",
-                "utf-8",
+                ),
             )
+            with (
+                mock.patch(
+                    "mlb_backtest.model_prep._schedule_evidence",
+                    return_value=candidate_evidence,
+                ),
+                mock.patch(
+                    "mlb_backtest.prepare.derive_team_code_map",
+                    return_value=SimpleNamespace(mapping=team_map),
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._safe_participants",
+                    return_value=[candidate_game],
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep.build_result_free_schedule_history",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._combined_history",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep.load_league_era_from_raw",
+                    return_value=({}, []),
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._raw_features_for_games",
+                    return_value=[candidate_raw],
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep.load_pitcher_bf_range",
+                    return_value=({}, []),
+                ),
+            ):
+                prepare_candidates_stage(CONFIG, root)
             features_stage(CONFIG, root)
             locked = lock_stage(CONFIG, root)
 
