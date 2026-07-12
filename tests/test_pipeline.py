@@ -3,6 +3,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -20,9 +21,16 @@ from mlb_backtest.pipeline import (
 )
 from mlb_backtest.config import load_config
 from mlb_backtest.manifest import RawStore
+from mlb_backtest.feature_engine import FeatureHistory, build_raw_game_features
+from mlb_backtest.model_prep import load_statcast_range
 from mlb_backtest.sources import schedule_url
-from mlb_backtest.statcast import regular_season_ranges
-from mlb_backtest.scoring_prep import METRIC_SPECS
+from mlb_backtest.statcast import regular_season_ranges, statcast_url
+from mlb_backtest.scoring_prep import (
+    METRIC_SPECS,
+    build_candidate_components,
+    build_training_edges,
+    compute_normalization,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini_replay"
@@ -69,6 +77,37 @@ def _copy_raw_schedule(root):
     store.put("mlb_schedule", extension_query, payload)
 
 
+def _fixture_training_rows(source_raw):
+    """Expand one real sparse-source row only for deterministic E2E calibration."""
+    rows = []
+    for index in range(6):
+        row = deepcopy(source_raw)
+        row["game_pk"] = 2000 + index
+        row["official_date"] = f"2024-04-{3 + index:02d}"
+        for side_index, side in enumerate(("away", "home")):
+            for component_index, (component, specs) in enumerate(
+                METRIC_SPECS.items()
+            ):
+                for metric_index, metric in enumerate(specs):
+                    row[side][component][metric] = {
+                        "value": 1.0
+                        + component_index
+                        + metric_index / 10
+                        + index * (0.2 + side_index * 0.15),
+                        "quality": 1.0,
+                        "sample_size": 200,
+                    }
+            row[side]["starter"]["career_bf"] = 500
+            for component in ("environment", "defense", "schedule"):
+                row[side][component] = {
+                    "value": 50.0 + index + side_index,
+                    "quality": 1.0,
+                    "sample_size": 200,
+                }
+        rows.append(row)
+    return rows
+
+
 def _prepare_through_lock(root, candidates=None):
     calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
     games = json.loads((FIXTURE / "games.json").read_text("utf-8"))
@@ -84,6 +123,147 @@ def _prepare_through_lock(root, candidates=None):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_production_shaped_source_preparation_reaches_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _copy_raw_schedule(root)
+            statcast_fixture = (
+                Path(__file__).parent / "fixtures" / "statcast_preparation_e2e.csv"
+            )
+            RawStore(root / "raw").put(
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-02",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-02", "2024-04-02"),
+                },
+                statcast_fixture.read_bytes(),
+            )
+            statcast, _hashes = load_statcast_range(
+                root / "raw",
+                "2024-04-02",
+                "2024-04-02",
+                final_outs_by_game={1002: 3},
+            )
+            weights = {slot: 1 / 9 for slot in range(1, 10)}
+            history = FeatureHistory(statcast, slot_weights=weights)
+            target = {
+                "game_pk": 2000,
+                "official_date": "2024-04-03",
+                "game_type": "R",
+                "scheduled_start_utc": "2024-04-03T23:00:00Z",
+                "status": "Scheduled",
+                "away_team": "Away",
+                "home_team": "Home",
+                "venue_id": 1,
+                "venue_name": "Park",
+                "away_probable_pitcher_id": 23,
+                "home_probable_pitcher_id": 13,
+                "away_actual_starter_id": 23,
+                "home_actual_starter_id": 13,
+                "starter_provenance": "RECONSTRUCTED_ACTUAL_STARTER",
+                "away_lineup": [
+                    {"player_id": 102 + slot, "player_name": str(slot)}
+                    for slot in range(1, 10)
+                ],
+                "home_lineup": [
+                    {"player_id": 202 + slot, "player_name": str(slot)}
+                    for slot in range(1, 10)
+                ],
+            }
+            team_map = {"Away": "AWY", "Home": "HOM"}
+            team_map.update({f"Team {i}": f"T{i:02d}" for i in range(28)})
+            raw = build_raw_game_features(
+                target,
+                history,
+                team_map,
+                {
+                    "2024-04-02": {
+                        "as_of_date": "2024-04-02",
+                        "value": 4.0,
+                        "earned_runs": 4,
+                        "outs": 27,
+                        "source": "mlb_stats_api",
+                        "manifest_sha256": "a" * 64,
+                    }
+                },
+            )
+            self.assertTrue(raw["eligible"])
+
+            training_rows = _fixture_training_rows(raw)
+            normalization = compute_normalization(training_rows)
+            outcomes = {row["game_pk"]: index % 2 for index, row in enumerate(training_rows)}
+            edges = build_training_edges(training_rows, normalization, outcomes)
+            calibration = root / "calibration"
+            _write_jsonl(calibration / "training_raw_features.jsonl", training_rows)
+            _write_jsonl(calibration / "training_edges.jsonl", edges)
+            raw_bytes = (calibration / "training_raw_features.jsonl").read_bytes()
+            source_hashes = sorted(
+                item["manifest_sha256"]
+                for item in RawStore(root / "raw").verify_manifests()
+            )
+            (calibration / "frozen_inputs.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "normalization": normalization,
+                        "slot_weights": {str(key): value for key, value in weights.items()},
+                        "source_manifest_sha256s": source_hashes,
+                        "normalization_input_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                        "training_raw_count": len(training_rows),
+                        "max_training_date": training_rows[-1]["official_date"],
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                "utf-8",
+            )
+            calibrate_stage(CONFIG, root)
+
+            game = json.loads((FIXTURE / "games.json").read_text("utf-8"))[0]
+            candidate_game = {
+                key: game[key]
+                for key in (
+                    "game_pk",
+                    "official_date",
+                    "scheduled_start_utc",
+                    "away_team",
+                    "home_team",
+                )
+            }
+            candidate_raw = deepcopy(training_rows[-1])
+            candidate_raw.update(
+                game_pk=game["game_pk"], official_date=game["official_date"]
+            )
+            candidate_raw["lineup_provenance"] = "RECONSTRUCTED_FINAL_LINEUP"
+            components = build_candidate_components(
+                [candidate_game], [candidate_raw], normalization
+            )
+            features = root / "features"
+            _write_jsonl(features / "candidate_raw_features.jsonl", [candidate_raw])
+            _write_jsonl(features / "candidate_components.jsonl", components)
+            candidate_raw_bytes = (features / "candidate_raw_features.jsonl").read_bytes()
+            component_bytes = (features / "candidate_components.jsonl").read_bytes()
+            (features / "candidate_provenance.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "candidate_raw_sha256": hashlib.sha256(candidate_raw_bytes).hexdigest(),
+                        "candidate_components_sha256": hashlib.sha256(component_bytes).hexdigest(),
+                        "source_manifest_sha256s": source_hashes,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                "utf-8",
+            )
+            features_stage(CONFIG, root)
+            locked = lock_stage(CONFIG, root)
+
+            self.assertEqual(locked["row_count"], 1)
+            self.assertTrue((root / "locked" / "lock_manifest.json").is_file())
+
     def test_candidate_provenance_binds_components_raw_and_source_manifests(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
