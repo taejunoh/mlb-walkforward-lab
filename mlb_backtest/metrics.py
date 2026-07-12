@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date
 from numbers import Real
 
-from .locking import _validate_prediction
+from .locking import _validate_prediction, validate_lock_rows
 from .outcomes import _validate_outcome
 
 
@@ -68,8 +69,12 @@ def wilson(wins: object, n: object, z: object = 1.96) -> tuple[float, float]:
         raise ValueError("z must be a positive finite number") from exc
     if not math.isfinite(z_value) or z_value <= 0:
         raise ValueError("z must be a positive finite number")
+    if z_value > math.sqrt(sys.float_info.max):
+        raise ValueError("z is too large for a finite Wilson interval")
     proportion = wins / n
     z_squared = z_value * z_value
+    if not math.isfinite(z_squared):
+        raise ValueError("z is too large for a finite Wilson interval")
     denominator = 1.0 + z_squared / n
     center = (proportion + z_squared / (2.0 * n)) / denominator
     margin = (
@@ -80,7 +85,10 @@ def wilson(wins: object, n: object, z: object = 1.96) -> tuple[float, float]:
         )
         / denominator
     )
-    return center - margin, center + margin
+    bounds = center - margin, center + margin
+    if not all(math.isfinite(bound) for bound in bounds):
+        raise ValueError("Wilson interval bounds must be finite")
+    return bounds
 
 
 def max_losing_streak(sequence: Iterable[bool]) -> int:
@@ -177,6 +185,12 @@ def _validated_rows(
             top1_by_date.setdefault(prediction["official_date"], 0)
     if any(count != 1 for count in top1_by_date.values()):
         raise ValueError("each selection date must contain exactly one top1 row")
+    validate_lock_rows(
+        [
+            {key: value for key, value in row.items() if key != "outcome"}
+            for row in validated
+        ]
+    )
     return sorted(
         validated,
         key=lambda row: (
@@ -235,19 +249,20 @@ def _in_bin(probability: float, low: float, high: float, inclusive: bool) -> boo
 def _baseline_summary(
     rows: Sequence[Mapping[str, object]], picks: Mapping[int, str]
 ) -> dict[str, object]:
-    paired = []
+    results = []
     for row in rows:
         pick = picks.get(row["game_pk"])
         if pick is None:
             continue
-        paired.append(
-            dict(
-                row,
-                correct=pick == row["outcome"]["actual_winner"],
-                pick_probability=0.5,
-            )
-        )
-    return _summary(paired)
+        results.append(pick == row["outcome"]["actual_winner"])
+    wins = sum(results)
+    n = len(results)
+    return {
+        "W": wins,
+        "L": n - wins,
+        "N": n,
+        "accuracy": wins / n if n else None,
+    }
 
 
 def _paired_market(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:

@@ -57,6 +57,10 @@ class PrimitiveMetricsTest(unittest.TestCase):
         low, _ = wilson(20, 30, z=1.959963984540054)
         self.assertAlmostEqual(low, 0.4878005164454384, places=15)
 
+    def test_wilson_rejects_z_that_would_overflow(self):
+        with self.assertRaises(ValueError):
+            wilson(1, 2, z=float.fromhex("0x1.fffffffffffffp+1023"))
+
     def test_log_loss_clips_and_all_primitives_validate_strictly(self):
         self.assertAlmostEqual(log_loss(0.0, True), -math.log(0.001))
         self.assertAlmostEqual(log_loss(1.0, False), -math.log(0.001))
@@ -110,6 +114,20 @@ class EvaluationTest(unittest.TestCase):
         self.assertIsNone(summary["subgroups"]["tiers"]["S"]["accuracy"])
         self.assertEqual(summary["baselines"]["home"]["N"], 1)
         self.assertEqual(summary["baselines"]["higher_season_win_pct"]["N"], 1)
+
+    def test_baselines_are_accuracy_only_without_fabricated_probabilities(self):
+        summary = evaluate([evaluated(winner="Home")], baseline_by_game={1: "Away"})
+        self.assertEqual(
+            summary["baselines"]["home"],
+            {"W": 1, "L": 0, "N": 1, "accuracy": 1.0},
+        )
+        self.assertEqual(
+            summary["baselines"]["higher_season_win_pct"],
+            {"W": 0, "L": 1, "N": 1, "accuracy": 0.0},
+        )
+        for baseline in summary["baselines"].values():
+            self.assertNotIn("brier", baseline)
+            self.assertNotIn("log_loss", baseline)
 
     def test_market_pairing_pickem_missing_and_brier(self):
         market = {
@@ -198,6 +216,19 @@ class EvaluationTest(unittest.TestCase):
         no_top1 = [evaluated(2, 2)]
         for rows in ([malformed], mixed, duplicate, no_top1):
             with self.subTest(rows=rows), self.assertRaises(ValueError):
+                evaluate(rows)
+
+    def test_revalidates_frozen_daily_rank_order_and_contiguity(self):
+        wrong_order = [
+            evaluated(1, 1, probability=0.60),
+            evaluated(2, 2, probability=0.62),
+        ]
+        gap = [
+            evaluated(1, 1, probability=0.62),
+            evaluated(3, 3, probability=0.60),
+        ]
+        for rows in (wrong_order, gap):
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "rank"):
                 evaluate(rows)
 
     def test_market_metadata_and_probabilities_are_validated(self):
