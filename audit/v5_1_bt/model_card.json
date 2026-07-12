@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "model_version": "v5.1-BT",
+  "protocol_phase": "Backtest",
+  "calibration": {
+    "alpha": 0.10307467324665347,
+    "beta": 0.6128874176132043
+  },
+  "training_window": {
+    "configured_start": "2022-01-01",
+    "configured_end": "2024-12-31",
+    "actual_feature_min_date": "2022-04-07",
+    "actual_calibration_min_date": "2022-04-08",
+    "actual_max_date": "2024-09-30"
+  },
+  "counts": {
+    "training_raw_rows": 7290,
+    "training_eligible_rows": 7265,
+    "training_ineligible_rows": 25,
+    "calibration_rows": 7265,
+    "candidate_rows": 1972,
+    "candidate_source_manifest_count": 692,
+    "frozen_training_source_manifest_count": 1311
+  },
+  "slot_weights": {
+    "1": 0.12242688272983294,
+    "2": 0.11957419272518478,
+    "3": 0.11690560603713054,
+    "4": 0.11418051239051777,
+    "5": 0.1113733925137394,
+    "6": 0.10859543751879767,
+    "7": 0.10552765651060417,
+    "8": 0.1023486843904084,
+    "9": 0.09906763518378432
+  },
+  "normalization": {
+    "starter": {
+      "expected_ip": {"direction": 1, "mean": 5.309488414774031, "n": 14530, "sd": 0.8539139263541476},
+      "fip": {"direction": -1, "mean": 4.154240657019525, "n": 13820, "sd": 1.4802309650154135},
+      "k_minus_bb": {"direction": 1, "mean": 0.1425843238863209, "n": 13820, "sd": 0.07153581208656606},
+      "last5_xwoba": {"direction": -1, "mean": 0.3200793467237036, "n": 13456, "sd": 0.05141955757155862},
+      "season_xwoba": {"direction": -1, "mean": 0.31941144577712316, "n": 13820, "sd": 0.04302945104501369},
+      "velocity_change": {"direction": 1, "mean": 0.046610659607966724, "n": 10069, "sd": 0.8476371980503222}
+    },
+    "offense": {
+      "barrel_rate": {"direction": 1, "mean": 0.08323469400010351, "n": 14486, "sd": 0.020924502842522973},
+      "bb_minus_k": {"direction": 1, "mean": -0.13984156725949842, "n": 14486, "sd": 0.03569205751862372},
+      "iso": {"direction": 1, "mean": 0.15821083402249594, "n": 14486, "sd": 0.03269946631320538},
+      "last14_xwoba": {"direction": 1, "mean": 0.31858508607908553, "n": 14486, "sd": 0.02936586042541932},
+      "platoon_xwoba": {"direction": 1, "mean": 0.3218519573043509, "n": 13818, "sd": 0.02398334084900498}
+    },
+    "bullpen": {
+      "availability": {"direction": 1, "mean": 84.71402959678231, "n": 14530, "sd": 15.5911360792003},
+      "k_minus_bb": {"direction": 1, "mean": 0.14109652134031028, "n": 14486, "sd": 0.034899732070341145},
+      "last14_xwoba": {"direction": -1, "mean": 0.30809954504376164, "n": 14486, "sd": 0.03276574862637803},
+      "season_xwoba": {"direction": -1, "mean": 0.3108117078701811, "n": 14486, "sd": 0.020636839776610554}
+    }
+  },
+  "component_weights": {
+    "starter": 0.35,
+    "offense": 0.25,
+    "bullpen": 0.20,
+    "environment": 0.10,
+    "defense": 0.05,
+    "schedule": 0.05
+  },
+  "sha256": {
+    "model_card_file": "c4a8dc9f70ad29bebb741fa9096eaa850a0bdb6b0fb0fe5727cc706a97c75061",
+    "config_file": "1bd3008a7bb95b622263c1ce73bb07182c1ffeea39ab1efd1ae38c271cc729d9",
+    "frozen_inputs_file": "745448ff0fee0b1dbde02a4a43ad90fb8e36515611e6070d69d00ddf13c9e7b4",
+    "training_raw_features_file": "7869a5379e7ec951d9233bd046528603bc5d7679f37ada02ee1cae9b2fe54dfc",
+    "training_edges_file": "66cfe5db414c76c625de316556236a172ce0e5db71e28fefc390576438e41318",
+    "normalization_input": "7869a5379e7ec951d9233bd046528603bc5d7679f37ada02ee1cae9b2fe54dfc",
+    "calibration_input": "66cfe5db414c76c625de316556236a172ce0e5db71e28fefc390576438e41318"
+  }
+}
