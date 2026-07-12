@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
 import argparse
@@ -349,6 +349,7 @@ FOLD_LITERALS = (
         "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT",
     },
 )
+FOLD_LITERALS = deep_freeze(list(FOLD_LITERALS))
 HISTORICAL_DATE_QUEUE = deep_freeze(HISTORICAL_DATE_QUEUE)
 HISTORICAL_SELECTION = deep_freeze(HISTORICAL_SELECTION)
 HISTORICAL_TERMINAL = deep_freeze(HISTORICAL_TERMINAL)
@@ -635,11 +636,28 @@ def parse_run_spec(raw: object) -> RunSpec:
     require_exact_keys(obj["namespaces"], NAMESPACE_KEYS, "namespaces")
     if not isinstance(obj["folds"], list):
         raise ValueError("run.folds must be a list")
-    folds = tuple(parse_fold(row) for row in obj["folds"])
+    for fold_index, fold_row in enumerate(obj["folds"]):
+        fold_obj = require_exact_keys(
+            fold_row, FOLD_REQUIRED_KEYS, f"run.folds[{fold_index}]"
+        )
+        require_exact_keys(
+            fold_obj["target_dates"],
+            frozenset({"start", "end"}),
+            f"run.folds[{fold_index}].target_dates",
+        )
+        if not isinstance(fold_obj["oof_calibration"], list):
+            raise ValueError(f"run.folds[{fold_index}].oof_calibration must be a list")
+        for oof_index, oof_row in enumerate(fold_obj["oof_calibration"]):
+            require_exact_keys(
+                oof_row,
+                OOF_ROW_KEYS,
+                f"run.folds[{fold_index}].oof_calibration[{oof_index}]",
+            )
     try:
         _validate_literal(obj, expected_historical_run(), "run")
     except ValueError as exc:
         raise ValueError("historical run differs from frozen values") from exc
+    folds = tuple(parse_fold(row) for row in obj["folds"])
     run = RunSpec(
         run_id=str(obj["run_id"]),
         target_count=int(obj["target_count"]),
@@ -663,11 +681,94 @@ def load_run_spec(path: Path) -> RunSpec:
 
 
 def validate_fold(fold: FoldSpec) -> None:
+    if (
+        not isinstance(fold.fold_id, str)
+        or isinstance(fold.target_year, bool)
+        or not isinstance(fold.target_year, int)
+        or not isinstance(fold.target_dates, tuple)
+        or len(fold.target_dates) != 2
+        or not all(isinstance(value, str) for value in fold.target_dates)
+        or not isinstance(fold.normalization_years, tuple)
+        or not all(
+            isinstance(year, int) and not isinstance(year, bool)
+            for year in fold.normalization_years
+        )
+        or not isinstance(fold.oof_calibration, tuple)
+        or not isinstance(fold.latest_training_date, str)
+        or not isinstance(fold.model_card_path, str)
+        or not isinstance(fold.model_card_status, str)
+        or not isinstance(fold.raw, Mapping)
+    ):
+        raise ValueError("fold typed fields are invalid")
+    expected_by_id = {str(item["fold_id"]): item for item in FOLD_LITERALS}
+    if fold.fold_id not in expected_by_id:
+        raise ValueError("unknown fold ID")
+    start = _canonical_date(fold.target_dates[0], "fold target start")
+    end = _canonical_date(fold.target_dates[1], "fold target end")
+    latest_training = _canonical_date(
+        fold.latest_training_date, "fold latest training date"
+    )
+    if start > end:
+        raise ValueError("fold target start must not follow end")
+    if start.year != fold.target_year or end.year != fold.target_year:
+        raise ValueError("fold target dates must match target year")
+    if latest_training >= start or latest_training.year >= fold.target_year:
+        raise ValueError("fold latest training date must precede target")
+    if fold.normalization_years != tuple(sorted(set(fold.normalization_years))):
+        raise ValueError(
+            "fold normalization years must be strictly ascending and unique"
+        )
     if any(year >= fold.target_year for year in fold.normalization_years):
         raise ValueError("normalization contains target or future season")
+    if fold.normalization_years != tuple(range(2018, fold.target_year)):
+        raise ValueError("fold normalization years differ from exact past range")
+    if not all(
+        isinstance(row, tuple)
+        and len(row) == 2
+        and isinstance(row[0], int)
+        and not isinstance(row[0], bool)
+        and isinstance(row[1], tuple)
+        and all(isinstance(year, int) and not isinstance(year, bool) for year in row[1])
+        for row in fold.oof_calibration
+    ):
+        raise ValueError("fold OOF calibration typed fields are invalid")
+    oof_targets = tuple(target for target, _ in fold.oof_calibration)
+    if oof_targets != tuple(sorted(set(oof_targets))):
+        raise ValueError("fold OOF target years must be unique and strictly ascending")
+    if oof_targets != tuple(range(2019, fold.target_year)):
+        raise ValueError("fold OOF target years differ from exact rolling-origin range")
     for target_year, normalization_years in fold.oof_calibration:
         if any(year >= target_year for year in normalization_years):
             raise ValueError("OOF normalization contains target or future season")
+        if normalization_years != tuple(range(2018, target_year)):
+            raise ValueError(
+                "fold OOF rolling-origin pool differs from exact past range"
+            )
+    expected = expected_by_id[fold.fold_id]
+    try:
+        _validate_literal(
+            json.loads(canonical_json_bytes(fold.raw)),
+            json.loads(canonical_json_bytes(expected)),
+            "fold.raw",
+        )
+    except ValueError as exc:
+        raise ValueError("fold raw differs from frozen contract") from exc
+    raw = fold.raw
+    typed_projection = {
+        "fold_id": fold.fold_id,
+        "target_year": fold.target_year,
+        "target_dates": {"start": fold.target_dates[0], "end": fold.target_dates[1]},
+        "normalization_years": list(fold.normalization_years),
+        "oof_calibration": [
+            {"target_year": target, "normalization_years": list(pool)}
+            for target, pool in fold.oof_calibration
+        ],
+        "latest_training_date": fold.latest_training_date,
+        "model_card_path": fold.model_card_path,
+        "model_card_status": fold.model_card_status,
+    }
+    if canonical_json_bytes(typed_projection) != canonical_json_bytes(raw):
+        raise ValueError("fold typed fields differ from raw")
 
 
 def expected_historical_run() -> dict[str, object]:
@@ -717,14 +818,74 @@ def expected_historical_run() -> dict[str, object]:
 
 
 def validate_run(run: RunSpec) -> None:
+    if (
+        not isinstance(run.run_id, str)
+        or isinstance(run.target_count, bool)
+        or not isinstance(run.target_count, int)
+        or not isinstance(run.allowed_target_years, tuple)
+        or not isinstance(run.forbidden_target_years, tuple)
+        or not all(
+            isinstance(year, int) and not isinstance(year, bool)
+            for year in (*run.allowed_target_years, *run.forbidden_target_years)
+        )
+        or not isinstance(run.folds, tuple)
+        or not all(isinstance(fold, FoldSpec) for fold in run.folds)
+        or not isinstance(run.terminal_contract, Mapping)
+        or not isinstance(run.date_state_precedence, tuple)
+        or not all(isinstance(state, str) for state in run.date_state_precedence)
+        or not isinstance(run.raw, Mapping)
+    ):
+        raise ValueError("run typed fields are invalid")
     if 2025 in run.allowed_target_years or run.forbidden_target_years != (2025,):
         raise ValueError("2025 is excluded")
-    if run.raw != deep_freeze(expected_historical_run()):
-        raise ValueError("historical run differs from frozen values")
-    if tuple(fold.target_year for fold in run.folds) != run.allowed_target_years:
+    fold_ids = tuple(fold.fold_id for fold in run.folds)
+    fold_targets = tuple(fold.target_year for fold in run.folds)
+    if not all(isinstance(fold_id, str) for fold_id in fold_ids) or not all(
+        isinstance(target, int) and not isinstance(target, bool)
+        for target in fold_targets
+    ):
+        raise ValueError("fold identity fields are invalid")
+    if len(set(fold_ids)) != len(fold_ids):
+        raise ValueError("fold IDs must be unique")
+    if len(set(fold_targets)) != len(fold_targets):
+        raise ValueError("fold target years must be unique")
+    try:
+        _validate_literal(
+            json.loads(canonical_json_bytes(run.raw)),
+            expected_historical_run(),
+            "run.raw",
+        )
+    except ValueError as exc:
+        raise ValueError("historical run differs from frozen values") from exc
+    raw = run.raw
+    if (
+        run.run_id != raw["run_id"]
+        or run.target_count != raw["target_count"]
+        or run.allowed_target_years != tuple(raw["allowed_target_years"])
+        or run.forbidden_target_years != tuple(raw["forbidden_target_years"])
+        or canonical_json_bytes([fold.raw for fold in run.folds])
+        != canonical_json_bytes(raw["folds"])
+        or canonical_json_bytes(run.terminal_contract)
+        != canonical_json_bytes(raw["terminal_contract"])
+        or run.date_state_precedence != tuple(raw["date_state_precedence"])
+    ):
+        raise ValueError("run typed fields differ from raw")
+    if fold_targets != run.allowed_target_years:
         raise ValueError("fold targets differ")
     for fold in run.folds:
         validate_fold(fold)
+
+
+def _canonical_date(value: str, label: str) -> date:
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        raise ValueError(f"{label} must be canonical ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be canonical ISO date") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"{label} must be canonical ISO date")
+    return parsed
 
 
 def expected_v52_config() -> dict[str, object]:
@@ -1106,11 +1267,11 @@ def write_json(path: Path, value: object) -> None:
 def write_historical_contract(root: Path) -> None:
     raw = expected_historical_run()
     parse_run_spec(raw)
-    write_json(
-        root / "protocols/v5_2_qd/historical_walkforward_500.json",
-        raw,
-    )
     schema = const_schema(raw, RUN_REQUIRED_KEYS)
+    schema["properties"]["folds"] = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/fold"},
+    }
     schema["$defs"] = {
         "fold": {
             "type": "object",
@@ -1119,7 +1280,18 @@ def write_historical_contract(root: Path) -> None:
             "additionalProperties": False,
         }
     }
-    write_json(root / "schemas/v5_2_run_spec.schema.json", schema)
+    _publish_bundle(
+        (
+            (
+                root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                canonical_json_bytes(raw) + b"\n",
+            ),
+            (
+                root / "schemas/v5_2_run_spec.schema.json",
+                canonical_json_bytes(schema) + b"\n",
+            ),
+        )
+    )
 
 
 def _write_fsynced_temp(path: Path, contents: bytes, *, mode: int) -> Path:

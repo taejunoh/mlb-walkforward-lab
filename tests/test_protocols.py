@@ -15,6 +15,7 @@ from mlb_backtest.protocols import (
     CHANGE_UNCHANGED,
     INTERNAL_METRIC_LITERALS,
     FOLD_REQUIRED_KEYS,
+    FOLD_LITERALS,
     HISTORICAL_DATE_QUEUE,
     HISTORICAL_DENOMINATORS,
     HISTORICAL_OUTCOME_ISOLATION,
@@ -28,6 +29,7 @@ from mlb_backtest.protocols import (
     direction_from_p_home,
     eligibility_disposition,
     expected_v52_config,
+    expected_historical_run,
     load_run_spec,
     load_change_contract,
     load_v52_config,
@@ -94,6 +96,10 @@ class HistoricalRunSpecTest(unittest.TestCase):
         self.assertEqual(set(fold_schema["properties"]), FOLD_REQUIRED_KEYS)
         self.assertFalse(schema["additionalProperties"])
         self.assertFalse(fold_schema["additionalProperties"])
+        self.assertEqual(
+            schema["properties"]["folds"],
+            {"type": "array", "items": {"$ref": "#/$defs/fold"}},
+        )
 
     def test_run_contract_literals(self):
         run = load_run_spec(HISTORICAL_SPEC)
@@ -161,6 +167,161 @@ class HistoricalRunSpecTest(unittest.TestCase):
         changed["target_count"] = True
         with self.assertRaisesRegex(ValueError, "historical run differs"):
             parse_run_spec(changed)
+
+    def test_fold_literal_oracle_is_recursive_frozen_and_detached(self):
+        with self.assertRaises(TypeError):
+            FOLD_LITERALS[0]["normalization_years"] = (2017,)
+        first = expected_historical_run()
+        first["folds"][0]["normalization_years"][0] = 2017
+        second = expected_historical_run()
+        self.assertEqual(second["folds"][0]["normalization_years"][0], 2018)
+        parse_run_spec(second)
+
+    def test_public_fold_validator_rejects_chronology_and_typed_raw_drift(self):
+        fold = load_run_spec(HISTORICAL_SPEC).folds[0]
+        invalid = (
+            (replace(fold, target_dates=("2022-4-07", "2022-10-05")), "canonical ISO"),
+            (
+                replace(fold, target_dates=("2022-10-05", "2022-04-07")),
+                "start must not follow",
+            ),
+            (replace(fold, target_dates=("2021-04-07", "2022-10-05")), "target year"),
+            (replace(fold, latest_training_date="2022-04-07"), "latest training"),
+            (
+                replace(fold, normalization_years=(2018, 2020, 2019, 2021)),
+                "strictly ascending",
+            ),
+            (
+                replace(fold, normalization_years=(2018, 2019, 2020, 2020)),
+                "strictly ascending",
+            ),
+            (replace(fold, normalization_years=(2019, 2020, 2021)), "exact past range"),
+            (
+                replace(
+                    fold,
+                    oof_calibration=(
+                        (2020, (2018, 2019)),
+                        (2019, (2018,)),
+                        (2021, (2018, 2019, 2020)),
+                    ),
+                ),
+                "OOF target years",
+            ),
+            (
+                replace(
+                    fold,
+                    oof_calibration=(
+                        (2019, (2018,)),
+                        (2020, (2018,)),
+                        (2021, (2018, 2019, 2020)),
+                    ),
+                ),
+                "rolling-origin",
+            ),
+            (replace(fold, fold_id="H99"), "unknown fold"),
+        )
+        for changed, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_fold(changed)
+
+        raw = copy.deepcopy(json.loads(HISTORICAL_SPEC.read_text())["folds"][0])
+        raw["latest_training_date"] = "2020-12-31"
+        with self.assertRaisesRegex(ValueError, "raw differs"):
+            validate_fold(replace(fold, raw=raw))
+
+    def test_public_run_validator_rejects_duplicate_and_typed_raw_drift(self):
+        run = load_run_spec(HISTORICAL_SPEC)
+        with self.assertRaisesRegex(ValueError, "fold identity fields are invalid"):
+            validate_run(replace(run, folds=(replace(run.folds[0], fold_id=[]),)))
+        with self.assertRaisesRegex(ValueError, "fold IDs must be unique"):
+            validate_run(replace(run, folds=(run.folds[0], run.folds[0], run.folds[2])))
+        duplicate_target = replace(run.folds[1], fold_id="H23-copy", target_year=2022)
+        with self.assertRaisesRegex(ValueError, "fold target years must be unique"):
+            validate_run(
+                replace(run, folds=(run.folds[0], duplicate_target, run.folds[2]))
+            )
+        with self.assertRaisesRegex(ValueError, "typed fields differ from raw"):
+            validate_run(replace(run, target_count=499))
+
+    def test_historical_writer_rolls_back_two_file_bundle(self):
+        relative_paths = (
+            Path("protocols/v5_2_qd/historical_walkforward_500.json"),
+            Path("schemas/v5_2_run_spec.schema.json"),
+        )
+        for initial_state in ((True, True), (False, False), (True, False)):
+            with (
+                self.subTest(initial_state=initial_state),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary).resolve()
+                old = {}
+                modes = {}
+                for index, (relative, preexisting) in enumerate(
+                    zip(relative_paths, initial_state, strict=True)
+                ):
+                    if preexisting:
+                        path = root / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        old[path] = f"old-{index}".encode()
+                        modes[path] = 0o600 + index
+                        path.write_bytes(old[path])
+                        path.chmod(modes[path])
+                original_replace = os.replace
+                final_replacements = 0
+
+                def fail_second_final(source, destination):
+                    nonlocal final_replacements
+                    if Path(destination) in tuple(
+                        root / item for item in relative_paths
+                    ):
+                        final_replacements += 1
+                        if final_replacements == 2:
+                            raise OSError("second historical replace failed")
+                    return original_replace(source, destination)
+
+                with patch(
+                    "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "second historical replace failed"
+                    ):
+                        write_historical_contract(root)
+                for relative, preexisting in zip(
+                    relative_paths, initial_state, strict=True
+                ):
+                    path = root / relative
+                    if preexisting:
+                        self.assertEqual(path.read_bytes(), old[path])
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), modes[path])
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_historical_writer_preserves_modes_and_defaults_new_files_to_0644(self):
+        relatives = (
+            Path("protocols/v5_2_qd/historical_walkforward_500.json"),
+            Path("schemas/v5_2_run_spec.schema.json"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, relative in enumerate(relatives):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"old")
+                path.chmod(0o600 + index)
+            write_historical_contract(root)
+            self.assertEqual(
+                tuple(stat.S_IMODE((root / item).stat().st_mode) for item in relatives),
+                (0o600, 0o601),
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_historical_contract(root)
+            self.assertEqual(
+                tuple(stat.S_IMODE((root / item).stat().st_mode) for item in relatives),
+                (0o644, 0o644),
+            )
 
 
 class V52ConfigTest(unittest.TestCase):
