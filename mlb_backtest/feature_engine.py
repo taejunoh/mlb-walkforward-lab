@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType
@@ -55,6 +56,12 @@ def _metric(
     return result
 
 
+def _reliability(sample_size: int, constant: float) -> float:
+    if sample_size <= 0:
+        return 0.0
+    return sample_size / (sample_size + constant)
+
+
 def pa_expected_woba(row: Mapping[str, object]) -> float | None:
     """Return result-independent PA expected wOBA when its rate denominator counts."""
     denom = row.get("woba_denom")
@@ -89,6 +96,55 @@ def pa_expected_woba(row: Mapping[str, object]) -> float | None:
     return float(value)
 
 
+class ScheduleHistory:
+    """Canonical schedule rows indexed once by team and team/date."""
+
+    def __init__(self, rows: Iterable[Mapping[str, object]] = ()) -> None:
+        canonical = tuple(
+            sorted(
+                (dict(row) for row in rows),
+                key=lambda row: (
+                    str(row.get("official_date", row.get("game_date", ""))),
+                    int(row.get("game_pk", 0)),
+                ),
+            )
+        )
+        by_team: defaultdict[str, list] = defaultdict(list)
+        by_team_date: defaultdict[tuple[str, date], list] = defaultdict(list)
+        dated = []
+        for row in canonical:
+            scheduled = _day(
+                row.get("official_date", row.get("game_date")), "schedule date"
+            )
+            dated.append(scheduled)
+            for team_code in row.get("team_codes", ()):
+                code = str(team_code)
+                by_team[code].append(row)
+                by_team_date[(code, scheduled)].append(row)
+        self.rows = canonical
+        self.by_team = MappingProxyType(
+            {key: tuple(value) for key, value in sorted(by_team.items())}
+        )
+        self.by_team_date = MappingProxyType(
+            {key: tuple(value) for key, value in sorted(by_team_date.items())}
+        )
+        self._dates = tuple(dated)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def max_before(self, target: date | None) -> date | None:
+        if not self._dates:
+            return None
+        if target is None:
+            return self._dates[-1]
+        index = bisect_left(self._dates, target)
+        return self._dates[index - 1] if index else None
+
+
 class FeatureHistory:
     """Canonical, indexed Statcast and schedule history used by raw feature builds."""
 
@@ -97,7 +153,7 @@ class FeatureHistory:
         statcast: StatcastData,
         *,
         slot_weights: Mapping[int, float],
-        schedule_history: Sequence[Mapping[str, object]] = (),
+        schedule_history: Iterable[Mapping[str, object]] | ScheduleHistory = (),
         venue_by_name: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         if not isinstance(statcast, StatcastData):
@@ -115,28 +171,33 @@ class FeatureHistory:
             sorted(statcast.plate_appearances, key=self._pitch_key)
         )
         self.roles = MappingProxyType(identify_pitcher_roles(self.pitches))
-        self.schedule_history = tuple(
-            sorted(
-                (dict(r) for r in schedule_history),
-                key=lambda r: (
-                    str(r.get("official_date", r.get("game_date", ""))),
-                    int(r.get("game_pk", 0)),
-                ),
-            )
+        self.schedule_history = (
+            schedule_history
+            if isinstance(schedule_history, ScheduleHistory)
+            else ScheduleHistory(schedule_history)
         )
         self.venue_by_name = MappingProxyType(dict(venue_by_name or {}))
         self.pa_by_pitcher = self._index(self.plate_appearances, "pitcher_id")
         self.pa_by_batter = self._index(self.plate_appearances, "batter_id")
         self.pitches_by_pitcher = self._index(self.pitches, "pitcher_id")
+        self.pitches_by_pitcher_game = self._pitcher_game_index(self.pitches)
         self.pa_by_date = self._index_value(self.plate_appearances, "game_date", str)
         self.pitches_by_date = self._index_value(self.pitches, "game_date", str)
         self.pa_by_game = self._index_value(self.plate_appearances, "game_pk", int)
         self.pitches_by_game = self._index_value(self.pitches, "game_pk", int)
         self.pa_by_year = self._year_index(self.plate_appearances)
         self.pa_by_team = self._team_index(self.plate_appearances)
-        self.game_pks = frozenset(int(row["game_pk"]) for row in self.pitches)
-        self.max_history_row = (
+        self.pitch_game_pks = frozenset(int(row["game_pk"]) for row in self.pitches)
+        self.pa_game_pks = frozenset(
+            int(row["game_pk"]) for row in self.plate_appearances
+        )
+        self.max_pitch_row = (
             max(self.pitches, key=self._pitch_key) if self.pitches else None
+        )
+        self.max_pa_row = (
+            max(self.plate_appearances, key=self._pitch_key)
+            if self.plate_appearances
+            else None
         )
         self.league_fip_by_year = MappingProxyType(
             {year: self._league_fip(rows) for year, rows in self.pa_by_year.items()}
@@ -183,6 +244,17 @@ class FeatureHistory:
         )
 
     @staticmethod
+    def _pitcher_game_index(
+        rows: Iterable[Mapping[str, object]],
+    ) -> Mapping[tuple[int, int], tuple]:
+        result: defaultdict[tuple[int, int], list] = defaultdict(list)
+        for row in rows:
+            result[(int(row["pitcher_id"]), int(row["game_pk"]))].append(row)
+        return MappingProxyType(
+            {key: tuple(value) for key, value in sorted(result.items())}
+        )
+
+    @staticmethod
     def _league_fip(rows: Sequence[Mapping[str, object]]) -> tuple[float | None, int]:
         numerator = (
             13 * sum(row["events"] == "home_run" for row in rows)
@@ -193,7 +265,7 @@ class FeatureHistory:
             )
         )
         outs = sum(int(row["outs_on_play"]) for row in rows)
-        return ((-numerator / (outs / 3.0)) if outs else None, len(rows))
+        return ((numerator / (outs / 3.0)) if outs else None, len(rows))
 
     @staticmethod
     def _team_index(rows: Iterable[Mapping[str, object]]) -> Mapping[str, tuple]:
@@ -216,31 +288,26 @@ def _rate(rows: Sequence[Mapping[str, object]]) -> tuple[float | None, int]:
 def _k_minus_bb(
     rows: Sequence[Mapping[str, object]], *, batting: bool = False
 ) -> tuple[float | None, int]:
-    eligible = [
-        row
-        for row in rows
-        if isinstance(row.get("woba_denom"), (int, float))
-        and not isinstance(row.get("woba_denom"), bool)
-        and float(row["woba_denom"]) > 0
-    ]
-    if not eligible:
+    if not rows:
         return None, 0
     strikeouts = sum(
-        str(row.get("events")) in {"strikeout", "strikeout_double_play"}
-        for row in eligible
+        str(row.get("events")) in {"strikeout", "strikeout_double_play"} for row in rows
     )
-    walks = sum(str(row.get("events")) in WALK_EVENTS for row in eligible)
-    value = (walks - strikeouts if batting else strikeouts - walks) / len(eligible)
-    return value, len(eligible)
+    walks = sum(str(row.get("events")) in WALK_EVENTS for row in rows)
+    value = (walks - strikeouts if batting else strikeouts - walks) / len(rows)
+    return value, len(rows)
 
 
-def _starter_component(history: FeatureHistory, pitcher_id: int, target: date) -> dict:
+def _starter_component(
+    history: FeatureHistory, pitcher_id: int, target: date, league_era: float
+) -> dict:
     season = [
         r
         for r in history.pa_by_pitcher.get(pitcher_id, ())
         if _day(r["game_date"], "game_date").year == target.year
     ]
     xwoba, bf = _rate(season)
+    season_bf = len(season)
     kbb, kbb_bf = _k_minus_bb(season)
     numerator = (
         13 * sum(r["events"] == "home_run" for r in season)
@@ -248,15 +315,21 @@ def _starter_component(history: FeatureHistory, pitcher_id: int, target: date) -
         - 2 * sum(r["events"] in {"strikeout", "strikeout_double_play"} for r in season)
     )
     outs = sum(int(r["outs_on_play"]) for r in season)
-    cfip, league_bf = history.league_fip_by_year.get(target.year, (None, 0))
+    league_raw_fip, league_bf = history.league_fip_by_year.get(target.year, (None, 0))
+    cfip = league_era - league_raw_fip if league_raw_fip is not None else None
+    pitcher_raw_fip = numerator / (outs / 3.0) if outs else None
+    fip = (
+        pitcher_raw_fip + cfip
+        if pitcher_raw_fip is not None and cfip is not None
+        else None
+    )
     games: defaultdict[int, list] = defaultdict(list)
     for row in season:
         if history.roles.get((int(row["game_pk"]), pitcher_id), {}).get("is_starter"):
             games[int(row["game_pk"])].append(row)
     starts = []
     for game_pk, rows in games.items():
-        pitches = history.pitches_by_pitcher.get(pitcher_id, ())
-        game_pitches = [r for r in pitches if int(r["game_pk"]) == game_pk]
+        game_pitches = history.pitches_by_pitcher_game.get((pitcher_id, game_pk), ())
         starts.append(
             {
                 "game_pk": game_pk,
@@ -270,45 +343,83 @@ def _starter_component(history: FeatureHistory, pitcher_id: int, target: date) -
     latest = starts[:5]
     recent_rows = [r for start in latest for r in start["rows"]]
     last5, last5_bf = _rate(recent_rows)
-    rest = (target - _day(latest[0]["game_date"], "start date")).days if latest else 5
+    rest = (
+        max(0, (target - _day(latest[0]["game_date"], "start date")).days - 1)
+        if latest
+        else 5
+    )
     innings = expected_innings(latest, rest)
-    season_velos = [
-        float(r["release_speed"])
-        for r in history.pitches_by_pitcher.get(pitcher_id, ())
-        if r.get("release_speed") is not None
-        and _day(r["game_date"], "game_date").year == target.year
-    ]
+    pitcher_pitches = history.pitches_by_pitcher.get(pitcher_id, ())
     recent_game_ids = {s["game_pk"] for s in latest}
     recent_velos = [
         float(r["release_speed"])
-        for r in history.pitches_by_pitcher.get(pitcher_id, ())
+        for r in pitcher_pitches
         if r.get("release_speed") is not None and int(r["game_pk"]) in recent_game_ids
     ]
+    prior_season_velos = [
+        float(r["release_speed"])
+        for r in pitcher_pitches
+        if r.get("release_speed") is not None
+        and _day(r["game_date"], "game_date").year == target.year - 1
+    ]
+    if len(prior_season_velos) >= 50:
+        baseline_velos = prior_season_velos
+    elif latest:
+        recent_start = min(_day(start["game_date"], "start date") for start in latest)
+        baseline_velos = [
+            float(r["release_speed"])
+            for r in pitcher_pitches
+            if r.get("release_speed") is not None
+            and _day(r["game_date"], "game_date").year == target.year
+            and _day(r["game_date"], "game_date") < recent_start
+        ]
+    else:
+        baseline_velos = []
     velo = (
         math.fsum(recent_velos) / len(recent_velos)
-        - math.fsum(season_velos) / len(season_velos)
-        if season_velos and recent_velos and len(latest) >= 2
+        - math.fsum(baseline_velos) / len(baseline_velos)
+        if recent_velos and len(baseline_velos) >= 50
         else None
+    )
+    starter_quality = _reliability(bf, 150)
+    fip_quality = _reliability(season_bf, 150)
+    last5_quality = _reliability(last5_bf, 100)
+    velo_quality = (
+        min(
+            _reliability(len(recent_velos), 150), _reliability(len(baseline_velos), 150)
+        )
+        if velo is not None
+        else 0.0
     )
     return {
         "pitcher_id": pitcher_id,
-        "season_xwoba": _metric(xwoba, bf),
-        "k_minus_bb": _metric(kbb, kbb_bf),
-        "fip_numerator": _metric(float(numerator), bf),
-        "outs": _metric(outs, bf),
-        "league_cfip": _metric(cfip, league_bf),
-        "last5_xwoba": _metric(last5, last5_bf),
-        "expected_ip": _metric(
-            innings.value, len(latest), 0.5 if innings.small_sample else 1.0
+        "season_xwoba": _metric(xwoba, bf, starter_quality),
+        "k_minus_bb": _metric(kbb, kbb_bf, _reliability(kbb_bf, 150)),
+        "fip_numerator": _metric(float(numerator), season_bf, fip_quality),
+        "outs": _metric(outs, season_bf, fip_quality),
+        "league_era": _metric(league_era, league_bf, _reliability(league_bf, 150)),
+        "league_raw_fip": _metric(
+            league_raw_fip, league_bf, _reliability(league_bf, 150)
         ),
-        "velocity_change": _metric(velo, len(recent_velos)),
+        "league_cfip": _metric(cfip, league_bf, _reliability(league_bf, 150)),
+        "fip": _metric(fip, season_bf, fip_quality),
+        "last5_xwoba": _metric(last5, last5_bf, last5_quality),
+        "expected_ip": _metric(
+            innings.value, len(latest), _reliability(len(latest), 3)
+        ),
+        "velocity_change": _metric(
+            velo,
+            len(recent_velos),
+            velo_quality,
+            baseline_sample_size=len(baseline_velos),
+        ),
     }
 
 
 def _offense_component(
     history: FeatureHistory,
     lineup: Sequence[Mapping[str, object]],
-    opponent_hand: str,
+    opponent_hand: str | None,
     target: date,
 ) -> dict:
     first = target - timedelta(days=14)
@@ -321,7 +432,11 @@ def _offense_component(
             for r in history.pa_by_batter.get(player_id, ())
             if _day(r["game_date"], "game_date").year == target.year
         ]
-        platoon = [r for r in rows if r["p_throws"] == opponent_hand]
+        platoon = [
+            r
+            for r in rows
+            if opponent_hand is not None and r["p_throws"] == opponent_hand
+        ]
         recent = [
             r for r in rows if first <= _day(r["game_date"], "game_date") < target
         ]
@@ -360,7 +475,14 @@ def _offense_component(
                 "player_id": player_id,
                 "batting_slot": slot,
                 "missing": not rows,
-                **{name: _metric(v, n) for name, (v, n) in metrics.items()},
+                **{
+                    name: _metric(
+                        v,
+                        n,
+                        _reliability(n, 100 if name == "last14_xwoba" else 150),
+                    )
+                    for name, (v, n) in metrics.items()
+                },
             }
         )
     output = {"players": players}
@@ -368,16 +490,20 @@ def _offense_component(
         present = {
             p["batting_slot"]: p[name] for p in players if p[name]["value"] is not None
         }
+        present_weight = math.fsum(history.slot_weights[s] for s in present)
         value = (
             math.fsum(
                 history.slot_weights[s] * float(m["value"]) for s, m in present.items()
             )
+            / present_weight
             if present
             else None
         )
         n = sum(int(m["sample_size"]) for m in present.values())
-        quality = math.fsum(history.slot_weights[s] for s in present)
-        output[name] = _metric(value, n, quality)
+        quality = math.fsum(
+            history.slot_weights[s] * float(m["quality"]) for s, m in present.items()
+        )
+        output[name] = _metric(value, n, quality, present_weight=present_weight)
     return output
 
 
@@ -401,7 +527,7 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
     events = [
         {
             **r,
-            "score_margin": int(r["post_home_score"]) - int(r["post_away_score"]),
+            "score_margin": int(r["home_score"]) - int(r["away_score"]),
             "batters_faced": 1,
             "is_reliever": True,
         }
@@ -422,13 +548,13 @@ def _bullpen_component(history: FeatureHistory, team_code: str, target: date) ->
     availability, aq = team_availability(pool, usage)
     pool_bf = sum(r["batters_faced"] for r in pool)
     return {
-        "season_xwoba": _metric(xwoba, bf),
-        "k_minus_bb": _metric(kbb, kbf),
-        "last14_xwoba": _metric(last14, lastbf),
+        "season_xwoba": _metric(xwoba, bf, _reliability(bf, 300)),
+        "k_minus_bb": _metric(kbb, kbf, _reliability(kbf, 300)),
+        "last14_xwoba": _metric(last14, lastbf, _reliability(lastbf, 300)),
         "leverage_pool": _metric(
-            float(pool_bf), pool_bf, 1.0 if pool else 0.0, members=pool
+            float(pool_bf), pool_bf, _reliability(pool_bf, 300), members=pool
         ),
-        "availability": _metric(availability, pool_bf, aq),
+        "availability": _metric(availability, pool_bf, aq * _reliability(pool_bf, 300)),
     }
 
 
@@ -495,9 +621,8 @@ def _schedule_component(
 ) -> dict:
     prior = [
         r
-        for r in history.schedule_history
-        if team_code in r.get("team_codes", ())
-        and _day(r.get("official_date", r.get("game_date")), "schedule date") < target
+        for r in history.schedule_history.by_team.get(team_code, ())
+        if _day(r.get("official_date", r.get("game_date")), "schedule date") < target
     ]
     prior.sort(
         key=lambda r: (
@@ -513,12 +638,24 @@ def _schedule_component(
     prior_innings = int(latest.get("innings", 0)) if latest and not rest else 0
     home_days = 0
     destination = _venue(game, history)
-    city = destination.get("city")
-    if city:
-        for r in prior:
-            if _venue(r, history).get("city") != city:
-                break
-            home_days += 1
+    target_venue = game.get("venue_name")
+    prior_home_games = []
+    for offset in (1, 2, 3):
+        candidates = history.schedule_history.by_team_date.get(
+            (team_code, target - timedelta(days=offset)), ()
+        )
+        matching = [
+            row
+            for row in candidates
+            if row.get("home_team_code") == team_code
+            and row.get("venue_name") == target_venue
+        ]
+        if not matching:
+            prior_home_games = []
+            break
+        prior_home_games.append(matching[0])
+    if len(prior_home_games) == 3:
+        home_days = 3
     doubleheader = game.get("doubleheader_marker") in {"GAME1", "GAME2"} or bool(
         game.get("doubleheader", False)
     )
@@ -546,27 +683,134 @@ def _schedule_component(
     return _metric(value, len(prior), supported / 6.0, flags=flags)
 
 
-def _max_history_date(history: FeatureHistory, target: date) -> str | None:
+def _max_history_date(history: FeatureHistory, target: date | None) -> str | None:
     dates = []
-    if history.max_history_row is not None:
-        dates.append(_day(history.max_history_row["game_date"], "game_date"))
-    dates.extend(
-        scheduled
-        for row in history.schedule_history
-        if (
-            scheduled := _day(
-                row.get("official_date", row.get("game_date")), "schedule date"
-            )
-        )
-        < target
-    )
+    for row in (history.max_pitch_row, history.max_pa_row):
+        if row is not None:
+            dates.append(_day(row["game_date"], "game_date"))
+    schedule_max = history.schedule_history.max_before(target)
+    if schedule_max is not None:
+        dates.append(schedule_max)
     return max(dates).isoformat() if dates else None
+
+
+def _valid_lineup(value: object) -> bool:
+    if (
+        isinstance(value, (str, bytes))
+        or not isinstance(value, Sequence)
+        or len(value) != 9
+    ):
+        return False
+    ids = []
+    for player in value:
+        if not isinstance(player, Mapping):
+            return False
+        player_id = player.get("player_id")
+        if type(player_id) is not int or player_id <= 0:
+            return False
+        ids.append(player_id)
+    return len(set(ids)) == 9
+
+
+def _canonical_start(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+
+
+def _eligibility(
+    game: Mapping[str, object], league_era_source: object
+) -> tuple[list[str], date | None, float | None]:
+    reasons = []
+    if game.get("game_type") != "R":
+        reasons.append("invalid_game_type")
+    game_pk = game.get("game_pk")
+    if type(game_pk) is not int or game_pk <= 0:
+        reasons.append("invalid_game_pk")
+    try:
+        target = _day(game.get("official_date"), "official_date")
+    except ValueError:
+        target = None
+        reasons.append("invalid_official_date")
+    if not _canonical_start(game.get("scheduled_start_utc")):
+        reasons.append("invalid_scheduled_start_utc")
+    status = game.get("status")
+    if (
+        not isinstance(status, str)
+        or not status
+        or any(word in status.lower() for word in ("cancel", "postpon"))
+    ):
+        reasons.append("ineligible_status")
+    if (
+        type(game.get("venue_id")) is not int
+        or game["venue_id"] <= 0
+        or not isinstance(game.get("venue_name"), str)
+        or not game["venue_name"]
+    ):
+        reasons.append("missing_venue")
+    home_team, away_team = game.get("home_team"), game.get("away_team")
+    if (
+        not isinstance(home_team, str)
+        or not home_team
+        or not isinstance(away_team, str)
+        or not away_team
+        or home_team == away_team
+    ):
+        reasons.append("invalid_teams")
+    for side in ("home", "away"):
+        pitcher_id = game.get(f"{side}_probable_pitcher_id")
+        if type(pitcher_id) is not int or pitcher_id <= 0:
+            reasons.append(f"missing_{side}_starter")
+        lineup = game.get(f"{side}_lineup")
+        if not lineup:
+            reasons.append(f"missing_{side}_lineup")
+        elif not _valid_lineup(lineup):
+            reasons.append(f"invalid_{side}_lineup")
+    league_era = None
+    if target is not None:
+        if isinstance(league_era_source, Mapping):
+            candidate = league_era_source.get(target.year)
+        else:
+            candidate = league_era_source
+        if candidate is None:
+            reasons.append("missing_league_era")
+        elif (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, (int, float))
+            or not math.isfinite(float(candidate))
+            or candidate <= 0
+        ):
+            reasons.append("invalid_league_era")
+        else:
+            league_era = float(candidate)
+    return reasons, target, league_era
+
+
+def _assert_history(game: Mapping[str, object], history: FeatureHistory) -> None:
+    game_pk = int(game["game_pk"])
+    pitch_boundary = []
+    if game_pk in history.pitch_game_pks:
+        pitch_boundary.append(history.pitches_by_game[game_pk][0])
+    if history.max_pitch_row is not None:
+        pitch_boundary.append(history.max_pitch_row)
+    assert_pregame_history(game, pitch_boundary)
+    pa_boundary = []
+    if game_pk in history.pa_game_pks:
+        pa_boundary.append(history.pa_by_game[game_pk][0])
+    if history.max_pa_row is not None:
+        pa_boundary.append(history.max_pa_row)
+    assert_pregame_history(game, pa_boundary)
 
 
 def build_raw_game_features(
     game: Mapping[str, object],
     history: FeatureHistory,
     team_code_by_name: Mapping[str, str],
+    league_era: float | Mapping[int, float],
 ) -> dict:
     """Build raw, unnormalized features for one normalized schedule game."""
     if not isinstance(history, FeatureHistory):
@@ -583,36 +827,29 @@ def build_raw_game_features(
         )
     ):
         raise ValueError("team_code_by_name must be an explicit frozen 30-team mapping")
-    target = _day(game.get("official_date"), "official_date")
-    boundary_rows = []
-    if int(game.get("game_pk", 0)) in history.game_pks:
-        boundary_rows.append(history.pitches_by_game[int(game["game_pk"])][0])
-    if history.max_history_row is not None:
-        boundary_rows.append(history.max_history_row)
-    assert_pregame_history(game, boundary_rows)
-    reasons = []
-    for side in ("home", "away"):
-        if game.get(f"{side}_probable_pitcher_id") is None:
-            reasons.append(f"missing_{side}_starter")
-        if len(game.get(f"{side}_lineup", ())) != 9:
-            reasons.append(f"missing_{side}_lineup")
+    reasons, target, resolved_league_era = _eligibility(game, league_era)
     result = {
         "game_pk": game.get("game_pk"),
-        "official_date": target.isoformat(),
+        "official_date": target.isoformat()
+        if target is not None
+        else game.get("official_date"),
         "eligible": not reasons,
         "reasons": reasons,
     }
+    if target is not None and type(game.get("game_pk")) is int and game["game_pk"] > 0:
+        _assert_history(game, history)
     if reasons:
         result["provenance"] = {
             "max_history_date": _max_history_date(history, target),
             "target_excluded": True,
         }
         return result
+    assert target is not None and resolved_league_era is not None
     hands = {}
     for side in ("home", "away"):
         pid = int(game[f"{side}_probable_pitcher_id"])
         pitcher_rows = history.pitches_by_pitcher.get(pid, ())
-        hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else "R"
+        hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else None
     for side, opponent in (("home", "away"), ("away", "home")):
         name = str(game[f"{side}_team"])
         if name not in team_code_by_name:
@@ -621,7 +858,10 @@ def build_raw_game_features(
         result[side] = {
             "team_code": code,
             "starter": _starter_component(
-                history, int(game[f"{side}_probable_pitcher_id"]), target
+                history,
+                int(game[f"{side}_probable_pitcher_id"]),
+                target,
+                resolved_league_era,
             ),
             "offense": _offense_component(
                 history, game[f"{side}_lineup"], hands[opponent], target
@@ -638,4 +878,9 @@ def build_raw_game_features(
     return result
 
 
-__all__ = ["FeatureHistory", "build_raw_game_features", "pa_expected_woba"]
+__all__ = [
+    "FeatureHistory",
+    "ScheduleHistory",
+    "build_raw_game_features",
+    "pa_expected_woba",
+]

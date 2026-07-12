@@ -41,6 +41,8 @@ REQUIRED_FIELDS = (
     "launch_speed_angle",
     "at_bat_number",
     "pitch_number",
+    "home_score",
+    "away_score",
     "post_home_score",
     "post_away_score",
     "outs_on_play",
@@ -211,7 +213,12 @@ def fetch_statcast_stage(
 
 
 def _integer(
-    value: str | None, field: str, row_number: int, *, positive: bool = False
+    value: str | None,
+    field: str,
+    row_number: int,
+    *,
+    positive: bool = False,
+    maximum: int | None = None,
 ) -> int:
     try:
         result = int(value or "")
@@ -221,6 +228,8 @@ def _integer(
         raise ValueError(f"statcast row {row_number}: {field} must be positive")
     if not positive and result < 0:
         raise ValueError(f"statcast row {row_number}: {field} must be nonnegative")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"statcast row {row_number}: {field} must be at most {maximum}")
     return result
 
 
@@ -298,6 +307,8 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
             "pitch_number": _integer(
                 raw["pitch_number"], "pitch_number", row_number, positive=True
             ),
+            "home_score": _integer(raw["home_score"], "home_score", row_number),
+            "away_score": _integer(raw["away_score"], "away_score", row_number),
             "post_home_score": _integer(
                 raw["post_home_score"], "post_home_score", row_number
             ),
@@ -305,7 +316,7 @@ def parse_statcast(source: str | Path | bytes) -> StatcastData:
                 raw["post_away_score"], "post_away_score", row_number
             ),
             "outs_on_play": _integer(
-                raw["outs_on_play"], "outs_on_play", row_number
+                raw["outs_on_play"], "outs_on_play", row_number, maximum=3
             ),
             "game_type": "R",
         }
