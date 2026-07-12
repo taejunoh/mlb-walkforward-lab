@@ -5,8 +5,10 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from mlb_backtest.career_bf import fetch_prior_career_bf_records
 from mlb_backtest.pipeline import (
     _load_model_card,
     _verify_candidate_provenance,
@@ -23,9 +25,9 @@ from mlb_backtest.pipeline import (
 from mlb_backtest.config import load_config
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.feature_engine import FeatureHistory, build_raw_game_features
-from mlb_backtest.model_prep import load_statcast_range
+from mlb_backtest.model_prep import load_statcast_range, prepare_training_stage
 from mlb_backtest.sources import schedule_url
-from mlb_backtest.statcast import regular_season_ranges, statcast_url
+from mlb_backtest.statcast import parse_statcast, regular_season_ranges, statcast_url
 from mlb_backtest.scoring_prep import (
     METRIC_SPECS,
     build_candidate_components,
@@ -109,6 +111,46 @@ def _fixture_training_rows(source_raw):
     return rows
 
 
+def _prepared_training_row(game_pk, official_date, index):
+    row = {
+        "eligible": True,
+        "game_pk": game_pk,
+        "official_date": official_date,
+        "lineup_provenance": "RECONSTRUCTED_FINAL_LINEUP",
+    }
+    for side_index, side in enumerate(("away", "home")):
+        side_row = {}
+        for component_index, (component, specs) in enumerate(METRIC_SPECS.items()):
+            side_row[component] = {
+                metric: {
+                    "value": 1.0
+                    + component_index
+                    + metric_index / 10
+                    + index * 0.4
+                    + side_index * 0.2,
+                    "quality": 1.0,
+                    "sample_size": 200,
+                }
+                for metric_index, metric in enumerate(specs)
+            }
+        side_row["starter"].update(
+            pitcher_id=13 if side == "away" else 23,
+            career_bf=100,
+        )
+        side_row["offense"]["players"] = [
+            {"player_id": side_index * 100 + slot, "batting_slot": slot}
+            for slot in range(1, 10)
+        ]
+        for component in ("environment", "defense", "schedule"):
+            side_row[component] = {
+                "value": 50.0 + index + side_index,
+                "quality": 1.0,
+                "sample_size": 200,
+            }
+        row[side] = side_row
+    return row
+
+
 def _prepare_through_lock(root, candidates=None):
     calibration = json.loads((FIXTURE / "calibration.json").read_text("utf-8"))
     games = json.loads((FIXTURE / "games.json").read_text("utf-8"))
@@ -142,6 +184,162 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(repeated, path)
         self.assertEqual(digest, hashlib.sha256(expected).hexdigest())
         self.assertEqual(repeated_digest, digest)
+
+    def test_irrelevant_2025_career_manifest_cannot_change_frozen_artifact_bytes(self):
+        seasons = regular_season_ranges(load_config(CONFIG)["extension_end"])[:3]
+        fixture = (
+            Path(__file__).parent / "fixtures" / "statcast_preparation_e2e.csv"
+        ).read_text("utf-8")
+        game_specs = [
+            (2201, "2022-04-07", False),
+            (2301, "2023-03-30", True),
+            (2401, "2024-03-20", False),
+        ]
+        prepared = {
+            game_pk: _prepared_training_row(game_pk, day, index)
+            for index, (game_pk, day, _home_win) in enumerate(game_specs)
+        }
+
+        def seed_raw(root):
+            _copy_raw_schedule(root)
+            store = RawStore(root / "raw")
+            for (start, end), (game_pk, day, _home_win) in zip(
+                seasons, game_specs
+            ):
+                payload = fixture.replace("2024-04-02", day).replace(
+                    ",1002,", f",{game_pk},"
+                )
+                store.put(
+                    "baseball_savant_statcast",
+                    {
+                        "start": start,
+                        "end": end,
+                        "game_type": "R",
+                        "url": statcast_url(start, end),
+                    },
+                    payload.encode("utf-8"),
+                )
+            fetch_prior_career_bf_records(
+                store,
+                [13, 23],
+                fetcher=lambda _url: b'{"stats":[]}',
+                sleeper=lambda _delay: None,
+            )
+
+        def run(root, *, extra_target_manifest):
+            store = RawStore(root / "raw")
+            if extra_target_manifest:
+                fetch_prior_career_bf_records(
+                    store,
+                    [999],
+                    fetcher=lambda _url: b'{"stats":[]}',
+                    sleeper=lambda _delay: None,
+                )
+
+            catalog = store.verify_manifests()
+            schedule_hashes = {
+                item["manifest"]["query"]["start"]: item["manifest_sha256"]
+                for item in catalog
+                if item["manifest"].get("source") == "mlb_schedule"
+                and item["manifest"]["query"].get("role") == "training"
+            }
+            statcast_hashes = tuple(
+                sorted(
+                    item["manifest_sha256"]
+                    for item in catalog
+                    if item["manifest"].get("source")
+                    == "baseball_savant_statcast"
+                )
+            )
+            evidence = {}
+            for (start, _end), (game_pk, day, home_win) in zip(
+                seasons, game_specs
+            ):
+                evidence[start] = SimpleNamespace(
+                    manifest_sha256=schedule_hashes[start],
+                    games=(
+                        {
+                            "game_pk": game_pk,
+                            "official_date": day,
+                            "status": "Final",
+                            "away_is_winner": not home_win,
+                            "home_is_winner": home_win,
+                            "final_outs": 3,
+                        },
+                    ),
+                )
+
+            def schedule_evidence(_raw, _role, start, _end, **_kwargs):
+                return evidence[start]
+
+            def participants(games, _statcast, **_kwargs):
+                return [dict(games[0], status="Scheduled")]
+
+            def raw_features(_statcast, games, *_args, **_kwargs):
+                return [deepcopy(prepared[int(games[0]["game_pk"])])]
+
+            with (
+                mock.patch(
+                    "mlb_backtest.model_prep.parse_statcast", wraps=parse_statcast
+                ) as parser,
+                mock.patch(
+                    "mlb_backtest.model_prep._schedule_evidence",
+                    side_effect=schedule_evidence,
+                ),
+                mock.patch(
+                    "mlb_backtest.prepare.load_verified_statcast_evidence",
+                    return_value=SimpleNamespace(
+                        manifest_sha256s=statcast_hashes
+                    ),
+                ),
+                mock.patch(
+                    "mlb_backtest.prepare.derive_training_slot_rows",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "mlb_backtest.features.offense.derive_slot_weights",
+                    return_value={slot: 1 / 9 for slot in range(1, 10)},
+                ),
+                mock.patch(
+                    "mlb_backtest.prepare.derive_team_code_map",
+                    return_value=SimpleNamespace(mapping={}),
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._safe_participants",
+                    side_effect=participants,
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._history_build", return_value=object()
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep._raw_features_for_games",
+                    side_effect=raw_features,
+                ),
+                mock.patch(
+                    "mlb_backtest.model_prep.load_league_era_from_raw",
+                    return_value=({}, []),
+                ),
+            ):
+                prepare_training_stage(CONFIG, root)
+                calibrate_stage(CONFIG, root)
+            self.assertEqual(parser.call_count, 3)
+            return (
+                (root / "calibration" / "frozen_inputs.json").read_bytes(),
+                (root / "calibration" / "model_card.json").read_bytes(),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "source"
+            seed_raw(source)
+            without_extra_root = base / "without-extra"
+            with_extra_root = base / "with-extra"
+            shutil.copytree(source / "raw", without_extra_root / "raw")
+            shutil.copytree(source / "raw", with_extra_root / "raw")
+            without_extra = run(without_extra_root, extra_target_manifest=False)
+            with_extra = run(with_extra_root, extra_target_manifest=True)
+
+        self.assertEqual(without_extra, with_extra)
 
     def test_production_shaped_source_preparation_reaches_lock(self):
         with tempfile.TemporaryDirectory() as td:
