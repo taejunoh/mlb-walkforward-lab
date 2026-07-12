@@ -4,8 +4,15 @@ import tempfile
 import unittest
 
 from mlb_backtest.report_artifact import (
+    MATERIALIZE_DATASETS_SQL,
+    baseline_pair_rows,
     build_chart_map,
     build_report_artifact,
+    component_rows,
+    materialize_datasets,
+    month_rows,
+    paired_table_rows,
+    team_rows,
     write_report_artifact,
 )
 
@@ -120,6 +127,36 @@ class ReportArtifactTest(unittest.TestCase):
         quality = next(block for block in blocks if block["id"] == "quality-leakage")
         self.assertIn("`NOT_TIMESTAMP_PROVEN`", quality["body"])
         self.assertIn("`LIMITATION`", quality["body"])
+
+    def test_source_query_is_the_executed_six_dataset_transformation(self):
+        source = self.artifact["sources"][0]
+        query = source["query"]
+        self.assertEqual(query["engine"], "sqlite-json1")
+        self.assertEqual(query["language"], "sql")
+        self.assertEqual(query["sql"], MATERIALIZE_DATASETS_SQL)
+        self.assertNotIn("read_json_auto", query["sql"])
+        self.assertNotIn("python-stdlib", query["engine"])
+        datasets = materialize_datasets(self.diagnostic)
+        self.assertEqual(datasets, self.artifact["snapshot"]["datasets"])
+        self.assertEqual(
+            set(datasets),
+            {
+                "baseline_pairs",
+                "calibration_bins",
+                "monthly",
+                "component_edges",
+                "paired_table",
+                "teams",
+            },
+        )
+        self.assertEqual(datasets["baseline_pairs"], baseline_pair_rows(self.diagnostic))
+        self.assertEqual(
+            datasets["calibration_bins"], self.diagnostic["calibration"]["bins"]
+        )
+        self.assertEqual(datasets["monthly"], month_rows(self.diagnostic))
+        self.assertEqual(datasets["component_edges"], component_rows(self.diagnostic))
+        self.assertEqual(datasets["paired_table"], paired_table_rows(self.diagnostic))
+        self.assertEqual(datasets["teams"], team_rows(self.diagnostic))
 
     def test_charts_have_rich_data_and_immediately_adjacent_narratives(self):
         artifact = self.artifact

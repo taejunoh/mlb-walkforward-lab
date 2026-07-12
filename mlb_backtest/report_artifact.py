@@ -2,10 +2,139 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from mlb_backtest.diagnostics import canonical_json_bytes
+
+
+MATERIALIZE_DATASETS_SQL = """\
+WITH
+input(document) AS (
+    SELECT json(:diagnostic)
+),
+baseline_keys(baseline_key, label, ordinal) AS (
+    VALUES
+        ('home', '홈팀', 0),
+        ('season_record', 'D-1 시즌 승률', 1)
+),
+baseline_rows AS (
+    SELECT
+        'baseline_pairs' AS dataset,
+        ordinal,
+        json_object(
+            'comparison', label,
+            'model_accuracy', json_extract(document, '$.baselines.' || baseline_key || '.model_accuracy'),
+            'baseline_accuracy', json_extract(document, '$.baselines.' || baseline_key || '.baseline_accuracy'),
+            'N', json_extract(document, '$.baselines.' || baseline_key || '.paired.N'),
+            'model_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.model_only'),
+            'baseline_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.baseline_only'),
+            'delta', json_extract(document, '$.baselines.' || baseline_key || '.delta'),
+            'mcnemar_p', json_extract(document, '$.baselines.' || baseline_key || '.mcnemar_p')
+        ) AS row_json
+    FROM input CROSS JOIN baseline_keys
+),
+calibration_rows AS (
+    SELECT
+        'calibration_bins' AS dataset,
+        CAST(bin.key AS INTEGER) AS ordinal,
+        json(bin.value) AS row_json
+    FROM input, json_each(json_extract(document, '$.calibration.bins')) AS bin
+),
+monthly_rows AS (
+    SELECT
+        'monthly' AS dataset,
+        row_number() OVER (ORDER BY month.key) - 1 AS ordinal,
+        json_object(
+            'month', month.key,
+            'accuracy', json_extract(month.value, '$.accuracy'),
+            'W', json_extract(month.value, '$.record.W'),
+            'L', json_extract(month.value, '$.record.L'),
+            'N', json_extract(month.value, '$.record.N')
+        ) AS row_json
+    FROM input, json_each(json_extract(document, '$.monthly')) AS month
+),
+component_keys(component, ordinal) AS (
+    VALUES ('starter', 0), ('offense', 1), ('bullpen', 2), ('schedule', 3)
+),
+component_rows AS (
+    SELECT
+        'component_edges' AS dataset,
+        ordinal,
+        json_object(
+            'component', component,
+            'wins_mean', json_extract(document, '$.components.' || component || '.win_mean'),
+            'losses_mean', json_extract(document, '$.components.' || component || '.loss_mean'),
+            'wins_N', json_extract(document, '$.primary.record.W'),
+            'losses_N', json_extract(document, '$.primary.record.L'),
+            'unit', 'score points'
+        ) AS row_json
+    FROM input CROSS JOIN component_keys
+),
+paired_rows AS (
+    SELECT
+        'paired_table' AS dataset,
+        ordinal,
+        json_object(
+            'comparison', label,
+            'N', json_extract(document, '$.baselines.' || baseline_key || '.paired.N'),
+            'baseline_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.baseline_only'),
+            'both_correct', json_extract(document, '$.baselines.' || baseline_key || '.paired.both_correct'),
+            'both_wrong', json_extract(document, '$.baselines.' || baseline_key || '.paired.both_wrong'),
+            'model_only', json_extract(document, '$.baselines.' || baseline_key || '.paired.model_only'),
+            'delta', json_extract(document, '$.baselines.' || baseline_key || '.delta'),
+            'interval_low', json_extract(document, '$.baselines.' || baseline_key || '.paired_delta_interval[0]'),
+            'interval_high', json_extract(document, '$.baselines.' || baseline_key || '.paired_delta_interval[1]'),
+            'mcnemar_p', json_extract(document, '$.baselines.' || baseline_key || '.mcnemar_p')
+        ) AS row_json
+    FROM input CROSS JOIN baseline_keys
+),
+team_ranked AS (
+    SELECT
+        team.key AS team,
+        team.value AS values_json,
+        row_number() OVER (
+            ORDER BY CAST(json_extract(team.value, '$.N') AS INTEGER) DESC, team.key
+        ) - 1 AS ordinal
+    FROM input, json_each(json_extract(document, '$.teams')) AS team
+),
+team_rows AS (
+    SELECT
+        'teams' AS dataset,
+        ordinal,
+        json_object(
+            'team', team,
+            'W', json_extract(values_json, '$.W'),
+            'L', json_extract(values_json, '$.L'),
+            'N', json_extract(values_json, '$.N'),
+            'accuracy', json_extract(values_json, '$.accuracy'),
+            'wilson_low', json_extract(values_json, '$.wilson_95[0]'),
+            'wilson_high', json_extract(values_json, '$.wilson_95[1]')
+        ) AS row_json
+    FROM team_ranked
+),
+all_rows AS (
+    SELECT * FROM baseline_rows
+    UNION ALL SELECT * FROM calibration_rows
+    UNION ALL SELECT * FROM monthly_rows
+    UNION ALL SELECT * FROM component_rows
+    UNION ALL SELECT * FROM paired_rows
+    UNION ALL SELECT * FROM team_rows
+)
+SELECT dataset, ordinal, row_json
+FROM all_rows
+ORDER BY
+    CASE dataset
+        WHEN 'baseline_pairs' THEN 0
+        WHEN 'calibration_bins' THEN 1
+        WHEN 'monthly' THEN 2
+        WHEN 'component_edges' THEN 3
+        WHEN 'paired_table' THEN 4
+        WHEN 'teams' THEN 5
+    END,
+    ordinal
+"""
 
 
 REPORT_SOURCE: dict[str, object] = {
@@ -13,23 +142,18 @@ REPORT_SOURCE: dict[str, object] = {
     "label": "Canonical v5.1 diagnostic",
     "path": "reports/v5_1_bt/diagnostic_100.json",
     "query": {
-        "engine": "python-stdlib-scipy",
+        "engine": "sqlite-json1",
         "id": "v5.1-BT-diagnostic-100",
         "description": (
-            "Sealed Daily Top 1 diagnostic derived from audited v5.1 files; "
-            "the SQL expression identifies the bounded canonical JSON input, "
-            "which is reshaped by mlb_backtest.report_artifact."
+            "Executed SQLite JSON1 transformation that materializes all six "
+            "bounded report datasets; :diagnostic is bound to the canonical "
+            "UTF-8 JSON at reports/v5_1_bt/diagnostic_100.json."
         ),
-        # The installed validator requires structured artifact sources to expose
-        # runnable SQL (or a .sql source path). DuckDB can read this bounded,
-        # repository-relative canonical input directly.
-        "sql": (
-            "SELECT *\n"
-            "FROM read_json_auto('reports/v5_1_bt/diagnostic_100.json')"
-        ),
-        "language": "python",
+        "sql": MATERIALIZE_DATASETS_SQL,
+        "language": "sql",
         "executed_at": None,
         "tables_used": [
+            "reports/v5_1_bt/diagnostic_100.json",
             "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl",
             "data/v5_1_bt/outcomes/baseline.json",
         ],
@@ -60,6 +184,38 @@ def markdown_block(
     if sourced:
         block["sourceId"] = "diagnostic-json"
     return block
+
+
+def materialize_datasets(
+    diagnostic: Mapping[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    """Execute the exact source query recorded in REPORT_SOURCE."""
+    encoded = canonical_json_bytes(diagnostic).decode("utf-8")
+    dataset_order = (
+        "baseline_pairs",
+        "calibration_bins",
+        "monthly",
+        "component_edges",
+        "paired_table",
+        "teams",
+    )
+    datasets: dict[str, list[dict[str, object]]] = {
+        dataset: [] for dataset in dataset_order
+    }
+    with sqlite3.connect(":memory:") as connection:
+        rows = connection.execute(
+            MATERIALIZE_DATASETS_SQL, {"diagnostic": encoded}
+        ).fetchall()
+    for dataset, expected_ordinal, row_json in rows:
+        if dataset not in datasets:
+            raise ValueError(f"unexpected report dataset: {dataset!r}")
+        if expected_ordinal != len(datasets[dataset]):
+            raise ValueError(f"non-contiguous report dataset ordinal: {dataset!r}")
+        row = json.loads(row_json)
+        if not isinstance(row, dict):
+            raise ValueError(f"report dataset row must be an object: {dataset!r}")
+        datasets[dataset].append(row)
+    return datasets
 
 
 def baseline_pair_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
@@ -109,6 +265,10 @@ def month_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
 def component_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
     components = diagnostic["components"]
     assert isinstance(components, Mapping)
+    primary = diagnostic["primary"]
+    assert isinstance(primary, Mapping)
+    record = primary["record"]
+    assert isinstance(record, Mapping)
     rows: list[dict[str, object]] = []
     for name in ("starter", "offense", "bullpen", "schedule"):
         value = components[name]
@@ -118,8 +278,8 @@ def component_rows(diagnostic: Mapping[str, object]) -> list[dict[str, object]]:
                 "component": name,
                 "wins_mean": value["win_mean"],
                 "losses_mean": value["loss_mean"],
-                "wins_N": 67,
-                "losses_N": 33,
+                "wins_N": record["W"],
+                "losses_N": record["L"],
                 "unit": "score points",
             }
         )
@@ -387,18 +547,7 @@ def exact_table_specs() -> list[dict[str, object]]:
 
 
 def build_report_artifact(diagnostic: Mapping[str, object]) -> dict[str, object]:
-    calibration = diagnostic["calibration"]
-    assert isinstance(calibration, Mapping)
-    bins = calibration["bins"]
-    assert isinstance(bins, list)
-    datasets = {
-        "baseline_pairs": baseline_pair_rows(diagnostic),
-        "calibration_bins": list(bins),
-        "monthly": month_rows(diagnostic),
-        "component_edges": component_rows(diagnostic),
-        "paired_table": paired_table_rows(diagnostic),
-        "teams": team_rows(diagnostic),
-    }
+    datasets = materialize_datasets(diagnostic)
     charts = exact_chart_specs()
     tables = exact_table_specs()
     blocks = [
