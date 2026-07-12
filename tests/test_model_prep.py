@@ -6,13 +6,17 @@ from unittest import mock
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.mlb_stats import league_era_url
 from mlb_backtest.model_prep import (
+    build_result_free_schedule_history,
     load_league_era_from_raw,
     load_pitcher_bf_range,
     load_statcast_range,
     merge_pitcher_bf_counts,
+    project_target_participant_inputs,
     safe_target_games,
 )
 from mlb_backtest.statcast import statcast_url
+from mlb_backtest.statcast import StatcastData
+from mlb_backtest.prepare import VerifiedScheduleEvidence
 
 
 ROOT = Path(__file__).parents[1]
@@ -21,6 +25,66 @@ ERA = ROOT / "tests" / "fixtures" / "mlb_pitching_stats.json"
 
 
 class ModelPreparationSourceTest(unittest.TestCase):
+    def test_target_projection_never_reads_result_or_status_fields(self):
+        safe = {
+            "game_pk": 1,
+            "official_date": "2025-05-01",
+            "game_type": "R",
+            "scheduled_start_utc": "2025-05-01T23:00:00Z",
+            "away_team": "Away",
+            "away_team_id": 1,
+            "home_team": "Home",
+            "home_team_id": 2,
+            "away_probable_pitcher_id": 10,
+            "away_probable_pitcher_name": "A",
+            "home_probable_pitcher_id": 20,
+            "home_probable_pitcher_name": "H",
+            "venue_id": 3,
+            "venue_name": "Park",
+            "scheduled_innings": 9,
+            "doubleheader_marker": None,
+            "away_lineup": [{"player_id": i, "player_name": str(i)} for i in range(1, 10)],
+            "home_lineup": [{"player_id": i, "player_name": str(i)} for i in range(11, 20)],
+        }
+
+        class Poison(dict):
+            def __getitem__(self, key):
+                if key in {"status", "completed_innings", "away_score", "home_score", "away_is_winner", "home_is_winner", "outcome"}:
+                    raise AssertionError(f"forbidden target access: {key}")
+                return super().__getitem__(key)
+
+            def items(self):
+                raise AssertionError("target mapping must not be scanned")
+
+        first = Poison(**safe, status="Final", completed_innings=9, away_score=1, home_score=2, away_is_winner=False, home_is_winner=True)
+        second = Poison(**safe, status="Postponed", completed_innings=18, away_score=99, home_score=0, away_is_winner=True, home_is_winner=False)
+        projected_first = project_target_participant_inputs([first])
+        projected_second = project_target_participant_inputs([second])
+        self.assertEqual(projected_first, projected_second)
+        self.assertEqual(projected_first[0]["status"], "Scheduled")
+        self.assertTrue(
+            {"away_score", "home_score", "away_is_winner", "home_is_winner"}.isdisjoint(projected_first[0])
+        )
+
+        evidence = object.__new__(VerifiedScheduleEvidence)
+        object.__setattr__(evidence, "coverage_start", "2025-05-01")
+        object.__setattr__(evidence, "coverage_end", "2025-05-01")
+        object.__setattr__(evidence, "manifest_sha256", "c" * 64)
+        object.__setattr__(evidence, "games", (first,))
+        played = StatcastData(
+            ({"game_pk": 1, "inning": 11},),
+            ({"game_pk": 1},),
+        )
+        history = build_result_free_schedule_history(
+            evidence, {"Away": "AWY", "Home": "HOM"}, played
+        )
+        object.__setattr__(evidence, "games", (second,))
+        changed = build_result_free_schedule_history(
+            evidence, {"Away": "AWY", "Home": "HOM"}, played
+        )
+        self.assertEqual(history.rows, changed.rows)
+        self.assertEqual(history.rows[0]["innings"], 11)
+
     def test_verified_catalog_prevents_reauditing_bulk_statcast_payloads(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

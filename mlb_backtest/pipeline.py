@@ -1252,7 +1252,8 @@ def _parser() -> argparse.ArgumentParser:
         description="Run deterministic backtest stages over prepared JSONL inputs.",
         epilog=(
             "calibrate and features require immutable raw schedule manifests. "
-            "Run fetch, fetch-statcast, fetch-era, prepare-training, calibrate, "
+            "Run fetch, fetch-statcast, fetch-era, fetch-career-bf, "
+            "prepare-training, calibrate, "
             "prepare-features, features, lock, prepare-outcomes, outcomes, report."
         ),
     )
@@ -1261,6 +1262,7 @@ def _parser() -> argparse.ArgumentParser:
         "fetch",
         "fetch-statcast",
         "fetch-era",
+        "fetch-career-bf",
         "prepare-training",
         "calibrate",
         "prepare-candidates",
@@ -1282,6 +1284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from .statcast import fetch_statcast_stage
     from .model_prep import (
         fetch_league_era_stage,
+        fetch_prior_career_bf_stage,
         prepare_candidates_stage,
         prepare_outcomes_stage,
         prepare_training_stage,
@@ -1291,6 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fetch": fetch_stage,
         "fetch-statcast": fetch_statcast_stage,
         "fetch-era": fetch_league_era_stage,
+        "fetch-career-bf": fetch_prior_career_bf_stage,
         "prepare-training": prepare_training_stage,
         "calibrate": calibrate_stage,
         "prepare-candidates": prepare_candidates_stage,

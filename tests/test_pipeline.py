@@ -336,6 +336,8 @@ class PipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing"):
                 main(["fetch-era", "--config", str(CONFIG), "--data-dir", str(root)])
             with self.assertRaisesRegex(RuntimeError, "missing"):
+                main(["fetch-career-bf", "--config", str(CONFIG), "--data-dir", str(root)])
+            with self.assertRaisesRegex(RuntimeError, "missing"):
                 main(["prepare-features", "--config", str(CONFIG), "--data-dir", str(root)])
             with self.assertRaisesRegex(RuntimeError, "lock"):
                 main(["prepare-outcomes", "--config", str(CONFIG), "--data-dir", str(root)])

@@ -13,6 +13,45 @@ from .statcast import StatcastData, parse_statcast, statcast_url
 
 
 _OUTCOME_TOKENS = ("score", "winner", "outcome", "result", "market", "odds")
+_TARGET_PARTICIPANT_FIELDS = (
+    "game_pk", "official_date", "game_type", "scheduled_start_utc",
+    "away_team", "away_team_id", "home_team", "home_team_id",
+    "away_probable_pitcher_id", "away_probable_pitcher_name",
+    "home_probable_pitcher_id", "home_probable_pitcher_name",
+    "venue_id", "venue_name", "scheduled_innings", "doubleheader_marker",
+    "away_lineup", "home_lineup",
+)
+
+
+def project_target_participant_inputs(
+    games: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Read only pregame participant fields; never scan target result mappings."""
+    projected = []
+    for source in games:
+        if not isinstance(source, Mapping):
+            raise ValueError("target schedule games must be mappings")
+        row = {
+            field: source[field]
+            for field in _TARGET_PARTICIPANT_FIELDS
+            if field in source
+        }
+        for lineup_field in ("away_lineup", "home_lineup"):
+            lineup = row.get(lineup_field)
+            if lineup is None:
+                continue
+            if isinstance(lineup, (str, bytes)) or not isinstance(lineup, Sequence):
+                raise ValueError("target lineups must be sequences")
+            row[lineup_field] = [
+                {
+                    "player_id": player["player_id"],
+                    "player_name": player["player_name"],
+                }
+                for player in lineup
+            ]
+        row["status"] = "Scheduled"
+        projected.append(row)
+    return projected
 
 
 def safe_target_games(
@@ -222,10 +261,15 @@ def _statcast_manifest_paths(
     return paths
 
 
-def _safe_participants(schedule_games, statcast):
+def _safe_participants(schedule_games, statcast, *, target=False):
     from .prepare import build_actual_participants
 
-    return safe_target_games(build_actual_participants(schedule_games, statcast).games)
+    source = (
+        project_target_participant_inputs(schedule_games)
+        if target
+        else schedule_games
+    )
+    return safe_target_games(build_actual_participants(source, statcast).games)
 
 
 def _history_build(evidence, team_map, venue_reference=None, *, catalog=None):
@@ -242,6 +286,76 @@ def _history_build(evidence, team_map, venue_reference=None, *, catalog=None):
         venue_reference or {},
         evidence,
         verified_catalog=catalog,
+    )
+
+
+def build_result_free_schedule_history(
+    evidence,
+    team_code_by_name: Mapping[str, str],
+    statcast: StatcastData,
+):
+    """Build schedule history without reading target status, scores, or winners."""
+    from .prepare import ScheduleHistoryBuild, VerifiedScheduleEvidence
+
+    if not isinstance(evidence, VerifiedScheduleEvidence):
+        raise ValueError("verified schedule evidence is required")
+    if not isinstance(statcast, StatcastData):
+        raise ValueError("verified Statcast data is required")
+    played_pks = {
+        int(row["game_pk"])
+        for row in (*statcast.pitches, *statcast.plate_appearances)
+    }
+    innings_by_game: dict[int, int] = {}
+    for pitch in statcast.pitches:
+        game_pk = int(pitch["game_pk"])
+        inning = pitch.get("inning")
+        if type(inning) is not int or inning <= 0:
+            raise ValueError("result-free Statcast inning is invalid")
+        innings_by_game[game_pk] = max(innings_by_game.get(game_pk, 0), inning)
+    rows = []
+    for game in evidence.games:
+        game_pk = game["game_pk"]
+        if game_pk not in played_pks:
+            continue
+        away_name, home_name = game["away_team"], game["home_team"]
+        if away_name not in team_code_by_name or home_name not in team_code_by_name:
+            raise ValueError("result-free schedule history team mapping is incomplete")
+        innings = innings_by_game.get(game_pk)
+        row = {
+            "game_pk": game_pk,
+            "official_date": game["official_date"],
+            "team_codes": [
+                team_code_by_name[away_name],
+                team_code_by_name[home_name],
+            ],
+            "home_team_code": team_code_by_name[home_name],
+            "venue_name": game["venue_name"],
+            "innings": innings,
+            "doubleheader_marker": (
+                game["doubleheader_marker"]
+                if "doubleheader_marker" in game
+                else None
+            ),
+        }
+        rows.append(row)
+    rows.sort(key=lambda row: (row["official_date"], row["game_pk"]))
+    if not rows:
+        raise ValueError("result-free schedule history has no played games")
+    expected = tuple(sorted(row["game_pk"] for row in rows))
+    return ScheduleHistoryBuild(
+        tuple(rows),
+        evidence.coverage_start,
+        evidence.coverage_end,
+        True,
+        evidence.manifest_sha256,
+        expected,
+        {
+            "source_manifest_sha256": evidence.manifest_sha256,
+            "played_game_count": len(rows),
+            "played_game_pks": expected,
+            "played_evidence": "STATCAST_GAME_PK",
+            "result_fields_accessed": False,
+        },
     )
 
 
@@ -302,6 +416,9 @@ def _training_outcomes(games: Iterable[Mapping[str, object]]) -> dict[int, int]:
 
 def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     """Build frozen normalization inputs and training edges from verified raw data."""
+    from collections import Counter
+
+    from .career_bf import apply_prior_career_bf, load_prior_career_bf_records
     from .config import load_config
     from .features.offense import derive_slot_weights
     from .pipeline import _canonical_json, _canonical_jsonl, _safe_data_dir, _stage, _write_once
@@ -343,10 +460,28 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
     )
     raw_features = []
     outcomes = {}
+    career_hashes = [
+        item["manifest_sha256"]
+        for item in raw_catalog
+        if item["manifest"].get("source") == "mlb_stats_pitcher_bf"
+    ]
+    if not career_hashes:
+        raise RuntimeError("missing frozen prior career BF manifests")
+    career_ids = sorted(
+        int(item["manifest"]["query"]["pitcher_id"])
+        for item in raw_catalog
+        if item["manifest"].get("source") == "mlb_stats_pitcher_bf"
+    )
+    career_records, verified_career_hashes = load_prior_career_bf_records(
+        raw_root, career_ids, catalog=raw_catalog
+    )
+    if sorted(career_hashes) != verified_career_hashes:
+        raise RuntimeError("prior career BF provenance is incomplete")
     source_hashes = [
         evidence.manifest_sha256 for evidence in schedule_evidence.values()
-    ] + list(compact.manifest_sha256s)
+    ] + list(compact.manifest_sha256s) + career_hashes
     season_open_by_year = {year: start for year, (start, _end) in zip((2022, 2023, 2024), seasons)}
+    completed_bf_by_year = {}
     for year, (start, end) in zip((2022, 2023, 2024), seasons):
         statcast, hashes = load_statcast_range(
             raw_root, start, end, catalog=raw_catalog
@@ -366,15 +501,29 @@ def prepare_training_stage(config_path: str | Path, data_dir: str | Path) -> Pat
         league_era, era_hashes = load_league_era_from_raw(
             raw_root, season_open_by_year, as_of_dates, catalog=raw_catalog
         )
-        raw_features.extend(
-            _raw_features_for_games(
-                statcast,
-                target_games,
-                slot_weights,
-                history,
-                team_map.mapping,
-                league_era,
-            )
+        season_raw = _raw_features_for_games(
+            statcast,
+            target_games,
+            slot_weights,
+            history,
+            team_map.mapping,
+            league_era,
+        )
+        prior_completed = merge_pitcher_bf_counts(
+            completed_bf_by_year.values()
+        )
+        for raw in season_raw:
+            if raw.get("eligible") is not True:
+                continue
+            for side in ("away", "home"):
+                starter = raw[side]["starter"]
+                starter["career_bf"] += prior_completed.get(
+                    starter["pitcher_id"], 0
+                )
+        apply_prior_career_bf(season_raw, career_records)
+        raw_features.extend(season_raw)
+        completed_bf_by_year[year] = dict(
+            Counter(int(row["pitcher_id"]) for row in statcast.plate_appearances)
         )
         outcomes.update(_training_outcomes(evidence.games))
         source_hashes.extend(hashes)
@@ -481,8 +630,52 @@ def fetch_league_era_stage(config_path: str | Path, data_dir: str | Path) -> lis
     return [after[digest] for digest in sorted(expected - before)]
 
 
+def fetch_prior_career_bf_stage(
+    config_path: str | Path, data_dir: str | Path
+) -> dict[int, dict[str, object]]:
+    """Fetch frozen through-2021 career BF for reconstructed 2025 starters."""
+    from .career_bf import fetch_prior_career_bf_records
+    from .config import load_config
+    from .feature_engine import actual_starter_index
+    from .pipeline import _safe_data_dir, _stage
+
+    config = load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    if not (root / "raw").is_dir():
+        raise RuntimeError("missing verified raw Statcast sources")
+    raw_root = _stage(root, "raw", create=False)
+    catalog = RawStore(raw_root).verify_manifests()
+    ranges = [
+        ("2022-04-07", "2022-10-05"),
+        ("2023-03-30", "2023-10-01"),
+        ("2024-03-20", "2024-09-30"),
+        ("2025-03-18", config["extension_end"]),
+    ]
+    starters = {}
+    for start, end in ranges:
+        statcast, _hashes = load_statcast_range(
+            raw_root, start, end, catalog=catalog
+        )
+        starters.update(actual_starter_index(statcast))
+    pitcher_ids = sorted(
+        {
+            pitcher_id
+            for values in starters.values()
+            for pitcher_id in values.values()
+        }
+    )
+    if not pitcher_ids:
+        raise RuntimeError("missing reconstructed 2025 starter identities")
+    return fetch_prior_career_bf_records(
+        RawStore(raw_root),
+        pitcher_ids,
+        verified_catalog=catalog,
+    )
+
+
 def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> Path:
     """Build result-free 2025 candidate components from the frozen v2 card."""
+    from .career_bf import apply_prior_career_bf, load_prior_career_bf_records
     from .config import load_config
     from .pipeline import (
         _canonical_json,
@@ -528,13 +721,18 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         config["extension_end"],
         catalog=raw_catalog,
     )
-    all_schedule = [*history_evidence.games, *backtest_evidence.games]
-    team_map = derive_team_code_map(all_schedule, statcast, 2025)
-    participants = _safe_participants(backtest_evidence.games, statcast)
+    team_map = derive_team_code_map(history_evidence.games, statcast, 2025)
+    participants = _safe_participants(
+        backtest_evidence.games, statcast, target=True
+    )
     history = _combined_history(
         (
-            _history_build(history_evidence, team_map, catalog=raw_catalog),
-            _history_build(backtest_evidence, team_map, catalog=raw_catalog),
+            build_result_free_schedule_history(
+                history_evidence, team_map.mapping, statcast
+            ),
+            build_result_free_schedule_history(
+                backtest_evidence, team_map.mapping, statcast
+            ),
         )
     )
     as_of_dates = sorted(
@@ -577,6 +775,18 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
         for side in ("away", "home"):
             starter = raw[side]["starter"]
             starter["career_bf"] += prior_bf.get(starter["pitcher_id"], 0)
+    starter_ids = sorted(
+        {
+            int(raw[side]["starter"]["pitcher_id"])
+            for raw in raw_features
+            if raw.get("eligible") is True
+            for side in ("away", "home")
+        }
+    )
+    career_records, career_hashes = load_prior_career_bf_records(
+        raw_root, starter_ids, catalog=raw_catalog
+    )
+    apply_prior_career_bf(raw_features, career_records)
     rows = build_candidate_components(
         participants, raw_features, card["normalization"]
     )
@@ -606,6 +816,7 @@ def prepare_candidates_stage(config_path: str | Path, data_dir: str | Path) -> P
                 *statcast_hashes,
                 *era_hashes,
                 *prior_hashes,
+                *career_hashes,
             }
         ),
     }
@@ -665,13 +876,16 @@ def prepare_outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Pat
 
 
 __all__ = [
+    "build_result_free_schedule_history",
     "load_league_era_from_raw",
     "load_pitcher_bf_range",
     "load_statcast_range",
     "merge_pitcher_bf_counts",
     "fetch_league_era_stage",
+    "fetch_prior_career_bf_stage",
     "prepare_candidates_stage",
     "prepare_outcomes_stage",
     "prepare_training_stage",
+    "project_target_participant_inputs",
     "safe_target_games",
 ]
