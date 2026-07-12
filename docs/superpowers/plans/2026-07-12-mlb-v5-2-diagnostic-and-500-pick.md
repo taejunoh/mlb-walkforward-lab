@@ -58,6 +58,7 @@ The diagnostic must bind these authoritative identities:
 - Create `analysis/v5_1_bt/build_diagnostic_notebook.py` and generated `diagnostic_100.ipynb`: rerunnable executed audit trail.
 - Create `reports/v5_1_bt/diagnostic_100_artifact.json`: canonical Data Analytics report payload.
 - Create `reports/v5_1_bt/diagnostic_100_chart_map.json`: chart contracts and source IDs.
+- Create `reports/v5_1_bt/report_delivery_receipt.json`: the single final portable-HTML delivery receipt, created only in Task 11.
 - Create `reports/v5_2_qd/walkforward_500_preflight.json` and `.md`: observed coverage, blockers, and exact next commands.
 - Create `/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html`: the only reader-facing report delivery mode.
 
@@ -81,17 +82,9 @@ Use these chart contracts and no others:
 | `monthly` | Stability | Is accuracy stable across time? | bar | `monthly`: `month`, `accuracy`, `N` | July is materially weaker; this is instability evidence, not regime discovery. |
 | `components` | Component hypotheses | Which chosen-side edges differ between wins and losses? | grouped bar | `component_edges`: `component`, `wins_mean`, `losses_mean` | Bullpen/schedule signs warrant prior-season testing, not 100-pick retuning. |
 
-Every chart has an adjacent explanatory Markdown block. The HTML artifact must include canonical relative file identities—not absolute machine-local paths or credentials—in source metadata. Build only through the plugin root:
+Every chart has an adjacent explanatory Markdown block. The HTML artifact must include canonical relative file identities—not absolute machine-local paths or credentials—in source metadata. The only delivery invocation is the exact plugin-root command in Task 11 Step 4.
 
-```bash
-PLUGIN_ROOT=/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599
-cd "$PLUGIN_ROOT"
-npm run report:deliver -- \
-  --input "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest/reports/v5_1_bt/diagnostic_100_artifact.json" \
-  --output "/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html"
-```
-
-Task 5 calls the plugin's real `validate_artifact` only; it does not package or deliver HTML. After every report input is stable and reviews pass, Task 11 runs the command above exactly once. Accept only a receipt whose `stages.validation` is `passed`, `stages.packaging` is `passed`, and `stages.verification` is `passed`. If the installed Chromium is unavailable and the receipt is `structural_only`, keep the semantic fallback but do not mark the current phase complete until browser verification can be run on a compatible installed Chromium. Do not create a hand-written HTML renderer, sidecar JavaScript, screenshot-only report, MCP report, or Sites report.
+Task 5 calls the plugin's real `validate_artifact` only; it does not package or deliver HTML. After every report input is stable and reviews pass, Task 11 runs the command above exactly once. Accept only a receipt whose installed-contract keys `stages.validation`, `stages.package`, and `stages.verification` are all `passed`. If the installed Chromium is unavailable and the receipt is `structural_only`, keep the semantic fallback but do not mark the current phase complete until browser verification can be run on a compatible installed Chromium. Do not create a hand-written HTML renderer, sidecar JavaScript, screenshot-only report, MCP report, or Sites report.
 
 ---
 
@@ -168,14 +161,51 @@ Expected: `ERROR` with `ModuleNotFoundError: No module named 'mlb_backtest.diagn
 - [ ] **Step 3: Implement strict readers, canonical byte/content hashes, and statistical helpers**
 
 ```python
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+import hashlib
+import json
+import math
+
+JsonScalar = str | int | float | bool | None
+FrozenJson = JsonScalar | tuple["FrozenJson", ...] | Mapping[str, "FrozenJson"]
+
+def deep_freeze(value: object) -> FrozenJson:
+    if isinstance(value, dict):
+        return MappingProxyType({str(k): deep_freeze(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(deep_freeze(v) for v in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported JSON value {type(value).__name__}")
+
+AUDITED_DIGEST_PATHS = MappingProxyType({
+    "predictions_contents_sha256": "data/v5_1_bt/locked/predictions.jsonl",
+    "lock_manifest_file_sha256": "data/v5_1_bt/locked/lock_manifest.json",
+    "source_provenance_file_sha256": "data/v5_1_bt/locked/source_provenance.json",
+    "audit_model_card_file_sha256": "audit/v5_1_bt/model_card.json",
+    "candidate_raw_features": "data/v5_1_bt/features/candidate_raw_features.jsonl",
+    "candidate_components": "data/v5_1_bt/features/candidate_components.jsonl",
+    "candidate_provenance": "data/v5_1_bt/features/candidate_provenance.json",
+    "scored_candidates": "data/v5_1_bt/features/scored_candidates.jsonl",
+    "scored_candidate_provenance": "data/v5_1_bt/features/scored_candidate_provenance.json",
+    "outcomes_input": "data/v5_1_bt/outcomes/outcomes_input.jsonl",
+    "baseline": "data/v5_1_bt/outcomes/baseline.json",
+    "evaluated_predictions": "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl",
+    "summary": "data/v5_1_bt/reports/summary.json",
+})
+
 @dataclass(frozen=True)
 class V51Evidence:
     root: Path
-    evaluated_rows: tuple[dict[str, object], ...]
-    baseline_by_game: dict[int, str]
-    summary: dict[str, object]
-    lock_audit: dict[str, object]
-    model_card: dict[str, object]
+    evaluated_rows: tuple[Mapping[str, FrozenJson], ...]
+    baseline_by_game: Mapping[int, str]
+    summary: Mapping[str, FrozenJson]
+    lock_audit: Mapping[str, FrozenJson]
+    model_card: Mapping[str, FrozenJson]
+    verified_file_sha256: Mapping[str, str]
     predictions_content_sha256: str
     evaluated_content_sha256: str
 
@@ -186,6 +216,13 @@ def exact_mcnemar(model_only: int, baseline_only: int) -> float:
     tail = sum(math.comb(discordant, k) for k in range(min(model_only, baseline_only) + 1)) / (2 ** discordant)
     return min(1.0, 2.0 * tail)
 
+def paired_table(model_correct: Sequence[bool], baseline_correct: Sequence[bool]) -> dict[str, int]:
+    if len(model_correct) != len(baseline_correct):
+        raise ValueError("paired correctness vectors differ in length")
+    pairs = list(zip(model_correct, baseline_correct, strict=True))
+    return {"both_correct": sum(a and b for a, b in pairs), "model_only": sum(a and not b for a, b in pairs),
+            "baseline_only": sum(not a and b for a, b in pairs), "both_wrong": sum(not a and not b for a, b in pairs), "N": len(pairs)}
+
 PAIRED_INTERVAL_LABEL = "approximate paired 95% interval (z=1.97)"
 
 def paired_delta_interval(model_only: int, baseline_only: int, n: int, z: float = 1.97) -> tuple[float, float]:
@@ -194,8 +231,15 @@ def paired_delta_interval(model_only: int, baseline_only: int, n: int, z: float 
     margin = z * math.sqrt(variance)
     return delta - margin, delta + margin
 
+def jsonable(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    return value
+
 def canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return json.dumps(jsonable(value), allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -203,12 +247,21 @@ def sha256_file(path: Path) -> str:
 def read_jsonl(path: Path) -> tuple[dict[str, object], ...]:
     return tuple(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
+def audited_digest_map(audit: Mapping[str, object]) -> dict[str, str]:
+    result = {"audit_model_card_file_sha256": str(audit["audit_model_card_file_sha256"])}
+    result.update({k: str(v) for k, v in audit["sealed_lock"].items() if k in AUDITED_DIGEST_PATHS})
+    result.update({k: str(v) for k, v in audit["input_and_output_sha256"].items() if k in AUDITED_DIGEST_PATHS})
+    if set(result) != set(AUDITED_DIGEST_PATHS):
+        raise ValueError("audited digest registry differs from available files")
+    return result
+
 def load_v51_evidence(root: Path) -> V51Evidence:
     evaluated_path = root / "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl"
     predictions_path = root / "data/v5_1_bt/locked/predictions.jsonl"
     audit = json.loads((root / "audit/v5_1_bt/lock_manifest.json").read_text(encoding="utf-8"))
-    predictions_hash, evaluated_hash = sha256_file(predictions_path), sha256_file(evaluated_path)
-    if predictions_hash != audit["sealed_lock"]["predictions_contents_sha256"] or evaluated_hash != audit["input_and_output_sha256"]["evaluated_predictions"]:
+    expected = audited_digest_map(audit)
+    verified = {name: sha256_file(root / relative) for name, relative in AUDITED_DIGEST_PATHS.items()}
+    if verified != expected:
         raise ValueError("authoritative v5.1 evidence hash differs")
     rows = read_jsonl(evaluated_path)
     if len(rows) != 1340 or len({row["game_pk"] for row in rows}) != 1340 or {row["model_version"] for row in rows} != {"v5.1-BT"}:
@@ -217,13 +270,31 @@ def load_v51_evidence(root: Path) -> V51Evidence:
     if len(top1_dates) != 100 or len(set(top1_dates)) != 100:
         raise ValueError("Daily Top 1 population differs")
     baseline_raw = json.loads((root / "data/v5_1_bt/outcomes/baseline.json").read_text(encoding="utf-8"))
-    baseline = {int(game_pk): str(team) for game_pk, team in baseline_raw.items()}
-    return V51Evidence(root.resolve(), rows, baseline,
-                       json.loads((root / "data/v5_1_bt/reports/summary.json").read_text(encoding="utf-8")), audit,
-                       json.loads((root / "audit/v5_1_bt/model_card.json").read_text(encoding="utf-8")), predictions_hash, evaluated_hash)
+    baseline = MappingProxyType({int(game_pk): str(team) for game_pk, team in baseline_raw.items()})
+    return V51Evidence(
+        root.resolve(),
+        tuple(deep_freeze(row) for row in rows),
+        baseline,
+        deep_freeze(json.loads((root / "data/v5_1_bt/reports/summary.json").read_text(encoding="utf-8"))),
+        deep_freeze(audit),
+        deep_freeze(json.loads((root / "audit/v5_1_bt/model_card.json").read_text(encoding="utf-8"))),
+        MappingProxyType(verified),
+        verified["predictions_contents_sha256"],
+        verified["evaluated_predictions"],
+    )
 ```
 
-`load_v51_evidence(root)` must read each authoritative path, reject duplicates/mixed versions/non-Top1 date counts, compare the audited byte/content digests, and return immutable copies. For the sealed prediction/evaluated files, hash the exact existing bytes; do not parse and reserialize them before comparison. Use the exported `canonical_json_bytes` only for newly generated v5.2/report JSON identities.
+Add these literal assertions to `test_authoritative_inputs_match_audited_content_hashes`; they prove nested values cannot be mutated and that every digest actually present in the audited lock manifest is checked against an existing file:
+
+```python
+self.assertEqual(set(evidence.verified_file_sha256), set(AUDITED_DIGEST_PATHS))
+with self.assertRaises(TypeError):
+    evidence.summary["primary"] = {}  # type: ignore[index]
+with self.assertRaises(TypeError):
+    evidence.model_card["counts"]["training_eligible_rows"] = 0  # type: ignore[index]
+```
+
+Do not claim a digest for `config/v5_1_bt.json`, `audit/v5_1_bt/manual_audit.md`, or any file not named by the audited lock manifest; those files are separately protected from the approved Git tree in Task 10.
 
 - [ ] **Step 4: Run focused tests and lint**
 
@@ -269,9 +340,65 @@ class DiagnosticGoldenTest(unittest.TestCase):
         self.assertAlmostEqual(self.result["components"]["bullpen"]["win_mean"], 11.752, places=3)
         self.assertEqual(self.result["data_quality"]["top1_states"], {"INCOMPLETE": 100, "High": 100, "Toss-up": 100})
         self.assertAlmostEqual(self.result["data_quality"]["completeness"]["mean"], 0.4602764334, places=10)
+
+    def test_exact_secondary_statistics(self):
+        self.assertEqual(self.result["sides"], {
+            "home": {"W": 52, "L": 26, "N": 78, "accuracy": 52 / 78},
+            "away": {"W": 15, "L": 7, "N": 22, "accuracy": 15 / 22},
+        })
+        self.assertEqual(self.result["team_concentration"]["distinct_teams"], 23)
+        self.assertEqual(self.result["team_concentration"]["top_six"], {
+            "New York Yankees": 14, "Philadelphia Phillies": 11,
+            "Houston Astros": 9, "San Diego Padres": 9,
+            "Los Angeles Dodgers": 7, "Seattle Mariners": 7,
+        })
+        self.assertEqual(self.result["team_concentration"]["top_six_share"], 0.57)
+        self.assertEqual([round(self.result["discrimination"]["probability_spearman"][k], 4 if k == "rho" else 3)
+                          for k in ("rho", "p")], [0.0077, 0.939])
+        self.assertEqual([round(self.result["discrimination"]["legacy_confidence_spearman"][k], 4 if k == "rho" else 3)
+                          for k in ("rho", "p")], [0.0365, 0.719])
+        self.assertEqual(self.result["thresholds"]["ge_63"], {"W": 59, "N": 82, "accuracy": 59 / 82, "post_hoc": True})
+        self.assertEqual(self.result["thresholds"]["ge_68"], {"W": 14, "N": 23, "accuracy": 14 / 23, "post_hoc": True})
+        self.assertEqual([round(x["p"], 3) for x in self.result["rank_comparisons"]], [0.349, 0.291])
+        self.assertEqual(round(self.result["temporal"]["july_vs_other_fisher_p"], 4), 0.0589)
+        self.assertEqual(self.result["components"]["bullpen"]["absolute_edge_halves"], {
+            "lower": {"W": 37, "N": 50, "accuracy": 0.74},
+            "upper": {"W": 30, "N": 50, "accuracy": 0.60},
+        })
+        self.assertEqual([round(self.result["components"]["bullpen"]["spearman"][k], 3)
+                          for k in ("rho", "p")], [-0.151, 0.135])
+
+    def test_chosen_side_component_edges_are_signed_not_absolute(self):
+        synthetic = [
+            {"predicted_side": "home", "correct": True, "starter_edge": 5.0},
+            {"predicted_side": "away", "correct": False, "starter_edge": 7.0},
+        ]
+        self.assertEqual(chosen_side_edge(synthetic[0], "starter"), 5.0)
+        self.assertEqual(chosen_side_edge(synthetic[1], "starter"), -7.0)
+        summary = component_summary(synthetic, "starter")
+        self.assertEqual(summary["win_mean"], 5.0)
+        self.assertEqual(summary["loss_mean"], -7.0)
+
+    def test_leakage_categories_are_distinct_and_exact(self):
+        self.assertEqual(set(self.result["leakage"]), {
+            "statistical_as_of_safety", "participant_time_limitation", "source_revision_limitation"
+        })
+        self.assertEqual(self.result["leakage"]["statistical_as_of_safety"]["status"], "PASS")
+        self.assertEqual(self.result["leakage"]["participant_time_limitation"]["status"], "LIMITATION")
+        self.assertEqual(self.result["leakage"]["source_revision_limitation"]["status"], "LIMITATION")
 ```
 
-The same test class includes `test_secondary_exact_contract`, which asserts this literal contract dictionary against the result: `{"home_side": [52,26,78], "away_side": [15,7,22], "distinct_teams": 23, "top_six_counts": {"New York Yankees":14,"Philadelphia Phillies":11,"Houston Astros":9,"San Diego Padres":9,"Los Angeles Dodgers":7,"Seattle Mariners":7}, "probability_spearman_rounded":[0.0077,0.939], "confidence_spearman_rounded":[0.0365,0.719], "ge_63":[59,82], "ge_68":[14,23], "rank_mcnemar_rounded":[0.349,0.291], "july_fisher_p_rounded":0.0589, "bullpen_halves_accuracy":[0.74,0.60], "bullpen_spearman_rounded":[-0.151,0.135], "training_eligible_rows":7265}`. It separately asserts the eight component means, each team's computed Wilson bounds, completeness `[min,max,mean]=[0.2358031605,0.5769861616,0.4602764334]`, and leakage keys exactly `statistical_as_of_safety`, `participant_time_limitation`, and `source_revision_limitation`.
+Also assert all eight chosen-side means literally:
+
+```python
+self.assertEqual({name: (round(v["win_mean"], 3), round(v["loss_mean"], 3))
+                  for name, v in self.result["components"].items() if name in {"starter", "offense", "bullpen", "schedule"}}, {
+    "starter": (14.879, 13.751), "offense": (8.287, 7.049),
+    "bullpen": (11.752, 14.238), "schedule": (1.313, 2.424),
+})
+for team, row in self.result["teams"].items():
+    self.assertEqual(row["wilson_95"], list(wilson(row["W"], row["N"])), team)
+self.assertEqual(self.result["data_quality"]["training_eligible_rows"], 7265)
 
 - [ ] **Step 2: Run the complete golden class and verify missing keys**
 
@@ -282,19 +409,25 @@ Expected: `FAIL` because `build_diagnostic` or required sections are absent.
 - [ ] **Step 3: Implement one canonical diagnostic tree**
 
 ```python
+from mlb_backtest.metrics import evaluate, wilson
+
 def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
     top1 = graded_rows(evidence.evaluated_rows, top1=True)
     all_graded = graded_rows(evidence.evaluated_rows)
     base = evaluate(evidence.evaluated_rows, baseline_by_game=evidence.baseline_by_game)
-    return {
+    result = {
         "schema_version": 1,
         "model_version": "v5.1-BT",
         "population": {"label": "sealed Daily Top 1", "N": 100, "dates": ["2025-05-01", "2025-08-12"]},
         "primary": {"record": {k: base["primary"][k] for k in ("W", "L", "N")}, **{k: base["primary"][k] for k in ("accuracy", "wilson_95", "brier", "log_loss", "max_losing_streak")}},
         "baselines": baseline_diagnostics(top1, evidence.baseline_by_game),
         "calibration": base["calibration"],
+        "discrimination": discrimination(top1),
+        "thresholds": threshold_results(top1),
         "rank": rank_diagnostic(all_graded),
+        "rank_comparisons": rank_comparisons(all_graded),
         "monthly": month_diagnostic(top1),
+        "temporal": temporal_diagnostic(top1),
         "sides": side_diagnostic(top1),
         "teams": team_diagnostic(top1),
         "team_concentration": team_concentration(top1),
@@ -308,6 +441,18 @@ def build_diagnostic(evidence: V51Evidence) -> dict[str, object]:
         },
         "sources": evidence_source_records(evidence),
     }
+    result["tables"] = {
+        "paired_baselines": contract_table([result["baselines"]["home"], result["baselines"]["season_record"]], "Daily Top 1 paired games", "paired correctness 2x2; exact McNemar; paired delta", ["season-record tie excluded"], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl", "data-v5_1_bt-outcomes-baseline-json"]),
+        "calibration": contract_table(result["calibration"]["bins"], "Daily Top 1 N=100", "fixed-bin probability mean, accuracy, gap, Brier contribution", [], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl"]),
+        "rank": contract_table(result["rank"], "graded daily ranks 1-3", "wins and N by immutable daily_rank", [], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl"]),
+        "monthly": contract_table([{"month": k, **v} for k, v in result["monthly"].items()], "Daily Top 1 N=100", "wins and N by official_date month", [], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl"]),
+        "teams": contract_table([{"team": k, **v} for k, v in result["teams"].items()], "Daily Top 1 N=100", "wins, N, accuracy, Wilson interval by predicted winner", [], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl"]),
+        "components": contract_table([{"component": k, **v} for k, v in result["components"].items() if k in {"starter", "offense", "bullpen", "schedule"}], "Daily Top 1 N=100", "chosen-side signed edge mean by outcome", [], ["data-v5_1_bt-outcomes-evaluated-evaluated_predictions-jsonl"]),
+    }
+    return result
+
+def contract_table(rows: object, population: str, formula: str, exclusions: Sequence[str], source_ids: Sequence[str]) -> dict[str, object]:
+    return {"rows": rows, "population": population, "formula": formula, "exclusions": list(exclusions), "source_ids": list(source_ids)}
 
 def graded_rows(rows: Sequence[Mapping[str, object]], *, top1: bool = False) -> list[dict[str, object]]:
     return [{**row, "correct": row["predicted_winner"] == row["outcome"]["actual_winner"]} for row in rows
@@ -338,7 +483,9 @@ def compact_record(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     return {"record": {"W": wins, "L": n - wins, "N": n}, "accuracy": wins / n if n else None}
 
 def side_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    return {side: compact_record([row for row in rows if row["predicted_side"] == side]) for side in ("home", "away")}
+    return {side: compact_record([row for row in rows if row["predicted_side"] == side])["record"] |
+                  {"accuracy": compact_record([row for row in rows if row["predicted_side"] == side])["accuracy"]}
+            for side in ("home", "away")}
 
 def team_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     result = {team: compact_record([row for row in rows if row["predicted_winner"] == team]) for team in sorted({row["predicted_winner"] for row in rows})}
@@ -348,10 +495,85 @@ def team_concentration(rows: Sequence[Mapping[str, object]]) -> dict[str, object
     counts = Counter(row["predicted_winner"] for row in rows); top = counts.most_common(6)
     return {"distinct_teams": len(counts), "top_six": dict(top), "top_six_share": sum(count for _, count in top) / len(rows)}
 
+def chosen_side_edge(row: Mapping[str, object], component: str) -> float:
+    side_sign = 1.0 if row["predicted_side"] == "home" else -1.0
+    return float(row[f"{component}_edge"]) * side_sign
+
+def finite_pairs(xs: Sequence[float], ys: Sequence[float]) -> tuple[list[float], list[float]]:
+    if len(xs) != len(ys) or not xs or any(not math.isfinite(v) for v in (*xs, *ys)):
+        raise ValueError("statistic inputs must be nonempty, paired, and finite")
+    return list(xs), list(ys)
+
+def spearman(xs: Sequence[float], ys: Sequence[float]) -> dict[str, float]:
+    from scipy.stats import spearmanr
+    x, y = finite_pairs(xs, ys)
+    result = spearmanr(x, y)
+    if not math.isfinite(float(result.statistic)) or not math.isfinite(float(result.pvalue)):
+        raise ValueError("nonfinite Spearman result")
+    return {"rho": float(result.statistic), "p": float(result.pvalue)}
+
+def fisher(table: Sequence[Sequence[int]]) -> float:
+    from scipy.stats import fisher_exact
+    if len(table) != 2 or any(len(row) != 2 for row in table):
+        raise ValueError("Fisher table must be 2x2")
+    p = float(fisher_exact(table, alternative="two-sided").pvalue)
+    if not math.isfinite(p):
+        raise ValueError("nonfinite Fisher result")
+    return p
+
+def component_summary(rows: Sequence[Mapping[str, object]], name: str) -> dict[str, object]:
+    wins = [chosen_side_edge(row, name) for row in rows if row["correct"]]
+    losses = [chosen_side_edge(row, name) for row in rows if not row["correct"]]
+    return {"win_mean": statistics.fmean(wins), "loss_mean": statistics.fmean(losses)}
+
+def bullpen_halves(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    ordered = sorted(rows, key=lambda row: (abs(chosen_side_edge(row, "bullpen")), int(row["game_pk"])))
+    if len(ordered) != 100:
+        raise ValueError("bullpen-half diagnostic requires 100 Top 1 rows")
+    return {label: {"W": sum(bool(row["correct"]) for row in part), "N": len(part),
+                    "accuracy": sum(bool(row["correct"]) for row in part) / len(part)}
+            for label, part in (("lower", ordered[:50]), ("upper", ordered[50:]))}
+
 def component_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    return {name: {"win_mean": statistics.fmean(abs(float(row[f"{name}_edge"])) for row in rows if row["correct"]),
-                   "loss_mean": statistics.fmean(abs(float(row[f"{name}_edge"])) for row in rows if not row["correct"])}
-            for name in ("starter", "offense", "bullpen", "schedule")}
+    result = {name: component_summary(rows, name) for name in ("starter", "offense", "bullpen", "schedule")}
+    bullpen_edges = [chosen_side_edge(row, "bullpen") for row in rows]
+    result["bullpen"] |= {
+        "absolute_edge_halves": bullpen_halves(rows),
+        "spearman": spearman(bullpen_edges, [float(bool(row["correct"])) for row in rows]),
+    }
+    return result
+
+def discrimination(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    outcomes = [float(bool(row["correct"])) for row in rows]
+    return {
+        "probability_spearman": spearman([float(row["pick_probability"]) for row in rows], outcomes),
+        "legacy_confidence_spearman": spearman([float(row["confidence"]) for row in rows], outcomes),
+    }
+
+def threshold_results(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    result = {}
+    for label, threshold in (("ge_63", 0.63), ("ge_68", 0.68)):
+        selected = [row for row in rows if float(row["pick_probability"]) >= threshold]
+        wins = sum(bool(row["correct"]) for row in selected)
+        result[label] = {"W": wins, "N": len(selected), "accuracy": wins / len(selected), "post_hoc": True}
+    return result
+
+def rank_comparisons(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    by_date = {date: {int(row["daily_rank"]): bool(row["correct"]) for row in rows if row["official_date"] == date and int(row["daily_rank"]) <= 3}
+               for date in sorted({str(row["official_date"]) for row in rows})}
+    result = []
+    for other in (2, 3):
+        pairs = [(daily[1], daily[other]) for daily in by_date.values()]
+        table = paired_table([x for x, _ in pairs], [y for _, y in pairs])
+        result.append({"rank1_vs": other, "paired": table,
+                       "p": exact_mcnemar(table["model_only"], table["baseline_only"])})
+    return result
+
+def temporal_diagnostic(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    july = [row for row in rows if str(row["official_date"]).startswith("2025-07")]
+    other = [row for row in rows if row not in july]
+    return {"july_vs_other_fisher_p": fisher([[sum(bool(r["correct"]) for r in july), sum(not bool(r["correct"]) for r in july)],
+                                               [sum(bool(r["correct"]) for r in other), sum(not bool(r["correct"]) for r in other)]])}
 
 def quality_diagnostic(rows: Sequence[Mapping[str, object]], card: Mapping[str, object]) -> dict[str, object]:
     completeness = [float(row["overall_completeness"]) for row in rows]
@@ -371,7 +593,7 @@ def evidence_source_records(evidence: V51Evidence) -> list[dict[str, str]]:
     return [{"id": path.replace("/", "-").replace(".", "-"), "path": path, "sha256": sha256_file(evidence.root / path)} for path in paths]
 ```
 
-Use unrounded row values for calculations. Use `scipy.stats.spearmanr` and `scipy.stats.fisher_exact` only behind wrappers that reject missing/nonfinite values and serialize finite floats. Fixed bins are `[0.50,0.54)`, `[0.54,0.58)`, `[0.58,0.63)`, `[0.63,0.68)`, and `[0.68,1.00]`. Every table object includes `population`, `formula`, `exclusions`, and `source_ids`.
+The imported `mlb_backtest.metrics.evaluate` supplies the fixed calibration bins `[0.50,0.54)`, `[0.54,0.58)`, `[0.58,0.63)`, `[0.63,0.68)`, and `[0.68,1.00]` (last bound inclusive), including `N`, mean probability, accuracy, gap, Brier contribution, and ECE. The local `tables` registry attaches population, formula, exclusions, and source IDs to every reader-facing table. All calculations consume unrounded values.
 
 - [ ] **Step 4: Run diagnostics tests and regression metrics tests**
 
@@ -408,7 +630,7 @@ class DiagnosticReportTest(unittest.TestCase):
             self.assertIn("4 대 3", report)
             self.assertIn("추가 예측 우위는 입증되지 않았다", report)
             self.assertIn("실제 T-45 재현성을 입증하지 않는다", report)
-            for forbidden in ("ROI", "CLV", "수익성", "시장 대비 우위"):
+            for forbidden in ("ROI가 양수", "CLV가 양수", "수익성이 입증", "시장 대비 우위가 입증"):
                 self.assertNotIn(forbidden, report)
 
     def test_every_table_has_population_formula_exclusions_and_sources(self):
@@ -426,6 +648,12 @@ Expected: `ERROR` importing `mlb_backtest.diagnostic_report`.
 - [ ] **Step 3: Implement deterministic serialization and complete Korean Markdown**
 
 ```python
+def iter_contract_tables(payload: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    tables = payload.get("tables")
+    if not isinstance(tables, Mapping):
+        raise ValueError("diagnostic tables registry missing")
+    return tuple(tables[name] for name in sorted(tables))
+
 def write_diagnostic_reports(root: Path, output_dir: Path) -> dict[str, str]:
     payload = build_diagnostic(load_v51_evidence(root))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -434,13 +662,60 @@ def write_diagnostic_reports(root: Path, output_dir: Path) -> dict[str, str]:
     json_path.write_bytes(canonical_json_bytes(payload) + b"\n")
     md_path.write_text(render_markdown(payload), encoding="utf-8")
     return {"json_sha256": sha256_file(json_path), "markdown_sha256": sha256_file(md_path)}
-```
 
-`render_markdown` must present, in order: bottom line; metric/population definitions; primary record; exact paired baseline tables; calibration/discrimination; rank; month/side/team concentration; components; data-quality/provenance; three-part leakage audit; decision; and next action. It must label `>=63%` and `>=68%` as post-hoc diagnostics, team cells as small samples, and the 2025 fit as in-sample rather than rolling-origin OOF.
+def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+    escape = lambda value: str(value).replace("|", "\\|")
+    return "\n".join([
+        "| " + " | ".join(map(escape, headers)) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+        *("| " + " | ".join(map(escape, row)) + " |" for row in rows),
+    ])
+
+def render_markdown(d: Mapping[str, object]) -> str:
+    home, season = d["baselines"]["home"], d["baselines"]["season_record"]
+    calibration = markdown_table(
+        ["구간", "N", "평균확률", "실제적중", "gap", "Brier 기여"],
+        [[r["bin"], r["N"], "—" if not r["N"] else f'{r["mean_probability"]:.6f}',
+          "—" if not r["N"] else f'{r["actual_accuracy"]:.6f}',
+          "—" if not r["N"] else f'{r["gap"]:.6f}', f'{r["brier_contribution"]:.10f}']
+         for r in d["calibration"]["bins"]],
+    )
+    components = markdown_table(
+        ["선택측 edge", "승리 평균", "패배 평균"],
+        [[name, f'{d["components"][name]["win_mean"]:.3f}', f'{d["components"][name]["loss_mean"]:.3f}']
+         for name in ("starter", "offense", "bullpen", "schedule")],
+    )
+    baselines = markdown_table(
+        ["비교", "N", "모델", "기준선", "모델만", "기준선만", "McNemar p"],
+        [["홈팀", 100, "67/100", "59/100", 15, 7, f'{home["mcnemar_p"]:.4f}'],
+         ["D-1 시즌승률", 99, "66/99", "65/99", 4, 3, f'{season["mcnemar_p"]:.4f}']],
+    )
+    sections = [
+        "# MLB v5.1 100픽 진단",
+        "## Executive Summary\n\n67승 33패는 고무적이지만 시즌 승률 기준선과 다른 7경기는 4 대 3에 그쳤다. 추가 예측 우위는 입증되지 않았다. 재구성된 최종 참가자는 실제 T-45 재현성을 입증하지 않는다.",
+        "## 지표·모집단·분모 정의\n\n모집단은 2025-05-01~2025-08-12의 봉인된 Daily Top 1 100경기다. Accuracy=W/N; Brier=mean((p-y)^2); Log loss=-mean(y log p+(1-y)log(1-p)); ECE는 고정 5개 구간의 N가중 절대 gap이다. 짝지은 delta는 양쪽 예측이 모두 정의된 경기만 분모로 쓰며 시즌승률 tie 1건을 제외해 N=99, 시장 비교는 N=0이다.",
+        f'## 1차 결과\n\n67승 33패, N=100, 적중률 67.00%, Wilson 95% {100*d["primary"]["wilson_95"][0]:.4f}%–{100*d["primary"]["wilson_95"][1]:.4f}%. Brier {d["primary"]["brier"]:.10f}, Log loss {d["primary"]["log_loss"]:.10f}, ECE {d["calibration"]["ece"]:.10f}, 최대 연패 {d["primary"]["max_losing_streak"]}.',
+        "## 짝지은 기준선\n\n" + baselines + "\n\n시장 N=0이므로 시장 우위나 베팅 성과를 평가하지 않는다.",
+        "## 확률 보정과 판별\n\n" + calibration + f'\n\n확률–결과 Spearman ρ={d["discrimination"]["probability_spearman"]["rho"]:.4f}, p={d["discrimination"]["probability_spearman"]["p"]:.3f}. ≥63%와 ≥68%는 사후 진단이며 새 컷이 아니다.',
+        "## 일별 순위\n\nRank 1/2/3은 67/100, 60/100, 59/100이고 Rank 1 대 2/3 exact McNemar p는 0.349/0.291이다.",
+        "## 시간·팀 집중\n\n5월 21/31, 6월 22/30, 7월 14/27, 8월 10/12다. 7월 대 나머지 Fisher p=0.0589는 불안정성 증거이지 체제 발견이 아니다. 23개 팀 중 상위 6개가 57%이며 팀별 Wilson 구간은 작은 셀의 불확실성을 보인다.",
+        "## 컴포넌트\n\n" + components + "\n\n불펜 절대 edge 하/상위 절반은 74%/60%, signed 불펜 edge–결과 ρ=-0.151, p=0.135다. 이는 prior-season 가설이지 재가중 근거가 아니다.",
+        "## 데이터 품질·누수\n\nTop 1 전부 INCOMPLETE/High/Toss-up이고 수비·환경은 50, quality 0이다. D-1/target-game 배제는 통과했지만 참가자는 사후 최종 기록이고 공급자 수정 상태도 과거 DB 스냅샷이 아니다. 7,265경기 동일 pool의 α/β는 rolling-origin OOF가 아니다.",
+        "## 권고\n\nv5.2-QD는 예측 구조를 유지하고 데이터 완전성 의미와 OOF 보정만 동결한다. 역사 500과 실제 T-45 prospective ledger를 분리한다.",
+        "## 추가 질문\n\n2018–2021 원천을 동일 정의로 복구할 수 있는가? 참가자 feed가 T-45 freshness 계약을 충족하는가?",
+        "## 한계와 가정\n\n독립 전향 검증, 시장 우위, ROI, CLV, 수익성, actionable betting 또는 v5.2 예측력 개선을 주장하지 않는다.",
+    ]
+    return "\n\n".join(sections) + "\n"
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv); write_diagnostic_reports(args.root.resolve(), args.output); return 0
+```
 
 - [ ] **Step 4: Generate and verify repository reports**
 
-Run: `python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostic_report -v && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_diagnostic_report -v && git diff --check`
 
 Expected: two files generated; all tests `OK`; `git diff --check` exits 0.
 
@@ -496,13 +771,32 @@ def execute_notebook_cells(sources: Sequence[str], globals_dict: dict[str, objec
             "outputs": [{"name": "stdout", "output_type": "stream", "text": stream.getvalue().splitlines(keepends=True)}],
         })
     return cells
+
+def notebook_sources(root: Path) -> tuple[str, ...]:
+    root_literal = repr(str(root.resolve()))
+    return (
+        "from pathlib import Path\nfrom mlb_backtest.diagnostics import load_v51_evidence, build_diagnostic, canonical_json_bytes, sha256_file\nimport json\nROOT = Path(" + root_literal + ")\nrecomputed = build_diagnostic(load_v51_evidence(ROOT))\nsaved_path = ROOT / 'reports/v5_1_bt/diagnostic_100.json'\nsaved = json.loads(saved_path.read_text())\nassert canonical_json_bytes(recomputed) + b'\\n' == saved_path.read_bytes()\n",
+        "print(json.dumps({'primary': saved['primary'], 'baselines': saved['baselines']}, ensure_ascii=False, sort_keys=True))\n",
+        "print(json.dumps({'calibration': saved['calibration'], 'rank': saved['rank'], 'monthly': saved['monthly']}, ensure_ascii=False, sort_keys=True))\n",
+        "print(json.dumps({'components': saved['components'], 'data_quality': saved['data_quality'], 'leakage': saved['leakage']}, ensure_ascii=False, sort_keys=True))\n",
+        "print(json.dumps({'diagnostic_sha256': sha256_file(saved_path), 'primary': saved['primary']['record'], 'recomputed_from_sealed_inputs': True}, sort_keys=True))\n",
+    )
+
+def write_executed_notebook(root: Path, output: Path) -> None:
+    cells = execute_notebook_cells(notebook_sources(root), {"__name__": "__diagnostic_notebook__"})
+    notebook = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+               "language_info": {"name": "python", "version": "3"}}, "nbformat": 4, "nbformat_minor": 5}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".ipynb.tmp")
+    temporary.write_bytes(canonical_json_bytes(notebook) + b"\n")
+    temporary.replace(output)
 ```
 
-The first fixed cell imports `load_v51_evidence`, `build_diagnostic`, and `canonical_json_bytes`; recomputes the complete diagnostic from the sealed inputs with `build_diagnostic(load_v51_evidence(ROOT))`; loads `diagnostic_100.json`; and asserts byte equality between `canonical_json_bytes(recomputed) + b"\n"` and the saved JSON. Later cells print primary/baseline results, calibration/rank/month/component views, and data-quality/leakage conclusions. The final cell prints one JSON line containing the saved diagnostic SHA-256, primary record, and `"recomputed_from_sealed_inputs": true`. On cell failure, propagate the exception and do not replace the prior notebook.
+`analysis/v5_1_bt/build_diagnostic_notebook.py` is exactly `from pathlib import Path; from mlb_backtest.notebook_artifact import write_executed_notebook; ROOT=Path(__file__).resolve().parents[2]; write_executed_notebook(ROOT, ROOT/'analysis/v5_1_bt/diagnostic_100.ipynb')`. Because the temporary replacement occurs only after all cells execute, a cell exception preserves any prior notebook.
 
 - [ ] **Step 4: Generate and validate the executed notebook**
 
-Run: `python3 analysis/v5_1_bt/build_diagnostic_notebook.py && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_notebook_artifact -v && ruff check mlb_backtest/notebook_artifact.py analysis/v5_1_bt/build_diagnostic_notebook.py tests/test_notebook_artifact.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 analysis/v5_1_bt/build_diagnostic_notebook.py && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_notebook_artifact -v && ruff check mlb_backtest/notebook_artifact.py analysis/v5_1_bt/build_diagnostic_notebook.py tests/test_notebook_artifact.py`
 
 Expected: notebook is written atomically; test is `OK`; Ruff exits 0.
 
@@ -562,7 +856,21 @@ Expected: `ERROR` importing `mlb_backtest.report_artifact`.
 
 ```python
 GENERATED_AT = "2026-07-12T00:00:00Z"
-REPORT_SOURCE = {"id": "diagnostic-json", "label": "Canonical v5.1 diagnostic", "path": "reports/v5_1_bt/diagnostic_100.json"}
+REPORT_SOURCE = {
+    "id": "diagnostic-json",
+    "label": "Canonical v5.1 diagnostic",
+    "path": "reports/v5_1_bt/diagnostic_100.json",
+    "query": {
+        "engine": "python-stdlib-scipy",
+        "id": "v5.1-BT-diagnostic-100",
+        "description": "Sealed Daily Top 1 diagnostic derived from audited v5.1 files.",
+        "language": "python",
+        "executed_at": GENERATED_AT,
+        "tables_used": ["data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl", "data/v5_1_bt/outcomes/baseline.json"],
+        "filters": ["top1=Yes", "outcome.status=Final", "official_date 2025-05-01 through 2025-08-12", "season-record tie excluded only from paired season denominator"],
+        "metric_definitions": ["Accuracy=W/N", "Brier=mean((pick_probability-correct)^2)", "Log loss=-mean(y log p+(1-y) log(1-p))", "ECE=sum_bin(N_bin/N)*abs(mean_probability-accuracy)", "chosen-side edge=(home-away edge)*(+1 home prediction; -1 away prediction)"],
+    },
+}
 
 def markdown_block(block_id: str, body: str, *, sourced: bool = False) -> dict[str, object]:
     block: dict[str, object] = {"id": block_id, "type": "markdown", "body": body}
@@ -584,6 +892,7 @@ def build_report_artifact(diagnostic: Mapping[str, object]) -> dict[str, object]
     blocks = [
         markdown_block("title", "# MLB v5.1 100픽 진단"),
         markdown_block("executive-summary", executive_summary_body(diagnostic), sourced=True),
+        markdown_block("definitions", definitions_body(), sourced=True),
         markdown_block("baseline-finding", baseline_body(diagnostic), sourced=True),
         {"id": "paired-baselines-block", "type": "chart", "chartId": "paired-baselines"},
         {"id": "paired-baseline-table-block", "type": "table", "tableId": "paired-baseline-table"},
@@ -633,6 +942,9 @@ def team_rows(d: Mapping[str, object]) -> list[dict[str, object]]:
 def executive_summary_body(d: Mapping[str, object]) -> str:
     return "## Executive Summary\n\n- **67%는 가능성 신호입니다.** 100픽에서 67승 33패였습니다.\n- **추가 우위는 입증되지 않았습니다.** 시즌 승률 기준선과 다른 7경기에서 4 대 3이었습니다.\n- **확률과 재현성은 미검증입니다.** 비단조 보정과 사후 참가자 재구성 한계가 남습니다."
 
+def definitions_body() -> str:
+    return "## 지표·모집단·분모 정의\n\n모집단은 봉인된 Daily Top 1 100경기입니다. Accuracy=W/N, Brier=mean((p-y)^2), Log loss=-mean(y log p+(1-y)log(1-p)), ECE는 고정 구간 N가중 절대 gap입니다. 홈 비교 N=100, 시즌 승률 비교는 tie 1건 제외 N=99, 시장 비교 N=0입니다."
+
 def baseline_body(d: Mapping[str, object]) -> str:
     return "## 67% 대부분은 강팀 선택과 겹칩니다\n\n홈 기준선 대비 차이는 +8.00%p이지만 p=0.1338이고, D-1 시즌 승률 기준선 대비 차이는 +1.0101%p이며 p=1.0입니다. 따라서 독립적인 추가 예측 가치는 확립되지 않았습니다."
 
@@ -658,27 +970,63 @@ def caveats_body(d: Mapping[str, object]) -> str:
     return "## Caveats and Assumptions\n\n시장 N=0이므로 시장 엣지나 베팅 성과를 평가하지 않습니다. 2025는 개발 진단 표본이며 향후 역사 500은 강건성 시험이지 전향 확인이 아닙니다."
 
 def exact_chart_specs() -> list[dict[str, object]]:
-    def chart(chart_id: str, title: str, dataset: str, x: str, series: tuple[tuple[str, str], ...]) -> dict[str, object]:
-        return {"id": chart_id, "title": title, "type": "bar", "dataset": dataset, "sourceId": "diagnostic-json", "layout": "full",
-                "encodings": {"x": {"field": x, "type": "nominal"}},
-                "series": [{"field": field, "label": label} for field, label in series], "valueFormat": "percent"}
+    def chart(chart_id: str, title: str, dataset: str, x: str, y_fields: tuple[str, ...], value_format: str) -> dict[str, object]:
+        return {"id": chart_id, "title": title, "type": "bar", "dataset": dataset,
+                "sourceId": "diagnostic-json", "layout": "full", "valueFormat": value_format,
+                "encodings": {"x": {"field": x, "type": "nominal"},
+                              "y": {"fields": list(y_fields), "type": "quantitative"},
+                              "tooltip": [{"field": "N", "type": "quantitative"}]}}
     return [
-        chart("paired-baselines", "동일 경기 기준선 비교", "baseline_pairs", "comparison", (("model_accuracy", "모델"), ("baseline_accuracy", "기준선"))),
-        chart("calibration", "예측 확률과 실제 적중률", "calibration_bins", "bin", (("mean_probability", "평균 예측 확률"), ("actual_accuracy", "실제 적중률"))),
-        chart("monthly", "월별 Top 1 적중률", "monthly", "month", (("accuracy", "적중률"),)),
-        chart("components", "승패별 선택 측 컴포넌트 엣지", "component_edges", "component", (("wins_mean", "승리"), ("losses_mean", "패배"))),
+        chart("paired-baselines", "동일 경기 기준선 비교", "baseline_pairs", "comparison", ("model_accuracy", "baseline_accuracy"), "percent"),
+        chart("calibration", "예측 확률과 실제 적중률", "calibration_bins", "bin", ("mean_probability", "actual_accuracy"), "percent"),
+        chart("monthly", "월별 Top 1 적중률", "monthly", "month", ("accuracy",), "percent"),
+        chart("components", "승패별 선택 측 컴포넌트 엣지", "component_edges", "component", ("wins_mean", "losses_mean"), "number"),
     ]
 
 def exact_table_specs() -> list[dict[str, object]]:
     return [
         {"id": "paired-baseline-table", "title": "짝지은 기준선 검정", "dataset": "paired_table", "sourceId": "diagnostic-json", "layout": "full", "density": "spacious",
          "defaultSort": {"field": "N", "direction": "desc"}, "columns": [{"field": f, "label": label} for f, label in (("comparison", "비교"), ("N", "N"), ("model_only", "모델만 정답"), ("baseline_only", "기준선만 정답"), ("delta", "차이"), ("mcnemar_p", "McNemar p"))]},
-        {"id": "team-table", "title": "선택 팀별 결과", "dataset": "teams", "sourceId": "diagnostic-json", "layout": "full", "density": "dense",
+        {"id": "team-table", "title": "선택 팀별 결과", "dataset": "teams", "sourceId": "diagnostic-json", "layout": "full", "density": "comfortable",
          "defaultSort": {"field": "N", "direction": "desc"}, "columns": [{"field": f, "label": label} for f, label in (("team", "팀"), ("W", "승"), ("L", "패"), ("N", "N"), ("accuracy", "적중률"), ("wilson_low", "Wilson 하한"), ("wilson_high", "Wilson 상한"))]},
     ]
+
+def build_chart_map() -> dict[str, object]:
+    claims = {"paired-baselines": "season-record incremental delta is negligible", "calibration": "accuracy is not monotonic by probability bin",
+              "monthly": "July is weaker and indicates instability", "components": "component differences are hypotheses, not retuning evidence"}
+    return {chart["id"]: {"question": chart["title"], "takeaway": claims[chart["id"]], "family": "grouped_bar" if len(chart["encodings"]["y"]["fields"]) > 1 else "bar",
+                                 "row_sufficiency": chart["dataset"], "encodings": chart["encodings"], "palette_policy": "shared categorical palette",
+                                 "denominator_context": "N is exposed in tooltip/dataset", "source_id": chart["sourceId"],
+                                 "adjacent_narrative_block": True, "footprint": "full-width responsive"}
+            for chart in exact_chart_specs()}
+
+def write_report_artifact(diagnostic_path: Path, artifact_path: Path, chart_map_path: Path) -> None:
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8")); artifact = build_report_artifact(diagnostic)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True); chart_map_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_bytes(canonical_json_bytes(artifact) + b"\n"); chart_map_path.write_bytes(canonical_json_bytes(build_chart_map()) + b"\n")
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(); parser.add_argument("--diagnostic", type=Path, required=True); parser.add_argument("--artifact", type=Path, required=True); parser.add_argument("--chart-map", type=Path, required=True)
+    args = parser.parse_args(argv); write_report_artifact(args.diagnostic, args.artifact, args.chart_map); return 0
 ```
 
-`exact_chart_specs()` returns four full-width native `bar` charts with `id/title/type/dataset/sourceId/layout/encodings`: paired/calibration/components use category `x` plus quantitative `y` fields and explicit `series`; monthly uses `month` x and `accuracy` y. `exact_table_specs()` returns the paired and team tables with `id/title/dataset/sourceId/layout/density/defaultSort/columns`. The tests assert exact equality to these definitions, including every encoding field, table column, and default sort. The visible blocks above are the exact reading order, so every visualization has adjacent interpretation.
+Add these literal tests; they are pinned to the installed `0.2.8-13ceeea1f599` validator contract and prevent regression to rejected legacy shapes:
+
+```python
+charts = artifact["manifest"]["charts"]
+self.assertFalse(any("series" in chart or "xField" in chart for chart in charts))
+self.assertTrue(all("field" in chart["encodings"]["x"] for chart in charts))
+self.assertTrue(all(bool(chart["encodings"]["y"].get("field") or chart["encodings"]["y"].get("fields")) for chart in charts))
+self.assertEqual(next(c for c in charts if c["id"] == "components")["valueFormat"], "number")
+self.assertTrue(all(table["density"] in {"compact", "comfortable", "spacious"} for table in artifact["manifest"]["tables"]))
+blocks = artifact["manifest"]["blocks"]
+self.assertEqual([blocks[1]["id"], blocks[2]["id"]], ["executive-summary", "definitions"])
+self.assertIn("모집단", blocks[2]["body"])
+self.assertIn("분모", blocks[2]["body"])
+```
+
+The six snapshot datasets contain only JSON scalar values. `component_edges` stores raw score-point edges (not proportions), with `wins_mean/losses_mean` numeric, `wins_N=67`, and `losses_N=33`. Each chart is immediately preceded by its finding Markdown block; each table follows the finding it substantiates.
 
 Create `scripts/validate_report_artifact.mjs` with this complete validator wrapper:
 
@@ -700,7 +1048,7 @@ process.stdout.write(`${JSON.stringify({ok: true, surface: result.surface})}\n`)
 Run from the repository first:
 
 ```bash
-python3 -m mlb_backtest.report_artifact \
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.report_artifact \
   --diagnostic reports/v5_1_bt/diagnostic_100.json \
   --artifact reports/v5_1_bt/diagnostic_100_artifact.json \
   --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
@@ -740,8 +1088,9 @@ class V52ConfigTest(unittest.TestCase):
         self.assertEqual(config.probability_clip, (0.10, 0.90))
         self.assertNotIn("normalization", config.raw)
         self.assertNotIn("slot_weights", config.raw)
-        self.assertNotIn("alpha", canonical_json(config.raw))
-        self.assertNotIn("beta", canonical_json(config.raw))
+        serialized = canonical_json_bytes(config.raw).decode("utf-8")
+        self.assertNotIn('"alpha"', serialized)
+        self.assertNotIn('"beta"', serialized)
 
     def test_completeness_uncertainty_and_tier_boundaries(self):
         qualities = {"starter": 1, "offense": 1, "bullpen": 1, "environment": 0, "defense": 0, "schedule": 1}
@@ -781,9 +1130,36 @@ class V52ConfigTest(unittest.TestCase):
             mutation(changed)
             with self.assertRaisesRegex(ValueError, "keys"):
                 parse_v52_config(changed)
-```
 
-`test_all_tier_boundaries_and_isolation` iterates the literal cases `[(.70,9.0,"Low",False,"S"),(.68,8.99,"Medium",False,"A"),(.63,8.5,"Medium",False,"A"),(.58,8.0,"Medium",False,"B"),(.54,8.0,"Medium",False,"Lean"),(.539999,10,"Low",False,"Toss-up"),(.90,7.999,"High",False,"Toss-up"),(.90,10,"Low",True,"UNRATED")]`; asserts clipped qualities `-1→0` and `2→1`; asserts agreement and `legacy_selection_quality_score` mutations do not change completeness/tier/rank; asserts environment/defense absence yields score 50, quality 0, and `ENV_NEUTRAL_NO_ASOF_SOURCE`/`DEF_NEUTRAL_NO_ASOF_SOURCE`; asserts exact ranking key tuple `(-pick_probability,-data_completeness_score,-starter_edge_abs,lock_basis_start_utc,game_pk)`; and asserts `p_home==0.5` returns no official rank plus `NO_DIRECTION_AT_50`. `test_reason_code_matrix_is_exact` compares the config rows to every reason code in Section 4.4 and rejects deletion/reordering of append-only critical reasons.
+    def test_all_tier_boundaries_and_isolation(self):
+        cases = [(.70, 9.0, "Low", False, "S"), (.68, 8.99, "Medium", False, "A"),
+                 (.63, 8.5, "Medium", False, "A"), (.58, 8.0, "Medium", False, "B"),
+                 (.54, 8.0, "Medium", False, "Lean"), (.539999, 10, "Low", False, "Toss-up"),
+                 (.90, 7.999, "High", False, "Toss-up"), (.90, 10, "Low", True, "UNRATED")]
+        for probability, completeness, uncertainty, critical, expected in cases:
+            self.assertEqual(classify_v52(probability, completeness, uncertainty, critical=critical), expected)
+        clipped = {"starter": -1, "offense": 2, "bullpen": 1, "environment": 1, "defense": 1, "schedule": 1}
+        self.assertEqual(data_completeness_score(clipped), 6.5)
+        key = ranking_key(.63, 8.5, 4.0, "2025-05-01T17:00:00Z", 1)
+        self.assertEqual(key, (-.63, -8.5, -4.0, "2025-05-01T17:00:00Z", 1))
+        self.assertEqual(direction_from_p_home(.5), (None, .5, "NO_DIRECTION_AT_50"))
+        self.assertEqual(optional_neutral("environment"), (50.0, 0.0, "ENV_NEUTRAL_NO_ASOF_SOURCE"))
+        self.assertEqual(optional_neutral("defense"), (50.0, 0.0, "DEF_NEUTRAL_NO_ASOF_SOURCE"))
+
+    def test_schema_mirrors_parser_constants_and_frozen_values(self):
+        raw, schema = json.loads(V52_CONFIG.read_text()), json.loads(V52_SCHEMA.read_text())
+        self.assertEqual(schema["const"], raw)
+        self.assertEqual(set(schema["required"]), V52_REQUIRED_KEYS)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(parse_v52_config(copy.deepcopy(schema["const"])).raw, parse_v52_config(raw).raw)
+
+    def test_change_contract_is_exact_and_hash_bound(self):
+        contract = parse_change_contract(json.loads(CHANGE_CONTRACT.read_text()))
+        self.assertEqual(contract["unchanged"], CHANGE_UNCHANGED)
+        self.assertEqual(contract["changed"], CHANGE_CHANGED)
+        self.assertEqual(contract["forbidden_from_2025_diagnostic"], CHANGE_FORBIDDEN)
+        self.assertEqual(contract["config_sha256"], sha256_file(V52_CONFIG))
+```
 
 - [ ] **Step 2: Run the protocol tests and verify missing contracts**
 
@@ -795,6 +1171,34 @@ Expected: `ERROR` because `protocols.py` and config are absent.
 
 ```python
 V52_REQUIRED_KEYS = frozenset({"schema_version", "model_version", "protocol", "component_weights", "internal_metrics", "shrinkage_constants", "probability_clip", "score_rules", "ranking", "completeness", "uncertainty", "tier_cascade", "eligibility", "provenance", "change_control"})
+COMPONENT_WEIGHTS = MappingProxyType({"starter": .35, "offense": .25, "bullpen": .20, "environment": .10, "defense": .05, "schedule": .05})
+EXPECTED_DIRECTIONS = {"starter": {"season_xwoba": -1, "k_minus_bb": 1, "fip": -1, "last5_xwoba": -1, "expected_ip": 1, "velo_change": 1},
+                       "offense": {"platoon_xwoba": 1, "last14_xwoba": 1, "bb_minus_k": 1, "barrel_rate": 1, "iso": 1},
+                       "bullpen": {"season_xwoba": -1, "k_minus_bb": 1, "last14_xwoba": -1, "availability": 1}}
+INTERNAL_WEIGHTS = MappingProxyType({
+    "starter": MappingProxyType({"season_xwoba": .35, "k_minus_bb": .20, "fip": .15, "last5_xwoba": .15, "expected_ip": .10, "velo_change": .05}),
+    "offense": MappingProxyType({"platoon_xwoba": .50, "last14_xwoba": .20, "bb_minus_k": .15, "barrel_rate": .10, "iso": .05}),
+    "bullpen": MappingProxyType({"season_xwoba": .35, "k_minus_bb": .20, "last14_xwoba": .15, "availability": .30}),
+    "environment": MappingProxyType({"park": .60, "weather_roof": .40}),
+    "defense": MappingProxyType({"oaa": .55, "framing": .30, "blocking_throwing": .15}),
+})
+SCHEDULE_ADJUSTMENTS = MappingProxyType({"rest_previous_date": 12, "three_days_same_home_city": 5, "previous_game_10_plus_innings": -12,
+                                         "travel_1000_plus_no_rest": -10, "cross_2_plus_timezones_no_rest": -6, "scheduled_doubleheader": -8})
+INTERNAL_METRIC_LITERALS = {
+    component: {metric: {"weight": weight, "direction": EXPECTED_DIRECTIONS[component][metric]}
+                for metric, weight in INTERNAL_WEIGHTS[component].items()}
+    for component in ("starter", "offense", "bullpen")
+}
+INTERNAL_METRIC_LITERALS.update({
+    "environment": {metric: {"weight": weight, "direction": 1} for metric, weight in INTERNAL_WEIGHTS["environment"].items()},
+    "defense": {metric: {"weight": weight, "direction": 1} for metric, weight in INTERNAL_WEIGHTS["defense"].items()},
+    "schedule": {"start_score": 50, "clip": [0, 100], "adjustments": dict(SCHEDULE_ADJUSTMENTS), "same_date_target_events_forbidden": True},
+})
+SHRINKAGE_CONSTANTS = MappingProxyType({"starter": 150, "hitter_split": 150, "recent_form": 100, "bullpen": 300, "defense_catcher": 500})
+V52_RANKING = ("pick_probability_desc", "data_completeness_score_desc", "absolute_starter_edge_desc", "lock_basis_start_utc_asc", "gamePk_asc")
+CHANGE_UNCHANGED = ("component_weights", "internal_metric_weights_and_signs", "shrinkage_constants", "clipping_and_neutralization", "missing_weight_no_redistribution", "score_construction", "probability_clip", "predicted_side_rule", "ranking_order", "slot_opportunity_method")
+CHANGE_CHANGED = ("rolling_origin_oof_probability_calibration", "confidence_renamed_data_completeness", "explicit_participant_provenance", "tier_unrated_integrity_gate", "historical_and_prospective_sample_separation")
+CHANGE_FORBIDDEN = ("bullpen_weight_or_sign", "season_record_feature", "probability_cutoff", "home_adjustment", "any_predictive_change_selected_from_2025")
 WEIGHT_KEYS = frozenset({"starter", "offense", "bullpen", "environment", "defense", "schedule"})
 SHRINKAGE_KEYS = frozenset({"starter", "hitter_split", "recent_form", "bullpen", "defense_catcher"})
 SCORE_RULE_KEYS = frozenset({"neutral_score", "missing_weight_redistribution", "probability_transform", "predicted_side"})
@@ -804,10 +1208,6 @@ PROVENANCE_KEYS = frozenset({"historical", "prospective_official", "prospective_
 CHANGE_CONTROL_KEYS = frozenset({"reset_fields", "presentation_only_fields", "forbidden_2025_derived_changes"})
 TIER_ROW_KEYS = frozenset({"tier", "critical", "uncertainty", "min_probability", "min_completeness"})
 ELIGIBILITY_ROW_KEYS = frozenset({"event", "historical", "prospective", "disposition", "reason_code", "run_invalid"})
-EXPECTED_DIRECTIONS = {"starter": {"season_xwoba": -1, "k_minus_bb": 1, "fip": -1, "last5_xwoba": -1, "expected_ip": 1, "velo_change": 1},
-                       "offense": {"platoon_xwoba": 1, "last14_xwoba": 1, "bb_minus_k": 1, "barrel_rate": 1, "iso": 1},
-                       "bullpen": {"season_xwoba": -1, "k_minus_bb": 1, "last14_xwoba": -1, "availability": 1}}
-
 def require_exact_keys(value: object, expected: frozenset[str], path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{path} must be an object")
@@ -824,17 +1224,9 @@ def deep_freeze(value: object) -> object:
     return value
 
 def validate_internal_metrics(value: object) -> None:
-    obj = require_exact_keys(value, frozenset(EXPECTED_DIRECTIONS), "internal_metrics")
-    from mlb_backtest.features.starter import WEIGHTS as starter_weights
-    from mlb_backtest.features.offense import WEIGHTS as offense_weights
-    from mlb_backtest.features.bullpen import WEIGHTS as bullpen_weights
-    expected_weights = {"starter": dict(starter_weights), "offense": dict(offense_weights), "bullpen": dict(bullpen_weights)}
-    for component in expected_weights:
-        metrics = require_exact_keys(obj[component], frozenset(expected_weights[component]), f"internal_metrics.{component}")
-        for name, expected_weight in expected_weights[component].items():
-            row = require_exact_keys(metrics[name], frozenset({"weight", "direction"}), f"internal_metrics.{component}.{name}")
-            if row != {"weight": expected_weight, "direction": EXPECTED_DIRECTIONS[component][name]}:
-                raise ValueError(f"internal metric differs: {component}.{name}")
+    obj = require_exact_keys(value, frozenset(INTERNAL_METRIC_LITERALS), "internal_metrics")
+    if obj != INTERNAL_METRIC_LITERALS:
+        raise ValueError("internal metric weights/signs/schedule adjustments differ")
 
 def validate_tier_rows(value: object) -> None:
     if not isinstance(value, list) or [row.get("tier") for row in value if isinstance(row, Mapping)] != ["UNRATED", "Toss-up", "S", "A", "B", "Lean", "Toss-up"]:
@@ -861,6 +1253,30 @@ class V52Config:
     ranking: tuple[str, ...]
     raw: Mapping[str, object]
 
+def expected_v52_config() -> dict[str, object]:
+    tier_rows = [
+        {"tier": "UNRATED", "critical": True, "uncertainty": None, "min_probability": None, "min_completeness": None},
+        {"tier": "Toss-up", "critical": False, "uncertainty": "High_or_probability_below_.54_or_completeness_below_8", "min_probability": None, "min_completeness": None},
+        {"tier": "S", "critical": False, "uncertainty": "not_High", "min_probability": .68, "min_completeness": 9.0},
+        {"tier": "A", "critical": False, "uncertainty": "not_High", "min_probability": .63, "min_completeness": 8.5},
+        {"tier": "B", "critical": False, "uncertainty": "not_High", "min_probability": .58, "min_completeness": 8.0},
+        {"tier": "Lean", "critical": False, "uncertainty": "not_High", "min_probability": .54, "min_completeness": 8.0},
+        {"tier": "Toss-up", "critical": False, "uncertainty": "fallback", "min_probability": None, "min_completeness": None},
+    ]
+    eligibility = [{"event": event, "historical": "apply_if_relevant", "prospective": "apply_if_relevant",
+                    "disposition": disposition, "reason_code": reason, "run_invalid": disposition == "RUN_INVALID"}
+                   for event, (disposition, reason) in ELIGIBILITY_DISPOSITIONS.items()]
+    return {"schema_version": 1, "model_version": "v5.2-QD", "protocol": "Quality-and-Data Discipline",
+            "component_weights": dict(COMPONENT_WEIGHTS), "internal_metrics": INTERNAL_METRIC_LITERALS,
+            "shrinkage_constants": dict(SHRINKAGE_CONSTANTS), "probability_clip": [.10, .90],
+            "score_rules": {"neutral_score": 50, "missing_weight_redistribution": False, "probability_transform": "sigmoid(alpha+beta*D/10)", "predicted_side": "home if p_home>.5; away if p_home<.5; none if equal"},
+            "ranking": list(V52_RANKING),
+            "completeness": {"formula": "10*(.35*starter+.25*offense+.20*bullpen+.10*environment+.05*defense+.05*schedule)", "quality_clip": [0, 1], "legacy_audit_field": "legacy_selection_quality_score", "agreement_affects_score": False},
+            "uncertainty": {"high": ["critical_integrity_failure", "completeness_below_7.5"], "medium": ["7.5<=completeness<9.0", "starter_prior_career_bf_below_150", "unresolved_pregame_context"], "low": ["completeness>=9.0", "no_medium_or_high_condition"]},
+            "tier_cascade": tier_rows, "eligibility": eligibility,
+            "provenance": {"historical": "RECONSTRUCTED_FINAL_PARTICIPANTS", "prospective_official": "TIMESTAMP_VERIFIED_T45", "prospective_shadow": "TIMESTAMP_PARTIAL_T45"},
+            "change_control": {"reset_fields": ["predictive_weight", "internal_weight", "sign", "shrinkage", "probability_transform", "ranking", "eligibility", "source_definition", "missing_value_behavior", "tier_threshold"], "presentation_only_fields": ["copy", "layout", "formatting"], "forbidden_2025_derived_changes": list(CHANGE_FORBIDDEN)}}
+
 def parse_v52_config(raw: object) -> V52Config:
     obj = require_exact_keys(raw, V52_REQUIRED_KEYS, "config")
     weights = require_exact_keys(obj["component_weights"], WEIGHT_KEYS, "component_weights")
@@ -882,6 +1298,8 @@ def parse_v52_config(raw: object) -> V52Config:
     forbidden = {"normalization", "slot_weights", "alpha", "beta", "fitted_model_cards"}
     if forbidden & set(obj):
         raise ValueError("unfitted config contains fitted values")
+    if obj != expected_v52_config():
+        raise ValueError("config differs from frozen values")
     return V52Config("v5.2-QD", deep_freeze(weights), deep_freeze(shrinkage), (0.10, 0.90), V52_RANKING, deep_freeze(obj))
 
 def load_v52_config(path: Path) -> V52Config:
@@ -890,6 +1308,38 @@ def load_v52_config(path: Path) -> V52Config:
 def data_completeness_score(qualities: Mapping[str, float]) -> float:
     clipped = {name: min(1.0, max(0.0, float(qualities[name]))) for name in COMPONENT_WEIGHTS}
     return 10.0 * math.fsum(COMPONENT_WEIGHTS[name] * clipped[name] for name in COMPONENT_WEIGHTS)
+
+def ranking_key(probability: float, completeness: float, starter_edge_abs: float,
+                lock_basis_start_utc: str, game_pk: int) -> tuple[float, float, float, str, int]:
+    return (-probability, -completeness, -starter_edge_abs, lock_basis_start_utc, game_pk)
+
+def direction_from_p_home(p_home: float) -> tuple[str | None, float, str | None]:
+    if p_home == .5:
+        return None, .5, "NO_DIRECTION_AT_50"
+    return ("home" if p_home > .5 else "away"), max(p_home, 1 - p_home), None
+
+def optional_neutral(component: str) -> tuple[float, float, str]:
+    codes = {"environment": "ENV_NEUTRAL_NO_ASOF_SOURCE", "defense": "DEF_NEUTRAL_NO_ASOF_SOURCE"}
+    if component not in codes:
+        raise ValueError("only environment and defense are optional neutral components")
+    return 50.0, 0.0, codes[component]
+
+ELIGIBILITY_DISPOSITIONS = MappingProxyType({
+    "missing_game_id": ("EXCLUDE", "MISSING_GAME_ID"), "invalid_competition": ("EXCLUDE", "INVALID_COMPETITION"),
+    "missing_teams": ("EXCLUDE", "MISSING_TEAMS"), "missing_start": ("EXCLUDE", "MISSING_START_TIME"),
+    "missing_venue": ("EXCLUDE", "MISSING_VENUE"), "missing_historical_participants": ("EXCLUDE", "MISSING_RECONSTRUCTED_PARTICIPANTS"),
+    "model_card_or_source_invalid": ("RUN_INVALID", "MODEL_CARD_OR_SOURCE_INVALID"),
+    "partial_t45": ("SHADOW_UNRATED", "PARTIAL_T45_PARTICIPANTS"), "provenance_mismatch": ("EXCLUDE", "PROVENANCE_MISMATCH"),
+    "missing_required_feature": ("EXCLUDE", "MISSING_REQUIRED_FEATURE_INPUT"), "as_of_violation": ("RUN_INVALID", "AS_OF_VIOLATION"),
+    "environment_no_asof": ("RETAIN_NEUTRAL", "ENV_NEUTRAL_NO_ASOF_SOURCE"), "defense_no_asof": ("RETAIN_NEUTRAL", "DEF_NEUTRAL_NO_ASOF_SOURCE"),
+    "prelock_not_scheduled": ("EXCLUDE", "PRELOCK_NOT_SCHEDULED"),
+})
+
+def eligibility_disposition(event: str) -> tuple[str, str]:
+    try:
+        return ELIGIBILITY_DISPOSITIONS[event]
+    except KeyError as exc:
+        raise ValueError(f"unknown eligibility event: {event}") from exc
 
 def classify_v52(probability: float, completeness: float, uncertainty: str, *, critical: bool) -> str:
     if critical:
@@ -905,9 +1355,23 @@ def classify_v52(probability: float, completeness: float, uncertainty: str, *, c
     if probability >= 0.54:
         return "Lean"
     return "Toss-up"
+
+CHANGE_KEYS = frozenset({"schema_version", "model_version", "unchanged", "changed", "forbidden_from_2025_diagnostic", "config_sha256", "approved_design_commit", "approved_design_blob_sha256"})
+
+def parse_change_contract(raw: object) -> Mapping[str, object]:
+    obj = require_exact_keys(raw, CHANGE_KEYS, "change_contract")
+    expected = {"schema_version": 1, "model_version": "v5.2-QD", "unchanged": list(CHANGE_UNCHANGED),
+                "changed": list(CHANGE_CHANGED), "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
+                "approved_design_commit": "a4aa8d2"}
+    for key, value in expected.items():
+        if obj[key] != value:
+            raise ValueError(f"change_contract.{key} differs")
+    if not all(isinstance(obj[key], str) and len(obj[key]) == 64 for key in ("config_sha256", "approved_design_blob_sha256")):
+        raise ValueError("change contract digests differ")
+    return deep_freeze(obj)
 ```
 
-The config must encode all unchanged internal metric weights/signs, shrinkage, clipping, neutralization, no-redistribution rule, probability bounds, predicted-side rule, and ranking. The change contract must have exact arrays `unchanged`, `changed`, and `forbidden_from_2025_diagnostic`; it records the config SHA-256 and v5.1 design/source digests. The schema uses `additionalProperties: false` at every fixed object level and explicitly forbids fitted-card keys.
+Generate `schemas/v5_2_qd.schema.json` as a documentation mirror with top-level `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","const":<exact config JSON>,"required":<sorted V52_REQUIRED_KEYS>,"properties":<one property per required key>,"additionalProperties":false}`. Tests compare `schema["const"]` byte-for-value to the parser fixture and mutate every nested object/list once to prove the stdlib parser rejects both unknown keys and frozen-value changes; the runtime does not import `jsonschema`.
 
 - [ ] **Step 4: Run schema/config tests and lint**
 
@@ -926,7 +1390,6 @@ git commit -m "feat: freeze unfitted v5.2-QD protocol"
 
 **Files:**
 - Modify: `mlb_backtest/protocols.py`
-- Create: `schemas/v5_2_prospective.schema.json`
 - Create: `schemas/v5_2_run_spec.schema.json`
 - Create: `protocols/v5_2_qd/historical_walkforward_500.json`
 - Modify: `tests/test_protocols.py`
@@ -961,9 +1424,27 @@ class HistoricalRunSpecTest(unittest.TestCase):
         self.assertEqual(set(fold_schema["properties"]), FOLD_REQUIRED_KEYS)
         self.assertFalse(schema["additionalProperties"])
         self.assertFalse(fold_schema["additionalProperties"])
-```
 
-`test_run_contract_literals` asserts `date_queue={"order":"official_date_ascending","start":"2022-opening-day","end":"2024-regular-season-end","exclude":["spring","exhibition","all-star","postseason","2025"]}`, `selection={"eligible_top1_per_date":1,"graded_target":500,"same_date_rank2_replacement":false}`, terminal timezone/deadline `America/New_York/7/23:59:59`, doubleheader ordering `["lock_basis_start_utc","gamePk"]`, date-state precedence `["RUN_INVALID","SYSTEM_MISS","NO_ELIGIBLE_DATE","LOCK_TOP1"]`, and evidence labels `["RUN_INVALID","ROBUSTNESS_NOT_SUPPORTED","ROBUSTNESS_SUPPORTED_NOT_CONFIRMED"]`. It enumerates every terminal mapping and verifies replacement date is strictly after the VOID date. `test_outcome_and_denominator_contract` asserts lock-stage namespaces cannot import outcomes and exact denominators `model/home/brier/log_loss/wilson/streak=500`, `season=N_season`, `market=N_market`.
+    def test_run_contract_literals(self):
+        run = load_run_spec(HISTORICAL_SPEC)
+        self.assertEqual(run.raw["date_queue"], HISTORICAL_DATE_QUEUE)
+        self.assertEqual(run.raw["selection"], HISTORICAL_SELECTION)
+        self.assertEqual(run.raw["terminal_contract"], HISTORICAL_TERMINAL)
+        self.assertEqual(run.raw["date_state_precedence"], ["RUN_INVALID", "SYSTEM_MISS", "NO_ELIGIBLE_DATE", "LOCK_TOP1"])
+        self.assertEqual(run.raw["evidence_labels"], ["RUN_INVALID", "ROBUSTNESS_NOT_SUPPORTED", "ROBUSTNESS_SUPPORTED_NOT_CONFIRMED"])
+        self.assertEqual(run.raw["paired_denominators"], HISTORICAL_DENOMINATORS)
+        self.assertEqual(run.raw["outcome_isolation"], HISTORICAL_OUTCOME_ISOLATION)
+
+    def test_schema_const_and_parser_reject_every_frozen_change(self):
+        raw, schema = json.loads(HISTORICAL_SPEC.read_text()), json.loads(RUN_SCHEMA.read_text())
+        self.assertEqual(schema["const"], raw)
+        changed = copy.deepcopy(raw); changed["selection"]["graded_target"] = 499
+        with self.assertRaisesRegex(ValueError, "historical run differs"):
+            parse_run_spec(changed)
+        changed = copy.deepcopy(raw); changed["folds"][0]["oof_calibration"][0]["normalization_years"] = [2017]
+        with self.assertRaisesRegex(ValueError, "historical run differs"):
+            parse_run_spec(changed)
+```
 
 - [ ] **Step 2: Run historical protocol tests and verify missing RunSpec behavior**
 
@@ -979,6 +1460,34 @@ FOLD_REQUIRED_KEYS = frozenset({"fold_id", "target_year", "target_dates", "norma
 OOF_ROW_KEYS = frozenset({"target_year", "normalization_years"})
 TERMINAL_KEYS = frozenset({"timezone", "deadline_days", "deadline_time", "status_mapping", "doubleheader_order", "replacement_rule", "late_result_rule"})
 NAMESPACE_KEYS = frozenset({"raw", "features", "locked", "outcomes", "reports", "audit"})
+MINIMUM_SOURCE_NAMES = ("mlb_schedule_game_feed", "baseball_savant_statcast", "mlb_stats_pitching", "venue_team_timezone_table", "prior_schedule_history")
+OPTIONAL_SOURCE_NAMES = ("environment", "defense", "catcher", "injury_restriction", "market_odds")
+HISTORICAL_DATE_QUEUE = {"order": "official_date_ascending", "start": "2022-opening-day", "end": "2024-regular-season-end", "exclude": ["spring", "exhibition", "all-star", "postseason", "2025"]}
+HISTORICAL_SELECTION = {"eligible_top1_per_date": 1, "graded_target": 500, "same_date_rank2_replacement": False, "void_replacement": "next_later_regular_season_date_with_newly_graded_top1"}
+HISTORICAL_TERMINAL = {
+    "timezone": "America/New_York", "deadline_days": 7, "deadline_time": "23:59:59",
+    "status_mapping": {"Final_unequal_with_winner": "GRADED", "Completed_Early_unequal_with_winner": "GRADED",
+                       "postlock_canceled_unresolved": "VOID:POSTLOCK_CANCELED", "postlock_postponed_unresolved": "VOID:POSTLOCK_POSTPONED",
+                       "suspended_or_delayed_before_deadline": "PENDING", "pending_at_deadline": "VOID:DEADLINE_UNRESOLVED",
+                       "official_tie": "VOID:TIE", "abandoned": "VOID:ABANDONED", "no_contest": "VOID:NO_CONTEST",
+                       "missing_winner": "VOID:MISSING_WINNER", "equal_terminal_scores": "VOID:EQUAL_TERMINAL_SCORE"},
+    "doubleheader_order": ["lock_basis_start_utc", "gamePk"],
+    "replacement_rule": "strictly_later_date_never_same_date_rank2_never_2025",
+    "late_result_rule": "audit_annotation_only_never_restore_membership",
+}
+HISTORICAL_DENOMINATORS = {"model": 500, "home": 500, "brier": 500, "log_loss": 500, "wilson": 500, "streak": 500, "season": "N_season", "market": "N_market"}
+HISTORICAL_OUTCOME_ISOLATION = {"feature_and_lock_import_outcomes": False, "lock_namespace": "data/v5_2_qd/historical/locked", "outcome_namespace": "data/v5_2_qd/historical/outcomes", "join_after_all_date_locks_sealed": True}
+FOLD_LITERALS = (
+    {"fold_id": "H22", "target_year": 2022, "target_dates": {"start": "2022-04-07", "end": "2022-10-05"},
+     "normalization_years": [2018, 2019, 2020, 2021], "oof_calibration": [{"target_year": 2019, "normalization_years": [2018]}, {"target_year": 2020, "normalization_years": [2018, 2019]}, {"target_year": 2021, "normalization_years": [2018, 2019, 2020]}],
+     "latest_training_date": "2021-12-31", "model_card_path": "models/v5_2_qd/folds/H22/model_card.json", "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT"},
+    {"fold_id": "H23", "target_year": 2023, "target_dates": {"start": "2023-03-30", "end": "2023-10-01"},
+     "normalization_years": [2018, 2019, 2020, 2021, 2022], "oof_calibration": [{"target_year": y, "normalization_years": list(range(2018, y))} for y in range(2019, 2023)],
+     "latest_training_date": "2022-12-31", "model_card_path": "models/v5_2_qd/folds/H23/model_card.json", "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT"},
+    {"fold_id": "H24", "target_year": 2024, "target_dates": {"start": "2024-03-20", "end": "2024-09-30"},
+     "normalization_years": [2018, 2019, 2020, 2021, 2022, 2023], "oof_calibration": [{"target_year": y, "normalization_years": list(range(2018, y))} for y in range(2019, 2024)],
+     "latest_training_date": "2023-12-31", "model_card_path": "models/v5_2_qd/folds/H24/model_card.json", "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT"},
+)
 
 @dataclass(frozen=True)
 class FoldSpec:
@@ -1039,9 +1548,31 @@ def validate_fold(fold: FoldSpec) -> None:
     for target, pool in fold.oof_calibration:
         if any(year >= target for year in pool):
             raise ValueError("OOF normalization contains target or future season")
+
+def expected_historical_run() -> dict[str, object]:
+    return {"schema_version": 1, "run_id": "historical_walkforward_500", "model_version": "v5.2-QD",
+            "label": "Historical Walk-forward Robustness 500", "target_count": 500,
+            "allowed_target_years": [2022, 2023, 2024], "forbidden_target_years": [2025], "folds": list(FOLD_LITERALS),
+            "date_queue": HISTORICAL_DATE_QUEUE, "selection": HISTORICAL_SELECTION, "terminal_contract": HISTORICAL_TERMINAL,
+            "date_state_precedence": ["RUN_INVALID", "SYSTEM_MISS", "NO_ELIGIBLE_DATE", "LOCK_TOP1"],
+            "outcome_isolation": HISTORICAL_OUTCOME_ISOLATION, "paired_denominators": HISTORICAL_DENOMINATORS,
+            "evidence_labels": ["RUN_INVALID", "ROBUSTNESS_NOT_SUPPORTED", "ROBUSTNESS_SUPPORTED_NOT_CONFIRMED"],
+            "source_requirements": {"minimum": list(MINIMUM_SOURCE_NAMES), "optional": list(OPTIONAL_SOURCE_NAMES)},
+            "namespaces": {"raw": "data/v5_2_qd/historical/raw", "features": "data/v5_2_qd/historical/features", "locked": "data/v5_2_qd/historical/locked", "outcomes": "data/v5_2_qd/historical/outcomes", "reports": "reports/v5_2_qd/historical", "audit": "audit/v5_2_qd/historical"},
+            "model_card_status": "UNFITTED_BLOCKED_BY_PREFLIGHT"}
+
+def validate_run(run: RunSpec) -> None:
+    if run.raw != deep_freeze(expected_historical_run()):
+        raise ValueError("historical run differs from frozen values")
+    if tuple(f.target_year for f in run.folds) != run.allowed_target_years:
+        raise ValueError("fold targets differ")
+    if 2025 in run.allowed_target_years or run.forbidden_target_years != (2025,):
+        raise ValueError("2025 is excluded")
+    for fold in run.folds:
+        validate_fold(fold)
 ```
 
-The JSON RunSpec must include every fold row from the approved design; sample/date/VOID rules; outcome-isolation stage paths; exact baseline denominators; integrity/robustness evidence labels; source requirements; output namespaces; and a `model_card_status: "UNFITTED_BLOCKED_BY_PREFLIGHT"` assertion for H22/H23/H24.
+Write `historical_walkforward_500.json` from `expected_historical_run()`. The schema is a documentation mirror with `const` equal to that exact JSON, closed top-level/fold objects, and its required/property keys derived from `RUN_REQUIRED_KEYS`/`FOLD_REQUIRED_KEYS`; no runtime `jsonschema` dependency is introduced.
 
 - [ ] **Step 4: Run the full protocol test module**
 
@@ -1087,10 +1618,42 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(all(step["status"] == "NOT_IMPLEMENTED_PLANNED" for step in report["acquisition_steps"] + report["execution_steps_after_ready"]))
 
     def test_optional_sources_never_fail_minimum_preflight(self):
-        report = build_fixture_preflight(FIXTURE_ROOT / "minimum_complete_optional_absent")
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory))
+            report = build_preflight(root, parse_run_spec(expected_historical_run()))
         self.assertEqual(report["status"], "READY")
-        self.assertEqual(report["optional_sources"]["market"]["status"], "ABSENT_NULL")
+        self.assertEqual(report["optional_sources"]["market_odds"]["status"], "ABSENT_NULL")
         self.assertEqual(report["optional_sources"]["environment"]["status"], "ABSENT_NEUTRAL")
+
+    def test_complete_fixture_is_ready_and_json_serializable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = build_preflight(make_complete_inventory(Path(directory)), parse_run_spec(expected_historical_run()))
+        self.assertEqual(report["status"], "READY")
+        self.assertTrue(report["may_fit_H22"])
+        self.assertEqual(json.loads(json.dumps(report)), report)
+
+    def test_each_integrity_failure_blocks_ready(self):
+        mutations = {
+            "raw_hash": lambda root: (root / first_manifest(root)["raw_path"]).write_bytes(b"changed"),
+            "sidecar_hash": lambda root: (root / first_manifest(root)["sidecar_path"]).write_bytes(b"changed"),
+            "schema": lambda root: rewrite_sidecar(root, {"schema_fields": ["gamePk"]}),
+            "duplicate_game_pk": lambda root: rewrite_sidecar(root, {"game_pks": [1, 1]}),
+            "date_range": lambda root: rewrite_manifest(root, {"query": {"season": 2018, "start_date": "2018-02-01", "end_date": "2018-12-31"}}),
+            "split_parent": lambda root: rewrite_manifest(root, {"parent_logical_query_id": "wrong"}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = make_complete_inventory(Path(directory)); mutate(root)
+                self.assertEqual(build_preflight(root, parse_run_spec(expected_historical_run()))["status"], "BLOCKED_REQUIRED_ACQUISITION")
+
+    def test_scanner_never_uses_network_or_mutates_data_or_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_complete_inventory(Path(directory)); before = protected_inventory(root)
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
+                 patch("http.client.HTTPConnection.request", side_effect=AssertionError("network forbidden")), \
+                 patch("socket.create_connection", side_effect=AssertionError("network forbidden")):
+                self.assertEqual(build_preflight(root, parse_run_spec(expected_historical_run()))["status"], "READY")
+            self.assertEqual(before, protected_inventory(root))
 
     def test_preflight_parser_and_schema_reject_unknown_or_missing_fields(self):
         payload = build_preflight(ROOT, load_run_spec(HISTORICAL_SPEC))
@@ -1102,9 +1665,43 @@ class PreflightTest(unittest.TestCase):
         changed = copy.deepcopy(payload); changed["unknown"] = 1
         with self.assertRaisesRegex(ValueError, "keys"):
             parse_preflight(changed)
-```
 
-Fixture manifests must cover query splitting, duplicate `gamePk`, missing critical schema field, incomplete date range, hash mismatch, and an oversized logical extract split across child manifests with one stable logical query ID.
+def make_complete_inventory(root: Path) -> Path:
+    for namespace in ("data", "audit"):
+        (root / namespace).mkdir(parents=True, exist_ok=True)
+    for year in range(2018, 2025):
+        for source in MINIMUM_SOURCES:
+            logical = parent_logical_query_id(source, year, f"{year}-01-01", f"{year}-12-31")
+            for split_index, (start, end) in enumerate(((f"{year}-01-01", f"{year}-06-30"), (f"{year}-07-01", f"{year}-12-31")), 1):
+                base = root / "inventory" / str(year) / source / f"part-{split_index}"
+                base.parent.mkdir(parents=True, exist_ok=True)
+                raw = base.with_suffix(".raw"); raw.write_bytes(f"{source}:{year}:{split_index}".encode())
+                sidecar = base.with_suffix(".sidecar.json")
+                side_payload = {"schema_version": 1, "schema_fields": list(REQUIRED_FIELDS[source]),
+                                "row_count": 1, "game_count": 1, "game_pks": [year * 100 + split_index],
+                                "event_dates": [start, end]}
+                sidecar.write_bytes(canonical_json_bytes(side_payload) + b"\n")
+                manifest = {"schema_version": 1, "source": source, "logical_query_id": f"{logical}:{split_index}",
+                            "parent_logical_query_id": logical, "query": {"season": year, "start_date": f"{year}-01-01", "end_date": f"{year}-12-31"},
+                            "child_range": {"start_date": start, "end_date": end}, "raw_path": raw.relative_to(root).as_posix(),
+                            "raw_sha256": sha256_file(raw), "sidecar_path": sidecar.relative_to(root).as_posix(), "sidecar_sha256": sha256_file(sidecar),
+                            "retrieved_at_utc": "2026-07-12T00:00:00Z", "split_index": split_index, "split_count": 2}
+                base.with_suffix(".manifest.json").write_bytes(canonical_json_bytes(manifest) + b"\n")
+    return root
+
+def first_manifest(root: Path) -> dict[str, object]:
+    return json.loads(next((root / "inventory").rglob("*.manifest.json")).read_text())
+
+def rewrite_manifest(root: Path, patch_values: Mapping[str, object]) -> None:
+    path = next((root / "inventory").rglob("*.manifest.json")); value = json.loads(path.read_text()); value.update(patch_values)
+    path.write_bytes(canonical_json_bytes(value) + b"\n")
+
+def rewrite_sidecar(root: Path, patch_values: Mapping[str, object]) -> None:
+    manifest_path = next((root / "inventory").rglob("*.manifest.json")); manifest = json.loads(manifest_path.read_text())
+    path = root / manifest["sidecar_path"]; value = json.loads(path.read_text()); value.update(patch_values)
+    path.write_bytes(canonical_json_bytes(value) + b"\n"); manifest["sidecar_sha256"] = sha256_file(path)
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+```
 
 - [ ] **Step 2: Run preflight tests and verify the missing scanner failure**
 
@@ -1115,14 +1712,24 @@ Expected: `ERROR` importing `mlb_backtest.preflight`.
 - [ ] **Step 3: Implement a manifest-only inventory and exact acquisition plan**
 
 ```python
-MINIMUM_SOURCES = (
-    "mlb_schedule_game_feed",
-    "baseball_savant_statcast",
-    "mlb_stats_pitching",
-    "venue_team_timezone_table",
-    "prior_schedule_history",
-)
-PROTECTED_PREFLIGHT_ROOTS = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
+MINIMUM_SOURCES = MINIMUM_SOURCE_NAMES
+PROTECTED_PREFLIGHT_ROOTS = ("data", "audit")
+SOURCE_ALIASES = MappingProxyType({
+    "mlb_schedule_game_feed": frozenset({"mlb_schedule_game_feed", "mlb_schedule"}),
+    "baseball_savant_statcast": frozenset({"baseball_savant_statcast", "statcast"}),
+    "mlb_stats_pitching": frozenset({"mlb_stats_pitching", "mlb_stats_pitcher_bf"}),
+    "venue_team_timezone_table": frozenset({"venue_team_timezone_table", "mlb_venue_team_timezone", "venue_timezone"}),
+    "prior_schedule_history": frozenset({"prior_schedule_history", "mlb_schedule_history"}),
+})
+REQUIRED_FIELDS = MappingProxyType({
+    "mlb_schedule_game_feed": ("gamePk", "officialDate", "gameType", "teams", "venue", "gameDate", "status"),
+    "baseball_savant_statcast": ("game_pk", "game_date", "batter", "pitcher", "events", "estimated_woba_using_speedangle"),
+    "mlb_stats_pitching": ("season", "earnedRuns", "outs", "battersFaced"),
+    "venue_team_timezone_table": ("venue_id", "team_id", "timezone", "effective_start", "effective_end"),
+    "prior_schedule_history": ("gamePk", "officialDate", "away_team_id", "home_team_id", "venue_id", "innings", "status"),
+})
+MANIFEST_KEYS = frozenset({"schema_version", "source", "logical_query_id", "parent_logical_query_id", "query", "child_range", "raw_path", "raw_sha256", "sidecar_path", "sidecar_sha256", "retrieved_at_utc", "split_index", "split_count"})
+SIDECAR_KEYS = frozenset({"schema_version", "schema_fields", "row_count", "game_count", "game_pks", "event_dates"})
 PREFLIGHT_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "mode", "status", "generated_from_inventory_sha256", "protected_tree_before", "protected_tree_after", "seasons", "optional_sources", "may_fit_H22", "fitted_model_cards_present", "fitted_model_card_namespace", "acquisition_steps", "execution_steps_after_ready"})
 SEASON_KEYS = frozenset({"minimum_contract", "sources"})
 STEP_KEYS = frozenset({"stage", "status", "command", "prerequisite"})
@@ -1131,6 +1738,8 @@ def protected_inventory(root: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     for relative in PROTECTED_PREFLIGHT_ROOTS:
         base = root / relative
+        if not base.exists():
+            continue
         for path in sorted(p for p in base.rglob("*") if p.is_file()):
             result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
@@ -1138,31 +1747,74 @@ def protected_inventory(root: Path) -> dict[str, str]:
 def planned_step(stage: str, command: str, prerequisite: str) -> dict[str, str]:
     return {"stage": stage, "status": "NOT_IMPLEMENTED_PLANNED", "command": command, "prerequisite": prerequisite}
 
+def safe_relative(root: Path, raw: object) -> Path:
+    relative = Path(str(raw))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("manifest path escapes root")
+    result = (root / relative).resolve()
+    if root.resolve() not in result.parents:
+        raise ValueError("manifest path escapes root")
+    return result
+
+def canonical_source(alias: str) -> str:
+    matches = [name for name, aliases in SOURCE_ALIASES.items() if alias in aliases]
+    if len(matches) != 1:
+        raise ValueError(f"unknown or ambiguous source alias: {alias}")
+    return matches[0]
+
+def parent_logical_query_id(source: str, year: int, start: str, end: str) -> str:
+    return hashlib.sha256(canonical_json_bytes({"source": source, "season": year, "start_date": start, "end_date": end})).hexdigest()
+
 def inventory_existing_manifests(root: Path) -> tuple[dict[str, object], ...]:
     rows: list[dict[str, object]] = []
-    for path in sorted((root / "data/v5_1_bt/raw").rglob("*.manifest.json")):
+    candidates = sorted(path for base in (root / "inventory", root / "data/v5_2_qd/raw") if base.exists() for path in base.rglob("*.manifest.json"))
+    for path in candidates:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or set(("source", "query", "sha256", "retrieved_at_utc", "row_count", "schema_version")) - set(manifest):
-            raise ValueError(f"invalid raw manifest: {path.relative_to(root)}")
-        rows.append({**manifest, "manifest_path": path.relative_to(root).as_posix(), "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        item = require_exact_keys(manifest, MANIFEST_KEYS, f"manifest:{path.relative_to(root)}")
+        if item["schema_version"] != 1:
+            raise ValueError("manifest schema version differs")
+        source = canonical_source(str(item["source"])); query = require_exact_keys(item["query"], frozenset({"season", "start_date", "end_date"}), "manifest.query")
+        child = require_exact_keys(item["child_range"], frozenset({"start_date", "end_date"}), "manifest.child_range")
+        raw_path, sidecar_path = safe_relative(root, item["raw_path"]), safe_relative(root, item["sidecar_path"])
+        sidecar = require_exact_keys(json.loads(sidecar_path.read_text(encoding="utf-8")), SIDECAR_KEYS, "sidecar")
+        failures: list[str] = []
+        if sha256_file(raw_path) != item["raw_sha256"]: failures.append("RAW_HASH_MISMATCH")
+        if sha256_file(sidecar_path) != item["sidecar_sha256"]: failures.append("SIDECAR_HASH_MISMATCH")
+        if sidecar["schema_version"] != 1: failures.append("SIDECAR_SCHEMA_VERSION")
+        if any(isinstance(sidecar[name], bool) or not isinstance(sidecar[name], int) or sidecar[name] < 0 for name in ("row_count", "game_count")) or sidecar["game_count"] > sidecar["row_count"]:
+            failures.append("INVALID_COUNTS")
+        if len(sidecar["event_dates"]) != 2 or any(not isinstance(value, str) for value in sidecar["event_dates"]):
+            failures.append("INVALID_EVENT_DATE_RANGE")
+        elif list(sidecar["event_dates"]) != [child["start_date"], child["end_date"]]:
+            failures.append("EVENT_DATE_RANGE_MISMATCH")
+        missing = sorted(set(REQUIRED_FIELDS[source]) - set(sidecar["schema_fields"]))
+        if missing: failures.append("MISSING_CRITICAL_FIELDS")
+        game_pks = list(sidecar["game_pks"])
+        if len(game_pks) != len(set(game_pks)): failures.append("DUPLICATE_GAME_PK")
+        year, start, end = int(query["season"]), str(query["start_date"]), str(query["end_date"])
+        expected_parent = parent_logical_query_id(source, year, start, end)
+        if item["parent_logical_query_id"] != expected_parent: failures.append("SPLIT_PARENT_ID_MISMATCH")
+        rows.append({"source": source, "query": dict(query), "child_range": dict(child), "logical_query_id": str(item["logical_query_id"]),
+                     "parent_logical_query_id": str(item["parent_logical_query_id"]), "split_index": int(item["split_index"]), "split_count": int(item["split_count"]),
+                     "row_count": int(sidecar["row_count"]), "game_count": int(sidecar["game_count"]), "game_pks": game_pks,
+                     "event_dates": list(sidecar["event_dates"]), "schema_fields": list(sidecar["schema_fields"]), "retrieved_at_utc": str(item["retrieved_at_utc"]),
+                     "raw_sha256": str(item["raw_sha256"]), "sidecar_sha256": str(item["sidecar_sha256"]),
+                     "manifest_path": path.relative_to(root).as_posix(), "manifest_sha256": sha256_file(path), "failures": failures})
     return tuple(rows)
 
 def fitted_cards_present(root: Path) -> bool:
     return any((root / "models/v5_2_qd/folds" / fold / "model_card.json").exists() for fold in ("H22", "H23", "H24"))
 
 def exact_acquisition_steps(seasons: Mapping[str, object]) -> list[dict[str, str]]:
-    return [planned_step("acquire-raw-2018-2024", "python3 -m mlb_backtest.v52_acquire --years 2018:2024 --output data/v5_2_qd/raw", "approved deferred execution plan"),
-            planned_step("verify-source-coverage", "python3 -m mlb_backtest.v52_verify_sources --root data/v5_2_qd/raw", "acquire-raw-2018-2024 complete")]
+    return [planned_step("acquire-raw-2018-2024", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_acquire --years 2018:2024 --output data/v5_2_qd/raw", "approved deferred execution plan"),
+            planned_step("verify-source-coverage", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_verify_sources --root data/v5_2_qd/raw", "acquire-raw-2018-2024 complete")]
 
 def exact_execution_steps(run_spec: RunSpec) -> list[dict[str, str]]:
-    return [planned_step("fit-fold-cards", "python3 -m mlb_backtest.v52_fit --run-spec protocols/v5_2_qd/historical_walkforward_500.json", "preflight status READY"),
-            planned_step("lock-historical-500", "python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --stop-after lock", "H22/H23/H24 cards sealed"),
-            planned_step("join-outcomes", "python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --resume outcomes", "all candidate/date locks sealed"),
-            planned_step("report-and-verify", "python3 -m mlb_backtest.v52_verify_run --run-id historical_walkforward_500", "exactly 500 graded dates resolved")]
+    return [planned_step("fit-fold-cards", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_fit --run-spec protocols/v5_2_qd/historical_walkforward_500.json", "preflight status READY"),
+            planned_step("lock-historical-500", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --stop-after lock", "H22/H23/H24 cards sealed"),
+            planned_step("join-outcomes", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_run --run-spec protocols/v5_2_qd/historical_walkforward_500.json --resume outcomes", "all candidate/date locks sealed"),
+            planned_step("report-and-verify", "PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.v52_verify_run --run-id historical_walkforward_500", "exactly 500 graded dates resolved")]
 
-SOURCE_ALIASES = MappingProxyType({"mlb_schedule_game_feed": {"mlb_schedule"}, "baseball_savant_statcast": {"baseball_savant_statcast"},
-                                  "mlb_stats_pitching": {"mlb_stats_pitching", "mlb_stats_pitcher_bf"},
-                                  "venue_team_timezone_table": set(), "prior_schedule_history": {"mlb_schedule"}})
 SOURCE_RECORD_KEYS = frozenset({"source", "required", "expected_start", "expected_end", "observed_start", "observed_end", "logical_query_ids", "row_count", "game_count", "schema_fields", "missing_critical_fields", "duplicate_game_pks", "retrieved_at_utc", "content_sha256", "manifest_sha256", "split_children", "status"})
 
 def date_boundaries(query: object) -> tuple[str, str] | None:
@@ -1180,23 +1832,44 @@ def assess_season(year: int, inventory: Sequence[Mapping[str, object]]) -> dict[
     expected_start, expected_end = f"{year}-01-01", f"{year}-12-31"
     records: dict[str, object] = {}
     for source in MINIMUM_SOURCES:
-        matched = [row for row in inventory if row["source"] in SOURCE_ALIASES[source] and query_overlaps_year(row["query"], year)]
-        observed_dates = sorted(date_boundaries(row["query"]) for row in matched if date_boundaries(row["query"]) is not None)
+        matched = [row for row in inventory if row["source"] == source and int(row["query"]["season"]) == year]
+        observed_dates = sorted((row["child_range"]["start_date"], row["child_range"]["end_date"]) for row in matched)
+        parents = {row["parent_logical_query_id"] for row in matched}; split_counts = {row["split_count"] for row in matched}
+        split_indices = sorted(row["split_index"] for row in matched)
+        coverage_ok = ranges_cover(observed_dates, expected_start, expected_end)
+        split_ok = len(parents) == 1 and len(split_counts) == 1 and split_indices == list(range(1, next(iter(split_counts)) + 1))
+        failures = sorted({failure for row in matched for failure in row["failures"]})
+        duplicates = sorted(pk for pk, count in Counter(pk for row in matched for pk in row["game_pks"]).items() if count > 1)
+        missing_fields = sorted(set(REQUIRED_FIELDS[source]) - {field for row in matched for field in row["schema_fields"]})
+        complete = coverage_ok and split_ok and not failures and not duplicates and not missing_fields
         record = {"source": source, "required": True, "expected_start": expected_start, "expected_end": expected_end,
                   "observed_start": observed_dates[0][0] if observed_dates else None, "observed_end": observed_dates[-1][1] if observed_dates else None,
-                  "logical_query_ids": [hashlib.sha256(canonical_json_bytes(row["query"])).hexdigest() for row in matched],
-                  "row_count": sum(int(row["row_count"]) for row in matched), "game_count": None,
-                  "schema_fields": [], "missing_critical_fields": ["manifest-bound full-season evidence"] if not matched else [],
-                  "duplicate_game_pks": [], "retrieved_at_utc": [row["retrieved_at_utc"] for row in matched],
-                  "content_sha256": [row["sha256"] for row in matched], "manifest_sha256": [row["manifest_sha256"] for row in matched],
-                  "split_children": [row["manifest_path"] for row in matched], "status": "MISSING" if not matched else "OBSERVED_NOT_PROVEN_COMPLETE"}
+                  "logical_query_ids": sorted(parents), "row_count": sum(int(row["row_count"]) for row in matched),
+                  "game_count": sum(int(row["game_count"]) for row in matched), "schema_fields": sorted({field for row in matched for field in row["schema_fields"]}),
+                  "missing_critical_fields": (["manifest-bound full-season evidence"] if not matched else missing_fields + failures + ([] if coverage_ok else ["INCOMPLETE_DATE_RANGE"]) + ([] if split_ok else ["INVALID_SPLIT_SET"])),
+                  "duplicate_game_pks": duplicates, "retrieved_at_utc": sorted(row["retrieved_at_utc"] for row in matched),
+                  "content_sha256": sorted(row["raw_sha256"] for row in matched), "manifest_sha256": sorted(row["manifest_sha256"] for row in matched),
+                  "split_children": sorted(row["manifest_path"] for row in matched), "status": "COMPLETE" if complete else "MISSING" if not matched else "INVALID"}
         require_exact_keys(record, SOURCE_RECORD_KEYS, f"season.{year}.{source}")
         records[source] = record
     return {"minimum_contract": "COMPLETE" if all(row["status"] == "COMPLETE" for row in records.values()) else "MISSING", "sources": records}
 
+def ranges_cover(ranges: Sequence[tuple[str, str]], expected_start: str, expected_end: str) -> bool:
+    from datetime import date, timedelta
+    if not ranges or ranges[0][0] != expected_start or ranges[-1][1] != expected_end:
+        return False
+    previous_end: date | None = None
+    for start_text, end_text in ranges:
+        start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
+        if start > end or (previous_end is not None and start != previous_end + timedelta(days=1)):
+            return False
+        previous_end = end
+    return True
+
 def optional_source_status(inventory: Sequence[Mapping[str, object]]) -> dict[str, dict[str, str]]:
-    return {"market": {"status": "ABSENT_NULL"}, "environment": {"status": "ABSENT_NEUTRAL"},
-            "defense": {"status": "ABSENT_NEUTRAL"}, "injury": {"status": "ABSENT_NULL"}}
+    return {"market_odds": {"status": "ABSENT_NULL"}, "environment": {"status": "ABSENT_NEUTRAL"},
+            "defense": {"status": "ABSENT_NEUTRAL"}, "catcher": {"status": "ABSENT_NEUTRAL"},
+            "injury_restriction": {"status": "ABSENT_NULL"}}
 
 def all_minimum_complete(seasons: Mapping[str, Mapping[str, object]]) -> bool:
     return all(season["minimum_contract"] == "COMPLETE" for season in seasons.values())
@@ -1214,7 +1887,7 @@ def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
         "mode": "READ_ONLY",
         "status": "READY" if all_minimum_complete(seasons) else "BLOCKED_REQUIRED_ACQUISITION",
         "seasons": seasons,
-        "generated_from_inventory_sha256": hashlib.sha256(canonical_json_bytes(before)).hexdigest(),
+        "generated_from_inventory_sha256": hashlib.sha256(canonical_json_bytes(inventory)).hexdigest(),
         "protected_tree_before": before,
         "protected_tree_after": after,
         "optional_sources": optional_source_status(inventory),
@@ -1228,26 +1901,62 @@ def build_preflight(root: Path, run_spec: RunSpec) -> dict[str, object]:
 
 def parse_preflight(raw: object) -> dict[str, object]:
     obj = require_exact_keys(raw, PREFLIGHT_REQUIRED_KEYS, "preflight")
-    if obj["schema_version"] != 1 or obj["mode"] != "READ_ONLY":
+    if obj["schema_version"] != 1 or obj["mode"] != "READ_ONLY" or obj["run_id"] != "historical_walkforward_500":
         raise ValueError("preflight identity differs")
+    if obj["fitted_model_card_namespace"] != "models/v5_2_qd/folds/{H22,H23,H24}/model_card.json":
+        raise ValueError("preflight fitted-card namespace differs")
+    if obj["optional_sources"] != optional_source_status(()):
+        raise ValueError("preflight optional-source neutral/null contract differs")
     for year in map(str, range(2018, 2025)):
         season = require_exact_keys(obj["seasons"][year], SEASON_KEYS, f"preflight.seasons.{year}")
         if set(season["sources"]) != set(MINIMUM_SOURCES):
             raise ValueError(f"preflight.seasons.{year}.sources differs")
         for source, record in season["sources"].items():
-            require_exact_keys(record, SOURCE_RECORD_KEYS, f"preflight.seasons.{year}.sources.{source}")
+            item = require_exact_keys(record, SOURCE_RECORD_KEYS, f"preflight.seasons.{year}.sources.{source}")
+            if item["source"] != source or item["required"] is not True or item["expected_start"] != f"{year}-01-01" or item["expected_end"] != f"{year}-12-31" or item["status"] not in {"COMPLETE", "MISSING", "INVALID"}:
+                raise ValueError(f"preflight.seasons.{year}.sources.{source} frozen values differ")
     for index, step in enumerate(obj["acquisition_steps"] + obj["execution_steps_after_ready"]):
         item = require_exact_keys(step, STEP_KEYS, f"preflight.steps[{index}]")
         if item["status"] != "NOT_IMPLEMENTED_PLANNED":
             raise ValueError("preflight must not claim unimplemented CLI is executable")
-    return dict(deep_freeze(obj))
+    if obj["acquisition_steps"] != exact_acquisition_steps(obj["seasons"]):
+        raise ValueError("preflight acquisition steps differ")
+    if obj["execution_steps_after_ready"] != exact_execution_steps(parse_run_spec(expected_historical_run())):
+        raise ValueError("preflight execution steps differ")
+    result = json.loads(json.dumps(obj, allow_nan=False))
+    if result["status"] not in {"READY", "BLOCKED_REQUIRED_ACQUISITION"}:
+        raise ValueError("preflight status differs")
+    expected_ready = all_minimum_complete(result["seasons"])
+    if (result["status"] == "READY") != expected_ready or bool(result["may_fit_H22"]) != all(result["seasons"][str(y)]["minimum_contract"] == "COMPLETE" for y in range(2018, 2022)):
+        raise ValueError("preflight status/fold gate differs")
+    return result
+
+def render_preflight_markdown(report: Mapping[str, object]) -> str:
+    rows = [f"| {year} | {record['minimum_contract']} | " + ", ".join(name for name, source in record["sources"].items() if source["status"] != "COMPLETE") + " |"
+            for year, record in sorted(report["seasons"].items())]
+    return "\n".join(["# v5.2-QD Historical 500 Source Preflight", "", f"Status: **{report['status']}**", "",
+                       "| Season | Minimum contract | Blocking sources |", "|---|---|---|", *rows, "",
+                       "Optional sources remain neutral/null and do not block READY.", "",
+                       "H22 fitting permitted: " + ("Yes" if report["may_fit_H22"] else "No"), ""])
+
+def write_preflight(root: Path, run_path: Path, json_path: Path, markdown_path: Path) -> None:
+    report = build_preflight(root, load_run_spec(run_path))
+    json_path.parent.mkdir(parents=True, exist_ok=True); markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_bytes(canonical_json_bytes(report) + b"\n")
+    markdown_path.write_text(render_preflight_markdown(report), encoding="utf-8")
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--run-spec", type=Path, required=True)
+    parser.add_argument("--json", type=Path, required=True); parser.add_argument("--markdown", type=Path, required=True)
+    args = parser.parse_args(argv); write_preflight(args.root.resolve(), args.run_spec, args.json, args.markdown); return 0
 ```
 
-Each source record has the exact keys `source`, `required`, `expected_start`, `expected_end`, `observed_start`, `observed_end`, `logical_query_ids`, `row_count`, `game_count`, `schema_fields`, `missing_critical_fields`, `duplicate_game_pks`, `retrieved_at_utc`, `content_sha256`, `manifest_sha256`, `split_children`, and `status`; `assess_season` rejects any missing/unknown key. The stage records name concrete intended module commands and destinations but remain `NOT_IMPLEMENTED_PLANNED` until the deferred plan actually creates those CLI entry points. The scanner must not make network calls or write under data/audit trees.
+Generate `schemas/v5_2_preflight.schema.json` with exact top-level/season/source/step required/property key sets and `additionalProperties:false` at each of those fixed levels. Its enum/const values mirror `MINIMUM_SOURCES`, optional statuses, modes, step status, and report statuses. The stdlib `parse_preflight` remains the runtime authority and tests mutate every nested fixed-value family. The current workspace report is expected to be blocked; the complete temporary fixture proves the same code has a real `READY` path.
 
 - [ ] **Step 4: Generate and test the current-state preflight**
 
-Run: `python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_preflight -v && ruff check mlb_backtest/preflight.py tests/test_preflight.py`
 
 Expected: report status is `BLOCKED_REQUIRED_ACQUISITION`; 2018-2021 required gaps are explicit; no fitted cards exist; tests are `OK`; Ruff exits 0.
 
@@ -1262,6 +1971,7 @@ git commit -m "feat: add read-only walk-forward source preflight"
 
 **Files:**
 - Modify: `mlb_backtest/protocols.py`
+- Create: `schemas/v5_2_prospective.schema.json`
 - Create: `protocols/v5_2_qd/prospective_2026.json`
 - Modify: `tests/test_protocols.py`
 
@@ -1294,9 +2004,29 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), PROSPECTIVE_REQUIRED_KEYS)
         self.assertEqual(set(schema["properties"]), PROSPECTIVE_REQUIRED_KEYS)
         self.assertFalse(schema["additionalProperties"])
-```
 
-`test_clock_and_pool_literal_contract` asserts the qualifying receipt interval is closed `[-50,-45]`, a response after T-45 is rejected, NTP offset `2.0` passes and `2.000001` yields `SYSTEM_MISS_CLOCK`, a pre-lock start change invalidates prior snapshots/restarts countdown, a discovered-after-T-45 reschedule yields `TIMESTAMP_PARTIAL_T45/LATE_RESCHEDULE_UNVERIFIED`, and post-lock updates change only `latest_effective_start_utc` while `lock_basis_start_utc`, lock, ranks, and no-relock count stay fixed. It also asserts verified-only official rank, separate shadow rank, no-direction behavior at 0.5, date precedence `[RUN_INVALID,SYSTEM_MISS,SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE,NO_VERIFIED_ELIGIBLE_DATE,LOCK_TOP1]`, milestones `[25,50,100,250,500]`, the shared seven-day terminal contract, and the full `CONFIRMED_INCREMENTAL_EDGE` gate fields.
+    def test_clock_and_pool_literal_contract(self):
+        spec = load_prospective_spec(PROSPECTIVE_SPEC)
+        self.assertEqual(spec.raw, deep_freeze(expected_prospective_spec()))
+        self.assertEqual(classify_snapshot(-50, 2.0, True), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(-45, 2.0, True), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(-44.999, 0, True), "LATE_RESPONSE_REJECTED")
+        self.assertEqual(classify_snapshot(-47, 2.000001, True), "SYSTEM_MISS_CLOCK")
+        self.assertEqual(classify_snapshot(-47, 0, False), "TIMESTAMP_PARTIAL_T45")
+        self.assertEqual(date_disposition("run_invalid"), "RUN_INVALID")
+        self.assertEqual(date_disposition("acquisition_failure"), "SYSTEM_MISS")
+        self.assertEqual(date_disposition("partial_only"), "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE")
+        self.assertEqual(date_disposition("empty_verified"), "NO_VERIFIED_ELIGIBLE_DATE")
+
+    def test_schema_const_mirrors_parser_and_pooling_is_forbidden(self):
+        raw, schema = json.loads(PROSPECTIVE_SPEC.read_text()), json.loads(PROSPECTIVE_SCHEMA.read_text())
+        self.assertEqual(schema["const"], raw)
+        changed = copy.deepcopy(raw); changed["polling"]["max_ntp_offset_seconds"] = 3
+        with self.assertRaisesRegex(ValueError, "prospective spec differs"):
+            parse_prospective_spec(changed)
+        with self.assertRaisesRegex(ValueError, "pooling forbidden"):
+            combine_ledgers("historical_walkforward_500", "prospective_2026")
+```
 
 - [ ] **Step 2: Run prospective tests and verify contract absence**
 
@@ -1310,6 +2040,24 @@ Expected: `FAIL` because prospective parsing/rules are absent.
 PROSPECTIVE_REQUIRED_KEYS = frozenset({"schema_version", "run_id", "model_version", "first_permitted_date", "fit_years", "excluded_fit_years", "oof_calibration", "card_seal", "polling", "clock", "schedule_changes", "participant_provenance", "official_pool", "shadow_pool", "date_state_precedence", "terminal_contract", "milestones", "evidence_gate", "namespace", "pooling_forbidden", "backfill_forbidden"})
 POLLING_KEYS = frozenset({"T-90_to_before_T-50_seconds", "T-50_to_T-45_seconds", "qualifying_window_minutes", "max_age_at_lock_minutes", "max_ntp_offset_seconds"})
 PROVENANCE_CONTRACT_KEYS = frozenset({"official", "partial", "historical_forbidden"})
+PROSPECTIVE_POLLING = {"T-90_to_before_T-50_seconds": 300, "T-50_to_T-45_seconds": 60, "qualifying_window_minutes": [-50, -45], "max_age_at_lock_minutes": 5, "max_ntp_offset_seconds": 2}
+PROSPECTIVE_DATE_PRECEDENCE = ["RUN_INVALID", "SYSTEM_MISS", "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE", "NO_VERIFIED_ELIGIBLE_DATE", "LOCK_TOP1"]
+
+def expected_prospective_spec() -> dict[str, object]:
+    return {"schema_version": 1, "run_id": "prospective_2026", "model_version": "v5.2-QD", "first_permitted_date": "2026-07-13",
+            "fit_years": list(range(2018, 2025)), "excluded_fit_years": [2025],
+            "oof_calibration": [{"target_year": y, "normalization_years": list(range(2018, y))} for y in range(2019, 2025)],
+            "card_seal": {"deadline": "before_first_counted_pick", "season_frozen": True, "target_year_outcomes_refit_forbidden": True},
+            "polling": PROSPECTIVE_POLLING,
+            "clock": {"basis": "authoritative_observed_start_and_ntp_receipt_time", "qualifying_interval_closed": True, "timezone_normalization": "UTC", "clock_failure_status": "SYSTEM_MISS_CLOCK"},
+            "schedule_changes": {"prelock": "invalidate_prior_snapshots_and_restart_countdown", "late_reschedule": "TIMESTAMP_PARTIAL_T45:LATE_RESCHEDULE_UNVERIFIED", "postlock_mutable_field": "latest_effective_start_utc", "immutable_fields": ["lock_basis_start_utc", "lock_at_utc", "snapshot_qualification", "prediction", "provenance", "official_rank", "shadow_rank", "top1"], "relock_forbidden": True},
+            "participant_provenance": {"official": "TIMESTAMP_VERIFIED_T45", "partial": "TIMESTAMP_PARTIAL_T45", "historical_forbidden": "RECONSTRUCTED_FINAL_PARTICIPANTS"},
+            "official_pool": {"provenance": "TIMESTAMP_VERIFIED_T45", "rank_field": "official_rank", "partial_rows_affect_rank": False, "p_home_equal_half_official": False},
+            "shadow_pool": {"provenance": "TIMESTAMP_PARTIAL_T45", "rank_field": "shadow_rank", "tier": "UNRATED"},
+            "date_state_precedence": PROSPECTIVE_DATE_PRECEDENCE, "terminal_contract": HISTORICAL_TERMINAL,
+            "milestones": [25, 50, 100, 250, 500],
+            "evidence_gate": {"label": "CONFIRMED_INCREMENTAL_EDGE", "minimum_graded": 500, "season_baseline_lower_bound_positive": True, "season_baseline_exact_mcnemar_p_lt": .05, "brier_lt": .25, "log_loss_lt": .6931471806, "historical_rows_permitted": False},
+            "namespace": "data/v5_2_qd/prospective_2026", "pooling_forbidden": True, "backfill_forbidden": True}
 
 @dataclass(frozen=True)
 class ProspectiveSpec:
@@ -1334,6 +2082,8 @@ def parse_prospective_spec(raw: object) -> ProspectiveSpec:
         require_exact_keys(row, OOF_ROW_KEYS, f"prospective.oof_calibration[{index}]")
         if tuple(row["normalization_years"]) != tuple(range(2018, row["target_year"])):
             raise ValueError("prospective OOF pool differs")
+    if obj != expected_prospective_spec():
+        raise ValueError("prospective spec differs from frozen values")
     spec = ProspectiveSpec(str(obj["run_id"]), date.fromisoformat(str(obj["first_permitted_date"])), tuple(obj["fit_years"]),
                            tuple(row["target_year"] for row in obj["oof_calibration"]), deep_freeze(polling), str(provenance["official"]),
                            str(obj["namespace"]), deep_freeze(obj))
@@ -1347,8 +2097,17 @@ def load_prospective_spec(path: Path) -> ProspectiveSpec:
 def eligible_for_prospective_official_pool(stratum: str) -> bool:
     return stratum == "TIMESTAMP_VERIFIED_T45"
 
-DATE_DISPOSITIONS = MappingProxyType({"acquisition_failure": "SYSTEM_MISS", "clock_failure": "SYSTEM_MISS_CLOCK",
+DATE_DISPOSITIONS = MappingProxyType({"run_invalid": "RUN_INVALID", "acquisition_failure": "SYSTEM_MISS", "clock_failure": "SYSTEM_MISS_CLOCK",
                                       "partial_only": "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE", "empty_verified": "NO_VERIFIED_ELIGIBLE_DATE"})
+
+def classify_snapshot(minutes_to_start: float, ntp_offset_seconds: float, complete_participants: bool) -> str:
+    if abs(ntp_offset_seconds) > 2:
+        return "SYSTEM_MISS_CLOCK"
+    if minutes_to_start < -50:
+        return "TOO_EARLY_NOT_QUALIFYING"
+    if minutes_to_start > -45:
+        return "LATE_RESPONSE_REJECTED"
+    return "TIMESTAMP_VERIFIED_T45" if complete_participants else "TIMESTAMP_PARTIAL_T45"
 
 def date_disposition(event: str) -> str:
     try:
@@ -1360,7 +2119,7 @@ def combine_ledgers(left_run_id: str, right_run_id: str) -> NoReturn:
     raise ValueError(f"ledger pooling forbidden: {left_run_id} + {right_run_id}")
 ```
 
-The JSON must encode the exact 2019-from-2018 through 2024-from-2018-2023 OOF sequence; 2018-2024 production fit pool excluding 2025; card-seal-before-first-pick rule; append-only snapshots; authoritative observed start; NTP receipt-time clock; polling cadence; start-change behavior; participant strata; official/shadow pools; date-state precedence; terminal/deadline rules; separate namespace; no backfill; and milestone/evidence labels. This phase defines and validates the protocol only—it does not create historical snapshots dated before 2026-07-13 or claim that missed dates were collected.
+Write `prospective_2026.json` from `expected_prospective_spec()` and generate a closed schema mirror whose top-level `const` is that exact JSON and whose nested required/property keys mirror every dict above. This phase defines and validates the protocol only; it creates no pre-2026-07-13 snapshot and never backfills a missed date.
 
 - [ ] **Step 4: Run all protocol tests and lint**
 
@@ -1396,22 +2155,27 @@ class DesignVerificationTest(unittest.TestCase):
         self.assertEqual(receipt["historical"]["execution_status"], "NOT_EXECUTED")
 
     def test_mutating_any_sealed_v51_artifact_fails(self):
-        protected = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
-        for relative in protected:
-            with self.subTest(tree=relative), tempfile.TemporaryDirectory() as directory:
-                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy)
-                files = sorted(path for path in (copy / relative).rglob("*") if path.is_file())
-                files[0].write_bytes(files[0].read_bytes() + b"mutation")
+        for change in ("mutate", "add", "delete"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                repo = make_tiny_git_fixture(Path(directory)); inventory = write_git_inventory(repo, "HEAD")
+                target = repo / "data/v5_1_bt/locked/predictions.jsonl"
+                if change == "mutate": target.write_bytes(b"changed\n")
+                elif change == "add": (target.parent / "added.json").write_text("{}\n")
+                else: target.unlink()
                 with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
-                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
-            with self.subTest(tree=relative, change="add"), tempfile.TemporaryDirectory() as directory:
-                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy); (copy / relative / "added.bin").write_bytes(b"added")
-                with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
-                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
-            with self.subTest(tree=relative, change="delete"), tempfile.TemporaryDirectory() as directory:
-                copy = Path(directory) / "repo"; shutil.copytree(ROOT, copy); next(path for path in (copy / relative).rglob("*") if path.is_file()).unlink()
-                with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
-                    verify_protected_inventory(copy, PROTECTED_INVENTORY)
+                    verify_protected_inventory(repo, inventory)
+
+    def test_inventory_is_pinned_to_approved_design_commit(self):
+        inventory_path = ROOT / "protocols/v5_2_qd/v51_protected_inventory.json"
+        inventory = json.loads(inventory_path.read_text())
+        self.assertEqual(inventory["approved_commit"], "a4aa8d2")
+        self.assertEqual(inventory, build_git_inventory(ROOT, "a4aa8d2"))
+
+    def test_absence_status_is_derived_not_hardcoded(self):
+        self.assertEqual(historical_execution_status(ROOT), "NOT_EXECUTED")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / HISTORICAL_OUTPUT_SENTINELS[0]).parent.mkdir(parents=True); (root / HISTORICAL_OUTPUT_SENTINELS[0]).write_text("x")
+            self.assertEqual(historical_execution_status(root), "PARTIAL_OUTPUT_PRESENT")
 ```
 
 - [ ] **Step 2: Run verifier tests and confirm missing module failure**
@@ -1423,20 +2187,65 @@ Expected: `ERROR` importing `mlb_backtest.verify_v52_design`.
 - [ ] **Step 3: Implement requirement-by-requirement verification**
 
 ```python
-PROTECTED_TREES = ("data/v5_1_bt/locked", "data/v5_1_bt/outcomes", "data/v5_1_bt/features", "data/v5_1_bt/calibration", "audit/v5_1_bt")
+APPROVED_DESIGN_COMMIT = "a4aa8d2"
+PROTECTED_TREES = ("data/v5_1_bt", "audit/v5_1_bt")
 PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
+HISTORICAL_OUTPUT_SENTINELS = ("data/v5_2_qd/historical/locked/top1.jsonl", "data/v5_2_qd/historical/outcomes/evaluated.jsonl", "reports/v5_2_qd/historical/summary.json")
+FITTED_CARD_PATHS = tuple(f"models/v5_2_qd/folds/{fold}/model_card.json" for fold in ("H22", "H23", "H24"))
+EXPECTED_CURRENT_FILES = (
+    "reports/v5_1_bt/diagnostic_100.json", "reports/v5_1_bt/diagnostic_100.md", "analysis/v5_1_bt/diagnostic_100.ipynb",
+    "reports/v5_1_bt/diagnostic_100_artifact.json", "reports/v5_1_bt/diagnostic_100_chart_map.json",
+    "config/v5_2_qd.json", "schemas/v5_2_qd.schema.json", "schemas/v5_2_run_spec.schema.json",
+    "schemas/v5_2_prospective.schema.json", "schemas/v5_2_preflight.schema.json", "protocols/v5_2_qd/change_contract.json",
+    "protocols/v5_2_qd/historical_walkforward_500.json", "protocols/v5_2_qd/prospective_2026.json",
+    "reports/v5_2_qd/walkforward_500_preflight.json", "reports/v5_2_qd/walkforward_500_preflight.md",
+)
 
-def build_protected_inventory(root: Path) -> dict[str, object]:
-    files = {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-             for relative in PROTECTED_TREES for path in sorted((root / relative).rglob("*")) if path.is_file()}
-    files.update({relative: hashlib.sha256((root / relative).read_bytes()).hexdigest() for relative in PROTECTED_FILES})
-    return {"schema_version": 1, "algorithm": "sha256-file-bytes", "protected_trees": list(PROTECTED_TREES),
-            "protected_files": list(PROTECTED_FILES), "files": dict(sorted(files.items()))}
+def git(root: Path, *args: str) -> bytes:
+    completed = subprocess.run(["git", *args], cwd=root, check=False, capture_output=True)
+    if completed.returncode:
+        raise ValueError(completed.stderr.decode(errors="replace"))
+    return completed.stdout
+
+def build_git_inventory(root: Path, commit: str = APPROVED_DESIGN_COMMIT) -> dict[str, object]:
+    paths = (*PROTECTED_TREES, *PROTECTED_FILES)
+    raw = git(root, "ls-tree", "-r", "-z", "--full-tree", commit, "--", *paths)
+    entries: dict[str, str] = {}
+    for item in raw.rstrip(b"\0").split(b"\0") if raw else ():
+        metadata, path = item.split(b"\t", 1); _mode, kind, oid = metadata.decode().split()
+        if kind == "blob": entries[path.decode()] = oid
+    return {"schema_version": 1, "approved_commit": commit, "algorithm": "git-blob-sha1",
+            "protected_trees": list(PROTECTED_TREES), "protected_files": list(PROTECTED_FILES), "blobs": dict(sorted(entries.items()))}
+
+def write_git_inventory(root: Path, commit: str) -> Path:
+    path = root / "inventory.json"; path.write_bytes(canonical_json_bytes(build_git_inventory(root, commit)) + b"\n"); return path
+
+def make_tiny_git_fixture(parent: Path) -> Path:
+    repo = parent / "repo"; (repo / "data/v5_1_bt/locked").mkdir(parents=True); (repo / "audit/v5_1_bt").mkdir(parents=True); (repo / "config").mkdir()
+    (repo / "data/v5_1_bt/locked/predictions.jsonl").write_text("{}\n")
+    (repo / "audit/v5_1_bt/model_card.json").write_text("{}\n")
+    (repo / "config/v5_1_bt.json").write_text("{}\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "fixture"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
+    return repo
 
 def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
     expected = json.loads(inventory_path.read_text(encoding="utf-8"))
-    actual = build_protected_inventory(root)
-    if actual != expected:
+    if expected != build_git_inventory(root, str(expected["approved_commit"])):
+        raise ValueError("protected v5.1 inventory baseline differs")
+    baseline = expected["blobs"]
+    tracked = set(git(root, "ls-files", "-z", "--", *PROTECTED_TREES, *PROTECTED_FILES).rstrip(b"\0").decode().split("\0"))
+    if tracked != set(baseline):
+        raise ValueError("protected v5.1 inventory differs by mutation, addition, or deletion")
+    for relative, oid in baseline.items():
+        path = root / relative
+        if not path.is_file() or git(root, "hash-object", "--", relative).decode().strip() != oid:
+            raise ValueError("protected v5.1 inventory differs by mutation, addition, or deletion")
+    untracked = git(root, "status", "--porcelain=v1", "--untracked-files=all", "--", *PROTECTED_TREES, *PROTECTED_FILES).decode().splitlines()
+    if any(line.startswith("?? ") for line in untracked):
         raise ValueError("protected v5.1 inventory differs by mutation, addition, or deletion")
 
 def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, object]:
@@ -1446,11 +2255,22 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     historical = load_run_spec(root / "protocols/v5_2_qd/historical_walkforward_500.json")
     prospective = load_prospective_spec(root / "protocols/v5_2_qd/prospective_2026.json")
     preflight = verify_preflight(root)
+    artifact = verify_artifact_agreement(root, diagnostic)
+    verify_notebook_agreement(root, diagnostic)
+    verify_markdown_agreement(root, diagnostic)
+    verify_contract_schemas(root, config, historical, prospective, preflight)
+    verify_change_contract(root)
+    verify_forbidden_claims(root)
+    ensure_expected_files(root)
+    fitted_count = fitted_model_card_count(root)
+    if fitted_count: raise ValueError("fitted fold card exists before source acquisition")
+    execution = historical_execution_status(root)
+    if execution != "NOT_EXECUTED": raise ValueError("historical outputs exist in design-only phase")
+    html = None
     if outputs is not None:
-        verify_html_payload(outputs / "mlb_v5_1_100_pick_diagnostic.html", root / "reports/v5_1_bt/diagnostic_100_artifact.json")
-    verify_no_fitted_cards(root)
+        html = verify_html_payload(outputs / "mlb_v5_1_100_pick_diagnostic.html", root / "reports/v5_1_bt/diagnostic_100_artifact.json", root / "reports/v5_1_bt/report_delivery_receipt.json")
     verify_namespaces_differ(historical, prospective)
-    return build_pass_receipt(diagnostic, config, historical, prospective, preflight)
+    return build_pass_receipt(diagnostic, config, prospective, preflight, fitted_count, execution, html)
 
 def verify_diagnostic(root: Path) -> dict[str, object]:
     saved = json.loads((root / "reports/v5_1_bt/diagnostic_100.json").read_text(encoding="utf-8"))
@@ -1459,41 +2279,105 @@ def verify_diagnostic(root: Path) -> dict[str, object]:
         raise ValueError("diagnostic does not match sealed inputs")
     return saved
 
+def verify_markdown_agreement(root: Path, diagnostic: Mapping[str, object]) -> None:
+    if (root / "reports/v5_1_bt/diagnostic_100.md").read_text(encoding="utf-8") != render_markdown(diagnostic):
+        raise ValueError("Markdown differs from canonical diagnostic")
+
+def verify_notebook_agreement(root: Path, diagnostic: Mapping[str, object]) -> None:
+    notebook = json.loads((root / "analysis/v5_1_bt/diagnostic_100.ipynb").read_text())
+    code = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
+    receipt = json.loads("".join(code[-1]["outputs"][0]["text"]))
+    if receipt["diagnostic_sha256"] != hashlib.sha256(canonical_json_bytes(diagnostic) + b"\n").hexdigest() or any(o.get("output_type") == "error" for c in code for o in c["outputs"]):
+        raise ValueError("notebook does not agree with diagnostic")
+
+def verify_artifact_agreement(root: Path, diagnostic: Mapping[str, object]) -> Mapping[str, object]:
+    saved = json.loads((root / "reports/v5_1_bt/diagnostic_100_artifact.json").read_text())
+    expected = build_report_artifact(diagnostic)
+    if saved != expected: raise ValueError("artifact differs from diagnostic")
+    return saved
+
+def verify_contract_schemas(root: Path, config: V52Config, historical: RunSpec, prospective: ProspectiveSpec, preflight: Mapping[str, object]) -> None:
+    pairs = (("schemas/v5_2_qd.schema.json", config.raw), ("schemas/v5_2_run_spec.schema.json", historical.raw),
+             ("schemas/v5_2_prospective.schema.json", prospective.raw))
+    for relative, raw in pairs:
+        schema = json.loads((root / relative).read_text());
+        if deep_freeze(schema["const"]) != raw: raise ValueError(f"schema/parser disagreement: {relative}")
+    schema = json.loads((root / "schemas/v5_2_preflight.schema.json").read_text())
+    if set(schema["required"]) != PREFLIGHT_REQUIRED_KEYS or schema["additionalProperties"] is not False:
+        raise ValueError("preflight schema/parser disagreement")
+
+def verify_change_contract(root: Path) -> None:
+    contract = parse_change_contract(json.loads((root / "protocols/v5_2_qd/change_contract.json").read_text()))
+    if contract["config_sha256"] != sha256_file(root / "config/v5_2_qd.json"):
+        raise ValueError("change contract config digest differs")
+    design_blob = git(root, "rev-parse", f"{APPROVED_DESIGN_COMMIT}:docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md").decode().strip()
+    if contract["approved_design_blob_sha256"] != hashlib.sha256(git(root, "cat-file", "blob", design_blob)).hexdigest():
+        raise ValueError("change contract design digest differs")
+
+FORBIDDEN_CLAIMS = ("시장 대비 우위가 입증", "ROI가 양수", "CLV가 양수", "수익성이 입증", "actionable betting", "predictive improvement established")
+def verify_forbidden_claims(root: Path) -> None:
+    paths = [root / "reports/v5_1_bt/diagnostic_100.md", root / "reports/v5_1_bt/diagnostic_100_artifact.json", root / "analysis/v5_1_bt/diagnostic_100.ipynb"]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        if any(claim in text for claim in FORBIDDEN_CLAIMS): raise ValueError(f"forbidden claim in {path}")
+
 def verify_preflight(root: Path) -> dict[str, object]:
     payload = parse_preflight(json.loads((root / "reports/v5_2_qd/walkforward_500_preflight.json").read_text(encoding="utf-8")))
     if payload["status"] != "BLOCKED_REQUIRED_ACQUISITION" or payload["may_fit_H22"]:
         raise ValueError("current preflight status differs")
     return payload
 
-def verify_no_fitted_cards(root: Path) -> None:
-    paths = [root / "models/v5_2_qd/folds" / fold / "model_card.json" for fold in ("H22", "H23", "H24")]
-    if any(path.exists() for path in paths):
-        raise ValueError("fitted fold card exists before source acquisition")
+def fitted_model_card_count(root: Path) -> int:
+    return sum((root / relative).exists() for relative in FITTED_CARD_PATHS)
+
+def historical_execution_status(root: Path) -> str:
+    return "PARTIAL_OUTPUT_PRESENT" if any((root / relative).exists() for relative in HISTORICAL_OUTPUT_SENTINELS) else "NOT_EXECUTED"
+
+def ensure_expected_files(root: Path) -> None:
+    missing = [relative for relative in EXPECTED_CURRENT_FILES if not (root / relative).is_file()]
+    if missing: raise ValueError(f"missing current-scope files: {missing}")
 
 def verify_namespaces_differ(historical: RunSpec, prospective: ProspectiveSpec) -> None:
     if prospective.namespace in set(historical.raw["namespaces"].values()):
         raise ValueError("historical and prospective namespaces overlap")
 
-def verify_html_payload(html_path: Path, artifact_path: Path) -> None:
+def verify_html_payload(html_path: Path, artifact_path: Path, receipt_path: Path) -> dict[str, object]:
     plugin = Path("/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599")
     completed = subprocess.run(["npm", "run", "report:verify", "--", "--html", str(html_path), "--artifact", str(artifact_path)],
                                cwd=plugin, check=False, capture_output=True, text=True)
-    if completed.returncode != 0 or '"ok":true' not in completed.stdout:
+    receipt = json.loads(receipt_path.read_text())
+    if completed.returncode != 0 or '"ok":true' not in completed.stdout or any(receipt["stages"].get(stage) != "passed" for stage in ("validation", "package", "verification")):
         raise ValueError(f"portable HTML verification failed: {completed.stderr}")
+    return {"sha256": sha256_file(html_path), "receipt": receipt}
 
-def build_pass_receipt(diagnostic: Mapping[str, object], config: V52Config, historical: RunSpec,
-                       prospective: ProspectiveSpec, preflight: Mapping[str, object]) -> dict[str, object]:
+def build_pass_receipt(diagnostic: Mapping[str, object], config: V52Config, prospective: ProspectiveSpec,
+                       preflight: Mapping[str, object], fitted_count: int, execution: str, html: object) -> dict[str, object]:
     return {"status": "PASS", "diagnostic": {"primary": diagnostic["primary"]["record"]},
-            "v52": {"model_version": config.model_version, "fitted_model_card_count": 0},
-            "preflight": {"status": preflight["status"]}, "historical": {"execution_status": "NOT_EXECUTED"},
-            "prospective": {"first_permitted_date": prospective.first_permitted_date.isoformat()}}
+            "v52": {"model_version": config.model_version, "fitted_model_card_count": fitted_count},
+            "preflight": {"status": preflight["status"]}, "historical": {"execution_status": execution},
+            "prospective": {"first_permitted_date": prospective.first_permitted_date.isoformat()}, "html": html}
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, required=True); parser.add_argument("--outputs", type=Path); parser.add_argument("--skip-html", action="store_true")
+    args = parser.parse_args(argv); receipt = verify_design_deliverables(args.root.resolve(), None if args.skip_html else args.outputs)
+    print(json.dumps(receipt, allow_nan=False, sort_keys=True)); return 0
 ```
 
-Verify exact hashes, JSON/Markdown/notebook agreement, HTML embedded artifact equality, all schema identities, config/change-contract digests, no H22/H23/H24 model cards, current preflight blockers, no historical run outputs, prospective/historical namespace separation, forbidden-claim scan, and all current-scope files. A changed v5.1 sealed artifact, missing/mismatched embedded HTML artifact, or unexpectedly fitted card fails closed; browser-verification success is separately proven by the fresh Task 11 delivery receipt.
+The production inventory is generated with `build_git_inventory(ROOT, "a4aa8d2")`; never snapshot the post-Task-10 tree as the baseline.
 
 - [ ] **Step 4: Run focused and full regression verification**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_verify_v52_design -v && python3 -m mlb_backtest.verify_v52_design --root . --skip-html && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q && ruff check . && git diff --check`
+Generate the approved-commit inventory, then verify:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -c 'from pathlib import Path; from mlb_backtest.diagnostics import canonical_json_bytes; from mlb_backtest.verify_v52_design import build_git_inventory; p=Path("protocols/v5_2_qd/v51_protected_inventory.json"); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(canonical_json_bytes(build_git_inventory(Path("."), "a4aa8d2"))+b"\n")'
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_verify_v52_design -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.verify_v52_design --root . --skip-html
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
+ruff check .
+git diff --check
+```
 
 Expected: verifier prints `PASS`; all tests are `OK`; Ruff and diff checks exit 0.
 
@@ -1528,21 +2412,30 @@ Expected: `APPROVED` or severity-ranked issues with file/line evidence. Fix all 
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
 ruff check .
 git diff --check
-python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt
-python3 analysis/v5_1_bt/build_diagnostic_notebook.py
-python3 -m mlb_backtest.report_artifact --diagnostic reports/v5_1_bt/diagnostic_100.json --artifact reports/v5_1_bt/diagnostic_100_artifact.json --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
-python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md
-python3 -m mlb_backtest.verify_v52_design --root . --skip-html
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.diagnostic_report --root . --output reports/v5_1_bt
+PYTHONDONTWRITEBYTECODE=1 python3 analysis/v5_1_bt/build_diagnostic_notebook.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.report_artifact --diagnostic reports/v5_1_bt/diagnostic_100.json --artifact reports/v5_1_bt/diagnostic_100_artifact.json --chart-map reports/v5_1_bt/diagnostic_100_chart_map.json
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.preflight --root . --run-spec protocols/v5_2_qd/historical_walkforward_500.json --json reports/v5_2_qd/walkforward_500_preflight.json --markdown reports/v5_2_qd/walkforward_500_preflight.md
+PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.verify_v52_design --root . --skip-html
 git status --short
 ```
 
 Expected: tests `OK`; Ruff/diff/verifier pass; regeneration is byte-stable; status contains only intentional current-phase files or is clean after their commits; there are no new files under fitted-card or historical-run output namespaces.
 
-- [ ] **Step 4: Deliver the stable artifact exactly once and inspect its success receipt**
+- [ ] **Step 4: Deliver the stable artifact exactly once and preserve its success receipt**
 
-Run the exact `npm run report:deliver` command under the Data Analytics report contract once after final artifact regeneration. No earlier task invokes that command.
+Run exactly this command once, after all report/artifact generation and both reviews. No earlier step invokes `report:deliver`:
 
-Expected: validation, packaging, and verification all `passed`; output exists at the exact user-facing path; semantic content includes all visible executive sections, four charts, exact paired tables, caveats, and recommendations; no network dependency is present.
+```bash
+PLUGIN_ROOT=/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599
+cd "$PLUGIN_ROOT"
+npm_config_loglevel=silent npm run report:deliver -- \
+  --input "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest/reports/v5_1_bt/diagnostic_100_artifact.json" \
+  --output "/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html" \
+  > "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest/reports/v5_1_bt/report_delivery_receipt.json"
+```
+
+Expected: receipt fields `stages.validation`, `stages.package`, and `stages.verification` are all `passed`; output exists at the exact user-facing path; semantic content includes all visible executive sections, four charts, exact paired tables, caveats, and recommendations; no network dependency is present.
 
 - [ ] **Step 5: Run the final HTML-aware verifier, then commit review fixes if changed**
 
@@ -1552,6 +2445,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.verify_v52_design \
   --outputs /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs
 shasum -a 256 /Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html
 git add -u
+git add reports/v5_1_bt/report_delivery_receipt.json
 git commit -m "fix: satisfy v5.2 design reviews"
 ```
 
