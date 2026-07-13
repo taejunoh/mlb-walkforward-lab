@@ -883,6 +883,15 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 )
                 state_path, log_path = root / state.audit_path, root / state.event_log_path
                 before = (log_path.read_bytes(), state_path.read_bytes())
+                receipt_dir = (
+                    root
+                    / "audit/v5_2_qd/prospective_2026/"
+                    "postlock_chain_receipts/777001"
+                )
+                before_receipts = tuple(
+                    (path.name, path.read_bytes())
+                    for path in sorted(receipt_dir.glob("*.json"))
+                )
                 if failure == "second_replace":
                     original_replace = os.replace
                     final_calls = 0
@@ -925,7 +934,131 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         state_persisted_at_utc="2026-07-13T22:30:01Z",
                     )
                 self.assertEqual((log_path.read_bytes(), state_path.read_bytes()), before)
+                self.assertEqual(
+                    tuple(
+                        (path.name, path.read_bytes())
+                        for path in sorted(receipt_dir.glob("*.json"))
+                    ),
+                    before_receipts,
+                )
                 self.assertEqual(list(root.rglob(".*.tmp")), [])
+                protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+                event, retried = protocols.append_and_persist_postlock_start_change(
+                    root,
+                    game_pk=777001,
+                    new_effective_start_utc="2026-07-13T23:40:00Z",
+                    observed_at_utc="2026-07-13T22:30:00Z",
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    state_persisted_at_utc="2026-07-13T22:30:01Z",
+                )
+                self.assertEqual((event.sequence, retried.event_count), (1, 1))
+
+    def test_initialize_postcondition_failure_removes_only_new_receipt_and_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipt_dir = (
+                root
+                / "audit/v5_2_qd/prospective_2026/"
+                "postlock_chain_receipts/777001"
+            )
+            with patch(
+                "mlb_backtest.protocols.validate_persisted_postlock_chain",
+                side_effect=ValueError("initialization postcondition failed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "postcondition"):
+                    protocols.initialize_postlock_chain(
+                        root,
+                        game_pk=777001,
+                        lock_basis_start_utc="2026-07-13T23:10:00Z",
+                        persisted_at_utc="2026-07-13T22:25:00Z",
+                    )
+            self.assertFalse(receipt_dir.exists())
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "audit/v5_2_qd/prospective_2026/"
+                        "postlock_start_changes/*.jsonl"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "audit/v5_2_qd/prospective_2026/"
+                        "postlock_chain_state/*.json"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+            state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            events, loaded = protocols.validate_persisted_postlock_chain(
+                root, game_pk=777001
+            )
+            self.assertEqual(events, ())
+            self.assertEqual(loaded, state)
+
+    def test_receipt_removal_failure_is_path_rich_and_preserves_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            state_path, log_path = root / state.audit_path, root / state.event_log_path
+            before = (log_path.read_bytes(), state_path.read_bytes())
+            original_validate = protocols.validate_persisted_postlock_chain
+            calls = 0
+
+            def fail_second_validation(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("postcondition failed after receipt creation")
+                return original_validate(*args, **kwargs)
+
+            expected_receipt_dir = (
+                root
+                / "audit/v5_2_qd/prospective_2026/"
+                "postlock_chain_receipts/777001"
+            )
+            with (
+                patch(
+                    "mlb_backtest.protocols.validate_persisted_postlock_chain",
+                    side_effect=fail_second_validation,
+                ),
+                patch(
+                    "mlb_backtest.protocols._remove_created_postlock_receipt",
+                    side_effect=OSError("injected receipt unlink failure"),
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "rollback failed") as raised,
+            ):
+                protocols.append_and_persist_postlock_start_change(
+                    root,
+                    game_pk=777001,
+                    new_effective_start_utc="2026-07-13T23:40:00Z",
+                    observed_at_utc="2026-07-13T22:30:00Z",
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    state_persisted_at_utc="2026-07-13T22:30:01Z",
+                )
+            self.assertEqual((log_path.read_bytes(), state_path.read_bytes()), before)
+            self.assertEqual(len(tuple(expected_receipt_dir.glob("*.json"))), 2)
+            recovery_files = tuple(sorted(root.rglob(".*.tmp")))
+            self.assertTrue(recovery_files)
+            error_message = str(raised.exception)
+            self.assertIn("postlock_chain_receipts/777001", error_message)
+            self.assertIn("injected receipt unlink failure", error_message)
+            self.assertIn("recovery paths=", error_message)
+            self.assertTrue(all(str(path) in error_message for path in recovery_files))
 
     def test_concurrent_appends_are_serialized_without_acknowledged_loss(self):
         with tempfile.TemporaryDirectory() as temporary:

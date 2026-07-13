@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -676,6 +677,14 @@ class PostlockChainReceipt:
     lock_basis_start_utc: str
     receipt_hash: str
     audit_path: str
+
+
+@dataclass(frozen=True)
+class _CreatedPostlockReceipt:
+    path: Path
+    device: int
+    inode: int
+    contents: bytes
 
 
 @dataclass(frozen=True)
@@ -2095,7 +2104,9 @@ def _postlock_receipt_relative_path(
     )
 
 
-def _create_postlock_receipt_exclusive(root: Path, receipt: PostlockChainReceipt) -> Path:
+def _create_postlock_receipt_exclusive(
+    root: Path, receipt: PostlockChainReceipt
+) -> _CreatedPostlockReceipt:
     relative = _postlock_receipt_relative_path(
         receipt.game_pk, receipt.sequence, receipt.head_hash
     )
@@ -2111,16 +2122,53 @@ def _create_postlock_receipt_exclusive(root: Path, receipt: PostlockChainReceipt
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o444)
+    contents = canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n"
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             os.fchmod(stream.fileno(), 0o444)
-            stream.write(canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n")
+            stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
+            metadata = os.fstat(stream.fileno())
     finally:
         os.close(descriptor)
+    return _CreatedPostlockReceipt(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        contents=contents,
+    )
+
+
+def _remove_created_postlock_receipt(created: _CreatedPostlockReceipt) -> None:
+    path = created.path
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"new post-lock receipt disappeared before rollback: {path}"
+        ) from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_dev != created.device
+        or metadata.st_ino != created.inode
+    ):
+        raise ValueError(
+            f"refusing to remove replaced or aliased post-lock receipt: {path}"
+        )
+    if path.read_bytes() != created.contents:
+        raise ValueError(f"refusing to remove modified post-lock receipt: {path}")
+    path.unlink()
     _fsync_directory(path.parent)
-    return path
+    try:
+        path.parent.rmdir()
+    except OSError as exc:
+        if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+            return
+        raise
+    _fsync_directory(path.parent.parent)
 
 
 def load_postlock_chain_receipts(
@@ -2328,12 +2376,26 @@ def _initialize_postlock_chain_locked(
         event_log_path=log_relative.as_posix(),
     )
     receipt = _receipt_for_state(state, POSTLOCK_RECEIPT_GENESIS_HASH)
+    created_receipt: _CreatedPostlockReceipt | None = None
 
     def verify() -> None:
-        _create_postlock_receipt_exclusive(root_path, receipt)
+        nonlocal created_receipt
+        created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        _fsync_directory(created_receipt.path.parent)
         events, loaded = validate_persisted_postlock_chain(root_path, game_pk=game_pk)
         if events or loaded != state:
             raise ValueError("post-lock initialization postcondition failed")
+
+    def rollback_receipt() -> None:
+        if created_receipt is None:
+            return
+        try:
+            _remove_created_postlock_receipt(created_receipt)
+        except BaseException as exc:
+            raise RuntimeError(
+                "post-lock receipt rollback failed at "
+                f"{created_receipt.path}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     _publish_bundle(
         (
@@ -2341,6 +2403,7 @@ def _initialize_postlock_chain_locked(
             (state_path, canonical_json_bytes(_postlock_state_raw(state)) + b"\n"),
         ),
         post_publish=verify,
+        rollback_side_effect=rollback_receipt,
     )
     return state
 
@@ -2392,14 +2455,28 @@ def _append_and_persist_postlock_start_change_locked(
     )
     appended = (*events, event)
     receipt = _receipt_for_state(new_state, receipts[-1].receipt_hash)
+    created_receipt: _CreatedPostlockReceipt | None = None
 
     def verify() -> None:
-        _create_postlock_receipt_exclusive(root_path, receipt)
+        nonlocal created_receipt
+        created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        _fsync_directory(created_receipt.path.parent)
         loaded_events, loaded_state = validate_persisted_postlock_chain(
             root_path, game_pk=game_pk
         )
         if loaded_events != appended or loaded_state != new_state:
             raise ValueError("post-lock append postcondition failed")
+
+    def rollback_receipt() -> None:
+        if created_receipt is None:
+            return
+        try:
+            _remove_created_postlock_receipt(created_receipt)
+        except BaseException as exc:
+            raise RuntimeError(
+                "post-lock receipt rollback failed at "
+                f"{created_receipt.path}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     _publish_bundle(
         (
@@ -2410,6 +2487,7 @@ def _append_and_persist_postlock_start_change_locked(
             ),
         ),
         post_publish=verify,
+        rollback_side_effect=rollback_receipt,
     )
     return event, new_state
 
@@ -3161,6 +3239,7 @@ def _publish_bundle(
     entries: tuple[tuple[Path, bytes], ...],
     *,
     post_publish: Callable[[], None] | None = None,
+    rollback_side_effect: Callable[[], None] | None = None,
 ) -> None:
     final_paths = tuple(path for path, _ in entries)
     if len(set(final_paths)) != len(final_paths):
@@ -3169,7 +3248,9 @@ def _publish_bundle(
     temporary_paths: list[Path] = []
     backups: dict[Path, Path | None] = {}
     replaced: list[Path] = []
+    recovery_evidence_paths: list[Path] = []
     preserve_recovery_files = False
+    modes: dict[Path, int] = {}
     try:
         modes = {
             path: stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
@@ -3196,6 +3277,25 @@ def _publish_bundle(
             post_publish()
     except BaseException as publish_error:
         rollback_errors: list[tuple[str, BaseException]] = []
+        side_effect_failed = False
+        if rollback_side_effect is not None:
+            try:
+                rollback_side_effect()
+            except BaseException as error:
+                side_effect_failed = True
+                rollback_errors.append(("rollback_side_effect", error))
+        if side_effect_failed:
+            for final_path in replaced:
+                try:
+                    recovery_evidence_paths.append(
+                        _write_fsynced_temp(
+                            final_path,
+                            final_path.read_bytes(),
+                            mode=modes[final_path],
+                        )
+                    )
+                except BaseException as error:
+                    rollback_errors.append((str(final_path), error))
         for final_path in reversed(replaced):
             backup_path = backups[final_path]
             try:
@@ -3215,7 +3315,11 @@ def _publish_bundle(
             recovery_paths = tuple(
                 sorted(
                     str(path)
-                    for path in (*temporary_paths, *backups.values())
+                    for path in (
+                        *temporary_paths,
+                        *backups.values(),
+                        *recovery_evidence_paths,
+                    )
                     if path is not None and path.exists()
                 )
             )
@@ -3246,7 +3350,11 @@ def _publish_bundle(
         raise
     finally:
         if not preserve_recovery_files:
-            for temporary_path in (*temporary_paths, *backups.values()):
+            for temporary_path in (
+                *temporary_paths,
+                *backups.values(),
+                *recovery_evidence_paths,
+            ):
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
         for directory in created_directories:
