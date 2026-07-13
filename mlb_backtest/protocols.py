@@ -366,7 +366,7 @@ CURRENT_APPROVED_DESIGN_SHA256 = (
     "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "2f74e5b5bcba1be033f5955310b4f4261d33a7b7bcecdaa39cc2e021553641bf"
+    "d4b8fa399c5dc8138aff961fdbd0cb4fc92facdfb4dc9ae4e820a486ce4bcc5e"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -647,6 +647,48 @@ class ProspectiveSnapshot:
 
 
 @dataclass(frozen=True)
+class ProspectiveSnapshotReceipt:
+    official_date: str
+    game_pk: int
+    sequence: int
+    prior_receipt_hash: str
+    snapshot: ProspectiveSnapshot
+    snapshot_sha256: str
+    persisted_at_utc: str
+    receipt_hash: str
+    audit_path: str
+
+
+@dataclass(frozen=True)
+class ProspectiveSnapshotLedgerState:
+    official_date: str
+    game_pk: int
+    lock_basis_start_utc: str
+    lock_at_utc: str
+    status: str
+    snapshot_count: int
+    head_hash: str
+    selected_sequence: int | None
+    selected_snapshot_id: str | None
+    selected_snapshot_sha256: str | None
+    closed_at_utc: str | None
+    audit_path: str
+    receipt_directory: str
+
+
+@dataclass(frozen=True)
+class ProspectiveSnapshotStateAnchor:
+    official_date: str
+    game_pk: int
+    revision: int
+    prior_anchor_hash: str
+    state_sha256: str
+    persisted_at_utc: str
+    anchor_hash: str
+    audit_path: str
+
+
+@dataclass(frozen=True)
 class PostlockStartChange:
     game_pk: int
     sequence: int
@@ -720,6 +762,14 @@ class ProspectiveCandidateRow:
     lock_receipt_at_utc: str
     verified_snapshot: ProspectiveSnapshot | None = None
     snapshot_candidates: tuple[ProspectiveSnapshot, ...] = ()
+    selected_snapshot: ProspectiveSnapshot | None = None
+    snapshot_history: tuple[ProspectiveSnapshotReceipt, ...] = ()
+    snapshot_ledger_status: str = ""
+    snapshot_ledger_head: str = ""
+    snapshot_ledger_count: int = 0
+    snapshot_ledger_path: str = ""
+    snapshot_ledger_digest: str = ""
+    snapshot_ledger_state: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -910,6 +960,50 @@ def _build_prospective_literal() -> dict[str, object]:
                 "sequence",
             ],
             "selection": "latest_successful_complete_eligible_snapshot",
+            "snapshot_ledger": {
+                "state_path_template": (
+                    "audit/v5_2_qd/prospective_2026/snapshot_ledgers/"
+                    "{official_date}/{gamePk}/state.json"
+                ),
+                "append_receipt_path_template": (
+                    "audit/v5_2_qd/prospective_2026/snapshot_receipts/"
+                    "{official_date}/{gamePk}/{sequence:08d}-{receipt_hash}.json"
+                ),
+                "game_lock_path_template": (
+                    "audit/v5_2_qd/prospective_2026/snapshot_locks/"
+                    "{official_date}/{gamePk}.lock"
+                ),
+                "state_anchor_path_template": (
+                    "audit/v5_2_qd/prospective_2026/snapshot_state_anchors/"
+                    "{official_date}/{gamePk}/{revision:08d}-{anchor_hash}.json"
+                ),
+                "state_anchor_write": (
+                    "O_EXCL_fsync_read_only_every_transition"
+                ),
+                "receipt_time_source": "internal_trusted_clock_only",
+                "subsecond_policy": (
+                    "precise_boundary_comparison_then_ceil_canonical_storage"
+                ),
+                "sequence_source": "validated_disk_receipt_history",
+                "append_receipt_write": "O_EXCL_fsync_read_only",
+                "append_receipt_fields": [
+                    "official_date",
+                    "gamePk",
+                    "sequence",
+                    "prior_receipt_hash",
+                    "snapshot",
+                    "snapshot_sha256",
+                    "persisted_at_utc",
+                    "receipt_hash",
+                    "audit_path",
+                ],
+                "hash_chain": "sha256_canonical_json_with_genesis_zero_hash",
+                "close_policy": "at_lock_from_disk_history",
+                "close_chronology": "closed_at_gte_lock_and_latest_receipt",
+                "append_after_close_forbidden": True,
+                "candidate_history_authority": "preexisting_sealed_disk_ledger_only",
+                "missing_or_unsealed_disposition": "SYSTEM_MISS_INELIGIBLE",
+            },
         },
         "schedule_changes": {
             "prelock": "invalidate_prior_snapshots_and_restart_countdown",
@@ -1024,6 +1118,14 @@ def _build_prospective_literal() -> dict[str, object]:
                 "absolute_starter_edge",
                 "lock_basis_start_utc",
                 "lock_receipt_at_utc",
+                "snapshot_history",
+                "selected_snapshot",
+                "snapshot_ledger_state",
+                "snapshot_ledger_status",
+                "snapshot_ledger_head",
+                "snapshot_ledger_count",
+                "snapshot_ledger_path",
+                "snapshot_ledger_digest",
             ],
             "candidate_date_state": "CANDIDATE_ACTIVE",
             "candidate_top1_preclaim_forbidden": True,
@@ -1173,6 +1275,1140 @@ def parse_prospective_spec(raw: object) -> ProspectiveSpec:
 
 def load_prospective_spec(path: Path) -> ProspectiveSpec:
     return parse_prospective_spec(json.loads(path.read_text(encoding="utf-8")))
+
+
+SNAPSHOT_LEDGER_GENESIS_HASH = "0" * 64
+SNAPSHOT_LEDGER_STATE_KEYS = frozenset(
+    {
+        "official_date",
+        "gamePk",
+        "lock_basis_start_utc",
+        "lock_at_utc",
+        "status",
+        "snapshot_count",
+        "head_hash",
+        "selected_sequence",
+        "selected_snapshot_id",
+        "selected_snapshot_sha256",
+        "closed_at_utc",
+        "audit_path",
+        "receipt_directory",
+    }
+)
+SNAPSHOT_RECEIPT_KEYS = frozenset(
+    {
+        "official_date",
+        "gamePk",
+        "sequence",
+        "prior_receipt_hash",
+        "snapshot",
+        "snapshot_sha256",
+        "persisted_at_utc",
+        "receipt_hash",
+        "audit_path",
+    }
+)
+SNAPSHOT_RECORD_KEYS = frozenset(
+    {
+        "gamePk",
+        "lock_basis_start_utc",
+        "observed_scheduled_start_utc",
+        "lock_at_utc",
+        "receipt_at_utc",
+        "successful",
+        "complete_participants",
+        "ntp_offset_seconds",
+        "sequence",
+    }
+)
+SNAPSHOT_STATE_ANCHOR_KEYS = frozenset(
+    {
+        "official_date",
+        "gamePk",
+        "revision",
+        "prior_anchor_hash",
+        "state_sha256",
+        "persisted_at_utc",
+        "anchor_hash",
+        "audit_path",
+    }
+)
+
+
+def _trusted_utc_now() -> datetime:
+    """Internal wall-clock hook; tests patch this function, callers cannot."""
+    return datetime.now(timezone.utc)
+
+
+def _trusted_utc_now_value_and_string() -> tuple[datetime, str]:
+    current = _trusted_utc_now()
+    if not isinstance(current, datetime):
+        raise RuntimeError("trusted clock returned a non-datetime value")
+    if current.tzinfo is not None:
+        current = current.astimezone(timezone.utc).replace(tzinfo=None)
+    stored = current
+    if stored.microsecond:
+        stored = (stored + timedelta(seconds=1)).replace(microsecond=0)
+    return current, stored.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _trusted_utc_now_string() -> str:
+    return _trusted_utc_now_value_and_string()[1]
+
+
+def _validate_prospective_identity(
+    official_date: object,
+    game_pk: object,
+    lock_basis_start_utc: object | None = None,
+) -> tuple[str, int, datetime | None]:
+    try:
+        parsed_date = _canonical_date(official_date, "snapshot ledger official_date")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("snapshot ledger official_date must be canonical") from exc
+    if parsed_date < date(2026, 7, 13):
+        raise ValueError("snapshot ledger precedes first permitted date; backfill forbidden")
+    if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+        raise ValueError("snapshot ledger gamePk must be an exact positive integer")
+    basis: datetime | None = None
+    if lock_basis_start_utc is not None:
+        basis = _canonical_utc_datetime(
+            lock_basis_start_utc, "snapshot ledger lock_basis_start_utc"
+        )
+        basis_date = basis.replace(tzinfo=timezone.utc).astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        if basis_date != parsed_date:
+            raise ValueError("snapshot ledger official_date differs from lock basis")
+    return parsed_date.isoformat(), game_pk, basis
+
+
+def _snapshot_ledger_relatives(
+    official_date: str, game_pk: int
+) -> tuple[Path, Path, Path, Path]:
+    official_date, game_pk, _ = _validate_prospective_identity(
+        official_date, game_pk
+    )
+    base = Path("audit/v5_2_qd/prospective_2026")
+    return (
+        base / "snapshot_ledgers" / official_date / str(game_pk) / "state.json",
+        base / "snapshot_receipts" / official_date / str(game_pk),
+        base / "snapshot_state_anchors" / official_date / str(game_pk),
+        base / "snapshot_locks" / official_date / f"{game_pk}.lock",
+    )
+
+
+def _snapshot_ledger_paths(
+    root: Path, official_date: str, game_pk: int
+) -> tuple[Path, Path, Path, Path, Path]:
+    root_input = Path(root)
+    if root_input.is_symlink():
+        raise ValueError("snapshot ledger root symlink or alias is forbidden")
+    root_path = _reject_symlink_ancestors(root_input, "snapshot ledger root")
+    state_relative, receipts_relative, anchors_relative, lock_relative = (
+        _snapshot_ledger_relatives(official_date, game_pk)
+    )
+    for relative in (
+        state_relative,
+        receipts_relative,
+        anchors_relative,
+        lock_relative,
+    ):
+        target = root_path / relative
+        existing = target if target.exists() or target.is_symlink() else target.parent
+        _reject_symlink_ancestors(existing, "snapshot ledger path")
+    return (
+        root_path,
+        root_path / state_relative,
+        root_path / receipts_relative,
+        root_path / anchors_relative,
+        root_path / lock_relative,
+    )
+
+
+@contextmanager
+def _snapshot_ledger_lock(root: Path, official_date: str, game_pk: int):
+    root_path, _, _, _, lock_path = _snapshot_ledger_paths(
+        root, official_date, game_pk
+    )
+    created_directories = _create_postlock_receipt_directories(lock_path.parent)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        _remove_created_receipt_directories(created_directories)
+        raise ValueError("snapshot ledger lock symlink or alias is forbidden") from exc
+    locked = False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != 0
+        ):
+            raise ValueError("snapshot ledger lock hardlink or stale alias is forbidden")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield root_path
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _snapshot_ledger_state_raw(
+    state: ProspectiveSnapshotLedgerState,
+) -> dict[str, object]:
+    return {
+        "official_date": state.official_date,
+        "gamePk": state.game_pk,
+        "lock_basis_start_utc": state.lock_basis_start_utc,
+        "lock_at_utc": state.lock_at_utc,
+        "status": state.status,
+        "snapshot_count": state.snapshot_count,
+        "head_hash": state.head_hash,
+        "selected_sequence": state.selected_sequence,
+        "selected_snapshot_id": state.selected_snapshot_id,
+        "selected_snapshot_sha256": state.selected_snapshot_sha256,
+        "closed_at_utc": state.closed_at_utc,
+        "audit_path": state.audit_path,
+        "receipt_directory": state.receipt_directory,
+    }
+
+
+def _snapshot_receipt_payload(
+    receipt: ProspectiveSnapshotReceipt,
+) -> dict[str, object]:
+    return {
+        "official_date": receipt.official_date,
+        "gamePk": receipt.game_pk,
+        "sequence": receipt.sequence,
+        "prior_receipt_hash": receipt.prior_receipt_hash,
+        "snapshot": _prospective_snapshot_raw(receipt.snapshot),
+        "snapshot_sha256": receipt.snapshot_sha256,
+        "persisted_at_utc": receipt.persisted_at_utc,
+    }
+
+
+def _snapshot_receipt_raw(
+    receipt: ProspectiveSnapshotReceipt,
+) -> dict[str, object]:
+    return {
+        **_snapshot_receipt_payload(receipt),
+        "receipt_hash": receipt.receipt_hash,
+        "audit_path": receipt.audit_path,
+    }
+
+
+def _snapshot_receipt_hash(receipt: ProspectiveSnapshotReceipt) -> str:
+    return hashlib.sha256(canonical_json_bytes(_snapshot_receipt_payload(receipt))).hexdigest()
+
+
+def _snapshot_state_anchor_payload(
+    anchor: ProspectiveSnapshotStateAnchor,
+) -> dict[str, object]:
+    return {
+        "official_date": anchor.official_date,
+        "gamePk": anchor.game_pk,
+        "revision": anchor.revision,
+        "prior_anchor_hash": anchor.prior_anchor_hash,
+        "state_sha256": anchor.state_sha256,
+        "persisted_at_utc": anchor.persisted_at_utc,
+    }
+
+
+def _snapshot_state_anchor_raw(
+    anchor: ProspectiveSnapshotStateAnchor,
+) -> dict[str, object]:
+    return {
+        **_snapshot_state_anchor_payload(anchor),
+        "anchor_hash": anchor.anchor_hash,
+        "audit_path": anchor.audit_path,
+    }
+
+
+def _snapshot_state_anchor_hash(anchor: ProspectiveSnapshotStateAnchor) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(_snapshot_state_anchor_payload(anchor))
+    ).hexdigest()
+
+
+def _snapshot_state_anchor_relative_path(
+    official_date: str, game_pk: int, revision: int, anchor_hash: str
+) -> Path:
+    _, _, anchors, _ = _snapshot_ledger_relatives(official_date, game_pk)
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or not isinstance(anchor_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", anchor_hash)
+    ):
+        raise ValueError("snapshot state anchor identity is invalid")
+    return anchors / f"{revision:08d}-{anchor_hash}.json"
+
+
+def _new_snapshot_state_anchor(
+    state: ProspectiveSnapshotLedgerState,
+    *,
+    revision: int,
+    prior_anchor_hash: str,
+    persisted_at_utc: str,
+) -> ProspectiveSnapshotStateAnchor:
+    state_sha = hashlib.sha256(
+        canonical_json_bytes(_snapshot_ledger_state_raw(state))
+    ).hexdigest()
+    unsigned = ProspectiveSnapshotStateAnchor(
+        official_date=state.official_date,
+        game_pk=state.game_pk,
+        revision=revision,
+        prior_anchor_hash=prior_anchor_hash,
+        state_sha256=state_sha,
+        persisted_at_utc=persisted_at_utc,
+        anchor_hash="",
+        audit_path="",
+    )
+    anchor_hash = _snapshot_state_anchor_hash(unsigned)
+    relative = _snapshot_state_anchor_relative_path(
+        state.official_date, state.game_pk, revision, anchor_hash
+    )
+    return replace(
+        unsigned, anchor_hash=anchor_hash, audit_path=relative.as_posix()
+    )
+
+
+def _snapshot_receipt_relative_path(
+    official_date: str, game_pk: int, sequence: int, receipt_hash: str
+) -> Path:
+    _, receipts, _, _ = _snapshot_ledger_relatives(official_date, game_pk)
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence <= 0
+        or not isinstance(receipt_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_hash)
+    ):
+        raise ValueError("snapshot receipt identity is invalid")
+    return receipts / f"{sequence:08d}-{receipt_hash}.json"
+
+
+def _snapshot_from_raw(raw: object, path: str) -> ProspectiveSnapshot:
+    obj = require_exact_keys(raw, SNAPSHOT_RECORD_KEYS, path)
+    snapshot = ProspectiveSnapshot(
+        game_pk=obj["gamePk"],
+        lock_basis_start_utc=obj["lock_basis_start_utc"],
+        observed_scheduled_start_utc=obj["observed_scheduled_start_utc"],
+        lock_at_utc=obj["lock_at_utc"],
+        receipt_at_utc=obj["receipt_at_utc"],
+        successful=obj["successful"],
+        complete_participants=obj["complete_participants"],
+        ntp_offset_seconds=obj["ntp_offset_seconds"],
+        sequence=obj["sequence"],
+    )
+    if (
+        isinstance(snapshot.game_pk, bool)
+        or not isinstance(snapshot.game_pk, int)
+        or isinstance(snapshot.sequence, bool)
+        or not isinstance(snapshot.sequence, int)
+        or not isinstance(snapshot.successful, bool)
+        or not isinstance(snapshot.complete_participants, bool)
+    ):
+        raise ValueError(f"{path} typed fields are invalid")
+    finite_number(snapshot.ntp_offset_seconds, f"{path}.ntp_offset_seconds")
+    for value, label in (
+        (snapshot.lock_basis_start_utc, "lock basis"),
+        (snapshot.observed_scheduled_start_utc, "observed scheduled start"),
+        (snapshot.lock_at_utc, "lock at"),
+        (snapshot.receipt_at_utc, "receipt at"),
+    ):
+        _canonical_utc_datetime(value, f"{path} {label}")
+    return snapshot
+
+
+def _load_snapshot_receipts(
+    root: Path, *, official_date: str, game_pk: int
+) -> tuple[ProspectiveSnapshotReceipt, ...]:
+    root_path, _, receipt_dir, _, _ = _snapshot_ledger_paths(
+        root, official_date, game_pk
+    )
+    if not receipt_dir.exists():
+        return ()
+    metadata = receipt_dir.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("snapshot receipt directory symlink or alias is forbidden")
+    receipts: list[ProspectiveSnapshotReceipt] = []
+    prior_hash = SNAPSHOT_LEDGER_GENESIS_HASH
+    for expected_sequence, path in enumerate(sorted(receipt_dir.iterdir()), start=1):
+        contents = _read_regular_unaliased(path, "snapshot receipt")
+        try:
+            raw = json.loads(contents)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("snapshot receipt is not canonical JSON") from exc
+        obj = require_exact_keys(raw, SNAPSHOT_RECEIPT_KEYS, "snapshot_receipt")
+        snapshot = _snapshot_from_raw(obj["snapshot"], "snapshot_receipt.snapshot")
+        receipt = ProspectiveSnapshotReceipt(
+            official_date=obj["official_date"],
+            game_pk=obj["gamePk"],
+            sequence=obj["sequence"],
+            prior_receipt_hash=obj["prior_receipt_hash"],
+            snapshot=snapshot,
+            snapshot_sha256=obj["snapshot_sha256"],
+            persisted_at_utc=obj["persisted_at_utc"],
+            receipt_hash=obj["receipt_hash"],
+            audit_path=obj["audit_path"],
+        )
+        expected_relative = _snapshot_receipt_relative_path(
+            official_date, game_pk, expected_sequence, receipt.receipt_hash
+        )
+        expected_snapshot_sha = hashlib.sha256(
+            canonical_json_bytes(_prospective_snapshot_raw(snapshot))
+        ).hexdigest()
+        if (
+            contents != canonical_json_bytes(_snapshot_receipt_raw(receipt)) + b"\n"
+            or receipt.official_date != official_date
+            or receipt.game_pk != game_pk
+            or receipt.sequence != expected_sequence
+            or snapshot.game_pk != game_pk
+            or snapshot.sequence != expected_sequence
+            or receipt.prior_receipt_hash != prior_hash
+            or receipt.snapshot_sha256 != expected_snapshot_sha
+            or receipt.persisted_at_utc != snapshot.receipt_at_utc
+            or receipt.receipt_hash != _snapshot_receipt_hash(receipt)
+            or receipt.audit_path != expected_relative.as_posix()
+            or path != root_path / expected_relative
+        ):
+            raise ValueError("snapshot receipt chain, identity, or canonical bytes differ")
+        receipts.append(receipt)
+        prior_hash = receipt.receipt_hash
+    return tuple(receipts)
+
+
+def _load_snapshot_state_anchors(
+    root: Path, *, official_date: str, game_pk: int
+) -> tuple[ProspectiveSnapshotStateAnchor, ...]:
+    root_path, _, _, anchor_dir, _ = _snapshot_ledger_paths(
+        root, official_date, game_pk
+    )
+    if not anchor_dir.exists():
+        raise ValueError("snapshot state anchor history is missing")
+    metadata = anchor_dir.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("snapshot state anchor directory alias is forbidden")
+    anchors: list[ProspectiveSnapshotStateAnchor] = []
+    prior_hash = SNAPSHOT_LEDGER_GENESIS_HASH
+    for expected_revision, path in enumerate(sorted(anchor_dir.iterdir())):
+        contents = _read_regular_unaliased(path, "snapshot state anchor")
+        try:
+            raw = json.loads(contents)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("snapshot state anchor is not canonical JSON") from exc
+        obj = require_exact_keys(raw, SNAPSHOT_STATE_ANCHOR_KEYS, "snapshot_state_anchor")
+        anchor = ProspectiveSnapshotStateAnchor(
+            official_date=obj["official_date"],
+            game_pk=obj["gamePk"],
+            revision=obj["revision"],
+            prior_anchor_hash=obj["prior_anchor_hash"],
+            state_sha256=obj["state_sha256"],
+            persisted_at_utc=obj["persisted_at_utc"],
+            anchor_hash=obj["anchor_hash"],
+            audit_path=obj["audit_path"],
+        )
+        expected_relative = _snapshot_state_anchor_relative_path(
+            official_date, game_pk, expected_revision, anchor.anchor_hash
+        )
+        if (
+            contents != canonical_json_bytes(_snapshot_state_anchor_raw(anchor)) + b"\n"
+            or anchor.official_date != official_date
+            or anchor.game_pk != game_pk
+            or anchor.revision != expected_revision
+            or anchor.prior_anchor_hash != prior_hash
+            or anchor.anchor_hash != _snapshot_state_anchor_hash(anchor)
+            or anchor.audit_path != expected_relative.as_posix()
+            or path != root_path / expected_relative
+            or not re.fullmatch(r"[0-9a-f]{64}", anchor.state_sha256)
+        ):
+            raise ValueError("snapshot state anchor chain or identity differs")
+        _canonical_utc_datetime(
+            anchor.persisted_at_utc, "snapshot state anchor persisted_at_utc"
+        )
+        anchors.append(anchor)
+        prior_hash = anchor.anchor_hash
+    if not anchors:
+        raise ValueError("snapshot state anchor history is empty")
+    return tuple(anchors)
+
+
+def _parse_snapshot_ledger_state(
+    raw: object, *, official_date: str, game_pk: int, contents: bytes
+) -> ProspectiveSnapshotLedgerState:
+    obj = require_exact_keys(raw, SNAPSHOT_LEDGER_STATE_KEYS, "snapshot_ledger")
+    state = ProspectiveSnapshotLedgerState(
+        official_date=obj["official_date"],
+        game_pk=obj["gamePk"],
+        lock_basis_start_utc=obj["lock_basis_start_utc"],
+        lock_at_utc=obj["lock_at_utc"],
+        status=obj["status"],
+        snapshot_count=obj["snapshot_count"],
+        head_hash=obj["head_hash"],
+        selected_sequence=obj["selected_sequence"],
+        selected_snapshot_id=obj["selected_snapshot_id"],
+        selected_snapshot_sha256=obj["selected_snapshot_sha256"],
+        closed_at_utc=obj["closed_at_utc"],
+        audit_path=obj["audit_path"],
+        receipt_directory=obj["receipt_directory"],
+    )
+    state_relative, receipt_relative, _, _ = _snapshot_ledger_relatives(
+        official_date, game_pk
+    )
+    _, _, basis = _validate_prospective_identity(
+        official_date, game_pk, state.lock_basis_start_utc
+    )
+    assert basis is not None
+    if (
+        contents != canonical_json_bytes(_snapshot_ledger_state_raw(state)) + b"\n"
+        or state.official_date != official_date
+        or state.game_pk != game_pk
+        or state.lock_at_utc
+        != (basis - timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        or state.status not in {"OPEN", "CLOSED"}
+        or isinstance(state.snapshot_count, bool)
+        or not isinstance(state.snapshot_count, int)
+        or state.snapshot_count < 0
+        or not isinstance(state.head_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", state.head_hash)
+        or state.audit_path != state_relative.as_posix()
+        or state.receipt_directory != receipt_relative.as_posix()
+    ):
+        raise ValueError("snapshot ledger state identity or canonical bytes differ")
+    return state
+
+
+def load_prospective_snapshot_ledger(
+    root: Path, *, official_date: str, game_pk: int
+) -> tuple[ProspectiveSnapshotLedgerState, tuple[ProspectiveSnapshotReceipt, ...]]:
+    root_path, state_path, _, _, _ = _snapshot_ledger_paths(
+        root, official_date, game_pk
+    )
+    try:
+        contents = _read_regular_unaliased(state_path, "snapshot ledger state")
+    except ValueError as exc:
+        raise ValueError("snapshot ledger missing; SYSTEM_MISS") from exc
+    try:
+        raw = json.loads(contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("snapshot ledger state is not canonical JSON") from exc
+    state = _parse_snapshot_ledger_state(
+        raw, official_date=official_date, game_pk=game_pk, contents=contents
+    )
+    receipts = _load_snapshot_receipts(
+        root_path, official_date=official_date, game_pk=game_pk
+    )
+    anchors = _load_snapshot_state_anchors(
+        root_path, official_date=official_date, game_pk=game_pk
+    )
+    expected_head = receipts[-1].receipt_hash if receipts else SNAPSHOT_LEDGER_GENESIS_HASH
+    if state.snapshot_count != len(receipts) or state.head_hash != expected_head:
+        raise ValueError("snapshot ledger tail rollback or state count/head differs")
+    if state.status == "OPEN":
+        expected_anchor_count = state.snapshot_count + 1
+        if any(
+            value is not None
+            for value in (
+                state.selected_sequence,
+                state.selected_snapshot_id,
+                state.selected_snapshot_sha256,
+                state.closed_at_utc,
+            )
+        ):
+            raise ValueError("open snapshot ledger contains closed-state fields")
+    else:
+        expected_anchor_count = state.snapshot_count + 2
+        if state.closed_at_utc is None:
+            raise ValueError("closed snapshot ledger has no close time")
+        closed_at = _canonical_utc_datetime(
+            state.closed_at_utc, "snapshot ledger closed_at_utc"
+        )
+        lock_at = _canonical_utc_datetime(
+            state.lock_at_utc, "snapshot ledger lock_at_utc"
+        )
+        latest_persisted = (
+            _canonical_utc_datetime(
+                receipts[-1].persisted_at_utc, "snapshot receipt persisted_at_utc"
+            )
+            if receipts
+            else lock_at
+        )
+        if closed_at < lock_at or closed_at < latest_persisted:
+            raise ValueError("snapshot ledger close chronology precedes lock or receipt")
+        selected = _select_snapshot_from_receipts(receipts, state)
+        if selected is None:
+            if any(
+                value is not None
+                for value in (
+                    state.selected_sequence,
+                    state.selected_snapshot_id,
+                    state.selected_snapshot_sha256,
+                )
+            ):
+                raise ValueError("closed snapshot ledger selected fields differ")
+        else:
+            selected_sha = hashlib.sha256(
+                canonical_json_bytes(_prospective_snapshot_raw(selected))
+            ).hexdigest()
+            if (
+                state.selected_sequence != selected.sequence
+                or state.selected_snapshot_sha256 != selected_sha
+                or state.selected_snapshot_id
+                != _prospective_snapshot_id(selected, selected_sha)
+            ):
+                raise ValueError("closed snapshot ledger selected snapshot differs")
+    current_state_sha = hashlib.sha256(
+        canonical_json_bytes(_snapshot_ledger_state_raw(state))
+    ).hexdigest()
+    if (
+        len(anchors) != expected_anchor_count
+        or anchors[-1].state_sha256 != current_state_sha
+    ):
+        raise ValueError("snapshot state anchor revision or state digest differs")
+    return state, receipts
+
+
+def _select_snapshot_from_receipts(
+    receipts: tuple[ProspectiveSnapshotReceipt, ...],
+    state: ProspectiveSnapshotLedgerState,
+) -> ProspectiveSnapshot | None:
+    basis = _canonical_utc_datetime(
+        state.lock_basis_start_utc, "snapshot ledger lock basis"
+    )
+    lock_at = basis - timedelta(minutes=45)
+    window_start = basis - timedelta(minutes=50)
+    selected: ProspectiveSnapshot | None = None
+    for receipt in receipts:
+        snapshot = receipt.snapshot
+        received = _canonical_utc_datetime(snapshot.receipt_at_utc, "snapshot receipt")
+        if (
+            snapshot.lock_basis_start_utc == state.lock_basis_start_utc
+            and snapshot.observed_scheduled_start_utc == state.lock_basis_start_utc
+            and snapshot.lock_at_utc == state.lock_at_utc
+            and window_start <= received <= lock_at
+            and abs(finite_number(snapshot.ntp_offset_seconds, "ntp_offset_seconds"))
+            <= 2
+            and snapshot.successful
+            and snapshot.complete_participants
+        ):
+            selected = snapshot
+    return selected
+
+
+def initialize_prospective_snapshot_ledger(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    lock_basis_start_utc: str,
+) -> ProspectiveSnapshotLedgerState:
+    official_date, game_pk, basis = _validate_prospective_identity(
+        official_date, game_pk, lock_basis_start_utc
+    )
+    assert basis is not None
+    lock_at = basis - timedelta(minutes=45)
+    state_relative, receipt_relative, _, _ = _snapshot_ledger_relatives(
+        official_date, game_pk
+    )
+    state = ProspectiveSnapshotLedgerState(
+        official_date=official_date,
+        game_pk=game_pk,
+        lock_basis_start_utc=lock_basis_start_utc,
+        lock_at_utc=lock_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        status="OPEN",
+        snapshot_count=0,
+        head_hash=SNAPSHOT_LEDGER_GENESIS_HASH,
+        selected_sequence=None,
+        selected_snapshot_id=None,
+        selected_snapshot_sha256=None,
+        closed_at_utc=None,
+        audit_path=state_relative.as_posix(),
+        receipt_directory=receipt_relative.as_posix(),
+    )
+    with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        _, state_path, _, _, _ = _snapshot_ledger_paths(
+            root_path, official_date, game_pk
+        )
+        if state_path.exists() or state_path.is_symlink():
+            existing, _ = load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+            if existing != state:
+                raise ValueError("snapshot ledger is already initialized and differs")
+            return existing
+        now, now_string = _trusted_utc_now_value_and_string()
+        if now > lock_at:
+            raise ValueError(
+                "snapshot ledger initialization after lock is backfill forbidden"
+            )
+        anchor = _new_snapshot_state_anchor(
+            state,
+            revision=0,
+            prior_anchor_hash=SNAPSHOT_LEDGER_GENESIS_HASH,
+            persisted_at_utc=now_string,
+        )
+        created_anchor: _CreatedPostlockReceipt | None = None
+
+        def verify() -> None:
+            nonlocal created_anchor
+            created_anchor = _write_snapshot_state_anchor_exclusive(
+                root_path, anchor
+            )
+            load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+
+        def rollback() -> None:
+            if created_anchor is not None:
+                _remove_created_postlock_receipt(created_anchor)
+
+        _publish_bundle(
+            ((state_path, canonical_json_bytes(_snapshot_ledger_state_raw(state)) + b"\n"),),
+            root=root_path,
+            post_publish=verify,
+            rollback_side_effect=rollback,
+        )
+    return state
+
+
+def _write_snapshot_receipt_exclusive(
+    root: Path, receipt: ProspectiveSnapshotReceipt
+) -> _CreatedPostlockReceipt:
+    relative = _snapshot_receipt_relative_path(
+        receipt.official_date,
+        receipt.game_pk,
+        receipt.sequence,
+        receipt.receipt_hash,
+    )
+    if receipt.audit_path != relative.as_posix():
+        raise ValueError("snapshot receipt audit path differs")
+    path = Path(root) / relative
+    created_directories = _create_postlock_receipt_directories(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o444)
+    except BaseException:
+        _remove_created_receipt_directories(created_directories)
+        raise
+    contents = canonical_json_bytes(_snapshot_receipt_raw(receipt)) + b"\n"
+    metadata: os.stat_result | None = None
+    written_total = 0
+    creation_error: BaseException | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("new snapshot receipt is not regular and unaliased")
+        os.fchmod(descriptor, 0o444)
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if (
+                isinstance(written, bool)
+                or not isinstance(written, int)
+                or written <= 0
+                or written > len(view)
+            ):
+                raise OSError("snapshot receipt write made no progress")
+            written_total += written
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException as exc:
+        creation_error = exc
+    close_error: BaseException | None = None
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        close_error = exc
+    if creation_error is not None or close_error is not None:
+        if metadata is None:
+            raise _PostlockReceiptRecoveryError(
+                "snapshot receipt creation identity recovery failed; "
+                f"recovery path={path}",
+                (path,),
+            ) from (creation_error or close_error)
+        created_prefix = _CreatedPostlockReceipt(
+            path=path,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            contents=contents[:written_total],
+            created_directories=created_directories,
+        )
+        try:
+            _remove_created_postlock_receipt(created_prefix)
+        except BaseException as cleanup_error:
+            raise _PostlockReceiptRecoveryError(
+                "snapshot receipt creation recovery refused a replaced or modified "
+                f"path; creation error={creation_error}; close error={close_error}; "
+                f"recovery path={path}",
+                (path,),
+            ) from cleanup_error
+        if creation_error is not None:
+            raise creation_error
+        assert close_error is not None
+        raise close_error
+    _fsync_directory(path.parent)
+    if metadata is None:
+        raise RuntimeError("snapshot receipt identity was not recorded")
+    return _CreatedPostlockReceipt(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        contents=contents,
+        created_directories=created_directories,
+    )
+
+
+def _write_snapshot_state_anchor_exclusive(
+    root: Path, anchor: ProspectiveSnapshotStateAnchor
+) -> _CreatedPostlockReceipt:
+    relative = _snapshot_state_anchor_relative_path(
+        anchor.official_date, anchor.game_pk, anchor.revision, anchor.anchor_hash
+    )
+    if (
+        anchor.audit_path != relative.as_posix()
+        or anchor.anchor_hash != _snapshot_state_anchor_hash(anchor)
+    ):
+        raise ValueError("snapshot state anchor identity differs")
+    path = Path(root) / relative
+    created_directories = _create_postlock_receipt_directories(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o444)
+    except BaseException:
+        _remove_created_receipt_directories(created_directories)
+        raise
+    contents = canonical_json_bytes(_snapshot_state_anchor_raw(anchor)) + b"\n"
+    metadata: os.stat_result | None = None
+    written_total = 0
+    creation_error: BaseException | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("new snapshot state anchor is aliased")
+        os.fchmod(descriptor, 0o444)
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if (
+                isinstance(written, bool)
+                or not isinstance(written, int)
+                or written <= 0
+                or written > len(view)
+            ):
+                raise OSError("snapshot state anchor write made no progress")
+            written_total += written
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException as exc:
+        creation_error = exc
+    close_error: BaseException | None = None
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        close_error = exc
+    if creation_error is not None or close_error is not None:
+        if metadata is None:
+            raise _PostlockReceiptRecoveryError(
+                f"snapshot state anchor identity recovery failed at {path}",
+                (path,),
+            ) from (creation_error or close_error)
+        created_prefix = _CreatedPostlockReceipt(
+            path=path,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            contents=contents[:written_total],
+            created_directories=created_directories,
+        )
+        try:
+            _remove_created_postlock_receipt(created_prefix)
+        except BaseException as cleanup_error:
+            raise _PostlockReceiptRecoveryError(
+                f"snapshot state anchor recovery refused replaced path {path}",
+                (path,),
+            ) from cleanup_error
+        if creation_error is not None:
+            raise creation_error
+        assert close_error is not None
+        raise close_error
+    _fsync_directory(path.parent)
+    assert metadata is not None
+    return _CreatedPostlockReceipt(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        contents=contents,
+        created_directories=created_directories,
+    )
+
+
+def record_prospective_snapshot(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    observed_scheduled_start_utc: str,
+    successful: bool,
+    away_starter_present: bool,
+    home_starter_present: bool,
+    away_lineup_count: int,
+    home_lineup_count: int,
+    ntp_offset_seconds: float,
+) -> ProspectiveSnapshotReceipt:
+    with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        state, receipts = load_prospective_snapshot_ledger(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        anchors = _load_snapshot_state_anchors(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
+        if state.status != "OPEN":
+            raise ValueError("snapshot ledger is closed; append forbidden")
+        if (
+            not isinstance(successful, bool)
+            or not isinstance(away_starter_present, bool)
+            or not isinstance(home_starter_present, bool)
+            or isinstance(away_lineup_count, bool)
+            or not isinstance(away_lineup_count, int)
+            or isinstance(home_lineup_count, bool)
+            or not isinstance(home_lineup_count, int)
+            or not 0 <= away_lineup_count <= 9
+            or not 0 <= home_lineup_count <= 9
+        ):
+            raise ValueError("snapshot participant completeness fields are invalid")
+        _canonical_utc_datetime(
+            observed_scheduled_start_utc, "observed_scheduled_start_utc"
+        )
+        offset = finite_number(ntp_offset_seconds, "ntp_offset_seconds")
+        now, now_string = _trusted_utc_now_value_and_string()
+        if now > lock_at:
+            raise ValueError("snapshot receipt is after lock; append forbidden")
+        sequence = len(receipts) + 1
+        complete = (
+            away_starter_present
+            and home_starter_present
+            and away_lineup_count == 9
+            and home_lineup_count == 9
+        )
+        snapshot = ProspectiveSnapshot(
+            game_pk=game_pk,
+            lock_basis_start_utc=state.lock_basis_start_utc,
+            observed_scheduled_start_utc=observed_scheduled_start_utc,
+            lock_at_utc=state.lock_at_utc,
+            receipt_at_utc=now_string,
+            successful=successful,
+            complete_participants=complete,
+            ntp_offset_seconds=offset,
+            sequence=sequence,
+        )
+        snapshot_sha = hashlib.sha256(
+            canonical_json_bytes(_prospective_snapshot_raw(snapshot))
+        ).hexdigest()
+        unsigned = ProspectiveSnapshotReceipt(
+            official_date=official_date,
+            game_pk=game_pk,
+            sequence=sequence,
+            prior_receipt_hash=(
+                receipts[-1].receipt_hash if receipts else SNAPSHOT_LEDGER_GENESIS_HASH
+            ),
+            snapshot=snapshot,
+            snapshot_sha256=snapshot_sha,
+            persisted_at_utc=now_string,
+            receipt_hash="",
+            audit_path="",
+        )
+        receipt_hash = _snapshot_receipt_hash(unsigned)
+        relative = _snapshot_receipt_relative_path(
+            official_date, game_pk, sequence, receipt_hash
+        )
+        receipt = replace(
+            unsigned, receipt_hash=receipt_hash, audit_path=relative.as_posix()
+        )
+        new_state = replace(
+            state, snapshot_count=sequence, head_hash=receipt.receipt_hash
+        )
+        state_anchor = _new_snapshot_state_anchor(
+            new_state,
+            revision=len(anchors),
+            prior_anchor_hash=anchors[-1].anchor_hash,
+            persisted_at_utc=now_string,
+        )
+        _, state_path, _, _, _ = _snapshot_ledger_paths(
+            root_path, official_date, game_pk
+        )
+        created_receipt: _CreatedPostlockReceipt | None = None
+        created_anchor: _CreatedPostlockReceipt | None = None
+
+        def verify() -> None:
+            nonlocal created_receipt, created_anchor
+            created_receipt = _write_snapshot_receipt_exclusive(root_path, receipt)
+            created_anchor = _write_snapshot_state_anchor_exclusive(
+                root_path, state_anchor
+            )
+            loaded_state, loaded_receipts = load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+            if loaded_state != new_state or loaded_receipts != (*receipts, receipt):
+                raise ValueError("snapshot ledger append postcondition failed")
+
+        def rollback() -> None:
+            if created_anchor is not None:
+                _remove_created_postlock_receipt(created_anchor)
+            if created_receipt is not None:
+                _remove_created_postlock_receipt(created_receipt)
+
+        _publish_bundle(
+            ((state_path, canonical_json_bytes(_snapshot_ledger_state_raw(new_state)) + b"\n"),),
+            root=root_path,
+            post_publish=verify,
+            rollback_side_effect=rollback,
+        )
+        return receipt
+
+
+def seal_prospective_snapshot_ledger(
+    root: Path, *, official_date: str, game_pk: int
+) -> ProspectiveSnapshotLedgerState:
+    with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        state, receipts = load_prospective_snapshot_ledger(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        if state.status == "CLOSED":
+            return state
+        anchors = _load_snapshot_state_anchors(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        now, now_string = _trusted_utc_now_value_and_string()
+        lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
+        if now < lock_at:
+            raise ValueError("snapshot ledger cannot close before lock")
+        selected = _select_snapshot_from_receipts(receipts, state)
+        selected_sha = (
+            hashlib.sha256(canonical_json_bytes(_prospective_snapshot_raw(selected))).hexdigest()
+            if selected is not None
+            else None
+        )
+        closed = replace(
+            state,
+            status="CLOSED",
+            selected_sequence=selected.sequence if selected is not None else None,
+            selected_snapshot_id=(
+                _prospective_snapshot_id(selected, selected_sha)
+                if selected is not None and selected_sha is not None
+                else None
+            ),
+            selected_snapshot_sha256=selected_sha,
+            closed_at_utc=now_string,
+        )
+        state_anchor = _new_snapshot_state_anchor(
+            closed,
+            revision=len(anchors),
+            prior_anchor_hash=anchors[-1].anchor_hash,
+            persisted_at_utc=now_string,
+        )
+        _, state_path, _, _, _ = _snapshot_ledger_paths(
+            root_path, official_date, game_pk
+        )
+        created_anchor: _CreatedPostlockReceipt | None = None
+
+        def verify() -> None:
+            nonlocal created_anchor
+            created_anchor = _write_snapshot_state_anchor_exclusive(
+                root_path, state_anchor
+            )
+            loaded, loaded_receipts = load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+            if loaded != closed or loaded_receipts != receipts:
+                raise ValueError("snapshot ledger close postcondition failed")
+
+        def rollback() -> None:
+            if created_anchor is not None:
+                _remove_created_postlock_receipt(created_anchor)
+
+        _publish_bundle(
+            ((state_path, canonical_json_bytes(_snapshot_ledger_state_raw(closed)) + b"\n"),),
+            root=root_path,
+            post_publish=verify,
+            rollback_side_effect=rollback,
+        )
+        return closed
+
+
+def _snapshot_ledger_digest(state: ProspectiveSnapshotLedgerState) -> str:
+    return hashlib.sha256(canonical_json_bytes(_snapshot_ledger_state_raw(state))).hexdigest()
+
+
+def build_prospective_candidate(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    p_home: float,
+    critical: bool,
+    eligibility_status: str,
+    data_completeness_score: float,
+    absolute_starter_edge: float,
+) -> ProspectiveCandidateRow:
+    state, receipts = load_prospective_snapshot_ledger(
+        root, official_date=official_date, game_pk=game_pk
+    )
+    if state.status != "CLOSED":
+        raise ValueError("snapshot ledger is unsealed; SYSTEM_MISS")
+    selected = _select_snapshot_from_receipts(receipts, state)
+    if selected is None:
+        raise ValueError("sealed snapshot ledger has no qualifying complete snapshot")
+    probability = finite_number(p_home, "candidate.p_home")
+    side = "home" if probability > 0.5 else "away"
+    row = ProspectiveCandidateRow(
+        game_pk=game_pk,
+        official_date=official_date,
+        recorded_at_utc=selected.receipt_at_utc,
+        retrospective_backfill=False,
+        p_home=probability,
+        predicted_side=side,
+        verified_snapshot_id=state.selected_snapshot_id or "",
+        verified_snapshot_sha256=state.selected_snapshot_sha256 or "",
+        sealed_lock_snapshot_id=state.selected_snapshot_id or "",
+        sealed_lock_snapshot_sha256=state.selected_snapshot_sha256 or "",
+        provenance="TIMESTAMP_VERIFIED_T45",
+        lock_state="SEALED",
+        final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
+        critical=critical,
+        eligibility_status=eligibility_status,
+        date_state="CANDIDATE_ACTIVE",
+        data_completeness_score=data_completeness_score,
+        absolute_starter_edge=absolute_starter_edge,
+        lock_basis_start_utc=state.lock_basis_start_utc,
+        lock_receipt_at_utc=state.lock_at_utc,
+        verified_snapshot=selected,
+        snapshot_candidates=tuple(receipt.snapshot for receipt in receipts),
+        selected_snapshot=selected,
+        snapshot_history=receipts,
+        snapshot_ledger_status=state.status,
+        snapshot_ledger_head=state.head_hash,
+        snapshot_ledger_count=state.snapshot_count,
+        snapshot_ledger_path=state.audit_path,
+        snapshot_ledger_digest=_snapshot_ledger_digest(state),
+        snapshot_ledger_state=deep_freeze(_snapshot_ledger_state_raw(state)),
+    )
+    if not eligible_for_prospective_official_pool(row):
+        raise ValueError("candidate from sealed snapshot ledger is ineligible")
+    return row
 
 
 def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool:
@@ -1355,6 +2591,24 @@ def _prospective_candidate_raw(
         "absolute_starter_edge": candidate.absolute_starter_edge,
         "lock_basis_start_utc": candidate.lock_basis_start_utc,
         "lock_receipt_at_utc": candidate.lock_receipt_at_utc,
+        "snapshot_history": [
+            _snapshot_receipt_raw(receipt) for receipt in candidate.snapshot_history
+        ],
+        "selected_snapshot": (
+            _prospective_snapshot_raw(candidate.selected_snapshot)
+            if candidate.selected_snapshot is not None
+            else None
+        ),
+        "snapshot_ledger_status": candidate.snapshot_ledger_status,
+        "snapshot_ledger_head": candidate.snapshot_ledger_head,
+        "snapshot_ledger_count": candidate.snapshot_ledger_count,
+        "snapshot_ledger_path": candidate.snapshot_ledger_path,
+        "snapshot_ledger_digest": candidate.snapshot_ledger_digest,
+        "snapshot_ledger_state": (
+            dict(candidate.snapshot_ledger_state)
+            if candidate.snapshot_ledger_state is not None
+            else None
+        ),
     }
 
 
@@ -1459,6 +2713,37 @@ def _candidate_slate_routing_date(
     official_date = candidates[0].official_date
     _canonical_date(official_date, "candidate slate lock official_date")
     return official_date
+
+
+def _reload_candidates_from_snapshot_ledgers(
+    root: Path,
+    *,
+    official_date: str,
+    candidates: tuple[ProspectiveCandidateRow, ...],
+) -> tuple[ProspectiveCandidateRow, ...]:
+    _canonical_date(official_date, "candidate slate official_date")
+    if not isinstance(candidates, tuple) or not all(
+        isinstance(candidate, ProspectiveCandidateRow) for candidate in candidates
+    ):
+        raise ValueError("prospective candidates must be a typed tuple")
+    if not candidates:
+        raise ValueError("candidate slate requires at least one eligible candidate")
+    if any(candidate.official_date != official_date for candidate in candidates):
+        raise ValueError("candidate slate must contain one official date")
+    refreshed: list[ProspectiveCandidateRow] = []
+    for candidate in candidates:
+        derived = build_prospective_candidate(
+            root,
+            official_date=official_date,
+            game_pk=candidate.game_pk,
+            p_home=candidate.p_home,
+            critical=candidate.critical,
+            eligibility_status=candidate.eligibility_status,
+            data_completeness_score=candidate.data_completeness_score,
+            absolute_starter_edge=candidate.absolute_starter_edge,
+        )
+        refreshed.append(derived)
+    return tuple(refreshed)
 
 
 @contextmanager
@@ -1698,16 +2983,23 @@ def _write_prospective_candidate_slate_locked(
 def write_prospective_candidate_slate(
     root: Path,
     *,
+    official_date: str,
     candidates: tuple[ProspectiveCandidateRow, ...],
-    persisted_at_utc: str,
 ) -> ProspectiveCandidateSlate:
-    routing_date = _candidate_slate_routing_date(candidates)
+    routing_date = _canonical_date(
+        official_date, "candidate slate official_date"
+    ).isoformat()
     with _candidate_slate_seal_lock(root, routing_date) as root_path:
+        derived_candidates = _reload_candidates_from_snapshot_ledgers(
+            root_path,
+            official_date=routing_date,
+            candidates=candidates,
+        )
         return _write_prospective_candidate_slate_locked(
             root_path,
             routing_date=routing_date,
-            candidates=candidates,
-            persisted_at_utc=persisted_at_utc,
+            candidates=derived_candidates,
+            persisted_at_utc=_trusted_utc_now_string(),
         )
 
 
@@ -1718,6 +3010,11 @@ def select_prospective_top1(
     candidates: tuple[ProspectiveCandidateRow, ...],
 ) -> ProspectiveTop1:
     slate = load_prospective_candidate_slate(root, official_date=official_date)
+    candidates = _reload_candidates_from_snapshot_ledgers(
+        root,
+        official_date=official_date,
+        candidates=candidates,
+    )
     (
         projected_date,
         candidate_ids,

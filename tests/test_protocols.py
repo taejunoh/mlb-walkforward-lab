@@ -1,6 +1,7 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 from threading import Barrier, BrokenBarrierError
 from unittest.mock import patch
 import copy
@@ -70,6 +71,580 @@ PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
 
 
 class ProspectiveProtocolTest(unittest.TestCase):
+    def _trusted_clock(self, value):
+        return patch(
+            "mlb_backtest.protocols._trusted_utc_now",
+            return_value=datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+    def _sealed_snapshot_ledger(
+        self,
+        root,
+        *,
+        game_pk=777001,
+        official_date="2026-07-13",
+        basis="2026-07-13T23:10:00Z",
+        receipts=(
+            ("2026-07-13T22:24:00Z", True, True),
+        ),
+    ):
+        with self._trusted_clock("2026-07-13T21:00:00Z"):
+            protocols.initialize_prospective_snapshot_ledger(
+                root,
+                official_date=official_date,
+                game_pk=game_pk,
+                lock_basis_start_utc=basis,
+            )
+        for receipt_at, successful, complete in receipts:
+            with self._trusted_clock(receipt_at):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date=official_date,
+                    game_pk=game_pk,
+                    observed_scheduled_start_utc=basis,
+                    successful=successful,
+                    away_starter_present=complete,
+                    home_starter_present=complete,
+                    away_lineup_count=9 if complete else 8,
+                    home_lineup_count=9,
+                    ntp_offset_seconds=0.25,
+                )
+        with self._trusted_clock("2026-07-13T22:25:00Z"):
+            return protocols.seal_prospective_snapshot_ledger(
+                root,
+                official_date=official_date,
+                game_pk=game_pk,
+            )
+
+    def _disk_candidate(self, root, *, game_pk=777001, p_home=0.63):
+        return protocols.build_prospective_candidate(
+            root,
+            official_date="2026-07-13",
+            game_pk=game_pk,
+            p_home=p_home,
+            critical=False,
+            eligibility_status="ELIGIBLE",
+            data_completeness_score=8.5,
+            absolute_starter_edge=4.0,
+        )
+
+    def test_snapshot_ledger_uses_trusted_clock_and_seals_disk_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = self._sealed_snapshot_ledger(
+                root,
+                receipts=(
+                    ("2026-07-13T22:20:00Z", True, True),
+                    ("2026-07-13T22:24:00Z", True, True),
+                    ("2026-07-13T22:24:30Z", False, False),
+                ),
+            )
+            loaded, receipts = protocols.load_prospective_snapshot_ledger(
+                root,
+                official_date="2026-07-13",
+                game_pk=777001,
+            )
+            self.assertEqual(loaded, state)
+            self.assertEqual(state.status, "CLOSED")
+            self.assertEqual(state.snapshot_count, 3)
+            self.assertEqual(state.selected_sequence, 2)
+            self.assertEqual(receipts[-1].snapshot.receipt_at_utc, "2026-07-13T22:24:30Z")
+            self.assertEqual(receipts[-1].persisted_at_utc, "2026-07-13T22:24:30Z")
+            self.assertEqual(receipts[-1].snapshot.sequence, 3)
+            self.assertEqual(receipts[-1].snapshot.complete_participants, False)
+            self.assertEqual(receipts[-1].prior_receipt_hash, receipts[-2].receipt_hash)
+            self.assertRegex(state.head_hash, r"^[0-9a-f]{64}$")
+            self.assertIn("snapshot_ledgers/2026-07-13/777001", state.audit_path)
+
+    def test_snapshot_ledger_rejects_backfill_late_append_and_empty_root_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2020-07-13T21:00:00Z"):
+                with self.assertRaisesRegex(ValueError, "first permitted|backfill"):
+                    protocols.initialize_prospective_snapshot_ledger(
+                        root,
+                        official_date="2020-07-13",
+                        game_pk=777001,
+                        lock_basis_start_utc="2020-07-13T23:10:00Z",
+                    )
+            with self.assertRaisesRegex(ValueError, "ledger.*missing|SYSTEM_MISS"):
+                protocols.build_prospective_candidate(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    p_home=0.63,
+                    critical=False,
+                    eligibility_status="ELIGIBLE",
+                    data_completeness_score=8.5,
+                    absolute_starter_edge=4.0,
+                )
+            self._sealed_snapshot_ledger(root)
+            with self._trusted_clock("2026-07-13T22:25:01Z"):
+                with self.assertRaisesRegex(ValueError, "closed|after lock"):
+                    protocols.record_prospective_snapshot(
+                        root,
+                        official_date="2026-07-13",
+                        game_pk=777001,
+                        observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                        successful=False,
+                        away_starter_present=False,
+                        home_starter_present=False,
+                        away_lineup_count=0,
+                        home_lineup_count=0,
+                        ntp_offset_seconds=0.25,
+                    )
+
+    def test_candidate_digest_binds_full_ordered_ledger_history(self):
+        with tempfile.TemporaryDirectory() as first_temp, tempfile.TemporaryDirectory() as second_temp:
+            first_root = Path(first_temp).resolve()
+            second_root = Path(second_temp).resolve()
+            self._sealed_snapshot_ledger(first_root)
+            self._sealed_snapshot_ledger(
+                second_root,
+                receipts=(
+                    ("2026-07-13T22:24:00Z", True, True),
+                    ("2026-07-13T22:24:30Z", False, False),
+                ),
+            )
+            first = self._disk_candidate(first_root)
+            second = self._disk_candidate(second_root)
+            self.assertNotEqual(
+                protocols._prospective_candidate_raw(first),
+                protocols._prospective_candidate_raw(second),
+            )
+            self.assertEqual(len(second.snapshot_history), 2)
+            self.assertEqual(second.snapshot_ledger_count, 2)
+            self.assertEqual(second.selected_snapshot.sequence, 1)
+            self.assertEqual(second.snapshot_ledger_state["status"], "CLOSED")
+            self.assertEqual(second.snapshot_ledger_state["snapshot_count"], 2)
+            self.assertNotEqual(first.snapshot_ledger_digest, second.snapshot_ledger_digest)
+
+    def test_official_slate_reloads_sealed_ledgers_and_rejects_fabrication_or_rollback(self):
+        fabricated = self._candidate()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                with self.assertRaisesRegex(ValueError, "ledger.*missing|SYSTEM_MISS"):
+                    protocols.write_prospective_candidate_slate(
+                        root,
+                        official_date="2026-07-13",
+                        candidates=(fabricated,),
+                    )
+            self._sealed_snapshot_ledger(
+                root,
+                receipts=(
+                    ("2026-07-13T22:24:00Z", True, True),
+                    ("2026-07-13T22:24:30Z", False, False),
+                ),
+            )
+            candidate = self._disk_candidate(root)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            self.assertEqual(slate.expected_candidate_count, 1)
+            state, receipts = protocols.load_prospective_snapshot_ledger(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            self.assertEqual(state.snapshot_count, 2)
+            (root / receipts[-1].audit_path).unlink()
+            with self.assertRaisesRegex(ValueError, "tail rollback|count/head"):
+                protocols.select_prospective_top1(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+
+    def test_snapshot_ledger_parallel_append_is_serialized_and_tail_rollback_detected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+
+            def append(successful):
+                with self._trusted_clock("2026-07-13T22:24:00Z"):
+                    return protocols.record_prospective_snapshot(
+                        root,
+                        official_date="2026-07-13",
+                        game_pk=777001,
+                        observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                        successful=successful,
+                        away_starter_present=True,
+                        home_starter_present=True,
+                        away_lineup_count=9,
+                        home_lineup_count=9,
+                        ntp_offset_seconds=0.25,
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                receipts = tuple(executor.map(append, (True, False)))
+            self.assertEqual({receipt.sequence for receipt in receipts}, {1, 2})
+            state, loaded = protocols.load_prospective_snapshot_ledger(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            self.assertEqual(state.snapshot_count, 2)
+            self.assertEqual(tuple(receipt.sequence for receipt in loaded), (1, 2))
+            state_path = root / state.audit_path
+            raw = json.loads(state_path.read_bytes())
+            raw["snapshot_count"] = 1
+            state_path.write_bytes(canonical_json_bytes(raw) + b"\n")
+            with self.assertRaisesRegex(ValueError, "tail rollback|count/head"):
+                protocols.load_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+
+    def test_snapshot_ledger_rejects_symlink_and_hardlink_paths(self):
+        for alias_type in ("ancestor_symlink", "lock_hardlink"):
+            with self.subTest(alias_type=alias_type), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                lock_parent = (
+                    root
+                    / "audit/v5_2_qd/prospective_2026/snapshot_locks/2026-07-13"
+                )
+                if alias_type == "ancestor_symlink":
+                    lock_parent.parent.mkdir(parents=True)
+                    outside = root / "outside"
+                    outside.mkdir()
+                    lock_parent.symlink_to(outside, target_is_directory=True)
+                else:
+                    lock_parent.mkdir(parents=True)
+                    target = root / "hardlink-target"
+                    target.write_bytes(b"")
+                    os.link(target, lock_parent / "777001.lock")
+                with self._trusted_clock("2026-07-13T21:00:00Z"):
+                    with self.assertRaisesRegex(ValueError, "symlink|hardlink|alias"):
+                        protocols.initialize_prospective_snapshot_ledger(
+                            root,
+                            official_date="2026-07-13",
+                            game_pk=777001,
+                            lock_basis_start_utc="2026-07-13T23:10:00Z",
+                        )
+
+    def test_snapshot_ledger_does_not_create_repository_observations(self):
+        observed_root = ROOT / "data/v5_2_qd/prospective_2026"
+        before = tuple(observed_root.rglob("*")) if observed_root.exists() else ()
+        with tempfile.TemporaryDirectory() as temporary:
+            self._sealed_snapshot_ledger(Path(temporary).resolve())
+        after = tuple(observed_root.rglob("*")) if observed_root.exists() else ()
+        self.assertEqual(after, before)
+
+    def test_snapshot_append_postcondition_failure_rolls_back_receipt_and_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            real_load = protocols.load_prospective_snapshot_ledger
+            calls = 0
+
+            def fail_second_load(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("snapshot append postcondition failed")
+                return real_load(*args, **kwargs)
+
+            with (
+                patch(
+                    "mlb_backtest.protocols.load_prospective_snapshot_ledger",
+                    side_effect=fail_second_load,
+                ),
+                self._trusted_clock("2026-07-13T22:24:00Z"),
+                self.assertRaisesRegex(ValueError, "postcondition"),
+            ):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    ntp_offset_seconds=0.25,
+                )
+            receipt_dir = (
+                root
+                / "audit/v5_2_qd/prospective_2026/snapshot_receipts/"
+                "2026-07-13/777001"
+            )
+            self.assertFalse(receipt_dir.exists())
+            state, receipts = real_load(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            self.assertEqual(state.snapshot_count, 0)
+            self.assertEqual(receipts, ())
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                receipt = protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    ntp_offset_seconds=0.25,
+                )
+            self.assertEqual(receipt.sequence, 1)
+
+    def test_snapshot_receipt_partial_write_never_deletes_replaced_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            snapshot = self._snapshot(sequence=1, receipt="2026-07-13T22:24:00Z")
+            snapshot_sha = hashlib.sha256(
+                canonical_json_bytes(protocols._prospective_snapshot_raw(snapshot))
+            ).hexdigest()
+            unsigned = protocols.ProspectiveSnapshotReceipt(
+                official_date="2026-07-13",
+                game_pk=777001,
+                sequence=1,
+                prior_receipt_hash="0" * 64,
+                snapshot=snapshot,
+                snapshot_sha256=snapshot_sha,
+                persisted_at_utc="2026-07-13T22:24:00Z",
+                receipt_hash="",
+                audit_path="",
+            )
+            receipt_hash = protocols._snapshot_receipt_hash(unsigned)
+            relative = protocols._snapshot_receipt_relative_path(
+                "2026-07-13", 777001, 1, receipt_hash
+            )
+            receipt = replace(
+                unsigned,
+                receipt_hash=receipt_hash,
+                audit_path=relative.as_posix(),
+            )
+            receipt_path = root / relative
+            original_write = os.write
+
+            def replace_then_fail(descriptor, contents):
+                original_write(descriptor, bytes(contents[:1]))
+                receipt_path.unlink()
+                receipt_path.write_bytes(b"external replacement")
+                raise OSError("simulated partial write")
+
+            with (
+                patch("mlb_backtest.protocols.os.write", side_effect=replace_then_fail),
+                self.assertRaisesRegex(Exception, "replaced|recovery|partial"),
+            ):
+                protocols._write_snapshot_receipt_exclusive(root, receipt)
+            self.assertEqual(receipt_path.read_bytes(), b"external replacement")
+
+    def test_snapshot_state_anchor_detects_reopen_and_coordinated_tail_rollback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root)
+            state, receipts = protocols.load_prospective_snapshot_ledger(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            state_path = root / state.audit_path
+            raw = json.loads(state_path.read_bytes())
+            raw.update(
+                {
+                    "status": "OPEN",
+                    "selected_sequence": None,
+                    "selected_snapshot_id": None,
+                    "selected_snapshot_sha256": None,
+                    "closed_at_utc": None,
+                }
+            )
+            state_path.write_bytes(canonical_json_bytes(raw) + b"\n")
+            with self.assertRaisesRegex(ValueError, "anchor|state digest|revision"):
+                protocols.load_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            append_kwargs = {
+                "official_date": "2026-07-13",
+                "game_pk": 777001,
+                "observed_scheduled_start_utc": "2026-07-13T23:10:00Z",
+                "successful": True,
+                "away_starter_present": True,
+                "home_starter_present": True,
+                "away_lineup_count": 9,
+                "home_lineup_count": 9,
+                "ntp_offset_seconds": 0.25,
+            }
+            with self._trusted_clock("2026-07-13T22:23:00Z"):
+                protocols.record_prospective_snapshot(root, **append_kwargs)
+            first_state, _ = protocols.load_prospective_snapshot_ledger(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            first_state_bytes = (root / first_state.audit_path).read_bytes()
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                protocols.record_prospective_snapshot(root, **append_kwargs)
+            _, current_receipts = protocols.load_prospective_snapshot_ledger(
+                root, official_date="2026-07-13", game_pk=777001
+            )
+            (root / current_receipts[-1].audit_path).unlink()
+            (root / first_state.audit_path).write_bytes(first_state_bytes)
+            with self.assertRaisesRegex(ValueError, "anchor|rollback|revision"):
+                protocols.load_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+
+    def test_snapshot_close_time_and_clock_sampling_are_inside_lock(self):
+        with patch(
+            "mlb_backtest.protocols._trusted_utc_now",
+            return_value=datetime(2026, 7, 13, 22, 25, 0, 1),
+        ):
+            self.assertEqual(
+                protocols._trusted_utc_now_string(), "2026-07-13T22:25:01Z"
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            early_root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    early_root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            with (
+                patch(
+                    "mlb_backtest.protocols._trusted_utc_now",
+                    return_value=datetime(2026, 7, 13, 22, 24, 59, 1),
+                ),
+                self.assertRaisesRegex(ValueError, "before lock"),
+            ):
+                protocols.seal_prospective_snapshot_ledger(
+                    early_root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            entered = False
+            real_lock = protocols._snapshot_ledger_lock
+
+            @protocols.contextmanager
+            def delayed_lock(*args, **kwargs):
+                nonlocal entered
+                with real_lock(*args, **kwargs) as locked_root:
+                    entered = True
+                    yield locked_root
+
+            def boundary_clock():
+                value = (
+                    "2026-07-13T22:25:01Z"
+                    if entered
+                    else "2026-07-13T22:24:59Z"
+                )
+                return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+
+            with (
+                patch(
+                    "mlb_backtest.protocols._snapshot_ledger_lock",
+                    side_effect=delayed_lock,
+                ),
+                patch(
+                    "mlb_backtest.protocols._trusted_utc_now",
+                    side_effect=boundary_clock,
+                ),
+                self.assertRaisesRegex(ValueError, "after lock"),
+            ):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    ntp_offset_seconds=0.25,
+                )
+
+            loaded = False
+            real_load = protocols.load_prospective_snapshot_ledger
+
+            def delayed_load(*args, **kwargs):
+                nonlocal loaded
+                result = real_load(*args, **kwargs)
+                loaded = True
+                return result
+
+            def post_load_clock():
+                value = (
+                    "2026-07-13T22:25:01Z"
+                    if loaded
+                    else "2026-07-13T22:24:59Z"
+                )
+                return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+
+            with (
+                patch(
+                    "mlb_backtest.protocols.load_prospective_snapshot_ledger",
+                    side_effect=delayed_load,
+                ),
+                patch(
+                    "mlb_backtest.protocols._trusted_utc_now",
+                    side_effect=post_load_clock,
+                ),
+                self.assertRaisesRegex(ValueError, "after lock"),
+            ):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    ntp_offset_seconds=0.25,
+                )
+
+            state_path = (
+                root
+                / "audit/v5_2_qd/prospective_2026/snapshot_ledgers/"
+                "2026-07-13/777001/state.json"
+            )
+            raw = json.loads(state_path.read_bytes())
+            raw.update(
+                {
+                    "status": "CLOSED",
+                    "closed_at_utc": "2020-01-01T00:00:00Z",
+                }
+            )
+            state_path.write_bytes(canonical_json_bytes(raw) + b"\n")
+            with self.assertRaisesRegex(ValueError, "close|chronology|anchor"):
+                protocols.load_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+
     def test_current_approved_design_pin_matches_reviewed_blob(self):
         design_path = (
             ROOT
@@ -286,6 +861,27 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertTrue(changes["relock_forbidden"])
         self.assertTrue(spec.raw["backfill_forbidden"])
         self.assertTrue(spec.raw["pooling_forbidden"])
+        ledger = spec.raw["clock"]["snapshot_ledger"]
+        self.assertEqual(ledger["receipt_time_source"], "internal_trusted_clock_only")
+        self.assertEqual(ledger["append_receipt_write"], "O_EXCL_fsync_read_only")
+        self.assertEqual(ledger["close_policy"], "at_lock_from_disk_history")
+        self.assertTrue(ledger["append_after_close_forbidden"])
+        self.assertIn("{official_date}/{gamePk}", ledger["state_path_template"])
+        self.assertIn("snapshot_state_anchors", ledger["state_anchor_path_template"])
+        self.assertEqual(
+            ledger["state_anchor_write"], "O_EXCL_fsync_read_only_every_transition"
+        )
+        candidate_fields = spec.raw["official_pool"]["candidate_record_fields"]
+        for field in (
+            "snapshot_history",
+            "selected_snapshot",
+            "snapshot_ledger_state",
+            "snapshot_ledger_head",
+            "snapshot_ledger_count",
+            "snapshot_ledger_path",
+            "snapshot_ledger_digest",
+        ):
+            self.assertIn(field, candidate_fields)
 
     def test_snapshot_record_validates_clock_basis_window_and_latest_selection(self):
         early = self._snapshot(sequence=1, receipt="2026-07-13T22:20:00Z")
@@ -490,14 +1086,16 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     eligible_for_prospective_official_pool(changed)
 
     def test_slate_manifest_persists_full_selected_snapshot_binding(self):
-        candidate = self._candidate(recorded_at="2026-07-13T22:24:00Z")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            slate = protocols.write_prospective_candidate_slate(
-                root,
-                candidates=(candidate,),
-                persisted_at_utc="2026-07-13T22:26:00Z",
-            )
+            self._sealed_snapshot_ledger(root)
+            candidate = self._disk_candidate(root)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
             receipt = dict(slate.snapshot_lock_receipts[0])
             self.assertEqual(
                 set(receipt),
@@ -522,30 +1120,24 @@ class ProspectiveProtocolTest(unittest.TestCase):
             )
 
     def test_final_selection_waits_for_all_locks_and_applies_exact_tie_break(self):
-        first = self._candidate(
-            game_pk=777002,
-            recorded_at="2026-07-13T22:24:00Z",
-        )
-        second = self._candidate(
-            game_pk=777001,
-            snapshot_id="snapshot-777001-5",
-            sealed_snapshot_id="snapshot-777001-5",
-            snapshot_hash="b" * 64,
-            sealed_snapshot_hash="b" * 64,
-        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root, game_pk=777001)
+            self._sealed_snapshot_ledger(root, game_pk=777002)
+            first = self._disk_candidate(root, game_pk=777002)
+            second = self._disk_candidate(root, game_pk=777001)
             with self.assertRaisesRegex(ValueError, "slate.*missing|missing.*slate"):
                 protocols.select_prospective_top1(
                     root,
                     official_date="2026-07-13",
                     candidates=(first, second),
                 )
-            slate = protocols.write_prospective_candidate_slate(
-                root,
-                candidates=(first, second),
-                persisted_at_utc="2026-07-13T22:26:00Z",
-            )
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(first, second),
+                )
             self.assertTrue(slate.all_locks_sealed)
             self.assertEqual(slate.final_lock_receipt_at_utc, "2026-07-13T22:25:00Z")
             top1 = protocols.select_prospective_top1(
@@ -572,42 +1164,35 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root)
             for candidates, message in (
                 ((candidate, other_date), "one official date"),
                 ((), "at least one eligible"),
-                ((replace(candidate, lock_state="UNSEALED"),), "eligible"),
+                ((replace(candidate, critical=True),), "eligible"),
             ):
                 with self.subTest(message=message):
                     with self.assertRaisesRegex(ValueError, message):
-                        protocols.write_prospective_candidate_slate(
-                            root,
-                            candidates=candidates,
-                            persisted_at_utc="2026-07-13T22:26:00Z",
-                        )
+                        with self._trusted_clock("2026-07-13T22:26:00Z"):
+                            protocols.write_prospective_candidate_slate(
+                                root,
+                                official_date="2026-07-13",
+                                candidates=candidates,
+                            )
 
     def test_slate_binding_rejects_candidate_omission_addition_and_tamper(self):
-        first = self._candidate()
-        second = self._candidate(
-            game_pk=777002,
-            snapshot_id="snapshot-777002-4",
-            sealed_snapshot_id="snapshot-777002-4",
-            snapshot_hash="b" * 64,
-            sealed_snapshot_hash="b" * 64,
-        )
-        third = self._candidate(
-            game_pk=777003,
-            snapshot_id="snapshot-777003-4",
-            sealed_snapshot_id="snapshot-777003-4",
-            snapshot_hash="c" * 64,
-            sealed_snapshot_hash="c" * 64,
-        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            slate = protocols.write_prospective_candidate_slate(
-                root,
-                candidates=(first, second),
-                persisted_at_utc="2026-07-13T22:26:00Z",
-            )
+            for game_pk in (777001, 777002, 777003):
+                self._sealed_snapshot_ledger(root, game_pk=game_pk)
+            first = self._disk_candidate(root, game_pk=777001)
+            second = self._disk_candidate(root, game_pk=777002)
+            third = self._disk_candidate(root, game_pk=777003)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(first, second),
+                )
             for candidates, message in (
                 ((first,), "count|IDs"),
                 ((first, second, third), "count|IDs"),
@@ -632,19 +1217,21 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 )
 
     def test_slate_writer_is_transactional_canonical_and_mode_safe(self):
-        candidate = self._candidate()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root)
+            candidate = self._disk_candidate(root)
             with patch(
                 "mlb_backtest.protocols.load_prospective_candidate_slate",
                 side_effect=ValueError("slate postcondition failed"),
             ):
                 with self.assertRaisesRegex(ValueError, "postcondition"):
-                    protocols.write_prospective_candidate_slate(
-                        root,
-                        candidates=(candidate,),
-                        persisted_at_utc="2026-07-13T22:26:00Z",
-                    )
+                    with self._trusted_clock("2026-07-13T22:26:00Z"):
+                        protocols.write_prospective_candidate_slate(
+                            root,
+                            official_date="2026-07-13",
+                            candidates=(candidate,),
+                        )
             slate_path = (
                 root
                 / "audit/v5_2_qd/prospective_2026/candidate_slates/2026-07-13.json"
@@ -659,11 +1246,12 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(slate_lock_path.stat().st_mode), 0o600)
             self.assertEqual(slate_lock_path.stat().st_nlink, 1)
             self.assertEqual(list(root.rglob(".*.tmp")), [])
-            slate = protocols.write_prospective_candidate_slate(
-                root,
-                candidates=(candidate,),
-                persisted_at_utc="2026-07-13T22:26:00Z",
-            )
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
             self.assertEqual(stat.S_IMODE(slate_path.stat().st_mode), 0o644)
             self.assertEqual(
                 slate_path.read_bytes(),
@@ -703,8 +1291,8 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         "ok",
                         protocols.write_prospective_candidate_slate(
                             root,
+                            official_date="2026-07-13",
                             candidates=candidates,
-                            persisted_at_utc="2026-07-13T22:26:00Z",
                         ),
                     )
                 except BaseException as exc:
@@ -715,12 +1303,17 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     "mlb_backtest.protocols._publish_bundle",
                     side_effect=gated_publish,
                 ),
+                self._trusted_clock("2026-07-13T22:26:00Z"),
                 ThreadPoolExecutor(max_workers=2) as executor,
             ):
                 return tuple(executor.map(seal, candidate_sets))
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root, game_pk=777001)
+            self._sealed_snapshot_ledger(root, game_pk=777002)
+            first = self._disk_candidate(root, game_pk=777001)
+            second = self._disk_candidate(root, game_pk=777002)
             results = race(root, ((first,), (second,)))
             successes = tuple(value for status, value in results if status == "ok")
             failures = tuple(value for status, value in results if status == "error")
@@ -743,8 +1336,10 @@ class ProspectiveProtocolTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root, game_pk=777001)
+            first = self._disk_candidate(root, game_pk=777001)
             results = race(root, ((first,), (first,)))
-            self.assertTrue(all(status == "ok" for status, _ in results))
+            self.assertTrue(all(status == "ok" for status, _ in results), results)
             self.assertEqual(results[0][1], results[1][1])
             lock_path = (
                 root
@@ -790,8 +1385,8 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 ):
                     protocols.write_prospective_candidate_slate(
                         root,
+                        official_date="2026-07-13",
                         candidates=(candidate,),
-                        persisted_at_utc="2026-07-13T22:26:00Z",
                     )
                 self.assertFalse(
                     (
@@ -1956,7 +2551,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "2f74e5b5bcba1be033f5955310b4f4261d33a7b7bcecdaa39cc2e021553641bf",
+            "d4b8fa399c5dc8138aff961fdbd0cb4fc92facdfb4dc9ae4e820a486ce4bcc5e",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
