@@ -361,7 +361,7 @@ APPROVED_DESIGN_BLOB_SHA256 = (
     "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "73a702afd529b4959855aa1df26fa91ad9f1d5a9f3e8a2931998925d89291e8d"
+    "e956e8481c255c8ae022f92b66ce2c133efdf903fe56ece9ef118c3ed9d66f90"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 FOLD_LITERALS = (
@@ -653,13 +653,49 @@ class PostlockStartChange:
 
 
 @dataclass(frozen=True)
-class ProspectivePoolRow:
+class PostlockChainState:
+    game_pk: int
+    lock_basis_start_utc: str
+    event_count: int
+    head_hash: str
+    persisted_at_utc: str
+    audit_path: str
+
+
+@dataclass(frozen=True)
+class ProspectiveCandidateRow:
+    game_pk: int
+    official_date: str
+    recorded_at_utc: str
+    retrospective_backfill: bool
+    p_home: float
+    predicted_side: str
+    verified_snapshot_id: str
+    verified_snapshot_sha256: str
+    sealed_lock_snapshot_id: str
+    sealed_lock_snapshot_sha256: str
     provenance: str
     lock_state: str
     final_snapshot_classification: str
     critical: bool
     eligibility_status: str
-    date_disposition: str
+    date_state: str
+    data_completeness_score: float
+    absolute_starter_edge: float
+    lock_basis_start_utc: str
+    lock_receipt_at_utc: str
+
+
+@dataclass(frozen=True)
+class ProspectiveTop1:
+    official_date: str
+    game_pk: int
+    predicted_side: str
+    pick_probability: float
+    official_rank: int
+    verified_snapshot_id: str
+    verified_snapshot_sha256: str
+    final_lock_receipt_at_utc: str
 
 
 def require_exact_keys(
@@ -855,6 +891,21 @@ def _build_prospective_literal() -> dict[str, object]:
                     "event_hash",
                 ],
                 "hash_chain": "sha256_canonical_json_with_genesis_zero_hash",
+                "sealed_state_path_template": (
+                    "audit/v5_2_qd/prospective_2026/"
+                    "postlock_chain_state/{gamePk}.json"
+                ),
+                "sealed_state_fields": [
+                    "gamePk",
+                    "lock_basis_start_utc",
+                    "event_count",
+                    "head_hash",
+                    "persisted_at_utc",
+                    "audit_path",
+                ],
+                "state_persistence": (
+                    "atomic_event_and_sealed_state_publish_fsync_before_ack"
+                ),
             },
             "immutable_fields": [
                 "lock_basis_start_utc",
@@ -882,13 +933,42 @@ def _build_prospective_literal() -> dict[str, object]:
             "incomplete_or_unverified_rows_affect_rank": False,
             "partial_rows_affect_rank": False,
             "p_home_equal_half_official": False,
-            "executable_row_fields": [
+            "candidate_record_fields": [
+                "gamePk",
+                "official_date",
+                "recorded_at_utc",
+                "retrospective_backfill",
+                "p_home",
+                "predicted_side",
+                "verified_snapshot_id",
+                "verified_snapshot_sha256",
+                "sealed_lock_snapshot_id",
+                "sealed_lock_snapshot_sha256",
                 "provenance",
                 "lock_state",
                 "final_snapshot_classification",
                 "critical",
                 "eligibility_status",
-                "date_disposition",
+                "date_state",
+                "data_completeness_score",
+                "absolute_starter_edge",
+                "lock_basis_start_utc",
+                "lock_receipt_at_utc",
+            ],
+            "candidate_date_state": "CANDIDATE_ACTIVE",
+            "candidate_top1_preclaim_forbidden": True,
+            "selection_gate": (
+                "all_candidate_locks_sealed_and_final_lock_receipt_recorded"
+            ),
+            "top1_output_fields": [
+                "official_date",
+                "gamePk",
+                "predicted_side",
+                "pick_probability",
+                "official_rank",
+                "verified_snapshot_id",
+                "verified_snapshot_sha256",
+                "final_lock_receipt_at_utc",
             ],
         },
         "shadow_pool": {
@@ -1001,9 +1081,58 @@ def load_prospective_spec(path: Path) -> ProspectiveSpec:
     return parse_prospective_spec(json.loads(path.read_text(encoding="utf-8")))
 
 
-def eligible_for_prospective_official_pool(row: ProspectivePoolRow) -> bool:
-    if not isinstance(row, ProspectivePoolRow):
-        raise ValueError("prospective official pool requires a typed full row")
+def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool:
+    if not isinstance(row, ProspectiveCandidateRow):
+        raise ValueError("prospective official pool requires a typed candidate row")
+    if (
+        isinstance(row.game_pk, bool)
+        or not isinstance(row.game_pk, int)
+        or row.game_pk <= 0
+    ):
+        raise ValueError("candidate gamePk must be an exact positive integer")
+    try:
+        candidate_date = _canonical_date(row.official_date, "official_date")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate official_date must be canonical") from exc
+    if candidate_date < date(2026, 7, 13):
+        raise ValueError("candidate official_date precedes first permitted date")
+    if not isinstance(row.retrospective_backfill, bool):
+        raise ValueError("candidate backfill flag must be boolean")
+    if row.retrospective_backfill:
+        raise ValueError("candidate retrospective backfill is forbidden")
+    probability = finite_number(row.p_home, "candidate.p_home")
+    if not 0.1 <= probability <= 0.9 or probability == 0.5:
+        raise ValueError("candidate p_home must be directional within [0.1, 0.9]")
+    expected_side = "home" if probability > 0.5 else "away"
+    if row.predicted_side != expected_side:
+        raise ValueError("candidate predicted side is inconsistent with p_home")
+    if (
+        not isinstance(row.verified_snapshot_id, str)
+        or not row.verified_snapshot_id
+        or not isinstance(row.sealed_lock_snapshot_id, str)
+        or not isinstance(row.verified_snapshot_sha256, str)
+        or not isinstance(row.sealed_lock_snapshot_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", row.verified_snapshot_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", row.sealed_lock_snapshot_sha256)
+        or row.verified_snapshot_id != row.sealed_lock_snapshot_id
+        or row.verified_snapshot_sha256 != row.sealed_lock_snapshot_sha256
+    ):
+        raise ValueError("candidate verified snapshot binding differs from sealed lock")
+    recorded = _canonical_utc_datetime(row.recorded_at_utc, "recorded_at_utc")
+    lock_receipt = _canonical_utc_datetime(
+        row.lock_receipt_at_utc, "lock_receipt_at_utc"
+    )
+    _canonical_utc_datetime(row.lock_basis_start_utc, "lock_basis_start_utc")
+    if recorded > lock_receipt:
+        raise ValueError("candidate recorded_at is retrospective to sealed lock")
+    completeness = finite_number(
+        row.data_completeness_score, "candidate.data_completeness_score"
+    )
+    edge = finite_number(row.absolute_starter_edge, "candidate.absolute_starter_edge")
+    if not 0 <= completeness <= 10 or edge < 0:
+        raise ValueError("candidate ranking inputs are out of bounds")
+    if row.date_state == "LOCK_TOP1":
+        raise ValueError("candidate cannot preclaim LOCK_TOP1")
     if not isinstance(row.critical, bool) or not all(
         isinstance(value, str)
         for value in (
@@ -1011,7 +1140,7 @@ def eligible_for_prospective_official_pool(row: ProspectivePoolRow) -> bool:
             row.lock_state,
             row.final_snapshot_classification,
             row.eligibility_status,
-            row.date_disposition,
+            row.date_state,
         )
     ):
         raise ValueError("prospective official pool row fields are invalid")
@@ -1021,7 +1150,67 @@ def eligible_for_prospective_official_pool(row: ProspectivePoolRow) -> bool:
         and row.final_snapshot_classification == "TIMESTAMP_VERIFIED_T45"
         and not row.critical
         and row.eligibility_status == "ELIGIBLE"
-        and row.date_disposition == "LOCK_TOP1"
+        and row.date_state == "CANDIDATE_ACTIVE"
+    )
+
+
+def select_prospective_top1(
+    candidates: tuple[ProspectiveCandidateRow, ...],
+    *,
+    all_candidate_locks_sealed: bool,
+    final_lock_receipt_at_utc: str,
+) -> ProspectiveTop1:
+    if not isinstance(candidates, tuple) or not all(
+        isinstance(candidate, ProspectiveCandidateRow) for candidate in candidates
+    ):
+        raise ValueError("prospective candidates must be a typed tuple")
+    if not isinstance(all_candidate_locks_sealed, bool):
+        raise ValueError("all_candidate_locks_sealed must be boolean")
+    if not all_candidate_locks_sealed:
+        raise ValueError("all candidate locks must be sealed before Top1 selection")
+    final_receipt = _canonical_utc_datetime(
+        final_lock_receipt_at_utc, "final_lock_receipt_at_utc"
+    )
+    if not candidates:
+        raise ValueError("Top1 selection requires at least one eligible candidate")
+    dates: set[str] = set()
+    game_pks: set[int] = set()
+    snapshot_ids: set[str] = set()
+    for candidate in candidates:
+        if not eligible_for_prospective_official_pool(candidate):
+            raise ValueError("Top1 input candidate is not eligible")
+        dates.add(candidate.official_date)
+        if candidate.game_pk in game_pks:
+            raise ValueError("Top1 candidates contain duplicate gamePk")
+        if candidate.verified_snapshot_id in snapshot_ids:
+            raise ValueError("Top1 candidates contain duplicate verified snapshot")
+        game_pks.add(candidate.game_pk)
+        snapshot_ids.add(candidate.verified_snapshot_id)
+        if final_receipt < _canonical_utc_datetime(
+            candidate.lock_receipt_at_utc, "lock_receipt_at_utc"
+        ):
+            raise ValueError("final lock receipt precedes a candidate lock")
+    if len(dates) != 1:
+        raise ValueError("Top1 candidates must share one official date")
+    winner = min(
+        candidates,
+        key=lambda candidate: ranking_key(
+            max(candidate.p_home, 1 - candidate.p_home),
+            candidate.data_completeness_score,
+            candidate.absolute_starter_edge,
+            candidate.lock_basis_start_utc,
+            candidate.game_pk,
+        ),
+    )
+    return ProspectiveTop1(
+        official_date=winner.official_date,
+        game_pk=winner.game_pk,
+        predicted_side=winner.predicted_side,
+        pick_probability=max(winner.p_home, 1 - winner.p_home),
+        official_rank=1,
+        verified_snapshot_id=winner.verified_snapshot_id,
+        verified_snapshot_sha256=winner.verified_snapshot_sha256,
+        final_lock_receipt_at_utc=final_lock_receipt_at_utc,
     )
 
 
@@ -1181,37 +1370,66 @@ def _postlock_event_hash(event: PostlockStartChange) -> str:
 def validate_postlock_start_changes(
     events: tuple[PostlockStartChange, ...],
     *,
-    game_pk: int,
+    sealed_state: PostlockChainState,
     lock_basis_start_utc: str,
-    expected_count: int | None = None,
-    expected_head_hash: str | None = None,
 ) -> str:
     if not isinstance(events, tuple) or not all(
         isinstance(event, PostlockStartChange) for event in events
     ):
         raise ValueError("post-lock events must be a typed immutable tuple")
+    if not isinstance(sealed_state, PostlockChainState):
+        raise ValueError("post-lock validation requires an independent sealed state")
     if (
-        isinstance(game_pk, bool)
-        or not isinstance(game_pk, int)
-        or game_pk <= 0
+        isinstance(sealed_state.game_pk, bool)
+        or not isinstance(sealed_state.game_pk, int)
+        or sealed_state.game_pk <= 0
     ):
-        raise ValueError("post-lock gamePk must be a positive integer")
+        raise ValueError("sealed-state gamePk must be an exact positive integer")
+    if (
+        isinstance(sealed_state.event_count, bool)
+        or not isinstance(sealed_state.event_count, int)
+        or sealed_state.event_count < 0
+    ):
+        raise ValueError("sealed-state event count must be an exact nonnegative integer")
+    if len(events) != sealed_state.event_count:
+        raise ValueError("post-lock event count differs from sealed state")
+    if not isinstance(sealed_state.head_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", sealed_state.head_hash
+    ):
+        raise ValueError("sealed-state head hash must be lowercase SHA-256")
+    expected_audit_path = (
+        "audit/v5_2_qd/prospective_2026/postlock_chain_state/"
+        f"{sealed_state.game_pk}.json"
+    )
+    if sealed_state.audit_path != expected_audit_path:
+        raise ValueError("sealed-state audit path differs from canonical namespace")
+    persisted = _canonical_utc_datetime(
+        sealed_state.persisted_at_utc, "sealed_state.persisted_at_utc"
+    )
     lock_basis = _canonical_utc_datetime(
         lock_basis_start_utc, "lock_basis_start_utc"
     )
+    if sealed_state.lock_basis_start_utc != lock_basis_start_utc:
+        raise ValueError("sealed-state lock basis differs from requested lock basis")
     lock_at = lock_basis - timedelta(minutes=45)
-    if expected_count is not None and (
-        isinstance(expected_count, bool)
-        or not isinstance(expected_count, int)
-        or expected_count < 0
-        or len(events) != expected_count
-    ):
-        raise ValueError("post-lock event count differs from append-only pin")
+    if persisted < lock_at:
+        raise ValueError("sealed-state persistence precedes sealed lock")
     prior_hash = POSTLOCK_GENESIS_HASH
     previous_effective = lock_basis_start_utc
     previous_observed: datetime | None = None
     for index, event in enumerate(events, start=1):
-        if event.game_pk != game_pk:
+        if (
+            isinstance(event.game_pk, bool)
+            or not isinstance(event.game_pk, int)
+            or event.game_pk <= 0
+            or isinstance(event.sequence, bool)
+            or not isinstance(event.sequence, int)
+            or event.sequence <= 0
+        ):
+            raise ValueError(
+                "post-lock event gamePk and sequence must be exact positive integers"
+            )
+        if event.game_pk != sealed_state.game_pk:
             raise ValueError("post-lock event gamePk differs from sealed lock")
         if event.sequence != index:
             raise ValueError("post-lock event sequence is not contiguous")
@@ -1241,28 +1459,31 @@ def validate_postlock_start_changes(
         prior_hash = calculated
         previous_effective = event.new_effective_start_utc
         previous_observed = observed
-    if expected_head_hash is not None:
-        if (
-            not isinstance(expected_head_hash, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", expected_head_hash)
-            or prior_hash != expected_head_hash
-        ):
-            raise ValueError("post-lock event head hash differs from append-only pin")
+    if prior_hash != sealed_state.head_hash:
+        raise ValueError("post-lock event head hash differs from sealed state")
+    if previous_observed is not None and persisted < previous_observed:
+        raise ValueError("sealed-state persistence precedes final event observation")
     return prior_hash
 
 
 def append_postlock_start_change(
     events: tuple[PostlockStartChange, ...],
     *,
+    sealed_state: PostlockChainState,
     game_pk: int,
     previous_effective_start_utc: str,
     new_effective_start_utc: str,
     observed_at_utc: str,
     lock_basis_start_utc: str,
-) -> tuple[PostlockStartChange, ...]:
+    state_persisted_at_utc: str,
+) -> tuple[PostlockStartChange, PostlockChainState]:
+    if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+        raise ValueError("post-lock gamePk must be an exact positive integer")
+    if not isinstance(sealed_state, PostlockChainState) or game_pk != sealed_state.game_pk:
+        raise ValueError("append gamePk differs from independent sealed state")
     head = validate_postlock_start_changes(
         events,
-        game_pk=game_pk,
+        sealed_state=sealed_state,
         lock_basis_start_utc=lock_basis_start_utc,
     )
     expected_previous = (
@@ -1282,9 +1503,17 @@ def append_postlock_start_change(
     ) - timedelta(minutes=45)
     if observed < lock_at:
         raise ValueError("post-lock event was observed before sealed lock")
+    persisted = _canonical_utc_datetime(
+        state_persisted_at_utc, "state_persisted_at_utc"
+    )
+    prior_persisted = _canonical_utc_datetime(
+        sealed_state.persisted_at_utc, "sealed_state.persisted_at_utc"
+    )
+    if persisted < observed or persisted <= prior_persisted:
+        raise ValueError("new sealed-state persistence must follow event and prior state")
     unsigned = PostlockStartChange(
         game_pk=game_pk,
-        sequence=len(events) + 1,
+        sequence=sealed_state.event_count + 1,
         previous_effective_start_utc=previous_effective_start_utc,
         new_effective_start_utc=new_effective_start_utc,
         observed_at_utc=observed_at_utc,
@@ -1294,14 +1523,23 @@ def append_postlock_start_change(
     )
     event = replace(unsigned, event_hash=_postlock_event_hash(unsigned))
     appended = (*events, event)
-    validate_postlock_start_changes(
-        appended,
+    new_state = PostlockChainState(
         game_pk=game_pk,
         lock_basis_start_utc=lock_basis_start_utc,
-        expected_count=len(events) + 1,
-        expected_head_hash=event.event_hash,
+        event_count=sealed_state.event_count + 1,
+        head_hash=event.event_hash,
+        persisted_at_utc=state_persisted_at_utc,
+        audit_path=(
+            "audit/v5_2_qd/prospective_2026/postlock_chain_state/"
+            f"{game_pk}.json"
+        ),
     )
-    return appended
+    validate_postlock_start_changes(
+        appended,
+        sealed_state=new_state,
+        lock_basis_start_utc=lock_basis_start_utc,
+    )
+    return event, new_state
 
 
 def combine_ledgers(left_run_id: str, right_run_id: str) -> None:

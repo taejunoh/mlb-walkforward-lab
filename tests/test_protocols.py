@@ -90,6 +90,62 @@ class ProspectiveProtocolTest(unittest.TestCase):
             sequence=sequence,
         )
 
+    def _candidate(
+        self,
+        *,
+        game_pk=777001,
+        official_date="2026-07-13",
+        recorded_at="2026-07-13T22:25:00Z",
+        retrospective_backfill=False,
+        p_home=0.63,
+        predicted_side="home",
+        snapshot_id="snapshot-777001-4",
+        snapshot_hash="a" * 64,
+        sealed_snapshot_id="snapshot-777001-4",
+        sealed_snapshot_hash="a" * 64,
+        critical=False,
+        eligibility_status="ELIGIBLE",
+        date_state="CANDIDATE_ACTIVE",
+        lock_receipt="2026-07-13T22:25:00Z",
+        completeness=8.5,
+        starter_edge=4.0,
+    ):
+        return protocols.ProspectiveCandidateRow(
+            game_pk=game_pk,
+            official_date=official_date,
+            recorded_at_utc=recorded_at,
+            retrospective_backfill=retrospective_backfill,
+            p_home=p_home,
+            predicted_side=predicted_side,
+            verified_snapshot_id=snapshot_id,
+            verified_snapshot_sha256=snapshot_hash,
+            sealed_lock_snapshot_id=sealed_snapshot_id,
+            sealed_lock_snapshot_sha256=sealed_snapshot_hash,
+            provenance="TIMESTAMP_VERIFIED_T45",
+            lock_state="SEALED",
+            final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
+            critical=critical,
+            eligibility_status=eligibility_status,
+            date_state=date_state,
+            data_completeness_score=completeness,
+            absolute_starter_edge=starter_edge,
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            lock_receipt_at_utc=lock_receipt,
+        )
+
+    def _empty_chain_state(self):
+        return protocols.PostlockChainState(
+            game_pk=777001,
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            event_count=0,
+            head_hash="0" * 64,
+            persisted_at_utc="2026-07-13T22:25:00Z",
+            audit_path=(
+                "audit/v5_2_qd/prospective_2026/"
+                "postlock_chain_state/777001.json"
+            ),
+        )
+
     def test_exact_2026_oof_and_timestamp_contract(self):
         spec = load_prospective_spec(PROSPECTIVE_SPEC)
         self.assertEqual(spec.first_permitted_date.isoformat(), "2026-07-13")
@@ -116,14 +172,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         ):
             self.assertFalse(
                 eligible_for_prospective_official_pool(
-                    protocols.ProspectivePoolRow(
-                        provenance=stratum,
-                        lock_state="SEALED",
-                        final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
-                        critical=False,
-                        eligibility_status="ELIGIBLE",
-                        date_disposition="LOCK_TOP1",
-                    )
+                    replace(self._candidate(), provenance=stratum)
                 )
             )
         with self.assertRaisesRegex(ValueError, "pooling forbidden"):
@@ -218,23 +267,22 @@ class ProspectiveProtocolTest(unittest.TestCase):
             protocols.select_qualifying_snapshot(
                 (self._snapshot(sequence=2), self._snapshot(sequence=1))
             )
+        for snapshot in (
+            replace(self._snapshot(), game_pk=True),
+            replace(self._snapshot(), sequence=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "positive integers"):
+                classify_snapshot(snapshot)
 
     def test_official_pool_full_row_gate_and_date_precedence(self):
-        eligible = protocols.ProspectivePoolRow(
-            provenance="TIMESTAMP_VERIFIED_T45",
-            lock_state="SEALED",
-            final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
-            critical=False,
-            eligibility_status="ELIGIBLE",
-            date_disposition="LOCK_TOP1",
-        )
+        eligible = self._candidate()
         self.assertTrue(eligible_for_prospective_official_pool(eligible))
         mutations = (
             replace(eligible, lock_state="UNSEALED"),
             replace(eligible, final_snapshot_classification="TIMESTAMP_PARTIAL_T45"),
             replace(eligible, critical=True),
             replace(eligible, eligibility_status="EXCLUDE"),
-            replace(eligible, date_disposition="SYSTEM_MISS"),
+            replace(eligible, date_state="SYSTEM_MISS"),
         )
         for changed in mutations:
             with self.subTest(changed=changed):
@@ -261,6 +309,101 @@ class ProspectiveProtocolTest(unittest.TestCase):
             with self.subTest(active=active):
                 self.assertEqual(date_disposition(active), expected)
 
+    def test_candidate_gate_rejects_missing_date_backfill_half_and_unbound_snapshot(self):
+        invalid = (
+            (replace(self._candidate(), official_date=""), "official_date"),
+            (
+                replace(self._candidate(), official_date="2026-07-12"),
+                "first permitted",
+            ),
+            (
+                replace(self._candidate(), retrospective_backfill=True),
+                "backfill",
+            ),
+            (replace(self._candidate(), p_home=0.5), "p_home"),
+            (
+                replace(self._candidate(), predicted_side="away"),
+                "predicted side",
+            ),
+            (
+                replace(self._candidate(), sealed_lock_snapshot_id="other"),
+                "snapshot binding",
+            ),
+            (
+                replace(self._candidate(), sealed_lock_snapshot_sha256="b" * 64),
+                "snapshot binding",
+            ),
+            (
+                replace(self._candidate(), verified_snapshot_sha256=None),
+                "snapshot binding",
+            ),
+            (
+                replace(self._candidate(), recorded_at_utc="2026-07-13T22:25:01Z"),
+                "retrospective",
+            ),
+            (replace(self._candidate(), date_state="LOCK_TOP1"), "preclaim"),
+        )
+        for candidate, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    eligible_for_prospective_official_pool(candidate)
+
+    def test_final_selection_waits_for_all_locks_and_applies_exact_tie_break(self):
+        first = self._candidate(game_pk=777002)
+        second = self._candidate(
+            game_pk=777001,
+            snapshot_id="snapshot-777001-5",
+            sealed_snapshot_id="snapshot-777001-5",
+            snapshot_hash="b" * 64,
+            sealed_snapshot_hash="b" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "all candidate locks"):
+            protocols.select_prospective_top1(
+                (first, second),
+                all_candidate_locks_sealed=False,
+                final_lock_receipt_at_utc="2026-07-13T22:25:00Z",
+            )
+        top1 = protocols.select_prospective_top1(
+            (first, second),
+            all_candidate_locks_sealed=True,
+            final_lock_receipt_at_utc="2026-07-13T22:25:00Z",
+        )
+        self.assertEqual(top1.game_pk, 777001)
+        self.assertEqual(top1.official_rank, 1)
+        self.assertEqual(top1.official_date, "2026-07-13")
+        self.assertEqual(top1.verified_snapshot_sha256, "b" * 64)
+
+    def test_final_selection_rejects_mixed_dates_empty_pool_and_early_final_receipt(self):
+        candidate = self._candidate()
+        cases = (
+            (
+                (
+                    candidate,
+                    replace(
+                        candidate,
+                        game_pk=777002,
+                        official_date="2026-07-14",
+                        verified_snapshot_id="snapshot-777002-4",
+                        sealed_lock_snapshot_id="snapshot-777002-4",
+                        verified_snapshot_sha256="b" * 64,
+                        sealed_lock_snapshot_sha256="b" * 64,
+                    ),
+                ),
+                "one official date",
+                "2026-07-14T22:25:00Z",
+            ),
+            ((), "at least one eligible", "2026-07-13T22:25:00Z"),
+            ((candidate,), "final lock receipt", "2026-07-13T22:24:59Z"),
+        )
+        for candidates, message, final_receipt in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    protocols.select_prospective_top1(
+                        candidates,
+                        all_candidate_locks_sealed=True,
+                        final_lock_receipt_at_utc=final_receipt,
+                    )
+
     def test_postlock_start_change_is_append_only_and_cannot_rewrite_lock(self):
         changes = load_prospective_spec(PROSPECTIVE_SPEC).raw["schedule_changes"]
         event = changes["postlock_start_change"]
@@ -276,89 +419,153 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertTrue(event["rewrite_forbidden"])
         self.assertTrue(event["delete_forbidden"])
+        self.assertEqual(
+            event["sealed_state_path_template"],
+            "audit/v5_2_qd/prospective_2026/postlock_chain_state/{gamePk}.json",
+        )
+        self.assertEqual(
+            event["state_persistence"],
+            "atomic_event_and_sealed_state_publish_fsync_before_ack",
+        )
+        self.assertEqual(
+            event["sealed_state_fields"],
+            (
+                "gamePk",
+                "lock_basis_start_utc",
+                "event_count",
+                "head_hash",
+                "persisted_at_utc",
+                "audit_path",
+            ),
+        )
         self.assertTrue(changes["relock_forbidden"])
         self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
 
     def test_postlock_start_change_typed_hash_chain_records_every_transition(self):
-        events = protocols.append_postlock_start_change(
+        state = self._empty_chain_state()
+        event, state = protocols.append_postlock_start_change(
             (),
+            sealed_state=state,
             game_pk=777001,
             previous_effective_start_utc="2026-07-13T23:10:00Z",
             new_effective_start_utc="2026-07-13T23:40:00Z",
             observed_at_utc="2026-07-13T22:30:00Z",
             lock_basis_start_utc="2026-07-13T23:10:00Z",
+            state_persisted_at_utc="2026-07-13T22:30:01Z",
         )
-        events = protocols.append_postlock_start_change(
+        events = (event,)
+        event, state = protocols.append_postlock_start_change(
             events,
+            sealed_state=state,
             game_pk=777001,
             previous_effective_start_utc="2026-07-13T23:40:00Z",
             new_effective_start_utc="2026-07-13T23:10:00Z",
             observed_at_utc="2026-07-13T22:35:00Z",
             lock_basis_start_utc="2026-07-13T23:10:00Z",
+            state_persisted_at_utc="2026-07-13T22:35:01Z",
         )
+        events = (*events, event)
         self.assertEqual(tuple(event.sequence for event in events), (1, 2))
         self.assertEqual(events[0].prior_event_hash, "0" * 64)
         self.assertEqual(events[1].prior_event_hash, events[0].event_hash)
         self.assertEqual(
             protocols.validate_postlock_start_changes(
                 events,
-                game_pk=777001,
+                sealed_state=state,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
-                expected_count=2,
-                expected_head_hash=events[-1].event_hash,
             ),
             events[-1].event_hash,
         )
+        self.assertEqual(state.event_count, 2)
+        self.assertEqual(state.head_hash, events[-1].event_hash)
 
     def test_postlock_chain_rejects_noop_rewrite_delete_and_wrong_lock(self):
-        events = protocols.append_postlock_start_change(
+        state = self._empty_chain_state()
+        first, state = protocols.append_postlock_start_change(
             (),
+            sealed_state=state,
             game_pk=777001,
             previous_effective_start_utc="2026-07-13T23:10:00Z",
             new_effective_start_utc="2026-07-13T23:40:00Z",
             observed_at_utc="2026-07-13T22:30:00Z",
             lock_basis_start_utc="2026-07-13T23:10:00Z",
+            state_persisted_at_utc="2026-07-13T22:30:01Z",
         )
+        events = (first,)
+        second, state = protocols.append_postlock_start_change(
+            events,
+            sealed_state=state,
+            game_pk=777001,
+            previous_effective_start_utc="2026-07-13T23:40:00Z",
+            new_effective_start_utc="2026-07-14T00:10:00Z",
+            observed_at_utc="2026-07-13T22:35:00Z",
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            state_persisted_at_utc="2026-07-13T22:35:01Z",
+        )
+        events = (*events, second)
         with self.assertRaisesRegex(ValueError, "effective start did not change"):
             protocols.append_postlock_start_change(
                 events,
+                sealed_state=state,
                 game_pk=777001,
-                previous_effective_start_utc="2026-07-13T23:40:00Z",
-                new_effective_start_utc="2026-07-13T23:40:00Z",
-                observed_at_utc="2026-07-13T22:31:00Z",
+                previous_effective_start_utc="2026-07-14T00:10:00Z",
+                new_effective_start_utc="2026-07-14T00:10:00Z",
+                observed_at_utc="2026-07-13T22:36:00Z",
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:36:01Z",
             )
         with self.assertRaisesRegex(ValueError, "before sealed lock"):
             protocols.append_postlock_start_change(
                 (),
+                sealed_state=self._empty_chain_state(),
                 game_pk=777001,
                 previous_effective_start_utc="2026-07-13T23:10:00Z",
                 new_effective_start_utc="2026-07-13T23:40:00Z",
                 observed_at_utc="2026-07-13T22:24:59Z",
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:25:01Z",
             )
-        rewritten = (
-            replace(events[0], new_effective_start_utc="2026-07-13T23:20:00Z"),
-        )
+        rewritten = (*events[:-1], replace(events[-1], new_effective_start_utc="2026-07-13T23:20:00Z"))
         with self.assertRaisesRegex(ValueError, "event hash"):
             protocols.validate_postlock_start_changes(
                 rewritten,
-                game_pk=777001,
+                sealed_state=state,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
             )
         with self.assertRaisesRegex(ValueError, "event count"):
             protocols.validate_postlock_start_changes(
-                (),
-                game_pk=777001,
+                events[:-1],
+                sealed_state=state,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
-                expected_count=1,
-                expected_head_hash=events[-1].event_hash,
             )
         with self.assertRaisesRegex(ValueError, "lock basis"):
             protocols.validate_postlock_start_changes(
                 events,
-                game_pk=777001,
+                sealed_state=state,
                 lock_basis_start_utc="2026-07-13T23:11:00Z",
+            )
+        with self.assertRaisesRegex(ValueError, "lock basis"):
+            protocols.validate_postlock_start_changes(
+                (),
+                sealed_state=self._empty_chain_state(),
+                lock_basis_start_utc="2026-07-13T23:11:00Z",
+            )
+        for invalid_state in (
+            replace(state, game_pk=True),
+            replace(state, event_count=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "exact positive integer|count"):
+                protocols.validate_postlock_start_changes(
+                    events,
+                    sealed_state=invalid_state,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+        bool_event = replace(events[0], game_pk=True, sequence=True)
+        with self.assertRaisesRegex(ValueError, "exact positive integers"):
+            protocols.validate_postlock_start_changes(
+                (bool_event, events[1]),
+                sealed_state=state,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
             )
 
     def test_prospective_oracle_is_recursive_frozen_detached_and_design_pinned(self):
@@ -375,7 +582,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "73a702afd529b4959855aa1df26fa91ad9f1d5a9f3e8a2931998925d89291e8d",
+            "e956e8481c255c8ae022f92b66ce2c133efdf903fe56ece9ef118c3ed9d66f90",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
@@ -439,6 +646,12 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertFalse(pool["incomplete_or_unverified_rows_affect_rank"])
         self.assertFalse(pool["partial_rows_affect_rank"])
+        self.assertEqual(pool["candidate_date_state"], "CANDIDATE_ACTIVE")
+        self.assertEqual(
+            pool["selection_gate"],
+            "all_candidate_locks_sealed_and_final_lock_receipt_recorded",
+        )
+        self.assertTrue(pool["candidate_top1_preclaim_forbidden"])
 
     def test_new_isolation_ranking_and_postlock_literals_reject_tampering(self):
         raw = json.loads(PROSPECTIVE_SPEC.read_text())
