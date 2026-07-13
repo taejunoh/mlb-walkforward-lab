@@ -4144,6 +4144,41 @@ def write_prospective_date_roster(
         return roster
 
 
+def _candidate_slate_date_disposition(
+    dispositions: tuple[Mapping[str, object], ...] | list[Mapping[str, object]],
+) -> str:
+    if not isinstance(dispositions, (tuple, list)) or not dispositions:
+        raise ValueError("candidate slate game dispositions must be nonempty")
+    terminal_names: set[str] = set()
+    for row in dispositions:
+        if not isinstance(row, Mapping):
+            raise ValueError("candidate slate game disposition must be a mapping")
+        value = row.get("disposition")
+        if not isinstance(value, str) or value not in {
+            "RUN_INVALID",
+            "OFFICIAL_CANDIDATE",
+            "SYSTEM_MISS",
+            "SYSTEM_MISS_CLOCK",
+            "TIMESTAMP_PARTIAL_T45",
+            "NO_VERIFIED_T45_SNAPSHOT",
+        }:
+            raise ValueError("candidate slate game disposition is unknown")
+        terminal_names.add(value)
+    events: list[str] = []
+    if "RUN_INVALID" in terminal_names:
+        events.append("RUN_INVALID")
+    events.extend(
+        sorted({"SYSTEM_MISS_CLOCK", "SYSTEM_MISS"} & terminal_names)
+    )
+    if "OFFICIAL_CANDIDATE" in terminal_names:
+        events.append("LOCK_TOP1")
+    elif "TIMESTAMP_PARTIAL_T45" in terminal_names:
+        events.append("SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE")
+    else:
+        events.append("NO_VERIFIED_ELIGIBLE_DATE")
+    return date_disposition(events)
+
+
 def _roster_terminal_projection(
     root: Path, roster: ProspectiveDateRoster
 ) -> tuple[tuple[Mapping[str, object], ...], frozenset[int], str, str]:
@@ -4208,15 +4243,7 @@ def _roster_terminal_projection(
                 }
             )
         )
-    terminal_names = {row["disposition"] for row in dispositions}
-    if eligible_games:
-        date_state = "LOCK_TOP1"
-    elif {"SYSTEM_MISS_CLOCK", "SYSTEM_MISS"} & terminal_names:
-        date_state = "SYSTEM_MISS"
-    elif "TIMESTAMP_PARTIAL_T45" in terminal_names:
-        date_state = "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"
-    else:
-        date_state = "NO_VERIFIED_ELIGIBLE_DATE"
+    date_state = _candidate_slate_date_disposition(dispositions)
     return (
         tuple(dispositions),
         frozenset(eligible_games),
@@ -4374,18 +4401,10 @@ def load_prospective_candidate_slate(
         raise ValueError("candidate slate manifest digest is invalid")
     if obj["all_locks_sealed"] is not True:
         raise ValueError("candidate slate manifest does not seal every lock")
-    terminal_names = {row["disposition"] for row in dispositions}
     official_count = sum(
         row["disposition"] == "OFFICIAL_CANDIDATE" for row in dispositions
     )
-    if official_count:
-        derived_date_disposition = "LOCK_TOP1"
-    elif {"SYSTEM_MISS_CLOCK", "SYSTEM_MISS"} & terminal_names:
-        derived_date_disposition = "SYSTEM_MISS"
-    elif "TIMESTAMP_PARTIAL_T45" in terminal_names:
-        derived_date_disposition = "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"
-    else:
-        derived_date_disposition = "NO_VERIFIED_ELIGIBLE_DATE"
+    derived_date_disposition = _candidate_slate_date_disposition(dispositions)
     if (
         not isinstance(obj["date_disposition"], str)
         or obj["date_disposition"] not in PROSPECTIVE_DATE_PRECEDENCE
@@ -4559,6 +4578,10 @@ def select_prospective_top1(
         or current_date_disposition != slate.date_disposition
     ):
         raise ValueError("Top1 roster terminal ledger coverage binding differs")
+    if slate.date_disposition != "LOCK_TOP1":
+        raise ValueError(
+            f"Top1 unavailable for terminal date disposition {slate.date_disposition}"
+        )
     if slate.expected_candidate_count == 0:
         raise ValueError(
             f"Top1 unavailable for terminal date disposition {slate.date_disposition}"

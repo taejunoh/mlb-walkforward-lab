@@ -561,6 +561,50 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     {"gamePk": 777002, "disposition": "SYSTEM_MISS_CLOCK"},
                 ),
             )
+            self.assertEqual(slate.date_disposition, "SYSTEM_MISS")
+            with self.assertRaisesRegex(ValueError, "SYSTEM_MISS|disposition|Top1"):
+                protocols.select_prospective_top1(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            slate_path = root / slate.audit_path
+            relabeled = json.loads(slate_path.read_bytes())
+            relabeled["date_disposition"] = "LOCK_TOP1"
+            slate_path.write_bytes(canonical_json_bytes(relabeled) + b"\n")
+            with self.assertRaisesRegex(ValueError, "date disposition"):
+                protocols.load_prospective_candidate_slate(
+                    root, official_date="2026-07-13"
+                )
+
+    def test_mixed_eligible_and_acquisition_miss_blocks_top1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root, game_pk=777001)
+            self._sealed_snapshot_ledger(
+                root,
+                game_pk=777002,
+                receipts=(("2026-07-13T22:24:00Z", False, False),),
+            )
+            self._seal_date_roster(root, (777001, 777002))
+            candidate = self._disk_candidate(root, game_pk=777001)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            self.assertEqual(
+                tuple(row["disposition"] for row in slate.game_dispositions),
+                ("OFFICIAL_CANDIDATE", "SYSTEM_MISS"),
+            )
+            self.assertEqual(slate.date_disposition, "SYSTEM_MISS")
+            with self.assertRaisesRegex(ValueError, "SYSTEM_MISS|disposition|Top1"):
+                protocols.select_prospective_top1(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
 
     def test_unsigned_caller_subset_cannot_define_authoritative_date_roster(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1126,6 +1170,13 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 dict(slate.game_dispositions[0])["disposition"],
                 "TIMESTAMP_PARTIAL_T45",
             )
+            self.assertEqual(slate.date_disposition, "LOCK_TOP1")
+            top1 = protocols.select_prospective_top1(
+                root,
+                official_date="2026-07-13",
+                candidates=(candidate,),
+            )
+            self.assertEqual(top1.game_pk, 777002)
 
     def test_zero_verified_eligible_date_seals_terminal_empty_slate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2513,6 +2564,34 @@ class ProspectiveProtocolTest(unittest.TestCase):
         for active, expected in precedence_cases:
             with self.subTest(active=active):
                 self.assertEqual(date_disposition(active), expected)
+
+    def test_candidate_slate_date_disposition_uses_frozen_precedence(self):
+        def disposition(value):
+            return deep_freeze({"gamePk": 777001, "disposition": value})
+
+        cases = (
+            (("OFFICIAL_CANDIDATE",), "LOCK_TOP1"),
+            (
+                ("OFFICIAL_CANDIDATE", "TIMESTAMP_PARTIAL_T45"),
+                "LOCK_TOP1",
+            ),
+            (
+                ("OFFICIAL_CANDIDATE", "SYSTEM_MISS_CLOCK"),
+                "SYSTEM_MISS",
+            ),
+            (("OFFICIAL_CANDIDATE", "SYSTEM_MISS"), "SYSTEM_MISS"),
+            (("TIMESTAMP_PARTIAL_T45",), "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"),
+            (("NO_VERIFIED_T45_SNAPSHOT",), "NO_VERIFIED_ELIGIBLE_DATE"),
+            (("RUN_INVALID", "OFFICIAL_CANDIDATE"), "RUN_INVALID"),
+        )
+        for terminal_names, expected in cases:
+            with self.subTest(terminal_names=terminal_names):
+                self.assertEqual(
+                    protocols._candidate_slate_date_disposition(
+                        tuple(disposition(value) for value in terminal_names)
+                    ),
+                    expected,
+                )
 
     def test_candidate_gate_rejects_missing_date_backfill_half_and_unbound_snapshot(self):
         invalid = (
