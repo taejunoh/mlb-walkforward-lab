@@ -7,6 +7,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mlb_backtest.manifest import RawStore
 
@@ -159,6 +160,99 @@ class V52ProtectedInventoryTest(unittest.TestCase):
             artifact.data_path.write_bytes(b"tampered\n")
             with self.assertRaisesRegex(RuntimeError, "payload digest mismatch"):
                 verify_protected_raw_inventory(root, inventory_path)
+
+    def test_build_rejects_mutation_between_rawstore_verification_and_inventory_reads(
+        self,
+    ) -> None:
+        original_verify = RawStore.verify_manifests
+
+        def mutate_raw(catalog):
+            catalog[0]["payload_path"].write_bytes(b"bad-one\nbad-two\n")
+
+        def mutate_manifest_and_seal(catalog):
+            manifest_path = catalog[0]["manifest_path"]
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            document["retrieved_at_utc"] = "2000-01-01T00:00:00Z"
+            content = json.dumps(
+                document, ensure_ascii=False, sort_keys=True, indent=2
+            ).encode("utf-8")
+            manifest_path.write_bytes(content)
+            seal_path = manifest_path.with_name(
+                manifest_path.name[:-5] + ".sha256"
+            )
+            seal_path.write_text(
+                hashlib.sha256(content).hexdigest() + "\n", encoding="ascii"
+            )
+
+        def mutate_seal(catalog):
+            manifest_path = catalog[0]["manifest_path"]
+            seal_path = manifest_path.with_name(
+                manifest_path.name[:-5] + ".sha256"
+            )
+            seal_path.write_bytes(b"0" * 64 + b"\n")
+
+        for label, mutation in (
+            ("raw", mutate_raw),
+            ("manifest", mutate_manifest_and_seal),
+            ("seal", mutate_seal),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                legacy_root, _ = self._fixture(root)
+
+                def verify_then_mutate(store):
+                    catalog = original_verify(store)
+                    mutation(catalog)
+                    return catalog
+
+                with (
+                    patch.object(
+                        RawStore, "verify_manifests", verify_then_mutate
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "changed after RawStore verification"
+                    ),
+                ):
+                    build_protected_raw_inventory(root, legacy_root)
+
+    def test_verify_rejects_boolean_for_every_closed_integer_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            legacy_root = root / "data/v5_1_bt/raw"
+            RawStore(legacy_root).put("source", {"season": 2022}, b"x")
+            inventory = build_protected_raw_inventory(root, legacy_root)
+            inventory_path = root / "inventory.json"
+
+            mutations = {
+                "schema_version": lambda item: item.__setitem__(
+                    "schema_version", True
+                ),
+                "manifest_count": lambda item: item.__setitem__(
+                    "manifest_count", True
+                ),
+            }
+            for object_kind in ("manifest", "raw", "seal"):
+                mutations[f"{object_kind}.byte_size"] = (
+                    lambda item, kind=object_kind: item["records"][0][kind].__setitem__(
+                        "byte_size", True
+                    )
+                )
+                for fingerprint_key in ("device", "inode"):
+                    mutations[f"{object_kind}.{fingerprint_key}"] = (
+                        lambda item,
+                        kind=object_kind,
+                        key=fingerprint_key: item["records"][0][kind][
+                            "inode_fingerprint"
+                        ].__setitem__(key, True)
+                    )
+
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    invalid = json.loads(json.dumps(inventory))
+                    mutate(invalid)
+                    inventory_path.write_bytes(_canonical_bytes(invalid))
+                    with self.assertRaisesRegex(ValueError, "must be an integer"):
+                        verify_protected_raw_inventory(root, inventory_path)
 
     def test_rejects_noncanonical_inventory_symlink_hardlink_and_special_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

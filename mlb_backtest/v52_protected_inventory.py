@@ -128,10 +128,20 @@ def _open_regular(path: Path, label: str) -> tuple[int, os.stat_result]:
         raise
 
 
-def _stream_object(root: Path, path: Path, label: str) -> dict[str, object]:
+def _stream_object(
+    root: Path,
+    path: Path,
+    label: str,
+    *,
+    capture_content: bool = False,
+    count_rows: bool = False,
+) -> tuple[dict[str, object], bytes | None, int | None]:
     descriptor, opened = _open_regular(path, label)
     digest = hashlib.sha256()
     byte_size = 0
+    chunks: list[bytes] | None = [] if capture_content else None
+    pending_line = b""
+    row_count = 0
     try:
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -139,6 +149,12 @@ def _stream_object(root: Path, path: Path, label: str) -> dict[str, object]:
                 break
             digest.update(chunk)
             byte_size += len(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+            if count_rows:
+                lines = (pending_line + chunk).split(b"\n")
+                pending_line = lines.pop()
+                row_count += sum(bool(line.strip()) for line in lines)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -150,16 +166,22 @@ def _stream_object(root: Path, path: Path, label: str) -> dict[str, object]:
         raise RuntimeError(f"{label} changed after reading")
     if byte_size != opened.st_size:
         raise RuntimeError(f"{label} byte count changed while reading")
+    if count_rows and pending_line.strip():
+        row_count += 1
     try:
         relative = path.absolute().relative_to(root).as_posix()
     except ValueError as exc:
         raise ValueError(f"{label} must be inside repository root") from exc
-    return {
-        "byte_size": byte_size,
-        "inode_fingerprint": {"device": opened.st_dev, "inode": opened.st_ino},
-        "path": relative,
-        "sha256": digest.hexdigest(),
-    }
+    return (
+        {
+            "byte_size": byte_size,
+            "inode_fingerprint": {"device": opened.st_dev, "inode": opened.st_ino},
+            "path": relative,
+            "sha256": digest.hexdigest(),
+        },
+        b"".join(chunks) if chunks is not None else None,
+        row_count if count_rows else None,
+    )
 
 
 def _read_regular(root: Path, path: Path, label: str) -> bytes:
@@ -201,7 +223,6 @@ def build_protected_raw_inventory(
     _validate_legacy_tree(legacy_path, repository_root)
 
     verified = RawStore(legacy_path).verify_manifests()
-    object_cache: dict[Path, dict[str, object]] = {}
     records: list[dict[str, object]] = []
     for item in verified:
         manifest = item["manifest"]
@@ -209,21 +230,54 @@ def build_protected_raw_inventory(
         raw_path = Path(item["payload_path"])
         seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
 
-        def object_record(path: Path, label: str) -> dict[str, object]:
-            canonical = path.absolute()
-            if canonical not in object_cache:
-                object_cache[canonical] = _stream_object(
-                    repository_root, path, label
-                )
-            return dict(object_cache[canonical])
+        manifest_record, manifest_content, _ = _stream_object(
+            repository_root,
+            manifest_path,
+            "legacy manifest",
+            capture_content=True,
+        )
+        raw_record, _, raw_row_count = _stream_object(
+            repository_root,
+            raw_path,
+            "legacy raw payload",
+            count_rows=True,
+        )
+        seal_record, seal_content, _ = _stream_object(
+            repository_root,
+            seal_path,
+            "legacy manifest seal",
+            capture_content=True,
+        )
+        expected_seal = f'{item["manifest_sha256"]}\n'.encode("ascii")
+        try:
+            streamed_manifest = RawStore._read_manifest(manifest_content)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "legacy manifest changed after RawStore verification"
+            ) from exc
+        verification_results = (
+            manifest_record["sha256"] == item["manifest_sha256"],
+            streamed_manifest == manifest,
+            streamed_manifest["source"] == manifest["source"],
+            streamed_manifest["query"] == manifest["query"],
+            raw_record["sha256"] == manifest["sha256"],
+            raw_row_count == manifest["row_count"],
+            seal_content == expected_seal,
+            seal_record["sha256"] == hashlib.sha256(expected_seal).hexdigest(),
+        )
+        rawstore_verified = all(verification_results)
+        if not rawstore_verified:
+            raise RuntimeError(
+                "legacy bytes changed after RawStore verification"
+            )
 
         records.append(
             {
                 "canonical_query": manifest["query"],
-                "manifest": object_record(manifest_path, "legacy manifest"),
-                "raw": object_record(raw_path, "legacy raw payload"),
-                "rawstore_verified": True,
-                "seal": object_record(seal_path, "legacy manifest seal"),
+                "manifest": manifest_record,
+                "raw": raw_record,
+                "rawstore_verified": rawstore_verified,
+                "seal": seal_record,
                 "source": manifest["source"],
             }
         )
@@ -240,23 +294,78 @@ def build_protected_raw_inventory(
 def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
     if not isinstance(inventory, dict) or set(inventory) != _INVENTORY_KEYS:
         raise ValueError("protected raw inventory keys are invalid")
-    if inventory["schema_version"] != 1:
+
+    def require_integer(value: object, label: str, minimum: int) -> int:
+        if type(value) is not int:
+            raise ValueError(f"protected raw inventory {label} must be an integer")
+        if value < minimum:
+            raise ValueError(f"protected raw inventory {label} is invalid")
+        return value
+
+    def require_string(value: object, label: str) -> str:
+        if type(value) is not str or not value:
+            raise ValueError(f"protected raw inventory {label} must be a string")
+        return value
+
+    schema_version = require_integer(
+        inventory["schema_version"], "schema_version", 1
+    )
+    if schema_version != 1:
         raise ValueError("protected raw inventory schema version is invalid")
-    if inventory["rawstore_verification"] != "PASS":
+    legacy_root = require_string(inventory["legacy_root"], "legacy_root")
+    if legacy_root != "data/v5_1_bt/raw":
+        raise ValueError("protected raw inventory legacy root is invalid")
+    verification = require_string(
+        inventory["rawstore_verification"], "rawstore_verification"
+    )
+    if verification != "PASS":
         raise ValueError("protected raw inventory RawStore result is invalid")
-    if not isinstance(inventory["records"], list):
+    if type(inventory["records"]) is not list or not inventory["records"]:
         raise ValueError("protected raw inventory records are invalid")
-    if inventory["manifest_count"] != len(inventory["records"]):
+    manifest_count = require_integer(
+        inventory["manifest_count"], "manifest_count", 1
+    )
+    if manifest_count != len(inventory["records"]):
         raise ValueError("protected raw inventory manifest count is invalid")
     for record in inventory["records"]:
-        if not isinstance(record, dict) or set(record) != _RECORD_KEYS:
+        if type(record) is not dict or set(record) != _RECORD_KEYS:
             raise ValueError("protected raw inventory record keys are invalid")
-        if record["rawstore_verified"] is not True:
+        if type(record["canonical_query"]) is not dict:
+            raise ValueError(
+                "protected raw inventory canonical_query must be an object"
+            )
+        require_string(record["source"], "record source")
+        if type(record["rawstore_verified"]) is not bool:
+            raise ValueError(
+                "protected raw inventory rawstore_verified must be a boolean"
+            )
+        if not record["rawstore_verified"]:
             raise ValueError("protected raw inventory record was not verified")
         for kind in ("manifest", "raw", "seal"):
             item = record[kind]
-            if not isinstance(item, dict) or set(item) != _OBJECT_KEYS:
+            if type(item) is not dict or set(item) != _OBJECT_KEYS:
                 raise ValueError("protected raw inventory object keys are invalid")
+            require_integer(item["byte_size"], f"{kind} byte_size", 0)
+            path = require_string(item["path"], f"{kind} path")
+            if path.startswith("/") or "\\" in path or ".." in Path(path).parts:
+                raise ValueError(f"protected raw inventory {kind} path is invalid")
+            digest = require_string(item["sha256"], f"{kind} sha256")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    f"protected raw inventory {kind} sha256 is invalid"
+                )
+            fingerprint = item["inode_fingerprint"]
+            if type(fingerprint) is not dict or set(fingerprint) != {
+                "device",
+                "inode",
+            }:
+                raise ValueError(
+                    "protected raw inventory inode fingerprint keys are invalid"
+                )
+            require_integer(fingerprint["device"], f"{kind} device", 0)
+            require_integer(fingerprint["inode"], f"{kind} inode", 1)
     return inventory
 
 
@@ -276,6 +385,6 @@ def verify_protected_raw_inventory(
     rebuilt = build_protected_raw_inventory(
         repository_root, repository_root / inventory["legacy_root"]
     )
-    if inventory != rebuilt:
+    if content != _canonical_json_bytes(rebuilt):
         raise ValueError("protected raw inventory mismatch")
     return inventory
