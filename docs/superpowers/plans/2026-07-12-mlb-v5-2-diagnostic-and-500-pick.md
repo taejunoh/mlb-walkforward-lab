@@ -2463,6 +2463,8 @@ if __name__ == "__main__":
 
 Write `prospective_2026.json` from `expected_prospective_spec()` and generate a closed schema mirror whose top-level `const` is that exact JSON and whose nested required/property keys mirror every dict above. This phase defines and validates the protocol only; it creates no pre-2026-07-13 snapshot and never backfills a missed date.
 
+Quality-hardening amendment: the frozen contract also publishes an approved-design blob pin and is checked against an independent frozen canonical digest, the exact typed snapshot fields used to prove the immutable start basis and T-45 receipt window, the exact typed `POSTLOCK_START_CHANGE` fields and SHA-256 append chain, and the complete official-pool row fields. Runtime helpers must select the latest successful complete qualifying snapshot, validate every effective-start transition including return-to-prior-start transitions, apply date-state precedence over a set/list of active conditions, and preserve fsynced recovery files with their exact paths if bundle rollback itself fails. These are protocol-verification rules only; they do not create a collector, observation, lock, or backfill.
+
 - [ ] **Step 4: Run all protocol tests and lint**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.protocols --root . --write-contracts && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`

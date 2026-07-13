@@ -8,6 +8,7 @@ import stat
 import tempfile
 import unittest
 
+import mlb_backtest.protocols as protocols
 from mlb_backtest.diagnostics import canonical_json_bytes, deep_freeze, sha256_file
 from mlb_backtest.protocols import (
     CHANGE_CHANGED,
@@ -66,6 +67,29 @@ PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
 
 
 class ProspectiveProtocolTest(unittest.TestCase):
+    def _snapshot(
+        self,
+        *,
+        sequence=1,
+        scheduled="2026-07-13T23:10:00Z",
+        receipt="2026-07-13T22:22:00Z",
+        lock="2026-07-13T22:25:00Z",
+        successful=True,
+        complete=True,
+        offset=0.25,
+    ):
+        return protocols.ProspectiveSnapshot(
+            game_pk=777001,
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            observed_scheduled_start_utc=scheduled,
+            lock_at_utc=lock,
+            receipt_at_utc=receipt,
+            successful=successful,
+            complete_participants=complete,
+            ntp_offset_seconds=offset,
+            sequence=sequence,
+        )
+
     def test_exact_2026_oof_and_timestamp_contract(self):
         spec = load_prospective_spec(PROSPECTIVE_SPEC)
         self.assertEqual(spec.first_permitted_date.isoformat(), "2026-07-13")
@@ -90,10 +114,21 @@ class ProspectiveProtocolTest(unittest.TestCase):
             "RECONSTRUCTED_FINAL_PARTICIPANTS",
             "TIMESTAMP_PARTIAL_T45",
         ):
-            self.assertFalse(eligible_for_prospective_official_pool(stratum))
+            self.assertFalse(
+                eligible_for_prospective_official_pool(
+                    protocols.ProspectivePoolRow(
+                        provenance=stratum,
+                        lock_state="SEALED",
+                        final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
+                        critical=False,
+                        eligibility_status="ELIGIBLE",
+                        date_disposition="LOCK_TOP1",
+                    )
+                )
+            )
         with self.assertRaisesRegex(ValueError, "pooling forbidden"):
             combine_ledgers("historical_walkforward_500", "prospective_2026")
-        self.assertEqual(date_disposition("acquisition_failure"), "SYSTEM_MISS")
+        self.assertEqual(date_disposition(["acquisition_failure"]), "SYSTEM_MISS")
 
     def test_unknown_missing_nested_and_tampered_values_fail_closed(self):
         raw = json.loads(PROSPECTIVE_SPEC.read_text())
@@ -114,14 +149,21 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_clock_pool_and_postlock_immutability_literal_contract(self):
         spec = load_prospective_spec(PROSPECTIVE_SPEC)
         self.assertEqual(spec.raw, deep_freeze(expected_prospective_spec()))
-        self.assertEqual(classify_snapshot(-50, 2.0, True), "TIMESTAMP_VERIFIED_T45")
-        self.assertEqual(classify_snapshot(-45, 2.0, True), "TIMESTAMP_VERIFIED_T45")
-        self.assertEqual(classify_snapshot(-44.999, 0, True), "LATE_RESPONSE_REJECTED")
-        self.assertEqual(classify_snapshot(-47, 2.000001, True), "SYSTEM_MISS_CLOCK")
-        self.assertEqual(classify_snapshot(-47, 0, False), "TIMESTAMP_PARTIAL_T45")
-        self.assertEqual(date_disposition("run_invalid"), "RUN_INVALID")
-        self.assertEqual(date_disposition("partial_only"), "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE")
-        self.assertEqual(date_disposition("empty_verified"), "NO_VERIFIED_ELIGIBLE_DATE")
+        self.assertEqual(
+            classify_snapshot(self._snapshot()), "TIMESTAMP_VERIFIED_T45"
+        )
+        self.assertEqual(
+            classify_snapshot(self._snapshot(complete=False)),
+            "TIMESTAMP_PARTIAL_T45",
+        )
+        self.assertEqual(date_disposition(["run_invalid"]), "RUN_INVALID")
+        self.assertEqual(
+            date_disposition(["partial_only"]),
+            "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
+        )
+        self.assertEqual(
+            date_disposition(["empty_verified"]), "NO_VERIFIED_ELIGIBLE_DATE"
+        )
         changes = spec.raw["schedule_changes"]
         self.assertEqual(changes["postlock_mutable_field"], "latest_effective_start_utc")
         self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
@@ -130,13 +172,102 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertTrue(spec.raw["backfill_forbidden"])
         self.assertTrue(spec.raw["pooling_forbidden"])
 
+    def test_snapshot_record_validates_clock_basis_window_and_latest_selection(self):
+        early = self._snapshot(sequence=1, receipt="2026-07-13T22:20:00Z")
+        later = self._snapshot(sequence=2, receipt="2026-07-13T22:24:59Z")
+        partial = self._snapshot(
+            sequence=3,
+            receipt="2026-07-13T22:25:00Z",
+            complete=False,
+        )
+        failed = self._snapshot(
+            sequence=4,
+            receipt="2026-07-13T22:25:00Z",
+            successful=False,
+        )
+        self.assertEqual(classify_snapshot(early), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(later), "TIMESTAMP_VERIFIED_T45")
+        self.assertEqual(classify_snapshot(partial), "TIMESTAMP_PARTIAL_T45")
+        self.assertEqual(classify_snapshot(failed), "UNSUCCESSFUL_RESPONSE_REJECTED")
+        self.assertEqual(
+            protocols.select_qualifying_snapshot((early, later, partial, failed)),
+            later,
+        )
+
+    def test_snapshot_record_rejects_basis_lock_receipt_and_sequence_mismatches(self):
+        cases = (
+            (self._snapshot(scheduled="2026-07-13T23:11:00Z"), "scheduled start"),
+            (self._snapshot(lock="2026-07-13T22:24:59Z"), "basis minus 45"),
+            (self._snapshot(receipt="2026-07-13T22:25:01Z"), "after lock"),
+            (self._snapshot(receipt="2026-07-13T22:19:59Z"), "qualifying window"),
+            (self._snapshot(offset=2.000001), "SYSTEM_MISS_CLOCK"),
+            (self._snapshot(sequence=0), "sequence"),
+        )
+        for snapshot, message in cases:
+            with self.subTest(message=message):
+                if message == "SYSTEM_MISS_CLOCK":
+                    self.assertEqual(classify_snapshot(snapshot), message)
+                else:
+                    with self.assertRaisesRegex(ValueError, message):
+                        classify_snapshot(snapshot)
+        with self.assertRaisesRegex(ValueError, "canonical UTC"):
+            classify_snapshot(
+                self._snapshot(receipt="2026-07-13T22:22:00+00:00")
+            )
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            protocols.select_qualifying_snapshot(
+                (self._snapshot(sequence=2), self._snapshot(sequence=1))
+            )
+
+    def test_official_pool_full_row_gate_and_date_precedence(self):
+        eligible = protocols.ProspectivePoolRow(
+            provenance="TIMESTAMP_VERIFIED_T45",
+            lock_state="SEALED",
+            final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
+            critical=False,
+            eligibility_status="ELIGIBLE",
+            date_disposition="LOCK_TOP1",
+        )
+        self.assertTrue(eligible_for_prospective_official_pool(eligible))
+        mutations = (
+            replace(eligible, lock_state="UNSEALED"),
+            replace(eligible, final_snapshot_classification="TIMESTAMP_PARTIAL_T45"),
+            replace(eligible, critical=True),
+            replace(eligible, eligibility_status="EXCLUDE"),
+            replace(eligible, date_disposition="SYSTEM_MISS"),
+        )
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                self.assertFalse(eligible_for_prospective_official_pool(changed))
+
+        precedence_cases = (
+            ({"lock_top1"}, "LOCK_TOP1"),
+            ({"empty_verified", "lock_top1"}, "NO_VERIFIED_ELIGIBLE_DATE"),
+            (
+                {"partial_only", "empty_verified", "lock_top1"},
+                "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
+            ),
+            (
+                {"acquisition_failure", "partial_only", "lock_top1"},
+                "SYSTEM_MISS",
+            ),
+            (
+                {"run_invalid", "acquisition_failure", "partial_only"},
+                "RUN_INVALID",
+            ),
+            ({"clock_failure", "partial_only"}, "SYSTEM_MISS"),
+        )
+        for active, expected in precedence_cases:
+            with self.subTest(active=active):
+                self.assertEqual(date_disposition(active), expected)
+
     def test_postlock_start_change_is_append_only_and_cannot_rewrite_lock(self):
         changes = load_prospective_spec(PROSPECTIVE_SPEC).raw["schedule_changes"]
         event = changes["postlock_start_change"]
         self.assertEqual(event["event"], "POSTLOCK_START_CHANGE")
         self.assertEqual(
             event["trigger"],
-            "latest_effective_start_utc_differs_from_lock_basis_start_utc",
+            "new_effective_start_utc_differs_from_previous_effective_start_utc",
         )
         self.assertEqual(event["write_mode"], "append_immutable_audit_event")
         self.assertEqual(
@@ -147,6 +278,128 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertTrue(event["delete_forbidden"])
         self.assertTrue(changes["relock_forbidden"])
         self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
+
+    def test_postlock_start_change_typed_hash_chain_records_every_transition(self):
+        events = protocols.append_postlock_start_change(
+            (),
+            game_pk=777001,
+            previous_effective_start_utc="2026-07-13T23:10:00Z",
+            new_effective_start_utc="2026-07-13T23:40:00Z",
+            observed_at_utc="2026-07-13T22:30:00Z",
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+        )
+        events = protocols.append_postlock_start_change(
+            events,
+            game_pk=777001,
+            previous_effective_start_utc="2026-07-13T23:40:00Z",
+            new_effective_start_utc="2026-07-13T23:10:00Z",
+            observed_at_utc="2026-07-13T22:35:00Z",
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+        )
+        self.assertEqual(tuple(event.sequence for event in events), (1, 2))
+        self.assertEqual(events[0].prior_event_hash, "0" * 64)
+        self.assertEqual(events[1].prior_event_hash, events[0].event_hash)
+        self.assertEqual(
+            protocols.validate_postlock_start_changes(
+                events,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                expected_count=2,
+                expected_head_hash=events[-1].event_hash,
+            ),
+            events[-1].event_hash,
+        )
+
+    def test_postlock_chain_rejects_noop_rewrite_delete_and_wrong_lock(self):
+        events = protocols.append_postlock_start_change(
+            (),
+            game_pk=777001,
+            previous_effective_start_utc="2026-07-13T23:10:00Z",
+            new_effective_start_utc="2026-07-13T23:40:00Z",
+            observed_at_utc="2026-07-13T22:30:00Z",
+            lock_basis_start_utc="2026-07-13T23:10:00Z",
+        )
+        with self.assertRaisesRegex(ValueError, "effective start did not change"):
+            protocols.append_postlock_start_change(
+                events,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:40:00Z",
+                new_effective_start_utc="2026-07-13T23:40:00Z",
+                observed_at_utc="2026-07-13T22:31:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+            )
+        with self.assertRaisesRegex(ValueError, "before sealed lock"):
+            protocols.append_postlock_start_change(
+                (),
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:10:00Z",
+                new_effective_start_utc="2026-07-13T23:40:00Z",
+                observed_at_utc="2026-07-13T22:24:59Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+            )
+        rewritten = (
+            replace(events[0], new_effective_start_utc="2026-07-13T23:20:00Z"),
+        )
+        with self.assertRaisesRegex(ValueError, "event hash"):
+            protocols.validate_postlock_start_changes(
+                rewritten,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+            )
+        with self.assertRaisesRegex(ValueError, "event count"):
+            protocols.validate_postlock_start_changes(
+                (),
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                expected_count=1,
+                expected_head_hash=events[-1].event_hash,
+            )
+        with self.assertRaisesRegex(ValueError, "lock basis"):
+            protocols.validate_postlock_start_changes(
+                events,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:11:00Z",
+            )
+
+    def test_prospective_oracle_is_recursive_frozen_detached_and_design_pinned(self):
+        oracle = protocols.PROSPECTIVE_LITERAL_ORACLE
+        with self.assertRaises(TypeError):
+            oracle["polling"]["max_ntp_offset_seconds"] = 3
+        first = expected_prospective_spec()
+        first["polling"]["max_ntp_offset_seconds"] = 3
+        second = expected_prospective_spec()
+        self.assertEqual(second["polling"]["max_ntp_offset_seconds"], 2)
+        self.assertEqual(
+            second["freeze_pin"]["approved_design_blob_sha256"],
+            protocols.APPROVED_DESIGN_BLOB_SHA256,
+        )
+        self.assertEqual(
+            protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
+            "73a702afd529b4959855aa1df26fa91ad9f1d5a9f3e8a2931998925d89291e8d",
+        )
+        with self.assertRaisesRegex(ValueError, "prospective spec differs"):
+            parse_prospective_spec(first)
+        tampered = copy.deepcopy(second)
+        tampered["freeze_pin"]["approved_design_blob_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "design pin"):
+            parse_prospective_spec(tampered)
+        with patch(
+            "mlb_backtest.protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256",
+            "0" * 64,
+        ):
+            with self.assertRaisesRegex(ValueError, "canonical digest"):
+                parse_prospective_spec(second)
+
+    def test_prospective_writer_verifies_approved_design_blob_before_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "output"
+            with patch(
+                "mlb_backtest.protocols.approved_design_bytes",
+                return_value=b"tampered approved design",
+            ):
+                with self.assertRaisesRegex(ValueError, "design pin"):
+                    write_prospective_contract(root)
+            self.assertFalse(root.exists())
 
     def test_prospective_outcomes_are_inaccessible_until_all_locks_are_sealed(self):
         isolation = load_prospective_spec(PROSPECTIVE_SPEC).raw["outcome_isolation"]
@@ -306,6 +559,49 @@ class ProspectiveProtocolTest(unittest.TestCase):
             for path, contents in old.items():
                 self.assertEqual(path.read_bytes(), contents)
             self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_writer_preserves_recovery_files_when_rollback_restore_fails(self):
+        relatives = (
+            Path("protocols/v5_2_qd/prospective_2026.json"),
+            Path("schemas/v5_2_prospective.schema.json"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            old = {}
+            for index, relative in enumerate(relatives):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                old[path] = f"irreplaceable-old-{index}".encode()
+                path.write_bytes(old[path])
+            original_replace = os.replace
+            final_calls = 0
+
+            def fail_publish_then_restore(source, destination):
+                nonlocal final_calls
+                if Path(destination) in tuple(root / item for item in relatives):
+                    final_calls += 1
+                    if final_calls == 2:
+                        raise OSError("publish replacement failed")
+                    if final_calls == 3:
+                        raise OSError("rollback restoration failed")
+                return original_replace(source, destination)
+
+            with patch(
+                "mlb_backtest.protocols.os.replace",
+                side_effect=fail_publish_then_restore,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "rollback failed.*recovery paths="
+                ) as raised:
+                    write_prospective_contract(root)
+            recovery_files = tuple(sorted(root.rglob(".*.tmp")))
+            self.assertTrue(recovery_files)
+            message = str(raised.exception)
+            for path in recovery_files:
+                self.assertIn(str(path), message)
+            recovered_bytes = {path.read_bytes() for path in recovery_files}
+            self.assertIn(old[root / relatives[0]], recovered_bytes)
+            self.assertEqual((root / relatives[1]).read_bytes(), old[root / relatives[1]])
 
 
 class HistoricalRunSpecTest(unittest.TestCase):

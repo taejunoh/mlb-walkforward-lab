@@ -1,6 +1,6 @@
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 import argparse
@@ -328,6 +328,7 @@ PROSPECTIVE_REQUIRED_KEYS = frozenset(
         "namespace",
         "pooling_forbidden",
         "backfill_forbidden",
+        "freeze_pin",
     }
 )
 POLLING_KEYS = frozenset(
@@ -356,6 +357,13 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
+APPROVED_DESIGN_BLOB_SHA256 = (
+    "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
+)
+PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
+    "73a702afd529b4959855aa1df26fa91ad9f1d5a9f3e8a2931998925d89291e8d"
+)
+POSTLOCK_GENESIS_HASH = "0" * 64
 FOLD_LITERALS = (
     {
         "fold_id": "H22",
@@ -619,6 +627,41 @@ class ProspectiveSpec:
     raw: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class ProspectiveSnapshot:
+    game_pk: int
+    lock_basis_start_utc: str
+    observed_scheduled_start_utc: str
+    lock_at_utc: str
+    receipt_at_utc: str
+    successful: bool
+    complete_participants: bool
+    ntp_offset_seconds: float
+    sequence: int
+
+
+@dataclass(frozen=True)
+class PostlockStartChange:
+    game_pk: int
+    sequence: int
+    previous_effective_start_utc: str
+    new_effective_start_utc: str
+    observed_at_utc: str
+    lock_basis_start_utc: str
+    prior_event_hash: str
+    event_hash: str
+
+
+@dataclass(frozen=True)
+class ProspectivePoolRow:
+    provenance: str
+    lock_state: str
+    final_snapshot_classification: str
+    critical: bool
+    eligibility_status: str
+    date_disposition: str
+
+
 def require_exact_keys(
     value: object, expected: frozenset[str], path: str
 ) -> Mapping[str, object]:
@@ -744,7 +787,7 @@ def load_run_spec(path: Path) -> RunSpec:
     return parse_run_spec(json.loads(path.read_text(encoding="utf-8")))
 
 
-def expected_prospective_spec() -> dict[str, object]:
+def _build_prospective_literal() -> dict[str, object]:
     return {
         "schema_version": 1,
         "run_id": "prospective_2026",
@@ -770,6 +813,18 @@ def expected_prospective_spec() -> dict[str, object]:
             "qualifying_interval_closed": True,
             "timezone_normalization": "UTC",
             "clock_failure_status": "SYSTEM_MISS_CLOCK",
+            "snapshot_record_fields": [
+                "gamePk",
+                "lock_basis_start_utc",
+                "observed_scheduled_start_utc",
+                "lock_at_utc",
+                "receipt_at_utc",
+                "successful",
+                "complete_participants",
+                "ntp_offset_seconds",
+                "sequence",
+            ],
+            "selection": "latest_successful_complete_eligible_snapshot",
         },
         "schedule_changes": {
             "prelock": "invalidate_prior_snapshots_and_restart_countdown",
@@ -780,8 +835,8 @@ def expected_prospective_spec() -> dict[str, object]:
             "postlock_start_change": {
                 "event": "POSTLOCK_START_CHANGE",
                 "trigger": (
-                    "latest_effective_start_utc_differs_from_"
-                    "lock_basis_start_utc"
+                    "new_effective_start_utc_differs_from_"
+                    "previous_effective_start_utc"
                 ),
                 "write_mode": "append_immutable_audit_event",
                 "latest_effective_start_utc_update": (
@@ -789,6 +844,17 @@ def expected_prospective_spec() -> dict[str, object]:
                 ),
                 "rewrite_forbidden": True,
                 "delete_forbidden": True,
+                "record_fields": [
+                    "gamePk",
+                    "sequence",
+                    "previous_effective_start_utc",
+                    "new_effective_start_utc",
+                    "observed_at_utc",
+                    "lock_basis_start_utc",
+                    "prior_event_hash",
+                    "event_hash",
+                ],
+                "hash_chain": "sha256_canonical_json_with_genesis_zero_hash",
             },
             "immutable_fields": [
                 "lock_basis_start_utc",
@@ -816,6 +882,14 @@ def expected_prospective_spec() -> dict[str, object]:
             "incomplete_or_unverified_rows_affect_rank": False,
             "partial_rows_affect_rank": False,
             "p_home_equal_half_official": False,
+            "executable_row_fields": [
+                "provenance",
+                "lock_state",
+                "final_snapshot_classification",
+                "critical",
+                "eligibility_status",
+                "date_disposition",
+            ],
         },
         "shadow_pool": {
             "provenance": "TIMESTAMP_PARTIAL_T45",
@@ -851,11 +925,35 @@ def expected_prospective_spec() -> dict[str, object]:
         "namespace": "data/v5_2_qd/prospective_2026",
         "pooling_forbidden": True,
         "backfill_forbidden": True,
+        "freeze_pin": {
+            "approved_design_commit": "a4aa8d2",
+            "approved_design_blob_sha256": APPROVED_DESIGN_BLOB_SHA256,
+        },
     }
+
+
+PROSPECTIVE_LITERAL_ORACLE = deep_freeze(_build_prospective_literal())
+if not isinstance(PROSPECTIVE_LITERAL_ORACLE, Mapping):
+    raise TypeError("prospective literal oracle freeze failed")
+
+
+def expected_prospective_spec() -> dict[str, object]:
+    return json.loads(canonical_json_bytes(PROSPECTIVE_LITERAL_ORACLE))
 
 
 def parse_prospective_spec(raw: object) -> ProspectiveSpec:
     obj = require_exact_keys(raw, PROSPECTIVE_REQUIRED_KEYS, "prospective")
+    freeze_pin = require_exact_keys(
+        obj["freeze_pin"],
+        frozenset({"approved_design_commit", "approved_design_blob_sha256"}),
+        "prospective.freeze_pin",
+    )
+    if (
+        freeze_pin["approved_design_commit"] != "a4aa8d2"
+        or freeze_pin["approved_design_blob_sha256"]
+        != APPROVED_DESIGN_BLOB_SHA256
+    ):
+        raise ValueError("prospective approved design pin differs")
     polling = require_exact_keys(obj["polling"], POLLING_KEYS, "prospective.polling")
     provenance = require_exact_keys(
         obj["participant_provenance"],
@@ -874,6 +972,11 @@ def parse_prospective_spec(raw: object) -> ProspectiveSpec:
         if "keys differ" in str(exc):
             raise
         raise ValueError("prospective spec differs from frozen values") from exc
+    if (
+        hashlib.sha256(canonical_json_bytes(obj)).hexdigest()
+        != PROSPECTIVE_CONTRACT_CANONICAL_SHA256
+    ):
+        raise ValueError("prospective canonical digest differs from frozen contract")
     spec = ProspectiveSpec(
         run_id=str(obj["run_id"]),
         first_permitted_date=date.fromisoformat(str(obj["first_permitted_date"])),
@@ -898,48 +1001,307 @@ def load_prospective_spec(path: Path) -> ProspectiveSpec:
     return parse_prospective_spec(json.loads(path.read_text(encoding="utf-8")))
 
 
-def eligible_for_prospective_official_pool(stratum: str) -> bool:
-    return stratum == "TIMESTAMP_VERIFIED_T45"
+def eligible_for_prospective_official_pool(row: ProspectivePoolRow) -> bool:
+    if not isinstance(row, ProspectivePoolRow):
+        raise ValueError("prospective official pool requires a typed full row")
+    if not isinstance(row.critical, bool) or not all(
+        isinstance(value, str)
+        for value in (
+            row.provenance,
+            row.lock_state,
+            row.final_snapshot_classification,
+            row.eligibility_status,
+            row.date_disposition,
+        )
+    ):
+        raise ValueError("prospective official pool row fields are invalid")
+    return (
+        row.provenance == "TIMESTAMP_VERIFIED_T45"
+        and row.lock_state == "SEALED"
+        and row.final_snapshot_classification == "TIMESTAMP_VERIFIED_T45"
+        and not row.critical
+        and row.eligibility_status == "ELIGIBLE"
+        and row.date_disposition == "LOCK_TOP1"
+    )
 
 
 DATE_DISPOSITIONS = MappingProxyType(
     {
         "run_invalid": "RUN_INVALID",
         "acquisition_failure": "SYSTEM_MISS",
-        "clock_failure": "SYSTEM_MISS_CLOCK",
+        "clock_failure": "SYSTEM_MISS",
         "partial_only": "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
         "empty_verified": "NO_VERIFIED_ELIGIBLE_DATE",
+        "lock_top1": "LOCK_TOP1",
+        "RUN_INVALID": "RUN_INVALID",
+        "SYSTEM_MISS": "SYSTEM_MISS",
+        "SYSTEM_MISS_CLOCK": "SYSTEM_MISS",
+        "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE": (
+            "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"
+        ),
+        "NO_VERIFIED_ELIGIBLE_DATE": "NO_VERIFIED_ELIGIBLE_DATE",
+        "LOCK_TOP1": "LOCK_TOP1",
     }
 )
 
 
-def classify_snapshot(
-    minutes_to_start: float,
-    ntp_offset_seconds: float,
-    complete_participants: bool,
-) -> str:
-    minutes = finite_number(minutes_to_start, "minutes_to_start")
-    offset = finite_number(ntp_offset_seconds, "ntp_offset_seconds")
-    if not isinstance(complete_participants, bool):
-        raise ValueError("complete_participants must be boolean")
+def _canonical_utc_datetime(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        value,
+    ):
+        raise ValueError(f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SSZ"
+        ) from exc
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ValueError(f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
+    return parsed
+
+
+def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
+    if not isinstance(snapshot, ProspectiveSnapshot):
+        raise ValueError("snapshot must be a typed ProspectiveSnapshot")
+    if (
+        isinstance(snapshot.game_pk, bool)
+        or not isinstance(snapshot.game_pk, int)
+        or snapshot.game_pk <= 0
+        or isinstance(snapshot.sequence, bool)
+        or not isinstance(snapshot.sequence, int)
+        or snapshot.sequence <= 0
+    ):
+        raise ValueError("snapshot gamePk and sequence must be positive integers")
+    if not isinstance(snapshot.successful, bool) or not isinstance(
+        snapshot.complete_participants, bool
+    ):
+        raise ValueError("snapshot success and completeness must be boolean")
+    basis = _canonical_utc_datetime(
+        snapshot.lock_basis_start_utc, "lock_basis_start_utc"
+    )
+    scheduled = _canonical_utc_datetime(
+        snapshot.observed_scheduled_start_utc,
+        "observed_scheduled_start_utc",
+    )
+    lock_at = _canonical_utc_datetime(snapshot.lock_at_utc, "lock_at_utc")
+    receipt = _canonical_utc_datetime(snapshot.receipt_at_utc, "receipt_at_utc")
+    if scheduled != basis:
+        raise ValueError("snapshot scheduled start differs from lock basis")
+    if lock_at != basis - timedelta(minutes=45):
+        raise ValueError("lock_at_utc must equal lock basis minus 45 minutes")
+    if receipt > lock_at:
+        raise ValueError("snapshot receipt is after lock")
+    if receipt < basis - timedelta(minutes=50):
+        raise ValueError("snapshot receipt is outside qualifying window")
+    if lock_at - receipt > timedelta(minutes=5):
+        raise ValueError("snapshot exceeds maximum freshness at lock")
+    offset = finite_number(snapshot.ntp_offset_seconds, "ntp_offset_seconds")
     if abs(offset) > 2:
         return "SYSTEM_MISS_CLOCK"
-    if minutes < -50:
-        return "TOO_EARLY_NOT_QUALIFYING"
-    if minutes > -45:
-        return "LATE_RESPONSE_REJECTED"
+    if not snapshot.successful:
+        return "UNSUCCESSFUL_RESPONSE_REJECTED"
     return (
         "TIMESTAMP_VERIFIED_T45"
-        if complete_participants
+        if snapshot.complete_participants
         else "TIMESTAMP_PARTIAL_T45"
     )
 
 
-def date_disposition(event: str) -> str:
-    try:
-        return DATE_DISPOSITIONS[event]
-    except KeyError as exc:
-        raise ValueError(f"unknown prospective date event: {event}") from exc
+def select_qualifying_snapshot(
+    candidates: tuple[ProspectiveSnapshot, ...],
+) -> ProspectiveSnapshot | None:
+    if not isinstance(candidates, tuple) or not all(
+        isinstance(candidate, ProspectiveSnapshot) for candidate in candidates
+    ):
+        raise ValueError("snapshot candidates must be a typed tuple")
+    if not candidates:
+        return None
+    sequences = tuple(candidate.sequence for candidate in candidates)
+    if sequences != tuple(sorted(set(sequences))):
+        raise ValueError("snapshot candidate sequence must be strictly increasing")
+    identity = {
+        (
+            candidate.game_pk,
+            candidate.lock_basis_start_utc,
+            candidate.lock_at_utc,
+        )
+        for candidate in candidates
+    }
+    if len(identity) != 1:
+        raise ValueError("snapshot candidates differ in game or immutable lock basis")
+    eligible = [
+        candidate
+        for candidate in candidates
+        if classify_snapshot(candidate) == "TIMESTAMP_VERIFIED_T45"
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda candidate: (
+            _canonical_utc_datetime(candidate.receipt_at_utc, "receipt_at_utc"),
+            candidate.sequence,
+        ),
+    )
+
+
+def date_disposition(events: object) -> str:
+    if not isinstance(events, (list, tuple, set, frozenset)) or not events:
+        raise ValueError("prospective date events must be a non-empty list or set")
+    active: set[str] = set()
+    for event in events:
+        if not isinstance(event, str) or event not in DATE_DISPOSITIONS:
+            raise ValueError(f"unknown prospective date event: {event}")
+        active.add(DATE_DISPOSITIONS[event])
+    for disposition in PROSPECTIVE_DATE_PRECEDENCE:
+        if disposition in active:
+            return disposition
+    raise ValueError("prospective date events contain no frozen disposition")
+
+
+def _postlock_event_payload(event: PostlockStartChange) -> dict[str, object]:
+    return {
+        "event": "POSTLOCK_START_CHANGE",
+        "gamePk": event.game_pk,
+        "sequence": event.sequence,
+        "previous_effective_start_utc": event.previous_effective_start_utc,
+        "new_effective_start_utc": event.new_effective_start_utc,
+        "observed_at_utc": event.observed_at_utc,
+        "lock_basis_start_utc": event.lock_basis_start_utc,
+        "prior_event_hash": event.prior_event_hash,
+    }
+
+
+def _postlock_event_hash(event: PostlockStartChange) -> str:
+    return hashlib.sha256(canonical_json_bytes(_postlock_event_payload(event))).hexdigest()
+
+
+def validate_postlock_start_changes(
+    events: tuple[PostlockStartChange, ...],
+    *,
+    game_pk: int,
+    lock_basis_start_utc: str,
+    expected_count: int | None = None,
+    expected_head_hash: str | None = None,
+) -> str:
+    if not isinstance(events, tuple) or not all(
+        isinstance(event, PostlockStartChange) for event in events
+    ):
+        raise ValueError("post-lock events must be a typed immutable tuple")
+    if (
+        isinstance(game_pk, bool)
+        or not isinstance(game_pk, int)
+        or game_pk <= 0
+    ):
+        raise ValueError("post-lock gamePk must be a positive integer")
+    lock_basis = _canonical_utc_datetime(
+        lock_basis_start_utc, "lock_basis_start_utc"
+    )
+    lock_at = lock_basis - timedelta(minutes=45)
+    if expected_count is not None and (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 0
+        or len(events) != expected_count
+    ):
+        raise ValueError("post-lock event count differs from append-only pin")
+    prior_hash = POSTLOCK_GENESIS_HASH
+    previous_effective = lock_basis_start_utc
+    previous_observed: datetime | None = None
+    for index, event in enumerate(events, start=1):
+        if event.game_pk != game_pk:
+            raise ValueError("post-lock event gamePk differs from sealed lock")
+        if event.sequence != index:
+            raise ValueError("post-lock event sequence is not contiguous")
+        if event.lock_basis_start_utc != lock_basis_start_utc:
+            raise ValueError("post-lock event lock basis differs from sealed lock")
+        if event.previous_effective_start_utc != previous_effective:
+            raise ValueError("post-lock effective-start chain is discontinuous")
+        if event.new_effective_start_utc == event.previous_effective_start_utc:
+            raise ValueError("post-lock effective start did not change")
+        _canonical_utc_datetime(
+            event.previous_effective_start_utc,
+            "previous_effective_start_utc",
+        )
+        _canonical_utc_datetime(
+            event.new_effective_start_utc, "new_effective_start_utc"
+        )
+        observed = _canonical_utc_datetime(event.observed_at_utc, "observed_at_utc")
+        if observed < lock_at:
+            raise ValueError("post-lock event was observed before sealed lock")
+        if previous_observed is not None and observed <= previous_observed:
+            raise ValueError("post-lock observed times must be strictly increasing")
+        if event.prior_event_hash != prior_hash:
+            raise ValueError("post-lock prior event hash differs")
+        calculated = _postlock_event_hash(event)
+        if event.event_hash != calculated:
+            raise ValueError("post-lock event hash differs")
+        prior_hash = calculated
+        previous_effective = event.new_effective_start_utc
+        previous_observed = observed
+    if expected_head_hash is not None:
+        if (
+            not isinstance(expected_head_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_head_hash)
+            or prior_hash != expected_head_hash
+        ):
+            raise ValueError("post-lock event head hash differs from append-only pin")
+    return prior_hash
+
+
+def append_postlock_start_change(
+    events: tuple[PostlockStartChange, ...],
+    *,
+    game_pk: int,
+    previous_effective_start_utc: str,
+    new_effective_start_utc: str,
+    observed_at_utc: str,
+    lock_basis_start_utc: str,
+) -> tuple[PostlockStartChange, ...]:
+    head = validate_postlock_start_changes(
+        events,
+        game_pk=game_pk,
+        lock_basis_start_utc=lock_basis_start_utc,
+    )
+    expected_previous = (
+        events[-1].new_effective_start_utc if events else lock_basis_start_utc
+    )
+    if previous_effective_start_utc != expected_previous:
+        raise ValueError("post-lock previous effective start differs from current head")
+    if new_effective_start_utc == previous_effective_start_utc:
+        raise ValueError("post-lock effective start did not change")
+    _canonical_utc_datetime(
+        previous_effective_start_utc, "previous_effective_start_utc"
+    )
+    _canonical_utc_datetime(new_effective_start_utc, "new_effective_start_utc")
+    observed = _canonical_utc_datetime(observed_at_utc, "observed_at_utc")
+    lock_at = _canonical_utc_datetime(
+        lock_basis_start_utc, "lock_basis_start_utc"
+    ) - timedelta(minutes=45)
+    if observed < lock_at:
+        raise ValueError("post-lock event was observed before sealed lock")
+    unsigned = PostlockStartChange(
+        game_pk=game_pk,
+        sequence=len(events) + 1,
+        previous_effective_start_utc=previous_effective_start_utc,
+        new_effective_start_utc=new_effective_start_utc,
+        observed_at_utc=observed_at_utc,
+        lock_basis_start_utc=lock_basis_start_utc,
+        prior_event_hash=head,
+        event_hash="",
+    )
+    event = replace(unsigned, event_hash=_postlock_event_hash(unsigned))
+    appended = (*events, event)
+    validate_postlock_start_changes(
+        appended,
+        game_pk=game_pk,
+        lock_basis_start_utc=lock_basis_start_utc,
+        expected_count=len(events) + 1,
+        expected_head_hash=event.event_hash,
+    )
+    return appended
 
 
 def combine_ledgers(left_run_id: str, right_run_id: str) -> None:
@@ -1590,7 +1952,17 @@ def write_historical_contract(root: Path) -> None:
     )
 
 
-def write_prospective_contract(root: Path) -> None:
+def write_prospective_contract(
+    root: Path, *, approved_design_root: Path | None = None
+) -> None:
+    design_root = (
+        Path(__file__).resolve().parents[1]
+        if approved_design_root is None
+        else approved_design_root.resolve()
+    )
+    design_digest = hashlib.sha256(approved_design_bytes(design_root)).hexdigest()
+    if design_digest != APPROVED_DESIGN_BLOB_SHA256:
+        raise ValueError("prospective approved design pin differs")
     raw = expected_prospective_spec()
     parse_prospective_spec(raw)
     schema = prospective_schema(raw)
@@ -1667,6 +2039,7 @@ def _publish_bundle(
     temporary_paths: list[Path] = []
     backups: dict[Path, Path | None] = {}
     replaced: list[Path] = []
+    preserve_recovery_files = False
     try:
         modes = {
             path: stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
@@ -1691,8 +2064,8 @@ def _publish_bundle(
             _fsync_directory(directory)
         if post_publish is not None:
             post_publish()
-    except BaseException:
-        rollback_error: BaseException | None = None
+    except BaseException as publish_error:
+        rollback_errors: list[tuple[str, BaseException]] = []
         for final_path in reversed(replaced):
             backup_path = backups[final_path]
             try:
@@ -1701,21 +2074,51 @@ def _publish_bundle(
                 else:
                     os.replace(backup_path, final_path)
             except BaseException as error:
-                rollback_error = rollback_error or error
+                rollback_errors.append((str(final_path), error))
         for directory in sorted({path.parent for path in final_paths}):
             try:
                 _fsync_directory(directory)
             except BaseException as error:
-                rollback_error = rollback_error or error
-        if rollback_error is not None:
+                rollback_errors.append((str(directory), error))
+        if rollback_errors:
+            preserve_recovery_files = True
+            recovery_paths = tuple(
+                sorted(
+                    str(path)
+                    for path in (*temporary_paths, *backups.values())
+                    if path is not None and path.exists()
+                )
+            )
+            for path_text in recovery_paths:
+                path = Path(path_text)
+                try:
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                except BaseException as error:
+                    rollback_errors.append((path_text, error))
+            for directory in sorted(
+                {Path(path).parent for path in recovery_paths}
+            ):
+                try:
+                    _fsync_directory(directory)
+                except BaseException as error:
+                    rollback_errors.append((str(directory), error))
+            failures = "; ".join(
+                f"{path}: {type(error).__name__}: {error}"
+                for path, error in rollback_errors
+            )
             raise RuntimeError(
-                "v5.2-QD protocol bundle rollback failed"
-            ) from rollback_error
+                "v5.2-QD protocol bundle rollback failed; "
+                f"recovery paths={list(recovery_paths)}; "
+                f"publish error={type(publish_error).__name__}: {publish_error}; "
+                f"rollback errors={failures}"
+            ) from rollback_errors[0][1]
         raise
     finally:
-        for temporary_path in (*temporary_paths, *backups.values()):
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        if not preserve_recovery_files:
+            for temporary_path in (*temporary_paths, *backups.values()):
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
         for directory in created_directories:
             try:
                 directory.rmdir()
@@ -1812,7 +2215,10 @@ def write_protocol_artifacts(
         approved_design_root=approved_design_root,
     )
     write_historical_contract(root)
-    write_prospective_contract(root)
+    write_prospective_contract(
+        root,
+        approved_design_root=approved_design_root,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
