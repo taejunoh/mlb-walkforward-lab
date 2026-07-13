@@ -361,12 +361,12 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
-CURRENT_APPROVED_DESIGN_COMMIT = "fb728b3"
+CURRENT_APPROVED_DESIGN_COMMIT = "151b8b6"
 CURRENT_APPROVED_DESIGN_SHA256 = (
-    "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
+    "7b690155bb82c0479f0699904d27fb518af5d96497a7feb7fd9ded9c7bbaf972"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "7bd9cf613985d2ead085c0b191cb053215def5273d1b028a2e463b4841053195"
+    "c2f67ea276944df3ad5f5f52c56d47b8384cffb0cc92fc69282098802ed8f8c8"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -634,6 +634,18 @@ class ProspectiveSpec:
 
 
 @dataclass(frozen=True)
+class ProspectiveClockEvidence:
+    observed_at_utc: str
+    offset_seconds: float
+    uncertainty_seconds: float
+    source: str
+    evidence_sha256: str
+    raw_path: str
+    audit_path: str
+    persisted_at_utc: str
+
+
+@dataclass(frozen=True)
 class ProspectiveSnapshot:
     game_pk: int
     lock_basis_start_utc: str
@@ -642,8 +654,10 @@ class ProspectiveSnapshot:
     receipt_at_utc: str
     successful: bool
     complete_participants: bool
-    ntp_offset_seconds: float
     sequence: int
+    countdown_revision: int
+    clock_evidence: ProspectiveClockEvidence | None
+    reason_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -663,7 +677,9 @@ class ProspectiveSnapshotReceipt:
 class ProspectiveSnapshotLedgerState:
     official_date: str
     game_pk: int
-    lock_basis_start_utc: str
+    current_observed_start_utc: str
+    countdown_revision: int
+    lock_basis_start_utc: str | None
     lock_at_utc: str
     status: str
     snapshot_count: int
@@ -787,12 +803,28 @@ class ProspectiveTop1:
 @dataclass(frozen=True)
 class ProspectiveCandidateSlate:
     official_date: str
+    roster_sha256: str
+    scheduled_game_pks: tuple[int, ...]
+    scheduled_game_count: int
+    game_dispositions: tuple[Mapping[str, object], ...]
     expected_candidate_ids: tuple[str, ...]
     expected_candidate_count: int
     candidates_sha256: str
     snapshot_lock_receipts: tuple[Mapping[str, object], ...]
     final_lock_receipt_at_utc: str
     all_locks_sealed: bool
+    persisted_at_utc: str
+    audit_path: str
+
+
+@dataclass(frozen=True)
+class ProspectiveDateRoster:
+    official_date: str
+    scheduled_game_pks: tuple[int, ...]
+    schedule_source: str
+    observed_at_utc: str
+    schedule_snapshot_sha256: str
+    schedule_snapshot_path: str
     persisted_at_utc: str
     audit_path: str
 
@@ -956,9 +988,34 @@ def _build_prospective_literal() -> dict[str, object]:
                 "receipt_at_utc",
                 "successful",
                 "complete_participants",
-                "ntp_offset_seconds",
                 "sequence",
+                "countdown_revision",
+                "clock_evidence",
+                "reason_codes",
             ],
+            "evidence": {
+                "required_fields": [
+                    "observed_at_utc",
+                    "offset_seconds",
+                    "uncertainty_seconds",
+                    "source",
+                    "evidence_sha256",
+                    "raw_path",
+                    "audit_path",
+                    "persisted_at_utc",
+                ],
+                "raw_path_template": (
+                    "audit/v5_2_qd/prospective_2026/clock_evidence_raw/"
+                    "{official_date}/{gamePk}/{evidence_sha256}.bin"
+                ),
+                "audit_path_template": (
+                    "audit/v5_2_qd/prospective_2026/clock_evidence/"
+                    "{official_date}/{gamePk}/{evidence_sha256}.json"
+                ),
+                "integrity_gate": "abs(offset_seconds)+uncertainty_seconds<=2.0",
+                "missing_or_invalid": "SYSTEM_MISS_CLOCK",
+                "digest_binding": "snapshot_candidate_and_slate",
+            },
             "selection": "latest_successful_complete_eligible_snapshot",
             "snapshot_ledger": {
                 "state_path_template": (
@@ -981,6 +1038,16 @@ def _build_prospective_literal() -> dict[str, object]:
                     "O_EXCL_fsync_read_only_every_transition"
                 ),
                 "receipt_time_source": "internal_trusted_clock_only",
+                "open_state_fields": [
+                    "current_observed_start_utc",
+                    "countdown_revision",
+                ],
+                "open_lock_basis": None,
+                "prelock_transition": (
+                    "every_observed_start_change_increments_revision_and_"
+                    "supersedes_prior_epoch"
+                ),
+                "sealed_lock_basis": "selected_final_qualifying_poll_start_only",
                 "subsecond_policy": (
                     "precise_boundary_comparison_then_ceil_canonical_storage"
                 ),
@@ -1154,6 +1221,20 @@ def _build_prospective_literal() -> dict[str, object]:
                 "audit/v5_2_qd/prospective_2026/"
                 "candidate_slate_locks/{official_date}.lock"
             ),
+            "date_roster": {
+                "source": "MLB Stats API schedule",
+                "manifest_path_template": (
+                    "audit/v5_2_qd/prospective_2026/date_rosters/"
+                    "{official_date}.json"
+                ),
+                "snapshot_path_template": (
+                    "audit/v5_2_qd/prospective_2026/schedule_snapshots/"
+                    "{official_date}/{schedule_snapshot_sha256}.json"
+                ),
+                "population_authority": "sealed_schedule_snapshot_gamePks",
+                "terminal_coverage_required": True,
+                "eligible_omission_forbidden": True,
+            },
             "slate_seal_policy": (
                 "immutable_sealed_once_idempotent_exact_same_manifest"
             ),
@@ -1165,6 +1246,10 @@ def _build_prospective_literal() -> dict[str, object]:
             ),
             "slate_manifest_fields": [
                 "official_date",
+                "roster_sha256",
+                "scheduled_game_pks",
+                "scheduled_game_count",
+                "game_dispositions",
                 "expected_candidate_ids",
                 "expected_candidate_count",
                 "candidates_sha256",
@@ -1292,6 +1377,8 @@ SNAPSHOT_LEDGER_STATE_KEYS = frozenset(
     {
         "official_date",
         "gamePk",
+        "current_observed_start_utc",
+        "countdown_revision",
         "lock_basis_start_utc",
         "lock_at_utc",
         "status",
@@ -1327,8 +1414,22 @@ SNAPSHOT_RECORD_KEYS = frozenset(
         "receipt_at_utc",
         "successful",
         "complete_participants",
-        "ntp_offset_seconds",
         "sequence",
+        "countdown_revision",
+        "clock_evidence",
+        "reason_codes",
+    }
+)
+CLOCK_EVIDENCE_KEYS = frozenset(
+    {
+        "observed_at_utc",
+        "offset_seconds",
+        "uncertainty_seconds",
+        "source",
+        "evidence_sha256",
+        "raw_path",
+        "audit_path",
+        "persisted_at_utc",
     }
 )
 SNAPSHOT_STATE_ANCHOR_KEYS = frozenset(
@@ -1364,6 +1465,205 @@ def _trusted_utc_now_value_and_string() -> tuple[datetime, str]:
 
 def _trusted_utc_now_string() -> str:
     return _trusted_utc_now_value_and_string()[1]
+
+
+def _clock_evidence_relative_paths(
+    official_date: str, game_pk: int, evidence_sha256: str
+) -> tuple[Path, Path]:
+    official_date, game_pk, _ = _validate_prospective_identity(
+        official_date, game_pk
+    )
+    if not isinstance(evidence_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", evidence_sha256
+    ):
+        raise ValueError("clock evidence SHA-256 is invalid")
+    base = Path("audit/v5_2_qd/prospective_2026")
+    return (
+        base
+        / "clock_evidence_raw"
+        / official_date
+        / str(game_pk)
+        / f"{evidence_sha256}.bin",
+        base
+        / "clock_evidence"
+        / official_date
+        / str(game_pk)
+        / f"{evidence_sha256}.json",
+    )
+
+
+def _clock_evidence_structurally_valid(
+    evidence: object, *, receipt_at_utc: str | None = None
+) -> bool:
+    if not isinstance(evidence, ProspectiveClockEvidence):
+        return False
+    try:
+        observed = _canonical_utc_datetime(
+            evidence.observed_at_utc, "clock evidence observed_at_utc"
+        )
+        persisted = _canonical_utc_datetime(
+            evidence.persisted_at_utc, "clock evidence persisted_at_utc"
+        )
+        offset = finite_number(evidence.offset_seconds, "clock evidence offset")
+        uncertainty = finite_number(
+            evidence.uncertainty_seconds, "clock evidence uncertainty"
+        )
+        if receipt_at_utc is not None:
+            receipt = _canonical_utc_datetime(
+                receipt_at_utc, "clock evidence bound receipt"
+            )
+        else:
+            receipt = None
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        uncertainty >= 0
+        and abs(offset) + uncertainty <= 2.0
+        and observed <= persisted
+        and (receipt is None or persisted <= receipt)
+        and isinstance(evidence.source, str)
+        and evidence.source.strip()
+        and isinstance(evidence.evidence_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", evidence.evidence_sha256)
+        and isinstance(evidence.raw_path, str)
+        and evidence.raw_path
+        and isinstance(evidence.audit_path, str)
+        and evidence.audit_path
+    )
+
+
+def _clock_evidence_raw_record(evidence: ProspectiveClockEvidence) -> dict[str, object]:
+    return _clock_evidence_raw(evidence)
+
+
+def load_prospective_clock_evidence(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    evidence_sha256: str,
+) -> ProspectiveClockEvidence:
+    raw_relative, audit_relative = _clock_evidence_relative_paths(
+        official_date, game_pk, evidence_sha256
+    )
+    root_path = _reject_symlink_ancestors(root, "clock evidence root")
+    raw_path = root_path / raw_relative
+    audit_path = root_path / audit_relative
+    raw_bytes = _read_regular_unaliased(raw_path, "clock evidence raw bytes")
+    contents = _read_regular_unaliased(audit_path, "clock evidence receipt")
+    try:
+        obj = require_exact_keys(
+            json.loads(contents), CLOCK_EVIDENCE_KEYS, "clock_evidence"
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("clock evidence receipt is not canonical JSON") from exc
+    evidence = _clock_evidence_from_raw(obj, "clock_evidence")
+    assert evidence is not None
+    if (
+        contents != canonical_json_bytes(_clock_evidence_raw_record(evidence)) + b"\n"
+        or evidence.evidence_sha256 != hashlib.sha256(raw_bytes).hexdigest()
+        or evidence.evidence_sha256 != evidence_sha256
+        or evidence.raw_path != raw_relative.as_posix()
+        or evidence.audit_path != audit_relative.as_posix()
+    ):
+        raise ValueError("clock evidence path, hash, or canonical bytes differ")
+    return evidence
+
+
+def write_prospective_clock_evidence(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    observed_at_utc: str,
+    offset_seconds: float,
+    uncertainty_seconds: float,
+    source: str,
+    raw_bytes: bytes,
+) -> ProspectiveClockEvidence:
+    if not isinstance(raw_bytes, bytes) or not raw_bytes:
+        raise ValueError("clock evidence raw bytes are required")
+    observed_at = _canonical_utc_datetime(
+        observed_at_utc, "clock evidence observed_at_utc"
+    )
+    offset = finite_number(offset_seconds, "clock evidence offset_seconds")
+    uncertainty = finite_number(
+        uncertainty_seconds, "clock evidence uncertainty_seconds"
+    )
+    if uncertainty < 0 or not isinstance(source, str) or not source.strip():
+        raise ValueError("clock evidence uncertainty/source is invalid")
+    evidence_sha = hashlib.sha256(raw_bytes).hexdigest()
+    raw_relative, audit_relative = _clock_evidence_relative_paths(
+        official_date, game_pk, evidence_sha
+    )
+    with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        persisted_at = _trusted_utc_now_string()
+        evidence = ProspectiveClockEvidence(
+            observed_at_utc=observed_at_utc,
+            offset_seconds=offset,
+            uncertainty_seconds=uncertainty,
+            source=source,
+            evidence_sha256=evidence_sha,
+            raw_path=raw_relative.as_posix(),
+            audit_path=audit_relative.as_posix(),
+            persisted_at_utc=persisted_at,
+        )
+        if observed_at > _canonical_utc_datetime(
+            persisted_at, "clock evidence persisted_at_utc"
+        ):
+            raise ValueError("clock evidence chronology is invalid")
+        raw_path = root_path / raw_relative
+        audit_path = root_path / audit_relative
+        audit_bytes = canonical_json_bytes(_clock_evidence_raw_record(evidence)) + b"\n"
+        if raw_path.exists() or audit_path.exists():
+            loaded = load_prospective_clock_evidence(
+                root_path,
+                official_date=official_date,
+                game_pk=game_pk,
+                evidence_sha256=evidence_sha,
+            )
+            if (
+                replace(loaded, persisted_at_utc=persisted_at) != evidence
+                or raw_path.read_bytes() != raw_bytes
+            ):
+                raise ValueError("clock evidence is already sealed and differs")
+            return loaded
+        _publish_bundle(
+            ((raw_path, raw_bytes), (audit_path, audit_bytes)),
+            root=root_path,
+            post_publish=lambda: load_prospective_clock_evidence(
+                root_path,
+                official_date=official_date,
+                game_pk=game_pk,
+                evidence_sha256=evidence_sha,
+            ),
+        )
+        return evidence
+
+
+def _clock_evidence_path_valid(
+    root: Path,
+    snapshot: ProspectiveSnapshot,
+    official_date: str,
+) -> bool:
+    evidence = snapshot.clock_evidence
+    if not _clock_evidence_structurally_valid(
+        evidence, receipt_at_utc=snapshot.receipt_at_utc
+    ):
+        return False
+    assert evidence is not None
+    try:
+        return (
+            load_prospective_clock_evidence(
+                root,
+                official_date=official_date,
+                game_pk=snapshot.game_pk,
+                evidence_sha256=evidence.evidence_sha256,
+            )
+            == evidence
+        )
+    except ValueError:
+        return False
 
 
 def _validate_prospective_identity(
@@ -1477,6 +1777,8 @@ def _snapshot_ledger_state_raw(
     return {
         "official_date": state.official_date,
         "gamePk": state.game_pk,
+        "current_observed_start_utc": state.current_observed_start_utc,
+        "countdown_revision": state.countdown_revision,
         "lock_basis_start_utc": state.lock_basis_start_utc,
         "lock_at_utc": state.lock_at_utc,
         "status": state.status,
@@ -1607,6 +1909,37 @@ def _snapshot_receipt_relative_path(
     return receipts / f"{sequence:08d}-{receipt_hash}.json"
 
 
+def _clock_evidence_raw(
+    evidence: ProspectiveClockEvidence,
+) -> dict[str, object]:
+    return {
+        "observed_at_utc": evidence.observed_at_utc,
+        "offset_seconds": evidence.offset_seconds,
+        "uncertainty_seconds": evidence.uncertainty_seconds,
+        "source": evidence.source,
+        "evidence_sha256": evidence.evidence_sha256,
+        "raw_path": evidence.raw_path,
+        "audit_path": evidence.audit_path,
+        "persisted_at_utc": evidence.persisted_at_utc,
+    }
+
+
+def _clock_evidence_from_raw(raw: object, path: str) -> ProspectiveClockEvidence | None:
+    if raw is None:
+        return None
+    obj = require_exact_keys(raw, CLOCK_EVIDENCE_KEYS, path)
+    return ProspectiveClockEvidence(
+        observed_at_utc=obj["observed_at_utc"],
+        offset_seconds=obj["offset_seconds"],
+        uncertainty_seconds=obj["uncertainty_seconds"],
+        source=obj["source"],
+        evidence_sha256=obj["evidence_sha256"],
+        raw_path=obj["raw_path"],
+        audit_path=obj["audit_path"],
+        persisted_at_utc=obj["persisted_at_utc"],
+    )
+
+
 def _snapshot_from_raw(raw: object, path: str) -> ProspectiveSnapshot:
     obj = require_exact_keys(raw, SNAPSHOT_RECORD_KEYS, path)
     snapshot = ProspectiveSnapshot(
@@ -1617,19 +1950,27 @@ def _snapshot_from_raw(raw: object, path: str) -> ProspectiveSnapshot:
         receipt_at_utc=obj["receipt_at_utc"],
         successful=obj["successful"],
         complete_participants=obj["complete_participants"],
-        ntp_offset_seconds=obj["ntp_offset_seconds"],
         sequence=obj["sequence"],
+        countdown_revision=obj["countdown_revision"],
+        clock_evidence=_clock_evidence_from_raw(
+            obj["clock_evidence"], f"{path}.clock_evidence"
+        ),
+        reason_codes=tuple(obj["reason_codes"]),
     )
     if (
         isinstance(snapshot.game_pk, bool)
         or not isinstance(snapshot.game_pk, int)
         or isinstance(snapshot.sequence, bool)
         or not isinstance(snapshot.sequence, int)
+        or isinstance(snapshot.countdown_revision, bool)
+        or not isinstance(snapshot.countdown_revision, int)
+        or snapshot.countdown_revision < 0
+        or not isinstance(obj["reason_codes"], list)
+        or not all(isinstance(reason, str) for reason in snapshot.reason_codes)
         or not isinstance(snapshot.successful, bool)
         or not isinstance(snapshot.complete_participants, bool)
     ):
         raise ValueError(f"{path} typed fields are invalid")
-    finite_number(snapshot.ntp_offset_seconds, f"{path}.ntp_offset_seconds")
     for value, label in (
         (snapshot.lock_basis_start_utc, "lock basis"),
         (snapshot.observed_scheduled_start_utc, "observed scheduled start"),
@@ -1760,6 +2101,8 @@ def _parse_snapshot_ledger_state(
     state = ProspectiveSnapshotLedgerState(
         official_date=obj["official_date"],
         game_pk=obj["gamePk"],
+        current_observed_start_utc=obj["current_observed_start_utc"],
+        countdown_revision=obj["countdown_revision"],
         lock_basis_start_utc=obj["lock_basis_start_utc"],
         lock_at_utc=obj["lock_at_utc"],
         status=obj["status"],
@@ -1775,17 +2118,36 @@ def _parse_snapshot_ledger_state(
     state_relative, receipt_relative, _, _ = _snapshot_ledger_relatives(
         official_date, game_pk
     )
-    _, _, basis = _validate_prospective_identity(
-        official_date, game_pk, state.lock_basis_start_utc
+    _, _, current_start = _validate_prospective_identity(
+        official_date, game_pk, state.current_observed_start_utc
     )
-    assert basis is not None
+    assert current_start is not None
+    basis = (
+        _canonical_utc_datetime(state.lock_basis_start_utc, "snapshot ledger lock basis")
+        if state.lock_basis_start_utc is not None
+        else None
+    )
     if (
         contents != canonical_json_bytes(_snapshot_ledger_state_raw(state)) + b"\n"
         or state.official_date != official_date
         or state.game_pk != game_pk
         or state.lock_at_utc
-        != (basis - timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        != (current_start - timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
         or state.status not in {"OPEN", "CLOSED"}
+        or isinstance(state.countdown_revision, bool)
+        or not isinstance(state.countdown_revision, int)
+        or state.countdown_revision < 0
+        or (state.status == "OPEN" and state.lock_basis_start_utc is not None)
+        or (
+            state.status == "CLOSED"
+            and state.selected_sequence is not None
+            and basis != current_start
+        )
+        or (
+            state.status == "CLOSED"
+            and state.selected_sequence is None
+            and basis is not None
+        )
         or isinstance(state.snapshot_count, bool)
         or not isinstance(state.snapshot_count, int)
         or state.snapshot_count < 0
@@ -1794,7 +2156,9 @@ def _parse_snapshot_ledger_state(
         or state.audit_path != state_relative.as_posix()
         or state.receipt_directory != receipt_relative.as_posix()
     ):
-        raise ValueError("snapshot ledger state identity or canonical bytes differ")
+        raise ValueError(
+            "snapshot ledger state identity, canonical bytes, or state digest differs"
+        )
     return state
 
 
@@ -1855,7 +2219,7 @@ def load_prospective_snapshot_ledger(
         )
         if closed_at < lock_at or closed_at < latest_persisted:
             raise ValueError("snapshot ledger close chronology precedes lock or receipt")
-        selected = _select_snapshot_from_receipts(receipts, state)
+        selected = _select_snapshot_from_receipts(root_path, receipts, state)
         if selected is None:
             if any(
                 value is not None
@@ -1889,11 +2253,12 @@ def load_prospective_snapshot_ledger(
 
 
 def _select_snapshot_from_receipts(
+    root: Path,
     receipts: tuple[ProspectiveSnapshotReceipt, ...],
     state: ProspectiveSnapshotLedgerState,
 ) -> ProspectiveSnapshot | None:
     basis = _canonical_utc_datetime(
-        state.lock_basis_start_utc, "snapshot ledger lock basis"
+        state.current_observed_start_utc, "snapshot ledger current start"
     )
     lock_at = basis - timedelta(minutes=45)
     window_start = basis - timedelta(minutes=50)
@@ -1902,12 +2267,14 @@ def _select_snapshot_from_receipts(
         snapshot = receipt.snapshot
         received = _canonical_utc_datetime(snapshot.receipt_at_utc, "snapshot receipt")
         if (
-            snapshot.lock_basis_start_utc == state.lock_basis_start_utc
-            and snapshot.observed_scheduled_start_utc == state.lock_basis_start_utc
+            snapshot.countdown_revision == state.countdown_revision
+            and snapshot.lock_basis_start_utc == state.current_observed_start_utc
+            and snapshot.observed_scheduled_start_utc
+            == state.current_observed_start_utc
             and snapshot.lock_at_utc == state.lock_at_utc
             and window_start <= received <= lock_at
-            and abs(finite_number(snapshot.ntp_offset_seconds, "ntp_offset_seconds"))
-            <= 2
+            and _classify_snapshot_with_root(root, snapshot)
+            == "TIMESTAMP_VERIFIED_T45"
             and snapshot.successful
             and snapshot.complete_participants
         ):
@@ -1943,7 +2310,9 @@ def initialize_prospective_snapshot_ledger(
     state = ProspectiveSnapshotLedgerState(
         official_date=official_date,
         game_pk=game_pk,
-        lock_basis_start_utc=lock_basis_start_utc,
+        current_observed_start_utc=lock_basis_start_utc,
+        countdown_revision=0,
+        lock_basis_start_utc=None,
         lock_at_utc=lock_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         status="OPEN",
         snapshot_count=0,
@@ -2186,7 +2555,7 @@ def record_prospective_snapshot(
     home_starter_present: bool,
     away_lineup_count: int,
     home_lineup_count: int,
-    ntp_offset_seconds: float,
+    clock_evidence: ProspectiveClockEvidence | None = None,
 ) -> ProspectiveSnapshotReceipt:
     with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
         state, receipts = load_prospective_snapshot_ledger(
@@ -2195,7 +2564,6 @@ def record_prospective_snapshot(
         anchors = _load_snapshot_state_anchors(
             root_path, official_date=official_date, game_pk=game_pk
         )
-        lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
         if state.status != "OPEN":
             raise ValueError("snapshot ledger is closed; append forbidden")
         if (
@@ -2210,13 +2578,28 @@ def record_prospective_snapshot(
             or not 0 <= home_lineup_count <= 9
         ):
             raise ValueError("snapshot participant completeness fields are invalid")
-        _canonical_utc_datetime(
+        observed_start = _canonical_utc_datetime(
             observed_scheduled_start_utc, "observed_scheduled_start_utc"
         )
-        offset = finite_number(ntp_offset_seconds, "ntp_offset_seconds")
         now, now_string = _trusted_utc_now_value_and_string()
-        if now > lock_at:
-            raise ValueError("snapshot receipt is after lock; append forbidden")
+        start_changed = (
+            observed_scheduled_start_utc != state.current_observed_start_utc
+        )
+        if start_changed:
+            state = replace(
+                state,
+                current_observed_start_utc=observed_scheduled_start_utc,
+                countdown_revision=state.countdown_revision + 1,
+                lock_at_utc=(observed_start - timedelta(minutes=45)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            )
+        lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
+        late_reschedule = start_changed and now > lock_at
+        if now > lock_at and not late_reschedule:
+            raise ValueError(
+                "snapshot receipt is after lock; LATE_RESCHEDULE_UNVERIFIED"
+            )
         sequence = len(receipts) + 1
         complete = (
             away_starter_present
@@ -2226,14 +2609,22 @@ def record_prospective_snapshot(
         )
         snapshot = ProspectiveSnapshot(
             game_pk=game_pk,
-            lock_basis_start_utc=state.lock_basis_start_utc,
+            lock_basis_start_utc=state.current_observed_start_utc,
             observed_scheduled_start_utc=observed_scheduled_start_utc,
             lock_at_utc=state.lock_at_utc,
             receipt_at_utc=now_string,
             successful=successful,
             complete_participants=complete,
-            ntp_offset_seconds=offset,
             sequence=sequence,
+            countdown_revision=state.countdown_revision,
+            clock_evidence=(
+                clock_evidence
+                if isinstance(clock_evidence, ProspectiveClockEvidence)
+                else None
+            ),
+            reason_codes=(
+                ("LATE_RESCHEDULE_UNVERIFIED",) if late_reschedule else ()
+            ),
         )
         snapshot_sha = hashlib.sha256(
             canonical_json_bytes(_prospective_snapshot_raw(snapshot))
@@ -2316,7 +2707,7 @@ def seal_prospective_snapshot_ledger(
         lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
         if now < lock_at:
             raise ValueError("snapshot ledger cannot close before lock")
-        selected = _select_snapshot_from_receipts(receipts, state)
+        selected = _select_snapshot_from_receipts(root_path, receipts, state)
         selected_sha = (
             hashlib.sha256(canonical_json_bytes(_prospective_snapshot_raw(selected))).hexdigest()
             if selected is not None
@@ -2325,6 +2716,11 @@ def seal_prospective_snapshot_ledger(
         closed = replace(
             state,
             status="CLOSED",
+            lock_basis_start_utc=(
+                selected.observed_scheduled_start_utc
+                if selected is not None
+                else None
+            ),
             selected_sequence=selected.sequence if selected is not None else None,
             selected_snapshot_id=(
                 _prospective_snapshot_id(selected, selected_sha)
@@ -2389,7 +2785,7 @@ def build_prospective_candidate(
     )
     if state.status != "CLOSED":
         raise ValueError("snapshot ledger is unsealed; SYSTEM_MISS")
-    selected = _select_snapshot_from_receipts(receipts, state)
+    selected = _select_snapshot_from_receipts(root, receipts, state)
     if selected is None:
         raise ValueError("sealed snapshot ledger has no qualifying complete snapshot")
     probability = finite_number(p_home, "candidate.p_home")
@@ -2547,6 +2943,10 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
 CANDIDATE_SLATE_KEYS = frozenset(
     {
         "official_date",
+        "roster_sha256",
+        "scheduled_game_pks",
+        "scheduled_game_count",
+        "game_dispositions",
         "expected_candidate_ids",
         "expected_candidate_count",
         "candidates_sha256",
@@ -2557,6 +2957,20 @@ CANDIDATE_SLATE_KEYS = frozenset(
         "audit_path",
     }
 )
+DATE_ROSTER_KEYS = frozenset(
+    {
+        "official_date",
+        "scheduled_game_pks",
+        "schedule_source",
+        "observed_at_utc",
+        "schedule_snapshot_sha256",
+        "schedule_snapshot_path",
+        "persisted_at_utc",
+        "audit_path",
+    }
+)
+DATE_ROSTER_SNAPSHOT_KEYS = frozenset({"official_date", "gamePks"})
+GAME_DISPOSITION_KEYS = frozenset({"gamePk", "disposition"})
 CANDIDATE_LOCK_RECEIPT_KEYS = frozenset(
     {
         "candidate_id",
@@ -2578,8 +2992,14 @@ def _prospective_snapshot_raw(snapshot: ProspectiveSnapshot) -> dict[str, object
         "receipt_at_utc": snapshot.receipt_at_utc,
         "successful": snapshot.successful,
         "complete_participants": snapshot.complete_participants,
-        "ntp_offset_seconds": snapshot.ntp_offset_seconds,
         "sequence": snapshot.sequence,
+        "countdown_revision": snapshot.countdown_revision,
+        "clock_evidence": (
+            _clock_evidence_raw(snapshot.clock_evidence)
+            if snapshot.clock_evidence is not None
+            else None
+        ),
+        "reason_codes": list(snapshot.reason_codes),
     }
 
 
@@ -2820,9 +3240,202 @@ def _candidate_slate_seal_lock(root: Path, official_date: str):
             os.close(descriptor)
 
 
+def _date_roster_relative_paths(
+    official_date: str, schedule_sha256: str | None = None
+) -> tuple[Path, Path | None]:
+    _canonical_date(official_date, "date roster official_date")
+    manifest = Path(
+        "audit/v5_2_qd/prospective_2026/date_rosters/"
+        f"{official_date}.json"
+    )
+    if schedule_sha256 is None:
+        return manifest, None
+    if not re.fullmatch(r"[0-9a-f]{64}", schedule_sha256):
+        raise ValueError("date roster schedule SHA-256 is invalid")
+    snapshot = Path(
+        "audit/v5_2_qd/prospective_2026/schedule_snapshots/"
+        f"{official_date}/{schedule_sha256}.json"
+    )
+    return manifest, snapshot
+
+
+def _date_roster_raw(roster: ProspectiveDateRoster) -> dict[str, object]:
+    return {
+        "official_date": roster.official_date,
+        "scheduled_game_pks": list(roster.scheduled_game_pks),
+        "schedule_source": roster.schedule_source,
+        "observed_at_utc": roster.observed_at_utc,
+        "schedule_snapshot_sha256": roster.schedule_snapshot_sha256,
+        "schedule_snapshot_path": roster.schedule_snapshot_path,
+        "persisted_at_utc": roster.persisted_at_utc,
+        "audit_path": roster.audit_path,
+    }
+
+
+def load_prospective_date_roster(
+    root: Path, *, official_date: str
+) -> ProspectiveDateRoster:
+    manifest_relative, _ = _date_roster_relative_paths(official_date)
+    root_path = _reject_symlink_ancestors(root, "date roster root")
+    manifest_path = root_path / manifest_relative
+    try:
+        contents = _read_regular_unaliased(manifest_path, "date roster manifest")
+    except ValueError as exc:
+        raise ValueError("sealed date roster is missing") from exc
+    try:
+        obj = require_exact_keys(
+            json.loads(contents), DATE_ROSTER_KEYS, "date_roster"
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("date roster is not canonical JSON") from exc
+    game_pks_raw = obj["scheduled_game_pks"]
+    if not isinstance(game_pks_raw, list) or not game_pks_raw:
+        raise ValueError("date roster scheduled game population is empty")
+    game_pks = tuple(game_pks_raw)
+    if (
+        not all(
+            not isinstance(game_pk, bool) and isinstance(game_pk, int) and game_pk > 0
+            for game_pk in game_pks
+        )
+        or tuple(sorted(set(game_pks))) != game_pks
+    ):
+        raise ValueError("date roster gamePks must be unique and sorted")
+    roster = ProspectiveDateRoster(
+        official_date=obj["official_date"],
+        scheduled_game_pks=game_pks,
+        schedule_source=obj["schedule_source"],
+        observed_at_utc=obj["observed_at_utc"],
+        schedule_snapshot_sha256=obj["schedule_snapshot_sha256"],
+        schedule_snapshot_path=obj["schedule_snapshot_path"],
+        persisted_at_utc=obj["persisted_at_utc"],
+        audit_path=obj["audit_path"],
+    )
+    _, snapshot_relative = _date_roster_relative_paths(
+        official_date, roster.schedule_snapshot_sha256
+    )
+    assert snapshot_relative is not None
+    snapshot_bytes = _read_regular_unaliased(
+        root_path / snapshot_relative, "date roster schedule snapshot"
+    )
+    try:
+        snapshot_obj = require_exact_keys(
+            json.loads(snapshot_bytes), DATE_ROSTER_SNAPSHOT_KEYS, "date_roster.snapshot"
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("date roster schedule snapshot is not canonical JSON") from exc
+    if (
+        contents != canonical_json_bytes(_date_roster_raw(roster)) + b"\n"
+        or snapshot_bytes != canonical_json_bytes(snapshot_obj) + b"\n"
+        or hashlib.sha256(snapshot_bytes).hexdigest()
+        != roster.schedule_snapshot_sha256
+        or roster.official_date != official_date
+        or snapshot_obj["official_date"] != official_date
+        or tuple(snapshot_obj["gamePks"]) != game_pks
+        or roster.schedule_snapshot_path != snapshot_relative.as_posix()
+        or roster.audit_path != manifest_relative.as_posix()
+        or roster.schedule_source != "MLB Stats API schedule"
+    ):
+        raise ValueError("date roster population, source, path, or hash differs")
+    observed = _canonical_utc_datetime(
+        roster.observed_at_utc, "date roster observed_at_utc"
+    )
+    persisted = _canonical_utc_datetime(
+        roster.persisted_at_utc, "date roster persisted_at_utc"
+    )
+    if observed > persisted:
+        raise ValueError("date roster persistence precedes schedule observation")
+    return roster
+
+
+def write_prospective_date_roster(
+    root: Path,
+    *,
+    official_date: str,
+    schedule_source: str,
+    schedule_snapshot_bytes: bytes,
+    observed_at_utc: str,
+) -> ProspectiveDateRoster:
+    if schedule_source != "MLB Stats API schedule":
+        raise ValueError("date roster requires the authoritative MLB schedule source")
+    if not isinstance(schedule_snapshot_bytes, bytes):
+        raise ValueError("date roster schedule snapshot bytes are required")
+    try:
+        snapshot_obj = require_exact_keys(
+            json.loads(schedule_snapshot_bytes),
+            DATE_ROSTER_SNAPSHOT_KEYS,
+            "date_roster.snapshot",
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("date roster schedule snapshot is invalid JSON") from exc
+    canonical_snapshot = canonical_json_bytes(snapshot_obj) + b"\n"
+    if schedule_snapshot_bytes != canonical_snapshot:
+        raise ValueError("date roster schedule snapshot must be canonical JSON")
+    if snapshot_obj["official_date"] != official_date:
+        raise ValueError("date roster snapshot official date differs")
+    game_pks_raw = snapshot_obj["gamePks"]
+    if not isinstance(game_pks_raw, list) or not game_pks_raw:
+        raise ValueError("date roster schedule snapshot has no games")
+    game_pks = tuple(game_pks_raw)
+    if (
+        not all(
+            not isinstance(game_pk, bool) and isinstance(game_pk, int) and game_pk > 0
+            for game_pk in game_pks
+        )
+        or tuple(sorted(set(game_pks))) != game_pks
+    ):
+        raise ValueError("date roster gamePks must be unique and sorted")
+    _canonical_utc_datetime(observed_at_utc, "date roster observed_at_utc")
+    schedule_sha = hashlib.sha256(canonical_snapshot).hexdigest()
+    manifest_relative, snapshot_relative = _date_roster_relative_paths(
+        official_date, schedule_sha
+    )
+    assert snapshot_relative is not None
+    with _candidate_slate_seal_lock(root, official_date) as root_path:
+        persisted_at = _trusted_utc_now_string()
+        roster = ProspectiveDateRoster(
+            official_date=official_date,
+            scheduled_game_pks=game_pks,
+            schedule_source=schedule_source,
+            observed_at_utc=observed_at_utc,
+            schedule_snapshot_sha256=schedule_sha,
+            schedule_snapshot_path=snapshot_relative.as_posix(),
+            persisted_at_utc=persisted_at,
+            audit_path=manifest_relative.as_posix(),
+        )
+        if _canonical_utc_datetime(persisted_at, "date roster persisted_at_utc") < _canonical_utc_datetime(
+            observed_at_utc, "date roster observed_at_utc"
+        ):
+            raise ValueError("date roster persistence precedes schedule observation")
+        manifest_path = root_path / manifest_relative
+        snapshot_path = root_path / snapshot_relative
+        if manifest_path.exists() or snapshot_path.exists():
+            existing = load_prospective_date_roster(
+                root_path, official_date=official_date
+            )
+            stable = replace(existing, persisted_at_utc=persisted_at)
+            if stable != roster or snapshot_path.read_bytes() != canonical_snapshot:
+                raise ValueError("date roster is already sealed and differs")
+            return existing
+        _publish_bundle(
+            (
+                (snapshot_path, canonical_snapshot),
+                (manifest_path, canonical_json_bytes(_date_roster_raw(roster)) + b"\n"),
+            ),
+            root=root_path,
+            post_publish=lambda: load_prospective_date_roster(
+                root_path, official_date=official_date
+            ),
+        )
+        return roster
+
+
 def _candidate_slate_raw(slate: ProspectiveCandidateSlate) -> dict[str, object]:
     return {
         "official_date": slate.official_date,
+        "roster_sha256": slate.roster_sha256,
+        "scheduled_game_pks": list(slate.scheduled_game_pks),
+        "scheduled_game_count": slate.scheduled_game_count,
+        "game_dispositions": [dict(row) for row in slate.game_dispositions],
         "expected_candidate_ids": list(slate.expected_candidate_ids),
         "expected_candidate_count": slate.expected_candidate_count,
         "candidates_sha256": slate.candidates_sha256,
@@ -2849,6 +3462,38 @@ def load_prospective_candidate_slate(
     obj = require_exact_keys(raw, CANDIDATE_SLATE_KEYS, "candidate_slate")
     if contents != canonical_json_bytes(obj) + b"\n":
         raise ValueError("candidate slate manifest bytes are not canonical")
+    roster = load_prospective_date_roster(root_path, official_date=official_date)
+    roster_sha = hashlib.sha256(
+        canonical_json_bytes(_date_roster_raw(roster))
+    ).hexdigest()
+    scheduled_raw = obj["scheduled_game_pks"]
+    dispositions_raw = obj["game_dispositions"]
+    if (
+        obj["roster_sha256"] != roster_sha
+        or not isinstance(scheduled_raw, list)
+        or tuple(scheduled_raw) != roster.scheduled_game_pks
+        or obj["scheduled_game_count"] != len(roster.scheduled_game_pks)
+        or not isinstance(dispositions_raw, list)
+        or len(dispositions_raw) != len(roster.scheduled_game_pks)
+    ):
+        raise ValueError("candidate slate roster binding differs")
+    dispositions: list[Mapping[str, object]] = []
+    for index, row in enumerate(dispositions_raw):
+        disposition = require_exact_keys(
+            row, GAME_DISPOSITION_KEYS, f"candidate_slate.game_dispositions[{index}]"
+        )
+        if (
+            disposition["gamePk"] != roster.scheduled_game_pks[index]
+            or disposition["disposition"]
+            not in {
+                "OFFICIAL_CANDIDATE",
+                "SYSTEM_MISS_CLOCK",
+                "TIMESTAMP_PARTIAL_T45",
+                "NO_VERIFIED_T45_SNAPSHOT",
+            }
+        ):
+            raise ValueError("candidate slate game disposition differs")
+        dispositions.append(deep_freeze(dict(disposition)))
     expected_ids_raw = obj["expected_candidate_ids"]
     receipts_raw = obj["snapshot_lock_receipts"]
     if not isinstance(expected_ids_raw, list) or not all(
@@ -2929,6 +3574,10 @@ def load_prospective_candidate_slate(
         raise ValueError("candidate slate manifest persistence precedes final lock")
     return ProspectiveCandidateSlate(
         official_date=official_date,
+        roster_sha256=roster_sha,
+        scheduled_game_pks=roster.scheduled_game_pks,
+        scheduled_game_count=len(roster.scheduled_game_pks),
+        game_dispositions=tuple(dispositions),
         expected_candidate_ids=expected_ids,
         expected_candidate_count=expected_count,
         candidates_sha256=obj["candidates_sha256"],
@@ -2944,6 +3593,7 @@ def _write_prospective_candidate_slate_locked(
     root_path: Path,
     *,
     routing_date: str,
+    roster: ProspectiveDateRoster,
     candidates: tuple[ProspectiveCandidateRow, ...],
 ) -> ProspectiveCandidateSlate:
     (
@@ -2955,7 +3605,50 @@ def _write_prospective_candidate_slate_locked(
     ) = _candidate_slate_projection(candidates)
     if official_date != routing_date:
         raise ValueError("candidate slate projection differs from locked official date")
+    candidate_game_pks = {candidate.game_pk for candidate in candidates}
+    dispositions: list[Mapping[str, object]] = []
+    eligible_roster_games: set[int] = set()
+    for game_pk in roster.scheduled_game_pks:
+        try:
+            ledger, receipts = load_prospective_snapshot_ledger(
+                root_path, official_date=routing_date, game_pk=game_pk
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"date roster game {game_pk} lacks sealed terminal ledger coverage"
+            ) from exc
+        if ledger.status != "CLOSED":
+            raise ValueError(
+                f"date roster game {game_pk} lacks sealed terminal ledger coverage"
+            )
+        selected = _select_snapshot_from_receipts(root_path, receipts, ledger)
+        if selected is not None:
+            disposition = "OFFICIAL_CANDIDATE"
+            eligible_roster_games.add(game_pk)
+        else:
+            classifications = {
+                _classify_snapshot_with_root(root_path, receipt.snapshot)
+                for receipt in receipts
+            }
+            if "SYSTEM_MISS_CLOCK" in classifications:
+                disposition = "SYSTEM_MISS_CLOCK"
+            elif "TIMESTAMP_PARTIAL_T45" in classifications:
+                disposition = "TIMESTAMP_PARTIAL_T45"
+            else:
+                disposition = "NO_VERIFIED_T45_SNAPSHOT"
+        dispositions.append(
+            deep_freeze({"gamePk": game_pk, "disposition": disposition})
+        )
+    omitted = sorted(eligible_roster_games - candidate_game_pks)
+    unexpected = sorted(candidate_game_pks - eligible_roster_games)
+    if omitted:
+        raise ValueError(f"roster eligible games omitted from slate: {omitted}")
+    if unexpected:
+        raise ValueError(f"slate candidates are not roster-eligible: {unexpected}")
     relative = _candidate_slate_relative_path(official_date)
+    roster_sha = hashlib.sha256(
+        canonical_json_bytes(_date_roster_raw(roster))
+    ).hexdigest()
     frozen_receipts = tuple(deep_freeze(receipt) for receipt in lock_receipts)
     path = root_path / relative
     _reject_symlink_ancestors(path.parent, "candidate slate path")
@@ -2965,6 +3658,10 @@ def _write_prospective_candidate_slate_locked(
         )
         stable_matches = (
             existing.official_date == official_date
+            and existing.roster_sha256 == roster_sha
+            and existing.scheduled_game_pks == roster.scheduled_game_pks
+            and existing.scheduled_game_count == len(roster.scheduled_game_pks)
+            and existing.game_dispositions == tuple(dispositions)
             and existing.expected_candidate_ids == candidate_ids
             and existing.expected_candidate_count == len(candidate_ids)
             and existing.candidates_sha256 == candidates_sha256
@@ -2984,6 +3681,10 @@ def _write_prospective_candidate_slate_locked(
         raise ValueError("candidate slate persistence precedes final lock receipt")
     slate = ProspectiveCandidateSlate(
         official_date=official_date,
+        roster_sha256=roster_sha,
+        scheduled_game_pks=roster.scheduled_game_pks,
+        scheduled_game_count=len(roster.scheduled_game_pks),
+        game_dispositions=tuple(dispositions),
         expected_candidate_ids=candidate_ids,
         expected_candidate_count=len(candidate_ids),
         candidates_sha256=candidates_sha256,
@@ -3019,6 +3720,9 @@ def write_prospective_candidate_slate(
         official_date, "candidate slate official_date"
     ).isoformat()
     with _candidate_slate_seal_lock(root, routing_date) as root_path:
+        roster = load_prospective_date_roster(
+            root_path, official_date=routing_date
+        )
         derived_candidates = _reload_candidates_from_snapshot_ledgers(
             root_path,
             official_date=routing_date,
@@ -3027,6 +3731,7 @@ def write_prospective_candidate_slate(
         return _write_prospective_candidate_slate_locked(
             root_path,
             routing_date=routing_date,
+            roster=roster,
             candidates=derived_candidates,
         )
 
@@ -3133,6 +3838,9 @@ def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
         or isinstance(snapshot.sequence, bool)
         or not isinstance(snapshot.sequence, int)
         or snapshot.sequence <= 0
+        or isinstance(snapshot.countdown_revision, bool)
+        or not isinstance(snapshot.countdown_revision, int)
+        or snapshot.countdown_revision < 0
     ):
         raise ValueError("snapshot gamePk and sequence must be positive integers")
     if not isinstance(snapshot.successful, bool) or not isinstance(
@@ -3157,15 +3865,25 @@ def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
         raise ValueError("snapshot scheduled start differs from lock basis")
     if lock_at != basis - timedelta(minutes=45):
         raise ValueError("lock_at_utc must equal lock basis minus 45 minutes")
-    if receipt > lock_at:
-        raise ValueError("snapshot receipt is after lock")
-    if receipt < basis - timedelta(minutes=50):
-        raise ValueError("snapshot receipt is outside qualifying window")
-    if lock_at - receipt > timedelta(minutes=5):
-        raise ValueError("snapshot exceeds maximum freshness at lock")
-    offset = finite_number(snapshot.ntp_offset_seconds, "ntp_offset_seconds")
-    if abs(offset) > 2:
+    if snapshot.reason_codes not in ((), ("LATE_RESCHEDULE_UNVERIFIED",)):
+        raise ValueError("snapshot reason codes are invalid")
+    late_reschedule = snapshot.reason_codes == ("LATE_RESCHEDULE_UNVERIFIED",)
+    if late_reschedule:
+        if receipt <= lock_at:
+            raise ValueError("late reschedule reason requires a response after lock")
+    else:
+        if receipt > lock_at:
+            raise ValueError("snapshot receipt is after lock")
+        if receipt < basis - timedelta(minutes=50):
+            raise ValueError("snapshot receipt is outside qualifying window")
+        if lock_at - receipt > timedelta(minutes=5):
+            raise ValueError("snapshot exceeds maximum freshness at lock")
+    if not _clock_evidence_structurally_valid(
+        snapshot.clock_evidence, receipt_at_utc=snapshot.receipt_at_utc
+    ):
         return "SYSTEM_MISS_CLOCK"
+    if late_reschedule:
+        return "TIMESTAMP_PARTIAL_T45"
     if not snapshot.successful:
         return "UNSUCCESSFUL_RESPONSE_REJECTED"
     return (
@@ -3173,6 +3891,25 @@ def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
         if snapshot.complete_participants
         else "TIMESTAMP_PARTIAL_T45"
     )
+
+
+def _classify_snapshot_with_root(root: Path, snapshot: ProspectiveSnapshot) -> str:
+    classification = classify_snapshot(snapshot)
+    if classification == "SYSTEM_MISS_CLOCK":
+        return classification
+    official_date = (
+        _canonical_utc_datetime(
+            snapshot.observed_scheduled_start_utc,
+            "snapshot observed scheduled start",
+        )
+        .replace(tzinfo=timezone.utc)
+        .astimezone(ZoneInfo("America/New_York"))
+        .date()
+        .isoformat()
+    )
+    if not _clock_evidence_path_valid(root, snapshot, official_date):
+        return "SYSTEM_MISS_CLOCK"
+    return classification
 
 
 def select_qualifying_snapshot(
@@ -3192,6 +3929,7 @@ def select_qualifying_snapshot(
             candidate.game_pk,
             candidate.lock_basis_start_utc,
             candidate.lock_at_utc,
+            candidate.countdown_revision,
         )
         for candidate in candidates
     }
