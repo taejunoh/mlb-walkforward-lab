@@ -93,7 +93,9 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def _snapshot(
         self,
         *,
+        game_pk=777001,
         sequence=1,
+        basis="2026-07-13T23:10:00Z",
         scheduled="2026-07-13T23:10:00Z",
         receipt="2026-07-13T22:22:00Z",
         lock="2026-07-13T22:25:00Z",
@@ -102,8 +104,8 @@ class ProspectiveProtocolTest(unittest.TestCase):
         offset=0.25,
     ):
         return protocols.ProspectiveSnapshot(
-            game_pk=777001,
-            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            game_pk=game_pk,
+            lock_basis_start_utc=basis,
             observed_scheduled_start_utc=scheduled,
             lock_at_utc=lock,
             receipt_at_utc=receipt,
@@ -132,7 +134,38 @@ class ProspectiveProtocolTest(unittest.TestCase):
         lock_receipt="2026-07-13T22:25:00Z",
         completeness=8.5,
         starter_edge=4.0,
+        snapshot_sequence=4,
+        snapshot_candidates=None,
+        lock_basis="2026-07-13T23:10:00Z",
     ):
+        del snapshot_id, snapshot_hash, sealed_snapshot_id, sealed_snapshot_hash
+        verified_snapshot = self._snapshot(
+            game_pk=game_pk,
+            sequence=snapshot_sequence,
+            receipt=recorded_at,
+            lock=lock_receipt,
+            basis=lock_basis,
+            scheduled=lock_basis,
+        )
+        snapshot_raw = {
+            "gamePk": verified_snapshot.game_pk,
+            "lock_basis_start_utc": verified_snapshot.lock_basis_start_utc,
+            "observed_scheduled_start_utc": (
+                verified_snapshot.observed_scheduled_start_utc
+            ),
+            "lock_at_utc": verified_snapshot.lock_at_utc,
+            "receipt_at_utc": verified_snapshot.receipt_at_utc,
+            "successful": verified_snapshot.successful,
+            "complete_participants": verified_snapshot.complete_participants,
+            "ntp_offset_seconds": verified_snapshot.ntp_offset_seconds,
+            "sequence": verified_snapshot.sequence,
+        }
+        verified_snapshot_sha256 = hashlib.sha256(
+            canonical_json_bytes(snapshot_raw)
+        ).hexdigest()
+        verified_snapshot_id = (
+            f"snapshot:{game_pk}:{snapshot_sequence}:{verified_snapshot_sha256}"
+        )
         return protocols.ProspectiveCandidateRow(
             game_pk=game_pk,
             official_date=official_date,
@@ -140,10 +173,10 @@ class ProspectiveProtocolTest(unittest.TestCase):
             retrospective_backfill=retrospective_backfill,
             p_home=p_home,
             predicted_side=predicted_side,
-            verified_snapshot_id=snapshot_id,
-            verified_snapshot_sha256=snapshot_hash,
-            sealed_lock_snapshot_id=sealed_snapshot_id,
-            sealed_lock_snapshot_sha256=sealed_snapshot_hash,
+            verified_snapshot_id=verified_snapshot_id,
+            verified_snapshot_sha256=verified_snapshot_sha256,
+            sealed_lock_snapshot_id=verified_snapshot_id,
+            sealed_lock_snapshot_sha256=verified_snapshot_sha256,
             provenance="TIMESTAMP_VERIFIED_T45",
             lock_state="SEALED",
             final_snapshot_classification="TIMESTAMP_VERIFIED_T45",
@@ -152,8 +185,14 @@ class ProspectiveProtocolTest(unittest.TestCase):
             date_state=date_state,
             data_completeness_score=completeness,
             absolute_starter_edge=starter_edge,
-            lock_basis_start_utc="2026-07-13T23:10:00Z",
+            lock_basis_start_utc=lock_basis,
             lock_receipt_at_utc=lock_receipt,
+            verified_snapshot=verified_snapshot,
+            snapshot_candidates=(
+                tuple(snapshot_candidates)
+                if snapshot_candidates is not None
+                else (verified_snapshot,)
+            ),
         )
 
     def _empty_chain_state(self):
@@ -301,6 +340,34 @@ class ProspectiveProtocolTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive integers"):
                 classify_snapshot(snapshot)
 
+    def test_snapshot_record_rejects_pre_protocol_backfill(self):
+        for basis, lock_at, receipt in (
+            (
+                "2020-07-13T23:10:00Z",
+                "2020-07-13T22:25:00Z",
+                "2020-07-13T22:24:00Z",
+            ),
+            (
+                "2026-07-13T00:10:00Z",
+                "2026-07-12T23:25:00Z",
+                "2026-07-12T23:24:00Z",
+            ),
+        ):
+            with self.subTest(basis=basis):
+                historical = protocols.ProspectiveSnapshot(
+                    game_pk=777001,
+                    lock_basis_start_utc=basis,
+                    observed_scheduled_start_utc=basis,
+                    lock_at_utc=lock_at,
+                    receipt_at_utc=receipt,
+                    successful=True,
+                    complete_participants=True,
+                    ntp_offset_seconds=0.25,
+                    sequence=1,
+                )
+                with self.assertRaisesRegex(ValueError, "first permitted|backfill"):
+                    classify_snapshot(historical)
+
     def test_official_pool_full_row_gate_and_date_precedence(self):
         eligible = self._candidate()
         self.assertTrue(eligible_for_prospective_official_pool(eligible))
@@ -375,11 +442,89 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     eligible_for_prospective_official_pool(candidate)
 
+    def test_candidate_gate_rejects_caller_asserted_historical_receipt(self):
+        candidate = replace(
+            self._candidate(),
+            recorded_at_utc="2020-01-01T00:00:00Z",
+            lock_receipt_at_utc="2020-01-01T00:00:00Z",
+        )
+        with self.assertRaisesRegex(ValueError, "snapshot|receipt|backfill"):
+            eligible_for_prospective_official_pool(candidate)
+
+    def test_candidate_record_carries_verified_snapshot_and_selection_history(self):
+        fields = protocols.ProspectiveCandidateRow.__dataclass_fields__
+        self.assertIn("verified_snapshot", fields)
+        self.assertIn("snapshot_candidates", fields)
+
+    def test_candidate_gate_binds_canonical_selected_snapshot_and_exact_receipt(self):
+        candidate = self._candidate(recorded_at="2026-07-13T22:24:00Z")
+        self.assertTrue(eligible_for_prospective_official_pool(candidate))
+        later = self._snapshot(
+            sequence=5,
+            receipt="2026-07-13T22:24:59Z",
+        )
+        invalid = (
+            (
+                replace(candidate, verified_snapshot=later),
+                "canonical|snapshot",
+            ),
+            (
+                replace(
+                    candidate,
+                    snapshot_candidates=(*candidate.snapshot_candidates, later),
+                ),
+                "latest|selected",
+            ),
+            (
+                replace(candidate, recorded_at_utc="2026-07-13T22:23:59Z"),
+                "recorded_at|receipt",
+            ),
+            (
+                replace(candidate, official_date="2026-07-14"),
+                "official_date|basis",
+            ),
+        )
+        for changed, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    eligible_for_prospective_official_pool(changed)
+
+    def test_slate_manifest_persists_full_selected_snapshot_binding(self):
+        candidate = self._candidate(recorded_at="2026-07-13T22:24:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            slate = protocols.write_prospective_candidate_slate(
+                root,
+                candidates=(candidate,),
+                persisted_at_utc="2026-07-13T22:26:00Z",
+            )
+            receipt = dict(slate.snapshot_lock_receipts[0])
+            self.assertEqual(
+                set(receipt),
+                {
+                    "candidate_id",
+                    "verified_snapshot_id",
+                    "verified_snapshot_sha256",
+                    "lock_basis_start_utc",
+                    "lock_at_utc",
+                    "receipt_at_utc",
+                },
+            )
+            self.assertEqual(
+                receipt["verified_snapshot_sha256"],
+                candidate.verified_snapshot_sha256,
+            )
+            self.assertEqual(
+                receipt["lock_at_utc"], candidate.verified_snapshot.lock_at_utc
+            )
+            self.assertEqual(
+                receipt["receipt_at_utc"], candidate.verified_snapshot.receipt_at_utc
+            )
+
     def test_final_selection_waits_for_all_locks_and_applies_exact_tie_break(self):
         first = self._candidate(
             game_pk=777002,
             recorded_at="2026-07-13T22:24:00Z",
-            lock_receipt="2026-07-13T22:24:00Z",
         )
         second = self._candidate(
             game_pk=777001,
@@ -411,18 +556,19 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertEqual(top1.game_pk, 777001)
             self.assertEqual(top1.official_rank, 1)
             self.assertEqual(top1.official_date, "2026-07-13")
-            self.assertEqual(top1.verified_snapshot_sha256, "b" * 64)
+            self.assertEqual(
+                top1.verified_snapshot_sha256,
+                second.verified_snapshot_sha256,
+            )
 
     def test_final_selection_rejects_mixed_dates_empty_pool_and_early_final_receipt(self):
         candidate = self._candidate()
-        other_date = replace(
-            candidate,
+        other_date = self._candidate(
             game_pk=777002,
             official_date="2026-07-14",
-            verified_snapshot_id="snapshot-777002-4",
-            sealed_lock_snapshot_id="snapshot-777002-4",
-            verified_snapshot_sha256="b" * 64,
-            sealed_lock_snapshot_sha256="b" * 64,
+            recorded_at="2026-07-14T22:25:00Z",
+            lock_receipt="2026-07-14T22:25:00Z",
+            lock_basis="2026-07-14T23:10:00Z",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1048,19 +1194,20 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     for path in sorted(receipt_dir.glob("*.json"))
                 )
                 if failure == "second_replace":
-                    original_replace = os.replace
+                    original_replace = protocols._replace_pinned
                     final_calls = 0
 
-                    def fail_second(source, destination):
+                    def fail_second(*args, **kwargs):
                         nonlocal final_calls
+                        destination = kwargs["destination_path"]
                         if Path(destination) in (log_path, state_path):
                             final_calls += 1
                             if final_calls == 2:
                                 raise OSError("state replace failed")
-                        return original_replace(source, destination)
+                        return original_replace(*args, **kwargs)
 
                     context = patch(
-                        "mlb_backtest.protocols.os.replace", side_effect=fail_second
+                        "mlb_backtest.protocols._replace_pinned", side_effect=fail_second
                     )
                     expected_error = OSError
                 else:
@@ -1997,19 +2144,20 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 old[path] = f"old-{index}".encode()
                 path.write_bytes(old[path])
-            original_replace = os.replace
+            original_replace = protocols._replace_pinned
             final_replacements = 0
 
-            def fail_second_final(source, destination):
+            def fail_second_final(*args, **kwargs):
                 nonlocal final_replacements
+                destination = kwargs["destination_path"]
                 if Path(destination) in tuple(root / item for item in relatives):
                     final_replacements += 1
                     if final_replacements == 2:
                         raise OSError("second prospective replace failed")
-                return original_replace(source, destination)
+                return original_replace(*args, **kwargs)
 
             with patch(
-                "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+                "mlb_backtest.protocols._replace_pinned", side_effect=fail_second_final
             ):
                 with self.assertRaisesRegex(
                     OSError, "second prospective replace failed"
@@ -2032,21 +2180,22 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 old[path] = f"irreplaceable-old-{index}".encode()
                 path.write_bytes(old[path])
-            original_replace = os.replace
+            original_replace = protocols._replace_pinned
             final_calls = 0
 
-            def fail_publish_then_restore(source, destination):
+            def fail_publish_then_restore(*args, **kwargs):
                 nonlocal final_calls
+                destination = kwargs["destination_path"]
                 if Path(destination) in tuple(root / item for item in relatives):
                     final_calls += 1
                     if final_calls == 2:
                         raise OSError("publish replacement failed")
                     if final_calls == 3:
                         raise OSError("rollback restoration failed")
-                return original_replace(source, destination)
+                return original_replace(*args, **kwargs)
 
             with patch(
-                "mlb_backtest.protocols.os.replace",
+                "mlb_backtest.protocols._replace_pinned",
                 side_effect=fail_publish_then_restore,
             ):
                 with self.assertRaisesRegex(
@@ -2061,6 +2210,108 @@ class ProspectiveProtocolTest(unittest.TestCase):
             recovered_bytes = {path.read_bytes() for path in recovery_files}
             self.assertIn(old[root / relatives[0]], recovered_bytes)
             self.assertEqual((root / relatives[1]).read_bytes(), old[root / relatives[1]])
+
+
+class ProtocolBundlePathSecurityTest(unittest.TestCase):
+    def test_contract_writers_reject_symlinked_roots_without_writing_outside(self):
+        writers = (
+            ("config", lambda root: write_v52_config_contracts(root, approved_design_root=ROOT)),
+            ("historical", write_historical_contract),
+            ("prospective", lambda root: write_prospective_contract(root, approved_design_root=ROOT)),
+        )
+        for label, writer in writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                outside = base / "outside"
+                outside.mkdir()
+                linked_root = base / "linked-root"
+                linked_root.symlink_to(outside, target_is_directory=True)
+
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    writer(linked_root)
+
+                self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_contract_writers_reject_symlinked_output_directories(self):
+        cases = (
+            (
+                "config",
+                "config",
+                lambda root: write_v52_config_contracts(root, approved_design_root=ROOT),
+            ),
+            ("historical", "protocols", write_historical_contract),
+            (
+                "prospective",
+                "protocols",
+                lambda root: write_prospective_contract(root, approved_design_root=ROOT),
+            ),
+        )
+        for label, linked_name, writer in cases:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                outside = base / "outside"
+                root.mkdir()
+                outside.mkdir()
+                (root / linked_name).symlink_to(outside, target_is_directory=True)
+
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    writer(root)
+
+                self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_contract_writer_rejects_symlink_in_earlier_root_ancestor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            real = base / "real"
+            root = real / "container/workspace"
+            root.mkdir(parents=True)
+            alias = base / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            aliased_root = alias / "container/workspace"
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                write_historical_contract(aliased_root)
+
+            self.assertEqual(list(root.rglob("*")), [])
+
+    def test_publisher_pins_directory_during_symlink_swap_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            outside = base / "outside"
+            protocol_dir = root / "protocols/v5_2_qd"
+            protocol_dir.mkdir(parents=True)
+            (root / "schemas").mkdir()
+            outside.mkdir()
+            historical = protocol_dir / "historical_walkforward_500.json"
+            historical.write_bytes(b"sealed-old")
+            original_replace = protocols._replace_pinned
+            swapped = False
+
+            def swap_before_replace(*args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    (root / "protocols").rename(root / "protocols-pinned")
+                    (root / "protocols").symlink_to(outside, target_is_directory=True)
+                return original_replace(*args, **kwargs)
+
+            with (
+                patch(
+                    "mlb_backtest.protocols._replace_pinned",
+                    side_effect=swap_before_replace,
+                ),
+                self.assertRaisesRegex(ValueError, "directory identity changed"),
+            ):
+                write_historical_contract(root)
+
+            self.assertEqual(list(outside.rglob("*")), [])
+            restored = (
+                root
+                / "protocols-pinned/v5_2_qd/historical_walkforward_500.json"
+            )
+            self.assertEqual(restored.read_bytes(), b"sealed-old")
 
 
 class HistoricalRunSpecTest(unittest.TestCase):
@@ -2276,21 +2527,23 @@ class HistoricalRunSpecTest(unittest.TestCase):
                         modes[path] = 0o600 + index
                         path.write_bytes(old[path])
                         path.chmod(modes[path])
-                original_replace = os.replace
+                original_replace = protocols._replace_pinned
                 final_replacements = 0
 
-                def fail_second_final(source, destination):
+                def fail_second_final(*args, **kwargs):
                     nonlocal final_replacements
+                    destination = kwargs["destination_path"]
                     if Path(destination) in tuple(
                         root / item for item in relative_paths
                     ):
                         final_replacements += 1
                         if final_replacements == 2:
                             raise OSError("second historical replace failed")
-                    return original_replace(source, destination)
+                    return original_replace(*args, **kwargs)
 
                 with patch(
-                    "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+                    "mlb_backtest.protocols._replace_pinned",
+                    side_effect=fail_second_final,
                 ):
                     with self.assertRaisesRegex(
                         OSError, "second historical replace failed"
@@ -2649,21 +2902,23 @@ class V52ConfigTest(unittest.TestCase):
                         modes[path] = 0o600 + index
                         path.write_bytes(old[path])
                         path.chmod(modes[path])
-                original_replace = os.replace
+                original_replace = protocols._replace_pinned
                 final_replacements = 0
 
-                def fail_second_final(source, destination):
+                def fail_second_final(*args, **kwargs):
                     nonlocal final_replacements
+                    destination = kwargs["destination_path"]
                     if Path(destination) in tuple(
                         root / item for item in relative_paths
                     ):
                         final_replacements += 1
                         if final_replacements == 2:
                             raise OSError("second bundle replace failed")
-                    return original_replace(source, destination)
+                    return original_replace(*args, **kwargs)
 
                 with patch(
-                    "mlb_backtest.protocols.os.replace", side_effect=fail_second_final
+                    "mlb_backtest.protocols._replace_pinned",
+                    side_effect=fail_second_final,
                 ):
                     with self.assertRaisesRegex(
                         OSError, "second bundle replace failed"

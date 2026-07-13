@@ -1,7 +1,7 @@
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 import argparse
@@ -15,6 +15,7 @@ import re
 import secrets
 import stat
 import subprocess
+from zoneinfo import ZoneInfo
 
 from mlb_backtest.diagnostics import (
     canonical_json_bytes,
@@ -717,6 +718,8 @@ class ProspectiveCandidateRow:
     absolute_starter_edge: float
     lock_basis_start_utc: str
     lock_receipt_at_utc: str
+    verified_snapshot: ProspectiveSnapshot | None = None
+    snapshot_candidates: tuple[ProspectiveSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1197,6 +1200,23 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
     expected_side = "home" if probability > 0.5 else "away"
     if row.predicted_side != expected_side:
         raise ValueError("candidate predicted side is inconsistent with p_home")
+    if not isinstance(row.verified_snapshot, ProspectiveSnapshot):
+        raise ValueError("candidate must bind a typed verified snapshot")
+    if not isinstance(row.snapshot_candidates, tuple) or not all(
+        isinstance(snapshot, ProspectiveSnapshot)
+        for snapshot in row.snapshot_candidates
+    ):
+        raise ValueError("candidate snapshot selection history must be a typed tuple")
+    if not row.snapshot_candidates:
+        raise ValueError("candidate snapshot selection history is empty")
+    verified_snapshot = row.verified_snapshot
+    classification = classify_snapshot(verified_snapshot)
+    selected_snapshot = select_qualifying_snapshot(row.snapshot_candidates)
+    if selected_snapshot != verified_snapshot:
+        raise ValueError("candidate verified snapshot is not the latest selected snapshot")
+    snapshot_raw = _prospective_snapshot_raw(verified_snapshot)
+    snapshot_sha256 = hashlib.sha256(canonical_json_bytes(snapshot_raw)).hexdigest()
+    snapshot_id = _prospective_snapshot_id(verified_snapshot, snapshot_sha256)
     if (
         not isinstance(row.verified_snapshot_id, str)
         or not row.verified_snapshot_id
@@ -1207,15 +1227,37 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
         or not re.fullmatch(r"[0-9a-f]{64}", row.sealed_lock_snapshot_sha256)
         or row.verified_snapshot_id != row.sealed_lock_snapshot_id
         or row.verified_snapshot_sha256 != row.sealed_lock_snapshot_sha256
+        or row.verified_snapshot_id != snapshot_id
+        or row.verified_snapshot_sha256 != snapshot_sha256
     ):
-        raise ValueError("candidate verified snapshot binding differs from sealed lock")
+        raise ValueError(
+            "candidate canonical verified snapshot binding differs from sealed lock"
+        )
     recorded = _canonical_utc_datetime(row.recorded_at_utc, "recorded_at_utc")
     lock_receipt = _canonical_utc_datetime(
         row.lock_receipt_at_utc, "lock_receipt_at_utc"
     )
-    _canonical_utc_datetime(row.lock_basis_start_utc, "lock_basis_start_utc")
-    if recorded > lock_receipt:
-        raise ValueError("candidate recorded_at is retrospective to sealed lock")
+    lock_basis = _canonical_utc_datetime(
+        row.lock_basis_start_utc, "lock_basis_start_utc"
+    )
+    if lock_receipt != lock_basis - timedelta(minutes=45):
+        raise ValueError("candidate lock receipt differs from exact T-45 lock")
+    if recorded > lock_receipt or recorded < lock_basis - timedelta(minutes=50):
+        raise ValueError(
+            "candidate recorded_at is retrospective or outside the verified snapshot window"
+        )
+    if (
+        verified_snapshot.game_pk != row.game_pk
+        or verified_snapshot.lock_basis_start_utc != row.lock_basis_start_utc
+        or verified_snapshot.lock_at_utc != row.lock_receipt_at_utc
+        or verified_snapshot.receipt_at_utc != row.recorded_at_utc
+    ):
+        raise ValueError("candidate receipt and lock basis differ from verified snapshot")
+    basis_official_date = lock_basis.replace(tzinfo=timezone.utc).astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+    if candidate_date != basis_official_date:
+        raise ValueError("candidate official_date differs from snapshot lock basis")
     completeness = finite_number(
         row.data_completeness_score, "candidate.data_completeness_score"
     )
@@ -1238,7 +1280,8 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
     return (
         row.provenance == "TIMESTAMP_VERIFIED_T45"
         and row.lock_state == "SEALED"
-        and row.final_snapshot_classification == "TIMESTAMP_VERIFIED_T45"
+        and row.final_snapshot_classification == classification
+        and classification == "TIMESTAMP_VERIFIED_T45"
         and not row.critical
         and row.eligibility_status == "ELIGIBLE"
         and row.date_state == "CANDIDATE_ACTIVE"
@@ -1263,9 +1306,29 @@ CANDIDATE_LOCK_RECEIPT_KEYS = frozenset(
         "candidate_id",
         "verified_snapshot_id",
         "verified_snapshot_sha256",
-        "lock_receipt_at_utc",
+        "lock_basis_start_utc",
+        "lock_at_utc",
+        "receipt_at_utc",
     }
 )
+
+
+def _prospective_snapshot_raw(snapshot: ProspectiveSnapshot) -> dict[str, object]:
+    return {
+        "gamePk": snapshot.game_pk,
+        "lock_basis_start_utc": snapshot.lock_basis_start_utc,
+        "observed_scheduled_start_utc": snapshot.observed_scheduled_start_utc,
+        "lock_at_utc": snapshot.lock_at_utc,
+        "receipt_at_utc": snapshot.receipt_at_utc,
+        "successful": snapshot.successful,
+        "complete_participants": snapshot.complete_participants,
+        "ntp_offset_seconds": snapshot.ntp_offset_seconds,
+        "sequence": snapshot.sequence,
+    }
+
+
+def _prospective_snapshot_id(snapshot: ProspectiveSnapshot, digest: str) -> str:
+    return f"snapshot:{snapshot.game_pk}:{snapshot.sequence}:{digest}"
 
 
 def _prospective_candidate_raw(
@@ -1344,7 +1407,9 @@ def _candidate_slate_projection(
             "candidate_id": _prospective_candidate_id(candidate),
             "verified_snapshot_id": candidate.verified_snapshot_id,
             "verified_snapshot_sha256": candidate.verified_snapshot_sha256,
-            "lock_receipt_at_utc": candidate.lock_receipt_at_utc,
+            "lock_basis_start_utc": candidate.verified_snapshot.lock_basis_start_utc,
+            "lock_at_utc": candidate.verified_snapshot.lock_at_utc,
+            "receipt_at_utc": candidate.verified_snapshot.receipt_at_utc,
         }
         for candidate in ordered
     )
@@ -1506,15 +1571,24 @@ def load_prospective_candidate_slate(
             or not isinstance(receipt["verified_snapshot_id"], str)
             or not isinstance(receipt["verified_snapshot_sha256"], str)
             or not re.fullmatch(r"[0-9a-f]{64}", receipt["verified_snapshot_sha256"])
-            or not isinstance(receipt["lock_receipt_at_utc"], str)
+            or not isinstance(receipt["lock_basis_start_utc"], str)
+            or not isinstance(receipt["lock_at_utc"], str)
+            or not isinstance(receipt["receipt_at_utc"], str)
         ):
             raise ValueError("candidate slate manifest lock receipt is invalid")
+        basis = _canonical_utc_datetime(
+            receipt["lock_basis_start_utc"], "slate lock basis"
+        )
+        lock_at = _canonical_utc_datetime(receipt["lock_at_utc"], "slate lock at")
+        receipt_at = _canonical_utc_datetime(
+            receipt["receipt_at_utc"], "slate snapshot receipt"
+        )
+        if lock_at != basis - timedelta(minutes=45) or receipt_at > lock_at:
+            raise ValueError("candidate slate manifest lock receipt chronology differs")
         receipt_times.append(
             (
-                _canonical_utc_datetime(
-                    receipt["lock_receipt_at_utc"], "slate lock receipt"
-                ),
-                receipt["lock_receipt_at_utc"],
+                lock_at,
+                receipt["lock_at_utc"],
             )
         )
         receipts.append(deep_freeze(dict(receipt)))
@@ -1749,6 +1823,11 @@ def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
     )
     lock_at = _canonical_utc_datetime(snapshot.lock_at_utc, "lock_at_utc")
     receipt = _canonical_utc_datetime(snapshot.receipt_at_utc, "receipt_at_utc")
+    basis_official_date = basis.replace(tzinfo=timezone.utc).astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+    if basis_official_date < date(2026, 7, 13):
+        raise ValueError("snapshot precedes the prospective first permitted date")
     if scheduled != basis:
         raise ValueError("snapshot scheduled start differs from lock basis")
     if lock_at != basis - timedelta(minutes=45):
