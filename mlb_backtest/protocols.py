@@ -1,9 +1,11 @@
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -361,9 +363,10 @@ APPROVED_DESIGN_BLOB_SHA256 = (
     "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "2008ae57cda8b7295482f1cab8f2fcece90e5aa4ef9b028119f237af441de48c"
+    "581e841e1416e2c7f5e24007c0b5dee00f69a156c5826df1632b13f754ddd270"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
+POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
 FOLD_LITERALS = (
     {
         "fold_id": "H22",
@@ -664,6 +667,18 @@ class PostlockChainState:
 
 
 @dataclass(frozen=True)
+class PostlockChainReceipt:
+    game_pk: int
+    sequence: int
+    head_hash: str
+    prior_receipt_hash: str
+    persisted_at_utc: str
+    lock_basis_start_utc: str
+    receipt_hash: str
+    audit_path: str
+
+
+@dataclass(frozen=True)
 class ProspectiveCandidateRow:
     game_pk: int
     official_date: str
@@ -697,6 +712,19 @@ class ProspectiveTop1:
     verified_snapshot_id: str
     verified_snapshot_sha256: str
     final_lock_receipt_at_utc: str
+
+
+@dataclass(frozen=True)
+class ProspectiveCandidateSlate:
+    official_date: str
+    expected_candidate_ids: tuple[str, ...]
+    expected_candidate_count: int
+    candidates_sha256: str
+    snapshot_lock_receipts: tuple[Mapping[str, object], ...]
+    final_lock_receipt_at_utc: str
+    all_locks_sealed: bool
+    persisted_at_utc: str
+    audit_path: str
 
 
 def require_exact_keys(
@@ -913,6 +941,18 @@ def _build_prospective_literal() -> dict[str, object]:
                     "canonical_jsonl_one_POSTLOCK_START_CHANGE_per_line"
                 ),
                 "sealed_state_format": "canonical_json_object_newline",
+                "receipt_path_template": (
+                    "audit/v5_2_qd/prospective_2026/postlock_chain_receipts/"
+                    "{gamePk}/{sequence:08d}-{head_hash}.json"
+                ),
+                "receipt_write": "O_EXCL_fsync_read_only",
+                "game_lock_path_template": (
+                    "audit/v5_2_qd/prospective_2026/locks/{gamePk}.lock"
+                ),
+                "local_threat_boundary": (
+                    "API-enforced append-only; arbitrary external deletion remains "
+                    "detectable only while a later receipt anchor remains"
+                ),
                 "state_persistence": (
                     "atomic_event_and_sealed_state_publish_fsync_before_ack"
                 ),
@@ -980,6 +1020,23 @@ def _build_prospective_literal() -> dict[str, object]:
                 "verified_snapshot_sha256",
                 "final_lock_receipt_at_utc",
             ],
+            "slate_manifest_path_template": (
+                "audit/v5_2_qd/prospective_2026/"
+                "candidate_slates/{official_date}.json"
+            ),
+            "slate_manifest_fields": [
+                "official_date",
+                "expected_candidate_ids",
+                "expected_candidate_count",
+                "candidates_sha256",
+                "snapshot_lock_receipts",
+                "final_lock_receipt_at_utc",
+                "all_locks_sealed",
+                "persisted_at_utc",
+                "audit_path",
+            ],
+            "all_locks_sealed": "derived_from_every_bound_candidate_lock",
+            "final_lock_receipt_at_utc": "max_candidate_lock_receipt_at_utc",
         },
         "shadow_pool": {
             "provenance": "TIMESTAMP_PARTIAL_T45",
@@ -1164,44 +1221,331 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
     )
 
 
-def select_prospective_top1(
+CANDIDATE_SLATE_KEYS = frozenset(
+    {
+        "official_date",
+        "expected_candidate_ids",
+        "expected_candidate_count",
+        "candidates_sha256",
+        "snapshot_lock_receipts",
+        "final_lock_receipt_at_utc",
+        "all_locks_sealed",
+        "persisted_at_utc",
+        "audit_path",
+    }
+)
+CANDIDATE_LOCK_RECEIPT_KEYS = frozenset(
+    {
+        "candidate_id",
+        "verified_snapshot_id",
+        "verified_snapshot_sha256",
+        "lock_receipt_at_utc",
+    }
+)
+
+
+def _prospective_candidate_raw(
+    candidate: ProspectiveCandidateRow,
+) -> dict[str, object]:
+    return {
+        "gamePk": candidate.game_pk,
+        "official_date": candidate.official_date,
+        "recorded_at_utc": candidate.recorded_at_utc,
+        "retrospective_backfill": candidate.retrospective_backfill,
+        "p_home": candidate.p_home,
+        "predicted_side": candidate.predicted_side,
+        "verified_snapshot_id": candidate.verified_snapshot_id,
+        "verified_snapshot_sha256": candidate.verified_snapshot_sha256,
+        "sealed_lock_snapshot_id": candidate.sealed_lock_snapshot_id,
+        "sealed_lock_snapshot_sha256": candidate.sealed_lock_snapshot_sha256,
+        "provenance": candidate.provenance,
+        "lock_state": candidate.lock_state,
+        "final_snapshot_classification": candidate.final_snapshot_classification,
+        "critical": candidate.critical,
+        "eligibility_status": candidate.eligibility_status,
+        "date_state": candidate.date_state,
+        "data_completeness_score": candidate.data_completeness_score,
+        "absolute_starter_edge": candidate.absolute_starter_edge,
+        "lock_basis_start_utc": candidate.lock_basis_start_utc,
+        "lock_receipt_at_utc": candidate.lock_receipt_at_utc,
+    }
+
+
+def _prospective_candidate_id(candidate: ProspectiveCandidateRow) -> str:
+    return f"{candidate.game_pk}:{candidate.verified_snapshot_id}"
+
+
+def _candidate_slate_projection(
     candidates: tuple[ProspectiveCandidateRow, ...],
-    *,
-    all_candidate_locks_sealed: bool,
-    final_lock_receipt_at_utc: str,
-) -> ProspectiveTop1:
+) -> tuple[str, tuple[str, ...], str, tuple[dict[str, object], ...], str]:
     if not isinstance(candidates, tuple) or not all(
         isinstance(candidate, ProspectiveCandidateRow) for candidate in candidates
     ):
         raise ValueError("prospective candidates must be a typed tuple")
-    if not isinstance(all_candidate_locks_sealed, bool):
-        raise ValueError("all_candidate_locks_sealed must be boolean")
-    if not all_candidate_locks_sealed:
-        raise ValueError("all candidate locks must be sealed before Top1 selection")
-    final_receipt = _canonical_utc_datetime(
-        final_lock_receipt_at_utc, "final_lock_receipt_at_utc"
-    )
     if not candidates:
-        raise ValueError("Top1 selection requires at least one eligible candidate")
+        raise ValueError("candidate slate requires at least one eligible candidate")
     dates: set[str] = set()
     game_pks: set[int] = set()
     snapshot_ids: set[str] = set()
+    candidate_ids: set[str] = set()
     for candidate in candidates:
         if not eligible_for_prospective_official_pool(candidate):
-            raise ValueError("Top1 input candidate is not eligible")
+            raise ValueError("candidate slate contains a candidate that is not eligible")
         dates.add(candidate.official_date)
         if candidate.game_pk in game_pks:
-            raise ValueError("Top1 candidates contain duplicate gamePk")
+            raise ValueError("candidate slate contains duplicate gamePk")
         if candidate.verified_snapshot_id in snapshot_ids:
-            raise ValueError("Top1 candidates contain duplicate verified snapshot")
+            raise ValueError("candidate slate contains duplicate verified snapshot")
+        candidate_id = _prospective_candidate_id(candidate)
+        if candidate_id in candidate_ids:
+            raise ValueError("candidate slate contains duplicate candidate IDs")
         game_pks.add(candidate.game_pk)
         snapshot_ids.add(candidate.verified_snapshot_id)
-        if final_receipt < _canonical_utc_datetime(
-            candidate.lock_receipt_at_utc, "lock_receipt_at_utc"
-        ):
-            raise ValueError("final lock receipt precedes a candidate lock")
+        candidate_ids.add(candidate_id)
     if len(dates) != 1:
-        raise ValueError("Top1 candidates must share one official date")
+        raise ValueError("candidate slate must contain one official date")
+    official_date = next(iter(dates))
+    _canonical_date(official_date, "candidate slate official_date")
+    ordered = tuple(
+        sorted(candidates, key=lambda candidate: _prospective_candidate_id(candidate))
+    )
+    ordered_ids = tuple(_prospective_candidate_id(candidate) for candidate in ordered)
+    candidates_sha256 = hashlib.sha256(
+        canonical_json_bytes(
+            [_prospective_candidate_raw(candidate) for candidate in ordered]
+        )
+    ).hexdigest()
+    lock_receipts = tuple(
+        {
+            "candidate_id": _prospective_candidate_id(candidate),
+            "verified_snapshot_id": candidate.verified_snapshot_id,
+            "verified_snapshot_sha256": candidate.verified_snapshot_sha256,
+            "lock_receipt_at_utc": candidate.lock_receipt_at_utc,
+        }
+        for candidate in ordered
+    )
+    final_lock_receipt = max(
+        (
+            _canonical_utc_datetime(
+                candidate.lock_receipt_at_utc, "candidate.lock_receipt_at_utc"
+            ),
+            candidate.lock_receipt_at_utc,
+        )
+        for candidate in ordered
+    )[1]
+    return (
+        official_date,
+        ordered_ids,
+        candidates_sha256,
+        lock_receipts,
+        final_lock_receipt,
+    )
+
+
+def _candidate_slate_relative_path(official_date: str) -> Path:
+    _canonical_date(official_date, "candidate slate official_date")
+    return Path(
+        "audit/v5_2_qd/prospective_2026/candidate_slates/"
+        f"{official_date}.json"
+    )
+
+
+def _candidate_slate_raw(slate: ProspectiveCandidateSlate) -> dict[str, object]:
+    return {
+        "official_date": slate.official_date,
+        "expected_candidate_ids": list(slate.expected_candidate_ids),
+        "expected_candidate_count": slate.expected_candidate_count,
+        "candidates_sha256": slate.candidates_sha256,
+        "snapshot_lock_receipts": [dict(receipt) for receipt in slate.snapshot_lock_receipts],
+        "final_lock_receipt_at_utc": slate.final_lock_receipt_at_utc,
+        "all_locks_sealed": slate.all_locks_sealed,
+        "persisted_at_utc": slate.persisted_at_utc,
+        "audit_path": slate.audit_path,
+    }
+
+
+def load_prospective_candidate_slate(
+    root: Path, *, official_date: str
+) -> ProspectiveCandidateSlate:
+    relative = _candidate_slate_relative_path(official_date)
+    root_path = _reject_symlink_ancestors(root, "candidate slate root")
+    path = root_path / relative
+    _reject_symlink_ancestors(path, "candidate slate path")
+    contents = _read_regular_unaliased(path, "candidate slate manifest")
+    try:
+        raw = json.loads(contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("candidate slate manifest is not canonical JSON") from exc
+    obj = require_exact_keys(raw, CANDIDATE_SLATE_KEYS, "candidate_slate")
+    if contents != canonical_json_bytes(obj) + b"\n":
+        raise ValueError("candidate slate manifest bytes are not canonical")
+    expected_ids_raw = obj["expected_candidate_ids"]
+    receipts_raw = obj["snapshot_lock_receipts"]
+    if not isinstance(expected_ids_raw, list) or not all(
+        isinstance(candidate_id, str) and candidate_id
+        for candidate_id in expected_ids_raw
+    ):
+        raise ValueError("candidate slate manifest IDs are invalid")
+    expected_ids = tuple(expected_ids_raw)
+    if tuple(sorted(expected_ids)) != expected_ids or len(set(expected_ids)) != len(
+        expected_ids
+    ):
+        raise ValueError("candidate slate manifest IDs are not unique and sorted")
+    if not isinstance(receipts_raw, list):
+        raise ValueError("candidate slate manifest lock receipts are invalid")
+    receipts: list[Mapping[str, object]] = []
+    receipt_times: list[tuple[datetime, str]] = []
+    for index, raw_receipt in enumerate(receipts_raw):
+        receipt = require_exact_keys(
+            raw_receipt,
+            CANDIDATE_LOCK_RECEIPT_KEYS,
+            f"candidate_slate.snapshot_lock_receipts[{index}]",
+        )
+        if (
+            not isinstance(receipt["candidate_id"], str)
+            or not isinstance(receipt["verified_snapshot_id"], str)
+            or not isinstance(receipt["verified_snapshot_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt["verified_snapshot_sha256"])
+            or not isinstance(receipt["lock_receipt_at_utc"], str)
+        ):
+            raise ValueError("candidate slate manifest lock receipt is invalid")
+        receipt_times.append(
+            (
+                _canonical_utc_datetime(
+                    receipt["lock_receipt_at_utc"], "slate lock receipt"
+                ),
+                receipt["lock_receipt_at_utc"],
+            )
+        )
+        receipts.append(deep_freeze(dict(receipt)))
+    expected_count = obj["expected_candidate_count"]
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count <= 0
+        or expected_count != len(expected_ids)
+        or expected_count != len(receipts)
+    ):
+        raise ValueError("candidate slate manifest count differs")
+    if tuple(receipt["candidate_id"] for receipt in receipts) != expected_ids:
+        raise ValueError("candidate slate manifest receipt IDs differ")
+    if obj["official_date"] != official_date:
+        raise ValueError("candidate slate manifest official date differs")
+    if obj["audit_path"] != relative.as_posix():
+        raise ValueError("candidate slate manifest audit path differs")
+    if not isinstance(obj["candidates_sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", obj["candidates_sha256"]
+    ):
+        raise ValueError("candidate slate manifest digest is invalid")
+    if obj["all_locks_sealed"] is not True:
+        raise ValueError("candidate slate manifest does not seal every lock")
+    if not isinstance(obj["final_lock_receipt_at_utc"], str) or (
+        obj["final_lock_receipt_at_utc"] != max(receipt_times)[1]
+    ):
+        raise ValueError("candidate slate manifest final lock receipt differs")
+    if not isinstance(obj["persisted_at_utc"], str) or (
+        _canonical_utc_datetime(obj["persisted_at_utc"], "slate persisted_at_utc")
+        < max(receipt_times)[0]
+    ):
+        raise ValueError("candidate slate manifest persistence precedes final lock")
+    return ProspectiveCandidateSlate(
+        official_date=official_date,
+        expected_candidate_ids=expected_ids,
+        expected_candidate_count=expected_count,
+        candidates_sha256=obj["candidates_sha256"],
+        snapshot_lock_receipts=tuple(receipts),
+        final_lock_receipt_at_utc=obj["final_lock_receipt_at_utc"],
+        all_locks_sealed=True,
+        persisted_at_utc=obj["persisted_at_utc"],
+        audit_path=obj["audit_path"],
+    )
+
+
+def write_prospective_candidate_slate(
+    root: Path,
+    *,
+    candidates: tuple[ProspectiveCandidateRow, ...],
+    persisted_at_utc: str,
+) -> ProspectiveCandidateSlate:
+    (
+        official_date,
+        candidate_ids,
+        candidates_sha256,
+        lock_receipts,
+        final_lock_receipt,
+    ) = _candidate_slate_projection(candidates)
+    persisted = _canonical_utc_datetime(persisted_at_utc, "slate persisted_at_utc")
+    if persisted < _canonical_utc_datetime(
+        final_lock_receipt, "slate final_lock_receipt_at_utc"
+    ):
+        raise ValueError("candidate slate persistence precedes final lock receipt")
+    relative = _candidate_slate_relative_path(official_date)
+    slate = ProspectiveCandidateSlate(
+        official_date=official_date,
+        expected_candidate_ids=candidate_ids,
+        expected_candidate_count=len(candidate_ids),
+        candidates_sha256=candidates_sha256,
+        snapshot_lock_receipts=tuple(
+            deep_freeze(receipt) for receipt in lock_receipts
+        ),
+        final_lock_receipt_at_utc=final_lock_receipt,
+        all_locks_sealed=True,
+        persisted_at_utc=persisted_at_utc,
+        audit_path=relative.as_posix(),
+    )
+    root_path = _reject_symlink_ancestors(root, "candidate slate root")
+    path = root_path / relative
+    _reject_symlink_ancestors(path.parent, "candidate slate path")
+    if path.exists() or path.is_symlink():
+        existing = load_prospective_candidate_slate(
+            root_path, official_date=official_date
+        )
+        if existing != slate:
+            raise ValueError("candidate slate manifest is already sealed and differs")
+        return existing
+
+    def verify() -> None:
+        loaded = load_prospective_candidate_slate(
+            root_path, official_date=official_date
+        )
+        if loaded != slate:
+            raise ValueError("candidate slate postcondition failed")
+
+    _publish_bundle(
+        ((path, canonical_json_bytes(_candidate_slate_raw(slate)) + b"\n"),),
+        post_publish=verify,
+    )
+    return slate
+
+
+def select_prospective_top1(
+    root: Path,
+    *,
+    official_date: str,
+    candidates: tuple[ProspectiveCandidateRow, ...],
+) -> ProspectiveTop1:
+    slate = load_prospective_candidate_slate(root, official_date=official_date)
+    (
+        projected_date,
+        candidate_ids,
+        candidates_sha256,
+        lock_receipts,
+        final_lock_receipt,
+    ) = _candidate_slate_projection(candidates)
+    if projected_date != official_date:
+        raise ValueError("Top1 candidates differ from the sealed slate official date")
+    if len(candidate_ids) != slate.expected_candidate_count:
+        raise ValueError("Top1 candidate count differs from sealed slate")
+    if candidate_ids != slate.expected_candidate_ids:
+        raise ValueError("Top1 candidate IDs differ from sealed slate")
+    if candidates_sha256 != slate.candidates_sha256:
+        raise ValueError("Top1 candidate digest differs from sealed slate")
+    if tuple(lock_receipts) != tuple(map(dict, slate.snapshot_lock_receipts)):
+        raise ValueError("Top1 candidate lock receipts differ from sealed slate")
+    if final_lock_receipt != slate.final_lock_receipt_at_utc:
+        raise ValueError("Top1 final lock receipt differs from sealed slate")
+    if not slate.all_locks_sealed:
+        raise ValueError("all candidate locks must be sealed before Top1 selection")
     winner = min(
         candidates,
         key=lambda candidate: ranking_key(
@@ -1220,7 +1564,7 @@ def select_prospective_top1(
         official_rank=1,
         verified_snapshot_id=winner.verified_snapshot_id,
         verified_snapshot_sha256=winner.verified_snapshot_sha256,
-        final_lock_receipt_at_utc=final_lock_receipt_at_utc,
+        final_lock_receipt_at_utc=slate.final_lock_receipt_at_utc,
     )
 
 
@@ -1465,8 +1809,8 @@ def validate_postlock_start_changes(
         observed = _canonical_utc_datetime(event.observed_at_utc, "observed_at_utc")
         if observed < lock_at:
             raise ValueError("post-lock event was observed before sealed lock")
-        if previous_observed is not None and observed <= previous_observed:
-            raise ValueError("post-lock observed times must be strictly increasing")
+        if previous_observed is not None and observed < previous_observed:
+            raise ValueError("post-lock observed times must be nondecreasing")
         if event.prior_event_hash != prior_hash:
             raise ValueError("post-lock prior event hash differs")
         calculated = _postlock_event_hash(event)
@@ -1525,8 +1869,8 @@ def append_postlock_start_change(
     prior_persisted = _canonical_utc_datetime(
         sealed_state.persisted_at_utc, "sealed_state.persisted_at_utc"
     )
-    if persisted < observed or persisted <= prior_persisted:
-        raise ValueError("new sealed-state persistence must follow event and prior state")
+    if persisted < observed or persisted < prior_persisted:
+        raise ValueError("new sealed-state persistence must not precede event or prior state")
     unsigned = PostlockStartChange(
         game_pk=game_pk,
         sequence=sealed_state.event_count + 1,
@@ -1586,6 +1930,18 @@ POSTLOCK_EVENT_KEYS = frozenset(
         "event_hash",
     }
 )
+POSTLOCK_RECEIPT_KEYS = frozenset(
+    {
+        "gamePk",
+        "sequence",
+        "head_hash",
+        "prior_receipt_hash",
+        "persisted_at_utc",
+        "lock_basis_start_utc",
+        "receipt_hash",
+        "audit_path",
+    }
+)
 
 
 def _postlock_relative_paths(game_pk: int) -> tuple[Path, Path]:
@@ -1603,11 +1959,22 @@ def _postlock_relative_paths(game_pk: int) -> tuple[Path, Path]:
     )
 
 
+def _reject_symlink_ancestors(path: Path, label: str) -> Path:
+    absolute = Path(os.path.abspath(path))
+    components = (absolute, *absolute.parents)
+    for component in reversed(components):
+        if component.exists() or component.is_symlink():
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"{label} ancestor symlink or path alias is forbidden")
+    return absolute
+
+
 def _postlock_paths(root: Path, game_pk: int) -> tuple[Path, Path, Path]:
     root_input = Path(root)
     if root_input.is_symlink():
         raise ValueError("post-lock root symlink or alias is forbidden")
-    root_path = Path(os.path.abspath(root_input))
+    root_path = _reject_symlink_ancestors(root_input, "post-lock root")
     log_relative, state_relative = _postlock_relative_paths(game_pk)
     for target in (root_path, root_path / log_relative.parent, root_path / state_relative.parent):
         current = target
@@ -1623,6 +1990,37 @@ def _postlock_paths(root: Path, game_pk: int) -> tuple[Path, Path, Path]:
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
                     raise ValueError("post-lock parent symlink or path alias is forbidden")
     return root_path, root_path / log_relative, root_path / state_relative
+
+
+def _postlock_lock_path(root: Path, game_pk: int) -> Path:
+    root_path, _, _ = _postlock_paths(root, game_pk)
+    return root_path / f"audit/v5_2_qd/prospective_2026/locks/{game_pk}.lock"
+
+
+@contextmanager
+def _postlock_game_lock(root: Path, game_pk: int):
+    lock_path = _postlock_lock_path(root, game_pk)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(lock_path.parent, "post-lock lock path")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("post-lock lock symlink or alias is forbidden") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("post-lock lock symlink or hardlink alias is forbidden")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _read_regular_unaliased(path: Path, label: str) -> bytes:
@@ -1657,6 +2055,131 @@ def _postlock_event_raw(event: PostlockStartChange) -> dict[str, object]:
 
 def _postlock_event_log_bytes(events: tuple[PostlockStartChange, ...]) -> bytes:
     return b"".join(canonical_json_bytes(_postlock_event_raw(event)) + b"\n" for event in events)
+
+
+def _postlock_receipt_payload(receipt: PostlockChainReceipt) -> dict[str, object]:
+    return {
+        "gamePk": receipt.game_pk,
+        "sequence": receipt.sequence,
+        "head_hash": receipt.head_hash,
+        "prior_receipt_hash": receipt.prior_receipt_hash,
+        "persisted_at_utc": receipt.persisted_at_utc,
+        "lock_basis_start_utc": receipt.lock_basis_start_utc,
+        "audit_path": receipt.audit_path,
+    }
+
+
+def _postlock_receipt_raw(receipt: PostlockChainReceipt) -> dict[str, object]:
+    return {**_postlock_receipt_payload(receipt), "receipt_hash": receipt.receipt_hash}
+
+
+def _postlock_receipt_hash(receipt: PostlockChainReceipt) -> str:
+    return hashlib.sha256(canonical_json_bytes(_postlock_receipt_payload(receipt))).hexdigest()
+
+
+def _postlock_receipt_relative_path(
+    game_pk: int, sequence: int, head_hash: str
+) -> Path:
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or not isinstance(head_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", head_hash)
+    ):
+        raise ValueError("post-lock receipt identity is invalid")
+    _postlock_relative_paths(game_pk)
+    return Path(
+        "audit/v5_2_qd/prospective_2026/postlock_chain_receipts/"
+        f"{game_pk}/{sequence:08d}-{head_hash}.json"
+    )
+
+
+def _create_postlock_receipt_exclusive(root: Path, receipt: PostlockChainReceipt) -> Path:
+    relative = _postlock_receipt_relative_path(
+        receipt.game_pk, receipt.sequence, receipt.head_hash
+    )
+    if receipt.audit_path != relative.as_posix():
+        raise ValueError("post-lock receipt audit path differs")
+    if receipt.receipt_hash != _postlock_receipt_hash(receipt):
+        raise ValueError("post-lock receipt hash differs")
+    root_path = _reject_symlink_ancestors(root, "post-lock receipt root")
+    path = root_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(path.parent, "post-lock receipt path")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o444)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            os.fchmod(stream.fileno(), 0o444)
+            stream.write(canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+    return path
+
+
+def load_postlock_chain_receipts(
+    root: Path, *, game_pk: int
+) -> tuple[PostlockChainReceipt, ...]:
+    root_path, _, _ = _postlock_paths(root, game_pk)
+    receipt_dir = (
+        root_path
+        / f"audit/v5_2_qd/prospective_2026/postlock_chain_receipts/{game_pk}"
+    )
+    _reject_symlink_ancestors(receipt_dir, "post-lock receipt directory")
+    if not receipt_dir.exists() or not receipt_dir.is_dir():
+        raise ValueError("post-lock receipt anchor directory is missing")
+    paths = tuple(sorted(receipt_dir.iterdir()))
+    if not paths:
+        raise ValueError("post-lock receipt anchor history is missing")
+    receipts: list[PostlockChainReceipt] = []
+    prior_receipt_hash = POSTLOCK_RECEIPT_GENESIS_HASH
+    for expected_sequence, path in enumerate(paths):
+        contents = _read_regular_unaliased(path, "post-lock receipt")
+        try:
+            raw = json.loads(contents)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("post-lock receipt is not canonical JSON") from exc
+        obj = require_exact_keys(raw, POSTLOCK_RECEIPT_KEYS, "postlock_receipt")
+        receipt = PostlockChainReceipt(
+            game_pk=obj["gamePk"],
+            sequence=obj["sequence"],
+            head_hash=obj["head_hash"],
+            prior_receipt_hash=obj["prior_receipt_hash"],
+            persisted_at_utc=obj["persisted_at_utc"],
+            lock_basis_start_utc=obj["lock_basis_start_utc"],
+            receipt_hash=obj["receipt_hash"],
+            audit_path=obj["audit_path"],
+        )
+        if contents != canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n":
+            raise ValueError("post-lock receipt bytes are not canonical")
+        expected_relative = _postlock_receipt_relative_path(
+            game_pk, expected_sequence, receipt.head_hash
+        )
+        if (
+            receipt.game_pk != game_pk
+            or isinstance(receipt.sequence, bool)
+            or receipt.sequence != expected_sequence
+            or receipt.audit_path != expected_relative.as_posix()
+            or path != root_path / expected_relative
+        ):
+            raise ValueError("post-lock receipt gap or identity mismatch")
+        if receipt.prior_receipt_hash != prior_receipt_hash:
+            raise ValueError("post-lock receipt chain has a gap")
+        if receipt.receipt_hash != _postlock_receipt_hash(receipt):
+            raise ValueError("post-lock receipt hash differs")
+        _canonical_utc_datetime(receipt.persisted_at_utc, "receipt.persisted_at_utc")
+        _canonical_utc_datetime(
+            receipt.lock_basis_start_utc, "receipt.lock_basis_start_utc"
+        )
+        prior_receipt_hash = receipt.receipt_hash
+        receipts.append(receipt)
+    return tuple(receipts)
 
 
 def load_postlock_chain_state(root: Path, *, game_pk: int) -> PostlockChainState:
@@ -1729,10 +2252,47 @@ def validate_persisted_postlock_chain(
         sealed_state=state,
         lock_basis_start_utc=state.lock_basis_start_utc,
     )
+    receipts = load_postlock_chain_receipts(root, game_pk=game_pk)
+    if len(receipts) != state.event_count + 1:
+        raise ValueError("post-lock receipt anchor count differs from sealed state")
+    for sequence, receipt in enumerate(receipts):
+        expected_head = (
+            POSTLOCK_GENESIS_HASH if sequence == 0 else events[sequence - 1].event_hash
+        )
+        if (
+            receipt.sequence != sequence
+            or receipt.head_hash != expected_head
+            or receipt.lock_basis_start_utc != state.lock_basis_start_utc
+        ):
+            raise ValueError("post-lock receipt anchor differs from event history")
+    if (
+        receipts[-1].head_hash != state.head_hash
+        or receipts[-1].persisted_at_utc != state.persisted_at_utc
+    ):
+        raise ValueError("post-lock latest receipt anchor differs from sealed state")
     return events, state
 
 
-def initialize_postlock_chain(
+def _receipt_for_state(
+    state: PostlockChainState, prior_receipt_hash: str
+) -> PostlockChainReceipt:
+    relative = _postlock_receipt_relative_path(
+        state.game_pk, state.event_count, state.head_hash
+    )
+    unsigned = PostlockChainReceipt(
+        game_pk=state.game_pk,
+        sequence=state.event_count,
+        head_hash=state.head_hash,
+        prior_receipt_hash=prior_receipt_hash,
+        persisted_at_utc=state.persisted_at_utc,
+        lock_basis_start_utc=state.lock_basis_start_utc,
+        receipt_hash="",
+        audit_path=relative.as_posix(),
+    )
+    return replace(unsigned, receipt_hash=_postlock_receipt_hash(unsigned))
+
+
+def _initialize_postlock_chain_locked(
     root: Path,
     *,
     game_pk: int,
@@ -1740,7 +2300,18 @@ def initialize_postlock_chain(
     persisted_at_utc: str,
 ) -> PostlockChainState:
     root_path, log_path, state_path = _postlock_paths(root, game_pk)
-    if log_path.exists() or log_path.is_symlink() or state_path.exists() or state_path.is_symlink():
+    receipt_dir = (
+        root_path
+        / f"audit/v5_2_qd/prospective_2026/postlock_chain_receipts/{game_pk}"
+    )
+    if (
+        log_path.exists()
+        or log_path.is_symlink()
+        or state_path.exists()
+        or state_path.is_symlink()
+        or receipt_dir.exists()
+        or receipt_dir.is_symlink()
+    ):
         raise ValueError("post-lock chain already exists or is inconsistent")
     lock_basis = _canonical_utc_datetime(lock_basis_start_utc, "lock_basis_start_utc")
     persisted = _canonical_utc_datetime(persisted_at_utc, "persisted_at_utc")
@@ -1756,8 +2327,10 @@ def initialize_postlock_chain(
         audit_path=state_relative.as_posix(),
         event_log_path=log_relative.as_posix(),
     )
+    receipt = _receipt_for_state(state, POSTLOCK_RECEIPT_GENESIS_HASH)
 
     def verify() -> None:
+        _create_postlock_receipt_exclusive(root_path, receipt)
         events, loaded = validate_persisted_postlock_chain(root_path, game_pk=game_pk)
         if events or loaded != state:
             raise ValueError("post-lock initialization postcondition failed")
@@ -1772,11 +2345,26 @@ def initialize_postlock_chain(
     return state
 
 
-def append_and_persist_postlock_start_change(
+def initialize_postlock_chain(
     root: Path,
     *,
     game_pk: int,
-    previous_effective_start_utc: str,
+    lock_basis_start_utc: str,
+    persisted_at_utc: str,
+) -> PostlockChainState:
+    with _postlock_game_lock(root, game_pk):
+        return _initialize_postlock_chain_locked(
+            root,
+            game_pk=game_pk,
+            lock_basis_start_utc=lock_basis_start_utc,
+            persisted_at_utc=persisted_at_utc,
+        )
+
+
+def _append_and_persist_postlock_start_change_locked(
+    root: Path,
+    *,
+    game_pk: int,
     new_effective_start_utc: str,
     observed_at_utc: str,
     lock_basis_start_utc: str,
@@ -1785,6 +2373,12 @@ def append_and_persist_postlock_start_change(
     root_path, log_path, state_path = _postlock_paths(root, game_pk)
     events, sealed_state = validate_persisted_postlock_chain(
         root_path, game_pk=game_pk
+    )
+    receipts = load_postlock_chain_receipts(root_path, game_pk=game_pk)
+    previous_effective_start_utc = (
+        events[-1].new_effective_start_utc
+        if events
+        else sealed_state.lock_basis_start_utc
     )
     event, new_state = append_postlock_start_change(
         events,
@@ -1797,8 +2391,10 @@ def append_and_persist_postlock_start_change(
         state_persisted_at_utc=state_persisted_at_utc,
     )
     appended = (*events, event)
+    receipt = _receipt_for_state(new_state, receipts[-1].receipt_hash)
 
     def verify() -> None:
+        _create_postlock_receipt_exclusive(root_path, receipt)
         loaded_events, loaded_state = validate_persisted_postlock_chain(
             root_path, game_pk=game_pk
         )
@@ -1816,6 +2412,26 @@ def append_and_persist_postlock_start_change(
         post_publish=verify,
     )
     return event, new_state
+
+
+def append_and_persist_postlock_start_change(
+    root: Path,
+    *,
+    game_pk: int,
+    new_effective_start_utc: str,
+    observed_at_utc: str,
+    lock_basis_start_utc: str,
+    state_persisted_at_utc: str,
+) -> tuple[PostlockStartChange, PostlockChainState]:
+    with _postlock_game_lock(root, game_pk):
+        return _append_and_persist_postlock_start_change_locked(
+            root,
+            game_pk=game_pk,
+            new_effective_start_utc=new_effective_start_utc,
+            observed_at_utc=observed_at_utc,
+            lock_basis_start_utc=lock_basis_start_utc,
+            state_persisted_at_utc=state_persisted_at_utc,
+        )
 
 
 def combine_ledgers(left_run_id: str, right_run_id: str) -> None:
