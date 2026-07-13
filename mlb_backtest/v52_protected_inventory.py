@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
 import stat
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-
-from .manifest import RawStore
-
 
 _INVENTORY_KEYS = {
     "legacy_root",
@@ -28,16 +25,64 @@ _RECORD_KEYS = {
     "source",
 }
 _OBJECT_KEYS = {"byte_size", "inode_fingerprint", "path", "sha256"}
+_MANIFEST_KEYS = {
+    "source",
+    "query",
+    "sha256",
+    "retrieved_at_utc",
+    "row_count",
+    "schema_version",
+}
+_QUERY_TYPES: dict[str, dict[str, type]] = {
+    "baseball_savant_statcast": {
+        "end": str,
+        "game_type": str,
+        "start": str,
+        "url": str,
+    },
+    "mlb_schedule": {
+        "end": str,
+        "gameType": str,
+        "role": str,
+        "start": str,
+        "url": str,
+    },
+    "mlb_stats_pitcher_bf": {
+        "endDate": str,
+        "gameType": str,
+        "group": str,
+        "pitcher_id": int,
+        "sportIds": int,
+        "startDate": str,
+        "stats": str,
+        "url": str,
+    },
+    "mlb_stats_pitching": {
+        "endDate": str,
+        "gameType": str,
+        "group": str,
+        "limit": int,
+        "playerPool": str,
+        "sportIds": int,
+        "startDate": str,
+        "stats": str,
+        "url": str,
+    },
+}
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _repository_root(root: Path) -> Path:
@@ -67,49 +112,11 @@ def _under_root(root: Path, path: Path, label: str) -> tuple[Path, str]:
     return candidate, relative
 
 
-def _validate_legacy_tree(legacy_root: Path, root: Path) -> None:
-    linked_root = os.stat(legacy_root, follow_symlinks=False)
-    if not stat.S_ISDIR(linked_root.st_mode) or legacy_root.is_symlink():
-        raise ValueError("legacy root must be a real directory")
-    if legacy_root.resolve(strict=True).parent == legacy_root.resolve(strict=True):
-        raise ValueError("legacy root is invalid")
-    try:
-        legacy_root.resolve(strict=True).relative_to(root)
-    except ValueError as exc:
-        raise ValueError("legacy root must be inside repository root") from exc
-
-    for child in legacy_root.iterdir():
-        linked = os.stat(child, follow_symlinks=False)
-        if child.is_symlink():
-            raise ValueError("legacy tree symlink is forbidden")
-        if stat.S_ISDIR(linked.st_mode):
-            if child.resolve(strict=True).parent != legacy_root.resolve(strict=True):
-                raise ValueError("legacy source directory escaped legacy root")
-            for leaf in child.iterdir():
-                _validate_regular_leaf(leaf, "legacy raw object")
-        else:
-            _validate_regular_leaf(child, "legacy root file")
-
-
-def _validate_regular_leaf(path: Path, label: str) -> os.stat_result:
-    try:
-        metadata = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise ValueError(f"{label} cannot be inspected safely") from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"{label} must be a regular file")
-    if metadata.st_nlink != 1:
-        raise ValueError(f"{label} hard link is forbidden")
-    return metadata
-
-
 class _BoundLegacyTree:
     def __init__(self, root: Path, legacy_root: Path) -> None:
         self.root = root
         self.legacy_root = legacy_root
-        self._directory_bindings: list[
-            tuple[int, str, int, os.stat_result, str]
-        ] = []
+        self._directory_bindings: list[tuple[int, str, int, os.stat_result, str]] = []
         self._source_fds: dict[str, int] = {}
         self._fds: list[int] = []
         directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -123,12 +130,12 @@ class _BoundLegacyTree:
             for index, component in enumerate(relative.parts):
                 child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
                 self._fds.append(child_fd)
-                linked = os.stat(
-                    component, dir_fd=parent_fd, follow_symlinks=False
-                )
+                linked = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
                 opened = os.fstat(child_fd)
-                label = "legacy root" if index == len(relative.parts) - 1 else (
-                    "legacy root ancestor"
+                label = (
+                    "legacy root"
+                    if index == len(relative.parts) - 1
+                    else ("legacy root ancestor")
                 )
                 self._require_bound_directory(linked, opened, label)
                 self._directory_bindings.append(
@@ -137,9 +144,12 @@ class _BoundLegacyTree:
                 parent_fd = child_fd
             self.legacy_fd = parent_fd
 
+            root_files: set[str] = set()
             for name in os.listdir(self.legacy_fd):
                 linked = os.stat(name, dir_fd=self.legacy_fd, follow_symlinks=False)
                 if stat.S_ISDIR(linked.st_mode):
+                    if name not in _QUERY_TYPES:
+                        raise ValueError("legacy source directory is unsupported")
                     source_fd = os.open(name, directory_flags, dir_fd=self.legacy_fd)
                     self._fds.append(source_fd)
                     opened = os.fstat(source_fd)
@@ -158,6 +168,12 @@ class _BoundLegacyTree:
                     self._source_fds[name] = source_fd
                 else:
                     self._require_regular_metadata(linked, "legacy root file")
+                    root_files.add(name)
+            expected_locks = {f".{source}.lock" for source in self._source_fds}
+            if root_files != expected_locks:
+                raise ValueError("legacy root lock membership is unexpected")
+            if not self._source_fds:
+                raise ValueError("legacy root contains no supported sources")
             self.assert_bound()
         except Exception:
             self.close()
@@ -193,9 +209,30 @@ class _BoundLegacyTree:
             ):
                 raise RuntimeError(f"{label} path binding changed")
 
-    def _leaf_binding(
-        self, path: Path, label: str
-    ) -> tuple[int, str, os.stat_result]:
+    def source_membership(self) -> dict[str, frozenset[str]]:
+        """Snapshot every source leaf through its already-bound directory FD."""
+        self.assert_bound()
+        expected_root_names = set(self._source_fds) | {
+            f".{source}.lock" for source in self._source_fds
+        }
+        if set(os.listdir(self.legacy_fd)) != expected_root_names:
+            raise RuntimeError("legacy root membership changed")
+        snapshot: dict[str, frozenset[str]] = {}
+        for source, source_fd in sorted(self._source_fds.items()):
+            names = os.listdir(source_fd)
+            for name in names:
+                try:
+                    metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "legacy source membership changed while listing"
+                    ) from exc
+                self._require_regular_metadata(metadata, "legacy raw object")
+            snapshot[source] = frozenset(names)
+        self.assert_bound()
+        return snapshot
+
+    def _leaf_binding(self, path: Path, label: str) -> tuple[int, str, os.stat_result]:
         self.assert_bound()
         try:
             relative = path.absolute().relative_to(self.legacy_root.absolute())
@@ -257,31 +294,6 @@ class _BoundLegacyTree:
         self.close()
 
 
-def _open_regular(path: Path, label: str) -> tuple[int, os.stat_result]:
-    before = _validate_regular_leaf(path, label)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EISDIR}:
-            raise ValueError(f"{label} must be a regular file") from exc
-        raise ValueError(f"{label} cannot be opened safely") from exc
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError(f"{label} must be a regular file")
-        if opened.st_nlink != 1:
-            raise ValueError(f"{label} hard link is forbidden")
-        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-            raise RuntimeError(f"{label} changed while opening")
-        return descriptor, opened
-    except Exception:
-        os.close(descriptor)
-        raise
-
-
 def _stream_object(
     root: Path,
     path: Path,
@@ -289,13 +301,9 @@ def _stream_object(
     *,
     capture_content: bool = False,
     count_rows: bool = False,
-    bound_tree: _BoundLegacyTree | None = None,
+    bound_tree: _BoundLegacyTree,
 ) -> tuple[dict[str, object], bytes | None, int | None]:
-    descriptor, opened = (
-        bound_tree.open_regular(path, label)
-        if bound_tree is not None
-        else _open_regular(path, label)
-    )
+    descriptor, opened = bound_tree.open_regular(path, label)
     digest = hashlib.sha256()
     byte_size = 0
     chunks: list[bytes] | None = [] if capture_content else None
@@ -303,7 +311,7 @@ def _stream_object(
     row_count = 0
     try:
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            chunk = os.read(descriptor, _STREAM_CHUNK_BYTES)
             if not chunk:
                 break
             digest.update(chunk)
@@ -317,11 +325,7 @@ def _stream_object(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    linked = (
-        bound_tree.assert_regular_bound(path, opened, label)
-        if bound_tree is not None
-        else _validate_regular_leaf(path, label)
-    )
+    linked = bound_tree.assert_regular_bound(path, opened, label)
     stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
     if any(getattr(opened, key) != getattr(after, key) for key in stable_fields):
         raise RuntimeError(f"{label} changed while reading")
@@ -368,16 +372,12 @@ def _read_regular(root: Path, path: Path, label: str) -> bytes:
         for component in relative.parts[:-1]:
             try:
                 child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-                linked = os.stat(
-                    component, dir_fd=parent_fd, follow_symlinks=False
-                )
+                linked = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
             except OSError as exc:
                 raise ValueError(f"{label} parent cannot be opened safely") from exc
             opened_fds.append(child_fd)
             opened = os.fstat(child_fd)
-            _BoundLegacyTree._require_bound_directory(
-                linked, opened, f"{label} parent"
-            )
+            _BoundLegacyTree._require_bound_directory(linked, opened, f"{label} parent")
             bindings.append((parent_fd, component, child_fd, opened))
             parent_fd = child_fd
 
@@ -417,9 +417,7 @@ def _read_regular(root: Path, path: Path, label: str) -> bytes:
         _BoundLegacyTree._require_regular_metadata(linked_after, label)
         for bound_parent, name, child_fd, expected in bindings:
             try:
-                linked = os.stat(
-                    name, dir_fd=bound_parent, follow_symlinks=False
-                )
+                linked = os.stat(name, dir_fd=bound_parent, follow_symlinks=False)
                 directory = os.fstat(child_fd)
             except OSError as exc:
                 raise RuntimeError(f"{label} parent path binding changed") from exc
@@ -436,8 +434,7 @@ def _read_regular(root: Path, path: Path, label: str) -> bytes:
         if any(getattr(opened, key) != getattr(after, key) for key in stable_fields):
             raise RuntimeError(f"{label} changed while reading")
         if any(
-            getattr(after, key) != getattr(linked_after, key)
-            for key in stable_fields
+            getattr(after, key) != getattr(linked_after, key) for key in stable_fields
         ):
             raise RuntimeError(f"{label} changed after reading")
         content = b"".join(chunks)
@@ -456,19 +453,19 @@ def _read_regular(root: Path, path: Path, label: str) -> bytes:
 def build_protected_raw_inventory(
     root: Path, legacy_root: Path
 ) -> Mapping[str, object]:
-    """Recompute a path-bound inventory of every verified legacy RawStore record."""
+    """Recompute a path-bound inventory of every verified legacy raw record."""
     repository_root = _repository_root(root)
     legacy_path, legacy_relative = _under_root(
         repository_root, Path(legacy_root), "legacy root"
     )
-    _validate_legacy_tree(legacy_path, repository_root)
     with _BoundLegacyTree(repository_root, legacy_path) as bound_tree:
-        verified = RawStore(legacy_path).verify_manifests()
-        bound_tree.assert_bound()
-        records = _records_from_verified_catalog(
-            repository_root, verified, bound_tree
+        membership = bound_tree.source_membership()
+        verified = _streaming_verified_catalog(
+            repository_root, legacy_path, membership, bound_tree
         )
-        bound_tree.assert_bound()
+        records = _records_from_verified_catalog(repository_root, verified, bound_tree)
+        if bound_tree.source_membership() != membership:
+            raise RuntimeError("legacy source membership changed during hashing")
     records.sort(key=lambda record: record["manifest"]["path"])
     return {
         "legacy_root": legacy_relative,
@@ -479,30 +476,157 @@ def build_protected_raw_inventory(
     }
 
 
+def _validate_source_query(source: object, query: object) -> dict[str, object]:
+    if type(source) is not str or source not in _QUERY_TYPES:
+        raise ValueError("protected raw source query source is unsupported")
+    expected = _QUERY_TYPES[source]
+    if type(query) is not dict or set(query) != set(expected):
+        raise ValueError(f"protected raw canonical query keys are invalid for {source}")
+    for key, expected_type in expected.items():
+        if type(query[key]) is not expected_type:
+            raise ValueError(
+                f"protected raw canonical query type is invalid for {source}.{key}"
+            )
+    return query
+
+
+def _parse_manifest(content: bytes, source: str) -> dict[str, Any]:
+    """Parse RawStore's closed manifest format without reading its raw payload."""
+    try:
+        manifest = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("immutable raw manifest is invalid") from exc
+    if type(manifest) is not dict or set(manifest) != _MANIFEST_KEYS:
+        raise RuntimeError("immutable raw manifest fields mismatch")
+    if type(manifest["row_count"]) is not int:
+        raise RuntimeError("immutable raw manifest row_count must be an int")
+    if type(manifest["schema_version"]) is not int:
+        raise RuntimeError("immutable raw manifest schema_version must be an int")
+    if type(manifest["sha256"]) is not str or (
+        len(manifest["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in manifest["sha256"])
+    ):
+        raise RuntimeError("immutable raw manifest sha256 is invalid")
+    retrieved_at = manifest["retrieved_at_utc"]
+    if type(retrieved_at) is not str:
+        raise RuntimeError("immutable raw manifest timestamp is invalid")
+    try:
+        parsed_retrieved_at = datetime.fromisoformat(retrieved_at)
+    except ValueError as exc:
+        raise RuntimeError("immutable raw manifest timestamp is invalid") from exc
+    if parsed_retrieved_at.utcoffset() != timedelta(0):
+        raise RuntimeError("immutable raw manifest timestamp is invalid")
+    canonical_manifest = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, indent=2
+    ).encode("utf-8")
+    if content != canonical_manifest:
+        raise RuntimeError("immutable raw manifest bytes differ")
+    if manifest["source"] != source:
+        raise RuntimeError("immutable raw manifest source mismatch")
+    try:
+        _validate_source_query(source, manifest["query"])
+    except ValueError as exc:
+        raise RuntimeError("immutable raw manifest source query is invalid") from exc
+    return manifest
+
+
+def _streaming_verified_catalog(
+    repository_root: Path,
+    legacy_path: Path,
+    membership: dict[str, frozenset[str]],
+    bound_tree: _BoundLegacyTree,
+) -> list[dict[str, Any]]:
+    """Verify manifests and seals while deriving exact allowed leaf membership."""
+    verified: list[dict[str, Any]] = []
+    expected_membership: dict[str, set[str]] = {source: set() for source in membership}
+    seen_queries: set[tuple[str, str]] = set()
+    for source, names in sorted(membership.items()):
+        for manifest_name in sorted(
+            name for name in names if name.endswith(".manifest.json")
+        ):
+            manifest_path = legacy_path / source / manifest_name
+            manifest_record, manifest_content, _ = _stream_object(
+                repository_root,
+                manifest_path,
+                "legacy manifest",
+                capture_content=True,
+                bound_tree=bound_tree,
+            )
+            assert manifest_content is not None
+            manifest = _parse_manifest(manifest_content, source)
+            query_bytes = json.dumps(
+                manifest["query"],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            query_digest = hashlib.sha256(query_bytes).hexdigest()
+            expected_manifest_name = (
+                f"{manifest['sha256']}.{query_digest}.manifest.json"
+            )
+            if manifest_name != expected_manifest_name:
+                raise RuntimeError("immutable raw manifest filename mismatch")
+            query_key = (source, query_digest)
+            if query_key in seen_queries:
+                raise RuntimeError("duplicate canonical raw query provenance")
+            seen_queries.add(query_key)
+
+            seal_name = manifest_name[:-5] + ".sha256"
+            raw_name = f"{manifest['sha256']}.raw"
+            expected_membership[source].update({manifest_name, seal_name, raw_name})
+            seal_path = legacy_path / source / seal_name
+            seal_record, seal_content, _ = _stream_object(
+                repository_root,
+                seal_path,
+                "legacy manifest seal",
+                capture_content=True,
+                bound_tree=bound_tree,
+            )
+            expected_seal = f"{manifest_record['sha256']}\n".encode("ascii")
+            if seal_content != expected_seal:
+                raise RuntimeError("immutable raw manifest integrity mismatch")
+            verified.append(
+                {
+                    "manifest": manifest,
+                    "manifest_content": manifest_content,
+                    "manifest_path": manifest_path,
+                    "manifest_record": manifest_record,
+                    "payload_path": legacy_path / source / raw_name,
+                    "seal_content": seal_content,
+                    "seal_path": seal_path,
+                    "seal_record": seal_record,
+                }
+            )
+
+    for source, names in membership.items():
+        if names != frozenset(expected_membership[source]):
+            raise RuntimeError(
+                f"legacy source membership contains orphan or unexpected leaves: {source}"
+            )
+    if bound_tree.source_membership() != membership:
+        raise RuntimeError("legacy source membership changed during cataloging")
+    return verified
+
+
 def _records_from_verified_catalog(
     repository_root: Path,
     verified: list[dict[str, Any]],
     bound_tree: _BoundLegacyTree,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
+    raw_cache: dict[Path, tuple[dict[str, object], int]] = {}
     for item in verified:
         manifest = item["manifest"]
         manifest_path = Path(item["manifest_path"])
         raw_path = Path(item["payload_path"])
-        seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
+        seal_path = Path(item["seal_path"])
 
         manifest_record, manifest_content, _ = _stream_object(
             repository_root,
             manifest_path,
             "legacy manifest",
             capture_content=True,
-            bound_tree=bound_tree,
-        )
-        raw_record, _, raw_row_count = _stream_object(
-            repository_root,
-            raw_path,
-            "legacy raw payload",
-            count_rows=True,
             bound_tree=bound_tree,
         )
         seal_record, seal_content, _ = _stream_object(
@@ -512,28 +636,32 @@ def _records_from_verified_catalog(
             capture_content=True,
             bound_tree=bound_tree,
         )
-        expected_seal = f'{item["manifest_sha256"]}\n'.encode("ascii")
-        try:
-            streamed_manifest = RawStore._read_manifest(manifest_content)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "legacy manifest changed after RawStore verification"
-            ) from exc
+        if raw_path not in raw_cache:
+            raw_record, _, raw_row_count = _stream_object(
+                repository_root,
+                raw_path,
+                "legacy raw payload",
+                count_rows=True,
+                bound_tree=bound_tree,
+            )
+            assert raw_row_count is not None
+            raw_cache[raw_path] = (raw_record, raw_row_count)
+        raw_record, raw_row_count = raw_cache[raw_path]
         verification_results = (
-            manifest_record["sha256"] == item["manifest_sha256"],
-            streamed_manifest == manifest,
-            streamed_manifest["source"] == manifest["source"],
-            streamed_manifest["query"] == manifest["query"],
+            manifest_record == item["manifest_record"],
+            manifest_content == item["manifest_content"],
+            seal_record == item["seal_record"],
+            seal_content == item["seal_content"],
             raw_record["sha256"] == manifest["sha256"],
             raw_row_count == manifest["row_count"],
-            seal_content == expected_seal,
-            seal_record["sha256"] == hashlib.sha256(expected_seal).hexdigest(),
         )
         rawstore_verified = all(verification_results)
         if not rawstore_verified:
-            raise RuntimeError(
-                "legacy bytes changed after RawStore verification"
-            )
+            if raw_record["sha256"] != manifest["sha256"]:
+                raise RuntimeError("immutable raw payload digest mismatch")
+            if raw_row_count != manifest["row_count"]:
+                raise RuntimeError("immutable raw manifest row_count mismatch")
+            raise RuntimeError("legacy bytes changed after streaming verification")
 
         records.append(
             {
@@ -564,9 +692,7 @@ def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
             raise ValueError(f"protected raw inventory {label} must be a string")
         return value
 
-    schema_version = require_integer(
-        inventory["schema_version"], "schema_version", 1
-    )
+    schema_version = require_integer(inventory["schema_version"], "schema_version", 1)
     if schema_version != 1:
         raise ValueError("protected raw inventory schema version is invalid")
     legacy_root = require_string(inventory["legacy_root"], "legacy_root")
@@ -579,19 +705,14 @@ def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
         raise ValueError("protected raw inventory RawStore result is invalid")
     if type(inventory["records"]) is not list or not inventory["records"]:
         raise ValueError("protected raw inventory records are invalid")
-    manifest_count = require_integer(
-        inventory["manifest_count"], "manifest_count", 1
-    )
+    manifest_count = require_integer(inventory["manifest_count"], "manifest_count", 1)
     if manifest_count != len(inventory["records"]):
         raise ValueError("protected raw inventory manifest count is invalid")
     for record in inventory["records"]:
         if type(record) is not dict or set(record) != _RECORD_KEYS:
             raise ValueError("protected raw inventory record keys are invalid")
-        if type(record["canonical_query"]) is not dict:
-            raise ValueError(
-                "protected raw inventory canonical_query must be an object"
-            )
-        require_string(record["source"], "record source")
+        source = require_string(record["source"], "record source")
+        _validate_source_query(source, record["canonical_query"])
         if type(record["rawstore_verified"]) is not bool:
             raise ValueError(
                 "protected raw inventory rawstore_verified must be a boolean"
@@ -610,9 +731,7 @@ def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
             if len(digest) != 64 or any(
                 character not in "0123456789abcdef" for character in digest
             ):
-                raise ValueError(
-                    f"protected raw inventory {kind} sha256 is invalid"
-                )
+                raise ValueError(f"protected raw inventory {kind} sha256 is invalid")
             fingerprint = item["inode_fingerprint"]
             if type(fingerprint) is not dict or set(fingerprint) != {
                 "device",
