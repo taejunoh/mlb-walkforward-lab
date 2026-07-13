@@ -941,6 +941,27 @@ class DesignVerificationTest(unittest.TestCase):
             inventory_path.read_bytes(), canonical_json_bytes(inventory) + b"\n"
         )
 
+    def test_task0_protected_addition_is_exactly_declared_and_hash_bound(
+        self,
+    ) -> None:
+        expected = {
+            "audit/v5_1_bt/protected_raw_inventory.json": (
+                "2ec8bf0237cc5bdb00ddb6d2236ac631"
+                "bb793aed9ba79f308672a9ecb90809c6"
+            )
+        }
+        self.assertEqual(verifier_module.APPROVED_PROTECTED_ADDITIONS, expected)
+        inventory_path = ROOT / "protocols/v5_2_qd/v51_protected_inventory.json"
+        verify_protected_inventory(ROOT, inventory_path)
+        with (
+            patch(
+                "mlb_backtest.verify_v52_design.sha256_file",
+                return_value="0" * 64,
+            ),
+            self.assertRaisesRegex(ValueError, "protected v5.1 inventory"),
+        ):
+            verify_protected_inventory(ROOT, inventory_path)
+
     def test_absence_status_is_derived_not_hardcoded(self) -> None:
         self.assertEqual(historical_execution_status(ROOT), "NOT_EXECUTED")
         self.assertEqual(observation_namespace_status(ROOT), "NOT_STARTED")

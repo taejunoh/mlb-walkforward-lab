@@ -54,6 +54,12 @@ from mlb_backtest.report_artifact import build_chart_map, build_report_artifact
 V51_PROTECTED_BASELINE_COMMIT = "a4aa8d2"
 PROTECTED_TREES = ("data/v5_1_bt", "audit/v5_1_bt")
 PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
+APPROVED_PROTECTED_ADDITIONS = {
+    "audit/v5_1_bt/protected_raw_inventory.json": (
+        "2ec8bf0237cc5bdb00ddb6d2236ac631"
+        "bb793aed9ba79f308672a9ecb90809c6"
+    )
+}
 HISTORICAL_NAMESPACE_ROOTS = (
     "data/v5_2_qd/historical",
     "reports/v5_2_qd/historical",
@@ -647,7 +653,12 @@ def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
         tracked = _decode_nul_paths(
             git(root, "ls-files", "-z", "--", *PROTECTED_TREES, *PROTECTED_FILES)
         )
-        if tracked != set(baseline):
+        approved_additions = (
+            APPROVED_PROTECTED_ADDITIONS
+            if commit == V51_PROTECTED_BASELINE_COMMIT
+            else {}
+        )
+        if tracked != set(baseline) | set(approved_additions):
             raise ValueError
         for relative, oid in baseline.items():
             require_regular_file(root, relative)
@@ -656,6 +667,10 @@ def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
                 or not isinstance(oid, str)
                 or git(root, "hash-object", "--", relative).decode().strip() != oid
             ):
+                raise ValueError
+        for relative, digest in approved_additions.items():
+            path = require_regular_file(root, relative)
+            if sha256_file(path) != digest:
                 raise ValueError
         changes = (
             git(
