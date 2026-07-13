@@ -215,6 +215,36 @@ class V52ProtectedInventoryTest(unittest.TestCase):
                 ):
                     build_protected_raw_inventory(root, legacy_root)
 
+    def test_build_rejects_source_parent_swapped_to_external_symlink_after_verify(
+        self,
+    ) -> None:
+        original_verify = RawStore.verify_manifests
+        with (
+            tempfile.TemporaryDirectory() as repository_directory,
+            tempfile.TemporaryDirectory() as external_directory,
+        ):
+            root = Path(repository_directory).resolve()
+            external_root = Path(external_directory).resolve()
+            legacy_root, _ = self._fixture(root)
+
+            def verify_then_swap_source(store):
+                catalog = original_verify(store)
+                source_path = legacy_root / "source"
+                external_source = external_root / "source"
+                source_path.rename(external_source)
+                source_path.symlink_to(external_source, target_is_directory=True)
+                return catalog
+
+            with (
+                patch.object(
+                    RawStore, "verify_manifests", verify_then_swap_source
+                ),
+                self.assertRaisesRegex(
+                    (RuntimeError, ValueError), "symlink|path binding|source directory"
+                ),
+            ):
+                build_protected_raw_inventory(root, legacy_root)
+
     def test_verify_rejects_boolean_for_every_closed_integer_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

@@ -103,6 +103,160 @@ def _validate_regular_leaf(path: Path, label: str) -> os.stat_result:
     return metadata
 
 
+class _BoundLegacyTree:
+    def __init__(self, root: Path, legacy_root: Path) -> None:
+        self.root = root
+        self.legacy_root = legacy_root
+        self._directory_bindings: list[
+            tuple[int, str, int, os.stat_result, str]
+        ] = []
+        self._source_fds: dict[str, int] = {}
+        self._fds: list[int] = []
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_fd = os.open(root, directory_flags)
+            self._fds.append(root_fd)
+            parent_fd = root_fd
+            relative = legacy_root.absolute().relative_to(root)
+            for index, component in enumerate(relative.parts):
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                self._fds.append(child_fd)
+                linked = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+                opened = os.fstat(child_fd)
+                label = "legacy root" if index == len(relative.parts) - 1 else (
+                    "legacy root ancestor"
+                )
+                self._require_bound_directory(linked, opened, label)
+                self._directory_bindings.append(
+                    (parent_fd, component, child_fd, opened, label)
+                )
+                parent_fd = child_fd
+            self.legacy_fd = parent_fd
+
+            for name in os.listdir(self.legacy_fd):
+                linked = os.stat(name, dir_fd=self.legacy_fd, follow_symlinks=False)
+                if stat.S_ISDIR(linked.st_mode):
+                    source_fd = os.open(name, directory_flags, dir_fd=self.legacy_fd)
+                    self._fds.append(source_fd)
+                    opened = os.fstat(source_fd)
+                    self._require_bound_directory(
+                        linked, opened, "legacy source directory"
+                    )
+                    self._directory_bindings.append(
+                        (
+                            self.legacy_fd,
+                            name,
+                            source_fd,
+                            opened,
+                            "legacy source directory",
+                        )
+                    )
+                    self._source_fds[name] = source_fd
+                else:
+                    self._require_regular_metadata(linked, "legacy root file")
+            self.assert_bound()
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _require_bound_directory(
+        linked: os.stat_result, opened: os.stat_result, label: str
+    ) -> None:
+        if not stat.S_ISDIR(linked.st_mode) or not stat.S_ISDIR(opened.st_mode):
+            raise ValueError(f"{label} must be a real directory")
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"{label} path binding changed")
+
+    @staticmethod
+    def _require_regular_metadata(metadata: os.stat_result, label: str) -> None:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        if metadata.st_nlink != 1:
+            raise ValueError(f"{label} hard link is forbidden")
+
+    def assert_bound(self) -> None:
+        for parent_fd, name, child_fd, expected, label in self._directory_bindings:
+            try:
+                linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(child_fd)
+            except OSError as exc:
+                raise RuntimeError(f"{label} path binding changed") from exc
+            self._require_bound_directory(linked, opened, label)
+            if (opened.st_dev, opened.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                raise RuntimeError(f"{label} path binding changed")
+
+    def _leaf_binding(
+        self, path: Path, label: str
+    ) -> tuple[int, str, os.stat_result]:
+        self.assert_bound()
+        try:
+            relative = path.absolute().relative_to(self.legacy_root.absolute())
+        except ValueError as exc:
+            raise ValueError(f"{label} escaped canonical legacy root") from exc
+        if len(relative.parts) != 2:
+            raise ValueError(f"{label} must be directly under a source directory")
+        source, leaf = relative.parts
+        if source not in self._source_fds or leaf in {"", ".", ".."}:
+            raise ValueError(f"{label} source directory is not bound")
+        source_fd = self._source_fds[source]
+        try:
+            linked = os.stat(leaf, dir_fd=source_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"{label} path binding changed") from exc
+        self._require_regular_metadata(linked, label)
+        return source_fd, leaf, linked
+
+    def open_regular(self, path: Path, label: str) -> tuple[int, os.stat_result]:
+        source_fd, leaf, linked = self._leaf_binding(path, label)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(leaf, flags, dir_fd=source_fd)
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be opened safely") from exc
+        try:
+            opened = os.fstat(descriptor)
+            self._require_regular_metadata(opened, label)
+            if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError(f"{label} path binding changed while opening")
+            self.assert_bound()
+            return descriptor, opened
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def assert_regular_bound(
+        self, path: Path, opened: os.stat_result, label: str
+    ) -> os.stat_result:
+        _, _, linked = self._leaf_binding(path, label)
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"{label} path binding changed after reading")
+        return linked
+
+    def close(self) -> None:
+        while self._fds:
+            descriptor = self._fds.pop()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "_BoundLegacyTree":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 def _open_regular(path: Path, label: str) -> tuple[int, os.stat_result]:
     before = _validate_regular_leaf(path, label)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -135,8 +289,13 @@ def _stream_object(
     *,
     capture_content: bool = False,
     count_rows: bool = False,
+    bound_tree: _BoundLegacyTree | None = None,
 ) -> tuple[dict[str, object], bytes | None, int | None]:
-    descriptor, opened = _open_regular(path, label)
+    descriptor, opened = (
+        bound_tree.open_regular(path, label)
+        if bound_tree is not None
+        else _open_regular(path, label)
+    )
     digest = hashlib.sha256()
     byte_size = 0
     chunks: list[bytes] | None = [] if capture_content else None
@@ -158,7 +317,11 @@ def _stream_object(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    linked = _validate_regular_leaf(path, label)
+    linked = (
+        bound_tree.assert_regular_bound(path, opened, label)
+        if bound_tree is not None
+        else _validate_regular_leaf(path, label)
+    )
     stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
     if any(getattr(opened, key) != getattr(after, key) for key in stable_fields):
         raise RuntimeError(f"{label} changed while reading")
@@ -221,8 +384,28 @@ def build_protected_raw_inventory(
         repository_root, Path(legacy_root), "legacy root"
     )
     _validate_legacy_tree(legacy_path, repository_root)
+    with _BoundLegacyTree(repository_root, legacy_path) as bound_tree:
+        verified = RawStore(legacy_path).verify_manifests()
+        bound_tree.assert_bound()
+        records = _records_from_verified_catalog(
+            repository_root, verified, bound_tree
+        )
+        bound_tree.assert_bound()
+    records.sort(key=lambda record: record["manifest"]["path"])
+    return {
+        "legacy_root": legacy_relative,
+        "manifest_count": len(records),
+        "rawstore_verification": "PASS",
+        "records": records,
+        "schema_version": 1,
+    }
 
-    verified = RawStore(legacy_path).verify_manifests()
+
+def _records_from_verified_catalog(
+    repository_root: Path,
+    verified: list[dict[str, Any]],
+    bound_tree: _BoundLegacyTree,
+) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for item in verified:
         manifest = item["manifest"]
@@ -235,18 +418,21 @@ def build_protected_raw_inventory(
             manifest_path,
             "legacy manifest",
             capture_content=True,
+            bound_tree=bound_tree,
         )
         raw_record, _, raw_row_count = _stream_object(
             repository_root,
             raw_path,
             "legacy raw payload",
             count_rows=True,
+            bound_tree=bound_tree,
         )
         seal_record, seal_content, _ = _stream_object(
             repository_root,
             seal_path,
             "legacy manifest seal",
             capture_content=True,
+            bound_tree=bound_tree,
         )
         expected_seal = f'{item["manifest_sha256"]}\n'.encode("ascii")
         try:
@@ -281,14 +467,7 @@ def build_protected_raw_inventory(
                 "source": manifest["source"],
             }
         )
-    records.sort(key=lambda record: record["manifest"]["path"])
-    return {
-        "legacy_root": legacy_relative,
-        "manifest_count": len(records),
-        "rawstore_verification": "PASS",
-        "records": records,
-        "schema_version": 1,
-    }
+    return records
 
 
 def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
