@@ -156,6 +156,35 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertRegex(state.head_hash, r"^[0-9a-f]{64}$")
             self.assertIn("snapshot_ledgers/2026-07-13/777001", state.audit_path)
 
+    def test_snapshot_ledger_selects_latest_receipt_time_then_sequence(self):
+        cases = (
+            (
+                (
+                    ("2026-07-13T22:24:00Z", True, True),
+                    ("2026-07-13T22:23:00Z", True, True),
+                ),
+                1,
+            ),
+            (
+                (
+                    ("2026-07-13T22:24:00Z", True, True),
+                    ("2026-07-13T22:24:00Z", True, True),
+                ),
+                2,
+            ),
+        )
+        for receipts, expected_sequence in cases:
+            with self.subTest(expected_sequence=expected_sequence), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                state = self._sealed_snapshot_ledger(root, receipts=receipts)
+                self.assertEqual(state.selected_sequence, expected_sequence)
+                candidate = self._disk_candidate(root)
+                self.assertEqual(candidate.selected_snapshot.sequence, expected_sequence)
+                self.assertEqual(
+                    candidate.snapshot_ledger_state["selected_sequence"],
+                    expected_sequence,
+                )
+
     def test_snapshot_ledger_rejects_backfill_late_append_and_empty_root_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -871,7 +900,20 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(
             ledger["state_anchor_write"], "O_EXCL_fsync_read_only_every_transition"
         )
-        candidate_fields = spec.raw["official_pool"]["candidate_record_fields"]
+        self.assertEqual(
+            ledger["selected_snapshot_order"],
+            ("receipt_at_utc_desc", "sequence_desc"),
+        )
+        official_pool = spec.raw["official_pool"]
+        self.assertEqual(
+            official_pool["slate_retry_comparison"],
+            "stable_semantic_projection_excluding_persisted_at_utc",
+        )
+        self.assertEqual(
+            official_pool["identical_retry_result"],
+            "return_existing_original_bytes_and_persisted_at_utc",
+        )
+        candidate_fields = official_pool["candidate_record_fields"]
         for field in (
             "snapshot_history",
             "selected_snapshot",
@@ -1263,6 +1305,29 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 ),
                 slate,
             )
+
+    def test_candidate_slate_identical_retry_keeps_original_persistence_and_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root)
+            candidate = self._disk_candidate(root)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                first = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            path = root / first.audit_path
+            first_bytes = path.read_bytes()
+            with self._trusted_clock("2026-07-13T22:27:00Z"):
+                second = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            self.assertEqual(second, first)
+            self.assertEqual(second.persisted_at_utc, "2026-07-13T22:26:00Z")
+            self.assertEqual(path.read_bytes(), first_bytes)
 
     def test_candidate_slate_concurrent_seal_once_and_identical_idempotency(self):
         first = self._candidate()
@@ -2551,7 +2616,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "d4b8fa399c5dc8138aff961fdbd0cb4fc92facdfb4dc9ae4e820a486ce4bcc5e",
+            "7bd9cf613985d2ead085c0b191cb053215def5273d1b028a2e463b4841053195",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)

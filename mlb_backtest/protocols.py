@@ -366,7 +366,7 @@ CURRENT_APPROVED_DESIGN_SHA256 = (
     "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "d4b8fa399c5dc8138aff961fdbd0cb4fc92facdfb4dc9ae4e820a486ce4bcc5e"
+    "7bd9cf613985d2ead085c0b191cb053215def5273d1b028a2e463b4841053195"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -999,6 +999,10 @@ def _build_prospective_literal() -> dict[str, object]:
                 ],
                 "hash_chain": "sha256_canonical_json_with_genesis_zero_hash",
                 "close_policy": "at_lock_from_disk_history",
+                "selected_snapshot_order": [
+                    "receipt_at_utc_desc",
+                    "sequence_desc",
+                ],
                 "close_chronology": "closed_at_gte_lock_and_latest_receipt",
                 "append_after_close_forbidden": True,
                 "candidate_history_authority": "preexisting_sealed_disk_ledger_only",
@@ -1152,6 +1156,12 @@ def _build_prospective_literal() -> dict[str, object]:
             ),
             "slate_seal_policy": (
                 "immutable_sealed_once_idempotent_exact_same_manifest"
+            ),
+            "slate_retry_comparison": (
+                "stable_semantic_projection_excluding_persisted_at_utc"
+            ),
+            "identical_retry_result": (
+                "return_existing_original_bytes_and_persisted_at_utc"
             ),
             "slate_manifest_fields": [
                 "official_date",
@@ -1887,7 +1897,7 @@ def _select_snapshot_from_receipts(
     )
     lock_at = basis - timedelta(minutes=45)
     window_start = basis - timedelta(minutes=50)
-    selected: ProspectiveSnapshot | None = None
+    eligible: list[ProspectiveSnapshot] = []
     for receipt in receipts:
         snapshot = receipt.snapshot
         received = _canonical_utc_datetime(snapshot.receipt_at_utc, "snapshot receipt")
@@ -1901,8 +1911,18 @@ def _select_snapshot_from_receipts(
             and snapshot.successful
             and snapshot.complete_participants
         ):
-            selected = snapshot
-    return selected
+            eligible.append(snapshot)
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda snapshot: (
+            _canonical_utc_datetime(
+                snapshot.receipt_at_utc, "qualifying snapshot receipt"
+            ),
+            snapshot.sequence,
+        ),
+    )
 
 
 def initialize_prospective_snapshot_ledger(
@@ -2925,7 +2945,6 @@ def _write_prospective_candidate_slate_locked(
     *,
     routing_date: str,
     candidates: tuple[ProspectiveCandidateRow, ...],
-    persisted_at_utc: str,
 ) -> ProspectiveCandidateSlate:
     (
         official_date,
@@ -2936,34 +2955,44 @@ def _write_prospective_candidate_slate_locked(
     ) = _candidate_slate_projection(candidates)
     if official_date != routing_date:
         raise ValueError("candidate slate projection differs from locked official date")
-    persisted = _canonical_utc_datetime(persisted_at_utc, "slate persisted_at_utc")
-    if persisted < _canonical_utc_datetime(
-        final_lock_receipt, "slate final_lock_receipt_at_utc"
-    ):
-        raise ValueError("candidate slate persistence precedes final lock receipt")
     relative = _candidate_slate_relative_path(official_date)
-    slate = ProspectiveCandidateSlate(
-        official_date=official_date,
-        expected_candidate_ids=candidate_ids,
-        expected_candidate_count=len(candidate_ids),
-        candidates_sha256=candidates_sha256,
-        snapshot_lock_receipts=tuple(
-            deep_freeze(receipt) for receipt in lock_receipts
-        ),
-        final_lock_receipt_at_utc=final_lock_receipt,
-        all_locks_sealed=True,
-        persisted_at_utc=persisted_at_utc,
-        audit_path=relative.as_posix(),
-    )
+    frozen_receipts = tuple(deep_freeze(receipt) for receipt in lock_receipts)
     path = root_path / relative
     _reject_symlink_ancestors(path.parent, "candidate slate path")
     if path.exists() or path.is_symlink():
         existing = load_prospective_candidate_slate(
             root_path, official_date=official_date
         )
-        if existing != slate:
+        stable_matches = (
+            existing.official_date == official_date
+            and existing.expected_candidate_ids == candidate_ids
+            and existing.expected_candidate_count == len(candidate_ids)
+            and existing.candidates_sha256 == candidates_sha256
+            and existing.snapshot_lock_receipts == frozen_receipts
+            and existing.final_lock_receipt_at_utc == final_lock_receipt
+            and existing.all_locks_sealed is True
+            and existing.audit_path == relative.as_posix()
+        )
+        if not stable_matches:
             raise ValueError("candidate slate manifest is already sealed and differs")
         return existing
+    persisted_at_utc = _trusted_utc_now_string()
+    persisted = _canonical_utc_datetime(persisted_at_utc, "slate persisted_at_utc")
+    if persisted < _canonical_utc_datetime(
+        final_lock_receipt, "slate final_lock_receipt_at_utc"
+    ):
+        raise ValueError("candidate slate persistence precedes final lock receipt")
+    slate = ProspectiveCandidateSlate(
+        official_date=official_date,
+        expected_candidate_ids=candidate_ids,
+        expected_candidate_count=len(candidate_ids),
+        candidates_sha256=candidates_sha256,
+        snapshot_lock_receipts=frozen_receipts,
+        final_lock_receipt_at_utc=final_lock_receipt,
+        all_locks_sealed=True,
+        persisted_at_utc=persisted_at_utc,
+        audit_path=relative.as_posix(),
+    )
 
     def verify() -> None:
         loaded = load_prospective_candidate_slate(
@@ -2999,7 +3028,6 @@ def write_prospective_candidate_slate(
             root_path,
             routing_date=routing_date,
             candidates=derived_candidates,
-            persisted_at_utc=_trusted_utc_now_string(),
         )
 
 

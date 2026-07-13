@@ -2472,6 +2472,8 @@ Final prospective-integrity amendment: every `(official_date, gamePk)` must have
 
 Every initialization, append, and close also writes a separate immutable `O_EXCL` state-transition anchor under `snapshot_state_anchors/{official_date}/{gamePk}`; the latest contiguous anchor must bind the exact canonical mutable-state digest, so rewriting CLOSED to OPEN or restoring an earlier state/receipt tail while later anchors remain fails closed. The trusted clock is sampled only after the per-game flock is acquired; exact boundary admission uses the unrounded instant and only canonical storage is conservatively ceiled to the next whole second. `closed_at_utc` must be no earlier than both T-45 and the latest receipt persistence time.
 
+Snapshot close selection is the maximum qualifying snapshot by canonical `(receipt_at_utc, sequence)`, not append order; sequence is the deterministic tiebreak when receipt timestamps are equal. Candidate-slate idempotency compares the already validated existing manifest against the stable semantic request projection while excluding generated `persisted_at_utc`; an exact retry returns the original manifest bytes and original persistence time unchanged, while any stable-field difference remains a hard rejection.
+
 - [ ] **Step 4: Run all protocol tests and lint**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.protocols --root . --write-contracts && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols -v && ruff check mlb_backtest/protocols.py tests/test_protocols.py`
