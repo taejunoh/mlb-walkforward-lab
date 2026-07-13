@@ -12,6 +12,9 @@ import stat
 import tempfile
 import unittest
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 import mlb_backtest.protocols as protocols
 from mlb_backtest.diagnostics import canonical_json_bytes, deep_freeze, sha256_file
 from mlb_backtest.protocols import (
@@ -71,6 +74,19 @@ PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
 
 
 class ProspectiveProtocolTest(unittest.TestCase):
+    def setUp(self):
+        self._schedule_signer = Ed25519PrivateKey.generate()
+        public_key = self._schedule_signer.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        public_key_patch = patch(
+            "mlb_backtest.protocols.PROSPECTIVE_SCHEDULE_RECEIPT_PUBLIC_KEY_HEX",
+            public_key.hex(),
+        )
+        public_key_patch.start()
+        self.addCleanup(public_key_patch.stop)
+
     def _trusted_clock(self, value):
         return patch(
             "mlb_backtest.protocols._trusted_utc_now",
@@ -87,11 +103,26 @@ class ProspectiveProtocolTest(unittest.TestCase):
         uncertainty=0.10,
         source="chrony:time.cloudflare.com",
         evidence_sha256="c" * 64,
+        countdown_revision=0,
+        basis="2026-07-13T23:10:00Z",
     ):
+        basis_value = datetime.strptime(basis, "%Y-%m-%dT%H:%M:%SZ")
+        window_start = (basis_value - protocols.timedelta(minutes=50)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        lock_at = (basis_value - protocols.timedelta(minutes=45)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         if root is not None:
             raw_bytes = canonical_json_bytes(
                 {
-                    "observed_at_utc": observed_at,
+                    "schema_version": 1,
+                    "official_date": "2026-07-13",
+                    "gamePk": game_pk,
+                    "countdown_revision": countdown_revision,
+                    "window_start_utc": window_start,
+                    "lock_at_utc": lock_at,
+                    "sampled_at_utc": observed_at,
                     "offset_seconds": offset,
                     "source": source,
                     "uncertainty_seconds": uncertainty,
@@ -109,7 +140,12 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     raw_bytes=raw_bytes,
                 )
         return protocols.ProspectiveClockEvidence(
-            observed_at_utc=observed_at,
+            official_date="2026-07-13",
+            game_pk=game_pk,
+            countdown_revision=countdown_revision,
+            window_start_utc=window_start,
+            lock_at_utc=lock_at,
+            sampled_at_utc=observed_at,
             offset_seconds=offset,
             uncertainty_seconds=uncertainty,
             source=source,
@@ -119,13 +155,58 @@ class ProspectiveProtocolTest(unittest.TestCase):
             persisted_at_utc="2026-07-13T22:00:00Z",
         )
 
-    def _seal_date_roster(self, root, game_pks):
+    def _signed_schedule_material(self, game_pks):
+        games = []
+        for index, game_pk in enumerate(sorted(game_pks)):
+            games.append(
+                {
+                    "gamePk": game_pk,
+                    "gameType": "R",
+                    "gameDate": "2026-07-13T23:10:00Z",
+                    "officialDate": "2026-07-13",
+                    "status": {"detailedState": "Scheduled"},
+                    "teams": {
+                        "away": {
+                            "team": {
+                                "id": 1000 + index * 2,
+                                "name": f"Away {game_pk}",
+                            }
+                        },
+                        "home": {
+                            "team": {
+                                "id": 1001 + index * 2,
+                                "name": f"Home {game_pk}",
+                            }
+                        },
+                    },
+                }
+            )
         snapshot = canonical_json_bytes(
+            {"dates": [{"date": "2026-07-13", "games": games}]}
+        ) + b"\n"
+        population_sha = hashlib.sha256(
+            canonical_json_bytes(sorted(game_pks))
+        ).hexdigest()
+        acquisition_receipt = canonical_json_bytes(
             {
+                "schema_version": 1,
+                "source": "MLB Stats API schedule",
                 "official_date": "2026-07-13",
-                "gamePks": sorted(game_pks),
+                "query": protocols._prospective_schedule_query("2026-07-13"),
+                "observed_at_utc": "2026-07-13T19:59:00Z",
+                "response_complete": True,
+                "schedule_snapshot_sha256": hashlib.sha256(snapshot).hexdigest(),
+                "game_count": len(game_pks),
+                "population_sha256": population_sha,
             }
         ) + b"\n"
+        signature = self._schedule_signer.sign(acquisition_receipt)
+        return snapshot, acquisition_receipt, signature
+
+    def _seal_date_roster(self, root, game_pks):
+        snapshot, acquisition_receipt, signature = self._signed_schedule_material(
+            game_pks
+        )
         with self._trusted_clock("2026-07-13T20:00:00Z"):
             return protocols.write_prospective_date_roster(
                 root,
@@ -133,6 +214,8 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 schedule_source="MLB Stats API schedule",
                 schedule_snapshot_bytes=snapshot,
                 observed_at_utc="2026-07-13T19:59:00Z",
+                acquisition_receipt_bytes=acquisition_receipt,
+                acquisition_signature=signature,
             )
 
     def test_candidate_slate_requires_independent_sealed_date_roster(self):
@@ -194,6 +277,11 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     home_lineup_count=9,
                     clock_evidence=clock_evidence,
                 )
+            revised_clock_evidence = self._clock_evidence(
+                root=root,
+                countdown_revision=1,
+                basis="2026-07-13T23:40:00Z",
+            )
             with self._trusted_clock("2026-07-13T22:54:00Z"):
                 new = protocols.record_prospective_snapshot(
                     root,
@@ -205,7 +293,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     home_starter_present=True,
                     away_lineup_count=9,
                     home_lineup_count=9,
-                    clock_evidence=clock_evidence,
+                    clock_evidence=revised_clock_evidence,
                 )
             self.assertEqual(old.snapshot.countdown_revision, 0)
             self.assertEqual(new.snapshot.countdown_revision, 1)
@@ -239,7 +327,12 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(
             set(raw["clock_evidence"]),
             {
-                "observed_at_utc",
+                "official_date",
+                "gamePk",
+                "countdown_revision",
+                "window_start_utc",
+                "lock_at_utc",
+                "sampled_at_utc",
                 "offset_seconds",
                 "uncertainty_seconds",
                 "source",
@@ -260,13 +353,17 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
                 )
-            evidence = self._clock_evidence(root=root)
             starts = (
                 ("2026-07-13T22:20:00Z", "2026-07-13T23:10:00Z"),
                 ("2026-07-13T22:21:00Z", "2026-07-13T23:40:00Z"),
                 ("2026-07-13T22:22:00Z", "2026-07-13T23:10:00Z"),
             )
-            for receipt_at, observed_start in starts:
+            for revision, (receipt_at, observed_start) in enumerate(starts):
+                evidence = self._clock_evidence(
+                    root=root,
+                    countdown_revision=revision,
+                    basis=observed_start,
+                )
                 with self._trusted_clock(receipt_at):
                     protocols.record_prospective_snapshot(
                         root,
@@ -304,7 +401,11 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
                 )
-            evidence = self._clock_evidence(root=root)
+            evidence = self._clock_evidence(
+                root=root,
+                countdown_revision=1,
+                basis="2026-07-13T23:30:00Z",
+            )
             with self._trusted_clock("2026-07-13T22:54:00Z"):
                 receipt = protocols.record_prospective_snapshot(
                     root,
@@ -405,12 +506,381 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     candidates=(candidate,),
                 )
             self.assertEqual(
-                tuple(map(dict, slate.game_dispositions)),
+                tuple(
+                    {
+                        "gamePk": row["gamePk"],
+                        "disposition": row["disposition"],
+                    }
+                    for row in slate.game_dispositions
+                ),
                 (
                     {"gamePk": 777001, "disposition": "OFFICIAL_CANDIDATE"},
                     {"gamePk": 777002, "disposition": "SYSTEM_MISS_CLOCK"},
                 ),
             )
+
+    def test_unsigned_caller_subset_cannot_define_authoritative_date_roster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for game_pk in (777001, 777002, 777003):
+                self._sealed_snapshot_ledger(root, game_pk=game_pk)
+            unsigned_subset = canonical_json_bytes(
+                {
+                    "official_date": "2026-07-13",
+                    "gamePks": [777001, 777002],
+                }
+            ) + b"\n"
+            with (
+                self._trusted_clock("2026-07-13T20:00:00Z"),
+                self.assertRaisesRegex(ValueError, "signed acquisition|signature"),
+            ):
+                protocols.write_prospective_date_roster(
+                    root,
+                    official_date="2026-07-13",
+                    schedule_source="MLB Stats API schedule",
+                    schedule_snapshot_bytes=unsigned_subset,
+                    observed_at_utc="2026-07-13T19:59:00Z",
+                )
+
+    def test_schedule_acquisition_trust_root_rejects_every_claim_substitution(self):
+        snapshot, receipt, signature = self._signed_schedule_material(
+            (777001, 777002, 777003)
+        )
+        subset_snapshot, _, _ = self._signed_schedule_material((777001, 777002))
+        receipt_object = json.loads(receipt)
+
+        def signed_mutation(**updates):
+            mutated = {**receipt_object, **updates}
+            encoded = canonical_json_bytes(mutated) + b"\n"
+            return encoded, self._schedule_signer.sign(encoded)
+
+        wrong_query, wrong_query_signature = signed_mutation(
+            query={
+                **receipt_object["query"],
+                "start": "2026-07-12",
+            }
+        )
+        incomplete, incomplete_signature = signed_mutation(response_complete=False)
+        wrong_count, wrong_count_signature = signed_mutation(game_count=2)
+        wrong_population, wrong_population_signature = signed_mutation(
+            population_sha256="0" * 64
+        )
+        noncanonical = receipt.rstrip(b"\n") + b" \n"
+        cases = (
+            ("bad_signature", snapshot, receipt, bytes([signature[0] ^ 1]) + signature[1:]),
+            ("raw_subset", subset_snapshot, receipt, signature),
+            ("wrong_query", snapshot, wrong_query, wrong_query_signature),
+            ("incomplete", snapshot, incomplete, incomplete_signature),
+            ("wrong_count", snapshot, wrong_count, wrong_count_signature),
+            (
+                "wrong_population",
+                snapshot,
+                wrong_population,
+                wrong_population_signature,
+            ),
+            (
+                "noncanonical",
+                snapshot,
+                noncanonical,
+                self._schedule_signer.sign(noncanonical),
+            ),
+        )
+        for label, raw_snapshot, raw_receipt, raw_signature in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                with (
+                    self._trusted_clock("2026-07-13T20:00:00Z"),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "signature|canonical|claims differ",
+                    ),
+                ):
+                    protocols.write_prospective_date_roster(
+                        root,
+                        official_date="2026-07-13",
+                        schedule_snapshot_bytes=raw_snapshot,
+                        acquisition_receipt_bytes=raw_receipt,
+                        acquisition_signature=raw_signature,
+                    )
+
+    def test_schedule_acquisition_receipt_rejects_boolean_integer_claims(self):
+        snapshot, receipt, _ = self._signed_schedule_material((777001,))
+        invalid = json.loads(receipt)
+        invalid["schema_version"] = True
+        invalid["game_count"] = True
+        invalid_bytes = canonical_json_bytes(invalid) + b"\n"
+        signature = self._schedule_signer.sign(invalid_bytes)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (
+                self._trusted_clock("2026-07-13T20:00:00Z"),
+                self.assertRaisesRegex(ValueError, "claims differ|integer"),
+            ):
+                protocols.write_prospective_date_roster(
+                    root,
+                    official_date="2026-07-13",
+                    schedule_snapshot_bytes=snapshot,
+                    acquisition_receipt_bytes=invalid_bytes,
+                    acquisition_signature=signature,
+                )
+
+    def test_clock_claims_are_derived_from_raw_and_wrong_revision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            raw_bytes = canonical_json_bytes(
+                {
+                    "schema_version": 1,
+                    "official_date": "2026-07-13",
+                    "gamePk": 777001,
+                    "countdown_revision": 99,
+                    "window_start_utc": "2026-07-13T22:20:00Z",
+                    "lock_at_utc": "2026-07-13T22:25:00Z",
+                    "sampled_at_utc": "2026-07-13T21:55:00Z",
+                    "source": "chrony:time.cloudflare.com",
+                    "offset_seconds": 0.25,
+                    "uncertainty_seconds": 0.10,
+                }
+            ) + b"\n"
+            with self._trusted_clock("2026-07-13T22:00:00Z"):
+                evidence = protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_at_utc="2026-07-13T21:55:00Z",
+                    offset_seconds=0.25,
+                    uncertainty_seconds=0.10,
+                    source="chrony:time.cloudflare.com",
+                    raw_bytes=raw_bytes,
+                )
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                receipt = protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=evidence,
+                )
+            self.assertEqual(
+                protocols._classify_snapshot_with_root(root, receipt.snapshot),
+                "SYSTEM_MISS_CLOCK",
+            )
+
+    def test_clock_raw_schema_rejects_boolean_version_and_parallel_mismatch(self):
+        raw = {
+            "schema_version": True,
+            "official_date": "2026-07-13",
+            "gamePk": 777001,
+            "countdown_revision": 0,
+            "window_start_utc": "2026-07-13T22:20:00Z",
+            "lock_at_utc": "2026-07-13T22:25:00Z",
+            "sampled_at_utc": "2026-07-13T21:55:00Z",
+            "source": "chrony:time.cloudflare.com",
+            "offset_seconds": 0.25,
+            "uncertainty_seconds": 0.10,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self.assertRaisesRegex(ValueError, "schema version"):
+                protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    raw_bytes=canonical_json_bytes(raw) + b"\n",
+                )
+            raw["schema_version"] = 1
+            with self.assertRaisesRegex(ValueError, "parallel claim"):
+                protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    offset_seconds=0.5,
+                    raw_bytes=canonical_json_bytes(raw) + b"\n",
+                )
+
+    def test_terminal_disposition_ignores_superseded_revision_clock_miss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=None,
+                )
+            evidence = self._clock_evidence(
+                root=root,
+                game_pk=777001,
+                countdown_revision=1,
+                basis="2026-07-13T23:40:00Z",
+            )
+            with self._trusted_clock("2026-07-13T22:54:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:40:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=False,
+                    away_lineup_count=9,
+                    home_lineup_count=8,
+                    clock_evidence=evidence,
+                )
+            with self._trusted_clock("2026-07-13T22:55:00Z"):
+                protocols.seal_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+            self._sealed_snapshot_ledger(root, game_pk=777002)
+            self._seal_date_roster(root, (777001, 777002))
+            candidate = self._disk_candidate(root, game_pk=777002)
+            with self._trusted_clock("2026-07-13T22:56:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            self.assertEqual(
+                dict(slate.game_dispositions[0])["disposition"],
+                "TIMESTAMP_PARTIAL_T45",
+            )
+
+    def test_zero_verified_eligible_date_seals_terminal_empty_slate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(
+                root,
+                receipts=(("2026-07-13T22:24:00Z", True, False),),
+            )
+            self._seal_date_roster(root, (777001,))
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(),
+                )
+            self.assertEqual(slate.expected_candidate_count, 0)
+            self.assertEqual(slate.expected_candidate_ids, ())
+            self.assertEqual(
+                slate.date_disposition,
+                "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
+            )
+
+    def test_candidate_slate_rejects_date_disposition_relabeling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(
+                root,
+                receipts=(("2026-07-13T22:24:00Z", True, False),),
+            )
+            self._seal_date_roster(root, (777001,))
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(),
+                )
+            slate_path = root / slate.audit_path
+            relabeled = json.loads(slate_path.read_bytes())
+            relabeled["date_disposition"] = "NO_VERIFIED_ELIGIBLE_DATE"
+            slate_path.write_bytes(canonical_json_bytes(relabeled) + b"\n")
+            with self.assertRaisesRegex(ValueError, "date disposition"):
+                protocols.load_prospective_candidate_slate(
+                    root, official_date="2026-07-13"
+                )
+
+    def test_top1_revalidates_noncandidate_terminal_ledger_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root, game_pk=777001)
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777002,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777002,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=None,
+                )
+            with self._trusted_clock("2026-07-13T22:25:00Z"):
+                noncandidate = protocols.seal_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777002
+                )
+            self._seal_date_roster(root, (777001, 777002))
+            candidate = self._disk_candidate(root, game_pk=777001)
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+            (root / noncandidate.audit_path).unlink()
+            with self.assertRaisesRegex(
+                ValueError, "terminal ledger coverage|roster.*binding|missing"
+            ):
+                protocols.select_prospective_top1(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(candidate,),
+                )
+
+    def test_postlock_initialization_requires_exact_closed_snapshot_basis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self.assertRaisesRegex(ValueError, "closed snapshot ledger|missing"):
+                protocols.initialize_postlock_chain(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    persisted_at_utc="2026-07-13T22:25:00Z",
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(root)
+            with self.assertRaisesRegex(ValueError, "sealed.*basis|basis.*differs"):
+                protocols.initialize_postlock_chain(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:40:00Z",
+                    persisted_at_utc="2026-07-13T22:55:00Z",
+                )
 
     def _sealed_snapshot_ledger(
         self,
@@ -462,6 +932,26 @@ class ProspectiveProtocolTest(unittest.TestCase):
             eligibility_status="ELIGIBLE",
             data_completeness_score=8.5,
             absolute_starter_edge=4.0,
+        )
+
+    def _initialize_postlock_chain(self, root, **kwargs):
+        game_pk = kwargs.get("game_pk", 777001)
+        official_date = kwargs.pop("official_date", "2026-07-13")
+        try:
+            protocols.load_prospective_snapshot_ledger(
+                root, official_date=official_date, game_pk=game_pk
+            )
+        except ValueError:
+            self._sealed_snapshot_ledger(
+                root,
+                game_pk=game_pk,
+                official_date=official_date,
+                basis=kwargs.get(
+                    "lock_basis_start_utc", "2026-07-13T23:10:00Z"
+                ),
+            )
+        return protocols.initialize_postlock_chain(
+            root, official_date=official_date, **kwargs
         )
 
     def test_snapshot_ledger_uses_trusted_clock_and_seals_disk_history(self):
@@ -1019,11 +1509,11 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_COMMIT", None),
-            "151b8b6",
+            "6b83249",
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_SHA256", None),
-            "7b690155bb82c0479f0699904d27fb518af5d96497a7feb7fd9ded9c7bbaf972",
+            "3c1b6d5be92a69a66074eabaa3ef517c0d607c8488be7364534c73189358e379",
         )
         self.assertEqual(protocols.approved_design_bytes(ROOT), design_path.read_bytes())
         self.assertEqual(
@@ -1562,7 +2052,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self._seal_date_roster(root, (777001,))
             for candidates, message in (
                 ((candidate, other_date), "one official date"),
-                ((), "at least one eligible"),
+                ((), "roster.*eligible.*omitted|omitted"),
                 ((replace(candidate, critical=True),), "eligible"),
             ):
                 with self.subTest(message=message):
@@ -2014,7 +2504,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_persisted_chain_initializes_and_appends_a_b_c_from_disk(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            state = protocols.initialize_postlock_chain(
+            state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2050,7 +2540,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_persisted_chain_detects_tail_delete_and_state_rollback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            initial = protocols.initialize_postlock_chain(
+            initial = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2100,7 +2590,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         for mutation in ("overwrite", "gap"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
-                protocols.initialize_postlock_chain(
+                self._initialize_postlock_chain(
                     root,
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2145,7 +2635,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             root = Path(temporary).resolve()
             with self.assertRaisesRegex(ValueError, "missing"):
                 protocols.validate_persisted_postlock_chain(root, game_pk=777001)
-            state = protocols.initialize_postlock_chain(
+            state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2158,7 +2648,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_persisted_append_cannot_accept_older_in_memory_state_and_a_b_a_passes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            old_state = protocols.initialize_postlock_chain(
+            old_state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2197,7 +2687,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         for failure in ("second_replace", "postcondition"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
-                state = protocols.initialize_postlock_chain(
+                state = self._initialize_postlock_chain(
                     root,
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2289,7 +2779,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 side_effect=ValueError("initialization postcondition failed"),
             ):
                 with self.assertRaisesRegex(ValueError, "postcondition"):
-                    protocols.initialize_postlock_chain(
+                    self._initialize_postlock_chain(
                         root,
                         game_pk=777001,
                         lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2315,7 +2805,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 [],
             )
             self.assertEqual(list(root.rglob(".*.tmp")), [])
-            state = protocols.initialize_postlock_chain(
+            state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2336,7 +2826,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 ):
                     root = Path(temporary).resolve()
                     if operation == "append":
-                        prior_state = protocols.initialize_postlock_chain(
+                        prior_state = self._initialize_postlock_chain(
                             root,
                             game_pk=777001,
                             lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2344,6 +2834,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         )
                     else:
                         prior_state = None
+                        self._sealed_snapshot_ledger(root)
                     receipt_dir = (
                         root
                         / "audit/v5_2_qd/prospective_2026/"
@@ -2410,7 +2901,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         self.assertRaisesRegex(OSError, f"receipt {stage} failure"),
                     ):
                         if operation == "genesis":
-                            protocols.initialize_postlock_chain(
+                            self._initialize_postlock_chain(
                                 root,
                                 game_pk=777001,
                                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2436,7 +2927,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     if operation == "genesis":
                         self.assertFalse(receipt_dir.exists())
                         self.assertFalse(receipt_dir.parent.exists())
-                        retried = protocols.initialize_postlock_chain(
+                        retried = self._initialize_postlock_chain(
                             root,
                             game_pk=777001,
                             lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2473,7 +2964,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 ):
                     root = Path(temporary).resolve()
                     if operation == "append":
-                        prior_state = protocols.initialize_postlock_chain(
+                        prior_state = self._initialize_postlock_chain(
                             root,
                             game_pk=777001,
                             lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2481,6 +2972,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         )
                     else:
                         prior_state = None
+                        self._sealed_snapshot_ledger(root)
                     log_path = (
                         root
                         / "audit/v5_2_qd/prospective_2026/"
@@ -2576,7 +3068,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         ) as raised,
                     ):
                         if operation == "genesis":
-                            protocols.initialize_postlock_chain(
+                            self._initialize_postlock_chain(
                                 root,
                                 game_pk=777001,
                                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2651,7 +3143,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 if operation == "append":
-                    prior_state = protocols.initialize_postlock_chain(
+                    prior_state = self._initialize_postlock_chain(
                         root,
                         game_pk=777001,
                         lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2659,6 +3151,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     )
                 else:
                     prior_state = None
+                    self._sealed_snapshot_ledger(root)
                 receipt_root = (
                     root
                     / "audit/v5_2_qd/prospective_2026/postlock_chain_receipts"
@@ -2690,7 +3183,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     self.assertRaisesRegex(OSError, "exclusive open failure"),
                 ):
                     if operation == "genesis":
-                        protocols.initialize_postlock_chain(
+                        self._initialize_postlock_chain(
                             root,
                             game_pk=777001,
                             lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2725,7 +3218,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                         ),
                         [],
                     )
-                    retried = protocols.initialize_postlock_chain(
+                    retried = self._initialize_postlock_chain(
                         root,
                         game_pk=777001,
                         lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2794,7 +3287,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     RuntimeError, "exclusive open recovery failed"
                 ) as raised,
             ):
-                protocols.initialize_postlock_chain(
+                self._initialize_postlock_chain(
                     root,
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2810,7 +3303,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_receipt_removal_failure_is_path_rich_and_preserves_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            state = protocols.initialize_postlock_chain(
+            state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2866,7 +3359,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_concurrent_appends_are_serialized_without_acknowledged_loss(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            protocols.initialize_postlock_chain(
+            self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2913,7 +3406,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             alias = base / "alias"
             alias.symlink_to(real, target_is_directory=True)
             with self.assertRaisesRegex(ValueError, "ancestor.*symlink|symlink.*ancestor"):
-                protocols.initialize_postlock_chain(
+                self._initialize_postlock_chain(
                     alias / "workspace",
                     game_pk=777001,
                     lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2923,7 +3416,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
     def test_persisted_chain_rejects_aliases_and_preserves_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            state = protocols.initialize_postlock_chain(
+            state = self._initialize_postlock_chain(
                 root,
                 game_pk=777001,
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
@@ -2977,7 +3470,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "c2f67ea276944df3ad5f5f52c56d47b8384cffb0cc92fc69282098802ed8f8c8",
+            "f6b063d4dcc83728676a6e533c69efdea814ec5b4a26cba7a5238826095bd28f",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
@@ -3064,7 +3557,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             pool["all_locks_sealed"], "derived_from_every_bound_candidate_lock"
         )
         self.assertEqual(
-            pool["final_lock_receipt_at_utc"], "max_candidate_lock_receipt_at_utc"
+            pool["final_lock_receipt_at_utc"], "max_roster_terminal_lock_at_utc"
         )
 
     def test_new_isolation_ranking_and_postlock_literals_reject_tampering(self):
