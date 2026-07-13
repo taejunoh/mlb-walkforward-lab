@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mlb_backtest.manifest import RawStore
+import mlb_backtest.v52_protected_inventory as inventory_module
 
 try:
     from mlb_backtest.v52_protected_inventory import (
@@ -340,6 +341,47 @@ class V52ProtectedInventoryTest(unittest.TestCase):
                 verify_protected_raw_inventory(
                     root, root / "linked-audit/inventory.json"
                 )
+
+    def test_verify_rejects_inventory_parent_swapped_external_after_under_root(
+        self,
+    ) -> None:
+        original_under_root = inventory_module._under_root
+        with (
+            tempfile.TemporaryDirectory() as repository_directory,
+            tempfile.TemporaryDirectory() as external_directory,
+        ):
+            root = Path(repository_directory).resolve()
+            external_root = Path(external_directory).resolve()
+            legacy_root, _ = self._fixture(root)
+            inventory = build_protected_raw_inventory(root, legacy_root)
+            inventory_path = root / "audit/protected_raw_inventory.json"
+            inventory_path.parent.mkdir()
+            inventory_path.write_bytes(_canonical_bytes(inventory))
+
+            def under_root_then_swap(repository_root, path, label):
+                result = original_under_root(repository_root, path, label)
+                if label == "inventory path":
+                    audit_path = root / "audit"
+                    external_audit = external_root / "audit"
+                    audit_path.rename(external_audit)
+                    audit_path.symlink_to(external_audit, target_is_directory=True)
+                    self.assertFalse(
+                        inventory_path.resolve().is_relative_to(root),
+                        "reproduction must move the resolved inventory outside root",
+                    )
+                return result
+
+            with (
+                patch.object(
+                    inventory_module,
+                    "_under_root",
+                    side_effect=under_root_then_swap,
+                ),
+                self.assertRaisesRegex(
+                    (RuntimeError, ValueError), "symlink|path binding|inventory parent"
+                ),
+            ):
+                verify_protected_raw_inventory(root, inventory_path)
 
 
 if __name__ == "__main__":

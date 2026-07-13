@@ -348,31 +348,109 @@ def _stream_object(
 
 
 def _read_regular(root: Path, path: Path, label: str) -> bytes:
-    descriptor, opened = _open_regular(path, label)
-    chunks: list[bytes] = []
     try:
+        relative = path.absolute().relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be inside repository root") from exc
+    if not relative.parts or any(
+        component in {"", ".", ".."} for component in relative.parts
+    ):
+        raise ValueError(f"{label} path is invalid")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    opened_fds: list[int] = []
+    bindings: list[tuple[int, str, int, os.stat_result]] = []
+    try:
+        parent_fd = os.open(root, directory_flags)
+        opened_fds.append(parent_fd)
+        for component in relative.parts[:-1]:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                linked = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise ValueError(f"{label} parent cannot be opened safely") from exc
+            opened_fds.append(child_fd)
+            opened = os.fstat(child_fd)
+            _BoundLegacyTree._require_bound_directory(
+                linked, opened, f"{label} parent"
+            )
+            bindings.append((parent_fd, component, child_fd, opened))
+            parent_fd = child_fd
+
+        leaf = relative.parts[-1]
+        try:
+            linked_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be inspected safely") from exc
+        _BoundLegacyTree._require_regular_metadata(linked_before, label)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NONBLOCK", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(leaf, file_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be opened safely") from exc
+        opened_fds.append(descriptor)
+        opened = os.fstat(descriptor)
+        _BoundLegacyTree._require_regular_metadata(opened, label)
+        if (linked_before.st_dev, linked_before.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise RuntimeError(f"{label} path binding changed while opening")
+
+        chunks: list[bytes] = []
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
         after = os.fstat(descriptor)
+        try:
+            linked_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"{label} path binding changed after reading") from exc
+        _BoundLegacyTree._require_regular_metadata(linked_after, label)
+        for bound_parent, name, child_fd, expected in bindings:
+            try:
+                linked = os.stat(
+                    name, dir_fd=bound_parent, follow_symlinks=False
+                )
+                directory = os.fstat(child_fd)
+            except OSError as exc:
+                raise RuntimeError(f"{label} parent path binding changed") from exc
+            _BoundLegacyTree._require_bound_directory(
+                linked, directory, f"{label} parent"
+            )
+            if (directory.st_dev, directory.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                raise RuntimeError(f"{label} parent path binding changed")
+
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        if any(getattr(opened, key) != getattr(after, key) for key in stable_fields):
+            raise RuntimeError(f"{label} changed while reading")
+        if any(
+            getattr(after, key) != getattr(linked_after, key)
+            for key in stable_fields
+        ):
+            raise RuntimeError(f"{label} changed after reading")
+        content = b"".join(chunks)
+        if len(content) != opened.st_size:
+            raise RuntimeError(f"{label} byte count changed while reading")
+        return content
     finally:
-        os.close(descriptor)
-    linked = _validate_regular_leaf(path, label)
-    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-    if any(getattr(opened, key) != getattr(after, key) for key in stable_fields):
-        raise RuntimeError(f"{label} changed while reading")
-    if any(getattr(after, key) != getattr(linked, key) for key in stable_fields):
-        raise RuntimeError(f"{label} changed after reading")
-    content = b"".join(chunks)
-    if len(content) != opened.st_size:
-        raise RuntimeError(f"{label} byte count changed while reading")
-    try:
-        path.absolute().relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"{label} must be inside repository root") from exc
-    return content
+        while opened_fds:
+            descriptor = opened_fds.pop()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def build_protected_raw_inventory(
