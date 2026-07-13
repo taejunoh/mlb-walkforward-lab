@@ -365,12 +365,12 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
-CURRENT_APPROVED_DESIGN_COMMIT = "6b82486"
+CURRENT_APPROVED_DESIGN_COMMIT = "fd04e8b"
 CURRENT_APPROVED_DESIGN_SHA256 = (
-    "c673e113a8a0eb6717f3f3921decf8671580bed70beda5076ba287ab3ad14af4"
+    "2439a5b355f0257c584abfb18ab6c714a0b24e543e5acdee97f2739e74cb8d9a"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "a7c38fea27b27536d1b51ce23be0dc7f8b14f9aa3043af7866b8f8357b0ae252"
+    "31386a811338ed8d7497b6c10f481b8b2be9735a2cd86576c9c6b4d4b942c622"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -1046,6 +1046,9 @@ def _build_prospective_literal() -> dict[str, object]:
                 "persistence_admission": (
                     "per_game_lock_trusted_precise_now_lte_T50_then_ceil_storage"
                 ),
+                "ledger_authority": (
+                    "same_game_lock_exact_current_OPEN_revision_T50_T45_start"
+                ),
                 "missing_or_invalid": "SYSTEM_MISS_CLOCK",
                 "digest_binding": "snapshot_candidate_and_slate",
             },
@@ -1079,6 +1082,13 @@ def _build_prospective_literal() -> dict[str, object]:
                 "prelock_transition": (
                     "every_observed_start_change_increments_revision_and_"
                     "supersedes_prior_epoch"
+                ),
+                "prelock_transition_order": (
+                    "atomic_state_anchor_then_clock_evidence_then_snapshot"
+                ),
+                "snapshot_append_start_gate": "exact_current_ledger_start_only",
+                "state_anchor_cardinality": (
+                    "snapshot_count_plus_countdown_revision_plus_genesis_and_close"
                 ),
                 "sealed_lock_basis": "selected_final_qualifying_poll_start_only",
                 "subsecond_policy": (
@@ -1236,6 +1246,10 @@ def _build_prospective_literal() -> dict[str, object]:
             ],
             "candidate_date_state": "CANDIDATE_ACTIVE",
             "candidate_top1_preclaim_forbidden": True,
+            "candidate_history_eligibility": (
+                "retain_full_order_filter_CLOSED_current_revision_basis_"
+                "and_reproduce_selected_digest"
+            ),
             "selection_gate": (
                 "all_candidate_locks_sealed_and_final_lock_receipt_recorded"
             ),
@@ -1809,6 +1823,36 @@ def write_prospective_clock_evidence(
         official_date, game_pk, evidence_sha
     )
     with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        try:
+            ledger, _ = load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "clock evidence requires a matching current OPEN snapshot ledger"
+            ) from exc
+        ledger_start = _canonical_utc_datetime(
+            ledger.current_observed_start_utc,
+            "clock evidence ledger current observed start",
+        )
+        expected_window_start = (ledger_start - timedelta(minutes=50)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        expected_lock_at = (ledger_start - timedelta(minutes=45)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        if (
+            ledger.status != "OPEN"
+            or claims["official_date"] != ledger.official_date
+            or claims["gamePk"] != ledger.game_pk
+            or claims["countdown_revision"] != ledger.countdown_revision
+            or claims["window_start_utc"] != expected_window_start
+            or claims["lock_at_utc"] != expected_lock_at
+            or ledger.lock_at_utc != expected_lock_at
+        ):
+            raise ValueError(
+                "clock evidence differs from the current OPEN ledger revision or window"
+            )
         persisted_precise, persisted_at = _trusted_utc_now_value_and_string()
         window_start = _canonical_utc_datetime(
             claims["window_start_utc"], "clock evidence window start"
@@ -2439,7 +2483,9 @@ def load_prospective_snapshot_ledger(
     if state.snapshot_count != len(receipts) or state.head_hash != expected_head:
         raise ValueError("snapshot ledger tail rollback or state count/head differs")
     if state.status == "OPEN":
-        expected_anchor_count = state.snapshot_count + 1
+        expected_anchor_count = (
+            state.snapshot_count + state.countdown_revision + 1
+        )
         if any(
             value is not None
             for value in (
@@ -2451,7 +2497,9 @@ def load_prospective_snapshot_ledger(
         ):
             raise ValueError("open snapshot ledger contains closed-state fields")
     else:
-        expected_anchor_count = state.snapshot_count + 2
+        expected_anchor_count = (
+            state.snapshot_count + state.countdown_revision + 2
+        )
         if state.closed_at_utc is None:
             raise ValueError("closed snapshot ledger has no close time")
         closed_at = _canonical_utc_datetime(
@@ -2618,6 +2666,80 @@ def initialize_prospective_snapshot_ledger(
             rollback_side_effect=rollback,
         )
     return state
+
+
+def transition_prospective_snapshot_countdown(
+    root: Path,
+    *,
+    official_date: str,
+    game_pk: int,
+    observed_scheduled_start_utc: str,
+) -> ProspectiveSnapshotLedgerState:
+    _, _, observed_start = _validate_prospective_identity(
+        official_date, game_pk, observed_scheduled_start_utc
+    )
+    assert observed_start is not None
+    with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
+        state, receipts = load_prospective_snapshot_ledger(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        anchors = _load_snapshot_state_anchors(
+            root_path, official_date=official_date, game_pk=game_pk
+        )
+        if state.status != "OPEN":
+            raise ValueError("snapshot countdown transition requires an OPEN ledger")
+        if observed_scheduled_start_utc == state.current_observed_start_utc:
+            return state
+        _, now_string = _trusted_utc_now_value_and_string()
+        transitioned = replace(
+            state,
+            current_observed_start_utc=observed_scheduled_start_utc,
+            countdown_revision=state.countdown_revision + 1,
+            lock_at_utc=(observed_start - timedelta(minutes=45)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+        anchor = _new_snapshot_state_anchor(
+            transitioned,
+            revision=len(anchors),
+            prior_anchor_hash=anchors[-1].anchor_hash,
+            persisted_at_utc=now_string,
+        )
+        _, state_path, _, _, _ = _snapshot_ledger_paths(
+            root_path, official_date, game_pk
+        )
+        created_anchor: _CreatedPostlockReceipt | None = None
+
+        def verify() -> None:
+            nonlocal created_anchor
+            created_anchor = _write_snapshot_state_anchor_exclusive(
+                root_path, anchor
+            )
+            loaded, loaded_receipts = load_prospective_snapshot_ledger(
+                root_path, official_date=official_date, game_pk=game_pk
+            )
+            if loaded != transitioned or loaded_receipts != receipts:
+                raise ValueError("snapshot countdown transition postcondition failed")
+
+        def rollback() -> None:
+            if created_anchor is not None:
+                _remove_created_postlock_receipt(created_anchor)
+
+        _publish_bundle(
+            (
+                (
+                    state_path,
+                    canonical_json_bytes(
+                        _snapshot_ledger_state_raw(transitioned)
+                    )
+                    + b"\n",
+                ),
+            ),
+            root=root_path,
+            post_publish=verify,
+            rollback_side_effect=rollback,
+        )
+        return transitioned
 
 
 def _write_snapshot_receipt_exclusive(
@@ -2828,24 +2950,30 @@ def record_prospective_snapshot(
             or not 0 <= home_lineup_count <= 9
         ):
             raise ValueError("snapshot participant completeness fields are invalid")
-        observed_start = _canonical_utc_datetime(
+        _canonical_utc_datetime(
             observed_scheduled_start_utc, "observed_scheduled_start_utc"
         )
         now, now_string = _trusted_utc_now_value_and_string()
-        start_changed = (
-            observed_scheduled_start_utc != state.current_observed_start_utc
-        )
-        if start_changed:
-            state = replace(
-                state,
-                current_observed_start_utc=observed_scheduled_start_utc,
-                countdown_revision=state.countdown_revision + 1,
-                lock_at_utc=(observed_start - timedelta(minutes=45)).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+        if observed_scheduled_start_utc != state.current_observed_start_utc:
+            raise ValueError(
+                "snapshot start differs from ledger; countdown transition required"
             )
         lock_at = _canonical_utc_datetime(state.lock_at_utc, "snapshot ledger lock_at")
-        late_reschedule = start_changed and now > lock_at
+        current_revision_receipts = tuple(
+            receipt
+            for receipt in receipts
+            if receipt.snapshot.countdown_revision == state.countdown_revision
+        )
+        transition_observed = _canonical_utc_datetime(
+            anchors[-1].persisted_at_utc,
+            "snapshot countdown transition persisted_at_utc",
+        )
+        late_reschedule = bool(
+            state.countdown_revision > 0
+            and not current_revision_receipts
+            and transition_observed > lock_at
+            and now > lock_at
+        )
         if now > lock_at and not late_reschedule:
             raise ValueError(
                 "snapshot receipt is after lock; LATE_RESCHEDULE_UNVERIFIED"
@@ -3111,9 +3239,36 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
         raise ValueError("candidate snapshot selection history must be a typed tuple")
     if not row.snapshot_candidates:
         raise ValueError("candidate snapshot selection history is empty")
+    if not isinstance(row.snapshot_ledger_state, Mapping):
+        raise ValueError("candidate must bind a CLOSED snapshot ledger state")
+    ledger_state = require_exact_keys(
+        dict(row.snapshot_ledger_state),
+        SNAPSHOT_LEDGER_STATE_KEYS,
+        "candidate.snapshot_ledger_state",
+    )
+    if (
+        ledger_state["status"] != "CLOSED"
+        or ledger_state["official_date"] != row.official_date
+        or ledger_state["gamePk"] != row.game_pk
+        or isinstance(ledger_state["countdown_revision"], bool)
+        or not isinstance(ledger_state["countdown_revision"], int)
+        or ledger_state["countdown_revision"] < 0
+        or ledger_state["current_observed_start_utc"]
+        != row.lock_basis_start_utc
+        or ledger_state["lock_basis_start_utc"] != row.lock_basis_start_utc
+        or ledger_state["lock_at_utc"] != row.lock_receipt_at_utc
+    ):
+        raise ValueError(
+            "candidate snapshot CLOSED ledger identity or final basis differs"
+        )
     verified_snapshot = row.verified_snapshot
     classification = classify_snapshot(verified_snapshot)
-    selected_snapshot = select_qualifying_snapshot(row.snapshot_candidates)
+    selected_snapshot = select_qualifying_snapshot(
+        row.snapshot_candidates,
+        countdown_revision=ledger_state["countdown_revision"],
+        lock_basis_start_utc=ledger_state["current_observed_start_utc"],
+        lock_at_utc=ledger_state["lock_at_utc"],
+    )
     if selected_snapshot != verified_snapshot:
         raise ValueError("candidate verified snapshot is not the latest selected snapshot")
     snapshot_raw = _prospective_snapshot_raw(verified_snapshot)
@@ -3131,6 +3286,12 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
         or row.verified_snapshot_sha256 != row.sealed_lock_snapshot_sha256
         or row.verified_snapshot_id != snapshot_id
         or row.verified_snapshot_sha256 != snapshot_sha256
+        or row.selected_snapshot != verified_snapshot
+        or ledger_state["selected_sequence"] != verified_snapshot.sequence
+        or ledger_state["selected_snapshot_id"] != snapshot_id
+        or ledger_state["selected_snapshot_sha256"] != snapshot_sha256
+        or row.snapshot_ledger_digest
+        != hashlib.sha256(canonical_json_bytes(ledger_state)).hexdigest()
     ):
         raise ValueError(
             "candidate canonical verified snapshot binding differs from sealed lock"
@@ -4402,12 +4563,12 @@ def classify_snapshot(snapshot: ProspectiveSnapshot) -> str:
             raise ValueError("snapshot receipt is outside qualifying window")
         if lock_at - receipt > timedelta(minutes=5):
             raise ValueError("snapshot exceeds maximum freshness at lock")
+    if late_reschedule:
+        return "TIMESTAMP_PARTIAL_T45"
     if not _clock_evidence_structurally_valid(
         snapshot.clock_evidence, receipt_at_utc=snapshot.receipt_at_utc
     ):
         return "SYSTEM_MISS_CLOCK"
-    if late_reschedule:
-        return "TIMESTAMP_PARTIAL_T45"
     if not snapshot.successful:
         return "UNSUCCESSFUL_RESPONSE_REJECTED"
     return (
@@ -4438,6 +4599,10 @@ def _classify_snapshot_with_root(root: Path, snapshot: ProspectiveSnapshot) -> s
 
 def select_qualifying_snapshot(
     candidates: tuple[ProspectiveSnapshot, ...],
+    *,
+    countdown_revision: int | None = None,
+    lock_basis_start_utc: str | None = None,
+    lock_at_utc: str | None = None,
 ) -> ProspectiveSnapshot | None:
     if not isinstance(candidates, tuple) or not all(
         isinstance(candidate, ProspectiveSnapshot) for candidate in candidates
@@ -4448,6 +4613,32 @@ def select_qualifying_snapshot(
     sequences = tuple(candidate.sequence for candidate in candidates)
     if sequences != tuple(sorted(set(sequences))):
         raise ValueError("snapshot candidate sequence must be strictly increasing")
+    filters = (countdown_revision, lock_basis_start_utc, lock_at_utc)
+    if any(value is not None for value in filters):
+        if (
+            isinstance(countdown_revision, bool)
+            or not isinstance(countdown_revision, int)
+            or countdown_revision < 0
+            or not isinstance(lock_basis_start_utc, str)
+            or not isinstance(lock_at_utc, str)
+        ):
+            raise ValueError("snapshot current-revision selection filter is invalid")
+        _canonical_utc_datetime(
+            lock_basis_start_utc, "snapshot selection lock basis"
+        )
+        _canonical_utc_datetime(lock_at_utc, "snapshot selection lock at")
+        filtered = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.countdown_revision == countdown_revision
+            and candidate.lock_basis_start_utc == lock_basis_start_utc
+            and candidate.observed_scheduled_start_utc == lock_basis_start_utc
+            and candidate.lock_at_utc == lock_at_utc
+        )
+    else:
+        filtered = candidates
+    if not filtered:
+        return None
     identity = {
         (
             candidate.game_pk,
@@ -4455,13 +4646,13 @@ def select_qualifying_snapshot(
             candidate.lock_at_utc,
             candidate.countdown_revision,
         )
-        for candidate in candidates
+        for candidate in filtered
     }
     if len(identity) != 1:
         raise ValueError("snapshot candidates differ in game or immutable lock basis")
     eligible = [
         candidate
-        for candidate in candidates
+        for candidate in filtered
         if classify_snapshot(candidate) == "TIMESTAMP_VERIFIED_T45"
     ]
     if not eligible:
