@@ -17,14 +17,20 @@ from mlb_backtest.diagnostics import (
 )
 from mlb_backtest.preflight import (
     PREFLIGHT_REQUIRED_KEYS,
+    build_preflight,
+    preflight_schema_document,
     parse_preflight,
     protected_inventory,
     render_preflight_markdown,
 )
 from mlb_backtest.protocols import (
+    FOLD_REQUIRED_KEYS,
+    RUN_REQUIRED_KEYS,
+    V52_REQUIRED_KEYS,
     ProspectiveSpec,
     RunSpec,
     V52Config,
+    const_schema,
     expected_historical_run,
     expected_prospective_spec,
     expected_v52_config,
@@ -32,7 +38,9 @@ from mlb_backtest.protocols import (
     load_run_spec,
     load_v52_config,
     parse_change_contract,
+    prospective_schema,
 )
+from mlb_backtest.notebook_artifact import execute_notebook_cells, notebook_sources
 from mlb_backtest.report_artifact import build_chart_map, build_report_artifact
 
 
@@ -51,6 +59,10 @@ PROSPECTIVE_OBSERVATION_ROOTS = (
     "models/v5_2_qd/prospective_2026",
 )
 FITTED_NAMESPACE_ROOT = "models/v5_2_qd/folds"
+FINAL_HTML_PATH = Path(
+    "/Users/taejunoh/Documents/Codex/2026-07-11/"
+    "files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html"
+)
 EXPECTED_CURRENT_FILES = (
     "reports/v5_1_bt/diagnostic_100.json",
     "reports/v5_1_bt/diagnostic_100.md",
@@ -249,41 +261,42 @@ def verify_markdown_agreement(root: Path, diagnostic: Mapping[str, object]) -> N
         raise ValueError("Markdown differs from canonical diagnostic")
 
 
-def verify_notebook_agreement(root: Path, diagnostic: Mapping[str, object]) -> None:
-    notebook = json.loads(
-        (root / "analysis/v5_1_bt/diagnostic_100.ipynb").read_text(encoding="utf-8")
+def verify_notebook_agreement(
+    root: Path,
+    diagnostic: Mapping[str, object],
+    *,
+    notebook_path: Path | None = None,
+) -> None:
+    saved_diagnostic = root / "reports/v5_1_bt/diagnostic_100.json"
+    if saved_diagnostic.read_bytes() != canonical_json_bytes(diagnostic) + b"\n":
+        raise ValueError("notebook diagnostic input differs")
+    cells = execute_notebook_cells(
+        notebook_sources(root),
+        {
+            "__name__": "__diagnostic_notebook__",
+            "NOTEBOOK_REPOSITORY_ROOT": root.resolve(),
+        },
     )
-    cells = notebook.get("cells")
-    if not isinstance(cells, list):
-        raise ValueError("notebook cells missing")
-    code = [cell for cell in cells if cell.get("cell_type") == "code"]
-    try:
-        output = code[-1]["outputs"][0]
-        text_value = output["text"]
-        text = "".join(text_value) if isinstance(text_value, list) else text_value
-        receipt = json.loads(text)
-    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("notebook receipt missing") from exc
-    expected_digest = hashlib.sha256(
-        canonical_json_bytes(diagnostic) + b"\n"
-    ).hexdigest()
-    has_error = any(
-        output.get("output_type") == "error"
-        for cell in code
-        for output in cell.get("outputs", [])
+    expected = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {"name": "python", "version": "3"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    path = (
+        root / "analysis/v5_1_bt/diagnostic_100.ipynb"
+        if notebook_path is None
+        else notebook_path
     )
-    execution_counts = [cell.get("execution_count") for cell in code]
-    if (
-        receipt
-        != {
-            "diagnostic_sha256": expected_digest,
-            "primary": {"L": 33, "N": 100, "W": 67},
-            "recomputed_from_sealed_inputs": True,
-        }
-        or has_error
-        or execution_counts != list(range(1, len(code) + 1))
-    ):
-        raise ValueError("notebook does not agree with diagnostic")
+    if path.read_bytes() != canonical_json_bytes(expected) + b"\n":
+        raise ValueError("notebook does not agree with deterministic execution")
 
 
 def verify_artifact_agreement(
@@ -314,35 +327,38 @@ def verify_contract_schemas(
     prospective: ProspectiveSpec,
     preflight: Mapping[str, object],
 ) -> None:
-    pairs = (
-        ("schemas/v5_2_qd.schema.json", config.raw, expected_v52_config()),
-        (
-            "schemas/v5_2_run_spec.schema.json",
-            historical.raw,
-            expected_historical_run(),
-        ),
-        (
-            "schemas/v5_2_prospective.schema.json",
-            prospective.raw,
-            expected_prospective_spec(),
-        ),
-    )
-    for relative, parsed, expected in pairs:
-        schema = json.loads((root / relative).read_text(encoding="utf-8"))
-        if deep_freeze(schema.get("const")) != parsed or parsed != deep_freeze(
-            expected
-        ):
-            raise ValueError(f"schema/parser disagreement: {relative}")
-    schema = json.loads(
-        (root / "schemas/v5_2_preflight.schema.json").read_text(encoding="utf-8")
-    )
+    v52_raw = expected_v52_config()
+    historical_raw = expected_historical_run()
+    prospective_raw = expected_prospective_spec()
+    historical_schema = const_schema(historical_raw, RUN_REQUIRED_KEYS)
+    historical_schema["properties"]["folds"] = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/fold"},
+    }
+    historical_schema["$defs"] = {
+        "fold": {
+            "type": "object",
+            "required": sorted(FOLD_REQUIRED_KEYS),
+            "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)},
+            "additionalProperties": False,
+        }
+    }
+    documents = {
+        "schemas/v5_2_qd.schema.json": const_schema(v52_raw, V52_REQUIRED_KEYS),
+        "schemas/v5_2_run_spec.schema.json": historical_schema,
+        "schemas/v5_2_prospective.schema.json": prospective_schema(prospective_raw),
+        "schemas/v5_2_preflight.schema.json": preflight_schema_document(),
+    }
     if (
-        set(schema.get("required", ())) != PREFLIGHT_REQUIRED_KEYS
-        or set(schema.get("properties", ())) != PREFLIGHT_REQUIRED_KEYS
-        or schema.get("additionalProperties") is not False
+        config.raw != deep_freeze(v52_raw)
+        or historical.raw != deep_freeze(historical_raw)
+        or prospective.raw != deep_freeze(prospective_raw)
         or set(preflight) != PREFLIGHT_REQUIRED_KEYS
     ):
-        raise ValueError("preflight schema/parser disagreement")
+        raise ValueError("schema/parser disagreement: parsed contract")
+    for relative, expected in documents.items():
+        if (root / relative).read_bytes() != canonical_json_bytes(expected) + b"\n":
+            raise ValueError(f"schema/parser disagreement: {relative}")
 
 
 def verify_change_contract(root: Path) -> Mapping[str, object]:
@@ -402,9 +418,19 @@ def verify_forbidden_claims(root: Path) -> None:
             raise ValueError(f"forbidden claim in {path}")
 
 
-def verify_preflight(root: Path) -> dict[str, object]:
+def verify_preflight_payload(
+    saved: Mapping[str, object], recomputed: Mapping[str, object]
+) -> None:
+    if canonical_json_bytes(saved) != canonical_json_bytes(recomputed):
+        raise ValueError("saved report differs from recomputed preflight")
+
+
+def verify_preflight(root: Path, historical: RunSpec) -> dict[str, object]:
     json_path = root / "reports/v5_2_qd/walkforward_500_preflight.json"
-    payload = parse_preflight(json.loads(json_path.read_text(encoding="utf-8")))
+    saved = json.loads(json_path.read_text(encoding="utf-8"))
+    recomputed = build_preflight(root, historical)
+    verify_preflight_payload(saved, recomputed)
+    payload = parse_preflight(saved)
     if json_path.read_bytes() != canonical_json_bytes(payload) + b"\n":
         raise ValueError("preflight JSON is not canonical")
     if (
@@ -508,6 +534,7 @@ def build_pass_receipt(
     execution: str,
     observation: str,
     inventory: Mapping[str, object],
+    task11: Mapping[str, str],
     html: object,
 ) -> dict[str, object]:
     return {
@@ -529,8 +556,26 @@ def build_pass_receipt(
             "full_tree_guard": "metadata_path_size_mtime_inode_mode",
             "small_sealed_guard": "sha256",
         },
+        "task11": dict(task11),
         "html": html,
     }
+
+
+def task11_artifact_status(root: Path) -> dict[str, str]:
+    paths = {
+        "html": FINAL_HTML_PATH,
+        "delivery_receipt": root / "reports/v5_1_bt/report_delivery_receipt.json",
+    }
+    return {
+        name: "PRESENT" if path.exists() else "ABSENT" for name, path in paths.items()
+    }
+
+
+def verify_task11_phase(status: Mapping[str, str], *, delivery_requested: bool) -> None:
+    expected_value = "PRESENT" if delivery_requested else "ABSENT"
+    expected = {"html": expected_value, "delivery_receipt": expected_value}
+    if dict(status) != expected:
+        raise ValueError("Task 11 delivery artifact differs from requested phase")
 
 
 def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, object]:
@@ -552,7 +597,7 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     prospective = load_prospective_spec(
         root / "protocols/v5_2_qd/prospective_2026.json"
     )
-    preflight = verify_preflight(root)
+    preflight = verify_preflight(root, historical)
     verify_contract_schemas(root, config, historical, prospective, preflight)
     contract = verify_change_contract(root)
     verify_prospective_pin(root, prospective, contract)
@@ -569,6 +614,8 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
         raise ValueError(
             "prospective observations exist before collector implementation"
         )
+    task11 = task11_artifact_status(root)
+    verify_task11_phase(task11, delivery_requested=outputs is not None)
     html = None
     if outputs is not None:
         html = verify_html_payload(
@@ -585,6 +632,7 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
         execution,
         observation,
         inventory,
+        task11,
         html,
     )
 
