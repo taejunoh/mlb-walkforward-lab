@@ -152,6 +152,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             evidence_sha256=evidence_sha256,
             raw_path=f"audit/v5_2_qd/prospective_2026/clock_evidence_raw/2026-07-13/{game_pk}/{evidence_sha256}.bin",
             audit_path=f"audit/v5_2_qd/prospective_2026/clock_evidence/2026-07-13/{game_pk}/{evidence_sha256}.json",
+            persisted_at_precise_utc="2026-07-13T22:00:00.000000Z",
             persisted_at_utc="2026-07-13T22:00:00Z",
         )
 
@@ -339,6 +340,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 "evidence_sha256",
                 "raw_path",
                 "audit_path",
+                "persisted_at_precise_utc",
                 "persisted_at_utc",
             },
         )
@@ -722,6 +724,141 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     offset_seconds=0.5,
                     raw_bytes=canonical_json_bytes(raw) + b"\n",
                 )
+
+    def test_clock_persistence_uses_precise_t50_admission_boundary(self):
+        raw_bytes = canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "official_date": "2026-07-13",
+                "gamePk": 777001,
+                "countdown_revision": 0,
+                "window_start_utc": "2026-07-13T22:20:00Z",
+                "lock_at_utc": "2026-07-13T22:25:00Z",
+                "sampled_at_utc": "2026-07-13T21:55:00Z",
+                "source": "chrony:time.cloudflare.com",
+                "offset_seconds": 0.25,
+                "uncertainty_seconds": 0.10,
+            }
+        ) + b"\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (
+                patch(
+                    "mlb_backtest.protocols._trusted_utc_now",
+                    return_value=datetime(2026, 7, 13, 22, 20, 0, 1000),
+                ),
+                self.assertRaisesRegex(ValueError, "T-50|window start"),
+            ):
+                protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    raw_bytes=raw_bytes,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch(
+                "mlb_backtest.protocols._trusted_utc_now",
+                return_value=datetime(2026, 7, 13, 22, 19, 59, 999000),
+            ):
+                evidence = protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    raw_bytes=raw_bytes,
+                )
+            self.assertEqual(evidence.persisted_at_utc, "2026-07-13T22:20:00Z")
+            self.assertEqual(
+                evidence.persisted_at_precise_utc,
+                "2026-07-13T22:19:59.999000Z",
+            )
+            loaded = protocols.load_prospective_clock_evidence(
+                root,
+                official_date="2026-07-13",
+                game_pk=777001,
+                evidence_sha256=evidence.evidence_sha256,
+            )
+            self.assertEqual(loaded, evidence)
+            self.assertTrue(protocols._clock_evidence_structurally_valid(loaded))
+
+            audit_path = root / evidence.audit_path
+            delayed = json.loads(audit_path.read_bytes())
+            delayed["persisted_at_precise_utc"] = "2026-07-13T22:20:00.001000Z"
+            audit_path.write_bytes(canonical_json_bytes(delayed) + b"\n")
+            with self.assertRaisesRegex(ValueError, "precise|window"):
+                protocols.load_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    evidence_sha256=evidence.evidence_sha256,
+                )
+
+    def test_delayed_clock_persistence_is_clock_miss_and_never_official(self):
+        raw_bytes = canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "official_date": "2026-07-13",
+                "gamePk": 777001,
+                "countdown_revision": 0,
+                "window_start_utc": "2026-07-13T22:20:00Z",
+                "lock_at_utc": "2026-07-13T22:25:00Z",
+                "sampled_at_utc": "2026-07-13T21:55:00Z",
+                "source": "chrony:time.cloudflare.com",
+                "offset_seconds": 0.25,
+                "uncertainty_seconds": 0.10,
+            }
+        ) + b"\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            with (
+                self._trusted_clock("2026-07-13T22:24:00Z"),
+                self.assertRaisesRegex(ValueError, "T-50|window start"),
+            ):
+                protocols.write_prospective_clock_evidence(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    raw_bytes=raw_bytes,
+                )
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                receipt = protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=None,
+                )
+            self.assertEqual(
+                protocols._classify_snapshot_with_root(root, receipt.snapshot),
+                "SYSTEM_MISS_CLOCK",
+            )
+            with self._trusted_clock("2026-07-13T22:25:00Z"):
+                protocols.seal_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+            self._seal_date_roster(root, (777001,))
+            with self._trusted_clock("2026-07-13T22:26:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root, official_date="2026-07-13", candidates=()
+                )
+            self.assertEqual(slate.expected_candidate_count, 0)
+            self.assertEqual(
+                slate.game_dispositions[0]["disposition"], "SYSTEM_MISS_CLOCK"
+            )
 
     def test_terminal_disposition_ignores_superseded_revision_clock_miss(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1646,11 +1783,11 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_COMMIT", None),
-            "8a16a0e",
+            "6b82486",
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_SHA256", None),
-            "394584b5b074ec34fe9090526232d8537a1b58b188b09c381c8679238b86ab7c",
+            "c673e113a8a0eb6717f3f3921decf8671580bed70beda5076ba287ab3ad14af4",
         )
         self.assertEqual(protocols.approved_design_bytes(ROOT), design_path.read_bytes())
         self.assertEqual(
@@ -3607,7 +3744,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "c5d587d9ffbe547135ae803ba19605d69caf967a93184c356c7dbb5ece762b75",
+            "a7c38fea27b27536d1b51ce23be0dc7f8b14f9aa3043af7866b8f8357b0ae252",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)

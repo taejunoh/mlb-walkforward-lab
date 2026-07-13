@@ -365,12 +365,12 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
-CURRENT_APPROVED_DESIGN_COMMIT = "8a16a0e"
+CURRENT_APPROVED_DESIGN_COMMIT = "6b82486"
 CURRENT_APPROVED_DESIGN_SHA256 = (
-    "394584b5b074ec34fe9090526232d8537a1b58b188b09c381c8679238b86ab7c"
+    "c673e113a8a0eb6717f3f3921decf8671580bed70beda5076ba287ab3ad14af4"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "c5d587d9ffbe547135ae803ba19605d69caf967a93184c356c7dbb5ece762b75"
+    "a7c38fea27b27536d1b51ce23be0dc7f8b14f9aa3043af7866b8f8357b0ae252"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -654,6 +654,7 @@ class ProspectiveClockEvidence:
     evidence_sha256: str
     raw_path: str
     audit_path: str
+    persisted_at_precise_utc: str
     persisted_at_utc: str
 
 
@@ -1025,6 +1026,7 @@ def _build_prospective_literal() -> dict[str, object]:
                     "evidence_sha256",
                     "raw_path",
                     "audit_path",
+                    "persisted_at_precise_utc",
                     "persisted_at_utc",
                 ],
                 "raw_path_template": (
@@ -1040,6 +1042,9 @@ def _build_prospective_literal() -> dict[str, object]:
                 "metadata_authority": "parse_derived_from_canonical_raw_bytes",
                 "identity_gate": (
                     "exact_official_date_gamePk_countdown_revision_T50_T45"
+                ),
+                "persistence_admission": (
+                    "per_game_lock_trusted_precise_now_lte_T50_then_ceil_storage"
                 ),
                 "missing_or_invalid": "SYSTEM_MISS_CLOCK",
                 "digest_binding": "snapshot_candidate_and_slate",
@@ -1499,6 +1504,7 @@ CLOCK_EVIDENCE_KEYS = frozenset(
         "evidence_sha256",
         "raw_path",
         "audit_path",
+        "persisted_at_precise_utc",
         "persisted_at_utc",
     }
 )
@@ -1535,16 +1541,45 @@ def _trusted_utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ceil_utc_second_string(value: datetime) -> str:
+    stored = value
+    if stored.microsecond:
+        stored = (stored + timedelta(seconds=1)).replace(microsecond=0)
+    return stored.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _precise_utc_string(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond:06d}Z"
+
+
+def _canonical_precise_utc_datetime(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z",
+        value,
+    ):
+        raise ValueError(
+            f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SS.ffffffZ"
+        )
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SS.ffffffZ"
+        ) from exc
+    if _precise_utc_string(parsed) != value:
+        raise ValueError(
+            f"{label} must be canonical UTC YYYY-MM-DDTHH:MM:SS.ffffffZ"
+        )
+    return parsed
+
+
 def _trusted_utc_now_value_and_string() -> tuple[datetime, str]:
     current = _trusted_utc_now()
     if not isinstance(current, datetime):
         raise RuntimeError("trusted clock returned a non-datetime value")
     if current.tzinfo is not None:
         current = current.astimezone(timezone.utc).replace(tzinfo=None)
-    stored = current
-    if stored.microsecond:
-        stored = (stored + timedelta(seconds=1)).replace(microsecond=0)
-    return current, stored.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return current, _ceil_utc_second_string(current)
 
 
 def _trusted_utc_now_string() -> str:
@@ -1604,6 +1639,10 @@ def _clock_evidence_structurally_valid(
         persisted = _canonical_utc_datetime(
             evidence.persisted_at_utc, "clock evidence persisted_at_utc"
         )
+        persisted_precise = _canonical_precise_utc_datetime(
+            evidence.persisted_at_precise_utc,
+            "clock evidence persisted_at_precise_utc",
+        )
         offset = finite_number(evidence.offset_seconds, "clock evidence offset")
         uncertainty = finite_number(
             evidence.uncertainty_seconds, "clock evidence uncertainty"
@@ -1621,8 +1660,12 @@ def _clock_evidence_structurally_valid(
         and abs(offset) + uncertainty <= 2.0
         and window_start < lock_at
         and sampled <= window_start
-        and sampled <= persisted
-        and (receipt is None or persisted <= receipt)
+        and sampled <= persisted_precise
+        and persisted_precise <= window_start
+        and evidence.persisted_at_utc
+        == _ceil_utc_second_string(persisted_precise)
+        and persisted >= persisted_precise
+        and (receipt is None or persisted_precise <= receipt)
         and isinstance(evidence.source, str)
         and evidence.source.strip()
         and isinstance(evidence.evidence_sha256, str)
@@ -1730,8 +1773,11 @@ def load_prospective_clock_evidence(
         or evidence.source != raw_claims["source"]
         or evidence.offset_seconds != raw_claims["offset_seconds"]
         or evidence.uncertainty_seconds != raw_claims["uncertainty_seconds"]
+        or not _clock_evidence_structurally_valid(evidence)
     ):
-        raise ValueError("clock evidence path, hash, or canonical bytes differ")
+        raise ValueError(
+            "clock evidence precise window, path, hash, or canonical bytes differ"
+        )
     return evidence
 
 
@@ -1763,7 +1809,12 @@ def write_prospective_clock_evidence(
         official_date, game_pk, evidence_sha
     )
     with _snapshot_ledger_lock(root, official_date, game_pk) as root_path:
-        persisted_at = _trusted_utc_now_string()
+        persisted_precise, persisted_at = _trusted_utc_now_value_and_string()
+        window_start = _canonical_utc_datetime(
+            claims["window_start_utc"], "clock evidence window start"
+        )
+        if persisted_precise > window_start:
+            raise ValueError("clock evidence persistence is after the T-50 window start")
         evidence = ProspectiveClockEvidence(
             official_date=official_date,
             game_pk=game_pk,
@@ -1777,13 +1828,12 @@ def write_prospective_clock_evidence(
             evidence_sha256=evidence_sha,
             raw_path=raw_relative.as_posix(),
             audit_path=audit_relative.as_posix(),
+            persisted_at_precise_utc=_precise_utc_string(persisted_precise),
             persisted_at_utc=persisted_at,
         )
         if _canonical_utc_datetime(
             evidence.sampled_at_utc, "clock evidence sampled_at_utc"
-        ) > _canonical_utc_datetime(
-            persisted_at, "clock evidence persisted_at_utc"
-        ):
+        ) > persisted_precise:
             raise ValueError("clock evidence chronology is invalid")
         raw_path = root_path / raw_relative
         audit_path = root_path / audit_relative
@@ -1796,7 +1846,12 @@ def write_prospective_clock_evidence(
                 evidence_sha256=evidence_sha,
             )
             if (
-                replace(loaded, persisted_at_utc=persisted_at) != evidence
+                replace(
+                    loaded,
+                    persisted_at_precise_utc=evidence.persisted_at_precise_utc,
+                    persisted_at_utc=persisted_at,
+                )
+                != evidence
                 or raw_path.read_bytes() != raw_bytes
             ):
                 raise ValueError("clock evidence is already sealed and differs")
@@ -2108,6 +2163,7 @@ def _clock_evidence_raw(
         "evidence_sha256": evidence.evidence_sha256,
         "raw_path": evidence.raw_path,
         "audit_path": evidence.audit_path,
+        "persisted_at_precise_utc": evidence.persisted_at_precise_utc,
         "persisted_at_utc": evidence.persisted_at_utc,
     }
 
@@ -2129,6 +2185,7 @@ def _clock_evidence_from_raw(raw: object, path: str) -> ProspectiveClockEvidence
         evidence_sha256=obj["evidence_sha256"],
         raw_path=obj["raw_path"],
         audit_path=obj["audit_path"],
+        persisted_at_precise_utc=obj["persisted_at_precise_utc"],
         persisted_at_utc=obj["persisted_at_utc"],
     )
 

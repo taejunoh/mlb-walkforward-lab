@@ -62,11 +62,11 @@ class DesignVerificationTest(unittest.TestCase):
     def test_design_and_v51_baseline_use_distinct_reviewed_commits(self) -> None:
         self.assertEqual(
             getattr(verifier_module, "CURRENT_APPROVED_DESIGN_COMMIT", None),
-            "8a16a0e",
+            "6b82486",
         )
         self.assertEqual(
             getattr(verifier_module, "CURRENT_APPROVED_DESIGN_SHA256", None),
-            "394584b5b074ec34fe9090526232d8537a1b58b188b09c381c8679238b86ab7c",
+            "c673e113a8a0eb6717f3f3921decf8671580bed70beda5076ba287ab3ad14af4",
         )
         self.assertEqual(
             getattr(verifier_module, "V51_PROTECTED_BASELINE_COMMIT", None),
