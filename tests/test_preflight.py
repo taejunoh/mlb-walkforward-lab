@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import mlb_backtest.protocols as protocols
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
 from mlb_backtest.preflight import (
     MINIMUM_SOURCES,
@@ -674,7 +675,7 @@ class PreflightTest(unittest.TestCase):
             )
             outputs = []
             for suffix in ("one", "two"):
-                base = Path(directory) / suffix
+                base = root / "reports" / suffix
                 json_path = base / "preflight.json"
                 markdown_path = base / "preflight.md"
                 schema_path = base / "schema.json"
@@ -722,6 +723,74 @@ class PreflightTest(unittest.TestCase):
                     link / "preflight.schema.json",
                 )
 
+    def test_writer_rejects_symlinked_root_and_output_directory_without_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            outside_root = make_complete_inventory(base / "outside-root")
+            linked_root = base / "linked-root"
+            linked_root.symlink_to(outside_root, target_is_directory=True)
+            run_path = base / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            outputs = (
+                linked_root / "reports/preflight.json",
+                linked_root / "reports/preflight.md",
+                linked_root / "schemas/preflight.schema.json",
+            )
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                write_preflight(linked_root, run_path, *outputs)
+            self.assertFalse(any(path.exists() for path in outputs))
+
+            root = make_complete_inventory(base / "root")
+            outside = base / "outside"
+            outside.mkdir()
+            (root / "reports").symlink_to(outside, target_is_directory=True)
+            safe_outputs = (
+                root / "reports/preflight.json",
+                root / "reports/preflight.md",
+                root / "schemas/preflight.schema.json",
+            )
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                write_preflight(root, run_path, *safe_outputs)
+            self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_writer_requires_every_output_to_be_lexically_under_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = make_complete_inventory(base / "root")
+            run_path = base / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            outside = base / "outside.json"
+            with self.assertRaisesRegex(ValueError, "under preflight root"):
+                write_preflight(
+                    root,
+                    run_path,
+                    outside,
+                    root / "reports/preflight.md",
+                    root / "schemas/preflight.schema.json",
+                )
+            self.assertFalse(outside.exists())
+
+    def test_writer_rejects_symlink_in_earlier_root_ancestor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            real = base / "real"
+            make_complete_inventory(real / "container/workspace")
+            alias = base / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            aliased_root = alias / "container/workspace"
+            run_path = base / "run.json"
+            run_path.write_bytes(canonical_json_bytes(expected_historical_run()) + b"\n")
+            outputs = (
+                aliased_root / "reports/preflight.json",
+                aliased_root / "reports/preflight.md",
+                aliased_root / "schemas/preflight.schema.json",
+            )
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                write_preflight(aliased_root, run_path, *outputs)
+
+            self.assertFalse(any(path.exists() for path in outputs))
+
     def test_writer_rejects_manifest_run_spec_and_duplicate_output_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_complete_inventory(Path(directory) / "root")
@@ -751,7 +820,9 @@ class PreflightTest(unittest.TestCase):
                     safe_schema,
                 )
 
-            with self.assertRaisesRegex(ValueError, "input evidence"):
+            with self.assertRaisesRegex(
+                ValueError, "input evidence|under preflight root"
+            ):
                 write_preflight(
                     root, run_path, run_path, safe_markdown, safe_schema
                 )
@@ -879,13 +950,16 @@ class PreflightTest(unittest.TestCase):
                         modes[path] = 0o600 + index
                         path.write_bytes(old[path])
                         path.chmod(modes[path])
-                original_replace = os.replace
+                original_replace = protocols._replace_pinned
                 final_replacements = 0
 
-                def mutate_after_third_final(source, destination):
+                def mutate_after_third_final(*args, **kwargs):
                     nonlocal final_replacements
-                    result = original_replace(source, destination)
-                    if Path(destination) in outputs:
+                    result = original_replace(*args, **kwargs)
+                    destination = kwargs["destination_path"]
+                    if Path(destination) in tuple(
+                        path.resolve(strict=False) for path in outputs
+                    ):
                         final_replacements += 1
                         if final_replacements == 3:
                             external_raw.write_bytes(b"changed after publication")
@@ -893,7 +967,7 @@ class PreflightTest(unittest.TestCase):
 
                 with (
                     patch(
-                        "mlb_backtest.protocols.os.replace",
+                        "mlb_backtest.protocols._replace_pinned",
                         side_effect=mutate_after_third_final,
                     ),
                     self.assertRaisesRegex(RuntimeError, "concrete input evidence"),
@@ -941,21 +1015,24 @@ class PreflightTest(unittest.TestCase):
                             modes[path] = 0o600 + index
                             path.write_bytes(old[path])
                             path.chmod(modes[path])
-                    original_replace = os.replace
+                    original_replace = protocols._replace_pinned
                     replacements = 0
                     failed = False
 
-                    def fail_selected_final(source, destination):
+                    def fail_selected_final(*args, **kwargs):
                         nonlocal replacements, failed
-                        if Path(destination) in paths and not failed:
+                        destination = kwargs["destination_path"]
+                        if Path(destination) in tuple(
+                            path.resolve(strict=False) for path in paths
+                        ) and not failed:
                             replacements += 1
                             if replacements == fail_at:
                                 failed = True
                                 raise OSError(f"replacement {fail_at} failed")
-                        return original_replace(source, destination)
+                        return original_replace(*args, **kwargs)
 
                     with patch(
-                        "mlb_backtest.protocols.os.replace",
+                        "mlb_backtest.protocols._replace_pinned",
                         side_effect=fail_selected_final,
                     ):
                         with self.assertRaisesRegex(

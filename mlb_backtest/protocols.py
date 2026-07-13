@@ -12,9 +12,9 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import subprocess
-import tempfile
 
 from mlb_backtest.diagnostics import (
     canonical_json_bytes,
@@ -1615,6 +1615,7 @@ def _write_prospective_candidate_slate_locked(
 
     _publish_bundle(
         ((path, canonical_json_bytes(_candidate_slate_raw(slate)) + b"\n"),),
+        root=root_path,
         post_publish=verify,
     )
     return slate
@@ -2678,6 +2679,7 @@ def _initialize_postlock_chain_locked(
             (log_path, b""),
             (state_path, canonical_json_bytes(_postlock_state_raw(state)) + b"\n"),
         ),
+        root=root_path,
         post_publish=verify,
         rollback_side_effect=rollback_receipt,
     )
@@ -2784,6 +2786,7 @@ def _append_and_persist_postlock_start_change_locked(
                 canonical_json_bytes(_postlock_state_raw(new_state)) + b"\n",
             ),
         ),
+        root=root_path,
         post_publish=verify,
         rollback_side_effect=rollback_receipt,
     )
@@ -3454,7 +3457,8 @@ def write_historical_contract(root: Path) -> None:
                 root / "schemas/v5_2_run_spec.schema.json",
                 canonical_json_bytes(schema) + b"\n",
             ),
-        )
+        ),
+        root=root,
     )
 
 
@@ -3482,25 +3486,9 @@ def write_prospective_contract(
                 root / "schemas/v5_2_prospective.schema.json",
                 canonical_json_bytes(schema) + b"\n",
             ),
-        )
+        ),
+        root=root,
     )
-
-
-def _write_fsynced_temp(path: Path, contents: bytes, *, mode: int) -> Path:
-    descriptor, temporary = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            os.fchmod(stream.fileno(), mode)
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
-    return temporary_path
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -3511,68 +3499,392 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _ensure_bundle_directories(final_paths: tuple[Path, ...]) -> tuple[Path, ...]:
-    missing: set[Path] = set()
-    for final_path in final_paths:
-        candidate = final_path.parent
-        while not candidate.exists():
-            missing.add(candidate)
-            candidate = candidate.parent
-    created: list[Path] = []
+@dataclass(frozen=True)
+class _PinnedDirectory:
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+    created: bool
+    parent_descriptor: int | None
+    name: str | None
+
+
+@dataclass(frozen=True)
+class _PinnedBundlePath:
+    path: Path
+    name: str
+    directory: _PinnedDirectory
+
+
+@dataclass(frozen=True)
+class _PinnedTemporary:
+    path: Path
+    name: str
+    directory: _PinnedDirectory
+
+
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _open_pinned_directory(
+    path: Path,
+    name: str,
+    parent_descriptor: int,
+    *,
+    allow_create: bool,
+) -> _PinnedDirectory:
+    created = False
     try:
-        for directory in sorted(missing, key=lambda value: len(value.parts)):
-            directory.mkdir(exist_ok=True)
-            created.append(directory)
-    except BaseException:
-        for directory in reversed(created):
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        if not allow_create:
+            raise ValueError(f"protocol bundle root ancestor is missing: {path}")
+        os.mkdir(name, 0o755, dir_fd=parent_descriptor)
+        created = True
+        try:
+            descriptor = os.open(
+                name, _directory_open_flags(), dir_fd=parent_descriptor
+            )
+        except BaseException:
             try:
-                directory.rmdir()
+                os.rmdir(name, dir_fd=parent_descriptor)
             except OSError:
                 pass
+            raise
+    except OSError as exc:
+        raise ValueError(
+            f"protocol bundle directory symlink or special path is forbidden: {path}"
+        ) from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"protocol bundle directory is not regular: {path}")
+    return _PinnedDirectory(
+        path=path,
+        descriptor=descriptor,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        created=created,
+        parent_descriptor=parent_descriptor,
+        name=name,
+    )
+
+
+def _pin_bundle_paths(
+    root: Path, final_paths: tuple[Path, ...]
+) -> tuple[tuple[_PinnedDirectory, ...], tuple[_PinnedBundlePath, ...]]:
+    lexical_root = Path(os.path.abspath(root))
+    lexical_paths = tuple(Path(os.path.abspath(path)) for path in final_paths)
+    if len(set(lexical_paths)) != len(lexical_paths):
+        raise ValueError("protocol bundle paths must be unique")
+    relatives: list[Path] = []
+    for path in lexical_paths:
+        try:
+            relative = path.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ValueError("protocol bundle output must be lexically under root") from exc
+        if not relative.parts:
+            raise ValueError("protocol bundle output must be a file under root")
+        relatives.append(relative)
+    root_path = _normalize_macos_system_alias(lexical_root)
+    absolute_paths = tuple(root_path / relative for relative in relatives)
+
+    directories: list[_PinnedDirectory] = []
+    directory_by_path: dict[Path, _PinnedDirectory] = {}
+    try:
+        root_descriptor = os.open("/", _directory_open_flags())
+        root_metadata = os.fstat(root_descriptor)
+        slash = _PinnedDirectory(
+            path=Path("/"),
+            descriptor=root_descriptor,
+            device=root_metadata.st_dev,
+            inode=root_metadata.st_ino,
+            created=False,
+            parent_descriptor=None,
+            name=None,
+        )
+        directories.append(slash)
+        directory_by_path[slash.path] = slash
+        current = slash
+        current_path = slash.path
+        for index, name in enumerate(root_path.parts[1:]):
+            current_path = current_path / name
+            current = _open_pinned_directory(
+                current_path,
+                name,
+                current.descriptor,
+                allow_create=index == len(root_path.parts[1:]) - 1,
+            )
+            directories.append(current)
+            directory_by_path[current_path] = current
+        pinned_root = directory_by_path[root_path]
+        for parent in sorted(
+            {path.parent for path in absolute_paths}, key=lambda value: len(value.parts)
+        ):
+            relative_parent = parent.relative_to(root_path)
+            current = pinned_root
+            current_path = root_path
+            for name in relative_parent.parts:
+                current_path = current_path / name
+                existing = directory_by_path.get(current_path)
+                if existing is None:
+                    existing = _open_pinned_directory(
+                        current_path,
+                        name,
+                        current.descriptor,
+                        allow_create=True,
+                    )
+                    directories.append(existing)
+                    directory_by_path[current_path] = existing
+                current = existing
+        pinned_paths = tuple(
+            _PinnedBundlePath(
+                path=path,
+                name=path.name,
+                directory=directory_by_path[path.parent],
+            )
+            for path in absolute_paths
+        )
+        for pinned in pinned_paths:
+            try:
+                metadata = os.stat(
+                    pinned.name,
+                    dir_fd=pinned.directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError(
+                    f"protocol bundle output symlink, hardlink, or special file is forbidden: "
+                    f"{pinned.path}"
+                )
+        _verify_pinned_directories(tuple(directories))
+        return tuple(directories), pinned_paths
+    except BaseException:
+        _remove_created_pinned_directories(tuple(directories))
+        for directory in reversed(directories):
+            os.close(directory.descriptor)
         raise
-    return tuple(sorted(missing, key=lambda value: len(value.parts), reverse=True))
+
+
+def _normalize_macos_system_alias(path: Path) -> Path:
+    parts = path.parts
+    if len(parts) < 2 or parts[0] != "/" or parts[1] not in {"tmp", "var"}:
+        return path
+    alias = Path("/") / parts[1]
+    try:
+        metadata = alias.lstat()
+    except FileNotFoundError:
+        return path
+    expected = Path("/private") / parts[1]
+    if stat.S_ISLNK(metadata.st_mode) and alias.resolve() == expected:
+        return expected.joinpath(*parts[2:])
+    return path
+
+
+def _verify_pinned_directories(directories: tuple[_PinnedDirectory, ...]) -> None:
+    for directory in directories:
+        try:
+            metadata = directory.path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"protocol bundle directory identity changed: {directory.path}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != directory.device
+            or metadata.st_ino != directory.inode
+        ):
+            raise ValueError(
+                f"protocol bundle directory identity changed: {directory.path}"
+            )
+
+
+def _remove_created_pinned_directories(
+    directories: tuple[_PinnedDirectory, ...],
+) -> None:
+    for directory in reversed(directories):
+        if (
+            not directory.created
+            or directory.parent_descriptor is None
+            or directory.name is None
+        ):
+            continue
+        try:
+            metadata = os.stat(
+                directory.name,
+                dir_fd=directory.parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_dev == directory.device
+                and metadata.st_ino == directory.inode
+            ):
+                os.rmdir(directory.name, dir_fd=directory.parent_descriptor)
+        except OSError:
+            pass
+
+
+def _read_pinned_output(path: _PinnedBundlePath) -> tuple[bytes, int] | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            path.name, flags, dir_fd=path.directory.descriptor
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(
+                f"protocol bundle output symlink, hardlink, or special file is forbidden: "
+                f"{path.path}"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks), stat.S_IMODE(metadata.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _write_pinned_temporary(
+    path: _PinnedBundlePath, contents: bytes, *, mode: int
+) -> _PinnedTemporary:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _ in range(128):
+        name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                mode,
+                dir_fd=path.directory.descriptor,
+            )
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"unable to reserve protocol temporary for {path.path}")
+    temporary = _PinnedTemporary(
+        path=path.path.parent / name,
+        name=name,
+        directory=path.directory,
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("protocol temporary write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(name, dir_fd=path.directory.descriptor)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    return temporary
+
+
+def _replace_pinned(
+    source_name: str,
+    destination_name: str,
+    *,
+    directory_fd: int,
+    source_path: Path,
+    destination_path: Path,
+) -> None:
+    del source_path, destination_path
+    os.replace(
+        source_name,
+        destination_name,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+    )
+
+
+def _unlink_pinned(temporary: _PinnedTemporary) -> None:
+    try:
+        os.unlink(temporary.name, dir_fd=temporary.directory.descriptor)
+    except FileNotFoundError:
+        pass
 
 
 def _publish_bundle(
     entries: tuple[tuple[Path, bytes], ...],
     *,
+    root: Path,
     post_publish: Callable[[], None] | None = None,
     rollback_side_effect: Callable[[], None] | None = None,
 ) -> None:
     final_paths = tuple(path for path, _ in entries)
-    if len(set(final_paths)) != len(final_paths):
-        raise ValueError("protocol bundle paths must be unique")
-    created_directories = _ensure_bundle_directories(final_paths)
-    temporary_paths: list[Path] = []
-    backups: dict[Path, Path | None] = {}
-    replaced: list[Path] = []
-    recovery_evidence_paths: list[Path] = []
+    directories, pinned_paths = _pin_bundle_paths(root, final_paths)
+    temporary_paths: list[_PinnedTemporary] = []
+    backups: dict[Path, _PinnedTemporary | None] = {}
+    replaced: list[_PinnedBundlePath] = []
+    recovery_evidence_paths: list[_PinnedTemporary] = []
     preserve_recovery_files = False
+    published = False
     modes: dict[Path, int] = {}
     try:
-        modes = {
-            path: stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
-            for path in final_paths
+        existing = {
+            pinned.path: _read_pinned_output(pinned) for pinned in pinned_paths
         }
-        for path, contents in entries:
+        modes = {
+            path: value[1] if value is not None else 0o644
+            for path, value in existing.items()
+        }
+        for pinned, (_, contents) in zip(pinned_paths, entries, strict=True):
             temporary_paths.append(
-                _write_fsynced_temp(path, contents, mode=modes[path])
+                _write_pinned_temporary(pinned, contents, mode=modes[pinned.path])
             )
-        for path in final_paths:
-            backups[path] = (
-                _write_fsynced_temp(path, path.read_bytes(), mode=modes[path])
-                if path.exists()
+        for pinned in pinned_paths:
+            value = existing[pinned.path]
+            backups[pinned.path] = (
+                _write_pinned_temporary(
+                    pinned, value[0], mode=modes[pinned.path]
+                )
+                if value is not None
                 else None
             )
+        _verify_pinned_directories(directories)
         for temporary_path, final_path in zip(
-            temporary_paths, final_paths, strict=True
+            temporary_paths, pinned_paths, strict=True
         ):
-            os.replace(temporary_path, final_path)
+            _verify_pinned_directories(directories)
+            _replace_pinned(
+                temporary_path.name,
+                final_path.name,
+                directory_fd=final_path.directory.descriptor,
+                source_path=temporary_path.path,
+                destination_path=final_path.path,
+            )
             replaced.append(final_path)
-        for directory in sorted({path.parent for path in final_paths}):
-            _fsync_directory(directory)
+        for directory in {path.directory for path in pinned_paths}:
+            os.fsync(directory.descriptor)
+        _verify_pinned_directories(directories)
         if post_publish is not None:
             post_publish()
+        _verify_pinned_directories(directories)
+        published = True
     except BaseException as publish_error:
         rollback_errors: list[tuple[str, BaseException]] = []
         side_effect_failed = False
@@ -3585,56 +3897,83 @@ def _publish_bundle(
         if side_effect_failed:
             for final_path in replaced:
                 try:
+                    value = _read_pinned_output(final_path)
+                    if value is None:
+                        raise FileNotFoundError(final_path.path)
                     recovery_evidence_paths.append(
-                        _write_fsynced_temp(
+                        _write_pinned_temporary(
                             final_path,
-                            final_path.read_bytes(),
-                            mode=modes[final_path],
+                            value[0],
+                            mode=modes[final_path.path],
                         )
                     )
                 except BaseException as error:
-                    rollback_errors.append((str(final_path), error))
+                    rollback_errors.append((str(final_path.path), error))
         for final_path in reversed(replaced):
-            backup_path = backups[final_path]
+            backup_path = backups[final_path.path]
             try:
                 if backup_path is None:
-                    final_path.unlink(missing_ok=True)
+                    try:
+                        os.unlink(
+                            final_path.name,
+                            dir_fd=final_path.directory.descriptor,
+                        )
+                    except FileNotFoundError:
+                        pass
                 else:
-                    os.replace(backup_path, final_path)
+                    _replace_pinned(
+                        backup_path.name,
+                        final_path.name,
+                        directory_fd=final_path.directory.descriptor,
+                        source_path=backup_path.path,
+                        destination_path=final_path.path,
+                    )
             except BaseException as error:
-                rollback_errors.append((str(final_path), error))
-        for directory in sorted({path.parent for path in final_paths}):
+                rollback_errors.append((str(final_path.path), error))
+        for directory in {path.directory for path in pinned_paths}:
             try:
-                _fsync_directory(directory)
+                os.fsync(directory.descriptor)
             except BaseException as error:
-                rollback_errors.append((str(directory), error))
+                rollback_errors.append((str(directory.path), error))
         if rollback_errors:
             preserve_recovery_files = True
             recovery_paths = tuple(
                 sorted(
-                    str(path)
+                    str(path.path)
                     for path in (
                         *temporary_paths,
                         *backups.values(),
                         *recovery_evidence_paths,
                     )
-                    if path is not None and path.exists()
+                    if path is not None
                 )
             )
-            for path_text in recovery_paths:
-                path = Path(path_text)
-                try:
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
-                except BaseException as error:
-                    rollback_errors.append((path_text, error))
-            for directory in sorted(
-                {Path(path).parent for path in recovery_paths}
+            for temporary in (
+                *temporary_paths,
+                *backups.values(),
+                *recovery_evidence_paths,
             ):
+                if temporary is None:
+                    continue
                 try:
-                    _fsync_directory(directory)
+                    descriptor = os.open(
+                        temporary.name,
+                        os.O_RDONLY,
+                        dir_fd=temporary.directory.descriptor,
+                    )
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                except FileNotFoundError:
+                    continue
                 except BaseException as error:
-                    rollback_errors.append((str(directory), error))
+                    rollback_errors.append((str(temporary.path), error))
+            for directory in {path.directory for path in pinned_paths}:
+                try:
+                    os.fsync(directory.descriptor)
+                except BaseException as error:
+                    rollback_errors.append((str(directory.path), error))
             failures = "; ".join(
                 f"{path}: {type(error).__name__}: {error}"
                 for path, error in rollback_errors
@@ -3654,12 +3993,11 @@ def _publish_bundle(
                 *recovery_evidence_paths,
             ):
                 if temporary_path is not None:
-                    temporary_path.unlink(missing_ok=True)
-        for directory in created_directories:
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
+                    _unlink_pinned(temporary_path)
+        if not published:
+            _remove_created_pinned_directories(directories)
+        for directory in reversed(directories):
+            os.close(directory.descriptor)
 
 
 def approved_design_bytes(root: Path) -> bytes:
@@ -3682,9 +4020,10 @@ def approved_design_bytes(root: Path) -> bytes:
 def write_v52_config_contracts(
     root: Path, *, approved_design_root: Path | None = None
 ) -> None:
-    root = root.resolve()
     design_root = (
-        root if approved_design_root is None else approved_design_root.resolve()
+        Path(os.path.abspath(root))
+        if approved_design_root is None
+        else approved_design_root.resolve()
     )
     design_contents = approved_design_bytes(design_root)
     config = expected_v52_config()
@@ -3713,7 +4052,8 @@ def write_v52_config_contracts(
                 root / "protocols/v5_2_qd/change_contract.json",
                 contract_contents,
             ),
-        )
+        ),
+        root=root,
     )
 
 

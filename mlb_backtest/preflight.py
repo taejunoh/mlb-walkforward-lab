@@ -2261,7 +2261,7 @@ def write_preflight(
             raise RuntimeError("preflight publication modified protected evidence")
         _verify_concrete_evidence(evidence)
 
-    _publish_bundle(entries, post_publish=verify_postconditions)
+    _publish_bundle(entries, root=root, post_publish=verify_postconditions)
 
 
 def _validate_preflight_output_paths(
@@ -2271,6 +2271,7 @@ def _validate_preflight_output_paths(
     evidence: Mapping[Path, EvidenceFingerprint],
     declared_inputs: set[Path],
 ) -> None:
+    lexical_root = Path(os.path.abspath(root))
     protected = tuple(
         (root / name).resolve(strict=False) for name in PROTECTED_PREFLIGHT_ROOTS
     )
@@ -2278,6 +2279,13 @@ def _validate_preflight_output_paths(
     input_inodes = {(value[0], value[1]) for value in evidence.values()}
     resolved: list[Path] = []
     for path in output_paths:
+        lexical_candidate = Path(os.path.abspath(path))
+        try:
+            lexical_candidate.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ValueError(
+                "preflight output path must be lexically under preflight root"
+            ) from exc
         candidate = path.resolve(strict=False)
         if any(candidate == base or base in candidate.parents for base in protected):
             raise ValueError("preflight output path is inside a protected namespace")
