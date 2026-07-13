@@ -364,7 +364,7 @@ APPROVED_DESIGN_BLOB_SHA256 = (
     "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "581e841e1416e2c7f5e24007c0b5dee00f69a156c5826df1632b13f754ddd270"
+    "f590dcfdeadc0dd5b04fdb1c16bb5ab3a25ae56fe3ffa96e1e7724b499799bb9"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -1040,6 +1040,13 @@ def _build_prospective_literal() -> dict[str, object]:
                 "audit/v5_2_qd/prospective_2026/"
                 "candidate_slates/{official_date}.json"
             ),
+            "slate_lock_path_template": (
+                "audit/v5_2_qd/prospective_2026/"
+                "candidate_slate_locks/{official_date}.lock"
+            ),
+            "slate_seal_policy": (
+                "immutable_sealed_once_idempotent_exact_same_manifest"
+            ),
             "slate_manifest_fields": [
                 "official_date",
                 "expected_candidate_ids",
@@ -1366,6 +1373,82 @@ def _candidate_slate_relative_path(official_date: str) -> Path:
     )
 
 
+def _candidate_slate_lock_relative_path(official_date: str) -> Path:
+    _canonical_date(official_date, "candidate slate lock official_date")
+    return Path(
+        "audit/v5_2_qd/prospective_2026/candidate_slate_locks/"
+        f"{official_date}.lock"
+    )
+
+
+def _candidate_slate_routing_date(
+    candidates: tuple[ProspectiveCandidateRow, ...],
+) -> str:
+    if not isinstance(candidates, tuple) or (
+        candidates and not isinstance(candidates[0], ProspectiveCandidateRow)
+    ):
+        raise ValueError("prospective candidates must be a typed tuple")
+    if not candidates:
+        raise ValueError("candidate slate requires at least one eligible candidate")
+    official_date = candidates[0].official_date
+    _canonical_date(official_date, "candidate slate lock official_date")
+    return official_date
+
+
+@contextmanager
+def _candidate_slate_seal_lock(root: Path, official_date: str):
+    root_path = _reject_symlink_ancestors(root, "candidate slate lock root")
+    relative = _candidate_slate_lock_relative_path(official_date)
+    lock_path = root_path / relative
+    created_directories = _create_postlock_receipt_directories(lock_path.parent)
+    _reject_symlink_ancestors(lock_path.parent, "candidate slate lock path")
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                lock_path,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(lock_path, flags)
+    except OSError as exc:
+        if not lock_path.exists() and not lock_path.is_symlink():
+            _remove_created_receipt_directories(created_directories)
+        raise ValueError(
+            f"candidate slate lock symlink or alias is forbidden: {lock_path}"
+        ) from exc
+    locked = False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != 0
+        ):
+            raise ValueError(
+                f"candidate slate lock hardlink or stale alias is forbidden: {lock_path}"
+            )
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        if created:
+            _fsync_directory(lock_path.parent)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield root_path
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _candidate_slate_raw(slate: ProspectiveCandidateSlate) -> dict[str, object]:
     return {
         "official_date": slate.official_date,
@@ -1477,9 +1560,10 @@ def load_prospective_candidate_slate(
     )
 
 
-def write_prospective_candidate_slate(
-    root: Path,
+def _write_prospective_candidate_slate_locked(
+    root_path: Path,
     *,
+    routing_date: str,
     candidates: tuple[ProspectiveCandidateRow, ...],
     persisted_at_utc: str,
 ) -> ProspectiveCandidateSlate:
@@ -1490,6 +1574,8 @@ def write_prospective_candidate_slate(
         lock_receipts,
         final_lock_receipt,
     ) = _candidate_slate_projection(candidates)
+    if official_date != routing_date:
+        raise ValueError("candidate slate projection differs from locked official date")
     persisted = _canonical_utc_datetime(persisted_at_utc, "slate persisted_at_utc")
     if persisted < _canonical_utc_datetime(
         final_lock_receipt, "slate final_lock_receipt_at_utc"
@@ -1509,7 +1595,6 @@ def write_prospective_candidate_slate(
         persisted_at_utc=persisted_at_utc,
         audit_path=relative.as_posix(),
     )
-    root_path = _reject_symlink_ancestors(root, "candidate slate root")
     path = root_path / relative
     _reject_symlink_ancestors(path.parent, "candidate slate path")
     if path.exists() or path.is_symlink():
@@ -1532,6 +1617,22 @@ def write_prospective_candidate_slate(
         post_publish=verify,
     )
     return slate
+
+
+def write_prospective_candidate_slate(
+    root: Path,
+    *,
+    candidates: tuple[ProspectiveCandidateRow, ...],
+    persisted_at_utc: str,
+) -> ProspectiveCandidateSlate:
+    routing_date = _candidate_slate_routing_date(candidates)
+    with _candidate_slate_seal_lock(root, routing_date) as root_path:
+        return _write_prospective_candidate_slate_locked(
+            root_path,
+            routing_date=routing_date,
+            candidates=candidates,
+            persisted_at_utc=persisted_at_utc,
+        )
 
 
 def select_prospective_top1(

@@ -1,6 +1,7 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier, BrokenBarrierError
 from unittest.mock import patch
 import copy
 import json
@@ -481,7 +482,15 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 root
                 / "audit/v5_2_qd/prospective_2026/candidate_slates/2026-07-13.json"
             )
+            slate_lock_path = (
+                root
+                / "audit/v5_2_qd/prospective_2026/"
+                "candidate_slate_locks/2026-07-13.lock"
+            )
             self.assertFalse(slate_path.exists())
+            self.assertTrue(slate_lock_path.exists())
+            self.assertEqual(stat.S_IMODE(slate_lock_path.stat().st_mode), 0o600)
+            self.assertEqual(slate_lock_path.stat().st_nlink, 1)
             self.assertEqual(list(root.rglob(".*.tmp")), [])
             slate = protocols.write_prospective_candidate_slate(
                 root,
@@ -499,6 +508,131 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 ),
                 slate,
             )
+
+    def test_candidate_slate_concurrent_seal_once_and_identical_idempotency(self):
+        first = self._candidate()
+        second = self._candidate(
+            game_pk=777002,
+            snapshot_id="snapshot-777002-4",
+            sealed_snapshot_id="snapshot-777002-4",
+            snapshot_hash="b" * 64,
+            sealed_snapshot_hash="b" * 64,
+        )
+
+        def race(root, candidate_sets):
+            barrier = Barrier(2)
+            original_publish = protocols._publish_bundle
+
+            def gated_publish(*args, **kwargs):
+                try:
+                    barrier.wait(timeout=0.25)
+                except BrokenBarrierError:
+                    pass
+                return original_publish(*args, **kwargs)
+
+            def seal(candidates):
+                try:
+                    return (
+                        "ok",
+                        protocols.write_prospective_candidate_slate(
+                            root,
+                            candidates=candidates,
+                            persisted_at_utc="2026-07-13T22:26:00Z",
+                        ),
+                    )
+                except BaseException as exc:
+                    return "error", exc
+
+            with (
+                patch(
+                    "mlb_backtest.protocols._publish_bundle",
+                    side_effect=gated_publish,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                return tuple(executor.map(seal, candidate_sets))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            results = race(root, ((first,), (second,)))
+            successes = tuple(value for status, value in results if status == "ok")
+            failures = tuple(value for status, value in results if status == "error")
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertRegex(str(failures[0]), "already sealed.*differs")
+            loaded = protocols.load_prospective_candidate_slate(
+                root, official_date="2026-07-13"
+            )
+            self.assertEqual(loaded, successes[0])
+            slate_path = root / loaded.audit_path
+            self.assertEqual(
+                slate_path.read_bytes(),
+                canonical_json_bytes(protocols._candidate_slate_raw(loaded)) + b"\n",
+            )
+            self.assertEqual(
+                json.loads(slate_path.read_bytes())["candidates_sha256"],
+                successes[0].candidates_sha256,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            results = race(root, ((first,), (first,)))
+            self.assertTrue(all(status == "ok" for status, _ in results))
+            self.assertEqual(results[0][1], results[1][1])
+            lock_path = (
+                root
+                / "audit/v5_2_qd/prospective_2026/"
+                "candidate_slate_locks/2026-07-13.lock"
+            )
+            self.assertTrue(lock_path.is_file())
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+
+    def test_candidate_slate_lock_rejects_symlink_and_hardlink_aliases(self):
+        candidate = self._candidate()
+        for alias_type in ("ancestor_symlink", "lock_hardlink", "root_symlink"):
+            with (
+                self.subTest(alias_type=alias_type),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                base = Path(temporary).resolve()
+                if alias_type == "root_symlink":
+                    real_root = base / "real" / "workspace"
+                    real_root.mkdir(parents=True)
+                    alias = base / "alias"
+                    alias.symlink_to(base / "real", target_is_directory=True)
+                    root = alias / "workspace"
+                else:
+                    root = base / "workspace"
+                    lock_parent = (
+                        root
+                        / "audit/v5_2_qd/prospective_2026/"
+                        "candidate_slate_locks"
+                    )
+                    lock_parent.parent.mkdir(parents=True)
+                    if alias_type == "ancestor_symlink":
+                        outside = base / "outside"
+                        outside.mkdir()
+                        lock_parent.symlink_to(outside, target_is_directory=True)
+                    else:
+                        lock_parent.mkdir()
+                        target = base / "hardlink-target"
+                        target.write_bytes(b"")
+                        os.link(target, lock_parent / "2026-07-13.lock")
+                with self.assertRaisesRegex(
+                    ValueError, "symlink|hardlink|alias|ancestor"
+                ):
+                    protocols.write_prospective_candidate_slate(
+                        root,
+                        candidates=(candidate,),
+                        persisted_at_utc="2026-07-13T22:26:00Z",
+                    )
+                self.assertFalse(
+                    (
+                        root
+                        / "audit/v5_2_qd/prospective_2026/"
+                        "candidate_slates/2026-07-13.json"
+                    ).exists()
+                )
 
     def test_postlock_start_change_is_append_only_and_cannot_rewrite_lock(self):
         changes = load_prospective_spec(PROSPECTIVE_SPEC).raw["schedule_changes"]
@@ -1650,7 +1784,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "581e841e1416e2c7f5e24007c0b5dee00f69a156c5826df1632b13f754ddd270",
+            "f590dcfdeadc0dd5b04fdb1c16bb5ab3a25ae56fe3ffa96e1e7724b499799bb9",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
@@ -1723,6 +1857,15 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(
             pool["slate_manifest_path_template"],
             "audit/v5_2_qd/prospective_2026/candidate_slates/{official_date}.json",
+        )
+        self.assertEqual(
+            pool["slate_lock_path_template"],
+            "audit/v5_2_qd/prospective_2026/"
+            "candidate_slate_locks/{official_date}.lock",
+        )
+        self.assertEqual(
+            pool["slate_seal_policy"],
+            "immutable_sealed_once_idempotent_exact_same_manifest",
         )
         self.assertEqual(
             pool["all_locks_sealed"], "derived_from_every_bound_candidate_lock"
