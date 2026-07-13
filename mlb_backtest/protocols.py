@@ -2121,17 +2121,83 @@ def _create_postlock_receipt_exclusive(
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o444)
     contents = canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n"
+    descriptor = os.open(path, flags, 0o444)
+    metadata: os.stat_result | None = None
+    written = 0
+    creation_error: BaseException | None = None
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            os.fchmod(stream.fileno(), 0o444)
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-            metadata = os.fstat(stream.fileno())
-    finally:
+        metadata = os.fstat(descriptor)
+        os.fchmod(descriptor, 0o444)
+        while written < len(contents):
+            count = os.write(descriptor, contents[written:])
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count <= 0
+                or count > len(contents) - written
+            ):
+                raise OSError(
+                    f"post-lock receipt write returned an invalid count at {path}"
+                )
+            written += count
+        os.fsync(descriptor)
+    except BaseException as exc:
+        creation_error = exc
+    close_error: BaseException | None = None
+    try:
         os.close(descriptor)
+    except BaseException as exc:
+        close_error = exc
+    if creation_error is not None or close_error is not None:
+        if metadata is None:
+            try:
+                fallback = path.lstat()
+                if (
+                    not stat.S_ISREG(fallback.st_mode)
+                    or fallback.st_nlink != 1
+                ):
+                    raise ValueError(
+                        "new post-lock receipt identity is unavailable or aliased"
+                    )
+                metadata = fallback
+            except BaseException as identity_error:
+                raise RuntimeError(
+                    "post-lock receipt creation identity recovery failed at "
+                    f"{path}; creation error={type(creation_error).__name__}: "
+                    f"{creation_error}; close error={type(close_error).__name__}: "
+                    f"{close_error}; identity error={type(identity_error).__name__}: "
+                    f"{identity_error}; recovery path={path}"
+                ) from identity_error
+        created_prefix = _CreatedPostlockReceipt(
+            path=path,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            contents=contents[:written],
+        )
+        try:
+            _remove_created_postlock_receipt(created_prefix)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                "post-lock receipt creation recovery failed at "
+                f"{path}; creation error={type(creation_error).__name__}: "
+                f"{creation_error}; close error={type(close_error).__name__}: "
+                f"{close_error}; cleanup error={type(cleanup_error).__name__}: "
+                f"{cleanup_error}; recovery path={path}"
+            ) from cleanup_error
+        if creation_error is not None and close_error is not None:
+            raise RuntimeError(
+                "post-lock receipt creation and close failed at "
+                f"{path}; creation error={type(creation_error).__name__}: "
+                f"{creation_error}; close error={type(close_error).__name__}: "
+                f"{close_error}"
+            ) from creation_error
+        if creation_error is not None:
+            raise creation_error
+        if close_error is not None:
+            raise close_error
+    if metadata is None:
+        raise RuntimeError(f"post-lock receipt identity was not recorded at {path}")
     return _CreatedPostlockReceipt(
         path=path,
         device=metadata.st_dev,
