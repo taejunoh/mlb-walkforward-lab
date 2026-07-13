@@ -688,6 +688,12 @@ class _CreatedPostlockReceipt:
     created_directories: tuple[Path, ...]
 
 
+class _PostlockReceiptRecoveryError(RuntimeError):
+    def __init__(self, message: str, recovery_paths: tuple[Path, ...]) -> None:
+        super().__init__(message)
+        self.recovery_paths = recovery_paths
+
+
 @dataclass(frozen=True)
 class ProspectiveCandidateRow:
     game_pk: int
@@ -2152,15 +2158,17 @@ def _create_postlock_receipt_directories(parent: Path) -> tuple[Path, ...]:
             _remove_created_receipt_directories(created_bottom_up)
         except BaseException as cleanup_error:
             recovery_paths = tuple(
-                str(directory)
+                directory
                 for directory in created_bottom_up
                 if directory.exists() or directory.is_symlink()
             )
-            raise RuntimeError(
+            raise _PostlockReceiptRecoveryError(
                 "post-lock receipt directory creation recovery failed; "
                 f"creation error={type(creation_error).__name__}: "
                 f"{creation_error}; cleanup error={type(cleanup_error).__name__}: "
-                f"{cleanup_error}; recovery paths={list(recovery_paths)}"
+                f"{cleanup_error}; recovery paths="
+                f"{[str(path) for path in recovery_paths]}",
+                recovery_paths,
             ) from cleanup_error
         raise
     return tuple(reversed(created))
@@ -2191,15 +2199,16 @@ def _create_postlock_receipt_exclusive(
             _remove_created_receipt_directories(created_directories)
         except BaseException as cleanup_error:
             recovery_paths = tuple(
-                str(directory)
+                directory
                 for directory in created_directories
                 if directory.exists() or directory.is_symlink()
             )
-            raise RuntimeError(
+            raise _PostlockReceiptRecoveryError(
                 "post-lock receipt exclusive open recovery failed at "
                 f"{path}; open error={type(open_error).__name__}: {open_error}; "
                 f"cleanup error={type(cleanup_error).__name__}: {cleanup_error}; "
-                f"recovery paths={list(recovery_paths)}"
+                f"recovery paths={[str(item) for item in recovery_paths]}",
+                recovery_paths,
             ) from cleanup_error
         raise
     metadata: os.stat_result | None = None
@@ -2241,12 +2250,13 @@ def _create_postlock_receipt_exclusive(
                     )
                 metadata = fallback
             except BaseException as identity_error:
-                raise RuntimeError(
+                raise _PostlockReceiptRecoveryError(
                     "post-lock receipt creation identity recovery failed at "
                     f"{path}; creation error={type(creation_error).__name__}: "
                     f"{creation_error}; close error={type(close_error).__name__}: "
                     f"{close_error}; identity error={type(identity_error).__name__}: "
-                    f"{identity_error}; recovery path={path}"
+                    f"{identity_error}; recovery path={path}",
+                    (path,),
                 ) from identity_error
         created_prefix = _CreatedPostlockReceipt(
             path=path,
@@ -2258,12 +2268,13 @@ def _create_postlock_receipt_exclusive(
         try:
             _remove_created_postlock_receipt(created_prefix)
         except BaseException as cleanup_error:
-            raise RuntimeError(
+            raise _PostlockReceiptRecoveryError(
                 "post-lock receipt creation recovery failed at "
                 f"{path}; creation error={type(creation_error).__name__}: "
                 f"{creation_error}; close error={type(close_error).__name__}: "
                 f"{close_error}; cleanup error={type(cleanup_error).__name__}: "
-                f"{cleanup_error}; recovery path={path}"
+                f"{cleanup_error}; recovery path={path}",
+                (path,),
             ) from cleanup_error
         if creation_error is not None and close_error is not None:
             raise RuntimeError(
@@ -2518,10 +2529,22 @@ def _initialize_postlock_chain_locked(
     )
     receipt = _receipt_for_state(state, POSTLOCK_RECEIPT_GENESIS_HASH)
     created_receipt: _CreatedPostlockReceipt | None = None
+    receipt_creation_error: BaseException | None = None
+    receipt_creation_recovery_paths: tuple[Path, ...] = ()
+    expected_receipt_path = root_path / receipt.audit_path
 
     def verify() -> None:
-        nonlocal created_receipt
-        created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        nonlocal created_receipt, receipt_creation_error
+        nonlocal receipt_creation_recovery_paths
+        try:
+            created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        except BaseException as exc:
+            receipt_creation_error = exc
+            if isinstance(exc, _PostlockReceiptRecoveryError):
+                receipt_creation_recovery_paths = exc.recovery_paths
+            elif expected_receipt_path.exists() or expected_receipt_path.is_symlink():
+                receipt_creation_recovery_paths = (expected_receipt_path,)
+            raise
         _fsync_directory(created_receipt.path.parent)
         events, loaded = validate_persisted_postlock_chain(root_path, game_pk=game_pk)
         if events or loaded != state:
@@ -2529,6 +2552,16 @@ def _initialize_postlock_chain_locked(
 
     def rollback_receipt() -> None:
         if created_receipt is None:
+            if (
+                receipt_creation_error is not None
+                and receipt_creation_recovery_paths
+            ):
+                raise RuntimeError(
+                    "post-lock receipt creation rollback remains unresolved; "
+                    f"creation error={type(receipt_creation_error).__name__}: "
+                    f"{receipt_creation_error}; recovery paths="
+                    f"{[str(path) for path in receipt_creation_recovery_paths]}"
+                ) from receipt_creation_error
             return
         try:
             _remove_created_postlock_receipt(created_receipt)
@@ -2597,10 +2630,22 @@ def _append_and_persist_postlock_start_change_locked(
     appended = (*events, event)
     receipt = _receipt_for_state(new_state, receipts[-1].receipt_hash)
     created_receipt: _CreatedPostlockReceipt | None = None
+    receipt_creation_error: BaseException | None = None
+    receipt_creation_recovery_paths: tuple[Path, ...] = ()
+    expected_receipt_path = root_path / receipt.audit_path
 
     def verify() -> None:
-        nonlocal created_receipt
-        created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        nonlocal created_receipt, receipt_creation_error
+        nonlocal receipt_creation_recovery_paths
+        try:
+            created_receipt = _create_postlock_receipt_exclusive(root_path, receipt)
+        except BaseException as exc:
+            receipt_creation_error = exc
+            if isinstance(exc, _PostlockReceiptRecoveryError):
+                receipt_creation_recovery_paths = exc.recovery_paths
+            elif expected_receipt_path.exists() or expected_receipt_path.is_symlink():
+                receipt_creation_recovery_paths = (expected_receipt_path,)
+            raise
         _fsync_directory(created_receipt.path.parent)
         loaded_events, loaded_state = validate_persisted_postlock_chain(
             root_path, game_pk=game_pk
@@ -2610,6 +2655,16 @@ def _append_and_persist_postlock_start_change_locked(
 
     def rollback_receipt() -> None:
         if created_receipt is None:
+            if (
+                receipt_creation_error is not None
+                and receipt_creation_recovery_paths
+            ):
+                raise RuntimeError(
+                    "post-lock receipt creation rollback remains unresolved; "
+                    f"creation error={type(receipt_creation_error).__name__}: "
+                    f"{receipt_creation_error}; recovery paths="
+                    f"{[str(path) for path in receipt_creation_recovery_paths]}"
+                ) from receipt_creation_error
             return
         try:
             _remove_created_postlock_receipt(created_receipt)

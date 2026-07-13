@@ -1142,66 +1142,186 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     self.assertEqual(loaded, retried if operation == "genesis" else prior_state)
 
     def test_pre_return_receipt_cleanup_failure_preserves_path_rich_evidence(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            state = protocols.initialize_postlock_chain(
-                root,
-                game_pk=777001,
-                lock_basis_start_utc="2026-07-13T23:10:00Z",
-                persisted_at_utc="2026-07-13T22:25:00Z",
-            )
-            state_path, log_path = root / state.audit_path, root / state.event_log_path
-            prior_pair = (log_path.read_bytes(), state_path.read_bytes())
-            receipt_dir = (
-                root
-                / "audit/v5_2_qd/prospective_2026/"
-                "postlock_chain_receipts/777001"
-            )
-            acknowledged = tuple(
-                (path.name, path.read_bytes(), path.stat().st_ino)
-                for path in sorted(receipt_dir.glob("*.json"))
-            )
-            original_fchmod = os.fchmod
+        for operation in ("genesis", "append"):
+            for stage in ("fchmod", "write", "fsync"):
+                with (
+                    self.subTest(operation=operation, stage=stage),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    root = Path(temporary).resolve()
+                    if operation == "append":
+                        prior_state = protocols.initialize_postlock_chain(
+                            root,
+                            game_pk=777001,
+                            lock_basis_start_utc="2026-07-13T23:10:00Z",
+                            persisted_at_utc="2026-07-13T22:25:00Z",
+                        )
+                    else:
+                        prior_state = None
+                    log_path = (
+                        root
+                        / "audit/v5_2_qd/prospective_2026/"
+                        "postlock_start_changes/777001.jsonl"
+                    )
+                    state_path = (
+                        root
+                        / "audit/v5_2_qd/prospective_2026/"
+                        "postlock_chain_state/777001.json"
+                    )
+                    prior_pair = (
+                        (log_path.read_bytes(), state_path.read_bytes())
+                        if operation == "append"
+                        else None
+                    )
+                    receipt_dir = (
+                        root
+                        / "audit/v5_2_qd/prospective_2026/"
+                        "postlock_chain_receipts/777001"
+                    )
+                    acknowledged = tuple(
+                        (path.name, path.read_bytes(), path.stat().st_ino)
+                        for path in sorted(receipt_dir.glob("*.json"))
+                    )
+                    original_fchmod = os.fchmod
+                    original_write = os.write
+                    original_fsync = os.fsync
+                    receipt_identity = None
+                    receipt_write_calls = 0
+                    receipt_fsync_failed = False
 
-            def fail_receipt_fchmod(descriptor, mode):
-                if mode == 0o444:
-                    raise OSError("injected pre-return fchmod failure")
-                return original_fchmod(descriptor, mode)
+                    def injected_fchmod(descriptor, mode):
+                        nonlocal receipt_identity
+                        if mode == 0o444:
+                            metadata = os.fstat(descriptor)
+                            receipt_identity = (metadata.st_dev, metadata.st_ino)
+                            if stage == "fchmod":
+                                raise OSError(
+                                    "injected pre-return receipt fchmod failure"
+                                )
+                        return original_fchmod(descriptor, mode)
 
-            with (
-                patch(
-                    "mlb_backtest.protocols.os.fchmod",
-                    side_effect=fail_receipt_fchmod,
-                ),
-                patch(
-                    "mlb_backtest.protocols._remove_created_postlock_receipt",
-                    side_effect=OSError("injected pre-return cleanup failure"),
-                ),
-                self.assertRaisesRegex(
-                    RuntimeError, "receipt creation recovery failed"
-                ) as raised,
-            ):
-                protocols.append_and_persist_postlock_start_change(
-                    root,
-                    game_pk=777001,
-                    new_effective_start_utc="2026-07-13T23:40:00Z",
-                    observed_at_utc="2026-07-13T22:30:00Z",
-                    lock_basis_start_utc="2026-07-13T23:10:00Z",
-                    state_persisted_at_utc="2026-07-13T22:30:01Z",
-                )
-            self.assertEqual((log_path.read_bytes(), state_path.read_bytes()), prior_pair)
-            receipt_paths = tuple(sorted(receipt_dir.glob("*.json")))
-            self.assertEqual(len(receipt_paths), 2)
-            self.assertEqual(
-                (receipt_paths[0].name, receipt_paths[0].read_bytes(), receipt_paths[0].stat().st_ino),
-                acknowledged[0],
-            )
-            self.assertEqual(receipt_paths[1].read_bytes(), b"")
-            error_message = str(raised.exception)
-            self.assertIn(str(receipt_paths[1]), error_message)
-            self.assertIn("injected pre-return fchmod failure", error_message)
-            self.assertIn("injected pre-return cleanup failure", error_message)
-            self.assertIn("recovery path=", error_message)
+                    def injected_write(descriptor, contents):
+                        nonlocal receipt_write_calls
+                        metadata = os.fstat(descriptor)
+                        identity = (metadata.st_dev, metadata.st_ino)
+                        if stage == "write" and identity == receipt_identity:
+                            receipt_write_calls += 1
+                            if receipt_write_calls == 1:
+                                partial = max(1, len(contents) // 3)
+                                return original_write(descriptor, contents[:partial])
+                            raise OSError(
+                                "injected pre-return receipt write failure"
+                            )
+                        return original_write(descriptor, contents)
+
+                    def injected_fsync(descriptor):
+                        nonlocal receipt_fsync_failed
+                        metadata = os.fstat(descriptor)
+                        identity = (metadata.st_dev, metadata.st_ino)
+                        if (
+                            stage == "fsync"
+                            and identity == receipt_identity
+                            and not receipt_fsync_failed
+                        ):
+                            receipt_fsync_failed = True
+                            raise OSError(
+                                "injected pre-return receipt fsync failure"
+                            )
+                        return original_fsync(descriptor)
+
+                    with (
+                        patch(
+                            "mlb_backtest.protocols.os.fchmod",
+                            side_effect=injected_fchmod,
+                        ),
+                        patch(
+                            "mlb_backtest.protocols.os.write",
+                            side_effect=injected_write,
+                        ),
+                        patch(
+                            "mlb_backtest.protocols.os.fsync",
+                            side_effect=injected_fsync,
+                        ),
+                        patch(
+                            "mlb_backtest.protocols._remove_created_postlock_receipt",
+                            side_effect=OSError(
+                                "injected pre-return receipt cleanup failure"
+                            ),
+                        ) as cleanup_receipt,
+                        self.assertRaisesRegex(
+                            RuntimeError, "protocol bundle rollback failed"
+                        ) as raised,
+                    ):
+                        if operation == "genesis":
+                            protocols.initialize_postlock_chain(
+                                root,
+                                game_pk=777001,
+                                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                                persisted_at_utc="2026-07-13T22:25:00Z",
+                            )
+                        else:
+                            protocols.append_and_persist_postlock_start_change(
+                                root,
+                                game_pk=777001,
+                                new_effective_start_utc="2026-07-13T23:40:00Z",
+                                observed_at_utc="2026-07-13T22:30:00Z",
+                                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                                state_persisted_at_utc="2026-07-13T22:30:01Z",
+                            )
+                    if operation == "genesis":
+                        self.assertFalse(log_path.exists())
+                        self.assertFalse(state_path.exists())
+                    else:
+                        self.assertEqual(
+                            (log_path.read_bytes(), state_path.read_bytes()),
+                            prior_pair,
+                        )
+                        self.assertEqual(
+                            protocols.load_postlock_event_log(
+                                root, game_pk=777001
+                            ),
+                            (),
+                        )
+                        self.assertEqual(
+                            protocols.load_postlock_chain_state(
+                                root, game_pk=777001
+                            ),
+                            prior_state,
+                        )
+                    receipt_paths = tuple(sorted(receipt_dir.glob("*.json")))
+                    self.assertEqual(len(receipt_paths), len(acknowledged) + 1)
+                    self.assertEqual(
+                        tuple(
+                            (path.name, path.read_bytes(), path.stat().st_ino)
+                            for path in receipt_paths[: len(acknowledged)]
+                        ),
+                        acknowledged,
+                    )
+                    orphan = receipt_paths[-1]
+                    cleanup_receipt.assert_called_once()
+                    self.assertEqual(
+                        cleanup_receipt.call_args.args[0].path,
+                        orphan,
+                    )
+                    recovery_files = tuple(sorted(root.rglob(".*.tmp")))
+                    self.assertGreaterEqual(len(recovery_files), 2)
+                    error_message = str(raised.exception)
+                    self.assertIn(str(orphan), error_message)
+                    self.assertIn(
+                        f"injected pre-return receipt {stage} failure",
+                        error_message,
+                    )
+                    self.assertIn(
+                        "injected pre-return receipt cleanup failure",
+                        error_message,
+                    )
+                    self.assertIn("recovery paths=", error_message)
+                    self.assertTrue(
+                        all(str(path) in error_message for path in recovery_files)
+                    )
+                    for path in recovery_files:
+                        with path.open("rb") as stream:
+                            os.fsync(stream.fileno())
 
     def test_exclusive_open_failure_removes_only_new_receipt_directories_and_retries(self):
         for operation in ("genesis", "append"):
