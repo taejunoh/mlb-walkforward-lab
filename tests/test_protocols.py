@@ -144,6 +144,10 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 "audit/v5_2_qd/prospective_2026/"
                 "postlock_chain_state/777001.json"
             ),
+            event_log_path=(
+                "audit/v5_2_qd/prospective_2026/"
+                "postlock_start_changes/777001.jsonl"
+            ),
         )
 
     def test_exact_2026_oof_and_timestamp_contract(self):
@@ -436,7 +440,19 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 "head_hash",
                 "persisted_at_utc",
                 "audit_path",
+                "event_log_path",
             ),
+        )
+        self.assertEqual(
+            event["event_log_path_template"],
+            "audit/v5_2_qd/prospective_2026/postlock_start_changes/{gamePk}.jsonl",
+        )
+        self.assertEqual(
+            event["event_log_format"],
+            "canonical_jsonl_one_POSTLOCK_START_CHANGE_per_line",
+        )
+        self.assertEqual(
+            event["sealed_state_format"], "canonical_json_object_newline"
         )
         self.assertTrue(changes["relock_forbidden"])
         self.assertIn("lock_basis_start_utc", changes["immutable_fields"])
@@ -568,6 +584,240 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 lock_basis_start_utc="2026-07-13T23:10:00Z",
             )
 
+    def test_persisted_chain_initializes_and_appends_a_b_c_from_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            self.assertEqual(state.event_count, 0)
+            transitions = (
+                ("2026-07-13T23:10:00Z", "2026-07-13T23:40:00Z", "22:30"),
+                ("2026-07-13T23:40:00Z", "2026-07-14T00:10:00Z", "22:35"),
+            )
+            for previous, new, observed_hm in transitions:
+                event, state = protocols.append_and_persist_postlock_start_change(
+                    root,
+                    game_pk=777001,
+                    previous_effective_start_utc=previous,
+                    new_effective_start_utc=new,
+                    observed_at_utc=f"2026-07-13T{observed_hm}:00Z",
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    state_persisted_at_utc=f"2026-07-13T{observed_hm}:01Z",
+                )
+                self.assertEqual(event.sequence, state.event_count)
+            events, loaded = protocols.validate_persisted_postlock_chain(
+                root, game_pk=777001
+            )
+            self.assertEqual(tuple(event.sequence for event in events), (1, 2))
+            self.assertEqual(loaded, state)
+            self.assertEqual(
+                protocols.load_postlock_event_log(root, game_pk=777001), events
+            )
+            self.assertEqual(
+                protocols.load_postlock_chain_state(root, game_pk=777001), state
+            )
+
+    def test_persisted_chain_detects_tail_delete_and_state_rollback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            initial = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            state_path = root / initial.audit_path
+            log_path = root / initial.event_log_path
+            initial_state_bytes = state_path.read_bytes()
+            protocols.append_and_persist_postlock_start_change(
+                root,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:10:00Z",
+                new_effective_start_utc="2026-07-13T23:40:00Z",
+                observed_at_utc="2026-07-13T22:30:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:30:01Z",
+            )
+            first_log_bytes = log_path.read_bytes()
+            protocols.append_and_persist_postlock_start_change(
+                root,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:40:00Z",
+                new_effective_start_utc="2026-07-14T00:10:00Z",
+                observed_at_utc="2026-07-13T22:35:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:35:01Z",
+            )
+            full_log_bytes = log_path.read_bytes()
+            full_state_bytes = state_path.read_bytes()
+
+            log_path.write_bytes(first_log_bytes)
+            with self.assertRaisesRegex(ValueError, "event count"):
+                protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+            log_path.write_bytes(full_log_bytes)
+            state_path.write_bytes(initial_state_bytes)
+            with self.assertRaisesRegex(ValueError, "event count"):
+                protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+            state_path.write_bytes(full_state_bytes)
+            protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+
+    def test_persisted_chain_rejects_missing_log_or_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+            state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            (root / state.audit_path).unlink()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                protocols.validate_persisted_postlock_chain(root, game_pk=777001)
+
+    def test_persisted_append_cannot_accept_older_in_memory_state_and_a_b_a_passes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            old_state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            with self.assertRaises(TypeError):
+                protocols.append_and_persist_postlock_start_change(
+                    root,
+                    sealed_state=old_state,
+                    game_pk=777001,
+                    previous_effective_start_utc="2026-07-13T23:10:00Z",
+                    new_effective_start_utc="2026-07-13T23:40:00Z",
+                    observed_at_utc="2026-07-13T22:30:00Z",
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    state_persisted_at_utc="2026-07-13T22:30:01Z",
+                )
+            protocols.append_and_persist_postlock_start_change(
+                root,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:10:00Z",
+                new_effective_start_utc="2026-07-13T23:40:00Z",
+                observed_at_utc="2026-07-13T22:30:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:30:01Z",
+            )
+            event, state = protocols.append_and_persist_postlock_start_change(
+                root,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:40:00Z",
+                new_effective_start_utc="2026-07-13T23:10:00Z",
+                observed_at_utc="2026-07-13T22:35:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:35:01Z",
+            )
+            self.assertEqual(event.sequence, 2)
+            self.assertEqual(state.event_count, 2)
+
+    def test_persisted_append_rolls_back_publish_and_postcondition_failures(self):
+        for failure in ("second_replace", "postcondition"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                state = protocols.initialize_postlock_chain(
+                    root,
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    persisted_at_utc="2026-07-13T22:25:00Z",
+                )
+                state_path, log_path = root / state.audit_path, root / state.event_log_path
+                before = (log_path.read_bytes(), state_path.read_bytes())
+                if failure == "second_replace":
+                    original_replace = os.replace
+                    final_calls = 0
+
+                    def fail_second(source, destination):
+                        nonlocal final_calls
+                        if Path(destination) in (log_path, state_path):
+                            final_calls += 1
+                            if final_calls == 2:
+                                raise OSError("state replace failed")
+                        return original_replace(source, destination)
+
+                    context = patch(
+                        "mlb_backtest.protocols.os.replace", side_effect=fail_second
+                    )
+                    expected_error = OSError
+                else:
+                    original_validate = protocols.validate_persisted_postlock_chain
+                    calls = 0
+
+                    def fail_second_validation(*args, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            raise ValueError("postcondition failed")
+                        return original_validate(*args, **kwargs)
+
+                    context = patch(
+                        "mlb_backtest.protocols.validate_persisted_postlock_chain",
+                        side_effect=fail_second_validation,
+                    )
+                    expected_error = ValueError
+                with context, self.assertRaises(expected_error):
+                    protocols.append_and_persist_postlock_start_change(
+                        root,
+                        game_pk=777001,
+                        previous_effective_start_utc="2026-07-13T23:10:00Z",
+                        new_effective_start_utc="2026-07-13T23:40:00Z",
+                        observed_at_utc="2026-07-13T22:30:00Z",
+                        lock_basis_start_utc="2026-07-13T23:10:00Z",
+                        state_persisted_at_utc="2026-07-13T22:30:01Z",
+                    )
+                self.assertEqual((log_path.read_bytes(), state_path.read_bytes()), before)
+                self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_persisted_chain_rejects_aliases_and_preserves_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = protocols.initialize_postlock_chain(
+                root,
+                game_pk=777001,
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                persisted_at_utc="2026-07-13T22:25:00Z",
+            )
+            state_path, log_path = root / state.audit_path, root / state.event_log_path
+            self.assertEqual(
+                (stat.S_IMODE(log_path.stat().st_mode), stat.S_IMODE(state_path.stat().st_mode)),
+                (0o644, 0o644),
+            )
+            log_path.chmod(0o600)
+            state_path.chmod(0o601)
+            protocols.append_and_persist_postlock_start_change(
+                root,
+                game_pk=777001,
+                previous_effective_start_utc="2026-07-13T23:10:00Z",
+                new_effective_start_utc="2026-07-13T23:40:00Z",
+                observed_at_utc="2026-07-13T22:30:00Z",
+                lock_basis_start_utc="2026-07-13T23:10:00Z",
+                state_persisted_at_utc="2026-07-13T22:30:01Z",
+            )
+            self.assertEqual(
+                (stat.S_IMODE(log_path.stat().st_mode), stat.S_IMODE(state_path.stat().st_mode)),
+                (0o600, 0o601),
+            )
+            hardlink = state_path.with_name("state-hardlink.json")
+            os.link(state_path, hardlink)
+            with self.assertRaisesRegex(ValueError, "alias"):
+                protocols.load_postlock_chain_state(root, game_pk=777001)
+            hardlink.unlink()
+            real_log = log_path.with_name("real.jsonl")
+            log_path.replace(real_log)
+            log_path.symlink_to(real_log)
+            with self.assertRaisesRegex(ValueError, "symlink|alias"):
+                protocols.load_postlock_event_log(root, game_pk=777001)
+
     def test_prospective_oracle_is_recursive_frozen_detached_and_design_pinned(self):
         oracle = protocols.PROSPECTIVE_LITERAL_ORACLE
         with self.assertRaises(TypeError):
@@ -582,7 +832,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "e956e8481c255c8ae022f92b66ce2c133efdf903fe56ece9ef118c3ed9d66f90",
+            "2008ae57cda8b7295482f1cab8f2fcece90e5aa4ef9b028119f237af441de48c",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)

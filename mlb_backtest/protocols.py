@@ -361,7 +361,7 @@ APPROVED_DESIGN_BLOB_SHA256 = (
     "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "e956e8481c255c8ae022f92b66ce2c133efdf903fe56ece9ef118c3ed9d66f90"
+    "2008ae57cda8b7295482f1cab8f2fcece90e5aa4ef9b028119f237af441de48c"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 FOLD_LITERALS = (
@@ -660,6 +660,7 @@ class PostlockChainState:
     head_hash: str
     persisted_at_utc: str
     audit_path: str
+    event_log_path: str
 
 
 @dataclass(frozen=True)
@@ -902,7 +903,16 @@ def _build_prospective_literal() -> dict[str, object]:
                     "head_hash",
                     "persisted_at_utc",
                     "audit_path",
+                    "event_log_path",
                 ],
+                "event_log_path_template": (
+                    "audit/v5_2_qd/prospective_2026/"
+                    "postlock_start_changes/{gamePk}.jsonl"
+                ),
+                "event_log_format": (
+                    "canonical_jsonl_one_POSTLOCK_START_CHANGE_per_line"
+                ),
+                "sealed_state_format": "canonical_json_object_newline",
                 "state_persistence": (
                     "atomic_event_and_sealed_state_publish_fsync_before_ack"
                 ),
@@ -1401,8 +1411,14 @@ def validate_postlock_start_changes(
         "audit/v5_2_qd/prospective_2026/postlock_chain_state/"
         f"{sealed_state.game_pk}.json"
     )
+    expected_event_log_path = (
+        "audit/v5_2_qd/prospective_2026/postlock_start_changes/"
+        f"{sealed_state.game_pk}.jsonl"
+    )
     if sealed_state.audit_path != expected_audit_path:
         raise ValueError("sealed-state audit path differs from canonical namespace")
+    if sealed_state.event_log_path != expected_event_log_path:
+        raise ValueError("event-log path differs from canonical namespace")
     persisted = _canonical_utc_datetime(
         sealed_state.persisted_at_utc, "sealed_state.persisted_at_utc"
     )
@@ -1533,11 +1549,271 @@ def append_postlock_start_change(
             "audit/v5_2_qd/prospective_2026/postlock_chain_state/"
             f"{game_pk}.json"
         ),
+        event_log_path=(
+            "audit/v5_2_qd/prospective_2026/postlock_start_changes/"
+            f"{game_pk}.jsonl"
+        ),
     )
     validate_postlock_start_changes(
         appended,
         sealed_state=new_state,
         lock_basis_start_utc=lock_basis_start_utc,
+    )
+    return event, new_state
+
+
+POSTLOCK_STATE_KEYS = frozenset(
+    {
+        "gamePk",
+        "lock_basis_start_utc",
+        "event_count",
+        "head_hash",
+        "persisted_at_utc",
+        "audit_path",
+        "event_log_path",
+    }
+)
+POSTLOCK_EVENT_KEYS = frozenset(
+    {
+        "event",
+        "gamePk",
+        "sequence",
+        "previous_effective_start_utc",
+        "new_effective_start_utc",
+        "observed_at_utc",
+        "lock_basis_start_utc",
+        "prior_event_hash",
+        "event_hash",
+    }
+)
+
+
+def _postlock_relative_paths(game_pk: int) -> tuple[Path, Path]:
+    if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+        raise ValueError("post-lock gamePk must be an exact positive integer")
+    return (
+        Path(
+            "audit/v5_2_qd/prospective_2026/postlock_start_changes/"
+            f"{game_pk}.jsonl"
+        ),
+        Path(
+            "audit/v5_2_qd/prospective_2026/postlock_chain_state/"
+            f"{game_pk}.json"
+        ),
+    )
+
+
+def _postlock_paths(root: Path, game_pk: int) -> tuple[Path, Path, Path]:
+    root_input = Path(root)
+    if root_input.is_symlink():
+        raise ValueError("post-lock root symlink or alias is forbidden")
+    root_path = Path(os.path.abspath(root_input))
+    log_relative, state_relative = _postlock_relative_paths(game_pk)
+    for target in (root_path, root_path / log_relative.parent, root_path / state_relative.parent):
+        current = target
+        chain: list[Path] = []
+        while current != root_path.parent:
+            chain.append(current)
+            if current == root_path:
+                break
+            current = current.parent
+        for directory in reversed(chain):
+            if directory.exists() or directory.is_symlink():
+                metadata = directory.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError("post-lock parent symlink or path alias is forbidden")
+    return root_path, root_path / log_relative, root_path / state_relative
+
+
+def _read_regular_unaliased(path: Path, label: str) -> bytes:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} is missing at canonical path: {path}") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise ValueError(f"{label} symlink or alias is forbidden: {path}")
+    return path.read_bytes()
+
+
+def _postlock_state_raw(state: PostlockChainState) -> dict[str, object]:
+    return {
+        "gamePk": state.game_pk,
+        "lock_basis_start_utc": state.lock_basis_start_utc,
+        "event_count": state.event_count,
+        "head_hash": state.head_hash,
+        "persisted_at_utc": state.persisted_at_utc,
+        "audit_path": state.audit_path,
+        "event_log_path": state.event_log_path,
+    }
+
+
+def _postlock_event_raw(event: PostlockStartChange) -> dict[str, object]:
+    return {**_postlock_event_payload(event), "event_hash": event.event_hash}
+
+
+def _postlock_event_log_bytes(events: tuple[PostlockStartChange, ...]) -> bytes:
+    return b"".join(canonical_json_bytes(_postlock_event_raw(event)) + b"\n" for event in events)
+
+
+def load_postlock_chain_state(root: Path, *, game_pk: int) -> PostlockChainState:
+    _, _, state_path = _postlock_paths(root, game_pk)
+    contents = _read_regular_unaliased(state_path, "post-lock sealed state")
+    try:
+        raw = json.loads(contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("post-lock sealed state is not canonical JSON") from exc
+    obj = require_exact_keys(raw, POSTLOCK_STATE_KEYS, "postlock_chain_state")
+    if contents != canonical_json_bytes(obj) + b"\n":
+        raise ValueError("post-lock sealed state bytes are not canonical")
+    state = PostlockChainState(
+        game_pk=obj["gamePk"],
+        lock_basis_start_utc=obj["lock_basis_start_utc"],
+        event_count=obj["event_count"],
+        head_hash=obj["head_hash"],
+        persisted_at_utc=obj["persisted_at_utc"],
+        audit_path=obj["audit_path"],
+        event_log_path=obj["event_log_path"],
+    )
+    if state.game_pk != game_pk:
+        raise ValueError("post-lock sealed state gamePk differs from canonical path")
+    return state
+
+
+def load_postlock_event_log(
+    root: Path, *, game_pk: int
+) -> tuple[PostlockStartChange, ...]:
+    _, log_path, _ = _postlock_paths(root, game_pk)
+    contents = _read_regular_unaliased(log_path, "post-lock event log")
+    events: list[PostlockStartChange] = []
+    if contents:
+        if not contents.endswith(b"\n"):
+            raise ValueError("post-lock event log must end with canonical newline")
+        for index, line in enumerate(contents.splitlines(), start=1):
+            try:
+                raw = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"post-lock event log row {index} is invalid") from exc
+            obj = require_exact_keys(raw, POSTLOCK_EVENT_KEYS, f"postlock_event[{index}]")
+            if obj["event"] != "POSTLOCK_START_CHANGE":
+                raise ValueError("post-lock event literal differs")
+            event = PostlockStartChange(
+                game_pk=obj["gamePk"],
+                sequence=obj["sequence"],
+                previous_effective_start_utc=obj["previous_effective_start_utc"],
+                new_effective_start_utc=obj["new_effective_start_utc"],
+                observed_at_utc=obj["observed_at_utc"],
+                lock_basis_start_utc=obj["lock_basis_start_utc"],
+                prior_event_hash=obj["prior_event_hash"],
+                event_hash=obj["event_hash"],
+            )
+            if line != canonical_json_bytes(_postlock_event_raw(event)):
+                raise ValueError("post-lock event log row bytes are not canonical")
+            events.append(event)
+    result = tuple(events)
+    if contents != _postlock_event_log_bytes(result):
+        raise ValueError("post-lock event log bytes are not canonical")
+    return result
+
+
+def validate_persisted_postlock_chain(
+    root: Path, *, game_pk: int
+) -> tuple[tuple[PostlockStartChange, ...], PostlockChainState]:
+    state = load_postlock_chain_state(root, game_pk=game_pk)
+    events = load_postlock_event_log(root, game_pk=game_pk)
+    validate_postlock_start_changes(
+        events,
+        sealed_state=state,
+        lock_basis_start_utc=state.lock_basis_start_utc,
+    )
+    return events, state
+
+
+def initialize_postlock_chain(
+    root: Path,
+    *,
+    game_pk: int,
+    lock_basis_start_utc: str,
+    persisted_at_utc: str,
+) -> PostlockChainState:
+    root_path, log_path, state_path = _postlock_paths(root, game_pk)
+    if log_path.exists() or log_path.is_symlink() or state_path.exists() or state_path.is_symlink():
+        raise ValueError("post-lock chain already exists or is inconsistent")
+    lock_basis = _canonical_utc_datetime(lock_basis_start_utc, "lock_basis_start_utc")
+    persisted = _canonical_utc_datetime(persisted_at_utc, "persisted_at_utc")
+    if persisted < lock_basis - timedelta(minutes=45):
+        raise ValueError("initial chain state precedes sealed lock")
+    log_relative, state_relative = _postlock_relative_paths(game_pk)
+    state = PostlockChainState(
+        game_pk=game_pk,
+        lock_basis_start_utc=lock_basis_start_utc,
+        event_count=0,
+        head_hash=POSTLOCK_GENESIS_HASH,
+        persisted_at_utc=persisted_at_utc,
+        audit_path=state_relative.as_posix(),
+        event_log_path=log_relative.as_posix(),
+    )
+
+    def verify() -> None:
+        events, loaded = validate_persisted_postlock_chain(root_path, game_pk=game_pk)
+        if events or loaded != state:
+            raise ValueError("post-lock initialization postcondition failed")
+
+    _publish_bundle(
+        (
+            (log_path, b""),
+            (state_path, canonical_json_bytes(_postlock_state_raw(state)) + b"\n"),
+        ),
+        post_publish=verify,
+    )
+    return state
+
+
+def append_and_persist_postlock_start_change(
+    root: Path,
+    *,
+    game_pk: int,
+    previous_effective_start_utc: str,
+    new_effective_start_utc: str,
+    observed_at_utc: str,
+    lock_basis_start_utc: str,
+    state_persisted_at_utc: str,
+) -> tuple[PostlockStartChange, PostlockChainState]:
+    root_path, log_path, state_path = _postlock_paths(root, game_pk)
+    events, sealed_state = validate_persisted_postlock_chain(
+        root_path, game_pk=game_pk
+    )
+    event, new_state = append_postlock_start_change(
+        events,
+        sealed_state=sealed_state,
+        game_pk=game_pk,
+        previous_effective_start_utc=previous_effective_start_utc,
+        new_effective_start_utc=new_effective_start_utc,
+        observed_at_utc=observed_at_utc,
+        lock_basis_start_utc=lock_basis_start_utc,
+        state_persisted_at_utc=state_persisted_at_utc,
+    )
+    appended = (*events, event)
+
+    def verify() -> None:
+        loaded_events, loaded_state = validate_persisted_postlock_chain(
+            root_path, game_pk=game_pk
+        )
+        if loaded_events != appended or loaded_state != new_state:
+            raise ValueError("post-lock append postcondition failed")
+
+    _publish_bundle(
+        (
+            (log_path, _postlock_event_log_bytes(appended)),
+            (
+                state_path,
+                canonical_json_bytes(_postlock_state_raw(new_state)) + b"\n",
+            ),
+        ),
+        post_publish=verify,
     )
     return event, new_state
 
