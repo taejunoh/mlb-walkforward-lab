@@ -1150,7 +1150,12 @@ def verify_html_payload(
         or verification_timings["totalMs"] < verification_timings["browserRunMs"]
     ):
         raise ValueError(f"portable HTML verification failed: {completed.stderr}")
-    return {"sha256": html_before["sha256"], "receipt": receipt}
+    return {
+        "path": str(html_path),
+        "sha256": html_before["sha256"],
+        "fingerprint": html_before,
+        "receipt": receipt,
+    }
 
 
 def build_pass_receipt(
@@ -1294,6 +1299,21 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     exit_scope = capture_current_scope(root)
     if entry_scope != exit_scope:
         raise ValueError("current-scope fingerprint changed during verification")
+    if outputs is not None:
+        if not isinstance(html, Mapping):
+            raise ValueError("verified HTML fingerprint is missing")
+        stored_fingerprint = html.get("fingerprint")
+        delivery_receipt = html.get("receipt")
+        final_html_fingerprint = _absolute_regular_file_fingerprint(FINAL_HTML_PATH)
+        if (
+            not isinstance(stored_fingerprint, Mapping)
+            or dict(stored_fingerprint) != final_html_fingerprint
+            or html.get("path") != str(FINAL_HTML_PATH)
+            or html.get("sha256") != final_html_fingerprint["sha256"]
+            or not isinstance(delivery_receipt, Mapping)
+            or delivery_receipt.get("html") != str(FINAL_HTML_PATH)
+        ):
+            raise ValueError("verified HTML fingerprint or identity changed")
     return build_pass_receipt(
         diagnostic,
         config,

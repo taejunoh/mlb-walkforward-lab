@@ -377,6 +377,9 @@ class DesignVerificationTest(unittest.TestCase):
             ):
                 result = verify_html_payload(html_path, artifact_path, receipt_path)
             self.assertEqual(result["sha256"], sha256_file(html_path))
+            self.assertEqual(result["path"], str(html_path))
+            self.assertEqual(result["fingerprint"]["sha256"], result["sha256"])
+            self.assertEqual(result["receipt"]["html"], result["path"])
             command = run.call_args.args[0]
             self.assertEqual(command[0], "node")
             self.assertTrue(command[1].endswith("verify_portable_artifact.mjs"))
@@ -426,6 +429,73 @@ class DesignVerificationTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "HTML.*changed|identity|snapshot"),
             ):
                 verify_html_payload(html_path, artifact_path, receipt_path)
+
+    def test_final_mode_rechecks_html_after_all_exit_checks(self) -> None:
+        import mlb_backtest.verify_v52_design as verifier_module
+
+        real_scope = verifier_module.capture_current_scope
+        for late_swap in (False, True):
+            with (
+                self.subTest(late_swap=late_swap),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                temporary_root = Path(directory).resolve()
+                output = temporary_root / "outputs"
+                output.mkdir()
+                html_path = output / "mlb_v5_1_100_pick_diagnostic.html"
+                html_path.write_text("<!doctype html>verified", encoding="utf-8")
+                fingerprint = verifier_module._absolute_regular_file_fingerprint(
+                    html_path
+                )
+                verified_html = {
+                    "path": str(html_path),
+                    "sha256": fingerprint["sha256"],
+                    "fingerprint": fingerprint,
+                    "receipt": {"html": str(html_path)},
+                }
+                scope_calls = 0
+
+                def capture_scope(root):
+                    nonlocal scope_calls
+                    scope_calls += 1
+                    captured = real_scope(root)
+                    if late_swap and scope_calls == 2:
+                        replacement = output / "late-replacement.html"
+                        replacement.write_text(
+                            "<!doctype html>late swap", encoding="utf-8"
+                        )
+                        os.replace(replacement, html_path)
+                    return captured
+
+                contexts = (
+                    patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                    patch(
+                        "mlb_backtest.verify_v52_design.task11_artifact_status",
+                        return_value={
+                            "html": "PRESENT",
+                            "delivery_receipt": "PRESENT",
+                        },
+                    ),
+                    patch(
+                        "mlb_backtest.verify_v52_design.verify_html_payload",
+                        return_value=verified_html,
+                    ),
+                    patch(
+                        "mlb_backtest.verify_v52_design.capture_current_scope",
+                        side_effect=capture_scope,
+                    ),
+                )
+                with ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    if late_swap:
+                        with self.assertRaisesRegex(
+                            ValueError, "HTML.*changed|fingerprint|identity"
+                        ):
+                            verify_design_deliverables(ROOT, outputs=output)
+                    else:
+                        result = verify_design_deliverables(ROOT, outputs=output)
+                        self.assertEqual(result["html"], verified_html)
 
     def test_current_scope_fingerprint_detects_late_protocol_append(self) -> None:
         import mlb_backtest.verify_v52_design as verifier_module
