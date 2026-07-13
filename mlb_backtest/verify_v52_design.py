@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
+import stat
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from mlb_backtest.diagnostic_report import render_markdown
 from mlb_backtest.diagnostics import (
+    AUDITED_DIGEST_PATHS,
+    V51Evidence,
     build_diagnostic,
     canonical_json_bytes,
     deep_freeze,
@@ -63,6 +68,7 @@ FINAL_HTML_PATH = Path(
     "/Users/taejunoh/Documents/Codex/2026-07-11/"
     "files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html"
 )
+DELIVERY_RECEIPT_RELATIVE = "reports/v5_1_bt/report_delivery_receipt.json"
 EXPECTED_CURRENT_FILES = (
     "reports/v5_1_bt/diagnostic_100.json",
     "reports/v5_1_bt/diagnostic_100.md",
@@ -80,6 +86,22 @@ EXPECTED_CURRENT_FILES = (
     "reports/v5_2_qd/walkforward_500_preflight.json",
     "reports/v5_2_qd/walkforward_500_preflight.md",
 )
+CANONICAL_JSON_FILES = (
+    "analysis/v5_1_bt/diagnostic_100.ipynb",
+    "config/v5_2_qd.json",
+    "protocols/v5_2_qd/change_contract.json",
+    "protocols/v5_2_qd/historical_walkforward_500.json",
+    "protocols/v5_2_qd/prospective_2026.json",
+    "protocols/v5_2_qd/v51_protected_inventory.json",
+    "reports/v5_1_bt/diagnostic_100.json",
+    "reports/v5_1_bt/diagnostic_100_artifact.json",
+    "reports/v5_1_bt/diagnostic_100_chart_map.json",
+    "reports/v5_2_qd/walkforward_500_preflight.json",
+    "schemas/v5_2_preflight.schema.json",
+    "schemas/v5_2_prospective.schema.json",
+    "schemas/v5_2_qd.schema.json",
+    "schemas/v5_2_run_spec.schema.json",
+)
 FORBIDDEN_CLAIMS = (
     "시장 대비 우위가 입증",
     "ROI가 양수",
@@ -88,11 +110,225 @@ FORBIDDEN_CLAIMS = (
     "actionable betting",
     "predictive improvement established",
 )
+V51_REQUIRED_FILES = tuple(
+    sorted(
+        {
+            *AUDITED_DIGEST_PATHS.values(),
+            "audit/v5_1_bt/lock_manifest.json",
+            "audit/v5_1_bt/manual_audit.md",
+            "config/v5_1_bt.json",
+        }
+    )
+)
+
+
+def _lexical_root(root: Path) -> Path:
+    candidate = root if root.is_absolute() else Path.cwd() / root
+    try:
+        file_stat = candidate.lstat()
+    except OSError as exc:
+        raise ValueError("verification root is unavailable") from exc
+    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+        raise ValueError("verification root must be a no-follow directory")
+    return candidate
+
+
+def require_regular_file(root: Path, relative: str) -> Path:
+    relative_path = Path(relative)
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or ".." in relative_path.parts
+    ):
+        raise ValueError("required input path escapes verification root")
+    root = _lexical_root(root)
+    current = root
+    for part in relative_path.parts[:-1]:
+        current = current / part
+        try:
+            file_stat = current.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"required input ancestor is unavailable: {relative}"
+            ) from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+            raise ValueError(
+                f"required input ancestor is a symlink or non-directory: {relative}"
+            )
+    path = root / relative_path
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"required input is unavailable: {relative}") from exc
+    if (
+        stat.S_ISLNK(file_stat.st_mode)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+    ):
+        raise ValueError(
+            f"required input must be an unaliased regular file: {relative}"
+        )
+    return path
+
+
+def require_absolute_regular_file(path: Path) -> Path:
+    if not path.is_absolute():
+        raise ValueError("required absolute input path is not absolute")
+    ancestors = tuple(reversed(path.parents))
+    for ancestor in ancestors:
+        try:
+            file_stat = ancestor.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"required absolute input ancestor is unavailable: {path}"
+            ) from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+            raise ValueError(f"required absolute input ancestor is a symlink: {path}")
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"required absolute input is unavailable: {path}") from exc
+    if (
+        stat.S_ISLNK(file_stat.st_mode)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+    ):
+        raise ValueError(
+            f"required absolute input must be an unaliased regular file: {path}"
+        )
+    return path
+
+
+def load_canonical_json(root: Path, relative: str) -> object:
+    path = require_regular_file(root, relative)
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"required canonical JSON is unreadable: {relative}") from exc
+    if raw != canonical_json_bytes(payload) + b"\n":
+        raise ValueError(f"required file is not canonical JSON: {relative}")
+    return payload
+
+
+def validate_delivery_paths(root: Path, outputs: Path) -> tuple[Path, Path]:
+    root = _lexical_root(root)
+    candidate = outputs if outputs.is_absolute() else Path.cwd() / outputs
+    if candidate != FINAL_HTML_PATH.parent:
+        raise ValueError("delivery output path mismatch")
+    return FINAL_HTML_PATH, root / DELIVERY_RECEIPT_RELATIVE
+
+
+def _expected_portable_counts(artifact: Mapping[str, object]) -> dict[str, int]:
+    manifest = artifact.get("manifest")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("delivery receipt artifact manifest is missing")
+    blocks = manifest.get("blocks")
+    charts = manifest.get("charts")
+    tables = manifest.get("tables")
+    if not all(isinstance(value, list) for value in (blocks, charts, tables)):
+        raise ValueError("delivery receipt artifact layout is malformed")
+    chart_ids = {row.get("id") for row in charts if isinstance(row, Mapping)}
+    table_ids = {row.get("id") for row in tables if isinstance(row, Mapping)}
+    counts = {"blocks": 0, "charts": 0, "html": 0, "metrics": 0, "tables": 0}
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            raise ValueError("delivery receipt artifact block is malformed")
+        block_type = block.get("type")
+        if block_type == "metric-strip":
+            card_ids = block.get("cardIds")
+            if not isinstance(card_ids, list):
+                raise ValueError("delivery receipt metric strip is malformed")
+            counts["metrics"] += len(card_ids)
+            counts["blocks"] += len(card_ids)
+            continue
+        counts["blocks"] += 1
+        if block_type == "chart" and block.get("chartId") in chart_ids:
+            counts["charts"] += 1
+        if block_type == "table" and block.get("tableId") in table_ids:
+            counts["tables"] += 1
+        if block_type == "html":
+            counts["html"] += 1
+    return counts
+
+
+def validate_delivery_receipt_payload(
+    raw: bytes, artifact: Mapping[str, object]
+) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("delivery receipt is unreadable") from exc
+    if raw != canonical_json_bytes(payload) + b"\n":
+        raise ValueError("canonical delivery receipt bytes differ")
+    if not isinstance(payload, dict):
+        raise ValueError("delivery receipt must be an object")
+    # Installed data-analytics 0.2.8 receipts expose no artifact digest field;
+    # the exact current artifact is bound separately by report:verify below.
+    required = {
+        "ok",
+        "html",
+        "stages",
+        "counts",
+        "sourceDialog",
+        "sourceInteraction",
+        "viewports",
+        "timings",
+    }
+    if set(payload) != required or payload.get("ok") is not True:
+        raise ValueError("delivery receipt keys or status differ")
+    if payload.get("html") != str(FINAL_HTML_PATH):
+        raise ValueError("delivery receipt HTML identity differs")
+    if payload.get("stages") != {
+        "validation": "passed",
+        "package": "passed",
+        "verification": "passed",
+    }:
+        raise ValueError("delivery receipt stages differ")
+    if payload.get("counts") != _expected_portable_counts(artifact):
+        raise ValueError("delivery receipt counts differ")
+    if payload.get("sourceDialog") != "passed" or payload.get(
+        "sourceInteraction"
+    ) not in {"keyboard_menu_semantic_click", "semantic_click"}:
+        raise ValueError("delivery receipt source interaction differs")
+    if payload.get("viewports") != [1440, 390]:
+        raise ValueError("delivery receipt viewports differ")
+    timings = payload.get("timings")
+    timing_keys = {
+        "validateAndPackageMs",
+        "staticChartExtractionMs",
+        "browserRunMs",
+        "readerReadyMs",
+        "contentChecksMs",
+        "sourceDialogMs",
+        "responsiveChecksMs",
+        "verificationMs",
+        "totalMs",
+    }
+    if not isinstance(timings, dict) or set(timings) != timing_keys:
+        raise ValueError("delivery receipt timing keys differ")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        for value in timings.values()
+    ):
+        raise ValueError("delivery receipt timing values differ")
+    if timings["totalMs"] < timings["validateAndPackageMs"]:
+        raise ValueError("delivery receipt total timing differs")
+    return payload
 
 
 def git(root: Path, *args: str) -> bytes:
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     completed = subprocess.run(
-        ["git", *args], cwd=root, check=False, capture_output=True
+        ["git", *args],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
     )
     if completed.returncode:
         raise ValueError(completed.stderr.decode(errors="replace"))
@@ -156,7 +392,12 @@ def _decode_nul_paths(raw: bytes) -> set[str]:
 
 def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
     try:
-        expected = json.loads(inventory_path.read_text(encoding="utf-8"))
+        relative_inventory = inventory_path.relative_to(root).as_posix()
+        inventory_file = require_regular_file(root, relative_inventory)
+        inventory_bytes = inventory_file.read_bytes()
+        expected = json.loads(inventory_bytes)
+        if inventory_bytes != canonical_json_bytes(expected) + b"\n":
+            raise ValueError
         commit = expected["approved_commit"]
         if not isinstance(commit, str) or expected != build_git_inventory(root, commit):
             raise ValueError
@@ -169,11 +410,10 @@ def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
         if tracked != set(baseline):
             raise ValueError
         for relative, oid in baseline.items():
-            path = root / relative
+            require_regular_file(root, relative)
             if (
                 not isinstance(relative, str)
                 or not isinstance(oid, str)
-                or not path.is_file()
                 or git(root, "hash-object", "--", relative).decode().strip() != oid
             ):
                 raise ValueError
@@ -198,16 +438,51 @@ def verify_protected_inventory(root: Path, inventory_path: Path) -> None:
         ) from exc
 
 
+def verify_required_inputs(root: Path) -> None:
+    for relative in EXPECTED_CURRENT_FILES:
+        require_regular_file(root, relative)
+    for relative in V51_REQUIRED_FILES:
+        require_regular_file(root, relative)
+    for relative in CANONICAL_JSON_FILES:
+        load_canonical_json(root, relative)
+
+
+def capture_v51_integrity(
+    root: Path, inventory_path: Path
+) -> tuple[dict[str, object], V51Evidence]:
+    """Production authority for entry/exit v5.1 integrity, independent of tests."""
+    try:
+        verify_protected_inventory(root, inventory_path)
+        evidence = load_v51_evidence(root)
+        fingerprint = {
+            "approved_git_inventory": load_canonical_json(
+                root, inventory_path.relative_to(root).as_posix()
+            ),
+            "audited_file_sha256": dict(evidence.verified_file_sha256),
+            "source_file_sha256": dict(evidence.source_file_sha256),
+            "predictions_content_sha256": evidence.predictions_content_sha256,
+            "evaluated_content_sha256": evidence.evaluated_content_sha256,
+            "protected_tree": protected_inventory(root),
+        }
+    except (OSError, ValueError) as exc:
+        raise ValueError("v5.1 integrity verification failed") from exc
+    return fingerprint, evidence
+
+
 def verify_protected_snapshot(root: Path, expected: Mapping[str, object]) -> None:
     """Compare the bounded preflight guard without hashing multi-GB raw trees."""
     if protected_inventory(root) != expected:
         raise ValueError("protected evidence metadata or small sealed digest differs")
 
 
-def verify_diagnostic(root: Path) -> dict[str, object]:
+def verify_diagnostic(
+    root: Path, evidence: V51Evidence | None = None
+) -> dict[str, object]:
     saved_path = root / "reports/v5_1_bt/diagnostic_100.json"
     saved = json.loads(saved_path.read_text(encoding="utf-8"))
-    recomputed = build_diagnostic(load_v51_evidence(root))
+    recomputed = build_diagnostic(
+        load_v51_evidence(root) if evidence is None else evidence
+    )
     if (
         saved_path.read_bytes() != canonical_json_bytes(saved) + b"\n"
         or canonical_json_bytes(saved) != canonical_json_bytes(recomputed)
@@ -453,15 +728,56 @@ def fitted_model_card_count(root: Path) -> int:
     return sum(path.is_file() for path in base.rglob("*")) if base.exists() else 0
 
 
+def _namespace_tree_present(root: Path, relative: str) -> bool:
+    root = _lexical_root(root)
+    relative_path = Path(relative)
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        try:
+            file_stat = current.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ValueError(f"namespace node is unreadable: {relative}") from exc
+        if stat.S_ISLNK(file_stat.st_mode):
+            raise ValueError(f"namespace contains symlink: {relative}")
+        if current != root / relative_path and not stat.S_ISDIR(file_stat.st_mode):
+            raise ValueError(f"namespace ancestor is an unexpected node: {relative}")
+    final_stat = current.lstat()
+    if not stat.S_ISDIR(final_stat.st_mode):
+        raise ValueError(f"namespace root is an unexpected node: {relative}")
+    stack = [current]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise ValueError(f"namespace directory is unreadable: {relative}") from exc
+        for entry in entries:
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(f"namespace node is unreadable: {entry.path}") from exc
+            if entry.is_symlink():
+                raise ValueError(f"namespace contains symlink: {entry.path}")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                stack.append(Path(entry.path))
+            elif stat.S_ISREG(entry_stat.st_mode):
+                if entry_stat.st_nlink != 1:
+                    raise ValueError(f"namespace contains hardlink alias: {entry.path}")
+            else:
+                raise ValueError(
+                    f"namespace contains special unexpected node: {entry.path}"
+                )
+    return True
+
+
 def _namespace_status(root: Path, relatives: Sequence[str], absent: str) -> str:
-    files = [
-        path
-        for relative in relatives
-        if (root / relative).exists()
-        for path in (root / relative).rglob("*")
-        if path.is_file()
-    ]
-    return "PARTIAL_OUTPUT_PRESENT" if files else absent
+    present = any(
+        tuple(_namespace_tree_present(root, relative) for relative in relatives)
+    )
+    return "PARTIAL_OUTPUT_PRESENT" if present else absent
 
 
 def historical_execution_status(root: Path) -> str:
@@ -491,6 +807,26 @@ def verify_namespaces_differ(historical: RunSpec, prospective: ProspectiveSpec) 
 def verify_html_payload(
     html_path: Path, artifact_path: Path, receipt_path: Path
 ) -> dict[str, object]:
+    root = artifact_path.parents[2]
+    expected_html, expected_receipt = validate_delivery_paths(root, html_path.parent)
+    expected_artifact = root / "reports/v5_1_bt/diagnostic_100_artifact.json"
+    if (
+        html_path != expected_html
+        or receipt_path != expected_receipt
+        or artifact_path != expected_artifact
+    ):
+        raise ValueError("portable HTML path mismatch")
+    require_absolute_regular_file(html_path)
+    artifact = load_canonical_json(root, "reports/v5_1_bt/diagnostic_100_artifact.json")
+    if not isinstance(artifact, Mapping):
+        raise ValueError("portable HTML artifact must be an object")
+    receipt_file = require_regular_file(root, DELIVERY_RECEIPT_RELATIVE)
+    receipt = validate_delivery_receipt_payload(receipt_file.read_bytes(), artifact)
+    if (
+        receipt_file.stat(follow_symlinks=False).st_mtime_ns
+        < html_path.stat(follow_symlinks=False).st_mtime_ns
+    ):
+        raise ValueError("delivery receipt predates delivered HTML")
     plugin = Path(
         "/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/"
         "data-analytics/0.2.8-13ceeea1f599"
@@ -511,15 +847,18 @@ def verify_html_payload(
         capture_output=True,
         text=True,
     )
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    stages = receipt.get("stages", {})
+    try:
+        verification = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("portable HTML verifier returned invalid JSON") from exc
     if (
         completed.returncode != 0
-        or '"ok":true' not in completed.stdout.replace(" ", "")
-        or any(
-            stages.get(stage) != "passed"
-            for stage in ("validation", "package", "verification")
-        )
+        or not isinstance(verification, dict)
+        or verification.get("ok") is not True
+        or verification.get("html") != str(FINAL_HTML_PATH)
+        or verification.get("counts") != _expected_portable_counts(artifact)
+        or verification.get("sourceDialog") != "passed"
+        or verification.get("viewports") != [1440, 390]
     ):
         raise ValueError(f"portable HTML verification failed: {completed.stderr}")
     return {"sha256": sha256_file(html_path), "receipt": receipt}
@@ -564,11 +903,27 @@ def build_pass_receipt(
 def task11_artifact_status(root: Path) -> dict[str, str]:
     paths = {
         "html": FINAL_HTML_PATH,
-        "delivery_receipt": root / "reports/v5_1_bt/report_delivery_receipt.json",
+        "delivery_receipt": root / DELIVERY_RECEIPT_RELATIVE,
     }
-    return {
-        name: "PRESENT" if path.exists() else "ABSENT" for name, path in paths.items()
-    }
+    result: dict[str, str] = {}
+    for name, path in paths.items():
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            result[name] = "ABSENT"
+            continue
+        except OSError as exc:
+            raise ValueError(f"Task 11 artifact is unreadable: {path}") from exc
+        if (
+            stat.S_ISLNK(file_stat.st_mode)
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+        ):
+            raise ValueError(
+                f"Task 11 artifact is not an unaliased regular file: {path}"
+            )
+        result[name] = "PRESENT"
+    return result
 
 
 def verify_task11_phase(status: Mapping[str, str], *, delivery_requested: bool) -> None:
@@ -579,14 +934,21 @@ def verify_task11_phase(status: Mapping[str, str], *, delivery_requested: bool) 
 
 
 def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, object]:
-    root = root.resolve()
+    root = _lexical_root(root)
+    if outputs is not None:
+        validate_delivery_paths(root, outputs)
     inventory_path = root / "protocols/v5_2_qd/v51_protected_inventory.json"
-    verify_protected_inventory(root, inventory_path)
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    verify_required_inputs(root)
+    entry_integrity, entry_evidence = capture_v51_integrity(root, inventory_path)
+    inventory = load_canonical_json(
+        root, "protocols/v5_2_qd/v51_protected_inventory.json"
+    )
+    if not isinstance(inventory, Mapping):
+        raise ValueError("protected v5.1 inventory must be an object")
     if inventory["approved_commit"] != APPROVED_DESIGN_COMMIT:
         raise ValueError("protected v5.1 inventory is not pinned to approved commit")
     ensure_expected_files(root)
-    diagnostic = verify_diagnostic(root)
+    diagnostic = verify_diagnostic(root, entry_evidence)
     verify_markdown_agreement(root, diagnostic)
     verify_notebook_agreement(root, diagnostic)
     verify_artifact_agreement(root, diagnostic)
@@ -623,6 +985,9 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
             root / "reports/v5_1_bt/diagnostic_100_artifact.json",
             root / "reports/v5_1_bt/report_delivery_receipt.json",
         )
+    exit_integrity, _exit_evidence = capture_v51_integrity(root, inventory_path)
+    if canonical_json_bytes(entry_integrity) != canonical_json_bytes(exit_integrity):
+        raise ValueError("v5.1 integrity fingerprint changed during verification")
     return build_pass_receipt(
         diagnostic,
         config,

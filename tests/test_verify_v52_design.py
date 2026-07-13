@@ -5,9 +5,11 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -23,15 +25,20 @@ from mlb_backtest.protocols import (
 )
 from mlb_backtest.verify_v52_design import (
     APPROVED_DESIGN_COMMIT,
+    CANONICAL_JSON_FILES,
+    DELIVERY_RECEIPT_RELATIVE,
     FINAL_HTML_PATH,
     build_git_inventory,
     historical_execution_status,
+    load_canonical_json,
     make_tiny_git_fixture,
     main,
     observation_namespace_status,
     verify_artifact_agreement,
     verify_contract_schemas,
     verify_design_deliverables,
+    validate_delivery_paths,
+    validate_delivery_receipt_payload,
     verify_leakage_evidence,
     verify_markdown_agreement,
     verify_namespaces_differ,
@@ -84,6 +91,103 @@ class DesignVerificationTest(unittest.TestCase):
             (ROOT / "reports/v5_1_bt/report_delivery_receipt.json").exists()
         )
 
+    def test_every_deterministic_json_rejects_trailing_whitespace(self) -> None:
+        for relative in CANONICAL_JSON_FILES:
+            with (
+                self.subTest(relative=relative),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                path = root / relative
+                path.parent.mkdir(parents=True)
+                path.write_bytes((ROOT / relative).read_bytes() + b" ")
+                with self.assertRaisesRegex(ValueError, "canonical JSON"):
+                    load_canonical_json(root, relative)
+
+    def test_required_json_rejects_external_symlink_and_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            external = base / "external"
+            external.mkdir()
+            target = external / "config.json"
+            target.write_bytes((ROOT / "config/v5_2_qd.json").read_bytes())
+
+            direct_root = base / "direct"
+            (direct_root / "config").mkdir(parents=True)
+            (direct_root / "config/v5_2_qd.json").symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "symlink|regular file"):
+                load_canonical_json(direct_root, "config/v5_2_qd.json")
+
+            ancestor_root = base / "ancestor"
+            ancestor_root.mkdir()
+            (ancestor_root / "config").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink|ancestor"):
+                load_canonical_json(ancestor_root, "config/config.json")
+
+            hardlink_root = base / "hardlink"
+            (hardlink_root / "config").mkdir(parents=True)
+            os.link(target, hardlink_root / "config/v5_2_qd.json")
+            with self.assertRaisesRegex(ValueError, "unalias|regular file"):
+                load_canonical_json(hardlink_root, "config/v5_2_qd.json")
+
+    def test_namespace_scan_rejects_broken_symlink_special_and_hardlink(self) -> None:
+        for kind in ("broken_symlink", "fifo", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                namespace = root / "audit/v5_2_qd/historical"
+                namespace.parent.mkdir(parents=True)
+                if kind == "broken_symlink":
+                    namespace.symlink_to(root / "missing", target_is_directory=True)
+                else:
+                    namespace.mkdir()
+                    path = namespace / "unexpected"
+                    if kind == "fifo":
+                        os.mkfifo(path)
+                        self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+                    else:
+                        source = root / "source"
+                        source.write_text("x", encoding="utf-8")
+                        os.link(source, path)
+                with self.assertRaisesRegex(
+                    ValueError, "namespace.*symlink|special|hardlink|unexpected"
+                ):
+                    historical_execution_status(root)
+
+    def test_exit_integrity_recheck_catches_mutation_after_artifact_agreement(
+        self,
+    ) -> None:
+        import mlb_backtest.verify_v52_design as verifier_module
+
+        target = ROOT / "config/v5_1_bt.json"
+        original_bytes = target.read_bytes()
+        original_stat = target.stat()
+        original_verifier = verifier_module.verify_artifact_agreement
+
+        def mutate_after_agreement(root, diagnostic):
+            artifact = original_verifier(root, diagnostic)
+            changed = bytearray(original_bytes)
+            changed[-2] = changed[-2] ^ 1
+            target.write_bytes(bytes(changed))
+            return artifact
+
+        try:
+            with (
+                patch(
+                    "mlb_backtest.verify_v52_design.verify_artifact_agreement",
+                    side_effect=mutate_after_agreement,
+                ),
+                self.assertRaisesRegex(ValueError, "v5.1 integrity"),
+            ):
+                verify_design_deliverables(ROOT, outputs=None)
+        finally:
+            target.write_bytes(original_bytes)
+            os.chmod(target, stat.S_IMODE(original_stat.st_mode))
+            os.utime(
+                target,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+        self.assertEqual(target.read_bytes(), original_bytes)
+
     def test_task11_artifacts_are_phase_gated(self) -> None:
         verify_task11_phase(
             {"html": "ABSENT", "delivery_receipt": "ABSENT"},
@@ -100,12 +204,110 @@ class DesignVerificationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Task 11 delivery artifact"):
                 verify_task11_phase(status, delivery_requested=requested)
 
+    def test_delivery_paths_are_exact_constants(self) -> None:
+        html, receipt = validate_delivery_paths(ROOT, FINAL_HTML_PATH.parent)
+        self.assertEqual(html, FINAL_HTML_PATH)
+        self.assertEqual(receipt, ROOT / DELIVERY_RECEIPT_RELATIVE)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "output path mismatch"):
+                validate_delivery_paths(ROOT, Path(directory))
+
+    def test_delivery_receipt_requires_full_installed_contract_shape(self) -> None:
+        artifact = json.loads(
+            (ROOT / "reports/v5_1_bt/diagnostic_100_artifact.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        good = {
+            "ok": True,
+            "html": str(FINAL_HTML_PATH),
+            "stages": {
+                "validation": "passed",
+                "package": "passed",
+                "verification": "passed",
+            },
+            "counts": {
+                "blocks": 17,
+                "charts": 4,
+                "html": 0,
+                "metrics": 0,
+                "tables": 2,
+            },
+            "sourceDialog": "passed",
+            "sourceInteraction": "semantic_click",
+            "viewports": [1440, 390],
+            "timings": {
+                "validateAndPackageMs": 1.0,
+                "staticChartExtractionMs": 1.0,
+                "browserRunMs": 1.0,
+                "readerReadyMs": 1.0,
+                "contentChecksMs": 1.0,
+                "sourceDialogMs": 1.0,
+                "responsiveChecksMs": 1.0,
+                "verificationMs": 2.0,
+                "totalMs": 4.0,
+            },
+        }
+        encoded = canonical_json_bytes(good) + b"\n"
+        self.assertEqual(validate_delivery_receipt_payload(encoded, artifact), good)
+        cases = {
+            "minimal": {"ok": True, "stages": good["stages"]},
+            "extra": {**good, "artifact_sha256": "0" * 64},
+            "cross_run_path": {**good, "html": "/tmp/old-report.html"},
+            "wrong_counts": {**good, "counts": {**good["counts"], "charts": 3}},
+            "wrong_stage": {
+                **good,
+                "stages": {**good["stages"], "verification": "structural_only"},
+            },
+            "wrong_viewports": {**good, "viewports": [1280, 390]},
+        }
+        for name, payload in cases.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "delivery receipt"),
+            ):
+                validate_delivery_receipt_payload(
+                    canonical_json_bytes(payload) + b"\n", artifact
+                )
+        with self.assertRaisesRegex(ValueError, "canonical delivery receipt"):
+            validate_delivery_receipt_payload(encoded + b" ", artifact)
+
     def test_verifier_uses_no_network_or_python_write_api(self) -> None:
+        # Regression defense only: production authority is the verifier's
+        # lstat/no-follow input validation and entry/exit integrity recheck.
         before = protected_inventory(ROOT)
         real_builtin_open = builtins.open
         real_io_open = io.open
         real_os_open = os.open
+        real_popen = subprocess.Popen
         real_subprocess_run = subprocess.run
+
+        def validate_git_invocation(args, cwd, environment):
+            allowed_prefixes = {
+                "ls-tree": ["git", "ls-tree", "-r", "-z", "--full-tree"],
+                "ls-files": ["git", "ls-files", "-z", "--"],
+                "hash-object": ["git", "hash-object", "--"],
+                "status": [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--",
+                ],
+                "rev-parse": ["git", "rev-parse"],
+                "cat-file": ["git", "cat-file", "blob"],
+            }
+            if not isinstance(args, list) or len(args) < 2:
+                raise AssertionError(f"subprocess forbidden: {args!r}")
+            prefix = allowed_prefixes.get(args[1])
+            if prefix is None or args[: len(prefix)] != prefix or "-w" in args:
+                raise AssertionError(f"subprocess argv differs: {args!r}")
+            if cwd != ROOT:
+                raise AssertionError(f"subprocess cwd differs: {cwd!r}")
+            expected_environment = os.environ.copy()
+            expected_environment["GIT_OPTIONAL_LOCKS"] = "0"
+            if environment != expected_environment:
+                raise AssertionError("git environment differs")
 
         def guarded_open(opener):
             def call(file, mode="r", *args, **kwargs):
@@ -129,25 +331,18 @@ class DesignVerificationTest(unittest.TestCase):
             return real_os_open(path, flags, *args, **kwargs)
 
         def guarded_subprocess_run(args, *positional, **kwargs):
-            allowed = {
-                "ls-tree",
-                "ls-files",
-                "hash-object",
-                "status",
-                "rev-parse",
-                "cat-file",
-            }
-            if (
-                not isinstance(args, list)
-                or len(args) < 2
-                or args[0] != "git"
-                or args[1] not in allowed
-                or "-w" in args
-            ):
-                raise AssertionError(f"subprocess forbidden: {args!r}")
+            validate_git_invocation(args, kwargs.get("cwd"), kwargs.get("env"))
+            if set(kwargs) != {"cwd", "check", "capture_output", "env"}:
+                raise AssertionError(f"subprocess kwargs differ: {kwargs!r}")
+            if kwargs["check"] is not False or kwargs["capture_output"] is not True:
+                raise AssertionError("subprocess execution mode differs")
             return real_subprocess_run(args, *positional, **kwargs)
 
-        with (
+        def guarded_popen(args, *positional, **kwargs):
+            validate_git_invocation(args, kwargs.get("cwd"), kwargs.get("env"))
+            return real_popen(args, *positional, **kwargs)
+
+        patches = (
             patch(
                 "urllib.request.urlopen",
                 side_effect=AssertionError("network forbidden"),
@@ -164,30 +359,50 @@ class DesignVerificationTest(unittest.TestCase):
             patch("builtins.open", side_effect=guarded_open(real_builtin_open)),
             patch("io.open", side_effect=guarded_open(real_io_open)),
             patch("os.open", side_effect=guarded_os_open),
+            *(
+                patch(name, side_effect=AssertionError("mutation forbidden"))
+                for name in (
+                    "pathlib.Path.write_bytes",
+                    "pathlib.Path.write_text",
+                    "pathlib.Path.rename",
+                    "pathlib.Path.replace",
+                    "pathlib.Path.unlink",
+                    "pathlib.Path.mkdir",
+                    "pathlib.Path.touch",
+                    "pathlib.Path.symlink_to",
+                    "pathlib.Path.hardlink_to",
+                    "pathlib.Path.chmod",
+                    "os.replace",
+                    "os.rename",
+                    "os.remove",
+                    "os.unlink",
+                    "os.link",
+                    "os.symlink",
+                    "os.chmod",
+                    "os.fchmod",
+                    "os.truncate",
+                    "os.ftruncate",
+                    "os.system",
+                )
+            ),
+            patch("subprocess.Popen", side_effect=guarded_popen),
             patch(
-                "pathlib.Path.write_bytes",
-                side_effect=AssertionError("write forbidden"),
+                "subprocess.check_output",
+                side_effect=AssertionError("check_output forbidden"),
             ),
             patch(
-                "pathlib.Path.write_text",
-                side_effect=AssertionError("write forbidden"),
+                "subprocess.check_call",
+                side_effect=AssertionError("check_call forbidden"),
             ),
-            patch("os.replace", side_effect=AssertionError("write forbidden")),
-            patch("os.rename", side_effect=AssertionError("write forbidden")),
-            patch("os.remove", side_effect=AssertionError("write forbidden")),
-            patch("os.unlink", side_effect=AssertionError("write forbidden")),
-            patch("pathlib.Path.rename", side_effect=AssertionError("write forbidden")),
-            patch(
-                "pathlib.Path.replace", side_effect=AssertionError("write forbidden")
-            ),
-            patch("pathlib.Path.unlink", side_effect=AssertionError("write forbidden")),
-            patch("pathlib.Path.mkdir", side_effect=AssertionError("write forbidden")),
-            patch("pathlib.Path.touch", side_effect=AssertionError("write forbidden")),
             patch(
                 "mlb_backtest.verify_v52_design.subprocess.run",
                 side_effect=guarded_subprocess_run,
             ),
-        ):
+        )
+        with ExitStack() as stack:
+            for guard in patches:
+                stack.enter_context(guard)
+            __import__("mlb_backtest.verify_v52_design")
             receipt = verify_design_deliverables(ROOT, outputs=None)
         self.assertEqual(receipt["status"], "PASS")
         self.assertEqual(before, protected_inventory(ROOT))
@@ -203,6 +418,11 @@ class DesignVerificationTest(unittest.TestCase):
         ):
             main(["--root", str(ROOT)])
         self.assertEqual(raised.exception.code, 2)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(ValueError, "output path mismatch"),
+        ):
+            main(["--root", str(ROOT), "--outputs", directory])
 
         success = subprocess.run(
             [
