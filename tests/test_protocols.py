@@ -1563,6 +1563,86 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertEqual(second.snapshot_ledger_state["snapshot_count"], 2)
             self.assertNotEqual(first.snapshot_ledger_digest, second.snapshot_ledger_digest)
 
+    def test_candidate_gate_retains_nonqualifying_early_poll_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(
+                root,
+                receipts=(
+                    ("2026-07-13T21:40:00Z", True, False),
+                    ("2026-07-13T22:24:00Z", True, True),
+                ),
+            )
+            candidate = self._disk_candidate(root)
+            self.assertEqual(len(candidate.snapshot_history), 2)
+            self.assertEqual(candidate.selected_snapshot.sequence, 2)
+            self.assertTrue(eligible_for_prospective_official_pool(candidate))
+
+    def test_candidate_gate_rejects_history_and_duplicated_ledger_mutations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._sealed_snapshot_ledger(
+                root,
+                receipts=(
+                    ("2026-07-13T22:23:00Z", True, True),
+                    ("2026-07-13T22:24:00Z", True, True),
+                ),
+            )
+            candidate = self._disk_candidate(root)
+            history = candidate.snapshot_history
+            snapshots = candidate.snapshot_candidates
+            self.assertEqual(len(history), 2)
+            self.assertTrue(eligible_for_prospective_official_pool(candidate))
+
+            rolled_back_state = dict(candidate.snapshot_ledger_state)
+            rolled_back_state["snapshot_count"] = 1
+            rolled_back_state["head_hash"] = history[0].receipt_hash
+            rolled_back_digest = hashlib.sha256(
+                canonical_json_bytes(rolled_back_state)
+            ).hexdigest()
+            mutations = (
+                (replace(candidate, snapshot_history=()), "history"),
+                (replace(candidate, snapshot_history=history[1:]), "history|sequence"),
+                (replace(candidate, snapshot_history=history[:-1]), "history|candidate"),
+                (
+                    replace(
+                        candidate,
+                        snapshot_history=history[:-1],
+                        snapshot_candidates=snapshots[:-1],
+                    ),
+                    "count|head|rollback",
+                ),
+                (
+                    replace(candidate, snapshot_history=(history[1], history[0])),
+                    "history|sequence|chain",
+                ),
+                (
+                    replace(candidate, snapshot_history=(*history, history[-1])),
+                    "history|sequence|chain",
+                ),
+                (
+                    replace(candidate, snapshot_candidates=snapshots[1:]),
+                    "history|candidate",
+                ),
+                (replace(candidate, snapshot_ledger_head="f" * 64), "head"),
+                (replace(candidate, snapshot_ledger_count=999), "count"),
+                (replace(candidate, snapshot_ledger_status="OPEN"), "status"),
+                (replace(candidate, snapshot_ledger_path="attacker.json"), "path"),
+                (replace(candidate, snapshot_ledger_digest="f" * 64), "digest"),
+                (
+                    replace(
+                        candidate,
+                        snapshot_ledger_state=deep_freeze(rolled_back_state),
+                        snapshot_ledger_digest=rolled_back_digest,
+                    ),
+                    "rollback|count|head|history",
+                ),
+            )
+            for changed, message in mutations:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(ValueError, message):
+                        eligible_for_prospective_official_pool(changed)
+
     def test_official_slate_reloads_sealed_ledgers_and_rejects_fabrication_or_rollback(self):
         fabricated = self._candidate()
         with tempfile.TemporaryDirectory() as temporary:
@@ -2059,7 +2139,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         lock_receipt="2026-07-13T22:25:00Z",
         completeness=8.5,
         starter_edge=4.0,
-        snapshot_sequence=4,
+        snapshot_sequence=1,
         snapshot_candidates=None,
         lock_basis="2026-07-13T23:10:00Z",
     ):
@@ -2100,6 +2180,36 @@ class ProspectiveProtocolTest(unittest.TestCase):
             if snapshot_candidates is not None
             else (verified_snapshot,)
         )
+        snapshot_history = []
+        prior_receipt_hash = protocols.SNAPSHOT_LEDGER_GENESIS_HASH
+        for snapshot in candidate_snapshots:
+            snapshot_sha = hashlib.sha256(
+                canonical_json_bytes(protocols._prospective_snapshot_raw(snapshot))
+            ).hexdigest()
+            unsigned_receipt = protocols.ProspectiveSnapshotReceipt(
+                official_date=official_date,
+                game_pk=game_pk,
+                sequence=snapshot.sequence,
+                prior_receipt_hash=prior_receipt_hash,
+                snapshot=snapshot,
+                snapshot_sha256=snapshot_sha,
+                persisted_at_utc=snapshot.receipt_at_utc,
+                receipt_hash="",
+                audit_path="",
+            )
+            receipt_hash = protocols._snapshot_receipt_hash(unsigned_receipt)
+            receipt = replace(
+                unsigned_receipt,
+                receipt_hash=receipt_hash,
+                audit_path=protocols._snapshot_receipt_relative_path(
+                    official_date,
+                    game_pk,
+                    snapshot.sequence,
+                    receipt_hash,
+                ).as_posix(),
+            )
+            snapshot_history.append(receipt)
+            prior_receipt_hash = receipt_hash
         ledger_state = {
             "official_date": official_date,
             "gamePk": game_pk,
@@ -2109,7 +2219,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             "lock_at_utc": lock_receipt,
             "status": "CLOSED",
             "snapshot_count": len(candidate_snapshots),
-            "head_hash": "b" * 64,
+            "head_hash": prior_receipt_hash,
             "selected_sequence": snapshot_sequence,
             "selected_snapshot_id": verified_snapshot_id,
             "selected_snapshot_sha256": verified_snapshot_sha256,
@@ -2147,8 +2257,9 @@ class ProspectiveProtocolTest(unittest.TestCase):
             verified_snapshot=verified_snapshot,
             snapshot_candidates=candidate_snapshots,
             selected_snapshot=verified_snapshot,
+            snapshot_history=tuple(snapshot_history),
             snapshot_ledger_status="CLOSED",
-            snapshot_ledger_head="b" * 64,
+            snapshot_ledger_head=prior_receipt_hash,
             snapshot_ledger_count=len(candidate_snapshots),
             snapshot_ledger_path=ledger_state["audit_path"],
             snapshot_ledger_digest=hashlib.sha256(
@@ -2473,7 +2584,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     candidate,
                     snapshot_candidates=(*candidate.snapshot_candidates, later),
                 ),
-                "latest|selected",
+                "history|candidate|latest|selected",
             ),
             (
                 replace(candidate, recorded_at_utc="2026-07-13T22:23:59Z"),
@@ -2481,7 +2592,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
             ),
             (
                 replace(candidate, official_date="2026-07-14"),
-                "official_date|basis",
+                "official_date|basis|history|identity",
             ),
         )
         for changed, message in invalid:

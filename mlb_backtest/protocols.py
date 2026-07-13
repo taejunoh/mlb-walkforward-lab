@@ -3147,6 +3147,153 @@ def _snapshot_ledger_digest(state: ProspectiveSnapshotLedgerState) -> str:
     return hashlib.sha256(canonical_json_bytes(_snapshot_ledger_state_raw(state))).hexdigest()
 
 
+def _validate_candidate_snapshot_history(
+    row: ProspectiveCandidateRow,
+) -> tuple[
+    ProspectiveSnapshotLedgerState,
+    tuple[ProspectiveSnapshot, ...],
+    str,
+]:
+    if not isinstance(row.snapshot_history, tuple) or not row.snapshot_history:
+        raise ValueError("candidate snapshot history must be a nonempty typed tuple")
+    if not all(
+        isinstance(receipt, ProspectiveSnapshotReceipt)
+        for receipt in row.snapshot_history
+    ):
+        raise ValueError("candidate snapshot history contains an untyped receipt")
+    prior_hash = SNAPSHOT_LEDGER_GENESIS_HASH
+    prior_revision = -1
+    snapshots: list[ProspectiveSnapshot] = []
+    for expected_sequence, receipt in enumerate(row.snapshot_history, start=1):
+        snapshot = receipt.snapshot
+        if not isinstance(snapshot, ProspectiveSnapshot):
+            raise ValueError("candidate snapshot history contains an untyped snapshot")
+        expected_snapshot_sha = hashlib.sha256(
+            canonical_json_bytes(_prospective_snapshot_raw(snapshot))
+        ).hexdigest()
+        expected_relative = _snapshot_receipt_relative_path(
+            row.official_date,
+            row.game_pk,
+            expected_sequence,
+            receipt.receipt_hash,
+        )
+        _canonical_utc_datetime(
+            receipt.persisted_at_utc,
+            "candidate snapshot history persisted_at_utc",
+        )
+        parsed_snapshot = _snapshot_from_raw(
+            _prospective_snapshot_raw(snapshot),
+            "candidate.snapshot_history.snapshot",
+        )
+        _, _, snapshot_basis = _validate_prospective_identity(
+            row.official_date,
+            row.game_pk,
+            snapshot.lock_basis_start_utc,
+        )
+        assert snapshot_basis is not None
+        snapshot_lock = _canonical_utc_datetime(
+            snapshot.lock_at_utc,
+            "candidate snapshot history lock_at_utc",
+        )
+        snapshot_receipt_at = _canonical_utc_datetime(
+            snapshot.receipt_at_utc,
+            "candidate snapshot history receipt_at_utc",
+        )
+        late_reschedule = snapshot.reason_codes == (
+            "LATE_RESCHEDULE_UNVERIFIED",
+        )
+        if (
+            parsed_snapshot != snapshot
+            or receipt.official_date != row.official_date
+            or receipt.game_pk != row.game_pk
+            or isinstance(receipt.sequence, bool)
+            or receipt.sequence != expected_sequence
+            or snapshot.game_pk != row.game_pk
+            or snapshot.sequence != expected_sequence
+            or snapshot.countdown_revision < prior_revision
+            or receipt.prior_receipt_hash != prior_hash
+            or receipt.snapshot_sha256 != expected_snapshot_sha
+            or receipt.persisted_at_utc != snapshot.receipt_at_utc
+            or receipt.receipt_hash != _snapshot_receipt_hash(receipt)
+            or receipt.audit_path != expected_relative.as_posix()
+            or snapshot.observed_scheduled_start_utc
+            != snapshot.lock_basis_start_utc
+            or snapshot_lock != snapshot_basis - timedelta(minutes=45)
+            or snapshot.reason_codes
+            not in ((), ("LATE_RESCHEDULE_UNVERIFIED",))
+            or (late_reschedule and snapshot_receipt_at <= snapshot_lock)
+            or (not late_reschedule and snapshot_receipt_at > snapshot_lock)
+        ):
+            raise ValueError(
+                "candidate snapshot history sequence, chain, identity, or digest differs"
+            )
+        snapshots.append(snapshot)
+        prior_hash = receipt.receipt_hash
+        prior_revision = snapshot.countdown_revision
+    snapshot_projection = tuple(snapshots)
+    if row.snapshot_candidates != snapshot_projection:
+        raise ValueError(
+            "candidate snapshot candidates differ from exact receipt history projection"
+        )
+    if not isinstance(row.snapshot_ledger_state, Mapping):
+        raise ValueError("candidate must bind a CLOSED snapshot ledger state")
+    ledger_state_raw = require_exact_keys(
+        dict(row.snapshot_ledger_state),
+        SNAPSHOT_LEDGER_STATE_KEYS,
+        "candidate.snapshot_ledger_state",
+    )
+    ledger_state_bytes = canonical_json_bytes(ledger_state_raw) + b"\n"
+    state = _parse_snapshot_ledger_state(
+        ledger_state_raw,
+        official_date=row.official_date,
+        game_pk=row.game_pk,
+        contents=ledger_state_bytes,
+    )
+    if state.status != "CLOSED":
+        raise ValueError("candidate snapshot ledger status must be CLOSED")
+    closed_at = _canonical_utc_datetime(
+        state.closed_at_utc, "candidate snapshot ledger closed_at_utc"
+    )
+    lock_at = _canonical_utc_datetime(
+        state.lock_at_utc, "candidate snapshot ledger lock_at_utc"
+    )
+    latest_persisted = _canonical_utc_datetime(
+        row.snapshot_history[-1].persisted_at_utc,
+        "candidate snapshot history latest persisted_at_utc",
+    )
+    expected_head = row.snapshot_history[-1].receipt_hash
+    state_digest = hashlib.sha256(
+        canonical_json_bytes(_snapshot_ledger_state_raw(state))
+    ).hexdigest()
+    if (
+        state.snapshot_count != len(row.snapshot_history)
+        or state.head_hash != expected_head
+        or state.countdown_revision < prior_revision
+        or closed_at < lock_at
+        or closed_at < latest_persisted
+    ):
+        raise ValueError(
+            "candidate snapshot ledger count, head, revision, chronology, or history rollback differs"
+        )
+    if (
+        not isinstance(row.snapshot_ledger_status, str)
+        or row.snapshot_ledger_status != state.status
+        or isinstance(row.snapshot_ledger_count, bool)
+        or not isinstance(row.snapshot_ledger_count, int)
+        or row.snapshot_ledger_count != state.snapshot_count
+        or not isinstance(row.snapshot_ledger_head, str)
+        or row.snapshot_ledger_head != state.head_hash
+        or not isinstance(row.snapshot_ledger_path, str)
+        or row.snapshot_ledger_path != state.audit_path
+        or not isinstance(row.snapshot_ledger_digest, str)
+        or row.snapshot_ledger_digest != state_digest
+    ):
+        raise ValueError(
+            "candidate duplicated snapshot ledger status, count, head, path, or digest differs"
+        )
+    return state, snapshot_projection, state_digest
+
+
 def build_prospective_candidate(
     root: Path,
     *,
@@ -3239,24 +3386,11 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
         raise ValueError("candidate snapshot selection history must be a typed tuple")
     if not row.snapshot_candidates:
         raise ValueError("candidate snapshot selection history is empty")
-    if not isinstance(row.snapshot_ledger_state, Mapping):
-        raise ValueError("candidate must bind a CLOSED snapshot ledger state")
-    ledger_state = require_exact_keys(
-        dict(row.snapshot_ledger_state),
-        SNAPSHOT_LEDGER_STATE_KEYS,
-        "candidate.snapshot_ledger_state",
-    )
+    state, history_snapshots, state_digest = _validate_candidate_snapshot_history(row)
     if (
-        ledger_state["status"] != "CLOSED"
-        or ledger_state["official_date"] != row.official_date
-        or ledger_state["gamePk"] != row.game_pk
-        or isinstance(ledger_state["countdown_revision"], bool)
-        or not isinstance(ledger_state["countdown_revision"], int)
-        or ledger_state["countdown_revision"] < 0
-        or ledger_state["current_observed_start_utc"]
-        != row.lock_basis_start_utc
-        or ledger_state["lock_basis_start_utc"] != row.lock_basis_start_utc
-        or ledger_state["lock_at_utc"] != row.lock_receipt_at_utc
+        state.current_observed_start_utc != row.lock_basis_start_utc
+        or state.lock_basis_start_utc != row.lock_basis_start_utc
+        or state.lock_at_utc != row.lock_receipt_at_utc
     ):
         raise ValueError(
             "candidate snapshot CLOSED ledger identity or final basis differs"
@@ -3264,10 +3398,10 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
     verified_snapshot = row.verified_snapshot
     classification = classify_snapshot(verified_snapshot)
     selected_snapshot = select_qualifying_snapshot(
-        row.snapshot_candidates,
-        countdown_revision=ledger_state["countdown_revision"],
-        lock_basis_start_utc=ledger_state["current_observed_start_utc"],
-        lock_at_utc=ledger_state["lock_at_utc"],
+        history_snapshots,
+        countdown_revision=state.countdown_revision,
+        lock_basis_start_utc=state.current_observed_start_utc,
+        lock_at_utc=state.lock_at_utc,
     )
     if selected_snapshot != verified_snapshot:
         raise ValueError("candidate verified snapshot is not the latest selected snapshot")
@@ -3287,11 +3421,10 @@ def eligible_for_prospective_official_pool(row: ProspectiveCandidateRow) -> bool
         or row.verified_snapshot_id != snapshot_id
         or row.verified_snapshot_sha256 != snapshot_sha256
         or row.selected_snapshot != verified_snapshot
-        or ledger_state["selected_sequence"] != verified_snapshot.sequence
-        or ledger_state["selected_snapshot_id"] != snapshot_id
-        or ledger_state["selected_snapshot_sha256"] != snapshot_sha256
-        or row.snapshot_ledger_digest
-        != hashlib.sha256(canonical_json_bytes(ledger_state)).hexdigest()
+        or state.selected_sequence != verified_snapshot.sequence
+        or state.selected_snapshot_id != snapshot_id
+        or state.selected_snapshot_sha256 != snapshot_sha256
+        or row.snapshot_ledger_digest != state_digest
     ):
         raise ValueError(
             "candidate canonical verified snapshot binding differs from sealed lock"
@@ -4623,10 +4756,15 @@ def select_qualifying_snapshot(
             or not isinstance(lock_at_utc, str)
         ):
             raise ValueError("snapshot current-revision selection filter is invalid")
-        _canonical_utc_datetime(
+        selection_basis = _canonical_utc_datetime(
             lock_basis_start_utc, "snapshot selection lock basis"
         )
-        _canonical_utc_datetime(lock_at_utc, "snapshot selection lock at")
+        selection_lock = _canonical_utc_datetime(
+            lock_at_utc, "snapshot selection lock at"
+        )
+        if selection_lock != selection_basis - timedelta(minutes=45):
+            raise ValueError("snapshot current-revision selection boundary differs")
+        selection_window_start = selection_basis - timedelta(minutes=50)
         filtered = tuple(
             candidate
             for candidate in candidates
@@ -4634,6 +4772,12 @@ def select_qualifying_snapshot(
             and candidate.lock_basis_start_utc == lock_basis_start_utc
             and candidate.observed_scheduled_start_utc == lock_basis_start_utc
             and candidate.lock_at_utc == lock_at_utc
+            and selection_window_start
+            <= _canonical_utc_datetime(
+                candidate.receipt_at_utc,
+                "snapshot selection receipt_at_utc",
+            )
+            <= selection_lock
         )
     else:
         filtered = candidates
