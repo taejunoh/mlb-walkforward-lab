@@ -100,7 +100,7 @@ class DesignVerificationTest(unittest.TestCase):
                 self.subTest(relative=relative),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                root = Path(directory)
+                root = Path(directory).resolve()
                 path = root / relative
                 path.parent.mkdir(parents=True)
                 path.write_bytes((ROOT / relative).read_bytes() + b" ")
@@ -109,7 +109,7 @@ class DesignVerificationTest(unittest.TestCase):
 
     def test_required_json_rejects_external_symlink_and_symlink_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             external = base / "external"
             external.mkdir()
             target = external / "config.json"
@@ -136,7 +136,7 @@ class DesignVerificationTest(unittest.TestCase):
     def test_namespace_scan_rejects_broken_symlink_special_and_hardlink(self) -> None:
         for kind in ("broken_symlink", "fifo", "hardlink"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 namespace = root / "audit/v5_2_qd/historical"
                 namespace.parent.mkdir(parents=True)
                 if kind == "broken_symlink":
@@ -243,25 +243,23 @@ class DesignVerificationTest(unittest.TestCase):
             "sourceInteraction": "semantic_click",
             "viewports": [1440, 390],
             "timings": {
-                "validateAndPackageMs": 1.0,
-                "staticChartExtractionMs": 1.0,
-                "browserRunMs": 1.0,
-                "readerReadyMs": 1.0,
-                "contentChecksMs": 1.0,
-                "sourceDialogMs": 1.0,
-                "responsiveChecksMs": 1.0,
-                "verificationMs": 2.0,
-                "totalMs": 4.0,
+                "validateAndPackageMs": 1,
+                "staticChartExtractionMs": 1,
+                "browserRunMs": 1,
+                "readerReadyMs": 1,
+                "contentChecksMs": 1,
+                "sourceDialogMs": 1,
+                "responsiveChecksMs": 1,
+                "verificationMs": 2,
+                "totalMs": 4,
             },
         }
         installed_order = json.dumps(good, separators=(",", ":")).encode() + b"\n"
         sorted_order = canonical_json_bytes(good) + b"\n"
         self.assertNotEqual(installed_order, sorted_order)
-        for encoded in (installed_order, installed_order[:-1], sorted_order):
-            with self.subTest(encoded=encoded[:20]):
-                self.assertEqual(
-                    validate_delivery_receipt_payload(encoded, artifact), good
-                )
+        self.assertEqual(
+            validate_delivery_receipt_payload(installed_order, artifact), good
+        )
         cases = {
             "minimal": {"ok": True, "stages": good["stages"]},
             "extra": {**good, "artifact_sha256": "0" * 64},
@@ -281,12 +279,21 @@ class DesignVerificationTest(unittest.TestCase):
                 validate_delivery_receipt_payload(
                     canonical_json_bytes(payload) + b"\n", artifact
                 )
-        for suffix in (b" ", b"\n\n", b"{}", b"\ntrailing"):
+        invalid_encodings = (
+            installed_order[:-1],
+            sorted_order,
+            json.dumps(good, indent=2).encode() + b"\n",
+            installed_order + b" ",
+            installed_order + b"\n",
+            installed_order + b"{}",
+            installed_order + b"\ntrailing",
+        )
+        for encoded in invalid_encodings:
             with (
-                self.subTest(suffix=suffix),
+                self.subTest(encoded=encoded[:30]),
                 self.assertRaisesRegex(ValueError, "delivery receipt"),
             ):
-                validate_delivery_receipt_payload(installed_order + suffix, artifact)
+                validate_delivery_receipt_payload(encoded, artifact)
 
     def test_html_verifier_uses_direct_node_and_parses_final_json_line(self) -> None:
         artifact = json.loads(
@@ -402,10 +409,127 @@ class DesignVerificationTest(unittest.TestCase):
             ):
                 verify_html_payload(html_path, artifact_path, receipt_path)
 
+            completed.stdout = json.dumps(verifier) + "\n"
+
+            def replace_html_during_verification(*_args, **_kwargs):
+                replacement = output / "replacement.html"
+                replacement.write_text("<!doctype html>changed", encoding="utf-8")
+                os.replace(replacement, html_path)
+                return completed
+
+            with (
+                patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                patch(
+                    "mlb_backtest.verify_v52_design.subprocess.run",
+                    side_effect=replace_html_during_verification,
+                ),
+                self.assertRaisesRegex(ValueError, "HTML.*changed|identity|snapshot"),
+            ):
+                verify_html_payload(html_path, artifact_path, receipt_path)
+
+    def test_current_scope_fingerprint_detects_late_protocol_append(self) -> None:
+        import mlb_backtest.verify_v52_design as verifier_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for relative in (
+                "schemas",
+                "protocols/v5_2_qd",
+                "reports/v5_1_bt",
+                "reports/v5_2_qd",
+                "analysis/v5_1_bt",
+                "config",
+                "mlb_backtest",
+                "scripts",
+                "tests",
+                ".gitignore",
+                "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+            ):
+                source = ROOT / relative
+                target = root / relative
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+            before = verifier_module.capture_current_scope(root)
+            protocol = root / "protocols/v5_2_qd/prospective_2026.json"
+            protocol_node = before["trees"]["protocols/v5_2_qd"]["nodes"][
+                "protocols/v5_2_qd/prospective_2026.json"
+            ]
+            self.assertEqual(
+                set(protocol_node),
+                {
+                    "kind",
+                    "dev",
+                    "ino",
+                    "mode",
+                    "nlink",
+                    "size",
+                    "mtime_ns",
+                    "ctime_ns",
+                    "sha256",
+                },
+            )
+            self.assertEqual(
+                set(before["forbidden_namespaces"]),
+                {
+                    *verifier_module.HISTORICAL_NAMESPACE_ROOTS,
+                    *verifier_module.PROSPECTIVE_OBSERVATION_ROOTS,
+                    verifier_module.FITTED_NAMESPACE_ROOT,
+                },
+            )
+            protocol.write_bytes(protocol.read_bytes() + b" ")
+            after = verifier_module.capture_current_scope(root)
+            self.assertNotEqual(before, after)
+
+    def test_final_boundary_rechecks_scope_and_forbidden_namespaces(self) -> None:
+        import mlb_backtest.verify_v52_design as verifier_module
+
+        entry_scope = verifier_module.capture_current_scope(ROOT)
+        changed_scope = json.loads(json.dumps(entry_scope))
+        changed_scope["late_protocol_append"] = True
+        with (
+            patch(
+                "mlb_backtest.verify_v52_design.capture_current_scope",
+                side_effect=(entry_scope, changed_scope),
+            ),
+            self.assertRaisesRegex(ValueError, "current-scope.*changed"),
+        ):
+            verify_design_deliverables(ROOT, outputs=None)
+
+        with (
+            patch(
+                "mlb_backtest.verify_v52_design.historical_execution_status",
+                side_effect=("NOT_EXECUTED", "PARTIAL_OUTPUT_PRESENT"),
+            ),
+            self.assertRaisesRegex(ValueError, "historical outputs"),
+        ):
+            verify_design_deliverables(ROOT, outputs=None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.assertEqual(historical_execution_status(root), "NOT_EXECUTED")
+            late_report = root / "reports/v5_2_qd/historical/late.json"
+            late_report.parent.mkdir(parents=True)
+            late_report.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(
+                historical_execution_status(root), "PARTIAL_OUTPUT_PRESENT"
+            )
+
+    def test_direct_api_rejects_root_with_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            linked_parent = base / "linked-parent"
+            linked_parent.symlink_to(ROOT.parent, target_is_directory=True)
+            alias = linked_parent / ROOT.name
+            with self.assertRaisesRegex(ValueError, "root.*symlink|ancestor"):
+                load_canonical_json(alias, "config/v5_2_qd.json")
+
     def test_fitted_model_card_scan_rejects_broken_symlink_and_fifo(self) -> None:
         for kind in ("symlink", "broken_symlink", "fifo", "socket", "hardlink"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 base = root / "models/v5_2_qd/folds"
                 base.mkdir(parents=True)
                 unexpected = base / "unexpected"
@@ -619,7 +743,7 @@ class DesignVerificationTest(unittest.TestCase):
                 self.subTest(change=change),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                repo = make_tiny_git_fixture(Path(directory))
+                repo = make_tiny_git_fixture(Path(directory).resolve())
                 inventory = write_git_inventory(repo, "HEAD")
                 target = repo / "data/v5_1_bt/locked/predictions.jsonl"
                 if change == "mutate":
@@ -633,7 +757,7 @@ class DesignVerificationTest(unittest.TestCase):
 
     def test_full_tree_metadata_guard_detects_ignored_addition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_tiny_git_fixture(Path(directory))
+            repo = make_tiny_git_fixture(Path(directory).resolve())
             (repo / ".gitignore").write_text("*.bin\n", encoding="utf-8")
             subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
             subprocess.run(
@@ -646,7 +770,7 @@ class DesignVerificationTest(unittest.TestCase):
 
     def test_small_sealed_hash_detects_metadata_preserving_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             path = root / "data/v5_1_bt/locked/predictions.jsonl"
             path.parent.mkdir(parents=True)
             path.write_bytes(b"abc\n")
@@ -679,7 +803,7 @@ class DesignVerificationTest(unittest.TestCase):
         self.assertEqual(historical_execution_status(ROOT), "NOT_EXECUTED")
         self.assertEqual(observation_namespace_status(ROOT), "NOT_STARTED")
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             path = root / "audit/v5_2_qd/historical/nested/unexpected.bin"
             path.parent.mkdir(parents=True)
             path.write_text("x", encoding="utf-8")
@@ -695,7 +819,7 @@ class DesignVerificationTest(unittest.TestCase):
 
     def test_inventory_baseline_cannot_be_repointed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_tiny_git_fixture(Path(directory))
+            repo = make_tiny_git_fixture(Path(directory).resolve())
             inventory = write_git_inventory(repo, "HEAD")
             payload = json.loads(inventory.read_text(encoding="utf-8"))
             payload["approved_commit"] = "HEAD~1"
@@ -720,7 +844,7 @@ class DesignVerificationTest(unittest.TestCase):
         cases = ("markdown", "notebook_source", "notebook_output", "chart_map")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 (root / "reports/v5_1_bt").mkdir(parents=True)
                 (root / "analysis/v5_1_bt").mkdir(parents=True)
                 for relative in (
@@ -807,7 +931,7 @@ class DesignVerificationTest(unittest.TestCase):
             )
         )
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "schemas").mkdir()
             for name in (
                 "v5_2_qd.schema.json",
@@ -860,7 +984,7 @@ class DesignVerificationTest(unittest.TestCase):
         )
         for case, filename in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 shutil.copytree(ROOT / "schemas", root / "schemas")
                 path = root / "schemas" / filename
                 schema = json.loads(path.read_text(encoding="utf-8"))
@@ -910,7 +1034,7 @@ class DesignVerificationTest(unittest.TestCase):
                 self.subTest(mutation=mutation),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                root = make_complete_inventory(Path(directory) / "root")
+                root = make_complete_inventory(Path(directory).resolve() / "root")
                 run = parse_run_spec(expected_historical_run())
                 saved = build_preflight(root, run)
                 manifest_path = next((root / "inventory").rglob("*.manifest.json"))

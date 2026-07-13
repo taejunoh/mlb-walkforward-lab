@@ -2789,8 +2789,9 @@ node skills/build-report/scripts/deliver_portable_artifact.mjs \
 
 Preserve the command's successful stdout receipt byte-for-byte as emitted by the
 installed plugin. Do not parse, reorder, canonicalize, or rewrite that receipt;
-the Task 10 verifier accepts the installed insertion order while enforcing one
-exact JSON object, the full successful receipt schema, and no trailing content.
+the Task 10 verifier requires the installed compact key insertion order and
+serialization, the full successful receipt schema, exactly one final newline,
+and no other leading or trailing content.
 
 Expected: receipt fields `stages.validation`, `stages.package`, and `stages.verification` are all `passed`; output exists at the exact user-facing path; semantic content includes all visible executive sections, four charts, exact paired tables, caveats, and recommendations; no network dependency is present.
 

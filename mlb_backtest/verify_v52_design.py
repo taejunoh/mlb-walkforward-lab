@@ -64,6 +64,39 @@ PROSPECTIVE_OBSERVATION_ROOTS = (
     "models/v5_2_qd/prospective_2026",
 )
 FITTED_NAMESPACE_ROOT = "models/v5_2_qd/folds"
+CURRENT_SCOPE_TREE_ROOTS = (
+    "schemas",
+    "protocols/v5_2_qd",
+    "reports/v5_1_bt",
+    "reports/v5_2_qd",
+    "analysis/v5_1_bt",
+    "tests/fixtures/v5_2_qd/manifests",
+)
+CURRENT_SCOPE_SINGLE_FILES = (
+    ".gitignore",
+    "config/v5_2_qd.json",
+    "mlb_backtest/diagnostics.py",
+    "mlb_backtest/diagnostic_report.py",
+    "mlb_backtest/notebook_artifact.py",
+    "mlb_backtest/report_artifact.py",
+    "mlb_backtest/protocols.py",
+    "mlb_backtest/preflight.py",
+    "mlb_backtest/verify_v52_design.py",
+    "scripts/validate_report_artifact.mjs",
+    "tests/test_diagnostics.py",
+    "tests/test_diagnostic_report.py",
+    "tests/test_notebook_artifact.py",
+    "tests/test_report_artifact.py",
+    "tests/test_protocols.py",
+    "tests/test_preflight.py",
+    "tests/test_verify_v52_design.py",
+    "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+)
+FORBIDDEN_NAMESPACE_ROOTS = (
+    *HISTORICAL_NAMESPACE_ROOTS,
+    *PROSPECTIVE_OBSERVATION_ROOTS,
+    FITTED_NAMESPACE_ROOT,
+)
 FINAL_HTML_PATH = Path(
     "/Users/taejunoh/Documents/Codex/2026-07-11/"
     "files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html"
@@ -123,14 +156,154 @@ V51_REQUIRED_FILES = tuple(
 
 
 def _lexical_root(root: Path) -> Path:
-    candidate = root if root.is_absolute() else Path.cwd() / root
-    try:
-        file_stat = candidate.lstat()
-    except OSError as exc:
-        raise ValueError("verification root is unavailable") from exc
-    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
-        raise ValueError("verification root must be a no-follow directory")
+    candidate = Path(os.path.abspath(os.fspath(root)))
+    for node in (*reversed(candidate.parents), candidate):
+        try:
+            file_stat = node.lstat()
+        except OSError as exc:
+            raise ValueError("verification root or ancestor is unavailable") from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+            raise ValueError("verification root ancestor must be a no-follow directory")
     return candidate
+
+
+def _stat_identity(file_stat: os.stat_result) -> dict[str, int]:
+    return {
+        "dev": file_stat.st_dev,
+        "ino": file_stat.st_ino,
+        "mode": file_stat.st_mode,
+        "nlink": file_stat.st_nlink,
+        "size": file_stat.st_size,
+        "mtime_ns": file_stat.st_mtime_ns,
+        "ctime_ns": file_stat.st_ctime_ns,
+    }
+
+
+def _regular_file_fingerprint(path: Path, label: str) -> dict[str, object]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"regular-file snapshot is unavailable: {label}") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise ValueError(f"regular-file snapshot is unsafe: {label}")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _stat_identity(before) != _stat_identity(opened)
+        ):
+            raise ValueError(f"regular-file snapshot changed: {label}")
+        hasher = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            hasher.update(chunk)
+        digest = hasher.hexdigest()
+    except OSError as exc:
+        raise ValueError(f"regular-file snapshot is unreadable: {label}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"regular-file snapshot changed: {label}") from exc
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or _stat_identity(before) != _stat_identity(after)
+    ):
+        raise ValueError(f"regular-file snapshot changed: {label}")
+    return {**_stat_identity(after), "sha256": digest}
+
+
+def _tree_fingerprint(
+    root: Path, relative: str, *, required: bool
+) -> dict[str, object]:
+    root = _lexical_root(root)
+    relative_path = Path(relative)
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        try:
+            node_stat = current.lstat()
+        except FileNotFoundError:
+            if required:
+                raise ValueError(f"current-scope tree is missing: {relative}")
+            return {"state": "ABSENT"}
+        except OSError as exc:
+            raise ValueError(f"current-scope tree is unavailable: {relative}") from exc
+        if stat.S_ISLNK(node_stat.st_mode) or not stat.S_ISDIR(node_stat.st_mode):
+            raise ValueError(
+                f"current-scope tree contains an unsafe ancestor: {relative}"
+            )
+
+    nodes: dict[str, object] = {}
+
+    def scan(directory: Path, key: str) -> None:
+        before = directory.lstat()
+        nodes[key] = {"kind": "directory", **_stat_identity(before)}
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ValueError(f"current-scope tree is unreadable: {relative}") from exc
+        for entry in entries:
+            child = Path(entry.path)
+            child_key = child.relative_to(root).as_posix() if child != root else "."
+            try:
+                child_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    f"current-scope node is unavailable: {child_key}"
+                ) from exc
+            if entry.is_symlink():
+                raise ValueError(f"current-scope tree contains symlink: {child_key}")
+            if stat.S_ISDIR(child_stat.st_mode):
+                scan(child, child_key)
+            elif stat.S_ISREG(child_stat.st_mode):
+                nodes[child_key] = {
+                    "kind": "file",
+                    **_regular_file_fingerprint(child, child_key),
+                }
+            else:
+                raise ValueError(
+                    f"current-scope tree contains special node: {child_key}"
+                )
+        after = directory.lstat()
+        if _stat_identity(before) != _stat_identity(after):
+            raise ValueError(f"current-scope tree changed during scan: {relative}")
+
+    scan(current, relative)
+    return {"state": "PRESENT", "nodes": nodes}
+
+
+def capture_current_scope(root: Path) -> dict[str, object]:
+    root = _lexical_root(root)
+    return {
+        "trees": {
+            relative: _tree_fingerprint(root, relative, required=True)
+            for relative in CURRENT_SCOPE_TREE_ROOTS
+        },
+        "single_files": {
+            relative: _regular_file_fingerprint(
+                require_regular_file(root, relative), relative
+            )
+            for relative in CURRENT_SCOPE_SINGLE_FILES
+        },
+        "forbidden_namespaces": {
+            relative: _tree_fingerprint(root, relative, required=False)
+            for relative in FORBIDDEN_NAMESPACE_ROOTS
+        },
+    }
 
 
 def require_regular_file(root: Path, relative: str) -> Path:
@@ -197,6 +370,11 @@ def require_absolute_regular_file(path: Path) -> Path:
             f"required absolute input must be an unaliased regular file: {path}"
         )
     return path
+
+
+def _absolute_regular_file_fingerprint(path: Path) -> dict[str, object]:
+    require_absolute_regular_file(path)
+    return _regular_file_fingerprint(path, str(path))
 
 
 def load_canonical_json(root: Path, relative: str) -> object:
@@ -269,13 +447,57 @@ def validate_delivery_receipt_payload(
 ) -> dict[str, object]:
     try:
         text = raw.decode("utf-8")
-        payload, consumed = json.JSONDecoder().raw_decode(text)
+        payload = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("delivery receipt is unreadable") from exc
-    if text[consumed:] not in {"", "\n"}:
-        raise ValueError("delivery receipt contains trailing content")
     if not isinstance(payload, dict):
         raise ValueError("delivery receipt must be an object")
+    expected_key_order = (
+        "ok",
+        "html",
+        "stages",
+        "counts",
+        "sourceDialog",
+        "sourceInteraction",
+        "viewports",
+        "timings",
+    )
+    expected_nested_orders = {
+        "stages": ("validation", "package", "verification"),
+        "counts": ("blocks", "charts", "html", "metrics", "tables"),
+        "timings": (
+            "validateAndPackageMs",
+            "staticChartExtractionMs",
+            "browserRunMs",
+            "readerReadyMs",
+            "contentChecksMs",
+            "sourceDialogMs",
+            "responsiveChecksMs",
+            "verificationMs",
+            "totalMs",
+        ),
+    }
+    if tuple(payload) != expected_key_order or any(
+        not isinstance(payload.get(key), dict) or tuple(payload[key]) != expected_order
+        for key, expected_order in expected_nested_orders.items()
+    ):
+        raise ValueError("delivery receipt key insertion order differs")
+    try:
+        installed_bytes = (
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("delivery receipt contains non-JSON values") from exc
+    if raw != installed_bytes:
+        raise ValueError(
+            "delivery receipt is not exact installed JSON.stringify output"
+        )
     # Installed data-analytics 0.2.8 receipts expose no artifact digest field;
     # the exact current artifact is bound separately by report:verify below.
     required = {
@@ -848,6 +1070,7 @@ def verify_html_payload(
         < html_path.stat(follow_symlinks=False).st_mtime_ns
     ):
         raise ValueError("delivery receipt predates delivered HTML")
+    html_before = _absolute_regular_file_fingerprint(html_path)
     plugin = Path(
         "/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/"
         "data-analytics/0.2.8-13ceeea1f599"
@@ -869,6 +1092,11 @@ def verify_html_payload(
         capture_output=True,
         text=True,
     )
+    html_after = _absolute_regular_file_fingerprint(html_path)
+    if html_before != html_after:
+        raise ValueError(
+            "portable HTML identity or snapshot changed during verification"
+        )
     try:
         output_lines = [line for line in completed.stdout.splitlines() if line]
         verification = json.loads(output_lines[-1])
@@ -922,7 +1150,7 @@ def verify_html_payload(
         or verification_timings["totalMs"] < verification_timings["browserRunMs"]
     ):
         raise ValueError(f"portable HTML verification failed: {completed.stderr}")
-    return {"sha256": sha256_file(html_path), "receipt": receipt}
+    return {"sha256": html_before["sha256"], "receipt": receipt}
 
 
 def build_pass_receipt(
@@ -1000,6 +1228,9 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
         validate_delivery_paths(root, outputs)
     inventory_path = root / "protocols/v5_2_qd/v51_protected_inventory.json"
     verify_required_inputs(root)
+    task11 = task11_artifact_status(root)
+    verify_task11_phase(task11, delivery_requested=outputs is not None)
+    entry_scope = capture_current_scope(root)
     entry_integrity, entry_evidence = capture_v51_integrity(root, inventory_path)
     inventory = load_canonical_json(
         root, "protocols/v5_2_qd/v51_protected_inventory.json"
@@ -1037,8 +1268,6 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
         raise ValueError(
             "prospective observations exist before collector implementation"
         )
-    task11 = task11_artifact_status(root)
-    verify_task11_phase(task11, delivery_requested=outputs is not None)
     html = None
     if outputs is not None:
         html = verify_html_payload(
@@ -1049,6 +1278,22 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     exit_integrity, _exit_evidence = capture_v51_integrity(root, inventory_path)
     if canonical_json_bytes(entry_integrity) != canonical_json_bytes(exit_integrity):
         raise ValueError("v5.1 integrity fingerprint changed during verification")
+    final_fitted_count = fitted_model_card_count(root)
+    if final_fitted_count:
+        raise ValueError("fitted fold card exists before source acquisition")
+    final_execution = historical_execution_status(root)
+    if final_execution != "NOT_EXECUTED":
+        raise ValueError("historical outputs exist in design-only phase")
+    final_observation = observation_namespace_status(root)
+    if final_observation != "NOT_STARTED":
+        raise ValueError(
+            "prospective observations exist before collector implementation"
+        )
+    final_task11 = task11_artifact_status(root)
+    verify_task11_phase(final_task11, delivery_requested=outputs is not None)
+    exit_scope = capture_current_scope(root)
+    if entry_scope != exit_scope:
+        raise ValueError("current-scope fingerprint changed during verification")
     return build_pass_receipt(
         diagnostic,
         config,
@@ -1072,7 +1317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.skip_html and args.outputs is None:
         parser.error("--outputs is required unless --skip-html is set")
     receipt = verify_design_deliverables(
-        args.root.resolve(), None if args.skip_html else args.outputs
+        args.root, None if args.skip_html else args.outputs
     )
     print(json.dumps(receipt, allow_nan=False, sort_keys=True))
     return 0
