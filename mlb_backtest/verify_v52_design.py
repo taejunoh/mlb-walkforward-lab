@@ -252,15 +252,28 @@ def _expected_portable_counts(artifact: Mapping[str, object]) -> dict[str, int]:
     return counts
 
 
+def _exact_counts_match(actual: object, expected: Mapping[str, int]) -> bool:
+    return (
+        isinstance(actual, dict)
+        and set(actual) == set(expected)
+        and all(
+            not isinstance(value, bool) and isinstance(value, int)
+            for value in actual.values()
+        )
+        and actual == expected
+    )
+
+
 def validate_delivery_receipt_payload(
     raw: bytes, artifact: Mapping[str, object]
 ) -> dict[str, object]:
     try:
-        payload = json.loads(raw)
+        text = raw.decode("utf-8")
+        payload, consumed = json.JSONDecoder().raw_decode(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("delivery receipt is unreadable") from exc
-    if raw != canonical_json_bytes(payload) + b"\n":
-        raise ValueError("canonical delivery receipt bytes differ")
+    if text[consumed:] not in {"", "\n"}:
+        raise ValueError("delivery receipt contains trailing content")
     if not isinstance(payload, dict):
         raise ValueError("delivery receipt must be an object")
     # Installed data-analytics 0.2.8 receipts expose no artifact digest field;
@@ -285,7 +298,9 @@ def validate_delivery_receipt_payload(
         "verification": "passed",
     }:
         raise ValueError("delivery receipt stages differ")
-    if payload.get("counts") != _expected_portable_counts(artifact):
+    counts = payload.get("counts")
+    expected_counts = _expected_portable_counts(artifact)
+    if not _exact_counts_match(counts, expected_counts):
         raise ValueError("delivery receipt counts differ")
     if payload.get("sourceDialog") != "passed" or payload.get(
         "sourceInteraction"
@@ -724,11 +739,11 @@ def verify_preflight(root: Path, historical: RunSpec) -> dict[str, object]:
 
 
 def fitted_model_card_count(root: Path) -> int:
-    base = root / FITTED_NAMESPACE_ROOT
-    return sum(path.is_file() for path in base.rglob("*")) if base.exists() else 0
+    count = _namespace_regular_file_count(root, FITTED_NAMESPACE_ROOT)
+    return 0 if count is None else count
 
 
-def _namespace_tree_present(root: Path, relative: str) -> bool:
+def _namespace_regular_file_count(root: Path, relative: str) -> int | None:
     root = _lexical_root(root)
     relative_path = Path(relative)
     current = root
@@ -737,7 +752,7 @@ def _namespace_tree_present(root: Path, relative: str) -> bool:
         try:
             file_stat = current.lstat()
         except FileNotFoundError:
-            return False
+            return None
         except OSError as exc:
             raise ValueError(f"namespace node is unreadable: {relative}") from exc
         if stat.S_ISLNK(file_stat.st_mode):
@@ -748,6 +763,7 @@ def _namespace_tree_present(root: Path, relative: str) -> bool:
     if not stat.S_ISDIR(final_stat.st_mode):
         raise ValueError(f"namespace root is an unexpected node: {relative}")
     stack = [current]
+    count = 0
     while stack:
         directory = stack.pop()
         try:
@@ -766,11 +782,16 @@ def _namespace_tree_present(root: Path, relative: str) -> bool:
             elif stat.S_ISREG(entry_stat.st_mode):
                 if entry_stat.st_nlink != 1:
                     raise ValueError(f"namespace contains hardlink alias: {entry.path}")
+                count += 1
             else:
                 raise ValueError(
                     f"namespace contains special unexpected node: {entry.path}"
                 )
-    return True
+    return count
+
+
+def _namespace_tree_present(root: Path, relative: str) -> bool:
+    return _namespace_regular_file_count(root, relative) is not None
 
 
 def _namespace_status(root: Path, relatives: Sequence[str], absent: str) -> str:
@@ -831,12 +852,13 @@ def verify_html_payload(
         "/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/"
         "data-analytics/0.2.8-13ceeea1f599"
     )
+    verifier_script = (
+        plugin / "skills/build-report/scripts/verify_portable_artifact.mjs"
+    )
     completed = subprocess.run(
         [
-            "npm",
-            "run",
-            "report:verify",
-            "--",
+            "node",
+            str(verifier_script),
             "--html",
             str(html_path),
             "--artifact",
@@ -848,17 +870,56 @@ def verify_html_payload(
         text=True,
     )
     try:
-        verification = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+        output_lines = [line for line in completed.stdout.splitlines() if line]
+        verification = json.loads(output_lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
         raise ValueError("portable HTML verifier returned invalid JSON") from exc
+    verification_keys = {
+        "ok",
+        "counts",
+        "html",
+        "sourceDialog",
+        "sourceInteraction",
+        "timings",
+        "viewports",
+    }
+    verification_timings = (
+        verification.get("timings", {}) if isinstance(verification, dict) else {}
+    )
+    expected_verification_timing_keys = {
+        "browserRunMs",
+        "readerReadyMs",
+        "contentChecksMs",
+        "sourceDialogMs",
+        "responsiveChecksMs",
+        "totalMs",
+    }
+    timing_values_valid = (
+        isinstance(verification_timings, dict)
+        and set(verification_timings) == expected_verification_timing_keys
+        and all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+            for value in verification_timings.values()
+        )
+    )
     if (
         completed.returncode != 0
         or not isinstance(verification, dict)
+        or set(verification) != verification_keys
         or verification.get("ok") is not True
         or verification.get("html") != str(FINAL_HTML_PATH)
-        or verification.get("counts") != _expected_portable_counts(artifact)
+        or not _exact_counts_match(
+            verification.get("counts"), _expected_portable_counts(artifact)
+        )
         or verification.get("sourceDialog") != "passed"
+        or verification.get("sourceInteraction")
+        not in {"keyboard_menu_semantic_click", "semantic_click"}
         or verification.get("viewports") != [1440, 390]
+        or not timing_values_valid
+        or verification_timings["totalMs"] < verification_timings["browserRunMs"]
     ):
         raise ValueError(f"portable HTML verification failed: {completed.stderr}")
     return {"sha256": sha256_file(html_path), "receipt": receipt}

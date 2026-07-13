@@ -2781,11 +2781,16 @@ Run exactly this command once, after all report/artifact generation and both rev
 ```bash
 PLUGIN_ROOT=/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599
 cd "$PLUGIN_ROOT"
-npm_config_loglevel=silent npm run report:deliver -- \
+node skills/build-report/scripts/deliver_portable_artifact.mjs \
   --input "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest/reports/v5_1_bt/diagnostic_100_artifact.json" \
   --output "/Users/taejunoh/Documents/Codex/2026-07-11/files-mentioned-by-the-user-mlb/outputs/mlb_v5_1_100_pick_diagnostic.html" \
   > "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest/reports/v5_1_bt/report_delivery_receipt.json"
 ```
+
+Preserve the command's successful stdout receipt byte-for-byte as emitted by the
+installed plugin. Do not parse, reorder, canonicalize, or rewrite that receipt;
+the Task 10 verifier accepts the installed insertion order while enforcing one
+exact JSON object, the full successful receipt schema, and no trailing content.
 
 Expected: receipt fields `stages.validation`, `stages.package`, and `stages.verification` are all `passed`; output exists at the exact user-facing path; semantic content includes all visible executive sections, four charts, exact paired tables, caveats, and recommendations; no network dependency is present.
 

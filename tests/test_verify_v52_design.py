@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -14,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from mlb_backtest.diagnostics import canonical_json_bytes
+from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
 from mlb_backtest.preflight import build_preflight, parse_preflight, protected_inventory
 from mlb_backtest.protocols import (
     expected_historical_run,
@@ -29,6 +30,7 @@ from mlb_backtest.verify_v52_design import (
     DELIVERY_RECEIPT_RELATIVE,
     FINAL_HTML_PATH,
     build_git_inventory,
+    fitted_model_card_count,
     historical_execution_status,
     load_canonical_json,
     make_tiny_git_fixture,
@@ -37,6 +39,7 @@ from mlb_backtest.verify_v52_design import (
     verify_artifact_agreement,
     verify_contract_schemas,
     verify_design_deliverables,
+    verify_html_payload,
     validate_delivery_paths,
     validate_delivery_receipt_payload,
     verify_leakage_evidence,
@@ -153,40 +156,43 @@ class DesignVerificationTest(unittest.TestCase):
                 ):
                     historical_execution_status(root)
 
-    def test_exit_integrity_recheck_catches_mutation_after_artifact_agreement(
+    def test_exit_integrity_recheck_uses_mock_without_touching_sealed_files(
         self,
     ) -> None:
         import mlb_backtest.verify_v52_design as verifier_module
 
-        target = ROOT / "config/v5_1_bt.json"
-        original_bytes = target.read_bytes()
-        original_stat = target.stat()
-        original_verifier = verifier_module.verify_artifact_agreement
+        def sealed_metadata() -> dict[str, tuple[int, ...]]:
+            paths = [ROOT / "config/v5_1_bt.json"]
+            for relative in ("data/v5_1_bt", "audit/v5_1_bt"):
+                paths.extend((ROOT / relative).rglob("*"))
+            return {
+                path.relative_to(ROOT).as_posix(): (
+                    metadata.st_mode,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_nlink,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                for path in paths
+                if (metadata := path.lstat())
+            }
 
-        def mutate_after_agreement(root, diagnostic):
-            artifact = original_verifier(root, diagnostic)
-            changed = bytearray(original_bytes)
-            changed[-2] = changed[-2] ^ 1
-            target.write_bytes(bytes(changed))
-            return artifact
-
-        try:
-            with (
-                patch(
-                    "mlb_backtest.verify_v52_design.verify_artifact_agreement",
-                    side_effect=mutate_after_agreement,
-                ),
-                self.assertRaisesRegex(ValueError, "v5.1 integrity"),
-            ):
-                verify_design_deliverables(ROOT, outputs=None)
-        finally:
-            target.write_bytes(original_bytes)
-            os.chmod(target, stat.S_IMODE(original_stat.st_mode))
-            os.utime(
-                target,
-                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-            )
-        self.assertEqual(target.read_bytes(), original_bytes)
+        inventory_path = ROOT / "protocols/v5_2_qd/v51_protected_inventory.json"
+        entry, evidence = verifier_module.capture_v51_integrity(ROOT, inventory_path)
+        exit_fingerprint = json.loads(json.dumps(entry))
+        exit_fingerprint["predictions_content_sha256"] = "0" * 64
+        before = sealed_metadata()
+        with (
+            patch(
+                "mlb_backtest.verify_v52_design.capture_v51_integrity",
+                side_effect=((entry, evidence), (exit_fingerprint, evidence)),
+            ),
+            self.assertRaisesRegex(ValueError, "v5.1 integrity"),
+        ):
+            verify_design_deliverables(ROOT, outputs=None)
+        self.assertEqual(sealed_metadata(), before)
 
     def test_task11_artifacts_are_phase_gated(self) -> None:
         verify_task11_phase(
@@ -248,8 +254,14 @@ class DesignVerificationTest(unittest.TestCase):
                 "totalMs": 4.0,
             },
         }
-        encoded = canonical_json_bytes(good) + b"\n"
-        self.assertEqual(validate_delivery_receipt_payload(encoded, artifact), good)
+        installed_order = json.dumps(good, separators=(",", ":")).encode() + b"\n"
+        sorted_order = canonical_json_bytes(good) + b"\n"
+        self.assertNotEqual(installed_order, sorted_order)
+        for encoded in (installed_order, installed_order[:-1], sorted_order):
+            with self.subTest(encoded=encoded[:20]):
+                self.assertEqual(
+                    validate_delivery_receipt_payload(encoded, artifact), good
+                )
         cases = {
             "minimal": {"ok": True, "stages": good["stages"]},
             "extra": {**good, "artifact_sha256": "0" * 64},
@@ -269,8 +281,153 @@ class DesignVerificationTest(unittest.TestCase):
                 validate_delivery_receipt_payload(
                     canonical_json_bytes(payload) + b"\n", artifact
                 )
-        with self.assertRaisesRegex(ValueError, "canonical delivery receipt"):
-            validate_delivery_receipt_payload(encoded + b" ", artifact)
+        for suffix in (b" ", b"\n\n", b"{}", b"\ntrailing"):
+            with (
+                self.subTest(suffix=suffix),
+                self.assertRaisesRegex(ValueError, "delivery receipt"),
+            ):
+                validate_delivery_receipt_payload(installed_order + suffix, artifact)
+
+    def test_html_verifier_uses_direct_node_and_parses_final_json_line(self) -> None:
+        artifact = json.loads(
+            (ROOT / "reports/v5_1_bt/diagnostic_100_artifact.json").read_text()
+        )
+        counts = {
+            "blocks": 17,
+            "charts": 4,
+            "html": 0,
+            "metrics": 0,
+            "tables": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory).resolve()
+            root = temporary_root / "repo"
+            output = temporary_root / "outputs"
+            artifact_path = root / "reports/v5_1_bt/diagnostic_100_artifact.json"
+            receipt_path = root / DELIVERY_RECEIPT_RELATIVE
+            html_path = output / "mlb_v5_1_100_pick_diagnostic.html"
+            artifact_path.parent.mkdir(parents=True)
+            output.mkdir()
+            artifact_path.write_bytes(canonical_json_bytes(artifact) + b"\n")
+            html_path.write_text("<!doctype html>", encoding="utf-8")
+            receipt = {
+                "ok": True,
+                "html": str(html_path),
+                "stages": {
+                    "validation": "passed",
+                    "package": "passed",
+                    "verification": "passed",
+                },
+                "counts": counts,
+                "sourceDialog": "passed",
+                "sourceInteraction": "semantic_click",
+                "viewports": [1440, 390],
+                "timings": {
+                    "validateAndPackageMs": 1,
+                    "staticChartExtractionMs": 1,
+                    "browserRunMs": 1,
+                    "readerReadyMs": 1,
+                    "contentChecksMs": 1,
+                    "sourceDialogMs": 1,
+                    "responsiveChecksMs": 1,
+                    "verificationMs": 1,
+                    "totalMs": 2,
+                },
+            }
+            receipt_path.write_bytes(
+                json.dumps(receipt, separators=(",", ":")).encode() + b"\n"
+            )
+            verifier = {
+                "ok": True,
+                "counts": counts,
+                "html": str(html_path),
+                "sourceDialog": "passed",
+                "sourceInteraction": "semantic_click",
+                "timings": {
+                    "browserRunMs": 1,
+                    "readerReadyMs": 1,
+                    "contentChecksMs": 1,
+                    "sourceDialogMs": 1,
+                    "responsiveChecksMs": 1,
+                    "totalMs": 2,
+                },
+                "viewports": [1440, 390],
+            }
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="npm notice update available\n"
+                + json.dumps(verifier, separators=(",", ":"))
+                + "\n",
+                stderr="",
+            )
+            with (
+                patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                patch(
+                    "mlb_backtest.verify_v52_design.subprocess.run",
+                    return_value=completed,
+                ) as run,
+            ):
+                result = verify_html_payload(html_path, artifact_path, receipt_path)
+            self.assertEqual(result["sha256"], sha256_file(html_path))
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], "node")
+            self.assertTrue(command[1].endswith("verify_portable_artifact.mjs"))
+            self.assertNotIn("npm", command)
+
+            forged = {**verifier, "unexpected": True}
+            completed.stdout = json.dumps(forged) + "\n"
+            with (
+                patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                patch(
+                    "mlb_backtest.verify_v52_design.subprocess.run",
+                    return_value=completed,
+                ),
+                self.assertRaisesRegex(ValueError, "portable HTML verification"),
+            ):
+                verify_html_payload(html_path, artifact_path, receipt_path)
+
+            forged_counts = {
+                **verifier,
+                "counts": {**counts, "metrics": False},
+            }
+            completed.stdout = json.dumps(forged_counts) + "\n"
+            with (
+                patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                patch(
+                    "mlb_backtest.verify_v52_design.subprocess.run",
+                    return_value=completed,
+                ),
+                self.assertRaisesRegex(ValueError, "portable HTML verification"),
+            ):
+                verify_html_payload(html_path, artifact_path, receipt_path)
+
+    def test_fitted_model_card_scan_rejects_broken_symlink_and_fifo(self) -> None:
+        for kind in ("symlink", "broken_symlink", "fifo", "socket", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                base = root / "models/v5_2_qd/folds"
+                base.mkdir(parents=True)
+                unexpected = base / "unexpected"
+                if kind in {"symlink", "hardlink"}:
+                    source = root / "source"
+                    source.write_text("x", encoding="utf-8")
+                    if kind == "symlink":
+                        unexpected.symlink_to(source)
+                    else:
+                        os.link(source, unexpected)
+                elif kind == "broken_symlink":
+                    unexpected.symlink_to(root / "missing")
+                elif kind == "fifo":
+                    os.mkfifo(unexpected)
+                else:
+                    unix_socket = socket.socket(socket.AF_UNIX)
+                    self.addCleanup(unix_socket.close)
+                    unix_socket.bind(str(unexpected))
+                with self.assertRaisesRegex(
+                    ValueError, "namespace.*symlink|special|hardlink|unexpected"
+                ):
+                    fitted_model_card_count(root)
 
     def test_verifier_uses_no_network_or_python_write_api(self) -> None:
         # Regression defense only: production authority is the verifier's
