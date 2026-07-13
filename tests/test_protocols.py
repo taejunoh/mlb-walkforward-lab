@@ -1112,6 +1112,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     self.assertEqual(list(root.rglob(".*.tmp")), [])
                     if operation == "genesis":
                         self.assertFalse(receipt_dir.exists())
+                        self.assertFalse(receipt_dir.parent.exists())
                         retried = protocols.initialize_postlock_chain(
                             root,
                             game_pk=777001,
@@ -1201,6 +1202,167 @@ class ProspectiveProtocolTest(unittest.TestCase):
             self.assertIn("injected pre-return fchmod failure", error_message)
             self.assertIn("injected pre-return cleanup failure", error_message)
             self.assertIn("recovery path=", error_message)
+
+    def test_exclusive_open_failure_removes_only_new_receipt_directories_and_retries(self):
+        for operation in ("genesis", "append"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                if operation == "append":
+                    prior_state = protocols.initialize_postlock_chain(
+                        root,
+                        game_pk=777001,
+                        lock_basis_start_utc="2026-07-13T23:10:00Z",
+                        persisted_at_utc="2026-07-13T22:25:00Z",
+                    )
+                else:
+                    prior_state = None
+                receipt_root = (
+                    root
+                    / "audit/v5_2_qd/prospective_2026/postlock_chain_receipts"
+                )
+                receipt_dir = receipt_root / "777001"
+                prior_directory_inode = (
+                    receipt_dir.stat().st_ino if receipt_dir.exists() else None
+                )
+                prior_receipts = tuple(
+                    (path.name, path.read_bytes(), path.stat().st_ino)
+                    for path in sorted(receipt_dir.glob("*.json"))
+                )
+                original_open = os.open
+
+                def fail_receipt_open(path, flags, *args, **kwargs):
+                    if (
+                        flags & os.O_EXCL
+                        and "postlock_chain_receipts" in str(path)
+                        and str(path).endswith(".json")
+                    ):
+                        raise OSError("injected receipt exclusive open failure")
+                    return original_open(path, flags, *args, **kwargs)
+
+                with (
+                    patch(
+                        "mlb_backtest.protocols.os.open",
+                        side_effect=fail_receipt_open,
+                    ),
+                    self.assertRaisesRegex(OSError, "exclusive open failure"),
+                ):
+                    if operation == "genesis":
+                        protocols.initialize_postlock_chain(
+                            root,
+                            game_pk=777001,
+                            lock_basis_start_utc="2026-07-13T23:10:00Z",
+                            persisted_at_utc="2026-07-13T22:25:00Z",
+                        )
+                    else:
+                        protocols.append_and_persist_postlock_start_change(
+                            root,
+                            game_pk=777001,
+                            new_effective_start_utc="2026-07-13T23:40:00Z",
+                            observed_at_utc="2026-07-13T22:30:00Z",
+                            lock_basis_start_utc="2026-07-13T23:10:00Z",
+                            state_persisted_at_utc="2026-07-13T22:30:01Z",
+                        )
+                if operation == "genesis":
+                    self.assertFalse(receipt_root.exists())
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "audit/v5_2_qd/prospective_2026/"
+                                "postlock_start_changes/*.jsonl"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "audit/v5_2_qd/prospective_2026/"
+                                "postlock_chain_state/*.json"
+                            )
+                        ),
+                        [],
+                    )
+                    retried = protocols.initialize_postlock_chain(
+                        root,
+                        game_pk=777001,
+                        lock_basis_start_utc="2026-07-13T23:10:00Z",
+                        persisted_at_utc="2026-07-13T22:25:00Z",
+                    )
+                    events, loaded = protocols.validate_persisted_postlock_chain(
+                        root, game_pk=777001
+                    )
+                    self.assertEqual(events, ())
+                    self.assertEqual(loaded, retried)
+                else:
+                    self.assertEqual(receipt_dir.stat().st_ino, prior_directory_inode)
+                    self.assertEqual(
+                        tuple(
+                            (path.name, path.read_bytes(), path.stat().st_ino)
+                            for path in sorted(receipt_dir.glob("*.json"))
+                        ),
+                        prior_receipts,
+                    )
+                    events, loaded = protocols.validate_persisted_postlock_chain(
+                        root, game_pk=777001
+                    )
+                    self.assertEqual(events, ())
+                    self.assertEqual(loaded, prior_state)
+                    event, retried = (
+                        protocols.append_and_persist_postlock_start_change(
+                            root,
+                            game_pk=777001,
+                            new_effective_start_utc="2026-07-13T23:40:00Z",
+                            observed_at_utc="2026-07-13T22:30:00Z",
+                            lock_basis_start_utc="2026-07-13T23:10:00Z",
+                            state_persisted_at_utc="2026-07-13T22:30:01Z",
+                        )
+                    )
+                    self.assertEqual((event.sequence, retried.event_count), (1, 1))
+
+    def test_exclusive_open_directory_cleanup_failure_is_path_rich(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipt_root = (
+                root / "audit/v5_2_qd/prospective_2026/postlock_chain_receipts"
+            )
+            receipt_dir = receipt_root / "777001"
+            original_open = os.open
+
+            def fail_receipt_open(path, flags, *args, **kwargs):
+                if (
+                    flags & os.O_EXCL
+                    and "postlock_chain_receipts" in str(path)
+                    and str(path).endswith(".json")
+                ):
+                    raise OSError("injected receipt exclusive open failure")
+                return original_open(path, flags, *args, **kwargs)
+
+            with (
+                patch(
+                    "mlb_backtest.protocols.os.open",
+                    side_effect=fail_receipt_open,
+                ),
+                patch(
+                    "mlb_backtest.protocols._remove_created_receipt_directories",
+                    side_effect=OSError("injected receipt directory cleanup failure"),
+                    create=True,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "exclusive open recovery failed"
+                ) as raised,
+            ):
+                protocols.initialize_postlock_chain(
+                    root,
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                    persisted_at_utc="2026-07-13T22:25:00Z",
+                )
+            self.assertTrue(receipt_dir.is_dir())
+            error_message = str(raised.exception)
+            self.assertIn("injected receipt exclusive open failure", error_message)
+            self.assertIn("injected receipt directory cleanup failure", error_message)
+            self.assertIn(str(receipt_dir), error_message)
+            self.assertIn("recovery paths=", error_message)
 
     def test_receipt_removal_failure_is_path_rich_and_preserves_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:

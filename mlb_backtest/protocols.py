@@ -685,6 +685,7 @@ class _CreatedPostlockReceipt:
     device: int
     inode: int
     contents: bytes
+    created_directories: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -2104,6 +2105,67 @@ def _postlock_receipt_relative_path(
     )
 
 
+def _remove_created_receipt_directories(
+    created_directories: tuple[Path, ...],
+) -> None:
+    for directory in created_directories:
+        try:
+            directory.rmdir()
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+            _fsync_directory(directory)
+        _fsync_directory(directory.parent)
+
+
+def _create_postlock_receipt_directories(parent: Path) -> tuple[Path, ...]:
+    missing: list[Path] = []
+    candidate = parent
+    while not candidate.exists() and not candidate.is_symlink():
+        missing.append(candidate)
+        candidate = candidate.parent
+    metadata = candidate.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(
+            f"post-lock receipt parent symlink or alias is forbidden: {candidate}"
+        )
+    created: list[Path] = []
+    try:
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                existing = directory.lstat()
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(
+                    existing.st_mode
+                ):
+                    raise ValueError(
+                        "post-lock receipt directory was replaced by an alias: "
+                        f"{directory}"
+                    )
+            else:
+                created.append(directory)
+                _fsync_directory(directory.parent)
+    except BaseException as creation_error:
+        created_bottom_up = tuple(reversed(created))
+        try:
+            _remove_created_receipt_directories(created_bottom_up)
+        except BaseException as cleanup_error:
+            recovery_paths = tuple(
+                str(directory)
+                for directory in created_bottom_up
+                if directory.exists() or directory.is_symlink()
+            )
+            raise RuntimeError(
+                "post-lock receipt directory creation recovery failed; "
+                f"creation error={type(creation_error).__name__}: "
+                f"{creation_error}; cleanup error={type(cleanup_error).__name__}: "
+                f"{cleanup_error}; recovery paths={list(recovery_paths)}"
+            ) from cleanup_error
+        raise
+    return tuple(reversed(created))
+
+
 def _create_postlock_receipt_exclusive(
     root: Path, receipt: PostlockChainReceipt
 ) -> _CreatedPostlockReceipt:
@@ -2116,13 +2178,30 @@ def _create_postlock_receipt_exclusive(
         raise ValueError("post-lock receipt hash differs")
     root_path = _reject_symlink_ancestors(root, "post-lock receipt root")
     path = root_path / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_ancestors(path.parent, "post-lock receipt path")
+    contents = canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n"
+    created_directories = _create_postlock_receipt_directories(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    contents = canonical_json_bytes(_postlock_receipt_raw(receipt)) + b"\n"
-    descriptor = os.open(path, flags, 0o444)
+    try:
+        _reject_symlink_ancestors(path.parent, "post-lock receipt path")
+        descriptor = os.open(path, flags, 0o444)
+    except BaseException as open_error:
+        try:
+            _remove_created_receipt_directories(created_directories)
+        except BaseException as cleanup_error:
+            recovery_paths = tuple(
+                str(directory)
+                for directory in created_directories
+                if directory.exists() or directory.is_symlink()
+            )
+            raise RuntimeError(
+                "post-lock receipt exclusive open recovery failed at "
+                f"{path}; open error={type(open_error).__name__}: {open_error}; "
+                f"cleanup error={type(cleanup_error).__name__}: {cleanup_error}; "
+                f"recovery paths={list(recovery_paths)}"
+            ) from cleanup_error
+        raise
     metadata: os.stat_result | None = None
     written = 0
     creation_error: BaseException | None = None
@@ -2174,6 +2253,7 @@ def _create_postlock_receipt_exclusive(
             device=metadata.st_dev,
             inode=metadata.st_ino,
             contents=contents[:written],
+            created_directories=created_directories,
         )
         try:
             _remove_created_postlock_receipt(created_prefix)
@@ -2203,6 +2283,7 @@ def _create_postlock_receipt_exclusive(
         device=metadata.st_dev,
         inode=metadata.st_ino,
         contents=contents,
+        created_directories=created_directories,
     )
 
 
@@ -2228,13 +2309,7 @@ def _remove_created_postlock_receipt(created: _CreatedPostlockReceipt) -> None:
         raise ValueError(f"refusing to remove modified post-lock receipt: {path}")
     path.unlink()
     _fsync_directory(path.parent)
-    try:
-        path.parent.rmdir()
-    except OSError as exc:
-        if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
-            return
-        raise
-    _fsync_directory(path.parent.parent)
+    _remove_created_receipt_directories(created.created_directories)
 
 
 def load_postlock_chain_receipts(
