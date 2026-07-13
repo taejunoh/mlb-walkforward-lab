@@ -365,12 +365,12 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
-CURRENT_APPROVED_DESIGN_COMMIT = "6b83249"
+CURRENT_APPROVED_DESIGN_COMMIT = "8a16a0e"
 CURRENT_APPROVED_DESIGN_SHA256 = (
-    "3c1b6d5be92a69a66074eabaa3ef517c0d607c8488be7364534c73189358e379"
+    "394584b5b074ec34fe9090526232d8537a1b58b188b09c381c8679238b86ab7c"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "f6b063d4dcc83728676a6e533c69efdea814ec5b4a26cba7a5238826095bd28f"
+    "c5d587d9ffbe547135ae803ba19605d69caf967a93184c356c7dbb5ece762b75"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -1285,6 +1285,7 @@ def _build_prospective_literal() -> dict[str, object]:
                 "population_authority": (
                     "Ed25519_signed_complete_raw_schedule_population_only"
                 ),
+                "duplicated_signed_claims": "exact_match_verified_receipt",
                 "terminal_coverage_required": True,
                 "eligible_omission_forbidden": True,
             },
@@ -1318,6 +1319,12 @@ def _build_prospective_literal() -> dict[str, object]:
             "top1_revalidation": (
                 "reload_roster_and_every_terminal_ledger_exact_projection"
             ),
+            "noncandidate_terminal_precedence": [
+                "SYSTEM_MISS_CLOCK",
+                "SYSTEM_MISS",
+                "TIMESTAMP_PARTIAL_T45",
+                "NO_VERIFIED_T45_SNAPSHOT",
+            ],
             "zero_candidate_slate": "sealed_terminal_date_disposition",
         },
         "shadow_pool": {
@@ -3665,16 +3672,24 @@ def load_prospective_date_roster(
         or hashlib.sha256(receipt_bytes).hexdigest()
         != roster.acquisition_receipt_sha256
         or roster.official_date != official_date
+        or roster.official_date != receipt["official_date"]
         or verified_game_pks != game_pks
         or roster.schedule_snapshot_path != snapshot_relative.as_posix()
         or roster.acquisition_receipt_path != receipt_relative.as_posix()
         or roster.acquisition_signature_path != signature_relative.as_posix()
         or roster.acquisition_public_key_sha256 != public_key_sha
+        or roster.schedule_source != receipt["source"]
+        or roster.observed_at_utc != receipt["observed_at_utc"]
+        or roster.schedule_snapshot_sha256
+        != receipt["schedule_snapshot_sha256"]
+        or len(roster.scheduled_game_pks) != receipt["game_count"]
         or roster.population_sha256 != receipt["population_sha256"]
         or roster.audit_path != manifest_relative.as_posix()
         or roster.schedule_source != "MLB Stats API schedule"
     ):
-        raise ValueError("date roster population, source, path, or hash differs")
+        raise ValueError(
+            "date roster differs from signed acquisition, population, path, or hash"
+        )
     observed = _canonical_utc_datetime(
         roster.observed_at_utc, "date roster observed_at_utc"
     )
@@ -3818,6 +3833,8 @@ def _roster_terminal_projection(
             }
             if "SYSTEM_MISS_CLOCK" in classifications:
                 disposition = "SYSTEM_MISS_CLOCK"
+            elif "UNSUCCESSFUL_RESPONSE_REJECTED" in classifications:
+                disposition = "SYSTEM_MISS"
             elif "TIMESTAMP_PARTIAL_T45" in classifications:
                 disposition = "TIMESTAMP_PARTIAL_T45"
             else:
@@ -3843,7 +3860,7 @@ def _roster_terminal_projection(
     terminal_names = {row["disposition"] for row in dispositions}
     if eligible_games:
         date_state = "LOCK_TOP1"
-    elif "SYSTEM_MISS_CLOCK" in terminal_names:
+    elif {"SYSTEM_MISS_CLOCK", "SYSTEM_MISS"} & terminal_names:
         date_state = "SYSTEM_MISS"
     elif "TIMESTAMP_PARTIAL_T45" in terminal_names:
         date_state = "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"
@@ -3917,6 +3934,7 @@ def load_prospective_candidate_slate(
             or disposition["disposition"]
             not in {
                 "OFFICIAL_CANDIDATE",
+                "SYSTEM_MISS",
                 "SYSTEM_MISS_CLOCK",
                 "TIMESTAMP_PARTIAL_T45",
                 "NO_VERIFIED_T45_SNAPSHOT",
@@ -4011,7 +4029,7 @@ def load_prospective_candidate_slate(
     )
     if official_count:
         derived_date_disposition = "LOCK_TOP1"
-    elif "SYSTEM_MISS_CLOCK" in terminal_names:
+    elif {"SYSTEM_MISS_CLOCK", "SYSTEM_MISS"} & terminal_names:
         derived_date_disposition = "SYSTEM_MISS"
     elif "TIMESTAMP_PARTIAL_T45" in terminal_names:
         derived_date_disposition = "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE"

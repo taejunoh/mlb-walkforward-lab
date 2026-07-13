@@ -624,6 +624,20 @@ class ProspectiveProtocolTest(unittest.TestCase):
                     acquisition_signature=signature,
                 )
 
+    def test_date_roster_manifest_cannot_relabel_signed_observation_time(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            roster = self._seal_date_roster(root, (777001,))
+            manifest_path = root / roster.audit_path
+            relabeled = json.loads(manifest_path.read_bytes())
+            relabeled["observed_at_utc"] = "2026-07-13T19:58:00Z"
+            manifest_path.write_bytes(canonical_json_bytes(relabeled) + b"\n")
+
+            with self.assertRaisesRegex(ValueError, "signed acquisition"):
+                protocols.load_prospective_date_roster(
+                    root, official_date="2026-07-13"
+                )
+
     def test_clock_claims_are_derived_from_raw_and_wrong_revision_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -789,6 +803,129 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 slate.date_disposition,
                 "SHADOW_ONLY_NO_VERIFIED_ELIGIBLE_DATE",
             )
+
+    def test_current_revision_acquisition_failure_is_terminal_system_miss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            old_evidence = self._clock_evidence(root=root, game_pk=777001)
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=False,
+                    away_lineup_count=9,
+                    home_lineup_count=8,
+                    clock_evidence=old_evidence,
+                )
+            current_evidence = self._clock_evidence(
+                root=root,
+                game_pk=777001,
+                countdown_revision=1,
+                basis="2026-07-13T23:40:00Z",
+            )
+            with self._trusted_clock("2026-07-13T22:53:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:40:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=False,
+                    away_lineup_count=9,
+                    home_lineup_count=8,
+                    clock_evidence=current_evidence,
+                )
+            with self._trusted_clock("2026-07-13T22:54:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:40:00Z",
+                    successful=False,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=current_evidence,
+                )
+            with self._trusted_clock("2026-07-13T22:55:00Z"):
+                protocols.seal_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777001
+                )
+            self._sealed_snapshot_ledger(
+                root,
+                game_pk=777002,
+                receipts=(("2026-07-13T22:24:00Z", True, False),),
+            )
+            with self._trusted_clock("2026-07-13T21:00:00Z"):
+                protocols.initialize_prospective_snapshot_ledger(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777003,
+                    lock_basis_start_utc="2026-07-13T23:10:00Z",
+                )
+            third_evidence = self._clock_evidence(root=root, game_pk=777003)
+            with self._trusted_clock("2026-07-13T22:23:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777003,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=False,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=third_evidence,
+                )
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777003,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=True,
+                    away_starter_present=True,
+                    home_starter_present=False,
+                    away_lineup_count=9,
+                    home_lineup_count=8,
+                    clock_evidence=None,
+                )
+            with self._trusted_clock("2026-07-13T22:25:00Z"):
+                protocols.seal_prospective_snapshot_ledger(
+                    root, official_date="2026-07-13", game_pk=777003
+                )
+            self._seal_date_roster(root, (777001, 777002, 777003))
+
+            with self._trusted_clock("2026-07-13T22:56:00Z"):
+                slate = protocols.write_prospective_candidate_slate(
+                    root,
+                    official_date="2026-07-13",
+                    candidates=(),
+                )
+
+            self.assertEqual(
+                [row["disposition"] for row in slate.game_dispositions],
+                [
+                    "SYSTEM_MISS",
+                    "TIMESTAMP_PARTIAL_T45",
+                    "SYSTEM_MISS_CLOCK",
+                ],
+            )
+            self.assertEqual(slate.expected_candidate_count, 0)
+            self.assertEqual(slate.date_disposition, "SYSTEM_MISS")
 
     def test_candidate_slate_rejects_date_disposition_relabeling(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1509,11 +1646,11 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_COMMIT", None),
-            "6b83249",
+            "8a16a0e",
         )
         self.assertEqual(
             getattr(protocols, "CURRENT_APPROVED_DESIGN_SHA256", None),
-            "3c1b6d5be92a69a66074eabaa3ef517c0d607c8488be7364534c73189358e379",
+            "394584b5b074ec34fe9090526232d8537a1b58b188b09c381c8679238b86ab7c",
         )
         self.assertEqual(protocols.approved_design_bytes(ROOT), design_path.read_bytes())
         self.assertEqual(
@@ -3470,7 +3607,7 @@ class ProspectiveProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "f6b063d4dcc83728676a6e533c69efdea814ec5b4a26cba7a5238826095bd28f",
+            "c5d587d9ffbe547135ae803ba19605d69caf967a93184c356c7dbb5ece762b75",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
