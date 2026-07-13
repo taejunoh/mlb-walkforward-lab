@@ -1573,7 +1573,7 @@ def parse_change_contract(raw: object) -> Mapping[str, object]:
     obj = require_exact_keys(raw, CHANGE_KEYS, "change_contract")
     expected = {"schema_version": 1, "model_version": "v5.2-QD", "unchanged": list(CHANGE_UNCHANGED),
                 "changed": list(CHANGE_CHANGED), "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
-                "approved_design_commit": "a4aa8d2"}
+                "approved_design_commit": CURRENT_APPROVED_DESIGN_COMMIT}
     for key, value in expected.items():
         if obj[key] != value:
             raise ValueError(f"change_contract.{key} differs")
@@ -1588,8 +1588,11 @@ def const_schema(raw: Mapping[str, object], required: frozenset[str]) -> dict[st
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(canonical_json_bytes(value) + b"\n")
 
+CURRENT_APPROVED_DESIGN_COMMIT = "fb728b3"
+CURRENT_APPROVED_DESIGN_SHA256 = "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
+
 def approved_design_bytes(root: Path) -> bytes:
-    completed = subprocess.run(["git", "show", "a4aa8d2:docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"], cwd=root, check=False, capture_output=True)
+    completed = subprocess.run(["git", "show", f"{CURRENT_APPROVED_DESIGN_COMMIT}:docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"], cwd=root, check=False, capture_output=True)
     if completed.returncode: raise ValueError("approved design blob unavailable")
     return completed.stdout
 
@@ -1597,7 +1600,7 @@ def write_v52_config_contracts(root: Path) -> None:
     config = expected_v52_config(); config_path = root / "config/v5_2_qd.json"; write_json(config_path, config)
     change = {"schema_version": 1, "model_version": "v5.2-QD", "unchanged": list(CHANGE_UNCHANGED), "changed": list(CHANGE_CHANGED),
               "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN), "config_sha256": sha256_file(config_path),
-              "approved_design_commit": "a4aa8d2", "approved_design_blob_sha256": hashlib.sha256(approved_design_bytes(root)).hexdigest()}
+              "approved_design_commit": CURRENT_APPROVED_DESIGN_COMMIT, "approved_design_blob_sha256": hashlib.sha256(approved_design_bytes(root)).hexdigest()}
     write_json(root / "schemas/v5_2_qd.schema.json", const_schema(config, V52_REQUIRED_KEYS))
     write_json(root / "protocols/v5_2_qd/change_contract.json", change)
 ```
@@ -2463,7 +2466,7 @@ if __name__ == "__main__":
 
 Write `prospective_2026.json` from `expected_prospective_spec()` and generate a closed schema mirror whose top-level `const` is that exact JSON and whose nested required/property keys mirror every dict above. This phase defines and validates the protocol only; it creates no pre-2026-07-13 snapshot and never backfills a missed date.
 
-Quality-hardening amendment: the frozen contract also publishes an approved-design blob pin and is checked against an independent frozen canonical digest, the exact typed snapshot fields used to prove the immutable start basis and T-45 receipt window, the exact typed `POSTLOCK_START_CHANGE` fields and SHA-256 append chain, and the complete official-candidate row fields. The canonical event log is `audit/v5_2_qd/prospective_2026/postlock_start_changes/{gamePk}.jsonl`; its chain count/head must be verified against the mandatory independently persisted state at `audit/v5_2_qd/prospective_2026/postlock_chain_state/{gamePk}.json`. Initialization, loading, validation, and append APIs are path-bound; append reloads both files itself and cannot accept caller-supplied prior state. Event log plus successor state publication is one transactional `_publish_bundle`, fsynced and postcondition-verified before acknowledgement. Every initialized and appended head also creates an immutable `O_EXCL`, fsynced receipt at `audit/v5_2_qd/prospective_2026/postlock_chain_receipts/{gamePk}/{sequence:08d}-{head_hash}.json`, and every per-game initialization/append transaction is serialized by an interprocess `flock` at `audit/v5_2_qd/prospective_2026/locks/{gamePk}.lock`; contiguous receipt history must remain after any log/state rollback for that rollback to be detected, while arbitrary external deletion of the later anchor is outside the local API-enforced threat boundary. If an initialization or append is not acknowledged, rollback removes only the receipt created by that attempt after exact path, inode, and canonical-byte verification, fsyncs the receipt directory, and then restores the prior log/state pair; a receipt-removal failure is a path-rich bundle rollback failure that preserves fsynced recovery evidence rather than deleting an earlier acknowledged receipt. Candidate eligibility and counted Top 1 membership are separate gates: no candidate may preclaim Top 1, and final exact ranking runs only against the canonical sealed manifest at `audit/v5_2_qd/prospective_2026/candidate_slates/{official_date}.json`. The entire projection, existing-seal check, publication, and postcondition sequence is serialized by a safe per-date interprocess `flock` at `audit/v5_2_qd/prospective_2026/candidate_slate_locks/{official_date}.lock`; the manifest is immutable sealed-once, with only an exact same-manifest retry returning the existing seal idempotently. That manifest binds the complete sorted candidate IDs/count/digest and each snapshot lock receipt; `all_locks_sealed` is derived from every bound eligible lock and `final_lock_receipt_at_utc` is the maximum candidate receipt, never caller assertions. Runtime helpers must select the latest successful complete qualifying snapshot, validate every effective-start transition including return-to-prior-start transitions, reject symlinks in every root ancestor or canonical audit path, apply date-state precedence over a set/list of active conditions, and preserve fsynced recovery files with their exact paths if bundle rollback itself fails. These are protocol-verification rules only; they do not create a collector, observation, lock, or backfill.
+Quality-hardening amendment: the frozen contract also publishes an approved-design blob pin and is checked against an independent frozen canonical digest, the exact typed snapshot fields used to prove the immutable start basis and T-45 receipt window, the exact typed `POSTLOCK_START_CHANGE` fields and SHA-256 append chain, and the complete official-candidate row fields. The canonical event log is `audit/v5_2_qd/prospective_2026/postlock_start_changes/{gamePk}.jsonl`; its chain count/head must be verified against the mandatory independently persisted state at `audit/v5_2_qd/prospective_2026/postlock_chain_state/{gamePk}.json`. Initialization, loading, validation, and append APIs are path-bound; append reloads both files itself and cannot accept caller-supplied prior state. Event log plus successor state publication is one transactional `_publish_bundle`, fsynced and postcondition-verified before acknowledgement. Every initialized and appended head also creates an immutable `O_EXCL`, fsynced receipt at `audit/v5_2_qd/prospective_2026/postlock_chain_receipts/{gamePk}/{sequence:08d}-{head_hash}.json`, and every per-game initialization/append transaction is serialized by an interprocess `flock` at `audit/v5_2_qd/prospective_2026/locks/{gamePk}.lock`; contiguous receipt history must remain after any log/state rollback for that rollback to be detected, while arbitrary external deletion of the later anchor is outside the local API-enforced threat boundary. If an initialization or append is not acknowledged, rollback removes only the receipt created by that attempt after exact path, inode, and canonical-byte verification, fsyncs the receipt directory, and then restores the prior log/state pair; a receipt-removal failure is a path-rich bundle rollback failure that preserves fsynced recovery evidence rather than deleting an earlier acknowledged receipt. Candidate eligibility and counted Top 1 membership are separate gates: no candidate may preclaim Top 1, and final exact ranking runs only against the canonical sealed manifest at `audit/v5_2_qd/prospective_2026/candidate_slates/{official_date}.json`. Every official candidate carries the typed selected `ProspectiveSnapshot` plus its ordered candidate history; canonical snapshot ID and SHA-256 are derived from the exact typed fields, and the gate requires `select_qualifying_snapshot(history) == selected`, candidate `recorded_at_utc == selected.receipt_at_utc`, candidate `lock_receipt_at_utc == selected.lock_at_utc`, and an official America/New_York date no earlier than 2026-07-13. Each slate receipt binds snapshot ID/SHA-256 together with `lock_basis_start_utc`, `lock_at_utc`, and `receipt_at_utc`. The entire projection, existing-seal check, publication, and postcondition sequence is serialized by a safe per-date interprocess `flock` at `audit/v5_2_qd/prospective_2026/candidate_slate_locks/{official_date}.lock`; the manifest is immutable sealed-once, with only an exact same-manifest retry returning the existing seal idempotently. That manifest binds the complete sorted candidate IDs/count/digest and each snapshot lock receipt; `all_locks_sealed` is derived from every bound eligible lock and `final_lock_receipt_at_utc` is the maximum candidate receipt, never caller assertions. Runtime helpers must select the latest successful complete qualifying snapshot, validate every effective-start transition including return-to-prior-start transitions, reject symlinks in every root ancestor or canonical audit path, apply date-state precedence over a set/list of active conditions, and preserve fsynced recovery files with their exact paths if bundle rollback itself fails. These are protocol-verification rules only; they do not create a collector, observation, lock, or backfill.
 
 - [ ] **Step 4: Run all protocol tests and lint**
 
@@ -2509,7 +2512,7 @@ class DesignVerificationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "protected v5.1 inventory"):
                     verify_protected_inventory(repo, inventory)
 
-    def test_inventory_is_pinned_to_approved_design_commit(self):
+    def test_inventory_is_pinned_to_v51_protected_baseline_commit(self):
         inventory_path = ROOT / "protocols/v5_2_qd/v51_protected_inventory.json"
         inventory = json.loads(inventory_path.read_text())
         self.assertEqual(inventory["approved_commit"], "a4aa8d2")
@@ -2531,7 +2534,9 @@ Expected: `ERROR` importing `mlb_backtest.verify_v52_design`.
 - [ ] **Step 3: Implement requirement-by-requirement verification**
 
 ```python
-APPROVED_DESIGN_COMMIT = "a4aa8d2"
+V51_PROTECTED_BASELINE_COMMIT = "a4aa8d2"
+CURRENT_APPROVED_DESIGN_COMMIT = "fb728b3"
+CURRENT_APPROVED_DESIGN_SHA256 = "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
 PROTECTED_TREES = ("data/v5_1_bt", "audit/v5_1_bt")
 PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
 HISTORICAL_NAMESPACE_ROOTS = ("data/v5_2_qd/historical", "reports/v5_2_qd/historical", "audit/v5_2_qd/historical")
@@ -2551,7 +2556,7 @@ def git(root: Path, *args: str) -> bytes:
         raise ValueError(completed.stderr.decode(errors="replace"))
     return completed.stdout
 
-def build_git_inventory(root: Path, commit: str = APPROVED_DESIGN_COMMIT) -> dict[str, object]:
+def build_git_inventory(root: Path, commit: str = V51_PROTECTED_BASELINE_COMMIT) -> dict[str, object]:
     paths = (*PROTECTED_TREES, *PROTECTED_FILES)
     raw = git(root, "ls-tree", "-r", "-z", "--full-tree", commit, "--", *paths)
     entries: dict[str, str] = {}
@@ -2656,8 +2661,14 @@ def verify_change_contract(root: Path) -> None:
     contract = parse_change_contract(json.loads((root / "protocols/v5_2_qd/change_contract.json").read_text()))
     if contract["config_sha256"] != sha256_file(root / "config/v5_2_qd.json"):
         raise ValueError("change contract config digest differs")
-    design_blob = git(root, "rev-parse", f"{APPROVED_DESIGN_COMMIT}:docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md").decode().strip()
-    if contract["approved_design_blob_sha256"] != hashlib.sha256(git(root, "cat-file", "blob", design_blob)).hexdigest():
+    design_path = "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
+    design_blob = git(root, "rev-parse", f"{CURRENT_APPROVED_DESIGN_COMMIT}:{design_path}").decode().strip()
+    approved_design = git(root, "cat-file", "blob", design_blob)
+    if hashlib.sha256(approved_design).hexdigest() != CURRENT_APPROVED_DESIGN_SHA256:
+        raise ValueError("current approved design digest differs")
+    if require_regular_file(root, design_path).read_bytes() != approved_design:
+        raise ValueError("working design differs from current approved design blob")
+    if contract["approved_design_blob_sha256"] != CURRENT_APPROVED_DESIGN_SHA256:
         raise ValueError("change contract design digest differs")
 
 FORBIDDEN_CLAIMS = ("시장 대비 우위가 입증", "ROI가 양수", "CLV가 양수", "수익성이 입증", "actionable betting", "predictive improvement established")
@@ -2716,7 +2727,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-The production inventory is generated with `build_git_inventory(ROOT, "a4aa8d2")`; never snapshot the post-Task-10 tree as the baseline.
+The v5.1 protected inventory is generated with `build_git_inventory(ROOT, V51_PROTECTED_BASELINE_COMMIT)` where the baseline remains `a4aa8d2`; never snapshot the post-Task-10 tree as that baseline. This is intentionally separate from the current independently reviewed design pin, `CURRENT_APPROVED_DESIGN_COMMIT="fb728b3"` and `CURRENT_APPROVED_DESIGN_SHA256="551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"`. The verifier entry/exit current-scope fingerprint includes both this implementation plan and the current design specification so either document changing during verification fails the final boundary.
 
 - [ ] **Step 4: Run focused and full regression verification**
 

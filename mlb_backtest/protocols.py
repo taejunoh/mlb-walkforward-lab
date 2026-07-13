@@ -360,11 +360,12 @@ PROSPECTIVE_DATE_PRECEDENCE = [
     "NO_VERIFIED_ELIGIBLE_DATE",
     "LOCK_TOP1",
 ]
-APPROVED_DESIGN_BLOB_SHA256 = (
-    "a640e89298297f656b992ebc0f9c0d27d2fe130802760b7bab63f421f51ff2d5"
+CURRENT_APPROVED_DESIGN_COMMIT = "fb728b3"
+CURRENT_APPROVED_DESIGN_SHA256 = (
+    "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c"
 )
 PROSPECTIVE_CONTRACT_CANONICAL_SHA256 = (
-    "f590dcfdeadc0dd5b04fdb1c16bb5ab3a25ae56fe3ffa96e1e7724b499799bb9"
+    "2f74e5b5bcba1be033f5955310b4f4261d33a7b7bcecdaa39cc2e021553641bf"
 )
 POSTLOCK_GENESIS_HASH = "0" * 64
 POSTLOCK_RECEIPT_GENESIS_HASH = "0" * 64
@@ -1096,8 +1097,8 @@ def _build_prospective_literal() -> dict[str, object]:
         "pooling_forbidden": True,
         "backfill_forbidden": True,
         "freeze_pin": {
-            "approved_design_commit": "a4aa8d2",
-            "approved_design_blob_sha256": APPROVED_DESIGN_BLOB_SHA256,
+            "approved_design_commit": CURRENT_APPROVED_DESIGN_COMMIT,
+            "approved_design_blob_sha256": CURRENT_APPROVED_DESIGN_SHA256,
         },
     }
 
@@ -1119,9 +1120,9 @@ def parse_prospective_spec(raw: object) -> ProspectiveSpec:
         "prospective.freeze_pin",
     )
     if (
-        freeze_pin["approved_design_commit"] != "a4aa8d2"
+        freeze_pin["approved_design_commit"] != CURRENT_APPROVED_DESIGN_COMMIT
         or freeze_pin["approved_design_blob_sha256"]
-        != APPROVED_DESIGN_BLOB_SHA256
+        != CURRENT_APPROVED_DESIGN_SHA256
     ):
         raise ValueError("prospective approved design pin differs")
     polling = require_exact_keys(obj["polling"], POLLING_KEYS, "prospective.polling")
@@ -3364,7 +3365,7 @@ def parse_change_contract(raw: object) -> Mapping[str, object]:
         "unchanged": list(CHANGE_UNCHANGED),
         "changed": list(CHANGE_CHANGED),
         "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
-        "approved_design_commit": "a4aa8d2",
+        "approved_design_commit": CURRENT_APPROVED_DESIGN_COMMIT,
     }
     for key, value in expected.items():
         _validate_literal(obj[key], value, f"change_contract.{key}")
@@ -3466,7 +3467,7 @@ def write_prospective_contract(
         else approved_design_root.resolve()
     )
     design_digest = hashlib.sha256(approved_design_bytes(design_root)).hexdigest()
-    if design_digest != APPROVED_DESIGN_BLOB_SHA256:
+    if design_digest != CURRENT_APPROVED_DESIGN_SHA256:
         raise ValueError("prospective approved design pin differs")
     raw = expected_prospective_spec()
     parse_prospective_spec(raw)
@@ -3666,7 +3667,7 @@ def approved_design_bytes(root: Path) -> bytes:
         [
             "git",
             "show",
-            "a4aa8d2:docs/superpowers/specs/"
+            f"{CURRENT_APPROVED_DESIGN_COMMIT}:docs/superpowers/specs/"
             "2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
         ],
         cwd=root,
@@ -3697,7 +3698,7 @@ def write_v52_config_contracts(
         "changed": list(CHANGE_CHANGED),
         "forbidden_from_2025_diagnostic": list(CHANGE_FORBIDDEN),
         "config_sha256": hashlib.sha256(config_contents).hexdigest(),
-        "approved_design_commit": "a4aa8d2",
+        "approved_design_commit": CURRENT_APPROVED_DESIGN_COMMIT,
         "approved_design_blob_sha256": hashlib.sha256(design_contents).hexdigest(),
     }
     schema_contents = (

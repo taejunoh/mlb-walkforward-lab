@@ -4,6 +4,7 @@ from dataclasses import replace
 from threading import Barrier, BrokenBarrierError
 from unittest.mock import patch
 import copy
+import hashlib
 import json
 import os
 import stat
@@ -69,6 +70,26 @@ PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
 
 
 class ProspectiveProtocolTest(unittest.TestCase):
+    def test_current_approved_design_pin_matches_reviewed_blob(self):
+        design_path = (
+            ROOT
+            / "docs/superpowers/specs/"
+            "2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
+        )
+        self.assertEqual(
+            getattr(protocols, "CURRENT_APPROVED_DESIGN_COMMIT", None),
+            "fb728b3",
+        )
+        self.assertEqual(
+            getattr(protocols, "CURRENT_APPROVED_DESIGN_SHA256", None),
+            "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c",
+        )
+        self.assertEqual(protocols.approved_design_bytes(ROOT), design_path.read_bytes())
+        self.assertEqual(
+            hashlib.sha256(protocols.approved_design_bytes(ROOT)).hexdigest(),
+            protocols.CURRENT_APPROVED_DESIGN_SHA256,
+        )
+
     def _snapshot(
         self,
         *,
@@ -1780,11 +1801,15 @@ class ProspectiveProtocolTest(unittest.TestCase):
         self.assertEqual(second["polling"]["max_ntp_offset_seconds"], 2)
         self.assertEqual(
             second["freeze_pin"]["approved_design_blob_sha256"],
-            protocols.APPROVED_DESIGN_BLOB_SHA256,
+            protocols.CURRENT_APPROVED_DESIGN_SHA256,
+        )
+        self.assertEqual(
+            second["freeze_pin"]["approved_design_commit"],
+            protocols.CURRENT_APPROVED_DESIGN_COMMIT,
         )
         self.assertEqual(
             protocols.PROSPECTIVE_CONTRACT_CANONICAL_SHA256,
-            "f590dcfdeadc0dd5b04fdb1c16bb5ab3a25ae56fe3ffa96e1e7724b499799bb9",
+            "2f74e5b5bcba1be033f5955310b4f4261d33a7b7bcecdaa39cc2e021553641bf",
         )
         with self.assertRaisesRegex(ValueError, "prospective spec differs"):
             parse_prospective_spec(first)
@@ -2529,6 +2554,14 @@ class V52ConfigTest(unittest.TestCase):
         self.assertEqual(contract["changed"], CHANGE_CHANGED)
         self.assertEqual(contract["forbidden_from_2025_diagnostic"], CHANGE_FORBIDDEN)
         self.assertEqual(contract["config_sha256"], sha256_file(V52_CONFIG))
+        self.assertEqual(
+            contract["approved_design_commit"],
+            protocols.CURRENT_APPROVED_DESIGN_COMMIT,
+        )
+        self.assertEqual(
+            contract["approved_design_blob_sha256"],
+            protocols.CURRENT_APPROVED_DESIGN_SHA256,
+        )
         self.assertEqual(load_change_contract(ROOT), contract)
 
     def test_contract_loader_rejects_config_and_design_digest_tampering(self):

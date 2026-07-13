@@ -32,6 +32,8 @@ from mlb_backtest.protocols import (
     FOLD_REQUIRED_KEYS,
     RUN_REQUIRED_KEYS,
     V52_REQUIRED_KEYS,
+    CURRENT_APPROVED_DESIGN_COMMIT,
+    CURRENT_APPROVED_DESIGN_SHA256,
     ProspectiveSpec,
     RunSpec,
     V52Config,
@@ -49,7 +51,7 @@ from mlb_backtest.notebook_artifact import execute_notebook_cells, notebook_sour
 from mlb_backtest.report_artifact import build_chart_map, build_report_artifact
 
 
-APPROVED_DESIGN_COMMIT = "a4aa8d2"
+V51_PROTECTED_BASELINE_COMMIT = "a4aa8d2"
 PROTECTED_TREES = ("data/v5_1_bt", "audit/v5_1_bt")
 PROTECTED_FILES = ("config/v5_1_bt.json", "data/v5_1_bt/reports/summary.json")
 HISTORICAL_NAMESPACE_ROOTS = (
@@ -90,6 +92,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_protocols.py",
     "tests/test_preflight.py",
     "tests/test_verify_v52_design.py",
+    "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
     "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
 )
 FORBIDDEN_NAMESPACE_ROOTS = (
@@ -573,7 +576,7 @@ def git(root: Path, *args: str) -> bytes:
 
 
 def build_git_inventory(
-    root: Path, commit: str = APPROVED_DESIGN_COMMIT
+    root: Path, commit: str = V51_PROTECTED_BASELINE_COMMIT
 ) -> dict[str, object]:
     paths = (*PROTECTED_TREES, *PROTECTED_FILES)
     raw = git(root, "ls-tree", "-r", "-z", "--full-tree", commit, "--", *paths)
@@ -887,13 +890,17 @@ def verify_change_contract(root: Path) -> Mapping[str, object]:
         "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
     )
     design_blob = (
-        git(root, "rev-parse", f"{APPROVED_DESIGN_COMMIT}:{design_path}")
+        git(root, "rev-parse", f"{CURRENT_APPROVED_DESIGN_COMMIT}:{design_path}")
         .decode()
         .strip()
     )
-    design_digest = hashlib.sha256(
-        git(root, "cat-file", "blob", design_blob)
-    ).hexdigest()
+    approved_design = git(root, "cat-file", "blob", design_blob)
+    design_digest = hashlib.sha256(approved_design).hexdigest()
+    if design_digest != CURRENT_APPROVED_DESIGN_SHA256:
+        raise ValueError("current approved design digest differs")
+    working_design = require_regular_file(root, design_path).read_bytes()
+    if working_design != approved_design:
+        raise ValueError("working design differs from current approved design blob")
     if contract["approved_design_blob_sha256"] != design_digest:
         raise ValueError("change contract design digest differs")
     return contract
@@ -906,7 +913,7 @@ def verify_prospective_pin(
     if not isinstance(freeze_pin, Mapping):
         raise ValueError("prospective freeze pin missing")
     if (
-        freeze_pin.get("approved_design_commit") != APPROVED_DESIGN_COMMIT
+        freeze_pin.get("approved_design_commit") != CURRENT_APPROVED_DESIGN_COMMIT
         or freeze_pin.get("approved_design_blob_sha256")
         != contract["approved_design_blob_sha256"]
     ):
@@ -1242,7 +1249,7 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     )
     if not isinstance(inventory, Mapping):
         raise ValueError("protected v5.1 inventory must be an object")
-    if inventory["approved_commit"] != APPROVED_DESIGN_COMMIT:
+    if inventory["approved_commit"] != V51_PROTECTED_BASELINE_COMMIT:
         raise ValueError("protected v5.1 inventory is not pinned to approved commit")
     ensure_expected_files(root)
     diagnostic = verify_diagnostic(root, entry_evidence)

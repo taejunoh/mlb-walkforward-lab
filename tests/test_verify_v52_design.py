@@ -25,7 +25,6 @@ from mlb_backtest.protocols import (
     parse_run_spec,
 )
 from mlb_backtest.verify_v52_design import (
-    APPROVED_DESIGN_COMMIT,
     CANONICAL_JSON_FILES,
     DELIVERY_RECEIPT_RELATIVE,
     FINAL_HTML_PATH,
@@ -53,12 +52,73 @@ from mlb_backtest.verify_v52_design import (
     write_git_inventory,
 )
 from tests.test_preflight import make_complete_inventory
+import mlb_backtest.verify_v52_design as verifier_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class DesignVerificationTest(unittest.TestCase):
+    def test_design_and_v51_baseline_use_distinct_reviewed_commits(self) -> None:
+        self.assertEqual(
+            getattr(verifier_module, "CURRENT_APPROVED_DESIGN_COMMIT", None),
+            "fb728b3",
+        )
+        self.assertEqual(
+            getattr(verifier_module, "CURRENT_APPROVED_DESIGN_SHA256", None),
+            "551e9f83e8f10ba7d7db3ee2cc756d4e9493eba756dd118babe74b95b513330c",
+        )
+        self.assertEqual(
+            getattr(verifier_module, "V51_PROTECTED_BASELINE_COMMIT", None),
+            "a4aa8d2",
+        )
+        self.assertNotEqual(
+            verifier_module.CURRENT_APPROVED_DESIGN_COMMIT,
+            verifier_module.V51_PROTECTED_BASELINE_COMMIT,
+        )
+
+    def test_current_scope_fingerprints_design_and_implementation_plan(self) -> None:
+        required_docs = {
+            "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
+            "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+        }
+        self.assertTrue(
+            required_docs.issubset(set(verifier_module.CURRENT_SCOPE_SINGLE_FILES))
+        )
+        scope = verifier_module.capture_current_scope(ROOT)
+        self.assertTrue(required_docs.issubset(set(scope["single_files"])))
+
+    def test_change_contract_rejects_working_design_that_differs_from_pin(self) -> None:
+        design_relative = (
+            "docs/superpowers/specs/"
+            "2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
+        )
+        approved_bytes = (ROOT / design_relative).read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for relative in (
+                "config/v5_2_qd.json",
+                "protocols/v5_2_qd/change_contract.json",
+                design_relative,
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            (root / design_relative).write_bytes(approved_bytes + b"late mutation\n")
+
+            def fake_git(_root: Path, *args: str) -> bytes:
+                if args[:2] == ("rev-parse", f"{verifier_module.CURRENT_APPROVED_DESIGN_COMMIT}:{design_relative}"):
+                    return b"approved-blob\n"
+                if args == ("cat-file", "blob", "approved-blob"):
+                    return approved_bytes
+                raise AssertionError(args)
+
+            with (
+                patch("mlb_backtest.verify_v52_design.git", side_effect=fake_git),
+                self.assertRaisesRegex(ValueError, "working design.*approved|approved.*working design"),
+            ):
+                verifier_module.verify_change_contract(root)
+
     def test_current_deliverables_cross_validate(self) -> None:
         receipt = verify_design_deliverables(ROOT, outputs=None)
         self.assertEqual(
@@ -513,6 +573,7 @@ class DesignVerificationTest(unittest.TestCase):
                 "scripts",
                 "tests",
                 ".gitignore",
+                "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
                 "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
             ):
                 source = ROOT / relative
@@ -552,6 +613,17 @@ class DesignVerificationTest(unittest.TestCase):
             protocol.write_bytes(protocol.read_bytes() + b" ")
             after = verifier_module.capture_current_scope(root)
             self.assertNotEqual(before, after)
+
+            shutil.copy2(ROOT / "protocols/v5_2_qd/prospective_2026.json", protocol)
+            before_design_mutation = verifier_module.capture_current_scope(root)
+            design = (
+                root
+                / "docs/superpowers/specs/"
+                "2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
+            )
+            design.write_bytes(design.read_bytes() + b" ")
+            after_design_mutation = verifier_module.capture_current_scope(root)
+            self.assertNotEqual(before_design_mutation, after_design_mutation)
 
     def test_final_boundary_rechecks_scope_and_forbidden_namespaces(self) -> None:
         import mlb_backtest.verify_v52_design as verifier_module
@@ -862,7 +934,7 @@ class DesignVerificationTest(unittest.TestCase):
     def test_inventory_is_pinned_to_approved_design_commit(self) -> None:
         inventory_path = ROOT / "protocols/v5_2_qd/v51_protected_inventory.json"
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-        self.assertEqual(APPROVED_DESIGN_COMMIT, "a4aa8d2")
+        self.assertEqual(verifier_module.V51_PROTECTED_BASELINE_COMMIT, "a4aa8d2")
         self.assertEqual(inventory["approved_commit"], "a4aa8d2")
         self.assertEqual(inventory, build_git_inventory(ROOT, "a4aa8d2"))
         self.assertEqual(
