@@ -14,7 +14,7 @@
         "away_score": {"$ref": "#/$defs/nullableNonnegative"},
         "away_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
         "away_team_id": {"$ref": "#/$defs/positiveId"},
-        "boxscore_sha256": {"$ref": "#/$defs/sha256"},
+        "boxscore_query_sidecar_sha256": {"$ref": "#/$defs/sha256"},
         "completed_innings": {"$ref": "#/$defs/nullableNonnegative"},
         "doubleheader_order": {"type": "integer", "minimum": 1},
         "feature_history_cutoff": {"$ref": "#/$defs/date"},
@@ -23,6 +23,8 @@
         "home_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
         "home_team_id": {"$ref": "#/$defs/positiveId"},
         "official_date": {"$ref": "#/$defs/date"},
+        "neutral_site": {"type": "boolean"},
+        "alternate_site": {"type": "boolean"},
         "participant_provenance": {"enum": ["RECONSTRUCTED_FINAL_PARTICIPANTS", "HISTORICAL_NO_PARTICIPANTS"]},
         "played": {"type": "boolean"},
         "scheduled_innings": {"$ref": "#/$defs/nullableNonnegative"},
@@ -30,12 +32,13 @@
         "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
         "season_start_date": {"$ref": "#/$defs/date"},
         "source_game_sha256": {"$ref": "#/$defs/sha256"},
+        "schedule_query_sidecar_sha256": {"$ref": "#/$defs/sha256"},
         "terminal_status": {"type": "string", "minLength": 1},
         "venue_id": {"$ref": "#/$defs/positiveId"},
         "verification_status": {"enum": ["VERIFIED", "INELIGIBLE_UNPLAYED"]},
         "winner_team_id": {"oneOf": [{"$ref": "#/$defs/positiveId"}, {"type": "null"}]}
       },
-      "required": ["away_team_id", "completed_innings", "doubleheader_order", "feature_history_cutoff", "game_pk", "home_team_id", "official_date", "participant_provenance", "played", "scheduled_innings", "scheduled_start_utc", "season", "source_game_sha256", "terminal_status", "venue_id", "verification_status"],
+      "required": ["alternate_site", "away_team_id", "completed_innings", "doubleheader_order", "feature_history_cutoff", "game_pk", "home_team_id", "neutral_site", "official_date", "participant_provenance", "played", "schedule_query_sidecar_sha256", "scheduled_innings", "scheduled_start_utc", "season", "source_game_sha256", "terminal_status", "venue_id", "verification_status"],
       "oneOf": [
         {
           "properties": {
@@ -49,7 +52,7 @@
             "verification_status": {"const": "VERIFIED"},
             "winner_team_id": {"$ref": "#/$defs/positiveId"}
           },
-          "required": ["actual_starter_ids", "away_score", "away_starting_hitter_ids", "boxscore_sha256", "home_score", "home_starting_hitter_ids", "winner_team_id"]
+          "required": ["actual_starter_ids", "away_score", "away_starting_hitter_ids", "boxscore_query_sidecar_sha256", "home_score", "home_starting_hitter_ids", "winner_team_id"]
         },
         {
           "properties": {
@@ -105,12 +108,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "alternate_site": {"type": "boolean"},
         "neutral_site": {"type": "boolean"},
         "official_date": {"$ref": "#/$defs/date"},
         "time_zone": {"type": "string", "minLength": 1},
         "venue_id": {"$ref": "#/$defs/positiveId"}
       },
-      "required": ["neutral_site", "official_date", "time_zone", "venue_id"]
+      "required": ["alternate_site", "neutral_site", "official_date", "time_zone", "venue_id"]
     },
     "historyGame": {
       "type": "object",
@@ -171,6 +175,43 @@
         "source_snapshot_sha256": {"$ref": "#/$defs/sha256"}
       },
       "required": ["games", "grain", "schema_version", "source_game_sha256s", "source_snapshot_sha256"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "grain": {"const": "pitch"},
+        "parent_coverage": {"type": "object", "additionalProperties": false, "properties": {"inclusive_start": {"$ref": "#/$defs/date"}, "inclusive_end": {"$ref": "#/$defs/date"}}, "required": ["inclusive_start", "inclusive_end"]},
+        "children": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "properties": {"inclusive_start": {"$ref": "#/$defs/date"}, "inclusive_end": {"$ref": "#/$defs/date"}, "query_sidecar_sha256": {"$ref": "#/$defs/sha256"}, "split_disposition": {"const": "READY"}}, "required": ["inclusive_start", "inclusive_end", "query_sidecar_sha256", "split_disposition"]}},
+        "child_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "played_game_pks": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
+        "statcast_game_pks": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
+        "unique_pitch_count": {"type": "integer", "minimum": 0},
+        "split_state": {"const": "READY_COMPLETE"}
+      },
+      "required": ["schema_version", "grain", "parent_coverage", "children", "child_query_sidecar_sha256s", "played_game_pks", "statcast_game_pks", "unique_pitch_count", "split_state"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "grain": {"const": "season_d1_league_pitching_reference"},
+        "records": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "properties": {"as_of_date": {"$ref": "#/$defs/date"}, "consumer_cutoff_dates": {"type": "object", "additionalProperties": {"$ref": "#/$defs/date"}}, "consuming_game_pks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true}, "earned_runs": {"type": "integer", "minimum": 0}, "outs": {"type": "integer", "minimum": 0}, "batters_faced": {"type": "integer", "minimum": 0}, "disposition": {"const": "PRESEASON_NO_CURRENT_SEASON_PITCHING"}, "query_sidecar_sha256": {"$ref": "#/$defs/sha256"}}, "required": ["as_of_date", "consumer_cutoff_dates", "consuming_game_pks", "query_sidecar_sha256"], "oneOf": [{"required": ["earned_runs", "outs", "batters_faced"]}, {"required": ["disposition"]}]}},
+        "query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true}
+      },
+      "required": ["schema_version", "grain", "records", "query_sidecar_sha256s"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "grain": {"const": "player_career_batters_faced_reference"},
+        "records": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "properties": {"pitcher_id": {"$ref": "#/$defs/positiveId"}, "game_pk": {"$ref": "#/$defs/positiveId"}, "consumer_cutoff_date": {"$ref": "#/$defs/date"}, "baseline_inclusive_end_date": {"$ref": "#/$defs/date"}, "baseline_batters_faced": {"type": "integer", "minimum": 0}, "verified_statcast_bf": {"type": "integer", "minimum": 0}, "total_batters_faced": {"type": "integer", "minimum": 0}, "baseline_query_sidecar_sha256": {"$ref": "#/$defs/sha256"}, "statcast_query_sidecar_sha256s": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/sha256"}}}, "required": ["pitcher_id", "game_pk", "consumer_cutoff_date", "baseline_inclusive_end_date", "baseline_batters_faced", "verified_statcast_bf", "total_batters_faced", "baseline_query_sidecar_sha256", "statcast_query_sidecar_sha256s"]}}
+      },
+      "required": ["schema_version", "grain", "records"]
     }
   ]
 }

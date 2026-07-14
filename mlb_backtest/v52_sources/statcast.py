@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
 from ..statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
 from ..v52_evidence import LogicalQuery
-from ..v52_source_contracts import canonical_sha256, query_sidecar, require_query
+from ..v52_source_contracts import (
+    QUERY_SIDECAR_KEYS,
+    canonical_json_bytes,
+    canonical_sha256,
+    query_sidecar,
+    require_query,
+)
 
 
 _STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _day(value: object, label: str) -> date:
@@ -197,8 +206,102 @@ def statcast_split_action(query: LogicalQuery, reason: str) -> str:
     return "SPLIT_REQUIRED"
 
 
+def recompute_statcast_season_snapshot(
+    parent_range: Mapping[str, object],
+    child_sidecars: Sequence[Mapping[str, object]],
+    played_game_pks: Sequence[int],
+) -> Mapping[str, object]:
+    if (
+        not isinstance(parent_range, Mapping)
+        or set(parent_range) != {"inclusive_start", "inclusive_end"}
+        or not isinstance(child_sidecars, Sequence)
+    ):
+        raise ValueError("Statcast aggregate inputs are invalid")
+    parent_first = _day(parent_range["inclusive_start"], "Statcast parent start")
+    parent_last = _day(parent_range["inclusive_end"], "Statcast parent end")
+    if (
+        parent_first > parent_last
+        or (parent_first.year, parent_first.month)
+        != (parent_last.year, parent_last.month)
+    ):
+        raise ValueError("Statcast aggregate requires exact monthly parent coverage")
+    played = list(played_game_pks)
+    if played != sorted(set(played)) or any(type(value) is not int or value <= 0 for value in played):
+        raise ValueError("played gamePks must be sorted unique positive integers")
+    children = []
+    statcast_games: set[int] = set()
+    total_pitches = 0
+    seen_child_hashes: set[str] = set()
+    for sidecar in child_sidecars:
+        if (
+            not isinstance(sidecar, Mapping)
+            or set(sidecar) != QUERY_SIDECAR_KEYS
+            or sidecar.get("source") != "baseball_savant_statcast"
+            or sidecar.get("grain") != "pitch"
+            or sidecar.get("parser_version") != "v5.2.1"
+            or sidecar.get("schema_version") != 1
+            or type(sidecar.get("byte_count")) is not int
+            or sidecar["byte_count"] < 0
+            or not isinstance(sidecar.get("query_id"), str)
+            or not _SHA256.fullmatch(sidecar["query_id"])
+            or not isinstance(sidecar.get("raw_sha256"), str)
+            or not _SHA256.fullmatch(sidecar["raw_sha256"])
+            or not isinstance(sidecar.get("semantics"), Mapping)
+        ):
+            raise ValueError("Statcast child must be a Task2 pitch sidecar")
+        semantics = sidecar["semantics"]
+        coverage = semantics.get("coverage")
+        if not isinstance(coverage, Mapping):
+            raise ValueError("Statcast child coverage is missing")
+        if semantics.get("split_disposition") != "READY":
+            raise ValueError("Statcast child cap/split state is not terminal READY")
+        game_pks = semantics.get("game_pks")
+        pitch_count = semantics.get("unique_pitch_count")
+        if (
+            not isinstance(game_pks, list)
+            or game_pks != sorted(set(game_pks))
+            or any(type(value) is not int or value <= 0 for value in game_pks)
+            or type(pitch_count) is not int
+            or pitch_count < 0
+        ):
+            raise ValueError("Statcast child population is invalid")
+        if statcast_games.intersection(game_pks):
+            raise ValueError("Statcast game population appears in multiple children")
+        statcast_games.update(game_pks)
+        total_pitches += pitch_count
+        sidecar_hash = hashlib.sha256(
+            canonical_json_bytes(dict(sidecar)) + b"\n"
+        ).hexdigest()
+        if sidecar_hash in seen_child_hashes:
+            raise ValueError("Statcast aggregate contains duplicate child sidecar")
+        seen_child_hashes.add(sidecar_hash)
+        children.append(
+            {
+                "inclusive_start": coverage.get("inclusive_start"),
+                "inclusive_end": coverage.get("inclusive_end"),
+                "query_sidecar_sha256": sidecar_hash,
+                "split_disposition": "READY",
+            }
+        )
+    validate_statcast_child_coverage(parent_range, children)
+    if sorted(statcast_games) != played:
+        raise ValueError("Statcast game population differs from played schedule population")
+    return {
+        "schema_version": 1,
+        "grain": "pitch",
+        "parent_coverage": dict(parent_range),
+        "children": children,
+        "child_query_sidecar_sha256s": [row["query_sidecar_sha256"] for row in children],
+        "played_game_pks": played,
+        "statcast_game_pks": sorted(statcast_games),
+        "unique_pitch_count": total_pitches,
+        "split_state": "READY_COMPLETE",
+    }
+
+
 __all__ = [
     "recompute_statcast_sidecar",
+    "recompute_statcast_season_snapshot",
     "statcast_split_action",
     "validate_statcast_child_coverage",
 ]

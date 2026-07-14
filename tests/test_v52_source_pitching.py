@@ -1,14 +1,45 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
 from pathlib import Path
+
+import jsonschema
 
 from mlb_backtest.v52_evidence import LogicalQuery
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/v5_2_qd/sources/pitching_mini.json"
+SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
+
+
+def _statcast_source_sidecar() -> dict[str, object]:
+    return {
+        "byte_count": 100,
+        "grain": "pitch",
+        "parser_version": "v5.2.1",
+        "query_id": "c" * 64,
+        "raw_sha256": "d" * 64,
+        "schema_version": 1,
+        "semantics": {
+            "coverage": {
+                "inclusive_start": "2024-03-20",
+                "inclusive_end": "2024-04-01",
+            },
+            "game_pks": [9001],
+            "pitcher_ids": [101],
+        },
+        "source": "baseball_savant_statcast",
+    }
+
+
+def _artifact_sha(sidecar: dict[str, object]) -> str:
+    payload = json.dumps(
+        sidecar, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return hashlib.sha256(payload + b"\n").hexdigest()
 
 
 def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league_pitching_reference", requested: dict[str, object] | None = None) -> LogicalQuery:
@@ -42,6 +73,51 @@ def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league
 
 
 class V52PitchingSourceTest(unittest.TestCase):
+    def test_pitching_season_snapshot_seals_exact_as_of_consumers_and_hashes(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_pitching_season_snapshot,
+            recompute_pitching_sidecar,
+        )
+
+        child = recompute_pitching_sidecar(FIXTURE.read_bytes(), _query(), [9001])
+        snapshot = recompute_pitching_season_snapshot([child])
+        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        self.assertEqual(snapshot["grain"], "season_d1_league_pitching_reference")
+        self.assertEqual(snapshot["records"][0]["consuming_game_pks"], [9001])
+        self.assertRegex(snapshot["records"][0]["query_sidecar_sha256"], r"^[0-9a-f]{64}$")
+        with self.assertRaisesRegex(ValueError, "duplicate as-of"):
+            recompute_pitching_season_snapshot([child, child])
+
+    def test_career_season_snapshot_requires_verified_statcast_additions(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+            recompute_career_bf_sidecar,
+        )
+
+        query = _query(
+            source="mlb_stats_pitcher_bf",
+            grain="player_career_batters_faced_reference",
+            requested={"pitcher_id": 101, "inclusive_end": "2017-12-31", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}},
+        )
+        baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
+        with self.assertRaisesRegex(ValueError, "Statcast BF"):
+            recompute_career_bf_season_snapshot([baseline], [])
+        statcast = _statcast_source_sidecar()
+        addition = {
+            "pitcher_id": 101,
+            "game_pk": 9001,
+            "consumer_cutoff_date": "2024-04-01",
+            "statcast_bf": 600,
+            "statcast_query_sidecars": [statcast],
+            "statcast_query_sidecar_sha256s": [_artifact_sha(statcast)],
+        }
+        snapshot = recompute_career_bf_season_snapshot([baseline], [addition])
+        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        self.assertEqual(snapshot["grain"], "player_career_batters_faced_reference")
+        self.assertEqual(snapshot["records"][0]["total_batters_faced"], 600)
+        wrong_hash = {**addition, "statcast_query_sidecar_sha256s": ["f" * 64]}
+        with self.assertRaisesRegex(ValueError, "source hash"):
+            recompute_career_bf_season_snapshot([baseline], [wrong_hash])
     def test_pitching_sidecar_checks_completeness_totals_and_consumers(self) -> None:
         from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar
 
@@ -84,7 +160,11 @@ class V52PitchingSourceTest(unittest.TestCase):
             recompute_pitching_sidecar(FIXTURE.read_bytes(), query, [9001])
 
     def test_preseason_disposition_query_has_response_local_semantics(self) -> None:
-        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+        from mlb_backtest.v52_source_contracts import (
+            query_sidecar,
+            recompute_query_sidecar,
+        )
+        from mlb_backtest.v52_sources.pitching import recompute_pitching_season_snapshot
 
         query = LogicalQuery(
             source="mlb_stats_pitching",
@@ -101,6 +181,14 @@ class V52PitchingSourceTest(unittest.TestCase):
             semantics["disposition"], "PRESEASON_NO_CURRENT_SEASON_PITCHING"
         )
         self.assertEqual(semantics["consuming_game_pks"], [9001])
+        snapshot = recompute_pitching_season_snapshot(
+            [query_sidecar(b"", query, semantics)]
+        )
+        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        self.assertEqual(
+            snapshot["records"][0]["disposition"],
+            "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+        )
 
     def test_pitching_and_career_cutoffs_must_match_actual_http_parameters(self) -> None:
         from mlb_backtest.v52_sources.pitching import (

@@ -41,11 +41,51 @@ def _query() -> LogicalQuery:
     )
 
 
+def _schedule_payload() -> dict[str, object]:
+    payload = json.loads((FIXTURES / "schedule_mini.json").read_bytes())
+    payload["totalGames"] = 2
+    payload["dates"][0]["totalGames"] = 2
+    payload["dates"][0]["games"][0]["neutralSite"] = False
+    payload["dates"][0]["games"][0]["isAlternateSite"] = False
+    payload["dates"][0]["games"][1]["neutralSite"] = True
+    payload["dates"][0]["games"][1]["isAlternateSite"] = True
+    return payload
+
+
+def _schedule_raw() -> bytes:
+    return json.dumps(_schedule_payload(), separators=(",", ":"), sort_keys=True).encode()
+
+
+def _box_query() -> LogicalQuery:
+    return LogicalQuery(
+        source="mlb_schedule_game_feed", grain="season_schedule_and_game",
+        endpoint="https://statsapi.mlb.com/api/v1/game/9001/boxscore",
+        parameters={}, requested_range={"season": 2024, "game_pk": 9001, "official_date": "2024-04-02"},
+        expected_media_type="application/json", parser_version="v5.2.1",
+        parent_query_id=None, run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+
+
+def _boxscore_raw() -> bytes:
+    payload = json.loads((FIXTURES / "boxscore_9001.json").read_bytes())
+    payload["status"] = {"detailedState": "Final"}
+    payload["completedInnings"] = 9
+    payload["teams"]["away"]["teamStats"] = {"batting": {"runs": 2}}
+    payload["teams"]["home"]["teamStats"] = {"batting": {"runs": 4}}
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+
+
+def _artifact(sidecar: dict[str, object]) -> tuple[bytes, str]:
+    raw = json.dumps(sidecar, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
 class V52ScheduleSourceTest(unittest.TestCase):
     def test_schedule_anchor_seals_complete_population_without_boxscores(self) -> None:
         from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
 
-        raw = (FIXTURES / "schedule_mini.json").read_bytes()
+        raw = _schedule_raw()
         sidecar = recompute_schedule_anchor_sidecar(raw, _query())
         self.assertEqual(sidecar["query_id"], logical_query_id(_query()))
         semantics = sidecar["semantics"]
@@ -59,7 +99,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
         )
         requirements = semantics["child_query_requirements"]
         self.assertEqual(
-            [row["game_pk"] for row in requirements["boxscores"]], [9001, 9002]
+            [row["game_pk"] for row in requirements["boxscores"]], [9001]
         )
         self.assertEqual([row["venue_id"] for row in requirements["venues"]], [31, 99])
         self.assertEqual(sidecar, recompute_schedule_anchor_sidecar(raw, _query()))
@@ -67,7 +107,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
     def test_schedule_anchor_rejects_wrong_range_duplicate_and_conflict(self) -> None:
         from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
 
-        payload = json.loads((FIXTURES / "schedule_mini.json").read_bytes())
+        payload = _schedule_payload()
         duplicate = copy.deepcopy(payload)
         duplicate["dates"][0]["games"].append(copy.deepcopy(duplicate["dates"][0]["games"][0]))
         with self.assertRaisesRegex(ValueError, "duplicate gamePk"):
@@ -81,11 +121,23 @@ class V52ScheduleSourceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside its query"):
             wrong_query = _query()
             recompute_schedule_anchor_sidecar(
-                (FIXTURES / "schedule_mini.json").read_bytes(),
+                _schedule_raw(),
                 wrong_query.__class__(**{**wrong_query.__dict__, "requested_range": {"year": 2023, "start_date": "2023-03-30", "end_date": "2023-10-01"}, "parameters": {**wrong_query.parameters, "startDate": "2023-03-30", "endDate": "2023-10-01"}}),
             )
         with self.assertRaisesRegex(ValueError, "no regular-season games"):
-            recompute_schedule_anchor_sidecar(b'{"dates":[]}', _query())
+            recompute_schedule_anchor_sidecar(b'{"totalGames":0,"dates":[]}', _query())
+        with self.assertRaisesRegex(ValueError, "totalGames"):
+            recompute_schedule_anchor_sidecar(
+                (FIXTURES / "schedule_mini.json").read_bytes(), _query()
+            )
+        truncated = _schedule_payload()
+        truncated["totalGames"] = 3
+        with self.assertRaisesRegex(ValueError, "population"):
+            recompute_schedule_anchor_sidecar(json.dumps(truncated).encode(), _query())
+        missing_site = _schedule_payload()
+        missing_site["dates"][0]["games"][0].pop("isAlternateSite")
+        with self.assertRaisesRegex(ValueError, "isAlternateSite"):
+            recompute_schedule_anchor_sidecar(json.dumps(missing_site).encode(), _query())
 
     def test_game_snapshot_joins_verified_anchors_and_final_participants(self) -> None:
         from mlb_backtest.v52_sources.schedule import (
@@ -94,11 +146,13 @@ class V52ScheduleSourceTest(unittest.TestCase):
         )
 
         anchor = recompute_schedule_anchor_sidecar(
-            (FIXTURES / "schedule_mini.json").read_bytes(), _query()
+            _schedule_raw(), _query()
         )
-        boxscore = (FIXTURES / "boxscore_9001.json").read_bytes()
+        from mlb_backtest.v52_sources.schedule import recompute_boxscore_sidecar
+        boxscore_sidecar = recompute_boxscore_sidecar(_boxscore_raw(), _box_query())
+        boxscore = _artifact(dict(boxscore_sidecar))
         snapshot = recompute_game_evidence_snapshot(
-            [anchor], {9001: (boxscore, hashlib.sha256(boxscore).hexdigest())}
+            [anchor], {9001: boxscore}
         )
         jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
         played, unplayed = snapshot["games"]
@@ -113,18 +167,16 @@ class V52ScheduleSourceTest(unittest.TestCase):
         self.assertEqual(
             unplayed["participant_provenance"], "HISTORICAL_NO_PARTICIPANTS"
         )
-        unplayed_raw = b'{"teams":{}}'
-        with_unplayed_response = recompute_game_evidence_snapshot(
-            [anchor],
+        self.assertTrue(unplayed["neutral_site"])
+        self.assertRegex(played["schedule_query_sidecar_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(played["boxscore_query_sidecar_sha256"], boxscore[1])
+        self.assertEqual(
+            set(snapshot["source_query_sidecar_sha256s"]),
             {
-                9001: (boxscore, hashlib.sha256(boxscore).hexdigest()),
-                9002: (
-                    unplayed_raw,
-                    hashlib.sha256(unplayed_raw).hexdigest(),
-                ),
+                played["schedule_query_sidecar_sha256"],
+                played["boxscore_query_sidecar_sha256"],
             },
         )
-        self.assertEqual(snapshot, with_unplayed_response)
 
     def test_game_snapshot_rejects_missing_boxscore_and_identity_disagreement(self) -> None:
         from mlb_backtest.v52_sources.schedule import (
@@ -133,55 +185,59 @@ class V52ScheduleSourceTest(unittest.TestCase):
         )
 
         anchor = recompute_schedule_anchor_sidecar(
-            (FIXTURES / "schedule_mini.json").read_bytes(), _query()
+            _schedule_raw(), _query()
         )
         with self.assertRaisesRegex(ValueError, "missing boxscore"):
             recompute_game_evidence_snapshot([anchor], {})
+        from mlb_backtest.v52_sources.schedule import recompute_boxscore_sidecar
+        valid_sidecar = dict(recompute_boxscore_sidecar(_boxscore_raw(), _box_query()))
+        valid_bytes, _ = _artifact(valid_sidecar)
         with self.assertRaisesRegex(ValueError, "verified hash"):
             recompute_game_evidence_snapshot(
-                [anchor],
-                {
-                    9001: (
-                        (FIXTURES / "boxscore_9001.json").read_bytes(),
-                        hashlib.sha256(
-                            (FIXTURES / "boxscore_9001.json").read_bytes()
-                        ).hexdigest(),
-                    ),
-                    9002: (b'{"teams":{}}', "0" * 64),
-                },
+                [anchor], {9001: (valid_bytes, "0" * 64)},
             )
-        boxscore = json.loads((FIXTURES / "boxscore_9001.json").read_bytes())
+        no_newline = valid_bytes.removesuffix(b"\n")
+        with self.assertRaisesRegex(ValueError, "lineage"):
+            recompute_game_evidence_snapshot(
+                [anchor],
+                {9001: (no_newline, hashlib.sha256(no_newline).hexdigest())},
+            )
+        wrong_query = copy.deepcopy(valid_sidecar)
+        wrong_query["query_id"] = "not-a-query-id"
+        with self.assertRaisesRegex(ValueError, "lineage"):
+            recompute_game_evidence_snapshot(
+                [anchor], {9001: _artifact(wrong_query)}
+            )
+        wrong_game = copy.deepcopy(valid_sidecar)
+        wrong_game["semantics"]["game_pk"] = 9002
+        with self.assertRaisesRegex(ValueError, "gamePk"):
+            recompute_game_evidence_snapshot(
+                [anchor], {9001: _artifact(wrong_game)}
+            )
+        boxscore = json.loads(_boxscore_raw())
         boxscore["teams"]["home"]["team"]["id"] = 21
         raw = json.dumps(boxscore).encode()
+        artifact = _artifact(dict(recompute_boxscore_sidecar(raw, _box_query())))
         with self.assertRaisesRegex(ValueError, "disagrees"):
-            recompute_game_evidence_snapshot(
-                [anchor], {9001: (raw, hashlib.sha256(raw).hexdigest())}
-            )
+            recompute_game_evidence_snapshot([anchor], {9001: artifact})
+        scores = json.loads(_boxscore_raw())
+        scores["teams"]["home"]["teamStats"]["batting"]["runs"] = 3
+        score_raw = json.dumps(scores).encode()
+        score_artifact = _artifact(dict(recompute_boxscore_sidecar(score_raw, _box_query())))
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            recompute_game_evidence_snapshot([anchor], {9001: score_artifact})
 
     def test_query_dispatch_seals_one_boxscore_response_independently(self) -> None:
         from mlb_backtest.v52_source_contracts import recompute_query_sidecar
 
-        query = LogicalQuery(
-            source="mlb_schedule_game_feed",
-            grain="season_schedule_and_game",
-            endpoint="https://statsapi.mlb.com/api/v1/game/9001/boxscore",
-            parameters={},
-            requested_range={
-                "season": 2024,
-                "game_pk": 9001,
-                "official_date": "2024-04-02",
-            },
-            expected_media_type="application/json",
-            parser_version="v5.2.1",
-            parent_query_id=None,
-            run_spec_sha256="a" * 64,
-            acquisition_contract_sha256="b" * 64,
-        )
+        query = _box_query()
         semantics = recompute_query_sidecar(
-            query, (FIXTURES / "boxscore_9001.json").read_bytes()
+            query, _boxscore_raw()
         )
         self.assertEqual(semantics["game_pk"], 9001)
         self.assertEqual(semantics["actual_starter_ids"], [101, 201])
+        self.assertEqual(semantics["terminal_status"], "Final")
+        self.assertEqual(semantics["completed_innings"], 9)
 
 
 if __name__ == "__main__":

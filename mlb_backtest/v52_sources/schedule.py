@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
 from ..sources import parse_schedule, validate_schedule_query_coverage
 from ..v52_evidence import LogicalQuery
-from ..v52_source_contracts import canonical_sha256, query_sidecar, require_query
+from ..v52_source_contracts import (
+    QUERY_SIDECAR_KEYS,
+    canonical_json_bytes,
+    canonical_sha256,
+    query_sidecar,
+    require_query,
+)
 
 
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _PLAYED = frozenset({"Final", "Completed Early"})
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _day(value: object, label: str) -> date:
@@ -46,15 +54,24 @@ def _json_object(raw: bytes, label: str) -> dict[str, object]:
     return value
 
 
-def _reject_duplicate_raw_game_pks(raw: bytes) -> None:
+def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]:
     payload = _json_object(raw, "schedule")
+    total_games = payload.get("totalGames")
+    if type(total_games) is not int or total_games < 0:
+        raise ValueError("schedule totalGames must be a nonnegative integer")
     dates = payload.get("dates")
     if not isinstance(dates, list):
         raise ValueError("schedule dates must be a list")
     seen: set[int] = set()
+    site_flags: dict[int, dict[str, bool]] = {}
+    date_total_sum = 0
     for day in dates:
         if not isinstance(day, dict) or not isinstance(day.get("games"), list):
             raise ValueError("schedule date games must be a list")
+        date_total = day.get("totalGames")
+        if type(date_total) is not int or date_total < 0:
+            raise ValueError("schedule date totalGames must be a nonnegative integer")
+        date_total_sum += date_total
         for game in day["games"]:
             if not isinstance(game, dict) or game.get("gameType") != "R":
                 continue
@@ -62,6 +79,21 @@ def _reject_duplicate_raw_game_pks(raw: bytes) -> None:
             if game_pk in seen:
                 raise ValueError("schedule contains duplicate gamePk")
             seen.add(game_pk)
+            neutral = game.get("neutralSite")
+            alternate = game.get("isAlternateSite")
+            if type(neutral) is not bool:
+                raise ValueError("schedule neutralSite must be explicitly boolean")
+            if type(alternate) is not bool:
+                raise ValueError("schedule isAlternateSite must be explicitly boolean")
+            site_flags[game_pk] = {
+                "alternate_site": alternate,
+                "neutral_site": neutral,
+            }
+        if date_total != len(day["games"]):
+            raise ValueError("schedule date totalGames differs from response population")
+    if total_games != date_total_sum or total_games != len(seen):
+        raise ValueError("schedule totalGames differs from exact parsed population")
+    return site_flags, total_games
 
 
 def _schedule_range(query: LogicalQuery) -> tuple[int, date, date]:
@@ -96,11 +128,13 @@ def recompute_schedule_anchor_sidecar(
         expected_media_type="application/json",
     )
     year, first, last = _schedule_range(query)
-    _reject_duplicate_raw_game_pks(raw)
+    site_flags, declared_total = _raw_schedule_metadata(raw)
     validate_schedule_query_coverage(raw, first.isoformat(), last.isoformat())
     games = parse_schedule(raw)
     if not games:
         raise ValueError("schedule response contains no regular-season games")
+    if len(games) != declared_total:
+        raise ValueError("schedule parsed population differs from totalGames")
     if any(
         not first <= _day(game["official_date"], "game official_date") <= last
         for game in games
@@ -127,12 +161,14 @@ def recompute_schedule_anchor_sidecar(
             )
         anchor = {
             "away_score": game["away_score"],
+            "alternate_site": site_flags[int(game["game_pk"])]["alternate_site"],
             "away_team_id": game["away_team_id"],
             "completed_innings": game["completed_innings"],
             "doubleheader_order": order,
             "game_pk": game["game_pk"],
             "home_score": game["home_score"],
             "home_team_id": game["home_team_id"],
+            "neutral_site": site_flags[int(game["game_pk"])]["neutral_site"],
             "official_date": game["official_date"],
             "played": played,
             "scheduled_innings": game["scheduled_innings"],
@@ -158,7 +194,7 @@ def recompute_schedule_anchor_sidecar(
                     "endpoint": f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore",
                     "game_pk": game_pk,
                 }
-                for game_pk in game_pks
+                for game_pk in played_pks
             ],
             "venues": [
                 {
@@ -226,12 +262,31 @@ def _boxscore(raw: bytes) -> dict[str, object]:
     home_team, home_starter, home_hitters = _boxscore_side(teams["home"], "home")
     if away_team == home_team or away_starter == home_starter:
         raise ValueError("boxscore sides must have distinct teams and starters")
+    status = payload.get("status")
+    completed_innings = payload.get("completedInnings")
+    if not isinstance(status, dict) or status.get("detailedState") not in _PLAYED:
+        raise ValueError("boxscore requires terminal status evidence")
+    if type(completed_innings) is not int or completed_innings <= 0:
+        raise ValueError("boxscore requires positive completed innings")
+
+    def runs(side: object, label: str) -> int:
+        team_stats = side.get("teamStats") if isinstance(side, dict) else None
+        batting = team_stats.get("batting") if isinstance(team_stats, dict) else None
+        value = batting.get("runs") if isinstance(batting, dict) else None
+        if type(value) is not int or value < 0:
+            raise ValueError(f"boxscore {label} requires nonnegative terminal runs")
+        return value
+
     return {
         "actual_starter_ids": [away_starter, home_starter],
         "away_starting_hitter_ids": away_hitters,
         "away_team_id": away_team,
         "home_starting_hitter_ids": home_hitters,
         "home_team_id": home_team,
+        "terminal_status": status["detailedState"],
+        "completed_innings": completed_innings,
+        "away_score": runs(teams["away"], "away"),
+        "home_score": runs(teams["home"], "home"),
     }
 
 
@@ -278,25 +333,52 @@ def recompute_game_evidence_snapshot(
     anchors_by_pk: dict[int, tuple[dict[str, object], str]] = {}
     sidecar_hashes: list[str] = []
     for sidecar in schedule_anchors:
-        if not isinstance(sidecar, Mapping) or sidecar.get("grain") != "season_schedule_and_game":
-            raise ValueError("schedule anchor sidecar has the wrong grain")
+        if (
+            not isinstance(sidecar, Mapping)
+            or set(sidecar) != QUERY_SIDECAR_KEYS
+            or sidecar.get("source") != "mlb_schedule_game_feed"
+            or sidecar.get("grain") != "season_schedule_and_game"
+            or sidecar.get("parser_version") != "v5.2.1"
+            or sidecar.get("schema_version") != 1
+            or type(sidecar.get("byte_count")) is not int
+            or sidecar["byte_count"] < 0
+            or not isinstance(sidecar.get("query_id"), str)
+            or not _SHA256.fullmatch(sidecar["query_id"])
+            or not isinstance(sidecar.get("raw_sha256"), str)
+            or not _SHA256.fullmatch(sidecar["raw_sha256"])
+        ):
+            raise ValueError("schedule anchor must be a canonical Task2 query sidecar")
         semantics = sidecar.get("semantics")
-        if not isinstance(semantics, Mapping) or not isinstance(semantics.get("anchors"), list):
+        if not isinstance(semantics, Mapping) or not isinstance(
+            semantics.get("anchors"), list
+        ):
             raise ValueError("schedule anchor semantics are invalid")
-        sidecar_hash = canonical_sha256(dict(sidecar))
+        sidecar_hash = hashlib.sha256(
+            canonical_json_bytes(dict(sidecar)) + b"\n"
+        ).hexdigest()
         sidecar_hashes.append(sidecar_hash)
         for raw_anchor in semantics["anchors"]:
             if not isinstance(raw_anchor, dict):
                 raise ValueError("schedule anchor must be an object")
             game_pk = _positive(raw_anchor.get("game_pk"), "anchor game_pk")
+            if (
+                type(raw_anchor.get("played")) is not bool
+                or type(raw_anchor.get("neutral_site")) is not bool
+                or type(raw_anchor.get("alternate_site")) is not bool
+            ):
+                raise ValueError("schedule anchor disposition flags must be explicit")
             if game_pk in anchors_by_pk:
                 raise ValueError("schedule snapshots contain duplicate gamePk")
             anchors_by_pk[game_pk] = (dict(raw_anchor), sidecar_hash)
 
-    extra = set(boxscores) - set(anchors_by_pk)
+    played_anchor_pks = {
+        game_pk for game_pk, (anchor, _hash) in anchors_by_pk.items()
+        if anchor.get("played") is True
+    }
+    extra = set(boxscores) - played_anchor_pks
     if extra:
         raise ValueError("boxscore has no verified schedule anchor")
-    verified_boxscores: dict[int, tuple[bytes, str]] = {}
+    verified_boxscores: dict[int, tuple[dict[str, object], str]] = {}
     for game_pk, evidence in boxscores.items():
         if (
             not isinstance(evidence, tuple)
@@ -306,7 +388,30 @@ def recompute_game_evidence_snapshot(
             or hashlib.sha256(evidence[0]).hexdigest() != evidence[1]
         ):
             raise ValueError("boxscore bytes do not match their verified hash")
-        verified_boxscores[game_pk] = evidence
+        try:
+            decoded = json.loads(evidence[0])
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("boxscore sidecar artifact must be canonical JSON") from exc
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != QUERY_SIDECAR_KEYS
+            or decoded.get("source") != "mlb_schedule_game_feed"
+            or decoded.get("grain") != "season_schedule_and_game"
+            or decoded.get("parser_version") != "v5.2.1"
+            or decoded.get("schema_version") != 1
+            or type(decoded.get("byte_count")) is not int
+            or decoded["byte_count"] < 0
+            or not isinstance(decoded.get("query_id"), str)
+            or not _SHA256.fullmatch(decoded["query_id"])
+            or not isinstance(decoded.get("raw_sha256"), str)
+            or not _SHA256.fullmatch(decoded["raw_sha256"])
+            or canonical_json_bytes(decoded) + b"\n" != evidence[0]
+            or not isinstance(decoded.get("semantics"), dict)
+            or decoded["semantics"].get("game_pk") != game_pk
+        ):
+            raise ValueError("boxscore query sidecar lineage differs from gamePk")
+        verified_boxscores[game_pk] = (decoded, evidence[1])
+        sidecar_hashes.append(evidence[1])
     games = []
     for game_pk, (anchor, anchor_hash) in sorted(anchors_by_pk.items()):
         played = anchor.get("played") is True
@@ -324,6 +429,7 @@ def recompute_game_evidence_snapshot(
                 "away_starting_hitter_ids": [],
                 "home_starting_hitter_ids": [],
                 "participant_provenance": "HISTORICAL_NO_PARTICIPANTS",
+                "schedule_query_sidecar_sha256": anchor_hash,
                 "verification_status": "INELIGIBLE_UNPLAYED",
             }
             game["source_game_sha256"] = canonical_sha256(
@@ -334,23 +440,37 @@ def recompute_game_evidence_snapshot(
         evidence = verified_boxscores.get(game_pk)
         if evidence is None:
             raise ValueError(f"missing boxscore for played game {game_pk}")
-        participants = _boxscore(evidence[0])
+        participants = dict(evidence[0]["semantics"])
         if (
             participants["away_team_id"] != anchor.get("away_team_id")
             or participants["home_team_id"] != anchor.get("home_team_id")
         ):
             raise ValueError("boxscore team identity disagrees with schedule anchor")
+        if any(
+            participants.get(field) != anchor.get(field)
+            for field in (
+                "official_date",
+                "terminal_status",
+                "completed_innings",
+                "away_score",
+                "home_score",
+            )
+        ):
+            raise ValueError("boxscore terminal evidence disagrees with schedule anchor")
+        participants.pop("game_pk", None)
+        participants.pop("official_date", None)
         game = {
             **base,
             **participants,
-            "boxscore_sha256": evidence[1],
+            "boxscore_query_sidecar_sha256": evidence[1],
+            "schedule_query_sidecar_sha256": anchor_hash,
             "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
             "verification_status": "VERIFIED",
         }
         game["source_game_sha256"] = canonical_sha256(
             {
                 "anchor_sidecar_sha256": anchor_hash,
-                "boxscore_sha256": evidence[1],
+                "boxscore_query_sidecar_sha256": evidence[1],
                 "game": game,
             }
         )

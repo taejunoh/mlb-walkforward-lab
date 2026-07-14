@@ -219,7 +219,7 @@ def recompute_reference_sidecar(
     team_ids = {int(row["team_id"]) for row in teams}
     venue_ids = {int(row["venue_id"]) for row in venues}
     observed_teams: set[int] = set()
-    observed: dict[tuple[int, str], bool] = {}
+    observed: dict[tuple[int, str], tuple[bool, bool]] = {}
     for schedule in schedules:
         if not isinstance(schedule, Mapping):
             raise ValueError("schedule reference rows must be mappings")
@@ -229,12 +229,16 @@ def recompute_reference_sidecar(
         venue_id = _positive(schedule.get("venue_id"), "schedule venue")
         observed_teams.update((away, home))
         key = (venue_id, official.isoformat())
-        neutral = schedule.get("neutral_site", False)
+        neutral = schedule.get("neutral_site")
+        alternate = schedule.get("alternate_site")
         if type(neutral) is not bool:
             raise ValueError("schedule neutral_site must be boolean")
-        if key in observed and observed[key] != neutral:
+        if type(alternate) is not bool:
+            raise ValueError("schedule alternate_site must be boolean")
+        site_disposition = (neutral, alternate)
+        if key in observed and observed[key] != site_disposition:
             raise ValueError("conflicting alternate/neutral venue disposition")
-        observed[key] = neutral
+        observed[key] = site_disposition
     missing_teams = observed_teams - team_ids
     if missing_teams:
         raise ValueError(f"official team identity missing for team {min(missing_teams)}")
@@ -244,7 +248,7 @@ def recompute_reference_sidecar(
             f"official venue identity missing for venue {min(missing_venues)}"
         )
     mappings = []
-    for (venue_id, official_text), neutral in sorted(observed.items()):
+    for (venue_id, official_text), (neutral, alternate) in sorted(observed.items()):
         official = date.fromisoformat(official_text)
         matches = [
             row
@@ -259,6 +263,7 @@ def recompute_reference_sidecar(
             )
         mappings.append(
             {
+                "alternate_site": alternate,
                 "neutral_site": neutral,
                 "official_date": official_text,
                 "time_zone": matches[0]["time_zone"],

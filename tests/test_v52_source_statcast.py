@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import csv
+import copy
 import io
 import unittest
+import json
 from pathlib import Path
+
+import jsonschema
 
 from mlb_backtest.statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP
 from mlb_backtest.v52_evidence import LogicalQuery
@@ -11,6 +15,7 @@ from mlb_backtest.v52_evidence import LogicalQuery
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/v5_2_qd/sources/statcast_mini.csv"
+SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
 
 
 def _query(start: str = "2024-04-01", end: str = "2024-04-30") -> LogicalQuery:
@@ -45,6 +50,46 @@ def _csv(fields: list[str], rows: list[dict[str, str]]) -> bytes:
 
 
 class V52StatcastSourceTest(unittest.TestCase):
+    def test_statcast_season_snapshot_seals_children_and_played_population(self) -> None:
+        from mlb_backtest.v52_sources.statcast import (
+            recompute_statcast_season_snapshot,
+            recompute_statcast_sidecar,
+        )
+
+        first = recompute_statcast_sidecar(
+            FIXTURE.read_bytes(), _query("2024-04-01", "2024-04-15")
+        )
+        second_raw = FIXTURE.read_bytes().replace(b"2024-04-02", b"2024-04-16").replace(b"9001", b"9002")
+        second = recompute_statcast_sidecar(
+            second_raw, _query("2024-04-16", "2024-04-30")
+        )
+        snapshot = recompute_statcast_season_snapshot(
+            {"inclusive_start": "2024-04-01", "inclusive_end": "2024-04-30"},
+            [first, second], [9001, 9002]
+        )
+        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        self.assertEqual(snapshot["grain"], "pitch")
+        self.assertEqual(snapshot["played_game_pks"], [9001, 9002])
+        self.assertEqual(len(snapshot["child_query_sidecar_sha256s"]), 2)
+        with self.assertRaisesRegex(ValueError, "played"):
+            recompute_statcast_season_snapshot(
+                {"inclusive_start": "2024-04-01", "inclusive_end": "2024-04-30"},
+                [first, second], [9001]
+            )
+        wrong_query = copy.deepcopy(first)
+        wrong_query["query_id"] = "not-a-query-id"
+        with self.assertRaisesRegex(ValueError, "Task2"):
+            recompute_statcast_season_snapshot(
+                {"inclusive_start": "2024-04-01", "inclusive_end": "2024-04-30"},
+                [wrong_query, second],
+                [9001, 9002],
+            )
+        with self.assertRaisesRegex(ValueError, "monthly"):
+            recompute_statcast_season_snapshot(
+                {"inclusive_start": "2024-04-01", "inclusive_end": "2024-05-01"},
+                [first, second],
+                [9001, 9002],
+            )
     def test_statcast_sidecar_reuses_strict_parser_and_proves_semantics(self) -> None:
         from mlb_backtest.v52_sources.statcast import recompute_statcast_sidecar
 

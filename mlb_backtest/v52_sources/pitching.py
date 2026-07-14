@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date
 
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
 from ..v52_evidence import LogicalQuery
-from ..v52_source_contracts import query_sidecar, require_query
+from ..v52_source_contracts import (
+    QUERY_SIDECAR_KEYS,
+    canonical_json_bytes,
+    query_sidecar,
+    require_query,
+)
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
@@ -22,6 +29,7 @@ _SEASON_OPEN = {
     2023: "2023-03-30",
     2024: "2024-03-20",
 }
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _day(value: object, label: str) -> date:
@@ -228,4 +236,239 @@ def recompute_career_bf_sidecar(
     return query_sidecar(raw, query, semantics)
 
 
-__all__ = ["recompute_career_bf_sidecar", "recompute_pitching_sidecar"]
+def _artifact_sha256(sidecar: Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_json_bytes(dict(sidecar)) + b"\n").hexdigest()
+
+
+def _require_task2_sidecar(
+    sidecar: Mapping[str, object], *, source: str, grain: str, label: str
+) -> Mapping[str, object]:
+    if (
+        not isinstance(sidecar, Mapping)
+        or set(sidecar) != QUERY_SIDECAR_KEYS
+        or sidecar.get("source") != source
+        or sidecar.get("grain") != grain
+        or sidecar.get("parser_version") != "v5.2.1"
+        or sidecar.get("schema_version") != 1
+        or type(sidecar.get("byte_count")) is not int
+        or sidecar["byte_count"] < 0
+        or not isinstance(sidecar.get("query_id"), str)
+        or not _SHA256.fullmatch(sidecar["query_id"])
+        or not isinstance(sidecar.get("raw_sha256"), str)
+        or not _SHA256.fullmatch(sidecar["raw_sha256"])
+        or not isinstance(sidecar.get("semantics"), Mapping)
+    ):
+        raise ValueError(f"{label} requires a valid Task2 {source}/{grain} sidecar")
+    return sidecar["semantics"]
+
+
+def recompute_pitching_season_snapshot(
+    query_sidecars: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    records = []
+    seen_as_of: set[str] = set()
+    for sidecar in query_sidecars:
+        semantics = _require_task2_sidecar(
+            sidecar,
+            source="mlb_stats_pitching",
+            grain="season_d1_league_pitching_reference",
+            label="pitching aggregate",
+        )
+        as_of = _day(semantics.get("as_of_date"), "pitching aggregate as-of")
+        as_of_text = as_of.isoformat()
+        if as_of_text in seen_as_of:
+            raise ValueError("pitching aggregate contains duplicate as-of date")
+        seen_as_of.add(as_of_text)
+        consumers = semantics.get("consuming_game_pks")
+        cutoffs = semantics.get("consumer_cutoff_dates")
+        if (
+            not isinstance(consumers, list)
+            or consumers != sorted(set(consumers))
+            or not consumers
+            or any(type(value) is not int or value <= 0 for value in consumers)
+            or not isinstance(cutoffs, Mapping)
+            or set(cutoffs) != {str(value) for value in consumers}
+            or any(value != as_of_text for value in cutoffs.values())
+        ):
+            raise ValueError("pitching aggregate consumer cutoffs differ from as-of")
+        record = {
+            "as_of_date": as_of_text,
+            "consumer_cutoff_dates": dict(cutoffs),
+            "consuming_game_pks": consumers,
+            "query_sidecar_sha256": _artifact_sha256(sidecar),
+        }
+        disposition = semantics.get("disposition")
+        if disposition is not None:
+            if disposition != "PRESEASON_NO_CURRENT_SEASON_PITCHING" or any(
+                field in semantics for field in ("earned_runs", "outs", "batters_faced")
+            ):
+                raise ValueError("pitching aggregate disposition semantics are invalid")
+            record["disposition"] = disposition
+        else:
+            for field in ("earned_runs", "outs", "batters_faced"):
+                value = semantics.get(field)
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"pitching aggregate {field} must be nonnegative")
+                record[field] = value
+        records.append(record)
+    records.sort(key=lambda row: row["as_of_date"])
+    if not records:
+        raise ValueError("pitching aggregate requires at least one as-of record")
+    return {
+        "schema_version": 1,
+        "grain": "season_d1_league_pitching_reference",
+        "records": records,
+        "query_sidecar_sha256s": [row["query_sidecar_sha256"] for row in records],
+    }
+
+
+def recompute_career_bf_season_snapshot(
+    baseline_sidecars: Sequence[Mapping[str, object]],
+    statcast_bf_additions: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    additions: dict[tuple[int, int], Mapping[str, object]] = {}
+    for row in statcast_bf_additions:
+        if not isinstance(row, Mapping) or set(row) != {
+            "consumer_cutoff_date",
+            "game_pk",
+            "pitcher_id",
+            "statcast_bf",
+            "statcast_query_sidecars",
+            "statcast_query_sidecar_sha256s",
+        }:
+            raise ValueError("Statcast BF additions must be mappings")
+        pitcher_id = _positive(row.get("pitcher_id"), "addition pitcher_id")
+        game_pk = _positive(row.get("game_pk"), "addition game_pk")
+        cutoff = _day(row.get("consumer_cutoff_date"), "addition cutoff")
+        bf = row.get("statcast_bf")
+        source_sidecars = row.get("statcast_query_sidecars")
+        source_hashes = row.get("statcast_query_sidecar_sha256s")
+        if (
+            type(bf) is not int
+            or bf < 0
+            or not isinstance(source_sidecars, Sequence)
+            or isinstance(source_sidecars, (str, bytes))
+            or not source_sidecars
+            or not isinstance(source_hashes, Sequence)
+            or isinstance(source_hashes, (str, bytes))
+        ):
+            raise ValueError("Statcast BF addition value/source lineage is invalid")
+        computed_hashes = []
+        source_ranges = []
+        for sidecar in source_sidecars:
+            semantics = _require_task2_sidecar(
+                sidecar,
+                source="baseball_savant_statcast",
+                grain="pitch",
+                label="Statcast BF addition",
+            )
+            pitcher_ids = semantics.get("pitcher_ids")
+            coverage = semantics.get("coverage")
+            if (
+                not isinstance(pitcher_ids, list)
+                or pitcher_ids != sorted(set(pitcher_ids))
+                or any(type(value) is not int or value <= 0 for value in pitcher_ids)
+                or not isinstance(coverage, Mapping)
+            ):
+                raise ValueError("Statcast BF source pitcher population is invalid")
+            first = _day(coverage.get("inclusive_start"), "Statcast BF source start")
+            last = _day(coverage.get("inclusive_end"), "Statcast BF source end")
+            if first > last:
+                raise ValueError("Statcast BF source coverage is reversed")
+            source_ranges.append((first, last))
+            computed_hashes.append(_artifact_sha256(sidecar))
+        if list(source_hashes) != computed_hashes or len(set(computed_hashes)) != len(
+            computed_hashes
+        ):
+            raise ValueError("Statcast BF source hash differs from canonical sidecar")
+        for previous, current in zip(source_ranges, source_ranges[1:]):
+            if current[0] <= previous[1]:
+                raise ValueError("Statcast BF source coverage overlaps or is unordered")
+        if source_ranges[-1][1] != cutoff:
+            raise ValueError("Statcast BF source coverage must end at consumer D-1")
+        key = (pitcher_id, game_pk)
+        if key in additions:
+            raise ValueError("duplicate Statcast BF addition")
+        additions[key] = {
+            **row,
+            "consumer_cutoff_date": cutoff.isoformat(),
+            "source_first_date": source_ranges[0][0].isoformat(),
+        }
+    records = []
+    used: set[tuple[int, int]] = set()
+    for sidecar in baseline_sidecars:
+        semantics = _require_task2_sidecar(
+            sidecar,
+            source="mlb_stats_pitcher_bf",
+            grain="player_career_batters_faced_reference",
+            label="career aggregate",
+        )
+        pitcher_id = _positive(semantics.get("pitcher_id"), "baseline pitcher_id")
+        baseline = semantics.get("baseline_batters_faced")
+        consumers = semantics.get("consuming_game_pks")
+        cutoffs = semantics.get("consumer_cutoff_dates")
+        inclusive_end = _day(
+            semantics.get("inclusive_end_date"), "career baseline inclusive end"
+        )
+        if (
+            type(baseline) is not int
+            or baseline < 0
+            or not isinstance(consumers, list)
+            or consumers != sorted(set(consumers))
+            or not consumers
+            or any(type(value) is not int or value <= 0 for value in consumers)
+            or not isinstance(cutoffs, Mapping)
+            or set(cutoffs) != {str(value) for value in consumers}
+            or inclusive_end not in {date(2017, 12, 31), date(2021, 12, 31)}
+            or semantics.get("requires_verified_statcast_bf_through_consumer_d1")
+            is not True
+        ):
+            raise ValueError("career baseline semantics are invalid")
+        for game_pk in consumers:
+            key = (pitcher_id, game_pk)
+            if key in used:
+                raise ValueError("duplicate career baseline consumer")
+            cutoff = _day(cutoffs[str(game_pk)], "career consumer cutoff")
+            if inclusive_end > cutoff or (
+                inclusive_end == date(2021, 12, 31) and cutoff < inclusive_end
+            ):
+                raise ValueError("career baseline cutoff differs from consumer D-1")
+            addition = additions.get((pitcher_id, game_pk))
+            if addition is None:
+                raise ValueError("verified Statcast BF addition is missing")
+            if addition["consumer_cutoff_date"] != cutoffs.get(str(game_pk)):
+                raise ValueError("Statcast BF cutoff differs from career consumer D-1")
+            if _day(addition["source_first_date"], "Statcast BF source start") <= inclusive_end:
+                raise ValueError("Statcast BF source overlaps career baseline")
+            used.add((pitcher_id, game_pk))
+            records.append(
+                {
+                    "pitcher_id": pitcher_id,
+                    "game_pk": game_pk,
+                    "consumer_cutoff_date": addition["consumer_cutoff_date"],
+                    "baseline_inclusive_end_date": inclusive_end.isoformat(),
+                    "baseline_batters_faced": baseline,
+                    "verified_statcast_bf": addition["statcast_bf"],
+                    "total_batters_faced": baseline + addition["statcast_bf"],
+                    "baseline_query_sidecar_sha256": _artifact_sha256(sidecar),
+                    "statcast_query_sidecar_sha256s": list(
+                        addition["statcast_query_sidecar_sha256s"]
+                    ),
+                }
+            )
+    if used != set(additions) or not records:
+        raise ValueError("Statcast BF additions contain wrong pitcher, consumer, or source lineage")
+    records.sort(key=lambda row: (row["pitcher_id"], row["game_pk"]))
+    return {
+        "schema_version": 1,
+        "grain": "player_career_batters_faced_reference",
+        "records": records,
+    }
+
+
+__all__ = [
+    "recompute_career_bf_season_snapshot",
+    "recompute_career_bf_sidecar",
+    "recompute_pitching_season_snapshot",
+    "recompute_pitching_sidecar",
+]

@@ -24,8 +24,8 @@ def _inputs() -> tuple[list[bytes], list[bytes], list[dict[str, object]], list[d
             {"venue_id": 99, "effective_start": "2024-01-01", "effective_end": "2024-12-31", "time_zone": "America/Los_Angeles"},
         ],
         [
-            {"game_pk": 9001, "official_date": "2024-04-02", "away_team_id": 10, "home_team_id": 20, "venue_id": 31},
-            {"game_pk": 9002, "official_date": "2024-04-02", "away_team_id": 10, "home_team_id": 20, "venue_id": 99, "neutral_site": True},
+            {"game_pk": 9001, "official_date": "2024-04-02", "away_team_id": 10, "home_team_id": 20, "venue_id": 31, "neutral_site": False, "alternate_site": False},
+            {"game_pk": 9002, "official_date": "2024-04-02", "away_team_id": 10, "home_team_id": 20, "venue_id": 99, "neutral_site": True, "alternate_site": True},
         ],
     )
 
@@ -41,6 +41,7 @@ class V52ReferenceSourceTest(unittest.TestCase):
         self.assertEqual([row["venue_id"] for row in snapshot["venues"]], [31, 99])
         self.assertEqual(len(snapshot["observed_venue_date_mappings"]), 2)
         self.assertTrue(snapshot["observed_venue_date_mappings"][1]["neutral_site"])
+        self.assertTrue(snapshot["observed_venue_date_mappings"][1]["alternate_site"])
         self.assertNotIn("row_count", snapshot)
         self.assertNotIn("game_pks", snapshot)
 
@@ -58,6 +59,10 @@ class V52ReferenceSourceTest(unittest.TestCase):
         missing_team[0]["away_team_id"] = 999
         with self.assertRaisesRegex(ValueError, "team"):
             recompute_reference_sidecar(teams, venues, rows, missing_team)
+        missing_site_flag = copy.deepcopy(schedules)
+        missing_site_flag[0].pop("neutral_site")
+        with self.assertRaisesRegex(ValueError, "neutral_site"):
+            recompute_reference_sidecar(teams, venues, rows, missing_site_flag)
 
     def test_reference_rejects_identity_coordinate_and_date_range_conflicts(self) -> None:
         from mlb_backtest.v52_sources.references import recompute_reference_sidecar
