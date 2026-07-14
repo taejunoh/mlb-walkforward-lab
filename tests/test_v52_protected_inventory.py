@@ -233,6 +233,64 @@ class V52ProtectedInventoryTest(unittest.TestCase):
                 ):
                     build_protected_raw_inventory(root, legacy_root)
 
+    def test_build_rejects_raw_identity_change_after_cached_hash(self) -> None:
+        original_records = inventory_module._records_from_verified_catalog
+        for mutation_kind in ("replace", "rewrite"):
+            with (
+                self.subTest(mutation_kind=mutation_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                legacy_root, _ = self._fixture(root)
+
+                def mutate_after_hash(repository_root, catalog, bound_tree):
+                    records = original_records(repository_root, catalog, bound_tree)
+                    raw_path = Path(catalog[0]["payload_path"])
+                    content = raw_path.read_bytes()
+                    before = raw_path.stat(follow_symlinks=False)
+                    if mutation_kind == "replace":
+                        replacement = raw_path.with_name(raw_path.name + ".replacement")
+                        replacement.write_bytes(content)
+                        os.replace(replacement, raw_path)
+                    else:
+                        raw_path.write_bytes(content[::-1])
+                        os.utime(
+                            raw_path,
+                            ns=(before.st_atime_ns, before.st_mtime_ns + 1),
+                        )
+                    after = raw_path.stat(follow_symlinks=False)
+                    self.assertNotEqual(
+                        (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_mode,
+                            before.st_nlink,
+                        ),
+                        (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                            after.st_mode,
+                            after.st_nlink,
+                        ),
+                    )
+                    return records
+
+                with (
+                    patch.object(
+                        inventory_module,
+                        "_records_from_verified_catalog",
+                        side_effect=mutate_after_hash,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "leaf identity|membership changed"
+                    ),
+                ):
+                    build_protected_raw_inventory(root, legacy_root)
+
     def test_build_rejects_source_parent_swapped_to_external_symlink_after_verify(
         self,
     ) -> None:
@@ -409,6 +467,63 @@ class V52ProtectedInventoryTest(unittest.TestCase):
             self.assertEqual(raw_streams, [raw_streams[0]])
             self.assertGreaterEqual(requested_sizes.count(chunk_limit), 3)
             self.assertLessEqual(max(requested_sizes), chunk_limit)
+
+    def test_nonempty_row_counter_is_constant_bounded_and_splitlines_equivalent(
+        self,
+    ) -> None:
+        counter_type = getattr(inventory_module, "_NonemptyRowCounter", None)
+        self.assertIsNotNone(counter_type, "constant-bounded row counter is missing")
+        cases = (
+            b"",
+            b"alpha",
+            b" ",
+            b"alpha\n",
+            b"alpha\rbeta",
+            b"alpha\r\nbeta\r\n",
+            b"alpha\r\r\nbeta",
+            b" \r\t\r\nalpha\n \t\rbravo",
+            b"alpha\vbravo\fcharlie\x1cdelta\x1eecho\x85foxtrot",
+        )
+        for payload in cases:
+            expected = sum(bool(line.strip()) for line in payload.splitlines())
+            for chunk_size in (1, 2, 3, 7, 1024):
+                with self.subTest(payload=payload, chunk_size=chunk_size):
+                    counter = counter_type()
+                    retained = []
+                    for offset in range(0, len(payload), chunk_size):
+                        counter.feed(payload[offset : offset + chunk_size])
+                        retained.append(counter.retained_byte_count)
+                    self.assertEqual(counter.finish(), expected)
+                    self.assertLessEqual(max(retained, default=0), 1)
+
+        counter = counter_type()
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(8):
+            counter.feed(chunk)
+            self.assertLessEqual(counter.retained_byte_count, 1)
+        self.assertEqual(counter.finish(), 1)
+
+    def test_streamed_row_count_handles_cr_crlf_boundaries_and_whitespace(
+        self,
+    ) -> None:
+        chunk_limit = 1024 * 1024
+        cases = {
+            "cr_only": b"alpha\rbravo\r \t\rcharlie\r",
+            "crlf_boundary": b"x" * (chunk_limit - 1) + b"\r\nnext\r\n",
+            "whitespace_only": b" \t\r\n\t\r \nalpha\r\t\r\nbravo\n",
+        }
+        for label, payload in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                legacy_root = root / "data/v5_1_bt/raw"
+                RawStore(legacy_root).put("mlb_schedule", dict(SCHEDULE_QUERY), payload)
+                try:
+                    inventory = build_protected_raw_inventory(root, legacy_root)
+                except RuntimeError as exc:
+                    self.fail(
+                        f"streamed row count differs from bytes.splitlines: {exc}"
+                    )
+                self.assertTrue(inventory["records"][0]["rawstore_verified"])
 
     def test_schema_and_runtime_reject_source_query_unknown_keys_and_wrong_types(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -70,6 +71,50 @@ _QUERY_TYPES: dict[str, dict[str, type]] = {
     },
 }
 _STREAM_CHUNK_BYTES = 1024 * 1024
+_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
+_NON_STRIPPED_BYTE = re.compile(rb"[^ \t\n\r\v\f]")
+_LeafIdentity = tuple[int, int, int, int, int, int]
+_SourceMembership = dict[str, dict[str, _LeafIdentity]]
+
+
+class _NonemptyRowCounter:
+    """Count nonempty bytes.splitlines rows without retaining line contents."""
+
+    __slots__ = ("_line_has_content", "_previous_chunk_ended_cr", "_row_count")
+
+    def __init__(self) -> None:
+        self._line_has_content = False
+        self._previous_chunk_ended_cr = False
+        self._row_count = 0
+
+    @property
+    def retained_byte_count(self) -> int:
+        return 0
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        offset = 0
+        if self._previous_chunk_ended_cr:
+            self._previous_chunk_ended_cr = False
+            if chunk[0] == 0x0A:
+                offset = 1
+        for match in _LINE_BREAK.finditer(chunk, offset):
+            if not self._line_has_content and _NON_STRIPPED_BYTE.search(
+                chunk, offset, match.start()
+            ):
+                self._line_has_content = True
+            self._row_count += int(self._line_has_content)
+            self._line_has_content = False
+            offset = match.end()
+            self._previous_chunk_ended_cr = match.group() == b"\r" and offset == len(
+                chunk
+            )
+        if not self._line_has_content and _NON_STRIPPED_BYTE.search(chunk, offset):
+            self._line_has_content = True
+
+    def finish(self) -> int:
+        return self._row_count + int(self._line_has_content)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -209,17 +254,22 @@ class _BoundLegacyTree:
             ):
                 raise RuntimeError(f"{label} path binding changed")
 
-    def source_membership(self) -> dict[str, frozenset[str]]:
-        """Snapshot every source leaf through its already-bound directory FD."""
+    def source_membership(self) -> _SourceMembership:
+        """Snapshot every source leaf identity through its bound directory FD.
+
+        The local threat boundary cannot distinguish a privileged in-place rewrite
+        that restores all six observed metadata fields between snapshots.
+        """
         self.assert_bound()
         expected_root_names = set(self._source_fds) | {
             f".{source}.lock" for source in self._source_fds
         }
         if set(os.listdir(self.legacy_fd)) != expected_root_names:
             raise RuntimeError("legacy root membership changed")
-        snapshot: dict[str, frozenset[str]] = {}
+        snapshot: _SourceMembership = {}
         for source, source_fd in sorted(self._source_fds.items()):
-            names = os.listdir(source_fd)
+            names = sorted(os.listdir(source_fd))
+            leaves: dict[str, _LeafIdentity] = {}
             for name in names:
                 try:
                     metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
@@ -228,7 +278,15 @@ class _BoundLegacyTree:
                         "legacy source membership changed while listing"
                     ) from exc
                 self._require_regular_metadata(metadata, "legacy raw object")
-            snapshot[source] = frozenset(names)
+                leaves[name] = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_mode,
+                    metadata.st_nlink,
+                )
+            snapshot[source] = leaves
         self.assert_bound()
         return snapshot
 
@@ -307,8 +365,7 @@ def _stream_object(
     digest = hashlib.sha256()
     byte_size = 0
     chunks: list[bytes] | None = [] if capture_content else None
-    pending_line = b""
-    row_count = 0
+    row_counter = _NonemptyRowCounter() if count_rows else None
     try:
         while True:
             chunk = os.read(descriptor, _STREAM_CHUNK_BYTES)
@@ -318,10 +375,8 @@ def _stream_object(
             byte_size += len(chunk)
             if chunks is not None:
                 chunks.append(chunk)
-            if count_rows:
-                lines = (pending_line + chunk).split(b"\n")
-                pending_line = lines.pop()
-                row_count += sum(bool(line.strip()) for line in lines)
+            if row_counter is not None:
+                row_counter.feed(chunk)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -333,8 +388,6 @@ def _stream_object(
         raise RuntimeError(f"{label} changed after reading")
     if byte_size != opened.st_size:
         raise RuntimeError(f"{label} byte count changed while reading")
-    if count_rows and pending_line.strip():
-        row_count += 1
     try:
         relative = path.absolute().relative_to(root).as_posix()
     except ValueError as exc:
@@ -347,7 +400,7 @@ def _stream_object(
             "sha256": digest.hexdigest(),
         },
         b"".join(chunks) if chunks is not None else None,
-        row_count if count_rows else None,
+        row_counter.finish() if row_counter is not None else None,
     )
 
 
@@ -464,9 +517,9 @@ def build_protected_raw_inventory(
             repository_root, legacy_path, membership, bound_tree
         )
         records = _records_from_verified_catalog(repository_root, verified, bound_tree)
-        if bound_tree.source_membership() != membership:
-            raise RuntimeError("legacy source membership changed during hashing")
-    records.sort(key=lambda record: record["manifest"]["path"])
+        _require_unchanged_membership(bound_tree, membership, "record reads")
+        records.sort(key=lambda record: record["manifest"]["path"])
+        _require_unchanged_membership(bound_tree, membership, "final return")
     return {
         "legacy_root": legacy_relative,
         "manifest_count": len(records),
@@ -533,7 +586,7 @@ def _parse_manifest(content: bytes, source: str) -> dict[str, Any]:
 def _streaming_verified_catalog(
     repository_root: Path,
     legacy_path: Path,
-    membership: dict[str, frozenset[str]],
+    membership: _SourceMembership,
     bound_tree: _BoundLegacyTree,
 ) -> list[dict[str, Any]]:
     """Verify manifests and seals while deriving exact allowed leaf membership."""
@@ -600,13 +653,23 @@ def _streaming_verified_catalog(
             )
 
     for source, names in membership.items():
-        if names != frozenset(expected_membership[source]):
+        if set(names) != expected_membership[source]:
             raise RuntimeError(
                 f"legacy source membership contains orphan or unexpected leaves: {source}"
             )
-    if bound_tree.source_membership() != membership:
-        raise RuntimeError("legacy source membership changed during cataloging")
+    _require_unchanged_membership(bound_tree, membership, "catalog reads")
     return verified
+
+
+def _require_unchanged_membership(
+    bound_tree: _BoundLegacyTree,
+    expected: _SourceMembership,
+    boundary: str,
+) -> None:
+    if bound_tree.source_membership() != expected:
+        raise RuntimeError(
+            f"legacy leaf identity or membership changed after {boundary}"
+        )
 
 
 def _records_from_verified_catalog(
