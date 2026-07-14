@@ -166,6 +166,7 @@ def _legacy_fixture(
     manifest = json.loads(artifact.manifest_path.read_bytes())
     reference = {
         "canonical_query": record["canonical_query"],
+        "legacy_source": "mlb_schedule",
         "legacy_manifest_path": record["manifest"]["path"],
         "legacy_manifest_sha256": record["manifest"]["sha256"],
         "legacy_seal_path": record["seal"]["path"],
@@ -196,6 +197,27 @@ def _legacy_fixture(
 
 
 class V52EvidenceTest(unittest.TestCase):
+    def test_legacy_reference_allows_only_closed_schedule_source_alias(self) -> None:
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            current = replace(query, source="mlb_schedule_game_feed")
+            reference["source"] = current.source
+            with store.acquire_query(current):
+                published = store.publish_legacy_reference(
+                    current, reference, _sidecar()
+                )
+            self.assertEqual(published.query_id, logical_query_id(current))
+            self.assertEqual(store.read_verified_success(current).registered_query, current)
+
+            forbidden = replace(query, source="mlb_stats_pitching")
+            reference["source"] = forbidden.source
+            with store.acquire_query(forbidden), self.assertRaisesRegex(
+                ValueError, "source|alias|binding"
+            ):
+                store.publish_legacy_reference(forbidden, reference, _sidecar())
+
     def test_acquire_query_has_exact_context_manager_return_annotation(self) -> None:
         annotation = inspect.signature(V52EvidenceStore.acquire_query).return_annotation
         self.assertEqual(annotation, "ContextManager[QueryLease]")

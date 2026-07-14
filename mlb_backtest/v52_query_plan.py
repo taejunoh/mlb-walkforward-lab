@@ -26,9 +26,7 @@ _STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
 _TEAMS_ENDPOINT = "https://statsapi.mlb.com/api/v1/teams"
 _MLB_BASE = "https://statsapi.mlb.com/api/v1"
-_RUN_SPEC_RELATIVE = Path(
-    "protocols/v5_2_qd/historical_walkforward_500.json"
-)
+_RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 _APPROVED_DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -38,15 +36,9 @@ _IMPLEMENTATION_PLAN_RELATIVE = Path(
 _PLAN_A_AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
-_ACQUISITION_SCHEMA_RELATIVE = Path(
-    "schemas/v5_2_acquisition_contract.schema.json"
-)
-_ACQUISITION_BATCH_ROOT = Path(
-    "audit/v5_2_qd/historical/acquisition/query_batches"
-)
-_PRESEASON_DISPOSITION_REASON = (
-    "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
-)
+_ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
+_ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
+_PRESEASON_DISPOSITION_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
 
 
 @dataclass(frozen=True)
@@ -185,8 +177,7 @@ def _read_repository_file(root: Path, relative: Path, label: str) -> bytes:
                 if (
                     not stat.S_ISDIR(opened.st_mode)
                     or not stat.S_ISDIR(linked.st_mode)
-                    or (opened.st_dev, opened.st_ino)
-                    != (linked.st_dev, linked.st_ino)
+                    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
                 ):
                     raise ValueError(f"{label} ancestor identity differs")
             except BaseException:
@@ -231,9 +222,7 @@ def _verify_repository_binding(
 
 def _clean_git_environment() -> dict[str, str]:
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_")
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
@@ -248,8 +237,7 @@ def _verify_head_blob(
     expected_blob: object | None = None,
 ) -> str:
     if expected_blob is not None and (
-        not isinstance(expected_blob, str)
-        or not _GIT_BLOB.fullmatch(expected_blob)
+        not isinstance(expected_blob, str) or not _GIT_BLOB.fullmatch(expected_blob)
     ):
         raise ValueError(f"{label} Git blob binding differs")
     environment = _clean_git_environment()
@@ -279,9 +267,7 @@ def _verify_head_blob(
     if (
         top_level.returncode
         or Path(
-            os.path.abspath(
-                top_level.stdout.decode("utf-8", errors="replace").strip()
-            )
+            os.path.abspath(top_level.stdout.decode("utf-8", errors="replace").strip())
         )
         != Path(os.path.abspath(root))
         or resolved.returncode
@@ -306,9 +292,7 @@ def _verify_implementation_plan_git_blob(
     )
 
 
-def _verify_frozen_acquisition_schema(
-    root: Path, contract: dict[str, object]
-) -> None:
+def _verify_frozen_acquisition_schema(root: Path, contract: dict[str, object]) -> None:
     contents = _read_repository_file(
         root,
         _ACQUISITION_SCHEMA_RELATIVE,
@@ -331,12 +315,10 @@ def _verify_frozen_acquisition_schema(
             "required",
             "type",
         }
-        or schema.get("$schema")
-        != "https://json-schema.org/draft/2020-12/schema"
+        or schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
         or schema.get("additionalProperties") is not False
         or schema.get("type") != "object"
-        or _canonical_json_bytes(schema.get("const"))
-        != _canonical_json_bytes(contract)
+        or _canonical_json_bytes(schema.get("const")) != _canonical_json_bytes(contract)
         or not isinstance(required, list)
         or set(required) != set(contract)
         or len(required) != len(contract)
@@ -446,7 +428,9 @@ def _source_contract(contract: Mapping[str, object], name: str) -> dict[str, obj
     sources = contract.get("sources")
     if not isinstance(sources, list):
         raise ValueError("acquisition contract sources must be a list")
-    matches = [item for item in sources if isinstance(item, dict) and item.get("name") == name]
+    matches = [
+        item for item in sources if isinstance(item, dict) and item.get("name") == name
+    ]
     if len(matches) != 1:
         raise ValueError(f"acquisition contract must define {name} exactly once")
     return matches[0]
@@ -483,7 +467,11 @@ def build_static_batch(
         raise ValueError("acquisition contract RunSpec binding differs")
     forbidden = contract.get("forbidden_years")
     years = contract.get("required_years")
-    if years != list(range(2018, 2025)) or not isinstance(forbidden, list) or 2025 not in forbidden:
+    if (
+        years != list(range(2018, 2025))
+        or not isinstance(forbidden, list)
+        or 2025 not in forbidden
+    ):
         raise ValueError("acquisition contract year scope differs")
     if 2025 not in run_spec.get("forbidden_target_years", []):
         raise ValueError("RunSpec must forbid 2025")
@@ -497,9 +485,7 @@ def build_static_batch(
     boundaries = contract.get("season_boundaries")
     if not isinstance(boundaries, list):
         raise ValueError("season boundaries must be a list")
-    by_year = {
-        item.get("year"): item for item in boundaries if isinstance(item, dict)
-    }
+    by_year = {item.get("year"): item for item in boundaries if isinstance(item, dict)}
     if set(by_year) != set(years):
         raise ValueError("season boundary years differ")
 
@@ -567,7 +553,9 @@ def _canonical_mapping_sha256(value: Mapping[str, object], label: str) -> str:
     return _sha256_bytes(_canonical_json_bytes(dict(value)))
 
 
-def _validate_binding_hashes(run_spec_sha256: str, acquisition_contract_sha256: str) -> None:
+def _validate_binding_hashes(
+    run_spec_sha256: str, acquisition_contract_sha256: str
+) -> None:
     _validate_sha256(run_spec_sha256, "run_spec_sha256")
     _validate_sha256(acquisition_contract_sha256, "acquisition_contract_sha256")
 
@@ -595,14 +583,19 @@ def build_schedule_reference_batch(
         game_pk = raw.get("game_pk")
         venue_id = raw.get("venue_id")
         played = raw.get("played")
-        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (season, game_pk, venue_id)):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (season, game_pk, venue_id)
+        ):
             raise ValueError("schedule anchor IDs must be positive integers")
         if season not in range(2018, 2025):
             raise ValueError("schedule anchor season is outside 2018-2024")
         if type(played) is not bool:
             raise ValueError("schedule anchor played must be explicitly boolean")
         official = _iso_date(raw.get("official_date"), "anchor official_date")
-        season_start = _iso_date(raw.get("season_start_date"), "anchor season_start_date")
+        season_start = _iso_date(
+            raw.get("season_start_date"), "anchor season_start_date"
+        )
         frozen_start, frozen_end = SEASON_BOUNDARIES[season]
         if season_start != frozen_start or not frozen_start <= official <= frozen_end:
             raise ValueError("schedule anchor dates differ from season")
@@ -696,7 +689,11 @@ def build_schedule_reference_batch(
                 source="venue_team_timezone_table",
                 grain="effective_dated_venue_team_reference",
                 endpoint=_TEAMS_ENDPOINT,
-                parameters={"sportId": 1, "season": season, "hydrate": "venue(location)"},
+                parameters={
+                    "sportId": 1,
+                    "season": season,
+                    "hydrate": "venue(location)",
+                },
                 requested_range={"season": season, "entity": "teams"},
                 expected_media_type="application/json",
                 parser_version="v5.2.1",
@@ -765,15 +762,18 @@ def build_participant_derived_batch(
             continue
         if (
             game.get("verification_status") != "VERIFIED"
-            or game.get("participant_provenance")
-            != "RECONSTRUCTED_FINAL_PARTICIPANTS"
+            or game.get("participant_provenance") != "RECONSTRUCTED_FINAL_PARTICIPANTS"
         ):
             continue
         starters = game.get("actual_starter_ids")
         if not isinstance(starters, list) or len(starters) != 2:
             raise ValueError("verified game must contain two actual starter IDs")
         for pitcher_id in starters:
-            if isinstance(pitcher_id, bool) or not isinstance(pitcher_id, int) or pitcher_id <= 0:
+            if (
+                isinstance(pitcher_id, bool)
+                or not isinstance(pitcher_id, int)
+                or pitcher_id <= 0
+            ):
                 raise ValueError("actual starter IDs must be positive integers")
             pitcher_consumers.setdefault(pitcher_id, {})[game_pk] = (
                 official_date - timedelta(days=1)
@@ -783,33 +783,44 @@ def build_participant_derived_batch(
 
     queries = []
     for pitcher_id in sorted(pitcher_consumers):
-        consumers = pitcher_consumers[pitcher_id]
-        queries.append(_logical_query(
-            source="mlb_stats_pitcher_bf",
-            grain="player_career_batters_faced_reference",
-            endpoint=f"{_MLB_BASE}/people/{pitcher_id}/stats",
-            parameters={
-                "stats": "byDateRange",
-                "group": "pitching",
-                "gameType": "R",
-                "sportIds": 1,
-                "startDate": "1876-01-01",
-                "endDate": "2017-12-31",
-            },
-            requested_range={
-                "consumer_cutoff_dates": {
-                    str(game_pk): consumers[game_pk].isoformat()
-                    for game_pk in sorted(consumers)
-                },
-                "consuming_game_pks": sorted(consumers),
-                "pitcher_id": pitcher_id,
-                "inclusive_end": "2017-12-31",
-            },
-            expected_media_type="application/json",
-            parser_version="v5.2.1",
-            run_spec_sha256=run_spec_sha256,
-            acquisition_contract_sha256=acquisition_contract_sha256,
-        ))
+        grouped: dict[str, dict[int, date]] = {
+            "2017-12-31": {},
+            "2021-12-31": {},
+        }
+        for game_pk, cutoff in pitcher_consumers[pitcher_id].items():
+            baseline = "2017-12-31" if cutoff <= date(2021, 12, 31) else "2021-12-31"
+            grouped[baseline][game_pk] = cutoff
+        for inclusive_end, consumers in grouped.items():
+            if not consumers:
+                continue
+            queries.append(
+                _logical_query(
+                    source="mlb_stats_pitcher_bf",
+                    grain="player_career_batters_faced_reference",
+                    endpoint=f"{_MLB_BASE}/people/{pitcher_id}/stats",
+                    parameters={
+                        "stats": "byDateRange",
+                        "group": "pitching",
+                        "gameType": "R",
+                        "sportIds": 1,
+                        "startDate": "1876-01-01",
+                        "endDate": inclusive_end,
+                    },
+                    requested_range={
+                        "consumer_cutoff_dates": {
+                            str(game_pk): consumers[game_pk].isoformat()
+                            for game_pk in sorted(consumers)
+                        },
+                        "consuming_game_pks": sorted(consumers),
+                        "pitcher_id": pitcher_id,
+                        "inclusive_end": inclusive_end,
+                    },
+                    expected_media_type="application/json",
+                    parser_version="v5.2.1",
+                    run_spec_sha256=run_spec_sha256,
+                    acquisition_contract_sha256=acquisition_contract_sha256,
+                )
+            )
     return _make_batch("PARTICIPANT_DERIVED", derived, queries)
 
 
@@ -979,9 +990,7 @@ def build_legacy_partition_batch(
             raise ValueError("Statcast parent ranges overlap")
 
     legacy = _legacy_ranges(protected_catalog)
-    candidates_by_parent: list[list[tuple[date, date]]] = [
-        [] for _ in parent_ranges
-    ]
+    candidates_by_parent: list[list[tuple[date, date]]] = [[] for _ in parent_ranges]
     prior_parent_index = -1
     for child_first, child_last in legacy:
         matches = [
@@ -998,11 +1007,13 @@ def build_legacy_partition_batch(
         candidates_by_parent[parent_index].append((child_first, child_last))
 
     queries: list[LogicalQuery] = []
-    for (first, last, parent), candidates in zip(
-        parent_ranges, candidates_by_parent
-    ):
-        exact = [(start, end) for start, end in candidates if start == first and end == last]
-        strict = [(start, end) for start, end in candidates if (start, end) != (first, last)]
+    for (first, last, parent), candidates in zip(parent_ranges, candidates_by_parent):
+        exact = [
+            (start, end) for start, end in candidates if start == first and end == last
+        ]
+        strict = [
+            (start, end) for start, end in candidates if (start, end) != (first, last)
+        ]
         if exact and strict:
             raise ValueError("mixed parent/child legacy ambiguity")
         for previous, current in zip(candidates, candidates[1:]):
@@ -1031,9 +1042,7 @@ def build_legacy_partition_batch(
                 acquisition="PROTECTED_LEGACY_REFERENCE",
             )
             promoted_range = dict(promoted.requested_range)
-            promoted_range["protected_inventory_sha256"] = (
-                protected_inventory_sha256
-            )
+            promoted_range["protected_inventory_sha256"] = protected_inventory_sha256
             queries.append(replace(promoted, requested_range=promoted_range))
             cursor = child_last + timedelta(days=1)
         if cursor <= last:
@@ -1045,13 +1054,16 @@ def build_legacy_partition_batch(
                     acquisition="FETCH_REQUIRED",
                 )
             )
-    return _make_batch(
-        "REMAINING", protected_inventory_sha256, queries
-    )
+    return _make_batch("REMAINING", protected_inventory_sha256, queries)
 
 
 def _directory_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
 
 
 def _open_root(root: Path) -> int:
@@ -1077,8 +1089,7 @@ def _open_root(root: Path) -> int:
                 if (
                     not stat.S_ISDIR(opened.st_mode)
                     or not stat.S_ISDIR(linked.st_mode)
-                    or (opened.st_dev, opened.st_ino)
-                    != (linked.st_dev, linked.st_ino)
+                    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
                 ):
                     raise ValueError("query batch root directory identity differs")
             except BaseException:
@@ -1104,7 +1115,9 @@ def _open_or_create_directory(parent_fd: int, name: str) -> int:
         descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-            raise ValueError("query batch ancestors must be no-follow directories") from exc
+            raise ValueError(
+                "query batch ancestors must be no-follow directories"
+            ) from exc
         raise
     metadata = os.fstat(descriptor)
     if not stat.S_ISDIR(metadata.st_mode):
@@ -1114,7 +1127,12 @@ def _open_or_create_directory(parent_fd: int, name: str) -> int:
 
 
 def _read_existing(parent_fd: int, name: str) -> bytes | None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(name, flags, dir_fd=parent_fd)
     except FileNotFoundError:
@@ -1195,10 +1213,9 @@ def _read_linked_regular(
             chunks.append(chunk)
         after = os.fstat(descriptor)
         rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            _batch_file_identity(before) != _batch_file_identity(after)
-            or _batch_file_identity(after) != _batch_file_identity(rebound)
-        ):
+        if _batch_file_identity(before) != _batch_file_identity(
+            after
+        ) or _batch_file_identity(after) != _batch_file_identity(rebound):
             raise ValueError(f"{label} identity changed while reading")
         return b"".join(chunks), after
     finally:
@@ -1269,9 +1286,7 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         for component in _ACQUISITION_BATCH_ROOT.parts:
             current = _open_existing_directory(current, component)
             descriptors.append(current)
-        loaded = _read_linked_regular(
-            current, f"{requested_id}.json", "query batch"
-        )
+        loaded = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if loaded is None:
             raise ValueError("query batch is missing")
         contents, metadata = loaded
@@ -1319,17 +1334,13 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
-        rebound = _read_linked_regular(
-            current, f"{requested_id}.json", "query batch"
-        )
+        rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if rebound is None:
             raise ValueError("query batch is missing after reconstruction")
         rebound_contents, rebound_metadata = rebound
-        if (
-            rebound_contents != contents
-            or _batch_file_identity(rebound_metadata)
-            != _batch_file_identity(metadata)
-        ):
+        if rebound_contents != contents or _batch_file_identity(
+            rebound_metadata
+        ) != _batch_file_identity(metadata):
             raise ValueError("query batch identity or bytes changed during load")
         _verify_opened_batch_chain(root, descriptors)
         return batch
@@ -1353,9 +1364,7 @@ def _reconcile_batch_final(
     if final_metadata.st_nlink == 1:
         return final_contents
 
-    stale_name = re.compile(
-        rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$"
-    )
+    stale_name = re.compile(rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$")
     removed = False
     for candidate_name in os.listdir(parent_fd):
         if stale_name.fullmatch(candidate_name) is None:
@@ -1366,16 +1375,14 @@ def _reconcile_batch_final(
         if candidate is None:
             continue
         candidate_contents, candidate_metadata = candidate
-        if (
-            (candidate_metadata.st_dev, candidate_metadata.st_ino)
-            != (final_metadata.st_dev, final_metadata.st_ino)
+        if (candidate_metadata.st_dev, candidate_metadata.st_ino) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
         ):
             continue
         if candidate_contents != expected_contents:
             raise ValueError("query batch stale temp bytes differ")
-        rebound = os.stat(
-            candidate_name, dir_fd=parent_fd, follow_symlinks=False
-        )
+        rebound = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             rebound.st_dev,
             rebound.st_ino,
@@ -1395,9 +1402,7 @@ def _reconcile_batch_final(
 
 
 def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
-    private_name = re.compile(
-        rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$"
-    )
+    private_name = re.compile(rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$")
     removed = False
     flags = (
         os.O_RDONLY
@@ -1418,9 +1423,7 @@ def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
             ) from exc
         try:
             opened = os.fstat(descriptor)
-            linked = os.stat(
-                candidate_name, dir_fd=parent_fd, follow_symlinks=False
-            )
+            linked = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or not stat.S_ISREG(linked.st_mode)
@@ -1431,9 +1434,7 @@ def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
                 raise ValueError(
                     "query batch private temp must be an unaliased regular file"
                 )
-            rebound = os.stat(
-                candidate_name, dir_fd=parent_fd, follow_symlinks=False
-            )
+            rebound = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
             if _batch_file_identity(opened) != _batch_file_identity(rebound):
                 raise ValueError("query batch private temp identity changed")
             os.unlink(candidate_name, dir_fd=parent_fd)

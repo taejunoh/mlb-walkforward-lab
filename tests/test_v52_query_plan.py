@@ -27,13 +27,16 @@ CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 
 
 def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _parent(start: str, end: str) -> LogicalQuery:
@@ -88,14 +91,17 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = build_static_batch(RUN_SPEC, CONTRACT)
         years = {
-            int(str(query.requested_range["start_date"])[:4])
-            for query in batch.queries
+            int(str(query.requested_range["start_date"])[:4]) for query in batch.queries
         }
         self.assertEqual(years, set(range(2018, 2025)))
-        self.assertFalse(any("2025" in canonical_query_bytes(q).decode() for q in batch.queries))
+        self.assertFalse(
+            any("2025" in canonical_query_bytes(q).decode() for q in batch.queries)
+        )
         self.assertEqual(batch.stage, "STATIC_SCHEDULES")
 
-    def test_static_batch_uses_only_official_endpoints_and_monthly_statcast_parents(self):
+    def test_static_batch_uses_only_official_endpoints_and_monthly_statcast_parents(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_static_batch
 
         batch = build_static_batch(RUN_SPEC, CONTRACT)
@@ -160,13 +166,16 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_static_batch_rejects_noncanonical_acquisition_contract(self):
         from mlb_backtest.v52_query_plan import build_static_batch
 
-        pretty = json.dumps(
-            json.loads(CONTRACT.read_bytes()),
-            allow_nan=False,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ).encode("utf-8") + b"\n"
+        pretty = (
+            json.dumps(
+                json.loads(CONTRACT.read_bytes()),
+                allow_nan=False,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             noncanonical_contract = Path(directory) / "acquisition-contract.json"
             noncanonical_contract.write_bytes(pretty)
@@ -180,14 +189,10 @@ class V52QueryPlanTest(unittest.TestCase):
             contract["response_byte_limits"]["statcast"] = 1
 
         def mutate_timezone_path(contract):
-            contract["timezone_mapping_path"] = (
-                "config/v5_2_qd_venue_timezones.json"
-            )
+            contract["timezone_mapping_path"] = "config/v5_2_qd_venue_timezones.json"
 
         def mutate_completeness_limit(contract):
-            contract["response_completeness_limits"][
-                "statcast_data_row_limit"
-            ] = 24_999
+            contract["response_completeness_limits"]["statcast_data_row_limit"] = 24_999
 
         def mutate_source_grain(contract):
             source = next(
@@ -204,9 +209,9 @@ class V52QueryPlanTest(unittest.TestCase):
             contract["schema_version"] = 2.0
 
         def mutate_split_limit_to_equal_float(contract):
-            contract["response_completeness_limits"][
-                "league_pitching_split_limit"
-            ] = 5000.0
+            contract["response_completeness_limits"]["league_pitching_split_limit"] = (
+                5000.0
+            )
 
         cases = (
             ("statcast response cap", mutate_statcast_limit),
@@ -224,9 +229,7 @@ class V52QueryPlanTest(unittest.TestCase):
                     mutate(contract)
                     forged_contract = Path(directory) / f"contract-{index}.json"
                     forged_contract.write_bytes(_canonical_json_bytes(contract))
-                    with self.assertRaisesRegex(
-                        ValueError, "schema|frozen|contract"
-                    ):
+                    with self.assertRaisesRegex(ValueError, "schema|frozen|contract"):
                         build_static_batch(RUN_SPEC, forged_contract)
 
     def test_static_batch_ignores_poisoned_git_repository_environment(self):
@@ -259,11 +262,14 @@ class V52QueryPlanTest(unittest.TestCase):
             forged_contract.write_bytes(_canonical_json_bytes(contract))
             forged_schema.write_bytes(_canonical_json_bytes(schema))
             relative_schema = forged_schema.relative_to(ROOT)
-            with mock.patch.object(
-                query_plan,
-                "_ACQUISITION_SCHEMA_RELATIVE",
-                relative_schema,
-            ), self.assertRaisesRegex(ValueError, "schema.*Git|blob|committed"):
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_ACQUISITION_SCHEMA_RELATIVE",
+                    relative_schema,
+                ),
+                self.assertRaisesRegex(ValueError, "schema.*Git|blob|committed"),
+            ):
                 query_plan.build_static_batch(RUN_SPEC, forged_contract)
 
     def test_bisect_children_bind_parent_and_cover_without_gap_or_overlap(self):
@@ -273,30 +279,62 @@ class V52QueryPlanTest(unittest.TestCase):
         left, right = bisect_statcast_query(parent)
         self.assertEqual(left.parent_query_id, logical_query_id(parent))
         self.assertEqual(right.parent_query_id, logical_query_id(parent))
-        self.assertEqual(left.requested_range, {"year": 2024, "start_date": "2024-06-01", "end_date": "2024-06-15"})
-        self.assertEqual(right.requested_range, {"year": 2024, "start_date": "2024-06-16", "end_date": "2024-06-30"})
+        self.assertEqual(
+            left.requested_range,
+            {"year": 2024, "start_date": "2024-06-01", "end_date": "2024-06-15"},
+        )
+        self.assertEqual(
+            right.requested_range,
+            {"year": 2024, "start_date": "2024-06-16", "end_date": "2024-06-30"},
+        )
         self.assertEqual(left.parameters["game_date_lt"], "2024-06-15")
         self.assertEqual(right.parameters["game_date_gt"], "2024-06-16")
         with self.assertRaisesRegex(ValueError, "single-day"):
             bisect_statcast_query(_parent("2024-06-01", "2024-06-01"))
 
-    def test_schedule_reference_batch_deduplicates_boxscore_pitching_team_and_venue_queries(self):
+    def test_schedule_reference_batch_deduplicates_boxscore_pitching_team_and_venue_queries(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
         inventory = {
             "anchors": [
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31, "played": True},
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31, "played": True},
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 8, "official_date": "2024-04-02", "venue_id": 31, "played": False},
+                {
+                    "season": 2024,
+                    "season_start_date": "2024-03-20",
+                    "game_pk": 7,
+                    "official_date": "2024-04-02",
+                    "venue_id": 31,
+                    "played": True,
+                },
+                {
+                    "season": 2024,
+                    "season_start_date": "2024-03-20",
+                    "game_pk": 7,
+                    "official_date": "2024-04-02",
+                    "venue_id": 31,
+                    "played": True,
+                },
+                {
+                    "season": 2024,
+                    "season_start_date": "2024-03-20",
+                    "game_pk": 8,
+                    "official_date": "2024-04-02",
+                    "venue_id": 31,
+                    "played": False,
+                },
             ]
         }
         batch = build_schedule_reference_batch(
-            inventory, run_spec_sha256=RUN_SHA,
+            inventory,
+            run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         sources = [query.source for query in batch.queries]
         self.assertEqual(sources.count("mlb_schedule_game_feed"), 1)
-        boxscore = next(q for q in batch.queries if q.source == "mlb_schedule_game_feed")
+        boxscore = next(
+            q for q in batch.queries if q.source == "mlb_schedule_game_feed"
+        )
         self.assertEqual(boxscore.requested_range["game_pk"], 7)
         self.assertEqual(sources.count("mlb_stats_pitching"), 1)
         pitching = next(q for q in batch.queries if q.source == "mlb_stats_pitching")
@@ -310,15 +348,13 @@ class V52QueryPlanTest(unittest.TestCase):
             pitching.requested_range["response_completeness"],
             {"limit": 5000, "reject_total_splits_at_or_above_limit": True},
         )
-        self.assertEqual(
-            sum(q.endpoint.endswith("/teams") for q in batch.queries), 1
-        )
-        self.assertEqual(
-            sum("/venues/31" in q.endpoint for q in batch.queries), 1
-        )
+        self.assertEqual(sum(q.endpoint.endswith("/teams") for q in batch.queries), 1)
+        self.assertEqual(sum("/venues/31" in q.endpoint for q in batch.queries), 1)
         self.assertEqual(batch.stage, "REFERENCE_INPUTS")
 
-    def test_schedule_reference_rejects_wrong_start_offseason_and_conflicting_season_rows(self):
+    def test_schedule_reference_rejects_wrong_start_offseason_and_conflicting_season_rows(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
         base = {
@@ -354,16 +390,21 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_opening_day_d1_emits_preseason_disposition_not_invalid_stats_query(self):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
-        inventory = {"anchors": [{
-            "season": 2024,
-            "season_start_date": "2024-03-20",
-            "game_pk": 1,
-            "official_date": "2024-03-20",
-            "venue_id": 31,
-            "played": True,
-        }]}
+        inventory = {
+            "anchors": [
+                {
+                    "season": 2024,
+                    "season_start_date": "2024-03-20",
+                    "game_pk": 1,
+                    "official_date": "2024-03-20",
+                    "venue_id": 31,
+                    "played": True,
+                }
+            ]
+        }
         batch = build_schedule_reference_batch(
-            inventory, run_spec_sha256=RUN_SHA,
+            inventory,
+            run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         pitching = [q for q in batch.queries if q.source == "mlb_stats_pitching"]
@@ -386,14 +427,18 @@ class V52QueryPlanTest(unittest.TestCase):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
         batch = build_schedule_reference_batch(
-            {"anchors": [{
-                "season": 2024,
-                "season_start_date": "2024-03-20",
-                "game_pk": 1,
-                "official_date": "2024-03-20",
-                "venue_id": 31,
-                "played": False,
-            }]},
+            {
+                "anchors": [
+                    {
+                        "season": 2024,
+                        "season_start_date": "2024-03-20",
+                        "game_pk": 1,
+                        "official_date": "2024-03-20",
+                        "venue_id": 31,
+                        "played": False,
+                    }
+                ]
+            },
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -421,40 +466,45 @@ class V52QueryPlanTest(unittest.TestCase):
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
 
-    def test_participant_batch_uses_only_verified_actual_starters_and_deduplicates(self):
+    def test_participant_batch_uses_only_verified_actual_starters_and_deduplicates(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_participant_derived_batch
 
-        inventory = {"games": [
-            {
-                "game_pk": 1,
-                "season": 2024,
-                "official_date": "2024-04-02",
-                "played": True,
-                "verification_status": "VERIFIED",
-                "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
-                "actual_starter_ids": [100, 200],
-            },
-            {
-                "game_pk": 2,
-                "season": 2024,
-                "official_date": "2024-04-02",
-                "played": True,
-                "verification_status": "VERIFIED",
-                "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
-                "actual_starter_ids": [100, 300],
-            },
-            {
-                "game_pk": 3,
-                "season": 2024,
-                "official_date": "2024-04-02",
-                "played": False,
-                "verification_status": "UNVERIFIED",
-                "participant_provenance": "PROBABLE",
-                "actual_starter_ids": [999],
-            },
-        ]}
+        inventory = {
+            "games": [
+                {
+                    "game_pk": 1,
+                    "season": 2024,
+                    "official_date": "2024-04-02",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [100, 200],
+                },
+                {
+                    "game_pk": 2,
+                    "season": 2024,
+                    "official_date": "2024-04-02",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [100, 300],
+                },
+                {
+                    "game_pk": 3,
+                    "season": 2024,
+                    "official_date": "2024-04-02",
+                    "played": False,
+                    "verification_status": "UNVERIFIED",
+                    "participant_provenance": "PROBABLE",
+                    "actual_starter_ids": [999],
+                },
+            ]
+        }
         batch = build_participant_derived_batch(
-            inventory, run_spec_sha256=RUN_SHA,
+            inventory,
+            run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         self.assertEqual(batch.stage, "PARTICIPANT_DERIVED")
@@ -469,11 +519,11 @@ class V52QueryPlanTest(unittest.TestCase):
             )
         )
         self.assertTrue(all("personId" not in q.parameters for q in batch.queries))
-        self.assertTrue(all(q.parameters["endDate"] == "2017-12-31" for q in batch.queries))
-        by_pitcher = {q.requested_range["pitcher_id"]: q for q in batch.queries}
-        self.assertEqual(
-            by_pitcher[100].requested_range["consuming_game_pks"], [1, 2]
+        self.assertTrue(
+            all(q.parameters["endDate"] == "2021-12-31" for q in batch.queries)
         )
+        by_pitcher = {q.requested_range["pitcher_id"]: q for q in batch.queries}
+        self.assertEqual(by_pitcher[100].requested_range["consuming_game_pks"], [1, 2])
         self.assertEqual(
             by_pitcher[100].requested_range["consumer_cutoff_dates"],
             {"1": "2024-04-01", "2": "2024-04-01"},
@@ -483,29 +533,134 @@ class V52QueryPlanTest(unittest.TestCase):
             {"1": "2024-04-01"},
         )
 
-    def test_participant_batch_validates_2018_2024_season_and_game_date_boundaries(self):
+    def test_participant_batch_splits_each_pitcher_by_cutoff_baseline_without_loss(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_participant_derived_batch
 
-        valid = {"games": [
+        inventory = {
+            "games": [
+                {
+                    "game_pk": 11,
+                    "season": 2018,
+                    "official_date": "2018-03-29",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [100, 200],
+                },
+                {
+                    "game_pk": 22,
+                    "season": 2022,
+                    "official_date": "2022-04-07",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [100, 300],
+                },
+            ]
+        }
+        batch = build_participant_derived_batch(
+            inventory,
+            run_spec_sha256=RUN_SHA,
+            acquisition_contract_sha256=CONTRACT_SHA,
+        )
+        observed = [
+            (
+                query.requested_range["pitcher_id"],
+                query.requested_range["inclusive_end"],
+                query.requested_range["consuming_game_pks"],
+                query.requested_range["consumer_cutoff_dates"],
+                query.parameters["endDate"],
+                query.endpoint,
+            )
+            for query in batch.queries
+        ]
+        self.assertEqual(
+            observed,
+            [
+                (
+                    100,
+                    "2017-12-31",
+                    [11],
+                    {"11": "2018-03-28"},
+                    "2017-12-31",
+                    "https://statsapi.mlb.com/api/v1/people/100/stats",
+                ),
+                (
+                    100,
+                    "2021-12-31",
+                    [22],
+                    {"22": "2022-04-06"},
+                    "2021-12-31",
+                    "https://statsapi.mlb.com/api/v1/people/100/stats",
+                ),
+                (
+                    200,
+                    "2017-12-31",
+                    [11],
+                    {"11": "2018-03-28"},
+                    "2017-12-31",
+                    "https://statsapi.mlb.com/api/v1/people/200/stats",
+                ),
+                (
+                    300,
+                    "2021-12-31",
+                    [22],
+                    {"22": "2022-04-06"},
+                    "2021-12-31",
+                    "https://statsapi.mlb.com/api/v1/people/300/stats",
+                ),
+            ],
+        )
+        all_game_pks = [
+            game_pk
+            for query in batch.queries
+            for game_pk in query.requested_range["consuming_game_pks"]
+        ]
+        self.assertEqual(sorted(all_game_pks), [11, 11, 22, 22])
+        query_ids = [logical_query_id(query) for query in batch.queries]
+        self.assertEqual(len(query_ids), len(set(query_ids)))
+        consumers_by_pitcher: dict[int, list[int]] = {}
+        for query in batch.queries:
+            consumers_by_pitcher.setdefault(
+                int(query.requested_range["pitcher_id"]), []
+            ).extend(query.requested_range["consuming_game_pks"])
+        self.assertEqual(
             {
-                "game_pk": 1,
-                "season": 2018,
-                "official_date": "2018-03-29",
-                "played": True,
-                "verification_status": "VERIFIED",
-                "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
-                "actual_starter_ids": [100, 200],
+                pitcher_id: sorted(game_pks)
+                for pitcher_id, game_pks in consumers_by_pitcher.items()
             },
-            {
-                "game_pk": 2,
-                "season": 2024,
-                "official_date": "2024-09-30",
-                "played": True,
-                "verification_status": "VERIFIED",
-                "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
-                "actual_starter_ids": [300, 400],
-            },
-        ]}
+            {100: [11, 22], 200: [11], 300: [22]},
+        )
+
+    def test_participant_batch_validates_2018_2024_season_and_game_date_boundaries(
+        self,
+    ):
+        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+
+        valid = {
+            "games": [
+                {
+                    "game_pk": 1,
+                    "season": 2018,
+                    "official_date": "2018-03-29",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [100, 200],
+                },
+                {
+                    "game_pk": 2,
+                    "season": 2024,
+                    "official_date": "2024-09-30",
+                    "played": True,
+                    "verification_status": "VERIFIED",
+                    "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+                    "actual_starter_ids": [300, 400],
+                },
+            ]
+        }
         batch = build_participant_derived_batch(
             valid,
             run_spec_sha256=RUN_SHA,
@@ -565,13 +720,18 @@ class V52QueryPlanTest(unittest.TestCase):
         valid = _parent("2024-06-01", "2024-06-30")
         invalid = [
             dataclasses.replace(
-                valid, parameters={k: v for k, v in valid.parameters.items() if k != "hfGT"}
+                valid,
+                parameters={k: v for k, v in valid.parameters.items() if k != "hfGT"},
             ),
-            dataclasses.replace(valid, parameters={**valid.parameters, "extra": "filter"}),
+            dataclasses.replace(
+                valid, parameters={**valid.parameters, "extra": "filter"}
+            ),
             dataclasses.replace(valid, parameters={**valid.parameters, "hfGT": "P|"}),
             _parent("2025-06-01", "2025-06-30"),
             _parent("2024-06-15", "2024-07-15"),
-            dataclasses.replace(valid, requested_range={**valid.requested_range, "year": 2023}),
+            dataclasses.replace(
+                valid, requested_range={**valid.requested_range, "year": 2023}
+            ),
         ]
         for parent in invalid:
             with self.subTest(parent=parent), self.assertRaises(ValueError):
@@ -586,15 +746,25 @@ class V52QueryPlanTest(unittest.TestCase):
             self.assertEqual(
                 set(child.parameters),
                 {
-                    "all", "type", "player_type", "game_date_gt", "game_date_lt",
-                    "hfGT", "group_by", "sort_col", "player_event_sort",
-                    "sort_order", "min_pitches",
+                    "all",
+                    "type",
+                    "player_type",
+                    "game_date_gt",
+                    "game_date_lt",
+                    "hfGT",
+                    "group_by",
+                    "sort_col",
+                    "player_event_sort",
+                    "sort_order",
+                    "min_pitches",
                 },
             )
             self.assertEqual(child.parameters["hfGT"], "R|")
             self.assertEqual(child.parent_query_id, logical_query_id(valid))
 
-    def test_bisect_preserves_valid_promoted_lineage_and_rejects_malformed_metadata(self):
+    def test_bisect_preserves_valid_promoted_lineage_and_rejects_malformed_metadata(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import (
             bisect_statcast_query,
             build_legacy_partition_batch,
@@ -655,7 +825,9 @@ class V52QueryPlanTest(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 bisect_statcast_query(candidate)
 
-    def test_legacy_partition_maps_verified_children_and_fetches_only_uncovered_gaps(self):
+    def test_legacy_partition_maps_verified_children_and_fetches_only_uncovered_gaps(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_legacy_partition_batch
 
         parent = _parent("2024-06-01", "2024-06-30")
@@ -670,14 +842,35 @@ class V52QueryPlanTest(unittest.TestCase):
         self.assertEqual(
             [q.requested_range for q in batch.queries],
             [
-                {"year": 2024, "start_date": "2024-06-01", "end_date": "2024-06-10", "acquisition": "PROTECTED_LEGACY_REFERENCE", "protected_inventory_sha256": "a" * 64},
-                {"year": 2024, "start_date": "2024-06-11", "end_date": "2024-06-20", "acquisition": "FETCH_REQUIRED"},
-                {"year": 2024, "start_date": "2024-06-21", "end_date": "2024-06-30", "acquisition": "PROTECTED_LEGACY_REFERENCE", "protected_inventory_sha256": "a" * 64},
+                {
+                    "year": 2024,
+                    "start_date": "2024-06-01",
+                    "end_date": "2024-06-10",
+                    "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                    "protected_inventory_sha256": "a" * 64,
+                },
+                {
+                    "year": 2024,
+                    "start_date": "2024-06-11",
+                    "end_date": "2024-06-20",
+                    "acquisition": "FETCH_REQUIRED",
+                },
+                {
+                    "year": 2024,
+                    "start_date": "2024-06-21",
+                    "end_date": "2024-06-30",
+                    "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                    "protected_inventory_sha256": "a" * 64,
+                },
             ],
         )
-        self.assertTrue(all(q.parent_query_id == logical_query_id(parent) for q in batch.queries))
+        self.assertTrue(
+            all(q.parent_query_id == logical_query_id(parent) for q in batch.queries)
+        )
 
-    def test_legacy_partition_rejects_gap_overlap_and_mixed_parent_child_ambiguity(self):
+    def test_legacy_partition_rejects_gap_overlap_and_mixed_parent_child_ambiguity(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_legacy_partition_batch
 
         parent = _parent("2024-06-01", "2024-06-30")
@@ -686,23 +879,35 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2024-06-20", "2024-06-30"),
         ]
         with self.assertRaisesRegex(ValueError, "overlap"):
-            build_legacy_partition_batch([parent], overlap, protected_inventory_sha256="a" * 64)
+            build_legacy_partition_batch(
+                [parent], overlap, protected_inventory_sha256="a" * 64
+            )
 
         mixed = [
             _legacy("2024-06-01", "2024-06-30"),
             _legacy("2024-06-01", "2024-06-10"),
         ]
         with self.assertRaisesRegex(ValueError, "mixed parent/child"):
-            build_legacy_partition_batch([parent], mixed, protected_inventory_sha256="a" * 64)
+            build_legacy_partition_batch(
+                [parent], mixed, protected_inventory_sha256="a" * 64
+            )
 
         bad_parent = dataclasses.replace(
             _parent("2024-07-01", "2024-07-31"),
-            requested_range={"year": 2024, "start_date": "2024-07-02", "end_date": "2024-07-31"},
+            requested_range={
+                "year": 2024,
+                "start_date": "2024-07-02",
+                "end_date": "2024-07-31",
+            },
         )
         with self.assertRaisesRegex(ValueError, "parameters"):
-            build_legacy_partition_batch([bad_parent], [], protected_inventory_sha256="a" * 64)
+            build_legacy_partition_batch(
+                [bad_parent], [], protected_inventory_sha256="a" * 64
+            )
 
-    def test_legacy_partition_requires_exact_canonical_url_and_no_duplicate_mapping(self):
+    def test_legacy_partition_requires_exact_canonical_url_and_no_duplicate_mapping(
+        self,
+    ):
         from mlb_backtest.v52_query_plan import build_legacy_partition_batch
 
         parent = _parent("2024-06-01", "2024-06-30")
@@ -752,7 +957,9 @@ class V52QueryPlanTest(unittest.TestCase):
         incompatible = _legacy("2024-06-01", "2024-06-10")
         incompatible["canonical_query"] = {
             **incompatible["canonical_query"],
-            "url": statcast_url("2024-06-01", "2024-06-10").replace("hfGT=R%7C", "hfGT=P%7C"),
+            "url": statcast_url("2024-06-01", "2024-06-10").replace(
+                "hfGT=R%7C", "hfGT=P%7C"
+            ),
         }
         with self.assertRaisesRegex(ValueError, "canonical URL"):
             build_legacy_partition_batch(
@@ -780,7 +987,13 @@ class V52QueryPlanTest(unittest.TestCase):
             record = json.loads(original)
             self.assertEqual(
                 set(record),
-                {"schema_version", "batch_id", "stage", "derived_from_sha256", "queries"},
+                {
+                    "schema_version",
+                    "batch_id",
+                    "stage",
+                    "derived_from_sha256",
+                    "queries",
+                },
             )
             self.assertEqual(publish_query_batch(root, first), path)
             self.assertEqual(path.read_bytes(), original)
@@ -897,9 +1110,7 @@ class V52QueryPlanTest(unittest.TestCase):
                     "_parse_json_object",
                     side_effect=replace_final,
                 ),
-                self.assertRaisesRegex(
-                    ValueError, "batch|identity|changed|replaced"
-                ),
+                self.assertRaisesRegex(ValueError, "batch|identity|changed|replaced"),
             ):
                 query_plan.load_query_batch(root, batch.batch_id)
 
@@ -951,7 +1162,8 @@ class V52QueryPlanTest(unittest.TestCase):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
                 root = Path(td).resolve()
                 destination = (
-                    root / "audit/v5_2_qd/historical/acquisition/query_batches"
+                    root
+                    / "audit/v5_2_qd/historical/acquisition/query_batches"
                     / f"{batch.batch_id}.json"
                 )
                 original_write = os.write
@@ -984,7 +1196,9 @@ class V52QueryPlanTest(unittest.TestCase):
                 self.assertEqual(
                     list(batch_dir.glob("*.tmp")) if batch_dir.exists() else [], []
                 )
-                self.assertEqual(query_plan.publish_query_batch(root, batch), destination)
+                self.assertEqual(
+                    query_plan.publish_query_batch(root, batch), destination
+                )
 
     def test_publish_concurrent_identical_batches_are_idempotent(self):
         import mlb_backtest.v52_query_plan as query_plan
@@ -1026,7 +1240,9 @@ class V52QueryPlanTest(unittest.TestCase):
             def lose_link(_src, dst, *, src_dir_fd, dst_dir_fd, follow_symlinks):
                 del src_dir_fd, follow_symlinks
                 descriptor = os.open(
-                    dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                    dst,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
                     dir_fd=dst_dir_fd,
                 )
                 try:
@@ -1115,11 +1331,14 @@ class V52QueryPlanTest(unittest.TestCase):
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve()
-            with mock.patch.object(
-                query_plan,
-                "_unlink_owned_temp",
-                side_effect=OSError("injected crash after link"),
-            ), self.assertRaisesRegex(OSError, "injected crash"):
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_unlink_owned_temp",
+                    side_effect=OSError("injected crash after link"),
+                ),
+                self.assertRaisesRegex(OSError, "injected crash"),
+            ):
                 query_plan.publish_query_batch(root, batch)
 
             batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"

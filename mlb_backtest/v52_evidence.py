@@ -58,6 +58,7 @@ _ATTEMPT_OUTCOMES = {
 }
 _LEGACY_REFERENCE_KEYS = {
     "canonical_query",
+    "legacy_source",
     "legacy_manifest_path",
     "legacy_manifest_sha256",
     "legacy_seal_path",
@@ -1809,8 +1810,19 @@ class V52EvidenceStore:
             != inventory_snapshot
         ):
             raise ValueError("protected inventory changed during verification")
+        legacy_source = _validate_segment(
+            reference["legacy_source"], "legacy_source"
+        )
+        allowed_legacy_sources = {
+            "baseball_savant_statcast": {"baseball_savant_statcast"},
+            "mlb_schedule": {"mlb_schedule"},
+            "mlb_schedule_game_feed": {"mlb_schedule"},
+            "mlb_stats_pitcher_bf": {"mlb_stats_pitcher_bf"},
+            "mlb_stats_pitching": {"mlb_stats_pitching"},
+        }
         if (
             reference["source"] != query.source
+            or legacy_source not in allowed_legacy_sources.get(query.source, set())
             or reference["parser_version"] != query.parser_version
         ):
             raise ValueError("legacy reference parser or source binding differs")
@@ -1838,7 +1850,7 @@ class V52EvidenceStore:
         matches = [
             record
             for record in inventory["records"]  # type: ignore[index]
-            if record["source"] == reference["source"]
+            if record["source"] == legacy_source
             and record["canonical_query"] == canonical_query
             and record["manifest"]["path"] == reference["legacy_manifest_path"]
             and record["manifest"]["sha256"] == reference["legacy_manifest_sha256"]
@@ -1880,7 +1892,7 @@ class V52EvidenceStore:
             raise ValueError("protected legacy manifest is invalid") from exc
         if (
             not isinstance(manifest, dict)
-            or manifest.get("source") != reference["source"]
+            or manifest.get("source") != legacy_source
             or manifest.get("query") != canonical_query
             or manifest.get("sha256") != digest
             or manifest.get("row_count") != row_count
