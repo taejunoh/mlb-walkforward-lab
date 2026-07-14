@@ -511,9 +511,6 @@ def _source_receipt_payload(
         != snapshot_sha256s
     ):
         raise ValueError("source evidence receipt binding failed")
-    reviewed_query_ids = _string_list(
-        payload.get("reviewed_query_ids"), "reviewed query IDs"
-    )
     kind = payload.get("receipt_kind")
     if kind == "SOURCE_REVIEW":
         if (
@@ -522,7 +519,9 @@ def _source_receipt_payload(
             or payload.get("decision") != "APPROVED"
         ):
             raise ValueError("independent source review is not approved")
-        return kind, reviewed_query_ids
+        return kind, _sorted_string_list(
+            payload.get("reviewed_query_ids"), "reviewed query IDs"
+        )
     if kind == "CLEAN_SOURCE_REPLAY":
         if (
             not path.startswith(_SOURCE_REPLAY_PREFIX)
@@ -531,7 +530,9 @@ def _source_receipt_payload(
             or payload.get("network_attempts") != 0
         ):
             raise ValueError("clean source replay failed")
-        return kind, reviewed_query_ids
+        return kind, _string_list(
+            payload.get("reviewed_query_ids"), "reviewed query IDs"
+        )
     raise ValueError("unknown source evidence receipt kind")
 
 
@@ -558,13 +559,21 @@ def _validate_sources_ready_evidence(
             inventory_sha256=inventory.sha256,
             snapshot_sha256s=snapshots,
         )
-        if reviewed_query_ids is None:
-            reviewed_query_ids = receipt_queries
-        elif receipt_queries != reviewed_query_ids:
-            raise ValueError("source evidence reviewed query IDs differ")
         if kind == "SOURCE_REVIEW":
+            if not set(receipt_queries).issubset(inventory_query_ids):
+                raise ValueError(
+                    "source review query IDs are outside the inventory"
+                )
+            if reviewed_query_ids is None:
+                reviewed_query_ids = receipt_queries
+            elif receipt_queries != reviewed_query_ids:
+                raise ValueError("source review query ID subsets differ")
             reviews += 1
         else:
+            if receipt_queries != inventory_query_ids:
+                raise ValueError(
+                    "clean source replay query IDs differ from inventory"
+                )
             if (
                 artifact.path in replay_paths
                 or artifact.sha256 in replay_hashes
@@ -576,8 +585,6 @@ def _validate_sources_ready_evidence(
         raise ValueError(
             "SOURCES_READY requires an approved review and two clean replays"
         )
-    if reviewed_query_ids != inventory_query_ids:
-        raise ValueError("source evidence reviewed query IDs differ from inventory")
 
 
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:

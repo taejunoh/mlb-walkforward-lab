@@ -236,6 +236,66 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
 
+    def test_sources_ready_allows_audited_review_subset_with_full_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            review, replay_one, replay_two = evidence
+            review_payload = json.loads(review.read_bytes())
+            review_payload["reviewed_query_ids"] = ["query-001"]
+            review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+
+            state = self.registry.advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="ACQUIRING",
+                next_phase="SOURCES_READY",
+                inventory_path=inventory,
+                validation_receipts=(review, replay_one, replay_two),
+            )
+            self.assertEqual(state.phase, "SOURCES_READY")
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), state
+            )
+
+    def test_sources_ready_rejects_invalid_review_subset_or_partial_replay(self) -> None:
+        cases = ("empty", "outside", "duplicate", "unsorted", "partial_replay")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(
+                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+                )
+                inventory, evidence = self.write_real_source_evidence(root)
+                review, replay_one, replay_two = evidence
+                target = replay_one if case == "partial_replay" else review
+                payload = json.loads(target.read_bytes())
+                replacements = {
+                    "empty": [],
+                    "outside": ["outside-query"],
+                    "duplicate": ["query-001", "query-001"],
+                    "unsorted": ["query-002", "query-001"],
+                    "partial_replay": ["query-001"],
+                }
+                payload["reviewed_query_ids"] = replacements[case]
+                target.write_bytes(canonical_json_bytes(payload) + b"\n")
+
+                with self.assertRaisesRegex(ValueError, "artifact|evidence|query"):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="ACQUIRING",
+                        next_phase="SOURCES_READY",
+                        inventory_path=inventory,
+                        validation_receipts=(review, replay_one, replay_two),
+                    )
+                self.assertEqual(
+                    self.registry.load_execution_registry(root, run_spec), initial
+                )
+
     def test_dynamic_phase_evidence_is_stable_through_publication(self) -> None:
         for artifact_kind in ("inventory", "review", "replay"):
             with self.subTest(artifact_kind=artifact_kind), tempfile.TemporaryDirectory() as directory:
