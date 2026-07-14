@@ -143,12 +143,17 @@ def _header_value(headers: tuple[tuple[str, str], ...], name: str) -> str | None
     return None
 
 
-def _read_bounded(response: object, max_bytes: int) -> tuple[bytes, bool]:
+def _read_bounded(
+    response: object, max_bytes: int
+) -> tuple[bytes, bool, BaseException | None]:
     chunks: list[bytes] = []
     total = 0
     exceeded = False
     while True:
-        chunk = response.read(_READ_CHUNK_BYTES)  # type: ignore[attr-defined]
+        try:
+            chunk = response.read(_READ_CHUNK_BYTES)  # type: ignore[attr-defined]
+        except (socket.timeout, OSError) as exc:
+            return b"".join(chunks), exceeded, exc
         if not chunk:
             break
         if not isinstance(chunk, bytes):
@@ -161,13 +166,16 @@ def _read_bounded(response: object, max_bytes: int) -> tuple[bytes, bool]:
         chunks.append(chunk)
         total += len(chunk)
         if total == max_bytes:
-            probe = response.read(1)  # type: ignore[attr-defined]
+            try:
+                probe = response.read(1)  # type: ignore[attr-defined]
+            except (socket.timeout, OSError) as exc:
+                return b"".join(chunks), exceeded, exc
             if probe:
                 if not isinstance(probe, bytes):
                     raise ValueError("response body must contain bytes")
                 exceeded = True
             break
-    return b"".join(chunks), exceeded
+    return b"".join(chunks), exceeded, None
 
 
 def _network_classification(exc: BaseException) -> str:
@@ -193,7 +201,9 @@ def _capture_response(
     if parsed_final.scheme != "https" or parsed_final.hostname != expected_host:
         return final_url, status, selected, None, "REDIRECT_HOST_NOT_ALLOWED"
 
-    body, exceeded = _read_bounded(response, max_bytes)
+    body, exceeded, read_error = _read_bounded(response, max_bytes)
+    if read_error is not None:
+        return final_url, status, selected, body, "TRANSIENT_NETWORK"
     if isinstance(status, int) and not 200 <= status <= 299:
         classification = "TRANSIENT_HTTP" if status in TRANSIENT_HTTP else "PERMANENT_HTTP"
         return final_url, status, selected, body, classification
@@ -242,12 +252,13 @@ def fetch_attempt(
                 max_bytes=max_bytes,
             )
     except HTTPError as exc:
-        final_url, status, headers, body, classification = _capture_response(
-            exc,
-            expected_host=expected_host,
-            expected_media_type=query.expected_media_type,
-            max_bytes=max_bytes,
-        )
+        with exc:
+            final_url, status, headers, body, classification = _capture_response(
+                exc,
+                expected_host=expected_host,
+                expected_media_type=query.expected_media_type,
+                max_bytes=max_bytes,
+            )
     except (URLError, TimeoutError, ConnectionError, socket.timeout) as exc:
         final_url = None
         status = None

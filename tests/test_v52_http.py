@@ -70,6 +70,24 @@ class _Response:
         return self._stream.read(size)
 
 
+class _FailingBody(BytesIO):
+    def __init__(self, failure: OSError) -> None:
+        super().__init__(b"")
+        self.failure = failure
+        self.read_count = 0
+        self.close_called = False
+
+    def read(self, _size=-1):
+        self.read_count += 1
+        if self.read_count == 1:
+            return b"part"
+        raise self.failure
+
+    def close(self):
+        self.close_called = True
+        super().close()
+
+
 class V52HttpTest(unittest.TestCase):
     def _clock(self):
         values = iter((T0, T0.replace(second=1)))
@@ -166,6 +184,38 @@ class V52HttpTest(unittest.TestCase):
                     opener=mock.Mock(side_effect=failure), clock=self._clock(),
                 )
                 self.assertEqual(capture.error_classification, expected)
+
+    def test_http_error_is_closed_and_read_failures_become_transient_capture(self):
+        from mlb_backtest.v52_http import fetch_attempt
+
+        for failure in (socket.timeout("late body"), OSError("broken body")):
+            with self.subTest(failure=failure):
+                body = _FailingBody(failure)
+                headers = Message()
+                headers["Content-Type"] = "application/json"
+                headers["Retry-After"] = "5"
+                error = HTTPError(
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                    503,
+                    "unavailable",
+                    headers,
+                    body,
+                )
+                capture = fetch_attempt(
+                    _query(),
+                    timeout=5,
+                    max_bytes=100,
+                    opener=mock.Mock(side_effect=error),
+                    clock=self._clock(),
+                )
+                self.assertTrue(body.close_called)
+                self.assertEqual(capture.final_url, error.geturl())
+                self.assertEqual(capture.http_status, 503)
+                self.assertEqual(capture.response_headers[-1], ("Retry-After", "5"))
+                self.assertEqual(capture.body, b"part")
+                self.assertEqual(
+                    capture.error_classification, "TRANSIENT_NETWORK"
+                )
 
     def test_retry_after_supports_delta_and_http_date(self):
         from mlb_backtest.v52_http import parse_retry_after

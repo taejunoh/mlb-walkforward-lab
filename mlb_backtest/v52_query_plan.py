@@ -331,7 +331,8 @@ def build_schedule_reference_batch(
             raise ValueError("schedule anchor season is outside 2018-2024")
         official = _iso_date(raw.get("official_date"), "anchor official_date")
         season_start = _iso_date(raw.get("season_start_date"), "anchor season_start_date")
-        if official.year != season or season_start.year != season or official < season_start:
+        frozen_start, frozen_end = _SEASON_BOUNDARIES[season]
+        if season_start != frozen_start or not frozen_start <= official <= frozen_end:
             raise ValueError("schedule anchor dates differ from season")
         identity = (season, season_start, official, venue_id)
         if game_pk in unique_games and unique_games[game_pk] != identity:
@@ -444,6 +445,7 @@ def build_participant_derived_batch(
     if not isinstance(games, list):
         raise ValueError("game_evidence_inventory.games must be a list")
     pitchers: set[int] = set()
+    seen_game_pks: set[int] = set()
     for game in games:
         if not isinstance(game, dict):
             raise ValueError("game evidence must be an object")
@@ -451,6 +453,9 @@ def build_participant_derived_batch(
         season = game.get("season")
         if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
             raise ValueError("game evidence game_pk must be a positive integer")
+        if game_pk in seen_game_pks:
+            raise ValueError("game evidence contains duplicate game_pk")
+        seen_game_pks.add(game_pk)
         if (
             isinstance(season, bool)
             or not isinstance(season, int)
@@ -476,6 +481,8 @@ def build_participant_derived_batch(
             if isinstance(pitcher_id, bool) or not isinstance(pitcher_id, int) or pitcher_id <= 0:
                 raise ValueError("actual starter IDs must be positive integers")
             pitchers.add(pitcher_id)
+        if starters[0] == starters[1]:
+            raise ValueError("verified game actual starter IDs must be distinct")
 
     queries = [
         _logical_query(
@@ -742,14 +749,35 @@ def _directory_flags() -> int:
 
 
 def _open_root(root: Path) -> int:
-    linked_root = os.lstat(root)
-    if stat.S_ISLNK(linked_root.st_mode) or not stat.S_ISDIR(linked_root.st_mode):
-        raise ValueError("query batch root must be a no-follow directory")
-    absolute = Path(os.path.realpath(os.fspath(root)))
+    absolute = Path(os.path.abspath(os.fspath(root)))
+    parts = absolute.parts
+    if not parts or parts[0] != os.sep:
+        raise ValueError("query batch root must resolve to an absolute path")
     current = os.open(os.sep, _directory_flags())
     try:
-        for component in absolute.parts[1:]:
-            child = os.open(component, _directory_flags(), dir_fd=current)
+        for component in parts[1:]:
+            child = -1
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        "query batch root ancestors must be no-follow directories"
+                    ) from exc
+                raise
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("query batch root directory identity differs")
+            except BaseException:
+                os.close(child)
+                raise
             os.close(current)
             current = child
         return current
@@ -927,6 +955,56 @@ def _reconcile_batch_final(
     return reconciled
 
 
+def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
+    private_name = re.compile(
+        rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$"
+    )
+    removed = False
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    for candidate_name in os.listdir(parent_fd):
+        if private_name.fullmatch(candidate_name) is None:
+            continue
+        try:
+            descriptor = os.open(candidate_name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                "query batch private temp must be a no-follow regular file"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            linked = os.stat(
+                candidate_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(linked.st_mode)
+                or opened.st_nlink != 1
+                or linked.st_nlink != 1
+                or _batch_file_identity(opened) != _batch_file_identity(linked)
+            ):
+                raise ValueError(
+                    "query batch private temp must be an unaliased regular file"
+                )
+            rebound = os.stat(
+                candidate_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if _batch_file_identity(opened) != _batch_file_identity(rebound):
+                raise ValueError("query batch private temp identity changed")
+            os.unlink(candidate_name, dir_fd=parent_fd)
+            removed = True
+        finally:
+            os.close(descriptor)
+    if removed:
+        os.fsync(parent_fd)
+
+
 def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     if not isinstance(batch, QueryBatch):
         raise TypeError("batch must be a QueryBatch")
@@ -948,6 +1026,7 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
         try:
             name = f"{batch.batch_id}.json"
             existing = _reconcile_batch_final(current, batch.batch_id, contents)
+            _cleanup_prelink_batch_temps(current, batch.batch_id)
             if existing is not None:
                 return root / _ACQUISITION_BATCH_ROOT / name
             temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"

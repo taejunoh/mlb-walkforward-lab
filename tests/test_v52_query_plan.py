@@ -145,6 +145,38 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         self.assertEqual(batch.stage, "REFERENCE_INPUTS")
 
+    def test_schedule_reference_rejects_wrong_start_offseason_and_conflicting_season_rows(self):
+        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+
+        base = {
+            "season": 2024,
+            "season_start_date": "2024-03-20",
+            "game_pk": 7,
+            "official_date": "2024-04-02",
+            "venue_id": 31,
+        }
+        invalid_inventories = [
+            {"anchors": [{**base, "season_start_date": "2024-03-21"}]},
+            {"anchors": [{**base, "official_date": "2024-10-01"}]},
+            {
+                "anchors": [
+                    base,
+                    {
+                        **base,
+                        "game_pk": 8,
+                        "season_start_date": "2024-03-19",
+                    },
+                ]
+            },
+        ]
+        for inventory in invalid_inventories:
+            with self.subTest(inventory=inventory), self.assertRaises(ValueError):
+                build_schedule_reference_batch(
+                    inventory,
+                    run_spec_sha256=RUN_SHA,
+                    acquisition_contract_sha256=CONTRACT_SHA,
+                )
+
     def test_opening_day_d1_emits_preseason_disposition_not_invalid_stats_query(self):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
@@ -252,6 +284,30 @@ class V52QueryPlanTest(unittest.TestCase):
             with self.subTest(game=game), self.assertRaises(ValueError):
                 build_participant_derived_batch(
                     {"games": [game]},
+                    run_spec_sha256=RUN_SHA,
+                    acquisition_contract_sha256=CONTRACT_SHA,
+                )
+
+    def test_participant_batch_rejects_duplicate_games_and_identical_starters(self):
+        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+
+        base = {
+            "game_pk": 1,
+            "season": 2024,
+            "official_date": "2024-04-02",
+            "verification_status": "VERIFIED",
+            "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
+            "actual_starter_ids": [100, 200],
+        }
+        invalid_games = [
+            [base, dict(base)],
+            [base, {**base, "actual_starter_ids": [300, 400]}],
+            [{**base, "actual_starter_ids": [100, 100]}],
+        ]
+        for games in invalid_games:
+            with self.subTest(games=games), self.assertRaises(ValueError):
+                build_participant_derived_batch(
+                    {"games": games},
                     run_spec_sha256=RUN_SHA,
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
@@ -466,7 +522,7 @@ class V52QueryPlanTest(unittest.TestCase):
         second = build_static_batch(RUN_SPEC, CONTRACT)
         self.assertEqual(first, second)
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             path = publish_query_batch(root, first)
             original = path.read_bytes()
             self.assertTrue(original.endswith(b"\n"))
@@ -487,7 +543,7 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
+            base = Path(td).resolve()
             actual_root = base / "actual"
             actual_root.mkdir()
             linked_root = base / "linked"
@@ -496,7 +552,18 @@ class V52QueryPlanTest(unittest.TestCase):
                 publish_query_batch(linked_root, batch)
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            base = Path(td).resolve()
+            actual = base / "actual"
+            nested = actual / "nested"
+            nested.mkdir(parents=True)
+            alias = base / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "root"):
+                publish_query_batch(alias / "nested", batch)
+            self.assertFalse((nested / "audit").exists())
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
             outside = root / "outside"
             outside.mkdir()
             (root / "audit").symlink_to(outside, target_is_directory=True)
@@ -504,7 +571,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 publish_query_batch(root, batch)
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             path = publish_query_batch(root, batch)
             alias = root / "alias"
             os.link(path, alias)
@@ -517,7 +584,7 @@ class V52QueryPlanTest(unittest.TestCase):
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         for failure in ("write", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
-                root = Path(td)
+                root = Path(td).resolve()
                 destination = (
                     root / "audit/v5_2_qd/historical/acquisition/query_batches"
                     / f"{batch.batch_id}.json"
@@ -559,7 +626,7 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             barrier = threading.Barrier(6)
 
             paths = []
@@ -586,7 +653,9 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as seed_td:
-            expected = query_plan.publish_query_batch(Path(seed_td), batch).read_bytes()
+            expected = query_plan.publish_query_batch(
+                Path(seed_td).resolve(), batch
+            ).read_bytes()
 
         def race(root: Path, competing: bytes):
             def lose_link(_src, dst, *, src_dir_fd, dst_dir_fd, follow_symlinks):
@@ -606,13 +675,13 @@ class V52QueryPlanTest(unittest.TestCase):
                 return query_plan.publish_query_batch(root, batch)
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             path = race(root, expected)
             self.assertEqual(path.read_bytes(), expected)
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             with self.assertRaisesRegex(RuntimeError, "differs"):
                 race(root, b"{}\n")
             batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
@@ -623,7 +692,7 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             entered = threading.Event()
             release = threading.Event()
             second_done = threading.Event()
@@ -680,7 +749,7 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             with mock.patch.object(
                 query_plan,
                 "_unlink_owned_temp",
@@ -705,7 +774,7 @@ class V52QueryPlanTest(unittest.TestCase):
 
         batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
             batch_dir.mkdir(parents=True)
             final = batch_dir / f"{batch.batch_id}.json"
@@ -718,6 +787,67 @@ class V52QueryPlanTest(unittest.TestCase):
             self.assertEqual(final.read_bytes(), b"{}\n")
             self.assertTrue(stale.exists())
             self.assertEqual(os.stat(final).st_nlink, 2)
+
+    def test_publish_cleans_accumulated_prelink_private_temp_orphans(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as seed_td:
+            expected = query_plan.publish_query_batch(
+                Path(seed_td).resolve(), batch
+            ).read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+            batch_dir.mkdir(parents=True)
+            stale = [
+                batch_dir / f".{batch.batch_id}.{'1' * 32}.tmp",
+                batch_dir / f".{batch.batch_id}.{'2' * 32}.tmp",
+            ]
+            stale[0].write_bytes(expected[:17])
+            stale[1].write_bytes(expected)
+
+            final = query_plan.publish_query_batch(root, batch)
+            self.assertEqual(final.read_bytes(), expected)
+            self.assertEqual(os.stat(final).st_nlink, 1)
+            self.assertFalse(any(path.exists() for path in stale))
+
+    def test_publish_never_deletes_nonprivate_or_aliased_temp_entries(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        matching_name = f".{batch.batch_id}.{'c' * 32}.tmp"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+            batch_dir.mkdir(parents=True)
+            unrelated = batch_dir / ".unrelated.tmp"
+            unrelated.write_bytes(b"keep")
+            query_plan.publish_query_batch(root, batch)
+            self.assertEqual(unrelated.read_bytes(), b"keep")
+
+        for attack in ("symlink", "hardlink", "fifo"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+                batch_dir.mkdir(parents=True)
+                candidate = batch_dir / matching_name
+                target = root / "target"
+                if attack == "symlink":
+                    target.write_bytes(b"keep")
+                    candidate.symlink_to(target)
+                elif attack == "hardlink":
+                    target.write_bytes(b"keep")
+                    os.link(target, candidate)
+                else:
+                    os.mkfifo(candidate)
+
+                with self.assertRaises(ValueError):
+                    query_plan.publish_query_batch(root, batch)
+                self.assertTrue(os.path.lexists(candidate))
+                final = batch_dir / f"{batch.batch_id}.json"
+                self.assertFalse(final.exists())
 
 
 if __name__ == "__main__":
