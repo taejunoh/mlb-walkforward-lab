@@ -585,6 +585,69 @@ class V52LegacyTest(unittest.TestCase):
             ), self.assertRaisesRegex(ValueError, "generic publisher rejection"):
                 promote_legacy_candidate(store, query, catalog, decision)
 
+    def test_consumer_specific_audits_may_reuse_raw_with_distinct_references(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_legacy import (
+            PromotionDisposition,
+            audit_legacy_candidate,
+            promote_legacy_candidate,
+        )
+
+        query = _pitching_query()
+        legacy_query = {
+            **query.parameters,
+            "url": query.endpoint + "?" + urlencode(tuple(query.parameters.items())),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repository, legacy_root, inventory, digest = _repository_records(
+                Path(directory),
+                (
+                    (
+                        "mlb_stats_pitching",
+                        legacy_query,
+                        (SOURCE_FIXTURES / "pitching_mini.json").read_bytes(),
+                    ),
+                ),
+            )
+            catalog = _load(repository, legacy_root, inventory, digest)
+            second = dataclasses.replace(
+                query,
+                requested_range={
+                    **query.requested_range,
+                    "consuming_game_pks": [9002],
+                    "consumer_cutoff_dates": {"9002": "2024-04-01"},
+                },
+            )
+            first_decision = audit_legacy_candidate(query, catalog)
+            second_decision = audit_legacy_candidate(second, catalog)
+            self.assertIs(first_decision.disposition, PromotionDisposition.PROMOTED)
+            self.assertIs(second_decision.disposition, PromotionDisposition.PROMOTED)
+            self.assertEqual(first_decision.candidate, second_decision.candidate)
+
+            store = _store(repository)
+            first_published = promote_legacy_candidate(
+                store, query, catalog, first_decision
+            )
+            second_published = promote_legacy_candidate(
+                store, second, catalog, second_decision
+            )
+            self.assertEqual(first_published.raw_sha256, second_published.raw_sha256)
+            for current in (query, second):
+                folder = (
+                    store.root
+                    / "queries"
+                    / current.source
+                    / logical_query_id(current)
+                    / "objects"
+                )
+                reference = json.loads(
+                    next(folder.glob("*.legacy-reference.json")).read_bytes()
+                )
+                self.assertEqual(
+                    reference["current_query_id"], logical_query_id(current)
+                )
+
     def test_quality_m1_has_no_exception_message_classifier(self) -> None:
         from mlb_backtest import v52_legacy
 

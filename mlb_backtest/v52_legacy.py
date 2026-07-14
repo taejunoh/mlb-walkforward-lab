@@ -7,13 +7,10 @@ import json
 import os
 import re
 import stat
-from calendar import monthrange
-from dataclasses import dataclass, replace
-from datetime import date
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import urlencode
 
 from .v52_evidence import (
     LogicalQuery,
@@ -22,14 +19,13 @@ from .v52_evidence import (
     V52EvidenceStore,
     logical_query_id,
 )
-from .v52_legacy_relation import is_approved_legacy_source_relation
+from .v52_legacy_relation import matches_current_query_to_legacy
 from .v52_protected_inventory import (
     ProtectedMembershipSnapshot,
     parse_protected_raw_inventory_document,
     snapshot_protected_inventory_membership,
     verify_protected_raw_inventory,
 )
-from .v52_seasons import SEASON_BOUNDARIES
 from .v52_source_contracts import canonical_json_bytes, recompute_query_sidecar
 
 
@@ -590,322 +586,18 @@ def load_protected_legacy_catalog(
     )
 
 
-def _canonical_day(value: object) -> date | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = date.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.isoformat() == value else None
-
-
-def _consumer_binding_matches(
-    requested: Mapping[str, object],
-    *,
-    exact_cutoff: str | None = None,
-    earliest_cutoff: date | None = None,
-) -> bool:
-    consumers = requested.get("consuming_game_pks")
-    cutoffs = requested.get("consumer_cutoff_dates")
-    if (
-        not isinstance(consumers, list)
-        or not consumers
-        or any(
-            isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0
-            for game_pk in consumers
-        )
-        or consumers != sorted(set(consumers))
-        or not isinstance(cutoffs, Mapping)
-        or set(cutoffs) != {str(game_pk) for game_pk in consumers}
-    ):
-        return False
-    for value in cutoffs.values():
-        parsed = _canonical_day(value)
-        if (
-            parsed is None
-            or (exact_cutoff is not None and value != exact_cutoff)
-            or (earliest_cutoff is not None and parsed < earliest_cutoff)
-        ):
-            return False
-    return True
-
-
-def _career_baseline_eligible(requested: Mapping[str, object], baseline: str) -> bool:
-    baseline_day = _canonical_day(baseline)
-    if baseline_day is None or not _consumer_binding_matches(
-        requested, earliest_cutoff=baseline_day
-    ):
-        return False
-    cutoffs = requested["consumer_cutoff_dates"]
-    if not isinstance(cutoffs, Mapping):
-        return False
-    boundary = date(2022, 1, 1)
-    parsed = tuple(_canonical_day(value) for value in cutoffs.values())
-    if any(value is None for value in parsed):
-        return False
-    if baseline == "2017-12-31":
-        return all(value < boundary for value in parsed if value is not None)
-    if baseline == "2021-12-31":
-        return all(value >= boundary for value in parsed if value is not None)
-    return False
-
-
-def _ordered_url(
-    endpoint: str, parameters: Mapping[str, object], keys: tuple[str, ...]
-) -> str:
-    return f"{endpoint}?{urlencode(tuple((key, parameters[key]) for key in keys))}"
-
-
 def _exact_match(
     query: LogicalQuery,
     record: _CatalogRecord,
     catalog: ProtectedLegacyCatalog,
 ) -> bool:
     legacy = json.loads(record.canonical_query_json)
-    if not isinstance(legacy, Mapping) or not is_approved_legacy_source_relation(
-        current_source=query.source,
-        endpoint=query.endpoint,
-        grain=query.grain,
-        parser_version=query.parser_version,
-        expected_media_type=query.expected_media_type,
+    return matches_current_query_to_legacy(
+        query,
         legacy_source=record.candidate.source,
-    ):
-        return False
-    if (
-        query.source == "mlb_schedule_game_feed"
-        and query.grain == "season_schedule_and_game"
-        and query.endpoint == "https://statsapi.mlb.com/api/v1/schedule"
-        and record.candidate.source == "mlb_schedule"
-    ):
-        year = query.requested_range.get("year")
-        return (
-            set(query.requested_range) == {"year", "start_date", "end_date"}
-            and query.expected_media_type == "application/json"
-            and query.parent_query_id is None
-            and type(year) is int
-            and year in {2022, 2023, 2024}
-            and query.requested_range.get("start_date")
-            == SEASON_BOUNDARIES[year][0].isoformat()
-            and query.requested_range.get("end_date")
-            == SEASON_BOUNDARIES[year][1].isoformat()
-            and legacy.get("role") == "training"
-            and legacy.get("gameType") == "R"
-            and legacy.get("start") == query.requested_range.get("start_date")
-            and legacy.get("end") == query.requested_range.get("end_date")
-            and legacy.get("url")
-            == _ordered_url(
-                query.endpoint,
-                query.parameters,
-                ("sportId", "gameType", "startDate", "endDate", "hydrate"),
-            )
-            and query.parameters
-            == {
-                "sportId": 1,
-                "gameType": "R",
-                "startDate": query.requested_range.get("start_date"),
-                "endDate": query.requested_range.get("end_date"),
-                "hydrate": "probablePitcher,lineups,venue,linescore",
-            }
-        )
-    if (
-        query.source == "baseball_savant_statcast"
-        and query.grain == "pitch"
-        and query.endpoint == "https://baseballsavant.mlb.com/statcast_search/csv"
-        and record.candidate.source == query.source
-    ):
-        from .statcast import statcast_url
-        from .v52_query_plan import validate_statcast_query
-
-        first = query.requested_range.get("start_date")
-        last = query.requested_range.get("end_date")
-        try:
-            validated_first, validated_last = validate_statcast_query(query)
-        except (TypeError, ValueError):
-            return False
-        year = validated_first.year
-        season_start, season_end = SEASON_BOUNDARIES[year]
-        parent_first = max(season_start, date(year, validated_first.month, 1))
-        parent_last = min(
-            season_end,
-            date(
-                year, validated_first.month, monthrange(year, validated_first.month)[1]
-            ),
-        )
-        parent_requested = {
-            "year": year,
-            "start_date": parent_first.isoformat(),
-            "end_date": parent_last.isoformat(),
-        }
-        parent_parameters = dict(query.parameters)
-        parent_parameters["game_date_gt"] = parent_first.isoformat()
-        parent_parameters["game_date_lt"] = parent_last.isoformat()
-        planned_parent = replace(
-            query,
-            parameters=parent_parameters,
-            requested_range=parent_requested,
-            parent_query_id=None,
-        )
-        return (
-            validated_first.year in {2022, 2023, 2024}
-            and isinstance(query.parent_query_id, str)
-            and bool(_SHA256.fullmatch(query.parent_query_id))
-            and query.parent_query_id == logical_query_id(planned_parent)
-            and query.requested_range.get("acquisition") == "PROTECTED_LEGACY_REFERENCE"
-            and query.requested_range.get("protected_inventory_sha256")
-            == catalog.protected_inventory_sha256
-            and legacy.get("start") == first
-            and legacy.get("end") == last
-            and legacy.get("game_type") == "R"
-            and legacy.get("url") == statcast_url(str(first), str(last))
-        )
-    if (
-        query.source == "mlb_stats_pitching"
-        and query.grain == "season_d1_league_pitching_reference"
-        and query.endpoint == "https://statsapi.mlb.com/api/v1/stats"
-        and record.candidate.source == query.source
-    ):
-        season = query.requested_range.get("season")
-        start = _canonical_day(query.requested_range.get("start_date"))
-        as_of = _canonical_day(query.requested_range.get("as_of_date"))
-        return (
-            set(query.requested_range)
-            == {
-                "season",
-                "start_date",
-                "as_of_date",
-                "consuming_game_pks",
-                "consumer_cutoff_dates",
-                "response_completeness",
-            }
-            and query.expected_media_type == "application/json"
-            and query.parent_query_id is None
-            and not isinstance(season, bool)
-            and isinstance(season, int)
-            and season in {2022, 2023, 2024}
-            and start == SEASON_BOUNDARIES[season][0]
-            and as_of is not None
-            and start <= as_of <= SEASON_BOUNDARIES[season][1]
-            and query.requested_range.get("start_date")
-            == query.parameters.get("startDate")
-            and query.requested_range.get("as_of_date")
-            == query.parameters.get("endDate")
-            and query.requested_range.get("response_completeness")
-            == {
-                "limit": 5000,
-                "reject_total_splits_at_or_above_limit": True,
-            }
-            and query.parameters
-            == {
-                "stats": "byDateRange",
-                "group": "pitching",
-                "sportIds": 1,
-                "gameType": "R",
-                "playerPool": "ALL",
-                "limit": 5000,
-                "startDate": start.isoformat(),
-                "endDate": as_of.isoformat(),
-            }
-            and _consumer_binding_matches(
-                query.requested_range,
-                exact_cutoff=str(query.requested_range.get("as_of_date")),
-            )
-            and all(
-                legacy.get(key) == query.parameters.get(key)
-                for key in (
-                    "stats",
-                    "group",
-                    "sportIds",
-                    "gameType",
-                    "playerPool",
-                    "limit",
-                    "startDate",
-                    "endDate",
-                )
-            )
-            and (
-                legacy.get("url")
-                == _ordered_url(
-                    query.endpoint,
-                    query.parameters,
-                    (
-                        "stats",
-                        "group",
-                        "sportIds",
-                        "gameType",
-                        "playerPool",
-                        "limit",
-                        "startDate",
-                        "endDate",
-                    ),
-                )
-                and query.requested_range.get("season") in {2022, 2023, 2024}
-            )
-        )
-    if (
-        query.source == "mlb_stats_pitcher_bf"
-        and query.grain == "player_career_batters_faced_reference"
-        and record.candidate.source == query.source
-    ):
-        baseline = query.requested_range.get("inclusive_end")
-        return (
-            set(query.requested_range)
-            == {
-                "pitcher_id",
-                "inclusive_end",
-                "consuming_game_pks",
-                "consumer_cutoff_dates",
-            }
-            and query.expected_media_type == "application/json"
-            and query.parent_query_id is None
-            and not isinstance(query.requested_range.get("pitcher_id"), bool)
-            and isinstance(query.requested_range.get("pitcher_id"), int)
-            and query.requested_range.get("pitcher_id") > 0
-            and query.endpoint
-            == (
-                "https://statsapi.mlb.com/api/v1/people/"
-                f"{query.requested_range.get('pitcher_id')}/stats"
-            )
-            and isinstance(baseline, str)
-            and baseline in {"2017-12-31", "2021-12-31"}
-            and query.parameters
-            == {
-                "stats": "byDateRange",
-                "group": "pitching",
-                "gameType": "R",
-                "sportIds": 1,
-                "startDate": "1876-01-01",
-                "endDate": baseline,
-            }
-            and _career_baseline_eligible(query.requested_range, str(baseline))
-            and legacy.get("pitcher_id") == query.requested_range.get("pitcher_id")
-            and legacy.get("endDate") == query.requested_range.get("inclusive_end")
-            and legacy.get("url")
-            == _ordered_url(
-                query.endpoint,
-                query.parameters,
-                (
-                    "stats",
-                    "group",
-                    "gameType",
-                    "sportIds",
-                    "startDate",
-                    "endDate",
-                ),
-            )
-            and all(
-                legacy.get(key) == query.parameters.get(key)
-                for key in (
-                    "stats",
-                    "group",
-                    "sportIds",
-                    "gameType",
-                    "startDate",
-                    "endDate",
-                )
-            )
-        )
-    return False
+        legacy_query=legacy,
+        protected_inventory_sha256=catalog.protected_inventory_sha256,
+    )
 
 
 def _decision(
@@ -1162,6 +854,7 @@ def promote_legacy_candidate(
         )
     reference = {
         "canonical_query": dict(record.canonical_query),
+        "current_query_id": logical_query_id(query),
         "legacy_manifest_path": record.candidate.manifest_path.relative_to(
             catalog.repository_root
         ).as_posix(),

@@ -9,8 +9,10 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import jsonschema
 
@@ -145,34 +147,69 @@ def _tmp(value: str) -> Path:
 def _legacy_fixture(
     base: Path,
 ) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
-    repository = base / "repo"
-    repository.mkdir()
-    legacy_root = repository / "data/v5_1_bt/raw"
-    legacy_query = {
-        "end": "2022-04-08",
+    parameters = {
+        "sportId": 1,
         "gameType": "R",
-        "role": "backtest",
-        "start": "2022-04-07",
-        "url": "https://statsapi.mlb.com/api/v1/schedule",
+        "startDate": "2022-04-07",
+        "endDate": "2022-10-05",
+        "hydrate": "probablePitcher,lineups,venue,linescore",
     }
-    artifact = RawStore(legacy_root).put(
-        "mlb_schedule", legacy_query, b"legacy-one\nlegacy-two\n"
-    )
-    inventory = build_protected_raw_inventory(repository, legacy_root)
-    inventory_path = repository / "audit/v5_1_bt/protected_raw_inventory.json"
-    inventory_path.parent.mkdir(parents=True)
-    inventory_path.write_bytes(_canonical_file(inventory))
-    record = inventory["records"][0]
-    manifest = json.loads(artifact.manifest_path.read_bytes())
     current_query = dataclasses.replace(
         _query(),
         source="mlb_schedule_game_feed",
         grain="season_schedule_and_game",
+        parameters=parameters,
+        requested_range={
+            "year": 2022,
+            "start_date": "2022-04-07",
+            "end_date": "2022-10-05",
+        },
         parser_version="v5.2.1",
     )
+    legacy_query = {
+        "end": "2022-10-05",
+        "gameType": "R",
+        "role": "training",
+        "start": "2022-04-07",
+        "url": (
+            "https://statsapi.mlb.com/api/v1/schedule?"
+            + urlencode(tuple(parameters.items()))
+        ),
+    }
+    return _legacy_reference_fixture(
+        base,
+        source="mlb_schedule",
+        legacy_query=legacy_query,
+        current_query=current_query,
+        raw=b"legacy-one\nlegacy-two\n",
+    )
+
+
+def _legacy_reference_fixture(
+    base: Path,
+    *,
+    source: str,
+    legacy_query: dict[str, object],
+    current_query: LogicalQuery | Callable[[str], LogicalQuery],
+    raw: bytes,
+) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
+    repository = base / "repo"
+    repository.mkdir()
+    legacy_root = repository / "data/v5_1_bt/raw"
+    artifact = RawStore(legacy_root).put(source, legacy_query, raw)
+    inventory = build_protected_raw_inventory(repository, legacy_root)
+    inventory_path = repository / "audit/v5_1_bt/protected_raw_inventory.json"
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_bytes(_canonical_file(inventory))
+    inventory_sha256 = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+    if callable(current_query):
+        current_query = current_query(inventory_sha256)
+    record = inventory["records"][0]
+    manifest = json.loads(artifact.manifest_path.read_bytes())
     reference = {
         "canonical_query": record["canonical_query"],
-        "legacy_source": "mlb_schedule",
+        "current_query_id": logical_query_id(current_query),
+        "legacy_source": source,
         "legacy_manifest_path": record["manifest"]["path"],
         "legacy_manifest_sha256": record["manifest"]["sha256"],
         "legacy_seal_path": record["seal"]["path"],
@@ -180,9 +217,7 @@ def _legacy_fixture(
         "parser_version": current_query.parser_version,
         "payload_path": record["raw"]["path"],
         "protected_inventory_path": "audit/v5_1_bt/protected_raw_inventory.json",
-        "protected_inventory_sha256": hashlib.sha256(
-            inventory_path.read_bytes()
-        ).hexdigest(),
+        "protected_inventory_sha256": inventory_sha256,
         "raw_byte_count": record["raw"]["byte_size"],
         "raw_row_count": manifest["row_count"],
         "raw_sha256": record["raw"]["sha256"],
@@ -202,7 +237,334 @@ def _legacy_fixture(
     return V52EvidenceStore(evidence_root), current_query, reference
 
 
+def _statcast_reference_fixture(
+    base: Path,
+) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
+    first = last = "2024-04-02"
+    parameters = {
+        "all": "true",
+        "type": "details",
+        "player_type": "batter",
+        "game_date_gt": first,
+        "game_date_lt": last,
+        "hfGT": "R|",
+        "group_by": "name-year",
+        "sort_col": "pitches",
+        "player_event_sort": "api_p_release_speed",
+        "sort_order": "desc",
+        "min_pitches": "0",
+    }
+
+    def current(inventory_sha256: str) -> LogicalQuery:
+        child = LogicalQuery(
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            parameters=parameters,
+            requested_range={
+                "year": 2024,
+                "start_date": first,
+                "end_date": last,
+                "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                "protected_inventory_sha256": inventory_sha256,
+            },
+            expected_media_type="text/csv",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+        parent = dataclasses.replace(
+            child,
+            parameters={
+                **parameters,
+                "game_date_gt": "2024-04-01",
+                "game_date_lt": "2024-04-30",
+            },
+            requested_range={
+                "year": 2024,
+                "start_date": "2024-04-01",
+                "end_date": "2024-04-30",
+            },
+        )
+        return dataclasses.replace(child, parent_query_id=logical_query_id(parent))
+
+    legacy_query = {
+        "start": first,
+        "end": last,
+        "game_type": "R",
+        "url": (
+            "https://baseballsavant.mlb.com/statcast_search/csv?"
+            + urlencode(tuple(parameters.items()))
+        ),
+    }
+    return _legacy_reference_fixture(
+        base,
+        source="baseball_savant_statcast",
+        legacy_query=legacy_query,
+        current_query=current,
+        raw=b"game_date,game_pk\n2024-04-02,1\n",
+    )
+
+
+def _d1_reference_fixture(
+    base: Path,
+) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
+    parameters = {
+        "stats": "byDateRange",
+        "group": "pitching",
+        "sportIds": 1,
+        "gameType": "R",
+        "playerPool": "ALL",
+        "limit": 5000,
+        "startDate": "2024-03-20",
+        "endDate": "2024-04-01",
+    }
+    query = LogicalQuery(
+        source="mlb_stats_pitching",
+        grain="season_d1_league_pitching_reference",
+        endpoint="https://statsapi.mlb.com/api/v1/stats",
+        parameters=parameters,
+        requested_range={
+            "season": 2024,
+            "start_date": "2024-03-20",
+            "as_of_date": "2024-04-01",
+            "consuming_game_pks": [9001],
+            "consumer_cutoff_dates": {"9001": "2024-04-01"},
+            "response_completeness": {
+                "limit": 5000,
+                "reject_total_splits_at_or_above_limit": True,
+            },
+        },
+        expected_media_type="application/json",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    return _legacy_reference_fixture(
+        base,
+        source=query.source,
+        legacy_query={
+            **parameters,
+            "url": query.endpoint + "?" + urlencode(tuple(parameters.items())),
+        },
+        current_query=query,
+        raw=b'{"stats":[]}\n',
+    )
+
+
+def _career_reference_fixture(
+    base: Path,
+) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
+    parameters = {
+        "stats": "byDateRange",
+        "group": "pitching",
+        "gameType": "R",
+        "sportIds": 1,
+        "startDate": "1876-01-01",
+        "endDate": "2017-12-31",
+    }
+    query = LogicalQuery(
+        source="mlb_stats_pitcher_bf",
+        grain="player_career_batters_faced_reference",
+        endpoint="https://statsapi.mlb.com/api/v1/people/101/stats",
+        parameters=parameters,
+        requested_range={
+            "pitcher_id": 101,
+            "inclusive_end": "2017-12-31",
+            "consuming_game_pks": [9001],
+            "consumer_cutoff_dates": {"9001": "2021-12-31"},
+        },
+        expected_media_type="application/json",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    return _legacy_reference_fixture(
+        base,
+        source=query.source,
+        legacy_query={
+            **parameters,
+            "pitcher_id": 101,
+            "url": query.endpoint + "?" + urlencode(tuple(parameters.items())),
+        },
+        current_query=query,
+        raw=b'{"stats":[]}\n',
+    )
+
+
 class V52EvidenceTest(unittest.TestCase):
+    def test_task6_publisher_requires_exact_source_specific_legacy_relation(
+        self,
+    ) -> None:
+        fixtures = (
+            ("schedule", _legacy_fixture),
+            ("statcast", _statcast_reference_fixture),
+            ("d1", _d1_reference_fixture),
+            ("career", _career_reference_fixture),
+        )
+        for label, fixture in fixtures:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                store, query, reference = fixture(_tmp(td))
+                with store.acquire_query(query):
+                    published = store.publish_legacy_reference(
+                        query, reference, _sidecar()
+                    )
+                self.assertEqual(published.query_id, logical_query_id(query))
+
+                if label == "schedule":
+                    mutations = (
+                        dataclasses.replace(
+                            query,
+                            parameters={**query.parameters, "sportId": 2},
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "end_date": "2022-10-04",
+                            },
+                        ),
+                    )
+                elif label == "statcast":
+                    mutations = (
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "start_date": "2024-04-03",
+                            },
+                        ),
+                        dataclasses.replace(query, parent_query_id="c" * 64),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "protected_inventory_sha256": "d" * 64,
+                            },
+                        ),
+                    )
+                elif label == "d1":
+                    mutations = (
+                        dataclasses.replace(
+                            query,
+                            parameters={**query.parameters, "limit": 4999},
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "as_of_date": "2024-04-02",
+                            },
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "consumer_cutoff_dates": {"9001": "2024-03-31"},
+                            },
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "consuming_game_pks": [9002],
+                                "consumer_cutoff_dates": {"9002": "2024-04-01"},
+                            },
+                        ),
+                    )
+                else:
+                    mutations = (
+                        dataclasses.replace(
+                            query,
+                            endpoint=(
+                                "https://statsapi.mlb.com/api/v1/people/102/stats"
+                            ),
+                            requested_range={
+                                **query.requested_range,
+                                "pitcher_id": 102,
+                            },
+                        ),
+                        dataclasses.replace(
+                            query,
+                            parameters={
+                                **query.parameters,
+                                "endDate": "2021-12-31",
+                            },
+                            requested_range={
+                                **query.requested_range,
+                                "inclusive_end": "2021-12-31",
+                            },
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "consumer_cutoff_dates": {"9001": "2022-01-01"},
+                            },
+                        ),
+                        dataclasses.replace(
+                            query,
+                            requested_range={
+                                **query.requested_range,
+                                "consuming_game_pks": [9002],
+                                "consumer_cutoff_dates": {"9002": "2021-12-31"},
+                            },
+                        ),
+                    )
+                for changed in mutations:
+                    with self.subTest(label=label, changed=changed):
+                        success = (
+                            store.root
+                            / "queries"
+                            / changed.source
+                            / logical_query_id(changed)
+                            / "success.json"
+                        )
+                        with store.acquire_query(changed), self.assertRaises(ValueError):
+                            store.publish_legacy_reference(
+                                changed, reference, _sidecar()
+                            )
+                        self.assertFalse(success.exists())
+
+        with tempfile.TemporaryDirectory() as td:
+            parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": "2022-04-07",
+                "endDate": "2022-10-05",
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+            query = dataclasses.replace(
+                _query(),
+                source="mlb_schedule_game_feed",
+                grain="season_schedule_and_game",
+                parameters=parameters,
+                requested_range={
+                    "year": 2022,
+                    "start_date": "2022-04-07",
+                    "end_date": "2022-10-05",
+                },
+                parser_version="v5.2.1",
+            )
+            store, query, reference = _legacy_reference_fixture(
+                _tmp(td),
+                source="mlb_schedule",
+                legacy_query={
+                    "end": "2022-10-05",
+                    "gameType": "R",
+                    "role": "training",
+                    "start": "2022-04-07",
+                    "url": query.endpoint + "?sportId=2",
+                },
+                current_query=query,
+                raw=b"legacy\n",
+            )
+            with store.acquire_query(query), self.assertRaises(ValueError):
+                store.publish_legacy_reference(query, reference, _sidecar())
+
     def test_quality_i5_schedule_alias_requires_exact_current_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store, query, reference = _legacy_fixture(_tmp(td))
@@ -213,6 +575,7 @@ class V52EvidenceTest(unittest.TestCase):
                 endpoint="https://statsapi.mlb.com/api/v1/game/1/boxscore",
             )
             reference["source"] = forbidden.source
+            reference["current_query_id"] = logical_query_id(forbidden)
             with store.acquire_query(forbidden), self.assertRaisesRegex(
                 ValueError, "source|alias|binding|contract"
             ):
@@ -234,6 +597,7 @@ class V52EvidenceTest(unittest.TestCase):
 
             forbidden = replace(query, source="mlb_stats_pitching")
             reference["source"] = forbidden.source
+            reference["current_query_id"] = logical_query_id(forbidden)
             with store.acquire_query(forbidden), self.assertRaisesRegex(
                 ValueError, "source|alias|binding"
             ):
@@ -1262,12 +1626,17 @@ class V52EvidenceTest(unittest.TestCase):
             store, query, reference = _legacy_fixture(_tmp(td))
             missing = dict(reference)
             missing.pop("legacy_manifest_sha256")
+            missing_query_id = dict(reference)
+            missing_query_id.pop("current_query_id")
             extra = {**reference, "unreviewed_alias": "forbidden"}
             bad_semantics = {**reference, "semantic_sha256": "0" * 64}
+            wrong_query_id = {**reference, "current_query_id": "0" * 64}
             for label, candidate in (
                 ("missing", missing),
+                ("missing-query-id", missing_query_id),
                 ("extra", extra),
                 ("semantic", bad_semantics),
+                ("wrong-query-id", wrong_query_id),
             ):
                 with self.subTest(label=label), store.acquire_query(query):
                     with self.assertRaisesRegex(

@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, ContextManager, Literal
 
-from .v52_legacy_relation import is_approved_legacy_source_relation
+from .v52_legacy_relation import matches_current_query_to_legacy
 from .v52_protected_inventory import (
     parse_protected_raw_inventory_document,
     snapshot_protected_inventory_membership,
@@ -62,6 +62,7 @@ _ATTEMPT_OUTCOMES = {
 }
 _LEGACY_REFERENCE_KEYS = {
     "canonical_query",
+    "current_query_id",
     "legacy_source",
     "legacy_manifest_path",
     "legacy_manifest_sha256",
@@ -1787,6 +1788,11 @@ class V52EvidenceStore:
         reference = _normalized_json_object(legacy_reference, "legacy_reference")
         if set(reference) != _LEGACY_REFERENCE_KEYS:
             raise ValueError("legacy reference lineage keys differ")
+        current_query_id = _validate_sha256(
+            reference["current_query_id"], "current_query_id"
+        )
+        if current_query_id != logical_query_id(query):
+            raise ValueError("legacy reference current query identity differs")
         repository = self._legacy_repository_root()
         if (
             reference["protected_inventory_path"]
@@ -1841,20 +1847,19 @@ class V52EvidenceStore:
         if (
             reference["source"] != query.source
             or reference["parser_version"] != query.parser_version
-            or not is_approved_legacy_source_relation(
-                current_source=query.source,
-                endpoint=query.endpoint,
-                grain=query.grain,
-                parser_version=query.parser_version,
-                expected_media_type=query.expected_media_type,
-                legacy_source=legacy_source,
-            )
         ):
             raise ValueError("legacy reference parser or source binding differs")
         canonical_query = _normalized_json_object(
             reference["canonical_query"],
             "legacy canonical_query",  # type: ignore[arg-type]
         )
+        if not matches_current_query_to_legacy(
+            query,
+            legacy_source=legacy_source,
+            legacy_query=canonical_query,
+            protected_inventory_sha256=inventory_sha256,
+        ):
+            raise ValueError("legacy reference current-query binding differs")
         digest = _validate_sha256(reference.get("raw_sha256"), "raw_sha256")
         byte_count = reference.get("raw_byte_count")
         if (
