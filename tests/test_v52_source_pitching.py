@@ -16,36 +16,66 @@ FIXTURE = ROOT / "tests/fixtures/v5_2_qd/sources/pitching_mini.json"
 SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
 
 
-def _statcast_source_sidecar() -> dict[str, object]:
+def _statcast_source_sidecar(
+    start: str = "2018-01-01",
+    end: str = "2024-04-01",
+    *,
+    include_target_pa: bool = True,
+) -> dict[str, object]:
+    identity = hashlib.sha256(f"{start}:{end}".encode()).hexdigest()
+    game_pks = [9001] if include_target_pa else []
+    pitcher_ids = [101] if include_target_pa else []
+    plate_appearances = []
+    pitcher_bf = {}
+    if include_target_pa:
+        plate_appearances = [
+            {
+                "at_bat_number": 1,
+                "batter_id": 2001,
+                "events": "strikeout",
+                "game_date": end,
+                "game_pk": 9001,
+                "pitch_number": 3,
+                "pitcher_id": 101,
+            }
+        ]
+        pitcher_bf = {"101": 1}
     return {
         "byte_count": 100,
         "grain": "pitch",
         "parser_version": "v5.2.1",
-        "query_id": "c" * 64,
-        "raw_sha256": "d" * 64,
+        "query_id": identity,
+        "raw_sha256": hashlib.sha256(f"raw:{start}:{end}".encode()).hexdigest(),
         "schema_version": 1,
         "semantics": {
             "coverage": {
-                "inclusive_start": "2024-03-20",
-                "inclusive_end": "2024-04-01",
+                "inclusive_start": start,
+                "inclusive_end": end,
             },
-            "game_pks": [9001],
-            "plate_appearance_evidence": [
-                {
-                    "at_bat_number": 1,
-                    "batter_id": 2001,
-                    "events": "strikeout",
-                    "game_date": "2024-04-01",
-                    "game_pk": 9001,
-                    "pitch_number": 3,
-                    "pitcher_id": 101,
-                }
-            ],
-            "pitcher_ids": [101],
-            "pitcher_batters_faced": {"101": 1},
+            "game_pks": game_pks,
+            "plate_appearance_evidence": plate_appearances,
+            "pitcher_ids": pitcher_ids,
+            "pitcher_batters_faced": pitcher_bf,
         },
         "source": "baseball_savant_statcast",
     }
+
+
+def _complete_statcast_sidecars(
+    cutoff: str, *, start_year: int = 2018
+) -> list[dict[str, object]]:
+    cutoff_year = int(cutoff[:4])
+    sidecars = []
+    for year in range(start_year, cutoff_year + 1):
+        end = cutoff if year == cutoff_year else f"{year}-12-31"
+        sidecars.append(
+            _statcast_source_sidecar(
+                f"{year}-01-01",
+                end,
+                include_target_pa=year == cutoff_year,
+            )
+        )
+    return sidecars
 
 
 def _artifact_sha(sidecar: dict[str, object]) -> str:
@@ -83,6 +113,37 @@ def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league
         run_spec_sha256="a" * 64,
         acquisition_contract_sha256="b" * 64,
     )
+
+
+def _career_baseline(inclusive_end: str, cutoff: str) -> dict[str, object]:
+    from mlb_backtest.v52_sources.pitching import recompute_career_bf_sidecar
+
+    query = _query(
+        source="mlb_stats_pitcher_bf",
+        grain="player_career_batters_faced_reference",
+        requested={
+            "pitcher_id": 101,
+            "inclusive_end": inclusive_end,
+            "consuming_game_pks": [9001],
+            "consumer_cutoff_dates": {"9001": cutoff},
+        },
+    )
+    return dict(recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001]))
+
+
+def _career_addition(
+    sidecars: list[dict[str, object]], cutoff: str
+) -> dict[str, object]:
+    return {
+        "pitcher_id": 101,
+        "game_pk": 9001,
+        "consumer_cutoff_date": cutoff,
+        "statcast_bf": 1,
+        "statcast_query_sidecars": sidecars,
+        "statcast_query_sidecar_sha256s": [
+            _artifact_sha(sidecar) for sidecar in sidecars
+        ],
+    }
 
 
 class V52PitchingSourceTest(unittest.TestCase):
@@ -137,14 +198,16 @@ class V52PitchingSourceTest(unittest.TestCase):
         baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
         with self.assertRaisesRegex(ValueError, "Statcast BF"):
             recompute_career_bf_season_snapshot([baseline], [])
-        statcast = _statcast_source_sidecar()
+        statcast_sidecars = _complete_statcast_sidecars("2024-04-01")
         addition = {
             "pitcher_id": 101,
             "game_pk": 9001,
             "consumer_cutoff_date": "2024-04-01",
             "statcast_bf": 1,
-            "statcast_query_sidecars": [statcast],
-            "statcast_query_sidecar_sha256s": [_artifact_sha(statcast)],
+            "statcast_query_sidecars": statcast_sidecars,
+            "statcast_query_sidecar_sha256s": [
+                _artifact_sha(sidecar) for sidecar in statcast_sidecars
+            ],
         }
         snapshot = recompute_career_bf_season_snapshot([baseline], [addition])
         jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
@@ -171,28 +234,92 @@ class V52PitchingSourceTest(unittest.TestCase):
             },
         )
         baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
-        statcast = _statcast_source_sidecar()
+        statcast_sidecars = _complete_statcast_sidecars("2024-04-01")
         forged = {
             "pitcher_id": 101,
             "game_pk": 9001,
             "consumer_cutoff_date": "2024-04-01",
             "statcast_bf": 600,
-            "statcast_query_sidecars": [statcast],
-            "statcast_query_sidecar_sha256s": [_artifact_sha(statcast)],
+            "statcast_query_sidecars": statcast_sidecars,
+            "statcast_query_sidecar_sha256s": [
+                _artifact_sha(sidecar) for sidecar in statcast_sidecars
+            ],
         }
         with self.assertRaisesRegex(ValueError, "Statcast BF.*differs"):
             recompute_career_bf_season_snapshot([baseline], [forged])
         absent = copy.deepcopy(forged)
         absent["statcast_bf"] = 1
-        absent_sidecar = absent["statcast_query_sidecars"][0]
+        absent_sidecar = absent["statcast_query_sidecars"][-1]
         absent_sidecar["semantics"]["pitcher_ids"] = [102]
         absent_sidecar["semantics"]["pitcher_batters_faced"] = {"102": 1}
         absent_sidecar["semantics"]["plate_appearance_evidence"][0][
             "pitcher_id"
         ] = 102
-        absent["statcast_query_sidecar_sha256s"] = [_artifact_sha(absent_sidecar)]
+        absent["statcast_query_sidecar_sha256s"][-1] = _artifact_sha(absent_sidecar)
         with self.assertRaisesRegex(ValueError, "target pitcher"):
             recompute_career_bf_season_snapshot([baseline], [absent])
+
+    def test_career_aggregate_rejects_2017_baseline_with_only_2024_evidence(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        baseline = _career_baseline("2017-12-31", "2024-04-01")
+        sidecars = [_statcast_source_sidecar("2024-01-01", "2024-04-01")]
+        with self.assertRaisesRegex(ValueError, "coverage gap"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, "2024-04-01")]
+            )
+    def test_career_aggregate_rejects_2021_baseline_with_only_2024_evidence(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        baseline = _career_baseline("2021-12-31", "2024-04-01")
+        sidecars = [_statcast_source_sidecar("2024-01-01", "2024-04-01")]
+        with self.assertRaisesRegex(ValueError, "coverage gap"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, "2024-04-01")]
+            )
+        complete = _complete_statcast_sidecars("2024-04-01", start_year=2022)
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(complete, "2024-04-01")]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_internal_month_gap(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        baseline = _career_baseline("2017-12-31", "2018-04-02")
+        sidecars = [
+            _statcast_source_sidecar(
+                "2018-01-01", "2018-03-31", include_target_pa=False
+            ),
+            _statcast_source_sidecar("2018-04-02", "2018-04-02"),
+        ]
+        with self.assertRaisesRegex(ValueError, "coverage gap"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, "2018-04-02")]
+            )
+
+    def test_career_aggregate_rejects_internal_year_gap(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        baseline = _career_baseline("2017-12-31", "2020-01-01")
+        sidecars = [
+            _statcast_source_sidecar(
+                "2018-01-01", "2018-12-31", include_target_pa=False
+            ),
+            _statcast_source_sidecar("2020-01-01", "2020-01-01"),
+        ]
+        with self.assertRaisesRegex(ValueError, "coverage gap"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, "2020-01-01")]
+            )
     def test_pitching_sidecar_checks_completeness_totals_and_consumers(self) -> None:
         from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar
 

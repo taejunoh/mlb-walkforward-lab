@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, timedelta
 
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
@@ -370,8 +370,12 @@ def recompute_career_bf_season_snapshot(
                 raise ValueError("Statcast BF source pitcher population is invalid")
             first = _day(coverage.get("inclusive_start"), "Statcast BF source start")
             last = _day(coverage.get("inclusive_end"), "Statcast BF source end")
-            if first > last:
-                raise ValueError("Statcast BF source coverage is reversed")
+            if (
+                first > last
+                or first.year not in range(2018, 2025)
+                or last.year not in range(2018, 2025)
+            ):
+                raise ValueError("Statcast BF source coverage is reversed or out of scope")
             counts: dict[int, int] = {}
             seen_plate_appearances: set[tuple[int, int]] = set()
             required_pa_keys = {
@@ -418,8 +422,13 @@ def recompute_career_bf_season_snapshot(
         ):
             raise ValueError("Statcast BF source hash differs from canonical sidecar")
         for previous, current in zip(source_ranges, source_ranges[1:]):
-            if current[0] <= previous[1]:
-                raise ValueError("Statcast BF source coverage overlaps or is unordered")
+            expected_start = previous[1] + timedelta(days=1)
+            if current[0] != expected_start:
+                if current[0] <= previous[1]:
+                    raise ValueError(
+                        "Statcast BF source coverage overlaps or is unordered"
+                    )
+                raise ValueError("Statcast BF source coverage gap is not explicit")
         if source_ranges[-1][1] != cutoff:
             raise ValueError("Statcast BF source coverage must end at consumer D-1")
         if not target_pitcher_found:
@@ -479,8 +488,14 @@ def recompute_career_bf_season_snapshot(
                 raise ValueError("verified Statcast BF addition is missing")
             if addition["consumer_cutoff_date"] != cutoffs.get(str(game_pk)):
                 raise ValueError("Statcast BF cutoff differs from career consumer D-1")
-            if _day(addition["source_first_date"], "Statcast BF source start") <= inclusive_end:
-                raise ValueError("Statcast BF source overlaps career baseline")
+            expected_source_start = inclusive_end + timedelta(days=1)
+            if (
+                _day(addition["source_first_date"], "Statcast BF source start")
+                != expected_source_start
+            ):
+                raise ValueError(
+                    "Statcast BF source coverage gap follows career baseline"
+                )
             used.add((pitcher_id, game_pk))
             records.append(
                 {
