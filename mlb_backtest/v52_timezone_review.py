@@ -748,7 +748,7 @@ def _write_safe(
     *,
     final_rebind: Callable[[], None] | None = None,
     after_parent_fsync: Callable[[], None] | None = None,
-) -> Path:
+) -> tuple[Path, _SafeSnapshot]:
     root = _trusted_root(root)
     relative = _relative(root, path, label)
     parent, descriptors = _open_parent(root, relative, create=True)
@@ -792,12 +792,18 @@ def _write_safe(
             after_parent_fsync()
         if final_rebind is not None:
             final_rebind()
+        published_metadata = os.fstat(descriptor)
         rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-        if _file_identity(os.fstat(descriptor)) != _file_identity(rebound):
+        if _file_identity(published_metadata) != _file_identity(rebound):
             raise ValueError(f"{label} identity changed before publication")
+        snapshot = _SafeSnapshot(
+            relative=relative,
+            contents=contents,
+            identity=_file_identity(published_metadata),
+        )
         os.close(descriptor)
         descriptor = -1
-        return Path(os.path.abspath(root)) / relative
+        return Path(os.path.abspath(root)) / relative, snapshot
     except BaseException:
         if created and descriptor >= 0 and created_identity is not None:
             try:
@@ -840,7 +846,7 @@ def _reconcile_or_write(
         if final_rebind is not None:
             final_rebind()
         return Path(os.path.abspath(root)) / existing.relative, existing
-    published = _write_safe(
+    published, snapshot = _write_safe(
         root,
         path,
         contents,
@@ -848,9 +854,9 @@ def _reconcile_or_write(
         final_rebind=final_rebind,
         after_parent_fsync=after_parent_fsync,
     )
-    snapshot = _read_safe_snapshot(root, path, label)
-    if snapshot is None:
-        raise RuntimeError(f"{label} is missing after publication")
+    if snapshot.contents != contents:
+        raise AssertionError(f"{label} created snapshot contents differ")
+    _rebind_safe_snapshot(root, snapshot, label)
     return published, snapshot
 
 
@@ -903,7 +909,7 @@ def write_timezone_review_receipt(
         "reviewer_role": reviewer_role,
         "schema_version": 1,
     }
-    return _write_safe(
+    path, _ = _write_safe(
         root,
         output_relative,
         _canonical_file_bytes(receipt),
@@ -913,6 +919,7 @@ def write_timezone_review_receipt(
         ),
         after_parent_fsync=_before_review_final_rebind,
     )
+    return path
 
 
 def _review_object(contents: bytes) -> dict[str, object]:

@@ -1282,6 +1282,48 @@ class V52TimezoneReviewTest(unittest.TestCase):
             self.assertEqual(retry_mapping.read_bytes(), original_mapping)
             self.assertEqual(retry_seal.read_bytes(), original_seal)
 
+    def test_seal_rejects_mapping_change_after_safe_write_returns(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        for mutation in ("bytes", "same-byte-inode"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                candidate, reviews = _reviewed_candidate_fixture(root)
+                mapping = root / "config/v5_2_qd/venue_timezones.json"
+                seal = root / AUDIT_NAMESPACE / "seal.json"
+                original_write_safe = timezone_review._write_safe
+
+                def write_then_change(*args, **kwargs):
+                    result = original_write_safe(*args, **kwargs)
+                    published = result[0] if isinstance(result, tuple) else result
+                    if args[3] == "timezone mapping":
+                        contents = published.read_bytes()
+                        if mutation == "bytes":
+                            published.write_bytes(contents + b" ")
+                        else:
+                            replacement = published.with_suffix(".replacement")
+                            replacement.write_bytes(contents)
+                            os.replace(replacement, published)
+                    return result
+
+                with (
+                    patch.object(
+                        timezone_review,
+                        "_write_safe",
+                        side_effect=write_then_change,
+                    ),
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    timezone_review.seal_timezone_mapping(
+                        root,
+                        candidate_path=candidate,
+                        review_receipt_paths=reviews,
+                        output=Path("config/v5_2_qd/venue_timezones.json"),
+                        receipt_output=AUDIT_NAMESPACE / "seal.json",
+                    )
+                self.assertTrue(mapping.is_file())
+                self.assertFalse(seal.exists())
+
     def test_review_and_seal_reject_input_replacement_at_publish_boundary(self):
         import mlb_backtest.v52_timezone_review as timezone_review
 
