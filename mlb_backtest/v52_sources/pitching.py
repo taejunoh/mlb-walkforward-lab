@@ -539,6 +539,40 @@ def _validate_statcast_split_graph(
     return ready_leaves
 
 
+def _statcast_population_contract(query: LogicalQuery) -> tuple[object, ...]:
+    invariant_parameters = {
+        key: value
+        for key, value in query.parameters.items()
+        if key not in {"game_date_gt", "game_date_lt"}
+    }
+    return (
+        query.source,
+        query.grain,
+        query.endpoint,
+        query.expected_media_type,
+        query.parser_version,
+        query.acquisition_contract_sha256,
+        canonical_json_bytes(invariant_parameters),
+    )
+
+
+def _validate_statcast_population_contract(
+    nodes: Sequence[_StatcastNode], ready_leaves: Sequence[_StatcastNode]
+) -> None:
+    if len({node.query.run_spec_sha256 for node in nodes}) > 1:
+        raise ValueError("Statcast population has mixed global run_spec_sha256")
+    if len({_statcast_population_contract(node.query) for node in nodes}) > 1:
+        raise ValueError("Statcast population has mixed global query contract")
+    protected_inventories = {
+        leaf.query.requested_range.get("protected_inventory_sha256")
+        for leaf in ready_leaves
+        if leaf.query.requested_range.get("acquisition")
+        == "PROTECTED_LEGACY_REFERENCE"
+    }
+    if len(protected_inventories) > 1:
+        raise ValueError("Statcast population has mixed global protected inventory")
+
+
 def recompute_pitching_season_snapshot(
     query_sidecars: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
@@ -796,6 +830,7 @@ def recompute_career_bf_season_snapshot(
         ):
             raise ValueError("Statcast BF source hash differs from canonical sidecar")
         ready_leaves = _validate_statcast_split_graph(nodes)
+        _validate_statcast_population_contract(nodes, ready_leaves)
         source_queries = [
             (node.first, node.last, node.query) for node in ready_leaves
         ]

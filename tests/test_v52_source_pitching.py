@@ -247,14 +247,27 @@ def _task3_legacy_partition_queries(
     protected_inventory_sha256: str,
     protected_start: str = "2024-04-01",
     protected_end: str = "2024-04-15",
+    parent_start: str = "2024-04-01",
+    parent_end: str = "2024-04-30",
 ) -> tuple[LogicalQuery, ...]:
     from mlb_backtest.v52_query_plan import build_legacy_partition_batch
 
-    parent = _planned_statcast_query("2024-04-01", "2024-04-30")
+    parent = _planned_statcast_query(parent_start, parent_end)
     return build_legacy_partition_batch(
         [parent],
         [_legacy_catalog_record(parent, protected_start, protected_end)],
         protected_inventory_sha256=protected_inventory_sha256,
+    ).queries
+
+
+def _task3_fetch_month_queries(
+    start: str, end: str, *, protected_inventory_sha256: str
+) -> tuple[LogicalQuery, ...]:
+    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+
+    parent = _planned_statcast_query(start, end)
+    return build_legacy_partition_batch(
+        [parent], [], protected_inventory_sha256=protected_inventory_sha256
     ).queries
 
 
@@ -273,6 +286,36 @@ def _replace_april_parent_with_query_nodes(
         for query, disposition, include_target_pa in nodes
     ]
     return [*sidecars[:-1], *replacements]
+
+
+def _replace_month_parent_with_query_nodes(
+    sidecars: list[dict[str, object]],
+    parent_start: str,
+    parent_end: str,
+    nodes: list[tuple[LogicalQuery, str, bool]],
+) -> list[dict[str, object]]:
+    index = next(
+        (
+            index
+            for index, sidecar in enumerate(sidecars)
+            if sidecar["semantics"]["coverage"]
+            == {"inclusive_start": parent_start, "inclusive_end": parent_end}
+        ),
+        None,
+    )
+    if index is None:
+        raise AssertionError(f"monthly parent is missing: {parent_start}..{parent_end}")
+    replacements = [
+        _statcast_source_sidecar(
+            str(query.requested_range["start_date"]),
+            str(query.requested_range["end_date"]),
+            include_target_pa=include_target_pa,
+            query=query,
+            split_disposition=disposition,
+        )
+        for query, disposition, include_target_pa in nodes
+    ]
+    return [*sidecars[:index], *replacements, *sidecars[index + 1 :]]
 
 
 def _task3_recursive_april_nodes() -> tuple[
@@ -665,6 +708,108 @@ class V52PitchingSourceTest(unittest.TestCase):
             [baseline], [_career_addition(sidecars, cutoff)]
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_accepts_task3_multi_month_acquisition_variation(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-05-31"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        march_fetch = _task3_fetch_month_queries(
+            "2024-03-20",
+            "2024-03-31",
+            protected_inventory_sha256="c" * 64,
+        )
+        april_hybrid = _task3_legacy_partition_queries(
+            protected_inventory_sha256="c" * 64
+        )
+        may_protected = _task3_legacy_partition_queries(
+            protected_inventory_sha256="c" * 64,
+            protected_start="2024-05-01",
+            protected_end="2024-05-31",
+            parent_start="2024-05-01",
+            parent_end="2024-05-31",
+        )
+        sidecars = _replace_month_parent_with_query_nodes(
+            sidecars,
+            "2024-03-20",
+            "2024-03-31",
+            [(march_fetch[0], "READY", False)],
+        )
+        sidecars = _replace_month_parent_with_query_nodes(
+            sidecars,
+            "2024-04-01",
+            "2024-04-30",
+            [(query, "READY", False) for query in april_hybrid],
+        )
+        sidecars = _replace_month_parent_with_query_nodes(
+            sidecars,
+            "2024-05-01",
+            "2024-05-31",
+            [(may_protected[0], "READY", True)],
+        )
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_cross_month_population_contract_mix(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-05-31"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        may_root = _planned_statcast_query("2024-05-01", "2024-05-31")
+        run_b = replace(may_root, run_spec_sha256="d" * 64)
+        contract_b = replace(may_root, acquisition_contract_sha256="e" * 64)
+
+        april_protected = _task3_legacy_partition_queries(
+            protected_inventory_sha256="c" * 64,
+            protected_start="2024-04-01",
+            protected_end="2024-04-30",
+        )[0]
+        may_protected = _task3_legacy_partition_queries(
+            protected_inventory_sha256="d" * 64,
+            protected_start="2024-05-01",
+            protected_end="2024-05-31",
+            parent_start="2024-05-01",
+            parent_end="2024-05-31",
+        )[0]
+        protected_mix = _replace_month_parent_with_query_nodes(
+            _planned_statcast_sidecars(cutoff),
+            "2024-04-01",
+            "2024-04-30",
+            [(april_protected, "READY", False)],
+        )
+        protected_mix = _replace_month_parent_with_query_nodes(
+            protected_mix,
+            "2024-05-01",
+            "2024-05-31",
+            [(may_protected, "READY", True)],
+        )
+        cases = {
+            "global run_spec_sha256": _replace_month_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff),
+                "2024-05-01",
+                "2024-05-31",
+                [(run_b, "READY", True)],
+            ),
+            "global query contract": _replace_month_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff),
+                "2024-05-01",
+                "2024-05-31",
+                [(contract_b, "READY", True)],
+            ),
+            "global protected inventory": protected_mix,
+        }
+        for label, sidecars in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
 
     def test_career_aggregate_rejects_mixed_monthly_root_bindings(self) -> None:
         from mlb_backtest.v52_query_plan import bisect_statcast_query
