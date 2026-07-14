@@ -63,6 +63,16 @@ _QUARANTINE_KEYS = frozenset(
         "validation_receipts",
     }
 )
+_AUTOMATIC_QUARANTINE_KEYS = _QUARANTINE_KEYS | {
+    "inventory",
+    "error_classification",
+}
+_QUARANTINE_ERROR_CLASSIFICATIONS = frozenset(
+    {
+        "DIRECT_INVENTORY_MISMATCH",
+        "SOURCE_GATE_EVIDENCE_INVALID",
+    }
+)
 _BINDING_KEYS = frozenset({"path", "sha256"})
 _PLAN_BINDING_KEYS = frozenset({"path", "sha256", "git_blob_id"})
 _LINEAGE_KEYS = frozenset({"baseline_inventory", "protected_inventory"})
@@ -795,7 +805,13 @@ def _validate_success_receipt(payload: object) -> Mapping[str, object]:
 
 
 def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
-    receipt = _exact_object(payload, _QUARANTINE_KEYS, "quarantine receipt")
+    if not isinstance(payload, Mapping):
+        raise ValueError("quarantine receipt keys differ")
+    keys = frozenset(payload)
+    if keys not in {_QUARANTINE_KEYS, _AUTOMATIC_QUARANTINE_KEYS}:
+        raise ValueError("quarantine receipt keys differ")
+    receipt = payload
+    automatic = keys == _AUTOMATIC_QUARANTINE_KEYS
     git_head = receipt.get("git_head")
     current_hash = receipt.get("current_receipt_sha256")
     if (
@@ -804,6 +820,11 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
         or receipt.get("run_id") != "historical_walkforward_500"
         or receipt.get("current_phase") not in PHASES
         or receipt.get("attempted_phase") not in PHASES
+        or (
+            automatic
+            and receipt.get("error_classification")
+            not in _QUARANTINE_ERROR_CLASSIFICATIONS
+        )
         or not isinstance(current_hash, str)
         or not _SHA256.fullmatch(current_hash)
         or not isinstance(git_head, str)
@@ -812,9 +833,11 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
         raise ValueError("quarantine receipt violates the receipt schema")
     _validate_timestamp(receipt.get("recorded_at_utc"), "quarantine receipt")
     _validate_binding_value(receipt.get("run_spec"), "run spec")
+    if automatic:
+        _validate_binding_value(receipt.get("inventory"), "phase inventory")
     validations = receipt.get("validation_receipts")
-    if not isinstance(validations, list) or not validations:
-        raise ValueError("quarantine receipt requires validation evidence")
+    if not isinstance(validations, list) or (not automatic and not validations):
+        raise ValueError("quarantine receipt requires valid validation evidence")
     paths = [
         str(_validate_binding_value(value, "validation receipt")["path"])
         for value in validations
@@ -869,9 +892,19 @@ def _validate_quarantine_locked(
         _validate_timestamp(payload.get("recorded_at_utc"), "quarantine receipt")
         if payload.get("run_spec") != payloads[0]["run_spec"]:
             raise ValueError("quarantine receipt RunSpec binding differs")
+        if "inventory" in payload:
+            inventory = _validate_binding_value(
+                payload.get("inventory"), "quarantine inventory"
+            )
+            if _binding(
+                paths.root,
+                paths.root / str(inventory["path"]),
+                "quarantine inventory",
+            ) != dict(inventory):
+                raise ValueError("quarantine inventory hash binding differs")
         validation_values = payload.get("validation_receipts")
-        if not isinstance(validation_values, list) or not validation_values:
-            raise ValueError("quarantine receipt requires validation evidence")
+        if not isinstance(validation_values, list):
+            raise ValueError("quarantine receipt validation evidence differs")
         _validate_stored_artifacts(
             paths.root, validation_values, "validation receipts"
         )
@@ -985,9 +1018,10 @@ def _publish_quarantine_locked(
     validations: list[dict[str, str]],
     snapshot: _GitSnapshot,
     lock_descriptor: int,
+    *,
+    inventory: Mapping[str, object] | None = None,
+    error_classification: str | None = None,
 ) -> Path:
-    if not validations:
-        raise ValueError("quarantine transition requires validation evidence")
     payload = {
         "schema_version": 1,
         "receipt_kind": "QUARANTINED_TRANSITION",
@@ -1000,6 +1034,11 @@ def _publish_quarantine_locked(
         "run_spec": base["run_spec"],
         "validation_receipts": validations,
     }
+    if inventory is not None and error_classification is not None:
+        payload["inventory"] = dict(inventory)
+        payload["error_classification"] = error_classification
+    elif inventory is not None or error_classification is not None:
+        raise ValueError("automatic quarantine evidence is incomplete")
     _validate_quarantine_receipt(payload)
     contents = canonical_json_bytes(payload) + b"\n"
     digest = _sha256_bytes(contents)
@@ -1120,17 +1159,23 @@ def advance_execution_phase(
                     run_id=run_spec.run_id,
                 )
         except ValueError as exc:
-            if validations:
-                _publish_quarantine_locked(
-                    paths,
-                    run_spec,
-                    state,
-                    base,
-                    next_phase,
-                    validations,
-                    snapshot,
-                    lock_descriptor,
-                )
+            error_classification = (
+                "DIRECT_INVENTORY_MISMATCH"
+                if next_phase == "ACQUIRING"
+                else "SOURCE_GATE_EVIDENCE_INVALID"
+            )
+            _publish_quarantine_locked(
+                paths,
+                run_spec,
+                state,
+                base,
+                next_phase,
+                validations,
+                snapshot,
+                lock_descriptor,
+                inventory=inventory,
+                error_classification=error_classification,
+            )
             raise ValueError("direct phase artifact evidence failed") from exc
         payload = {
             "schema_version": 1,

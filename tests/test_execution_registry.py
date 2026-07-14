@@ -371,6 +371,91 @@ class ExecutionRegistryTest(unittest.TestCase):
                 quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
                 self.assertEqual(len(list(quarantine.iterdir())), 1)
 
+    def test_invalid_acquiring_inventory_quarantines_without_validation_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            initial = self.initialize(root, run_spec)
+            inventory = self.write_artifact(
+                root, "audit/v5_2_qd/historical/acquisition/wrong_inventory.json", {"wrong": True}
+            )
+            with self.assertRaisesRegex(ValueError, "artifact|evidence"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=inventory,
+                    validation_receipts=(),
+                )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            quarantine_dir = root / "audit/v5_2_qd/historical/execution/quarantine"
+            receipts = list(quarantine_dir.iterdir())
+            self.assertEqual(len(receipts), 1)
+            payload = json.loads(receipts[0].read_bytes())
+            self.assertEqual(
+                payload["inventory"],
+                {
+                    "path": inventory.relative_to(root).as_posix(),
+                    "sha256": _sha256(inventory),
+                },
+            )
+            self.assertEqual(payload["validation_receipts"], [])
+            self.assertEqual(
+                payload["error_classification"], "DIRECT_INVENTORY_MISMATCH"
+            )
+            self.assertEqual(payload["attempted_phase"], "ACQUIRING")
+            self.assertEqual(payload["current_phase"], "DESIGN_ACCEPTED")
+            self.assertEqual(
+                payload["current_receipt_sha256"], initial.receipt_sha256
+            )
+            self.assertEqual(payload["git_head"], _git(root, "rev-parse", "HEAD"))
+            schema = json.loads(
+                (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
+            )
+            jsonschema.validate(payload, schema)
+            self.assertEqual(
+                receipts[0].read_bytes(), canonical_json_bytes(payload) + b"\n"
+            )
+
+    def test_sources_ready_missing_receipts_quarantines_with_inventory_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(
+                root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+            )
+            inventory, _evidence = self.write_real_source_evidence(root)
+            with self.assertRaisesRegex(ValueError, "artifact|evidence"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=(),
+                )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            quarantine_dir = root / "audit/v5_2_qd/historical/execution/quarantine"
+            receipts = list(quarantine_dir.iterdir())
+            self.assertEqual(len(receipts), 1)
+            payload = json.loads(receipts[0].read_bytes())
+            self.assertEqual(
+                payload["inventory"],
+                {
+                    "path": SOURCE_INVENTORY_RELATIVE.as_posix(),
+                    "sha256": _sha256(inventory),
+                },
+            )
+            self.assertEqual(payload["validation_receipts"], [])
+            self.assertEqual(
+                payload["error_classification"],
+                "SOURCE_GATE_EVIDENCE_INVALID",
+            )
+
     def test_rejects_git_head_identity_race_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
@@ -469,6 +554,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                     validation_receipts=(),
                 )
             self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+            self.assertEqual(list(quarantine.iterdir()), [])
 
     def test_transition_binds_prior_receipt_commit_specs_and_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -584,6 +671,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.registry.advance_execution_phase(root, run_spec, **arguments)
             with self.assertRaisesRegex(ValueError, "replay|expected phase"):
                 self.registry.advance_execution_phase(root, run_spec, **arguments)
+            quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+            self.assertEqual(list(quarantine.iterdir()), [])
 
     def test_registry_load_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
