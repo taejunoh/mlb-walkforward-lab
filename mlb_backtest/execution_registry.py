@@ -104,6 +104,10 @@ _SOURCE_REPLAY_PREFIX = (
 )
 
 
+class _ReceiptMembershipError(ValueError):
+    """The visible receipt directory cannot be safely changed by this operation."""
+
+
 @dataclass(frozen=True)
 class ExecutionRegistryState:
     phase: str
@@ -825,6 +829,7 @@ def _verify_published_receipt(
     descriptor: int,
     contents: bytes,
     label: str,
+    expected_receipt_names: Sequence[str] | None,
 ) -> None:
     """Use the final no-follow read as the operation's return snapshot.
 
@@ -853,9 +858,30 @@ def _verify_published_receipt(
             or _identity(os.fstat(rebound_parent))[:2] != parent_identity[:2]
         ):
             raise ValueError(f"{label} parent identity changed at publication return")
+        membership_identity: tuple[int, ...] | None = None
+        if expected_receipt_names is not None:
+            membership_identity = _identity(os.fstat(rebound_parent))
+            try:
+                visible_names = sorted(os.listdir(rebound_parent))
+            except OSError as exc:
+                raise _ReceiptMembershipError(
+                    "execution registry receipt membership is unreadable"
+                ) from exc
+            _validate_receipt_name_chain(visible_names)
+            if tuple(visible_names) != tuple(expected_receipt_names):
+                raise _ReceiptMembershipError(
+                    "execution registry receipt membership has a gap, fork, or unknown entry"
+                )
         final_contents, _ = _read_file_at(
             rebound_parent, relative.name, label
         )
+        if (
+            membership_identity is not None
+            and _identity(os.fstat(rebound_parent)) != membership_identity
+        ):
+            raise _ReceiptMembershipError(
+                "execution registry receipt membership changed during final snapshot"
+            )
     finally:
         _close_directories(descriptors)
     if (
@@ -872,6 +898,7 @@ def _write_exclusive(
     contents: bytes,
     label: str,
     verify_after_publish: Callable[[], None],
+    expected_receipt_names: Sequence[str] | None = None,
 ) -> None:
     parent_fd, descriptors = _open_directory_at(
         execution_descriptor, relative.parent
@@ -908,8 +935,11 @@ def _write_exclusive(
             descriptor,
             contents,
             label,
+            expected_receipt_names,
         )
     except FileExistsError:
+        raise
+    except _ReceiptMembershipError:
         raise
     except BaseException as exc:
         if created:
@@ -1219,6 +1249,27 @@ def _snapshots_from_bindings(
     return tuple(snapshots)
 
 
+def _validate_receipt_name_chain(names: Sequence[str]) -> None:
+    if not names:
+        raise FileNotFoundError("execution registry has no phase receipts")
+    for expected_sequence, name in enumerate(names):
+        match = _SUCCESS_NAME.fullmatch(name)
+        if match is None:
+            raise _ReceiptMembershipError(
+                "execution registry contains an ambiguous or partial receipt"
+            )
+        sequence = int(match.group("sequence"))
+        phase = match.group("phase")
+        if (
+            sequence != expected_sequence
+            or sequence >= len(PHASES)
+            or phase != PHASES[sequence]
+        ):
+            raise _ReceiptMembershipError(
+                "execution registry chain has a gap, fork, replay, or rollback anchor"
+            )
+
+
 def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, filename_sequence: int) -> Mapping[str, object]:
     if _sha256_bytes(contents) != expected_sha:
         raise ValueError("execution receipt filename hash differs")
@@ -1421,8 +1472,7 @@ def _load_locked(
         names = sorted(os.listdir(receipt_fd))
     finally:
         _close_directories(descriptors)
-    if not names:
-        raise FileNotFoundError("execution registry has no phase receipts")
+    _validate_receipt_name_chain(names)
     payloads: list[Mapping[str, object]] = []
     phase_receipt_sha: dict[str, str] = {}
     prior_sha: str | None = None
@@ -1431,12 +1481,10 @@ def _load_locked(
     for expected_sequence, name in enumerate(names):
         match = _SUCCESS_NAME.fullmatch(name)
         if match is None:
-            raise ValueError("execution registry contains an ambiguous or partial receipt")
+            raise AssertionError("validated receipt name no longer matches")
         sequence = int(match.group("sequence"))
         phase = match.group("phase")
         receipt_sha = match.group("sha")
-        if sequence != expected_sequence or sequence >= len(PHASES) or phase != PHASES[sequence]:
-            raise ValueError("execution registry chain has a gap, fork, replay, or rollback anchor")
         contents = _read_relative_at(
             lock_binding.execution_descriptor,
             receipts_relative / name,
@@ -1541,6 +1589,11 @@ def _success_contents(payload: Mapping[str, object]) -> tuple[bytes, str]:
     return contents, _sha256_bytes(contents)
 
 
+def _success_receipt_name(payload: Mapping[str, object]) -> str:
+    _, digest = _success_contents(payload)
+    return f"{int(payload['sequence']):06d}-{payload['phase']}-{digest}.json"
+
+
 def _publish_locked(
     paths: _RegistryPaths,
     snapshot: _GitSnapshot,
@@ -1549,6 +1602,8 @@ def _publish_locked(
     contents: bytes,
     label: str,
     evidence_snapshots: Sequence[_ArtifactSnapshot] = (),
+    *,
+    expected_receipt_names: Sequence[str] | None = None,
 ) -> None:
     child = _execution_child(paths, relative)
     _before_registry_publish()
@@ -1571,6 +1626,7 @@ def _publish_locked(
         contents,
         label,
         verify_after_publish,
+        expected_receipt_names,
     )
 
 
@@ -1683,6 +1739,7 @@ def initialize_execution_registry(
             contents,
             "execution receipt",
             (protected_snapshot,),
+            expected_receipt_names=(relative.name,),
         )
         return ExecutionRegistryState("DESIGN_ACCEPTED", 0, digest, str(protected["sha256"]))
 
@@ -1788,6 +1845,10 @@ def advance_execution_phase(
             contents,
             "execution receipt",
             (inventory_snapshot, *validation_snapshots),
+            expected_receipt_names=(
+                *(_success_receipt_name(item) for item in payloads),
+                relative.name,
+            ),
         )
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 

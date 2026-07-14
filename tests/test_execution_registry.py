@@ -471,6 +471,56 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.registry.load_execution_registry(root, run_spec), advanced
             )
 
+    def test_publication_rejects_final_same_sequence_receipt_fork(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            receipts = root / RECEIPTS_RELATIVE
+            fork_path: Path | None = None
+
+            def add_valid_same_sequence_fork() -> None:
+                nonlocal fork_path
+                published = next(
+                    path
+                    for path in receipts.iterdir()
+                    if path.name.startswith("000001-")
+                )
+                payload = json.loads(published.read_bytes())
+                payload["recorded_at_utc"] = "2099-01-01T00:00:00.000000Z"
+                contents = canonical_json_bytes(payload) + b"\n"
+                digest = hashlib.sha256(contents).hexdigest()
+                fork_path = receipts / f"000001-ACQUIRING-{digest}.json"
+                fork_path.write_bytes(contents)
+
+            with patch.object(
+                self.registry,
+                "_after_registry_receipt_read",
+                side_effect=add_valid_same_sequence_fork,
+            ), self.assertRaisesRegex(ValueError, "fork|receipt|membership|chain"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
+
+            self.assertIsNotNone(fork_path)
+            self.assertTrue(fork_path.is_file())
+            self.assertEqual(
+                len(
+                    [
+                        path
+                        for path in receipts.iterdir()
+                        if path.name.startswith("000001-")
+                    ]
+                ),
+                2,
+            )
+            with self.assertRaisesRegex(ValueError, "fork|gap|chain"):
+                self.registry.load_execution_registry(root, run_spec)
+
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
         for failure in ("partial_write", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
