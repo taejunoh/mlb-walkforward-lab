@@ -193,6 +193,17 @@ def build_static_batch(
     bindings = contract.get("bindings")
     if not isinstance(bindings, dict):
         raise ValueError("acquisition contract bindings must be an object")
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    amendment = bindings.get("plan_a_amendment")
+    if (
+        not isinstance(amendment, dict)
+        or amendment.get("path")
+        != "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+        or not isinstance(amendment.get("sha256"), str)
+        or not _SHA256.fullmatch(amendment["sha256"])
+    ):
+        raise ValueError("acquisition contract Plan A amendment binding differs")
     run_binding = bindings.get("run_spec")
     if not isinstance(run_binding, dict) or run_binding.get("sha256") != run_sha:
         raise ValueError("acquisition contract RunSpec binding differs")
@@ -327,9 +338,10 @@ def build_schedule_reference_batch(
         unique_games[game_pk] = identity
         seasons.add(season)
         venues.add(venue_id)
-        pitching_consumers.setdefault(
-            (season, season_start, official - timedelta(days=1)), set()
-        ).add(game_pk)
+        if played:
+            pitching_consumers.setdefault(
+                (season, season_start, official - timedelta(days=1)), set()
+            ).add(game_pk)
 
     queries: list[LogicalQuery] = []
     for game_pk, (season, _season_start, official, _venue_id, played) in sorted(
@@ -385,6 +397,10 @@ def build_schedule_reference_batch(
                 "as_of_date": as_of.isoformat(),
                 "consumer_cutoff_dates": consumer_cutoffs,
                 "consuming_game_pks": consumers,
+                "response_completeness": {
+                    "limit": 5000,
+                    "reject_total_splits_at_or_above_limit": True,
+                },
             }
         queries.append(
             _logical_query(
@@ -467,6 +483,11 @@ def build_participant_derived_batch(
         season_start, season_end = SEASON_BOUNDARIES[season]
         if not season_start <= official_date <= season_end:
             raise ValueError("game evidence official_date differs from season")
+        played = game.get("played")
+        if type(played) is not bool:
+            raise ValueError("game evidence played must be explicitly boolean")
+        if not played:
+            continue
         if (
             game.get("verification_status") != "VERIFIED"
             or game.get("participant_provenance")
@@ -491,9 +512,8 @@ def build_participant_derived_batch(
         queries.append(_logical_query(
             source="mlb_stats_pitcher_bf",
             grain="player_career_batters_faced_reference",
-            endpoint=_STATS_ENDPOINT,
+            endpoint=f"{_MLB_BASE}/people/{pitcher_id}/stats",
             parameters={
-                "personId": pitcher_id,
                 "stats": "byDateRange",
                 "group": "pitching",
                 "gameType": "R",

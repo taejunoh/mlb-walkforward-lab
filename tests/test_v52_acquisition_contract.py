@@ -18,6 +18,9 @@ DESIGN_PATH = Path(
 PLAN_PATH = Path(
     "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
 )
+AMENDMENT_PATH = Path(
+    "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+)
 RUN_SPEC_PATH = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 BASELINE_INVENTORY_PATH = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RAW_INVENTORY_PATH = Path("audit/v5_1_bt/protected_raw_inventory.json")
@@ -105,6 +108,13 @@ class V52AcquisitionContractTest(unittest.TestCase):
             bindings["run_spec"],
             {"path": RUN_SPEC_PATH.as_posix(), "sha256": _sha256(ROOT / RUN_SPEC_PATH)},
         )
+        self.assertEqual(
+            bindings["plan_a_amendment"],
+            {
+                "path": AMENDMENT_PATH.as_posix(),
+                "sha256": _sha256(ROOT / AMENDMENT_PATH),
+            },
+        )
         protection = self.contract["legacy_protection"]
         self.assertEqual(
             protection["baseline_inventory_path"],
@@ -125,6 +135,7 @@ class V52AcquisitionContractTest(unittest.TestCase):
         for key, value in {
             "design": bindings["approved_design"]["sha256"],
             "plan": bindings["implementation_plan"]["working_tree_sha256"],
+            "amendment": bindings["plan_a_amendment"]["sha256"],
             "run_spec": bindings["run_spec"]["sha256"],
             "baseline_inventory": protection["baseline_inventory_sha256"],
             "protected_inventory": protection["protected_inventory_sha256"],
@@ -192,6 +203,45 @@ class V52AcquisitionContractTest(unittest.TestCase):
         )
         self.assertEqual(
             self.contract["minimum_free_space_reserve_bytes"], 20 * 1024**3
+        )
+
+    def test_contract_v2_freezes_timezone_path_transport_caps_and_completeness(self) -> None:
+        self.assertEqual(self.contract["schema_version"], 2)
+        self.assertEqual(
+            self.contract["timezone_mapping_path"],
+            "config/v5_2_qd/venue_timezones.json",
+        )
+        self.assertNotIn(
+            "config/v5_2_qd_venue_timezones.json",
+            json.dumps(self.contract, sort_keys=True),
+        )
+        self.assertEqual(
+            self.contract["response_byte_limits"],
+            {
+                "boxscore": 16_777_216,
+                "career_bf": 16_777_216,
+                "league_pitching": 16_777_216,
+                "schedule": 134_217_728,
+                "statcast": 268_435_456,
+                "team": 16_777_216,
+                "venue": 16_777_216,
+            },
+        )
+        self.assertEqual(
+            self.contract["response_completeness_limits"],
+            {
+                "league_pitching_split_limit": 5000,
+                "statcast_data_row_limit": 25000,
+            },
+        )
+        source = next(
+            item
+            for item in self.contract["sources"]
+            if item["name"] == "mlb_stats_pitcher_bf"
+        )
+        self.assertEqual(
+            source["endpoints"],
+            ["https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"],
         )
 
     def test_contract_rejects_unknown_keys_and_contains_no_generated_query_ids(self) -> None:

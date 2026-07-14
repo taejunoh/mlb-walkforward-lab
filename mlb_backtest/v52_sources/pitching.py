@@ -23,6 +23,7 @@ from ..v52_source_contracts import (
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
+_MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_QUERY_KEYS = {
     "acquisition_contract_sha256",
@@ -96,7 +97,7 @@ def _consumer_cutoffs(
     return consumers, normalized
 
 
-def _pitching_group(raw: bytes) -> tuple[int, int]:
+def _pitching_group(raw: bytes, *, limit: int) -> tuple[int, int]:
     payload = _json_object(raw, "MLB pitching stats")
     stats = payload.get("stats")
     if not isinstance(stats, list) or len(stats) != 1 or not isinstance(stats[0], dict):
@@ -108,6 +109,8 @@ def _pitching_group(raw: bytes) -> tuple[int, int]:
         raise ValueError("MLB pitching totalSplits must be a nonnegative integer")
     if not isinstance(splits, list) or len(splits) != total_splits:
         raise ValueError("MLB pitching stats are truncated or paged")
+    if total_splits >= limit:
+        raise ValueError("MLB pitching totalSplits reached the response limit")
     batters_faced = 0
     for split in splits:
         stat = split.get("stat") if isinstance(split, dict) else None
@@ -151,11 +154,16 @@ def recompute_pitching_sidecar(
     }
     if dict(query.parameters) != expected_parameters:
         raise ValueError("pitching query parameters differ from the cutoff contract")
+    if query.requested_range.get("response_completeness") != {
+        "limit": 5000,
+        "reject_total_splits_at_or_above_limit": True,
+    }:
+        raise ValueError("pitching query completeness contract differs")
     consumers, cutoffs = _consumer_cutoffs(query, consuming_game_pks)
     if any(as_of != cutoff for cutoff in cutoffs.values()):
         raise ValueError("pitching as-of date must equal every consumer D-1 cutoff")
     parsed = parse_league_era(raw)
-    total_splits, batters_faced = _pitching_group(raw)
+    total_splits, batters_faced = _pitching_group(raw, limit=5000)
     semantics = {
         "as_of_date": as_of.isoformat(),
         "batters_faced": batters_faced,
@@ -182,7 +190,7 @@ def recompute_career_bf_sidecar(
         query,
         source="mlb_stats_pitcher_bf",
         grain="player_career_batters_faced_reference",
-        endpoint=_STATS_ENDPOINT,
+        endpoint=f"{_MLB_BASE}/people/{_positive(query.requested_range.get('pitcher_id'), 'pitcher_id')}/stats",
         expected_media_type="application/json",
     )
     pitcher_id = _positive(query.requested_range.get("pitcher_id"), "pitcher_id")
@@ -190,7 +198,6 @@ def recompute_career_bf_sidecar(
         query.requested_range.get("inclusive_end"), "career BF inclusive end"
     )
     expected_parameters = {
-        "personId": pitcher_id,
         "stats": "byDateRange",
         "group": "pitching",
         "gameType": "R",

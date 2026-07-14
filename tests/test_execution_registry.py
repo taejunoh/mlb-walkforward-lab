@@ -49,6 +49,9 @@ DESIGN_RELATIVE = Path(
 PLAN_RELATIVE = Path(
     "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
 )
+AMENDMENT_RELATIVE = Path(
+    "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+)
 CONTRACT_RELATIVE = Path("protocols/v5_2_qd/historical_source_acquisition.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
@@ -89,6 +92,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             RUN_SPEC_RELATIVE,
             DESIGN_RELATIVE,
             PLAN_RELATIVE,
+            AMENDMENT_RELATIVE,
             CONTRACT_RELATIVE,
             BASELINE_RELATIVE,
             PROTECTED_RELATIVE,
@@ -98,6 +102,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         shutil.copy2(ROOT / RUN_SPEC_RELATIVE, root / RUN_SPEC_RELATIVE)
         shutil.copy2(ROOT / DESIGN_RELATIVE, root / DESIGN_RELATIVE)
         shutil.copy2(ROOT / PLAN_RELATIVE, root / PLAN_RELATIVE)
+        shutil.copy2(ROOT / AMENDMENT_RELATIVE, root / AMENDMENT_RELATIVE)
         shutil.copy2(ROOT / BASELINE_RELATIVE, root / BASELINE_RELATIVE)
         shutil.copy2(ROOT / PROTECTED_RELATIVE, root / PROTECTED_RELATIVE)
         for relative in BOUND_EXECUTION_CODE:
@@ -118,6 +123,10 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "git_blob_id": _git(root, "rev-parse", f"HEAD:{PLAN_RELATIVE}"),
                 "path": PLAN_RELATIVE.as_posix(),
                 "working_tree_sha256": _sha256(root / PLAN_RELATIVE),
+            },
+            "plan_a_amendment": {
+                "path": AMENDMENT_RELATIVE.as_posix(),
+                "sha256": _sha256(root / AMENDMENT_RELATIVE),
             },
             "run_spec": {
                 "path": RUN_SPEC_RELATIVE.as_posix(),
@@ -1615,6 +1624,17 @@ class ExecutionRegistryTest(unittest.TestCase):
                 return data
 
             with patch.object(self.registry, "_read_fd_all", side_effect=replace_after_read), self.assertRaisesRegex((ValueError, RuntimeError), "changed|identity"):
+                self.registry.load_execution_registry(root, run_spec)
+
+
+    def test_plan_a_amendment_binding_is_rehashed_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            (root / AMENDMENT_RELATIVE).write_bytes(
+                (root / AMENDMENT_RELATIVE).read_bytes() + b"tampered\n"
+            )
+            with self.assertRaisesRegex(ValueError, "amendment|binding|hash|dirty|worktree"):
                 self.registry.load_execution_registry(root, run_spec)
 
 

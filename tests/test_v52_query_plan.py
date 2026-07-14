@@ -140,10 +140,15 @@ class V52QueryPlanTest(unittest.TestCase):
         self.assertEqual(boxscore.requested_range["game_pk"], 7)
         self.assertEqual(sources.count("mlb_stats_pitching"), 1)
         pitching = next(q for q in batch.queries if q.source == "mlb_stats_pitching")
-        self.assertEqual(pitching.requested_range["consuming_game_pks"], [7, 8])
+        self.assertEqual(pitching.requested_range["consuming_game_pks"], [7])
         self.assertEqual(
             pitching.requested_range["consumer_cutoff_dates"],
-            {"7": "2024-04-01", "8": "2024-04-01"},
+            {"7": "2024-04-01"},
+        )
+        self.assertEqual(pitching.parameters["limit"], 5000)
+        self.assertEqual(
+            pitching.requested_range["response_completeness"],
+            {"limit": 5000, "reject_total_splits_at_or_above_limit": True},
         )
         self.assertEqual(
             sum(q.endpoint.endswith("/teams") for q in batch.queries), 1
@@ -213,6 +218,23 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         self.assertNotIn("startDate", pitching[0].parameters)
 
+    def test_all_unplayed_schedule_population_emits_no_d1_query_or_disposition(self):
+        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+
+        batch = build_schedule_reference_batch(
+            {"anchors": [{
+                "season": 2024,
+                "season_start_date": "2024-03-20",
+                "game_pk": 1,
+                "official_date": "2024-03-20",
+                "venue_id": 31,
+                "played": False,
+            }]},
+            run_spec_sha256=RUN_SHA,
+            acquisition_contract_sha256=CONTRACT_SHA,
+        )
+        self.assertFalse(any(q.source == "mlb_stats_pitching" for q in batch.queries))
+
     def test_schedule_reference_requires_played_and_rejects_conflicting_duplicate(self):
         from mlb_backtest.v52_query_plan import build_schedule_reference_batch
 
@@ -243,6 +265,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 "game_pk": 1,
                 "season": 2024,
                 "official_date": "2024-04-02",
+                "played": True,
                 "verification_status": "VERIFIED",
                 "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
                 "actual_starter_ids": [100, 200],
@@ -251,6 +274,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 "game_pk": 2,
                 "season": 2024,
                 "official_date": "2024-04-02",
+                "played": True,
                 "verification_status": "VERIFIED",
                 "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
                 "actual_starter_ids": [100, 300],
@@ -259,6 +283,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 "game_pk": 3,
                 "season": 2024,
                 "official_date": "2024-04-02",
+                "played": False,
                 "verification_status": "UNVERIFIED",
                 "participant_provenance": "PROBABLE",
                 "actual_starter_ids": [999],
@@ -270,11 +295,18 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         self.assertEqual(batch.stage, "PARTICIPANT_DERIVED")
         self.assertEqual(
-            [q.parameters["personId"] for q in batch.queries], [100, 200, 300]
+            [q.requested_range["pitcher_id"] for q in batch.queries], [100, 200, 300]
         )
+        self.assertTrue(
+            all(
+                q.endpoint
+                == f"https://statsapi.mlb.com/api/v1/people/{q.requested_range['pitcher_id']}/stats"
+                for q in batch.queries
+            )
+        )
+        self.assertTrue(all("personId" not in q.parameters for q in batch.queries))
         self.assertTrue(all(q.parameters["endDate"] == "2017-12-31" for q in batch.queries))
-        self.assertFalse(any(q.parameters.get("personId") == 999 for q in batch.queries))
-        by_pitcher = {q.parameters["personId"]: q for q in batch.queries}
+        by_pitcher = {q.requested_range["pitcher_id"]: q for q in batch.queries}
         self.assertEqual(
             by_pitcher[100].requested_range["consuming_game_pks"], [1, 2]
         )
@@ -295,6 +327,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 "game_pk": 1,
                 "season": 2018,
                 "official_date": "2018-03-29",
+                "played": True,
                 "verification_status": "VERIFIED",
                 "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
                 "actual_starter_ids": [100, 200],
@@ -303,6 +336,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 "game_pk": 2,
                 "season": 2024,
                 "official_date": "2024-09-30",
+                "played": True,
                 "verification_status": "VERIFIED",
                 "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
                 "actual_starter_ids": [300, 400],
@@ -314,7 +348,7 @@ class V52QueryPlanTest(unittest.TestCase):
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         self.assertEqual(
-            [query.parameters["personId"] for query in batch.queries],
+            [query.requested_range["pitcher_id"] for query in batch.queries],
             [100, 200, 300, 400],
         )
 
@@ -339,6 +373,7 @@ class V52QueryPlanTest(unittest.TestCase):
             "game_pk": 1,
             "season": 2024,
             "official_date": "2024-04-02",
+            "played": True,
             "verification_status": "VERIFIED",
             "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
             "actual_starter_ids": [100, 200],
@@ -347,6 +382,7 @@ class V52QueryPlanTest(unittest.TestCase):
             [base, dict(base)],
             [base, {**base, "actual_starter_ids": [300, 400]}],
             [{**base, "actual_starter_ids": [100, 100]}],
+            [{key: value for key, value in base.items() if key != "played"}],
         ]
         for games in invalid_games:
             with self.subTest(games=games), self.assertRaises(ValueError):

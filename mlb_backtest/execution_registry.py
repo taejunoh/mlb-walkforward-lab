@@ -619,7 +619,30 @@ def _require_bound_execution_code_clean(root: Path) -> None:
         _require_tracked_clean(root, relative, "bound execution code")
 
 
-def _git_bound_paths(evidence: Mapping[str, object]) -> tuple[str, ...]:
+def _plan_a_amendment_binding(
+    root: Path, evidence: Mapping[str, object]
+) -> Mapping[str, object]:
+    contract_binding = _validate_binding_value(
+        evidence["acquisition_contract"], "acquisition contract"
+    )
+    _, contents = _read_path(
+        root,
+        root / str(contract_binding["path"]),
+        "acquisition contract",
+    )
+    contract = _canonical_object(contents, "acquisition contract")
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("acquisition contract bindings differ")
+    amendment = bindings.get("plan_a_amendment")
+    if not isinstance(amendment, Mapping):
+        raise ValueError("Plan A amendment binding is missing")
+    return _artifact_binding(root, amendment, "Plan A amendment")
+
+
+def _git_bound_paths(root: Path, evidence: Mapping[str, object]) -> tuple[str, ...]:
     paths = list(_BOUND_EXECUTION_CODE)
     for key in (
         "run_spec",
@@ -638,6 +661,7 @@ def _git_bound_paths(evidence: Mapping[str, object]) -> tuple[str, ...]:
         paths.append(
             str(_validate_binding_value(lineage[key], key)["path"])
         )
+    paths.append(str(_plan_a_amendment_binding(root, evidence)["path"]))
     return tuple(dict.fromkeys(paths))
 
 
@@ -658,6 +682,8 @@ def _capture_git_snapshot(
             evidence[key], key, plan=key == "implementation_plan"
         )
         expected_bindings[str(binding["path"])] = binding
+    amendment = _plan_a_amendment_binding(root, evidence)
+    expected_bindings[str(amendment["path"])] = amendment
     lineage = _exact_object(
         evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
     )
@@ -665,7 +691,7 @@ def _capture_git_snapshot(
         binding = _validate_binding_value(lineage[key], key)
         expected_bindings[str(binding["path"])] = binding
     files: list[_GitFileSnapshot] = []
-    for relative in _git_bound_paths(evidence):
+    for relative in _git_bound_paths(root, evidence):
         captured = _capture_git_file(root, relative, "bound Git evidence")
         expected = expected_bindings.get(relative)
         if expected is not None and captured.artifact.binding != {
@@ -1130,6 +1156,7 @@ def _validate_common_bindings(root: Path, payload: Mapping[str, object], run_spe
         or bindings.get("implementation_plan") != expected_plan
     ):
         raise ValueError("execution receipt differs from acquisition contract bindings")
+    _plan_a_amendment_binding(root, payload)
     lineage = _exact_object(payload["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage")
     protection = contract.get("legacy_protection")
     if not isinstance(protection, Mapping):

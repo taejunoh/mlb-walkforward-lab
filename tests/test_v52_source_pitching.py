@@ -341,8 +341,12 @@ def _artifact_sha(sidecar: dict[str, object]) -> str:
 
 
 def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league_pitching_reference", requested: dict[str, object] | None = None) -> LogicalQuery:
-    requested_range = requested or {"season": 2024, "start_date": "2024-03-20", "as_of_date": "2024-04-01", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}}
+    requested_range = dict(requested or {"season": 2024, "start_date": "2024-03-20", "as_of_date": "2024-04-01", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}})
     if source == "mlb_stats_pitching":
+        requested_range.setdefault(
+            "response_completeness",
+            {"limit": 5000, "reject_total_splits_at_or_above_limit": True},
+        )
         parameters = {
             "stats": "byDateRange", "group": "pitching", "sportIds": 1,
             "gameType": "R", "playerPool": "ALL", "limit": 5000,
@@ -351,7 +355,6 @@ def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league
         }
     else:
         parameters = {
-            "personId": requested_range.get("pitcher_id"),
             "stats": "byDateRange", "group": "pitching", "gameType": "R",
             "sportIds": 1, "startDate": "1876-01-01",
             "endDate": requested_range.get("inclusive_end"),
@@ -359,7 +362,11 @@ def _query(*, source: str = "mlb_stats_pitching", grain: str = "season_d1_league
     return LogicalQuery(
         source=source,
         grain=grain,
-        endpoint="https://statsapi.mlb.com/api/v1/stats",
+        endpoint=(
+            "https://statsapi.mlb.com/api/v1/stats"
+            if source == "mlb_stats_pitching"
+            else f"https://statsapi.mlb.com/api/v1/people/{requested_range.get('pitcher_id')}/stats"
+        ),
         parameters=parameters,
         requested_range=requested_range,
         expected_media_type="application/json",
@@ -1151,6 +1158,27 @@ class V52PitchingSourceTest(unittest.TestCase):
                 _query(requested={"season": 2024, "start_date": "2024-03-21", "as_of_date": "2024-04-01", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}}),
                 [9001],
             )
+
+    def test_pitching_rejects_total_splits_at_response_limit(self) -> None:
+        from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar
+
+        payload = json.loads(FIXTURE.read_bytes())
+        payload["stats"][0]["splits"] = payload["stats"][0]["splits"] * 2500
+        payload["stats"][0]["totalSplits"] = 5000
+        with self.assertRaisesRegex(ValueError, "limit|capped"):
+            recompute_pitching_sidecar(json.dumps(payload).encode(), _query(), [9001])
+
+    def test_career_query_uses_person_path_and_no_person_id_parameter(self) -> None:
+        query = _query(
+            source="mlb_stats_pitcher_bf",
+            grain="player_career_batters_faced_reference",
+            requested={"pitcher_id": 101, "inclusive_end": "2017-12-31", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}},
+        )
+        self.assertEqual(
+            query.endpoint,
+            "https://statsapi.mlb.com/api/v1/people/101/stats",
+        )
+        self.assertNotIn("personId", query.parameters)
 
     def test_pitching_rejects_missing_task3_consumer_cutoff_binding(self) -> None:
         from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar
