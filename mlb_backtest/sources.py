@@ -27,6 +27,7 @@ def fetch_bytes(
     timeout: int | float = 90,
     max_bytes: int = _DEFAULT_MAX_BYTES,
 ) -> bytes:
+    """Fetch legacy source bytes; v5.2 evidence uses ``v52_http.fetch_attempt``."""
     _validate_http_url(url, "url")
     if (
         isinstance(timeout, bool)

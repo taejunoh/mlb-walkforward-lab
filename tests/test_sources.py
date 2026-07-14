@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+import inspect
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -55,6 +56,12 @@ class _Response:
 
 
 class SourceTest(unittest.TestCase):
+    def test_fetch_bytes_public_signature_remains_backward_compatible(self):
+        self.assertEqual(
+            str(inspect.signature(fetch_bytes)),
+            "(url: str, timeout: int | float = 90, max_bytes: int = 67108864) -> bytes",
+        )
+
     def test_schedule_url_has_exact_query_semantics(self):
         parsed = urlparse(schedule_url("2025-05-01", "2025-08-12"))
 
