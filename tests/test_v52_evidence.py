@@ -253,9 +253,11 @@ class V52EvidenceTest(unittest.TestCase):
             store = V52EvidenceStore(root)
             query_id = store.register_query(query)
             folder = root / "queries" / query.source / query_id
+            registration = json.loads((folder / "query.json").read_bytes())
+            registration.pop("lock_identity")
             self.assertEqual(
-                (folder / "query.json").read_bytes(),
-                canonical_query_bytes(query) + b"\n",
+                registration,
+                json.loads(canonical_query_bytes(query)),
             )
             for child in ("attempts", "objects", "sidecars"):
                 self.assertTrue((folder / child).is_dir())
@@ -268,6 +270,55 @@ class V52EvidenceTest(unittest.TestCase):
                 (ValueError, RuntimeError), "query|ambiguous|differ"
             ):
                 store.register_query(query)
+
+    def test_query_registration_immutably_binds_lock_device_and_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            query = _query()
+            store = V52EvidenceStore(root)
+            query_id = store.register_query(query)
+            folder = root / "queries" / query.source / query_id
+            registration = json.loads((folder / "query.json").read_bytes())
+            lock_metadata = (folder / ".query.lock").lstat()
+            logical_record = json.loads(canonical_query_bytes(query))
+            self.assertEqual(
+                registration,
+                {
+                    **logical_record,
+                    "lock_identity": {
+                        "device": lock_metadata.st_dev,
+                        "inode": lock_metadata.st_ino,
+                    },
+                },
+            )
+
+    def test_lock_bound_query_registration_rejects_tamper_and_aliases(self) -> None:
+        for attack in ("tamper", "symlink", "hardlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                query = _query()
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query):
+                    pass
+                folder = root / "queries" / query.source / logical_query_id(query)
+                registration_path = folder / "query.json"
+                if attack == "tamper":
+                    registration = json.loads(registration_path.read_bytes())
+                    registration["lock_identity"]["inode"] += 1
+                    registration_path.write_bytes(_canonical_file(registration))
+                else:
+                    displaced = folder / "query.displaced.json"
+                    registration_path.rename(displaced)
+                    if attack == "symlink":
+                        registration_path.symlink_to(displaced.name)
+                    else:
+                        os.link(displaced, registration_path)
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "query|registration|lock|identity|alias|unalias|differ",
+                ):
+                    with V52EvidenceStore(root).acquire_query(query):
+                        self.fail("tampered query registration was accepted")
 
     def test_append_only_attempt_numbering_selected_headers_and_exact_byte_count(
         self,
@@ -324,7 +375,10 @@ class V52EvidenceTest(unittest.TestCase):
             "header": lambda item: item["response_headers"].__setitem__(
                 "X-Unselected", "forbidden"
             ),
-            "byte_count": lambda item: item.__setitem__("byte_count", 999),
+            "content_length": lambda item: item["response_headers"].__setitem__(
+                "Content-Length", "-1"
+            ),
+            "byte_count": lambda item: item.__setitem__("byte_count", -1),
             "outcome": lambda item: item.__setitem__("outcome", "UNKNOWN"),
             "attempt_binding": lambda item: item.__setitem__("attempt_number", 2),
         }
@@ -368,6 +422,32 @@ class V52EvidenceTest(unittest.TestCase):
                         "attempt|timestamp|header|byte|outcome|keys|binding",
                     ):
                         store.next_attempt_number(lease)
+
+    def test_content_length_is_independent_selected_response_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            body = b"short"
+            capture = dataclasses.replace(
+                _capture(body, status=503, error="TRUNCATED_HTTP"),
+                response_headers=(
+                    ("Content-Length", "100"),
+                    ("Content-Type", "application/json"),
+                ),
+            )
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                receipt_path = store.record_attempt(
+                    query, number, capture, outcome="TRANSIENT_HTTP"
+                )
+            receipt = json.loads(receipt_path.read_bytes())
+            self.assertEqual(receipt["byte_count"], len(body))
+            self.assertEqual(receipt["body_sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual(receipt["response_headers"]["Content-Length"], "100")
+            jsonschema.validate(receipt, json.loads(MANIFEST_SCHEMA.read_bytes()))
+            with store.acquire_query(query) as lease:
+                self.assertEqual(store.next_attempt_number(lease), 2)
 
     def test_attempt_schema_is_closed_and_enforces_branch_semantics(self) -> None:
         schema = json.loads(MANIFEST_SCHEMA.read_bytes())
@@ -502,7 +582,10 @@ class V52EvidenceTest(unittest.TestCase):
             )
             self.assertIn("fetched_raw_path", success)
             self.assertNotIn("protected_legacy_reference_path", success)
-            self.assertEqual(success["query_sha256"], logical_query_id(query))
+            self.assertEqual(
+                success["query_sha256"],
+                hashlib.sha256((root / success["query_path"]).read_bytes()).hexdigest(),
+            )
 
             sidecar_path = root / success["query_sidecar_path"]
             sidecar = json.loads(sidecar_path.read_bytes())
@@ -892,10 +975,50 @@ class V52EvidenceTest(unittest.TestCase):
 
             second_store = V52EvidenceStore(root)
             with self.assertRaisesRegex(
-                (ValueError, RuntimeError), "ambiguous|lock|membership"
+                (ValueError, RuntimeError),
+                "ambiguous|lock|membership|registration|differ",
             ):
                 with second_store.acquire_query(query):
                     self.fail("replacement lock must not create a second valid lease")
+
+    def test_unlinked_and_recreated_lock_cannot_admit_a_second_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            query = _query()
+            first_store = V52EvidenceStore(root)
+            context = first_store.acquire_query(query)
+            lease = context.__enter__()
+            folder = root / "queries" / query.source / logical_query_id(query)
+            lock_path = folder / ".query.lock"
+            lock_path.unlink()
+            lock_path.write_bytes(b"")
+            try:
+                second_store = V52EvidenceStore(root)
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "registration|lock|identity|differ"
+                ):
+                    with second_store.acquire_query(query):
+                        self.fail("replacement lock admitted a second store")
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "lease|lock|identity"
+                ):
+                    first_store.next_attempt_number(lease)
+            finally:
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "lease|lock|identity"
+                ):
+                    context.__exit__(None, None, None)
+
+    def test_second_store_can_acquire_unchanged_lock_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            query = _query()
+            first_store = V52EvidenceStore(root)
+            with first_store.acquire_query(query):
+                pass
+            second_store = V52EvidenceStore(root)
+            with second_store.acquire_query(query) as lease:
+                self.assertEqual(second_store.next_attempt_number(lease), 1)
 
     def test_publish_rechecks_lock_after_final_success_verification(self) -> None:
         with tempfile.TemporaryDirectory() as td:

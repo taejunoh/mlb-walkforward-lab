@@ -117,6 +117,7 @@ class QueryLease:
     _descriptor: int
     _owner_thread: int
     _directory_descriptors: tuple[int, ...]
+    _registration_sha256: str
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -215,6 +216,39 @@ def canonical_query_bytes(query: LogicalQuery) -> bytes:
 
 def logical_query_id(query: LogicalQuery) -> str:
     return hashlib.sha256(canonical_query_bytes(query)).hexdigest()
+
+
+def _registration_contents(query: LogicalQuery, lock_metadata: os.stat_result) -> bytes:
+    return _canonical_file_bytes(
+        {
+            **_query_record(query),
+            "lock_identity": {
+                "device": lock_metadata.st_dev,
+                "inode": lock_metadata.st_ino,
+            },
+        }
+    )
+
+
+def _decode_registration(contents: bytes) -> tuple[LogicalQuery, dict[str, int]]:
+    record = _json_object(contents, "logical query registration")
+    lock_identity = record.pop("lock_identity", None)
+    if (
+        not isinstance(lock_identity, dict)
+        or set(lock_identity) != {"device", "inode"}
+        or any(
+            type(lock_identity[key]) is not int or lock_identity[key] < 0
+            for key in lock_identity
+        )
+    ):
+        raise ValueError("logical query lock identity differs")
+    try:
+        query = LogicalQuery(**record)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("logical query registration keys differ") from exc
+    if _query_record(query) != record:
+        raise ValueError("logical query registration differs")
+    return query, lock_identity
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -549,10 +583,8 @@ def _validate_attempt_record(
     ):
         raise ValueError("attempt receipt selected headers differ")
     content_length = headers.get("Content-Length")
-    if content_length is not None and (
-        not content_length.isdigit() or int(content_length) != byte_count
-    ):
-        raise ValueError("attempt receipt byte count differs from Content-Length")
+    if content_length is not None and not content_length.isdigit():
+        raise ValueError("attempt receipt Content-Length syntax differs")
     outcome = record["outcome"]
     if outcome not in _ATTEMPT_OUTCOMES:
         raise ValueError("attempt receipt outcome differs")
@@ -710,11 +742,79 @@ class V52EvidenceStore:
             query.source, logical_query_id(query), descriptors
         )
 
-    def _validate_registered(self, query: LogicalQuery, query_fd: int) -> str:
+    @staticmethod
+    def _open_query_lock(query_fd: int, *, create: bool) -> int:
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            if create:
+                try:
+                    descriptor = os.open(
+                        ".query.lock",
+                        flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=query_fd,
+                    )
+                    os.fsync(descriptor)
+                    os.fsync(query_fd)
+                except FileExistsError:
+                    descriptor = os.open(".query.lock", flags, dir_fd=query_fd)
+            else:
+                descriptor = os.open(".query.lock", flags, dir_fd=query_fd)
+            metadata = os.fstat(descriptor)
+            linked = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size != 0
+                or _identity(metadata) != _identity(linked)
+            ):
+                raise ValueError("query lease lock must be an empty unaliased file")
+            return descriptor
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _verify_registered_lock(
+        query_fd: int, descriptor: int, lock_identity: Mapping[str, int]
+    ) -> None:
+        try:
+            metadata = os.fstat(descriptor)
+            linked = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("query registration lock identity changed") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != 0
+            or _identity(metadata) != _identity(linked)
+            or metadata.st_dev != lock_identity["device"]
+            or metadata.st_ino != lock_identity["inode"]
+        ):
+            raise ValueError("query registration lock identity changed")
+
+    def _validate_registered(
+        self,
+        query: LogicalQuery,
+        query_fd: int,
+        *,
+        lock_descriptor: int | None = None,
+    ) -> str:
         query_id = logical_query_id(query)
         contents = _read_regular_at(query_fd, "query.json", "logical query")
-        if contents != canonical_query_bytes(query) + b"\n":
+        registered_query, lock_identity = _decode_registration(contents)
+        if canonical_query_bytes(registered_query) != canonical_query_bytes(query):
             raise RuntimeError("registered logical query differs or is ambiguous")
+        owned_descriptor = lock_descriptor is None
+        if lock_descriptor is None:
+            lock_descriptor = self._open_query_lock(query_fd, create=False)
+        try:
+            self._verify_registered_lock(query_fd, lock_descriptor, lock_identity)
+        finally:
+            if owned_descriptor:
+                os.close(lock_descriptor)
         for name in ("attempts", "objects", "sidecars"):
             descriptor = _open_directory_at(query_fd, name, create=False)
             os.close(descriptor)
@@ -728,22 +828,30 @@ class V52EvidenceStore:
         }
         if not set(os.listdir(query_fd)) <= allowed:
             raise ValueError("query directory membership is ambiguous")
-        return query_id
+        if logical_query_id(registered_query) != query_id:
+            raise RuntimeError("registered logical query identity differs")
+        return _sha256_bytes(contents)
 
     def register_query(self, query: LogicalQuery) -> str:
         query_id, descriptors = self._query_fds(query, create=True)
         try:
             query_fd = descriptors[-1]
-            _write_once_at(
-                query_fd,
-                "query.json",
-                canonical_query_bytes(query) + b"\n",
-                "logical query",
-            )
             for name in ("attempts", "objects", "sidecars"):
                 descriptor = _open_directory_at(query_fd, name, create=True)
                 os.close(descriptor)
-            self._validate_registered(query, query_fd)
+            lock_descriptor = self._open_query_lock(query_fd, create=True)
+            try:
+                _write_once_at(
+                    query_fd,
+                    "query.json",
+                    _registration_contents(query, os.fstat(lock_descriptor)),
+                    "logical query registration",
+                )
+                self._validate_registered(
+                    query, query_fd, lock_descriptor=lock_descriptor
+                )
+            finally:
+                os.close(lock_descriptor)
             return query_id
         finally:
             self._close_fds(descriptors)
@@ -772,18 +880,15 @@ class V52EvidenceStore:
             lease.source, lease.query_id, lease._directory_descriptors
         )
         query_fd = lease._directory_descriptors[-1]
-        try:
-            metadata = os.fstat(lease._descriptor)
-            linked = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise ValueError("query lease lock identity changed") from exc
+        contents = _read_regular_at(query_fd, "query.json", "logical query")
+        query, lock_identity = _decode_registration(contents)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_size != 0
-            or _identity(metadata) != _identity(linked)
+            _sha256_bytes(contents) != lease._registration_sha256
+            or logical_query_id(query) != lease.query_id
+            or query.source != lease.source
         ):
-            raise ValueError("query lease lock identity changed")
+            raise ValueError("query lease registration identity changed")
+        self._verify_registered_lock(query_fd, lease._descriptor, lock_identity)
 
     def _ensure_unpublished(self, query: LogicalQuery) -> None:
         if self.load_success(query) is not None:
@@ -802,34 +907,18 @@ class V52EvidenceStore:
         query_fd = descriptors[-1]
         lock_descriptor = -1
         try:
-            flags = (
-                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            lock_descriptor = self._open_query_lock(query_fd, create=False)
+            registration_sha256 = self._validate_registered(
+                query, query_fd, lock_descriptor=lock_descriptor
             )
-            try:
-                lock_descriptor = os.open(
-                    ".query.lock",
-                    flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=query_fd,
-                )
-                os.fsync(lock_descriptor)
-                os.fsync(query_fd)
-            except FileExistsError:
-                lock_descriptor = os.open(".query.lock", flags, dir_fd=query_fd)
-            metadata = os.fstat(lock_descriptor)
-            linked = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or metadata.st_size != 0
-                or _identity(metadata) != _identity(linked)
-            ):
-                raise ValueError("query lease lock must be an empty unaliased file")
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-            self._validate_registered(query, query_fd)
-            rebound = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
-            if _identity(os.fstat(lock_descriptor)) != _identity(rebound):
-                raise ValueError("query lease lock identity changed")
+            if (
+                self._validate_registered(
+                    query, query_fd, lock_descriptor=lock_descriptor
+                )
+                != registration_sha256
+            ):
+                raise ValueError("query lease registration identity changed")
             lease = QueryLease(
                 query_id,
                 query.source,
@@ -837,6 +926,7 @@ class V52EvidenceStore:
                 lock_descriptor,
                 threading.get_ident(),
                 tuple(descriptors),
+                registration_sha256,
             )
             self._verify_lease_binding(lease)
             active[query_id] = lease
@@ -947,12 +1037,14 @@ class V52EvidenceStore:
             for name in ("queries", lease.source, lease.query_id):
                 child = _open_directory_at(descriptors[-1], name, create=False)
                 descriptors.append(child)
-            record = _json_object(
-                _read_regular_at(descriptors[-1], "query.json", "logical query"),
-                "logical query",
+            contents = _read_regular_at(
+                descriptors[-1], "query.json", "logical query registration"
             )
-            query = LogicalQuery(**record)  # type: ignore[arg-type]
-            if logical_query_id(query) != lease.query_id:
+            query, _ = _decode_registration(contents)
+            if (
+                _sha256_bytes(contents) != lease._registration_sha256
+                or logical_query_id(query) != lease.query_id
+            ):
                 raise RuntimeError("leased logical query identity differs")
             return query
         finally:
@@ -1175,13 +1267,14 @@ class V52EvidenceStore:
         storage_mode: str,
     ) -> dict[str, object]:
         query_id = logical_query_id(query)
+        registration_sha256 = self._require_lease(query)._registration_sha256
         return {
             "attempt_history": self._attempt_history(query),
             "attempt_number": attempt_number,
             "grain": query.grain,
             "query_id": query_id,
             "query_path": _relative_path(query.source, query_id, "query.json"),
-            "query_sha256": query_id,
+            "query_sha256": registration_sha256,
             "query_sidecar_path": _relative_path(
                 query.source, query_id, "sidecars", sidecar_name
             ),
@@ -1623,7 +1716,7 @@ class V52EvidenceStore:
         query_id, descriptors = self._query_fds(query, create=False)
         try:
             query_fd = descriptors[-1]
-            self._validate_registered(query, query_fd)
+            registration_sha256 = self._validate_registered(query, query_fd)
             success_contents = _read_regular_at(
                 query_fd, "success.json", "success receipt"
             )
@@ -1673,7 +1766,7 @@ class V52EvidenceStore:
         if (
             manifest.get("schema_version") != 1
             or manifest.get("query_id") != query_id
-            or manifest.get("query_sha256") != query_id
+            or manifest.get("query_sha256") != registration_sha256
             or manifest.get("source") != query.source
             or manifest.get("grain") != query.grain
             or manifest.get("query_path")
