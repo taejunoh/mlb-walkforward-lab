@@ -11,7 +11,7 @@ import threading
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, ContextManager, Literal
 
@@ -74,6 +74,8 @@ _LEGACY_REFERENCE_KEYS = {
 }
 _V52_RAW_RELATIVE = Path("data/v5_2_qd/historical/raw")
 _PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
+_DERIVED_ENDPOINT = "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+_DERIVED_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
 
 
 @dataclass(frozen=True)
@@ -105,9 +107,23 @@ class AttemptCapture:
 class PublishedEvidence:
     query_id: str
     success_receipt_path: Path
-    raw_sha256: str
+    raw_sha256: str | None
     query_sidecar_sha256: str
-    storage_mode: Literal["FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"]
+    storage_mode: Literal[
+        "DERIVED_DISPOSITION",
+        "FETCHED_RAW",
+        "PROTECTED_LEGACY_REFERENCE",
+    ]
+
+
+@dataclass(frozen=True)
+class VerifiedEvidenceRead:
+    registered_query: LogicalQuery
+    published_evidence: PublishedEvidence
+    raw_bytes: bytes | None
+    query_sidecar: Mapping[str, object]
+    success_receipt: Mapping[str, object]
+    attempt_receipts: tuple[Mapping[str, object], ...]
 
 
 @dataclass(frozen=True)
@@ -818,13 +834,13 @@ class V52EvidenceStore:
         ):
             raise ValueError("query registration lock identity changed")
 
-    def _validate_registered(
+    def _validated_registered_query(
         self,
         query: LogicalQuery,
         query_fd: int,
         *,
         lock_descriptor: int | None = None,
-    ) -> str:
+    ) -> tuple[str, LogicalQuery]:
         query_id = logical_query_id(query)
         contents = _read_regular_at(query_fd, "query.json", "logical query")
         registered_query, lock_identity = _decode_registration(contents)
@@ -853,7 +869,18 @@ class V52EvidenceStore:
             raise ValueError("query directory membership is ambiguous")
         if logical_query_id(registered_query) != query_id:
             raise RuntimeError("registered logical query identity differs")
-        return _sha256_bytes(contents)
+        return _sha256_bytes(contents), registered_query
+
+    def _validate_registered(
+        self,
+        query: LogicalQuery,
+        query_fd: int,
+        *,
+        lock_descriptor: int | None = None,
+    ) -> str:
+        return self._validated_registered_query(
+            query, query_fd, lock_descriptor=lock_descriptor
+        )[0]
 
     def register_query(self, query: LogicalQuery) -> str:
         query_id, descriptors = self._query_fds(query, create=True)
@@ -1250,6 +1277,71 @@ class V52EvidenceStore:
             os.close(attempts_fd)
             self._close_fds(descriptors)
 
+    def _verified_attempt_bundle(
+        self,
+        query: LogicalQuery,
+        attempts_fd: int,
+    ) -> tuple[
+        set[int],
+        list[dict[str, object]],
+        tuple[Mapping[str, object], ...],
+    ]:
+        query_id = logical_query_id(query)
+        reservations: set[int] = set()
+        receipts: dict[int, tuple[dict[str, object], bytes]] = {}
+        try:
+            names = os.listdir(attempts_fd)
+        except OSError as exc:
+            raise ValueError("attempt directory cannot be listed safely") from exc
+        for name in names:
+            reservation = _RESERVATION_NAME.fullmatch(name)
+            receipt = _ATTEMPT_NAME.fullmatch(name)
+            if reservation:
+                number = int(reservation.group("number"))
+                value = _json_object(
+                    _read_regular_at(
+                        attempts_fd, name, "attempt reservation"
+                    ),
+                    "attempt reservation",
+                )
+                if value != {
+                    "attempt_number": number,
+                    "query_id": query_id,
+                    "schema_version": 1,
+                }:
+                    raise ValueError("attempt reservation binding differs")
+                reservations.add(number)
+            elif receipt:
+                number = int(receipt.group("number"))
+                contents = _read_regular_at(
+                    attempts_fd, name, "attempt receipt"
+                )
+                record = _json_object(contents, "attempt receipt")
+                _validate_attempt_record(record, query_id, number)
+                receipts[number] = (record, contents)
+            else:
+                raise ValueError("attempt directory contains an ambiguous entry")
+        if not set(receipts) <= reservations:
+            raise ValueError("attempt receipt has no immutable reservation")
+        if reservations and reservations != set(range(1, max(reservations) + 1)):
+            raise ValueError("attempt reservation order has a gap")
+        history: list[dict[str, object]] = []
+        records: list[Mapping[str, object]] = []
+        for number in sorted(receipts):
+            name = f"{number:06d}.json"
+            record, contents = receipts[number]
+            history.append(
+                {
+                    "attempt_number": number,
+                    "path": _relative_path(
+                        query.source, query_id, "attempts", name
+                    ),
+                    "sha256": _sha256_bytes(contents),
+                }
+            )
+            records.append(record)
+        return reservations, history, tuple(records)
+
     def _validated_fetched_success_attempt(
         self,
         query: LogicalQuery,
@@ -1309,6 +1401,78 @@ class V52EvidenceStore:
         return name, digest, contents
 
     @staticmethod
+    def _derived_semantics(
+        query: LogicalQuery, semantics: Mapping[str, object]
+    ) -> dict[str, object]:
+        from .v52_seasons import SEASON_BOUNDARIES
+        from .v52_source_contracts import recompute_query_sidecar
+
+        expected_range = {
+            "as_of_date",
+            "consumer_cutoff_dates",
+            "consuming_game_pks",
+            "disposition",
+            "reason",
+            "season",
+        }
+        if (
+            query.source != "mlb_stats_pitching"
+            or query.grain != "season_d1_league_pitching_reference"
+            or query.endpoint != _DERIVED_ENDPOINT
+            or query.parameters != {}
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or set(query.requested_range) != expected_range
+            or query.requested_range.get("reason") != _DERIVED_REASON
+        ):
+            raise ValueError("derived disposition query contract differs")
+        season = query.requested_range.get("season")
+        as_of_text = query.requested_range.get("as_of_date")
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in SEASON_BOUNDARIES
+            or not isinstance(as_of_text, str)
+        ):
+            raise ValueError("derived disposition season/date binding differs")
+        try:
+            as_of = date.fromisoformat(as_of_text)
+        except ValueError as exc:
+            raise ValueError("derived disposition as_of_date differs") from exc
+        if (
+            as_of.isoformat() != as_of_text
+            or as_of != SEASON_BOUNDARIES[season][0] - timedelta(days=1)
+        ):
+            raise ValueError(
+                "derived disposition as_of_date must equal frozen season start D-1"
+            )
+        expected = dict(recompute_query_sidecar(query, b""))
+        expected["reason"] = _DERIVED_REASON
+        supplied = _normalized_json_object(semantics, "derived query_sidecar")
+        if supplied != expected:
+            raise ValueError("derived disposition semantics differ from query")
+        return expected
+
+    def _derived_sidecar_artifact(
+        self,
+        query: LogicalQuery,
+        semantics: Mapping[str, object],
+    ) -> tuple[str, str, bytes]:
+        semantic_record = self._derived_semantics(query, semantics)
+        sidecar = {
+            "grain": query.grain,
+            "parser_version": query.parser_version,
+            "query_id": logical_query_id(query),
+            "schema_version": 1,
+            "semantics": semantic_record,
+            "source": query.source,
+            "storage_mode": "DERIVED_DISPOSITION",
+        }
+        contents = _canonical_file_bytes(sidecar)
+        digest = _sha256_bytes(contents)
+        return f"{digest}.json", digest, contents
+
+    @staticmethod
     def _ensure_content_slot(
         directory_fd: int,
         expected_name: str,
@@ -1328,6 +1492,17 @@ class V52EvidenceStore:
             existing = _read_regular_at(directory_fd, existing_name, label)
             if existing_name != expected_name or existing != expected_contents:
                 raise RuntimeError(f"conflicting ambiguous {label} inventory")
+
+    @staticmethod
+    def _ensure_empty_inventory(directory_fd: int, label: str) -> None:
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise ValueError(f"{label} inventory cannot be read safely") from exc
+        for name in names:
+            _read_regular_at(directory_fd, name, label)
+        if names:
+            raise ValueError(f"derived disposition {label} inventory must be empty")
 
     def _manifest_base(
         self,
@@ -1729,23 +1904,98 @@ class V52EvidenceStore:
         self._require_lease(query)
         return published
 
-    def load_success(self, query: LogicalQuery) -> PublishedEvidence | None:
-        logical_query_id(query)
-        try:
-            _, descriptors = self._query_fds(query, create=False)
-        except FileNotFoundError:
-            return None
+    def publish_derived_disposition(
+        self,
+        query: LogicalQuery,
+        query_sidecar: Mapping[str, object],
+    ) -> PublishedEvidence:
+        self._require_lease(query)
+        self._ensure_unpublished(query)
+        sidecar_name, sidecar_sha256, sidecar_contents = (
+            self._derived_sidecar_artifact(query, query_sidecar)
+        )
+        query_id, descriptors = self._query_fds(query, create=False)
         try:
             query_fd = descriptors[-1]
-            self._validate_registered(query, query_fd)
-            contents = _read_regular_at(
-                query_fd, "success.json", "success receipt", missing_ok=True
-            )
-            if contents is None:
-                return None
+            registration_sha256 = self._validate_registered(query, query_fd)
+            with ExitStack() as opened:
+                attempts_fd = _open_directory_at(
+                    query_fd, "attempts", create=False
+                )
+                opened.callback(os.close, attempts_fd)
+                objects_fd = _open_directory_at(query_fd, "objects", create=False)
+                opened.callback(os.close, objects_fd)
+                sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
+                opened.callback(os.close, sidecars_fd)
+                reservations, receipts = self._attempt_numbers(
+                    attempts_fd, query_id
+                )
+                if reservations or receipts:
+                    raise ValueError(
+                        "derived disposition cannot own attempts or reservations"
+                    )
+                self._ensure_empty_inventory(objects_fd, "query object")
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
+                _write_once_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "derived disposition sidecar",
+                )
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
+                manifest = {
+                    "attempt_history": [],
+                    "attempt_number": None,
+                    "grain": query.grain,
+                    "query_id": query_id,
+                    "query_path": _relative_path(
+                        query.source, query_id, "query.json"
+                    ),
+                    "query_sha256": registration_sha256,
+                    "query_sidecar_path": _relative_path(
+                        query.source, query_id, "sidecars", sidecar_name
+                    ),
+                    "query_sidecar_sha256": sidecar_sha256,
+                    "schema_version": 1,
+                    "source": query.source,
+                    "storage_mode": "DERIVED_DISPOSITION",
+                }
+                _before_success_publish()
+                self._verify_query_chain(query, descriptors)
+                self._require_lease(query)
+                reservations, receipts = self._attempt_numbers(
+                    attempts_fd, query_id
+                )
+                if reservations or receipts:
+                    raise ValueError(
+                        "derived disposition attempt inventory changed"
+                    )
+                self._ensure_empty_inventory(objects_fd, "query object")
+                _write_once_at(
+                    query_fd,
+                    "success.json",
+                    _canonical_file_bytes(manifest),
+                    "success receipt",
+                )
         finally:
             self._close_fds(descriptors)
-        return self.verify_success(query)
+        published = self.verify_success(query)
+        self._require_lease(query)
+        return published
+
+    def load_success(self, query: LogicalQuery) -> PublishedEvidence | None:
+        verified = self._read_verified_success(query, missing_ok=True)
+        return None if verified is None else verified.published_evidence
 
     def _read_bound_relative(
         self, relative: str, expected_prefix: tuple[str, ...], label: str
@@ -1796,202 +2046,326 @@ class V52EvidenceStore:
         finally:
             self._close_fds(descriptors)
 
-    def verify_success(self, query: LogicalQuery) -> PublishedEvidence:
-        query_id, descriptors = self._query_fds(query, create=False)
+    def _read_verified_success(
+        self,
+        query: LogicalQuery,
+        *,
+        missing_ok: bool,
+    ) -> VerifiedEvidenceRead | None:
+        try:
+            query_id, descriptors = self._query_fds(query, create=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
         try:
             query_fd = descriptors[-1]
-            registration_sha256 = self._validate_registered(query, query_fd)
-            success_contents = _read_regular_at(
-                query_fd, "success.json", "success receipt"
+            registration_sha256, registered_query = (
+                self._validated_registered_query(query, query_fd)
             )
+            success_contents = _read_regular_at(
+                query_fd,
+                "success.json",
+                "success receipt",
+                missing_ok=missing_ok,
+            )
+            if success_contents is None:
+                return None
             manifest = _json_object(success_contents, "success receipt")
+            raw_common_keys = {
+                "attempt_history",
+                "attempt_number",
+                "grain",
+                "query_id",
+                "query_path",
+                "query_sha256",
+                "query_sidecar_path",
+                "query_sidecar_sha256",
+                "raw_byte_count",
+                "raw_sha256",
+                "schema_version",
+                "source",
+                "storage_mode",
+            }
+            derived_keys = raw_common_keys - {"raw_byte_count", "raw_sha256"}
+            mode = manifest.get("storage_mode")
+            if mode == "FETCHED_RAW":
+                if set(manifest) != raw_common_keys | {"fetched_raw_path"}:
+                    raise ValueError("fetched success receipt keys differ")
+            elif mode == "PROTECTED_LEGACY_REFERENCE":
+                if set(manifest) != raw_common_keys | {
+                    "protected_legacy_reference_path",
+                    "protected_legacy_reference_sha256",
+                }:
+                    raise ValueError("protected success receipt keys differ")
+            elif mode == "DERIVED_DISPOSITION":
+                if set(manifest) != derived_keys:
+                    raise ValueError("derived success receipt keys differ")
+            else:
+                raise ValueError("success storage_mode differs")
+            if (
+                manifest.get("schema_version") != 1
+                or manifest.get("query_id") != query_id
+                or manifest.get("query_sha256") != registration_sha256
+                or manifest.get("source") != query.source
+                or manifest.get("grain") != query.grain
+                or manifest.get("query_path")
+                != _relative_path(query.source, query_id, "query.json")
+            ):
+                raise ValueError("success query binding differs")
+
+            with ExitStack() as opened:
+                attempts_fd = _open_directory_at(
+                    query_fd, "attempts", create=False
+                )
+                opened.callback(os.close, attempts_fd)
+                objects_fd = _open_directory_at(query_fd, "objects", create=False)
+                opened.callback(os.close, objects_fd)
+                sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
+                opened.callback(os.close, sidecars_fd)
+                reservations, history, attempt_receipts = (
+                    self._verified_attempt_bundle(query, attempts_fd)
+                )
+                if manifest.get("attempt_history") != history:
+                    raise ValueError("success attempt history binding differs")
+
+                legacy_reference_record: dict[str, object] | None = None
+                raw_sha256: str | None
+                raw_bytes: bytes | None
+                if mode == "FETCHED_RAW":
+                    attempt_number = manifest.get("attempt_number")
+                    raw_sha256 = _validate_sha256(
+                        manifest.get("raw_sha256"), "success raw_sha256"
+                    )
+                    raw_byte_count = manifest.get("raw_byte_count")
+                    receipt_numbers = {
+                        int(record["attempt_number"])
+                        for record in attempt_receipts
+                    }
+                    if (
+                        isinstance(attempt_number, bool)
+                        or not isinstance(attempt_number, int)
+                        or not reservations
+                        or not receipt_numbers
+                        or attempt_number != max(reservations)
+                        or attempt_number != max(receipt_numbers)
+                    ):
+                        raise ValueError(
+                            "successful attempt is not the current finalized tail"
+                        )
+                    final_attempt = attempt_receipts[-1]
+                    if (
+                        final_attempt.get("outcome") != "SUCCESS"
+                        or final_attempt.get("body_sha256") != raw_sha256
+                        or final_attempt.get("byte_count") != raw_byte_count
+                    ):
+                        raise ValueError("successful attempt raw binding differs")
+                    object_path = manifest.get("fetched_raw_path")
+                    object_name = f"{raw_sha256}.raw"
+                    if object_path != _relative_path(
+                        query.source, query_id, "objects", object_name
+                    ):
+                        raise ValueError(
+                            "fetched raw content-addressed path binding differs"
+                        )
+                    raw_bytes = _read_regular_at(
+                        objects_fd, object_name, "fetched raw object"
+                    )
+                    object_contents = raw_bytes
+                elif mode == "PROTECTED_LEGACY_REFERENCE":
+                    if manifest.get("attempt_number") is not None:
+                        raise ValueError("protected success attempt binding differs")
+                    raw_sha256 = _validate_sha256(
+                        manifest.get("raw_sha256"), "success raw_sha256"
+                    )
+                    raw_byte_count = manifest.get("raw_byte_count")
+                    reference_sha256 = _validate_sha256(
+                        manifest.get("protected_legacy_reference_sha256"),
+                        "protected reference SHA-256",
+                    )
+                    object_name = (
+                        f"{reference_sha256}.legacy-reference.json"
+                    )
+                    if manifest.get("protected_legacy_reference_path") != _relative_path(
+                        query.source, query_id, "objects", object_name
+                    ):
+                        raise ValueError(
+                            "protected reference content-addressed path binding differs"
+                        )
+                    object_contents = _read_regular_at(
+                        objects_fd, object_name, "protected legacy reference"
+                    )
+                    if _sha256_bytes(object_contents) != reference_sha256:
+                        raise ValueError("protected legacy reference hash differs")
+                    reference = _json_object(
+                        object_contents, "protected legacy reference"
+                    )
+                    legacy_reference_record, raw_bytes = (
+                        self._validated_legacy_reference(query, reference, None)
+                    )
+                else:
+                    if (
+                        manifest.get("attempt_number") is not None
+                        or reservations
+                        or attempt_receipts
+                    ):
+                        raise ValueError(
+                            "derived disposition cannot bind attempts or reservations"
+                        )
+                    self._ensure_empty_inventory(objects_fd, "query object")
+                    object_name = None
+                    object_contents = None
+                    raw_sha256 = None
+                    raw_byte_count = None
+                    raw_bytes = None
+
+                if mode != "DERIVED_DISPOSITION":
+                    if (
+                        isinstance(raw_byte_count, bool)
+                        or not isinstance(raw_byte_count, int)
+                        or raw_byte_count < 0
+                        or raw_bytes is None
+                        or len(raw_bytes) != raw_byte_count
+                        or _sha256_bytes(raw_bytes) != raw_sha256
+                    ):
+                        raise ValueError("success raw binding differs")
+                    self._ensure_content_slot(
+                        objects_fd,
+                        object_name,  # type: ignore[arg-type]
+                        object_contents,  # type: ignore[arg-type]
+                        "query object",
+                    )
+
+                sidecar_sha256 = _validate_sha256(
+                    manifest.get("query_sidecar_sha256"),
+                    "query sidecar SHA-256",
+                )
+                sidecar_name = f"{sidecar_sha256}.json"
+                if manifest.get("query_sidecar_path") != _relative_path(
+                    query.source, query_id, "sidecars", sidecar_name
+                ):
+                    raise ValueError(
+                        "query sidecar content-addressed path binding differs"
+                    )
+                sidecar_contents = _read_regular_at(
+                    sidecars_fd, sidecar_name, "query semantic sidecar"
+                )
+                if _sha256_bytes(sidecar_contents) != sidecar_sha256:
+                    raise ValueError("query sidecar hash differs")
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
+                sidecar = _json_object(
+                    sidecar_contents, "query semantic sidecar"
+                )
+                if mode == "DERIVED_DISPOSITION":
+                    if set(sidecar) != {
+                        "grain",
+                        "parser_version",
+                        "query_id",
+                        "schema_version",
+                        "semantics",
+                        "source",
+                        "storage_mode",
+                    } or any(
+                        (
+                            sidecar.get("schema_version") != 1,
+                            sidecar.get("storage_mode")
+                            != "DERIVED_DISPOSITION",
+                            sidecar.get("query_id") != query_id,
+                            sidecar.get("source") != query.source,
+                            sidecar.get("grain") != query.grain,
+                            sidecar.get("parser_version") != query.parser_version,
+                            not isinstance(sidecar.get("semantics"), Mapping),
+                        )
+                    ):
+                        raise ValueError(
+                            "derived disposition sidecar binding differs"
+                        )
+                    self._derived_semantics(
+                        query,
+                        sidecar["semantics"],  # type: ignore[arg-type]
+                    )
+                elif set(sidecar) != {
+                    "byte_count",
+                    "grain",
+                    "parser_version",
+                    "query_id",
+                    "raw_sha256",
+                    "schema_version",
+                    "semantics",
+                    "source",
+                } or any(
+                    (
+                        sidecar.get("schema_version") != 1,
+                        sidecar.get("query_id") != query_id,
+                        sidecar.get("source") != query.source,
+                        sidecar.get("grain") != query.grain,
+                        sidecar.get("parser_version") != query.parser_version,
+                        sidecar.get("raw_sha256") != raw_sha256,
+                        sidecar.get("byte_count") != raw_byte_count,
+                        not isinstance(sidecar.get("semantics"), dict),
+                    )
+                ):
+                    raise ValueError("query sidecar binding differs")
+                if (
+                    legacy_reference_record is not None
+                    and _sha256_bytes(
+                        _canonical_json_bytes(sidecar["semantics"])
+                    )
+                    != legacy_reference_record["semantic_sha256"]
+                ):
+                    raise ValueError("legacy semantic hash binding differs")
+                (
+                    final_reservations,
+                    final_history,
+                    final_attempt_receipts,
+                ) = self._verified_attempt_bundle(query, attempts_fd)
+                if (
+                    final_reservations != reservations
+                    or final_history != history
+                    or final_attempt_receipts != attempt_receipts
+                ):
+                    raise ValueError(
+                        "attempt namespace or history changed during verified read"
+                    )
+
+            self._verify_query_chain(query, descriptors)
+            if self._validate_registered(query, query_fd) != registration_sha256:
+                raise ValueError("logical query registration changed during read")
+            published = PublishedEvidence(
+                query_id=query_id,
+                success_receipt_path=self.root
+                / "queries"
+                / query.source
+                / query_id
+                / "success.json",
+                raw_sha256=raw_sha256,
+                query_sidecar_sha256=sidecar_sha256,
+                storage_mode=mode,  # type: ignore[arg-type]
+            )
+            return VerifiedEvidenceRead(
+                registered_query=registered_query,
+                published_evidence=published,
+                raw_bytes=raw_bytes,
+                query_sidecar=sidecar,
+                success_receipt=manifest,
+                attempt_receipts=attempt_receipts,
+            )
         finally:
             self._close_fds(descriptors)
 
-        common_keys = {
-            "attempt_history",
-            "attempt_number",
-            "grain",
-            "query_id",
-            "query_path",
-            "query_sha256",
-            "query_sidecar_path",
-            "query_sidecar_sha256",
-            "raw_byte_count",
-            "raw_sha256",
-            "schema_version",
-            "source",
-            "storage_mode",
-        }
-        fetched_keys = common_keys | {"fetched_raw_path"}
-        legacy_keys = common_keys | {
-            "protected_legacy_reference_path",
-            "protected_legacy_reference_sha256",
-        }
-        mode = manifest.get("storage_mode")
-        if mode == "FETCHED_RAW":
-            if set(manifest) != fetched_keys:
-                raise ValueError("fetched success receipt keys differ")
-            attempt_number = manifest.get("attempt_number")
-            if (
-                isinstance(attempt_number, bool)
-                or not isinstance(attempt_number, int)
-                or attempt_number < 1
-            ):
-                raise ValueError("fetched success attempt binding differs")
-        elif mode == "PROTECTED_LEGACY_REFERENCE":
-            if (
-                set(manifest) != legacy_keys
-                or manifest.get("attempt_number") is not None
-            ):
-                raise ValueError("protected success receipt keys differ")
-        else:
-            raise ValueError("success storage_mode differs")
-        if (
-            manifest.get("schema_version") != 1
-            or manifest.get("query_id") != query_id
-            or manifest.get("query_sha256") != registration_sha256
-            or manifest.get("source") != query.source
-            or manifest.get("grain") != query.grain
-            or manifest.get("query_path")
-            != _relative_path(query.source, query_id, "query.json")
-        ):
-            raise ValueError("success query binding differs")
-        raw_sha256 = _validate_sha256(manifest.get("raw_sha256"), "success raw_sha256")
-        raw_byte_count = manifest.get("raw_byte_count")
-        if (
-            isinstance(raw_byte_count, bool)
-            or not isinstance(raw_byte_count, int)
-            or raw_byte_count < 0
-        ):
-            raise ValueError("success raw_byte_count differs")
+    def read_verified_success(self, query: LogicalQuery) -> VerifiedEvidenceRead:
+        verified = self._read_verified_success(query, missing_ok=False)
+        if verified is None:
+            raise RuntimeError("success receipt is missing")
+        return verified
 
-        expected_query_prefix = ("queries", query.source, query_id)
-        legacy_reference_record: dict[str, object] | None = None
-        if mode == "FETCHED_RAW":
-            object_path = manifest["fetched_raw_path"]
-            if object_path != _relative_path(
-                query.source, query_id, "objects", f"{raw_sha256}.raw"
-            ):
-                raise ValueError("fetched raw content-addressed path binding differs")
-            raw = self._read_bound_relative(
-                object_path,  # type: ignore[arg-type]
-                (*expected_query_prefix, "objects"),
-                "fetched raw object",
-            )
-            object_contents = raw
-        else:
-            object_path = manifest["protected_legacy_reference_path"]
-            reference_sha256 = _validate_sha256(
-                manifest.get("protected_legacy_reference_sha256"),
-                "protected reference SHA-256",
-            )
-            if object_path != _relative_path(
-                query.source,
-                query_id,
-                "objects",
-                f"{reference_sha256}.legacy-reference.json",
-            ):
-                raise ValueError(
-                    "protected reference content-addressed path binding differs"
-                )
-            reference_contents = self._read_bound_relative(
-                object_path,  # type: ignore[arg-type]
-                (*expected_query_prefix, "objects"),
-                "protected legacy reference",
-            )
-            object_contents = reference_contents
-            if _sha256_bytes(reference_contents) != reference_sha256:
-                raise ValueError("protected legacy reference hash differs")
-            reference = _json_object(reference_contents, "protected legacy reference")
-            legacy_reference_record, raw = self._validated_legacy_reference(
-                query, reference, None
-            )
-        if len(raw) != raw_byte_count or _sha256_bytes(raw) != raw_sha256:
-            raise ValueError("success raw binding differs")
-
-        sidecar_path = manifest.get("query_sidecar_path")
-        sidecar_sha256 = _validate_sha256(
-            manifest.get("query_sidecar_sha256"), "query sidecar SHA-256"
-        )
-        if sidecar_path != _relative_path(
-            query.source, query_id, "sidecars", f"{sidecar_sha256}.json"
-        ):
-            raise ValueError("query sidecar content-addressed path binding differs")
-        sidecar_contents = self._read_bound_relative(
-            sidecar_path,  # type: ignore[arg-type]
-            (*expected_query_prefix, "sidecars"),
-            "query semantic sidecar",
-        )
-        if _sha256_bytes(sidecar_contents) != sidecar_sha256:
-            raise ValueError("query sidecar hash differs")
-        self._verify_published_content_slots(
-            query,
-            object_name=Path(object_path).name,  # type: ignore[arg-type]
-            object_contents=object_contents,
-            sidecar_name=Path(sidecar_path).name,  # type: ignore[arg-type]
-            sidecar_contents=sidecar_contents,
-        )
-        sidecar = _json_object(sidecar_contents, "query semantic sidecar")
-        if set(sidecar) != {
-            "byte_count",
-            "grain",
-            "parser_version",
-            "query_id",
-            "raw_sha256",
-            "schema_version",
-            "semantics",
-            "source",
-        } or any(
-            (
-                sidecar.get("schema_version") != 1,
-                sidecar.get("query_id") != query_id,
-                sidecar.get("source") != query.source,
-                sidecar.get("grain") != query.grain,
-                sidecar.get("parser_version") != query.parser_version,
-                sidecar.get("raw_sha256") != raw_sha256,
-                sidecar.get("byte_count") != raw_byte_count,
-                not isinstance(sidecar.get("semantics"), dict),
-            )
-        ):
-            raise ValueError("query sidecar binding differs")
-        if (
-            legacy_reference_record is not None
-            and _sha256_bytes(_canonical_json_bytes(sidecar["semantics"]))
-            != legacy_reference_record["semantic_sha256"]
-        ):
-            raise ValueError("legacy semantic hash binding differs")
-
-        history = manifest.get("attempt_history")
-        if not isinstance(history, list):
-            raise ValueError("attempt history must be an array")
-        if mode == "FETCHED_RAW":
-            current_history = self._validated_fetched_success_attempt(
-                query,
-                manifest["attempt_number"],  # type: ignore[arg-type]
-                raw_sha256,
-                raw_byte_count,
-            )
-        else:
-            current_history = self._attempt_history(query)
-        if history != current_history:
-            raise ValueError("success attempt history binding differs")
-        if mode == "FETCHED_RAW" and (
-            not history
-            or history[-1].get("attempt_number") != manifest.get("attempt_number")
-        ):
-            raise ValueError("successful attempt is not the history tail")
-        return PublishedEvidence(
-            query_id=query_id,
-            success_receipt_path=self.root
-            / "queries"
-            / query.source
-            / query_id
-            / "success.json",
-            raw_sha256=raw_sha256,
-            query_sidecar_sha256=sidecar_sha256,
-            storage_mode=mode,  # type: ignore[arg-type]
-        )
+    def verify_success(self, query: LogicalQuery) -> PublishedEvidence:
+        return self.read_verified_success(query).published_evidence
 
 
 __all__ = [
@@ -2000,6 +2374,7 @@ __all__ = [
     "PublishedEvidence",
     "QueryLease",
     "V52EvidenceStore",
+    "VerifiedEvidenceRead",
     "canonical_query_bytes",
     "logical_query_id",
 ]

@@ -376,6 +376,10 @@ class V52QueryPlanTest(unittest.TestCase):
             pitching[0].requested_range["disposition"],
             "PRESEASON_NO_CURRENT_SEASON_PITCHING",
         )
+        self.assertEqual(
+            pitching[0].requested_range["reason"],
+            "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+        )
         self.assertNotIn("startDate", pitching[0].parameters)
 
     def test_all_unplayed_schedule_population_emits_no_d1_query_or_disposition(self):
@@ -756,7 +760,13 @@ class V52QueryPlanTest(unittest.TestCase):
             )
 
     def test_batches_and_published_bytes_are_stable_closed_and_immutable(self):
-        from mlb_backtest.v52_query_plan import build_static_batch, publish_query_batch
+        import mlb_backtest.v52_query_plan as query_plan
+
+        from mlb_backtest.v52_query_plan import (
+            build_static_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
 
         first = build_static_batch(RUN_SPEC, CONTRACT)
         second = build_static_batch(RUN_SPEC, CONTRACT)
@@ -774,9 +784,92 @@ class V52QueryPlanTest(unittest.TestCase):
             )
             self.assertEqual(publish_query_batch(root, first), path)
             self.assertEqual(path.read_bytes(), original)
+            with mock.patch.object(
+                query_plan.os,
+                "listdir",
+                side_effect=AssertionError("batch load must not discover files"),
+            ):
+                self.assertEqual(load_query_batch(root, first.batch_id), first)
             conflicting = dataclasses.replace(first, stage="REMAINING")
             with self.assertRaisesRegex(ValueError, "batch_id"):
                 publish_query_batch(root, conflicting)
+
+    def test_load_query_batch_rejects_id_path_alias_and_canonical_binding_attacks(self):
+        from mlb_backtest.v52_query_plan import (
+            build_static_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+
+        batch = build_static_batch(RUN_SPEC, CONTRACT)
+        for bad_id in (batch.batch_id.upper(), "../" + batch.batch_id, "g" * 64):
+            with self.subTest(bad_id=bad_id), tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(ValueError):
+                    load_query_batch(Path(td).resolve(), bad_id)
+
+        for attack in ("embedded_id", "unknown", "query", "noncanonical"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                path = publish_query_batch(root, batch)
+                record = json.loads(path.read_bytes())
+                if attack == "embedded_id":
+                    record["batch_id"] = "0" * 64
+                    contents = _canonical_json_bytes(record)
+                elif attack == "unknown":
+                    record["unknown"] = True
+                    contents = _canonical_json_bytes(record)
+                elif attack == "query":
+                    record["queries"][0]["parameters"]["sportId"] = 2.0
+                    contents = _canonical_json_bytes(record)
+                else:
+                    contents = json.dumps(record, indent=2).encode() + b"\n"
+                path.write_bytes(contents)
+                with self.assertRaises((ValueError, RuntimeError, TypeError)):
+                    load_query_batch(root, batch.batch_id)
+
+        for attack in ("symlink", "hardlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                path = publish_query_batch(root, batch)
+                contents = path.read_bytes()
+                path.unlink()
+                target = root / "target.json"
+                target.write_bytes(contents)
+                if attack == "symlink":
+                    path.symlink_to(target)
+                else:
+                    os.link(target, path)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    load_query_batch(root, batch.batch_id)
+
+    def test_load_query_batch_rejects_ancestor_replacement_during_read(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            query_plan.publish_query_batch(root, batch)
+            original_read = query_plan._read_linked_regular
+            replaced = False
+
+            def replace_ancestor(*args: object, **kwargs: object):
+                nonlocal replaced
+                result = original_read(*args, **kwargs)  # type: ignore[arg-type]
+                if not replaced:
+                    replaced = True
+                    (root / "audit").rename(root / "detached-audit")
+                    (root / "audit").mkdir()
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_read_linked_regular",
+                    side_effect=replace_ancestor,
+                ),
+                self.assertRaisesRegex(ValueError, "identity|changed|ancestor"),
+            ):
+                query_plan.load_query_batch(root, batch.batch_id)
 
     def test_publish_rejects_symlink_ancestors_and_hardlinked_existing_file(self):
         from mlb_backtest.v52_query_plan import build_static_batch, publish_query_batch

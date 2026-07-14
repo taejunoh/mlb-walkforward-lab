@@ -44,6 +44,11 @@ _ACQUISITION_SCHEMA_RELATIVE = Path(
 _ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/query_batches"
 )
+_PRESEASON_DISPOSITION_REASON = (
+    "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+)
+
+
 @dataclass(frozen=True)
 class QueryBatch:
     batch_id: str
@@ -647,6 +652,7 @@ def build_schedule_reference_batch(
                 "consumer_cutoff_dates": consumer_cutoffs,
                 "consuming_game_pks": consumers,
                 "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                "reason": _PRESEASON_DISPOSITION_REASON,
             }
         else:
             endpoint = _STATS_ENDPOINT
@@ -1197,6 +1203,127 @@ def _read_linked_regular(
         return b"".join(chunks), after
     finally:
         os.close(descriptor)
+
+
+def _open_existing_directory(parent_fd: int, name: str) -> int:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(
+            "query batch ancestors must be existing no-follow directories"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("query batch ancestor identity differs")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_opened_batch_chain(root: Path, descriptors: Sequence[int]) -> None:
+    expected_components = _ACQUISITION_BATCH_ROOT.parts
+    if len(descriptors) != len(expected_components) + 1:
+        raise ValueError("query batch ancestor chain differs")
+    fresh_root = _open_root(root)
+    try:
+        opened_root = os.fstat(descriptors[0])
+        rebound_root = os.fstat(fresh_root)
+        if (opened_root.st_dev, opened_root.st_ino) != (
+            rebound_root.st_dev,
+            rebound_root.st_ino,
+        ):
+            raise ValueError("query batch root identity changed")
+    finally:
+        os.close(fresh_root)
+    for index, component in enumerate(expected_components):
+        try:
+            opened = os.fstat(descriptors[index + 1])
+            linked = os.stat(
+                component,
+                dir_fd=descriptors[index],
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("query batch ancestor identity changed") from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("query batch ancestor identity changed")
+
+
+def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
+    root = Path(root)
+    requested_id = _validate_sha256(batch_id, "batch_id")
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in _ACQUISITION_BATCH_ROOT.parts:
+            current = _open_existing_directory(current, component)
+            descriptors.append(current)
+        loaded = _read_linked_regular(
+            current, f"{requested_id}.json", "query batch"
+        )
+        if loaded is None:
+            raise ValueError("query batch is missing")
+        contents, metadata = loaded
+        if metadata.st_nlink != 1:
+            raise ValueError("query batch must be an unaliased regular file")
+        record = _parse_json_object(contents, "query batch", canonical=True)
+        if set(record) != {
+            "batch_id",
+            "derived_from_sha256",
+            "queries",
+            "schema_version",
+            "stage",
+        }:
+            raise ValueError("query batch keys differ")
+        if record.get("schema_version") != 1:
+            raise ValueError("query batch schema version differs")
+        embedded_id = _validate_sha256(record.get("batch_id"), "embedded batch_id")
+        if embedded_id != requested_id:
+            raise ValueError("query batch requested and embedded IDs differ")
+        raw_queries = record.get("queries")
+        if not isinstance(raw_queries, list):
+            raise ValueError("query batch queries must be an array")
+        queries = []
+        for raw in raw_queries:
+            if not isinstance(raw, dict):
+                raise ValueError("query batch query must be an object")
+            try:
+                query = LogicalQuery(**raw)
+            except TypeError as exc:
+                raise ValueError("query batch query keys differ") from exc
+            if _query_record(query) != raw:
+                raise ValueError("query batch query record differs")
+            queries.append(query)
+        batch = _make_batch(
+            record.get("stage"),  # type: ignore[arg-type]
+            record.get("derived_from_sha256"),  # type: ignore[arg-type]
+            queries,
+        )
+        expected = {
+            "batch_id": batch.batch_id,
+            "derived_from_sha256": batch.derived_from_sha256,
+            "queries": [_query_record(query) for query in batch.queries],
+            "schema_version": 1,
+            "stage": batch.stage,
+        }
+        if batch.batch_id != requested_id or record != expected:
+            raise ValueError("query batch canonical ID binding differs")
+        _verify_opened_batch_chain(root, descriptors)
+        return batch
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _reconcile_batch_final(

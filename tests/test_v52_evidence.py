@@ -30,6 +30,9 @@ from mlb_backtest.v52_protected_inventory import build_protected_raw_inventory
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_SCHEMA = ROOT / "schemas/v5_2_evidence_manifest.schema.json"
 SIDECAR_SCHEMA = ROOT / "schemas/v5_2_query_sidecar.schema.json"
+DERIVED_SIDECAR_SCHEMA = (
+    ROOT / "schemas/v5_2_derived_disposition_sidecar.schema.json"
+)
 
 
 def _query(**changes: object) -> LogicalQuery:
@@ -84,6 +87,41 @@ def _sidecar() -> dict[str, object]:
         },
         "game_pks": [1, 2],
         "status": "READY",
+    }
+
+
+def _derived_query(**changes: object) -> LogicalQuery:
+    values: dict[str, object] = {
+        "source": "mlb_stats_pitching",
+        "grain": "season_d1_league_pitching_reference",
+        "endpoint": "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING",
+        "parameters": {},
+        "requested_range": {
+            "as_of_date": "2024-03-19",
+            "consumer_cutoff_dates": {"9001": "2024-03-19"},
+            "consuming_game_pks": [9001],
+            "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+            "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+            "season": 2024,
+        },
+        "expected_media_type": "application/json",
+        "parser_version": "v5.2.1",
+        "parent_query_id": None,
+        "run_spec_sha256": "a" * 64,
+        "acquisition_contract_sha256": "b" * 64,
+    }
+    values.update(changes)
+    return LogicalQuery(**values)  # type: ignore[arg-type]
+
+
+def _derived_semantics() -> dict[str, object]:
+    return {
+        "as_of_date": "2024-03-19",
+        "consumer_cutoff_dates": {"9001": "2024-03-19"},
+        "consuming_game_pks": [9001],
+        "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+        "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+        "season": 2024,
     }
 
 
@@ -163,6 +201,8 @@ class V52EvidenceTest(unittest.TestCase):
         self.assertEqual(annotation, "ContextManager[QueryLease]")
 
     def test_public_records_are_frozen_with_exact_fields(self) -> None:
+        from mlb_backtest.v52_evidence import VerifiedEvidenceRead
+
         expected = {
             LogicalQuery: (
                 "source",
@@ -192,6 +232,14 @@ class V52EvidenceTest(unittest.TestCase):
                 "query_sidecar_sha256",
                 "storage_mode",
             ),
+            VerifiedEvidenceRead: (
+                "registered_query",
+                "published_evidence",
+                "raw_bytes",
+                "query_sidecar",
+                "success_receipt",
+                "attempt_receipts",
+            ),
         }
         for record, fields in expected.items():
             with self.subTest(record=record.__name__):
@@ -199,6 +247,263 @@ class V52EvidenceTest(unittest.TestCase):
                     tuple(field.name for field in dataclasses.fields(record)), fields
                 )
                 self.assertTrue(record.__dataclass_params__.frozen)
+
+    def test_verified_read_returns_one_fully_bound_fetched_and_legacy_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            capture = _capture(b'{"dates":[{"date":"2022-04-07"}]}')
+            with store.acquire_query(query) as lease:
+                failed_number = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    failed_number,
+                    _capture(None, status=None, error="TIMEOUT"),
+                    outcome="TRANSIENT_NETWORK",
+                )
+                published = store.publish_fetched(
+                    query, store.next_attempt_number(lease), capture, _sidecar()
+                )
+            verified = store.read_verified_success(query)
+            self.assertEqual(verified.registered_query, query)
+            self.assertEqual(verified.published_evidence, published)
+            self.assertEqual(verified.raw_bytes, capture.body)
+            self.assertEqual(verified.query_sidecar["semantics"], _sidecar())
+            self.assertEqual(verified.success_receipt["storage_mode"], "FETCHED_RAW")
+            self.assertEqual(
+                [record["attempt_number"] for record in verified.attempt_receipts],
+                [1, 2],
+            )
+            self.assertEqual(
+                [record["outcome"] for record in verified.attempt_receipts],
+                ["TRANSIENT_NETWORK", "SUCCESS"],
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            with store.acquire_query(query):
+                published = store.publish_legacy_reference(
+                    query, reference, _sidecar()
+                )
+            verified = store.read_verified_success(query)
+            self.assertEqual(verified.published_evidence, published)
+            self.assertEqual(verified.raw_bytes, b"legacy-one\nlegacy-two\n")
+            self.assertEqual(verified.attempt_receipts, ())
+
+    def test_load_success_uses_one_verified_tree_open_without_preflight_reopen(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                published = store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            original = store._query_fds
+            calls = 0
+
+            def count_opens(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(store, "_query_fds", side_effect=count_opens):
+                self.assertEqual(store.load_success(query), published)
+            self.assertEqual(calls, 1)
+
+    def test_verified_read_rejects_attempt_tail_added_after_initial_enumeration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            query_id = logical_query_id(query)
+            attempts = root / "queries" / query.source / query_id / "attempts"
+            original = store._verified_attempt_bundle
+            injected = False
+
+            def inject_tail(*args: object, **kwargs: object):
+                nonlocal injected
+                result = original(*args, **kwargs)  # type: ignore[arg-type]
+                if not injected:
+                    injected = True
+                    number = 2
+                    reservation = {
+                        "attempt_number": number,
+                        "query_id": query_id,
+                        "schema_version": 1,
+                    }
+                    receipt = v52_evidence._attempt_record(
+                        query_id,
+                        number,
+                        _capture(None, status=None, error="TIMEOUT"),
+                        "TRANSIENT_NETWORK",
+                    )
+                    (attempts / "000002.reservation.json").write_bytes(
+                        _canonical_file(reservation)
+                    )
+                    (attempts / "000002.json").write_bytes(
+                        _canonical_file(receipt)
+                    )
+                return result
+
+            with (
+                patch.object(
+                    store,
+                    "_verified_attempt_bundle",
+                    side_effect=inject_tail,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "attempt|history|changed|tail"
+                ),
+            ):
+                store.read_verified_success(query)
+
+    def test_derived_disposition_has_no_raw_or_attempt_and_is_retry_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _derived_query()
+            with self.assertRaisesRegex(RuntimeError, "interruption"):
+                with store.acquire_query(query):
+                    with patch(
+                        "mlb_backtest.v52_evidence._before_success_publish",
+                        side_effect=RuntimeError("derived interruption"),
+                    ):
+                        store.publish_derived_disposition(
+                            query, _derived_semantics()
+                        )
+            folder = root / "queries" / query.source / logical_query_id(query)
+            self.assertFalse((folder / "success.json").exists())
+            self.assertEqual(list((folder / "objects").iterdir()), [])
+            self.assertEqual(list((folder / "attempts").iterdir()), [])
+            self.assertEqual(len(list((folder / "sidecars").iterdir())), 1)
+            with store.acquire_query(query):
+                published = store.publish_derived_disposition(
+                    query, _derived_semantics()
+                )
+            self.assertEqual(published.storage_mode, "DERIVED_DISPOSITION")
+            self.assertIsNone(published.raw_sha256)
+            verified = store.read_verified_success(query)
+            self.assertIsNone(verified.raw_bytes)
+            self.assertEqual(verified.attempt_receipts, ())
+            self.assertEqual(verified.success_receipt["attempt_history"], [])
+            self.assertIsNone(verified.success_receipt["attempt_number"])
+            self.assertNotIn("raw_sha256", verified.success_receipt)
+            self.assertNotIn("raw_byte_count", verified.success_receipt)
+            manifest_schema = json.loads(MANIFEST_SCHEMA.read_bytes())
+            derived_schema = json.loads(DERIVED_SIDECAR_SCHEMA.read_bytes())
+            jsonschema.Draft202012Validator.check_schema(manifest_schema)
+            jsonschema.Draft202012Validator.check_schema(derived_schema)
+            jsonschema.validate(verified.success_receipt, manifest_schema)
+            jsonschema.validate(verified.query_sidecar, derived_schema)
+
+    def test_derived_disposition_rejects_query_semantic_attempt_and_content_tamper(self):
+        query_mutations = (
+            _derived_query(endpoint="https://statsapi.mlb.com/api/v1/stats"),
+            _derived_query(parameters={"limit": 1}),
+            _derived_query(expected_media_type="text/plain"),
+            _derived_query(
+                requested_range={
+                    **_derived_query().requested_range,
+                    "as_of_date": "2024-03-20",
+                    "consumer_cutoff_dates": {"9001": "2024-03-20"},
+                }
+            ),
+            _derived_query(
+                requested_range={
+                    **_derived_query().requested_range,
+                    "reason": "MADE_UP",
+                }
+            ),
+        )
+        for query in query_mutations:
+            with self.subTest(query=query), tempfile.TemporaryDirectory() as td:
+                store = V52EvidenceStore(_tmp(td) / "raw")
+                with store.acquire_query(query):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        store.publish_derived_disposition(
+                            query, _derived_semantics()
+                        )
+
+        for attack in ("semantics", "attempt", "reservation", "object"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _derived_query()
+                if attack == "semantics":
+                    semantics = {**_derived_semantics(), "reason": "MADE_UP"}
+                    with store.acquire_query(query):
+                        with self.assertRaises((ValueError, RuntimeError)):
+                            store.publish_derived_disposition(query, semantics)
+                    continue
+                if attack == "reservation":
+                    with store.acquire_query(query) as lease:
+                        store.next_attempt_number(lease)
+                        with self.assertRaises((ValueError, RuntimeError)):
+                            store.publish_derived_disposition(
+                                query, _derived_semantics()
+                            )
+                    continue
+                store.register_query(query)
+                folder = root / "queries" / query.source / logical_query_id(query)
+                target = folder / ("attempts" if attack == "attempt" else "objects")
+                (target / "unexpected.json").write_bytes(b"{}\n")
+                with store.acquire_query(query):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        store.publish_derived_disposition(
+                            query, _derived_semantics()
+                        )
+
+        for attack in ("sidecar", "attempt", "object"):
+            with self.subTest(post_publish=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _derived_query()
+                with store.acquire_query(query):
+                    published = store.publish_derived_disposition(
+                        query, _derived_semantics()
+                    )
+                folder = root / "queries" / query.source / logical_query_id(query)
+                success = json.loads(published.success_receipt_path.read_bytes())
+                if attack == "sidecar":
+                    (root / success["query_sidecar_path"]).write_bytes(b"{}\n")
+                else:
+                    target = folder / (
+                        "attempts" if attack == "attempt" else "objects"
+                    )
+                    (target / "unexpected.json").write_bytes(b"{}\n")
+                with self.assertRaises((ValueError, RuntimeError)):
+                    store.read_verified_success(query)
+
+    def test_derived_disposition_requires_exact_frozen_season_start_d1(self):
+        too_early_range = {
+            **_derived_query().requested_range,
+            "as_of_date": "2024-03-18",
+            "consumer_cutoff_dates": {"9001": "2024-03-18"},
+        }
+        too_early_semantics = {
+            **_derived_semantics(),
+            "as_of_date": "2024-03-18",
+            "consumer_cutoff_dates": {"9001": "2024-03-18"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _derived_query(requested_range=too_early_range)
+            with store.acquire_query(query):
+                with self.assertRaisesRegex(ValueError, "D-1|season start|date"):
+                    store.publish_derived_disposition(
+                        query, too_early_semantics
+                    )
 
     def test_canonical_parameter_ordering_and_identity_field_sensitivity(self) -> None:
         first = _query(
@@ -924,6 +1229,29 @@ class V52EvidenceTest(unittest.TestCase):
             sidecar_unknown = {**sidecar, "aggregate_snapshot": {}}
             with self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(sidecar_unknown, sidecar_schema)
+
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            with store.acquire_query(query):
+                published = store.publish_legacy_reference(
+                    query, reference, _sidecar()
+                )
+            jsonschema.validate(
+                json.loads(published.success_receipt_path.read_bytes()),
+                manifest_schema,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _derived_query()
+            with store.acquire_query(query):
+                published = store.publish_derived_disposition(
+                    query, _derived_semantics()
+                )
+            jsonschema.validate(
+                json.loads(published.success_receipt_path.read_bytes()),
+                manifest_schema,
+            )
 
     def test_query_lease_serializes_load_fetch_and_publication(self) -> None:
         with tempfile.TemporaryDirectory() as td:
