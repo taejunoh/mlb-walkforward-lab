@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "candidate": {
+      "additionalProperties": false,
+      "properties": {"path": {"minLength": 1, "type": "string"}, "sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"}},
+      "required": ["path", "sha256"],
+      "type": "object"
+    },
+    "decision": {"enum": ["APPROVED", "REJECTED"]},
+    "occurred_at_utc": {"pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$", "type": "string"},
+    "receipt_kind": {"const": "TIMEZONE_REVIEW"},
+    "reviewed_venue_ids": {"items": {"minimum": 1, "type": "integer"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "reviewer_identity": {"minLength": 1, "type": "string"},
+    "reviewer_role": {"enum": ["TIMEZONE_COVERAGE_REVIEW", "TIMEZONE_SEMANTIC_REVIEW"]},
+    "schema_version": {"const": 1}
+  },
+  "required": ["candidate", "decision", "occurred_at_utc", "receipt_kind", "reviewed_venue_ids", "reviewer_identity", "reviewer_role", "schema_version"],
+  "type": "object"
+}
