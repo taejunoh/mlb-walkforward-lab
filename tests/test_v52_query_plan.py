@@ -201,6 +201,35 @@ class V52QueryPlanTest(unittest.TestCase):
                 list(batches),
             )
 
+    def test_query_batch_construction_rejects_unknown_stage_with_any_population(self):
+        from mlb_backtest.v52_query_plan import _make_batch, build_static_batch
+
+        query = build_static_batch(RUN_SPEC, CONTRACT).queries[0]
+        for queries in ((), (query,)):
+            with self.subTest(query_count=len(queries)), self.assertRaisesRegex(
+                ValueError, "stage"
+            ):
+                _make_batch("TYPO_STAGE", None, queries)
+
+    def test_load_recomputation_rejects_unknown_stage_with_any_population(self):
+        from mlb_backtest.v52_query_plan import build_static_batch, load_query_batch
+
+        query = build_static_batch(RUN_SPEC, CONTRACT).queries[0]
+        for queries in ((), (query,)):
+            with (
+                self.subTest(query_count=len(queries)),
+                tempfile.TemporaryDirectory() as td,
+            ):
+                root = Path(td).resolve()
+                batch_id = _write_forged_canonical_batch(
+                    root,
+                    stage="TYPO_STAGE",
+                    derived_from_sha256=None,
+                    queries=queries,
+                )
+                with self.assertRaisesRegex(ValueError, "stage"):
+                    load_query_batch(root, batch_id)
+
     def test_load_recomputation_rejects_semantically_forged_static_root_batches(self):
         from mlb_backtest.v52_query_plan import build_static_batch, load_query_batch
 

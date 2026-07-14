@@ -136,11 +136,10 @@ def _resolve_candidate(candidate: dict[str, object]):
 def _sealed_candidate_fixture(root: Path, evidence_root: Path):
     from mlb_backtest.v52_evidence import (
         AttemptCapture,
-        LogicalQuery,
         V52EvidenceStore,
     )
     from mlb_backtest.v52_query_plan import (
-        _make_batch,
+        build_schedule_reference_batch,
         build_static_batch,
         publish_query_batch,
     )
@@ -148,25 +147,38 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
     schedule_batch = build_static_batch(RUN_SPEC, CONTRACT)
     schedule_queries = schedule_batch.queries
     schedule = schedule_queries[-1]
-    common = {
-        "expected_media_type": "application/json",
-        "parser_version": "v5.2.1",
-        "parent_query_id": None,
-        "run_spec_sha256": RUN_SHA,
-        "acquisition_contract_sha256": CONTRACT_SHA,
+    anchor_inventory = {
+        "anchors": [
+            {
+                "game_pk": 9001,
+                "official_date": "2024-04-02",
+                "played": True,
+                "season": 2024,
+                "season_start_date": "2024-03-20",
+                "venue_id": 31,
+            },
+            {
+                "game_pk": 9002,
+                "official_date": "2024-04-02",
+                "played": False,
+                "season": 2024,
+                "season_start_date": "2024-03-20",
+                "venue_id": 99,
+            },
+        ]
     }
-    venues = tuple(
-        LogicalQuery(
-            source="venue_team_timezone_table",
-            grain="effective_dated_venue_team_reference",
-            endpoint=f"https://statsapi.mlb.com/api/v1/venues/{venue_id}",
-            parameters={"hydrate": "location"},
-            requested_range={"venue_id": venue_id},
-            **common,
-        )
-        for venue_id in (31, 99)
+    reference_batch = build_schedule_reference_batch(
+        anchor_inventory,
+        run_spec_sha256=RUN_SHA,
+        acquisition_contract_sha256=CONTRACT_SHA,
     )
-    reference_batch = _make_batch("REFERENCE_INPUTS", None, list(venues))
+    venues = tuple(
+        query
+        for query in reference_batch.queries
+        if query.endpoint.startswith("https://statsapi.mlb.com/api/v1/venues/")
+    )
+    if len(venues) != 2:
+        raise AssertionError("production reference fixture must contain two venues")
     publish_query_batch(root, schedule_batch)
     publish_query_batch(root, reference_batch)
     store = V52EvidenceStore(evidence_root)
@@ -874,8 +886,6 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 )
 
     def test_candidate_cli_ignores_non_timezone_queries_in_sealed_batch(self):
-        from mlb_backtest.v52_evidence import LogicalQuery
-        from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
         from mlb_backtest.v52_timezone_review import main
 
         with tempfile.TemporaryDirectory() as directory:
@@ -883,22 +893,25 @@ class V52TimezoneReviewTest(unittest.TestCase):
             evidence_root = root / "evidence"
             evidence_root.mkdir()
             batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
-            unrelated = LogicalQuery(
-                source="mlb_stats_pitching",
-                grain="season_d1_league_pitching_reference",
-                endpoint="https://statsapi.mlb.com/api/v1/stats",
-                parameters={},
-                requested_range={"season": 2024},
-                expected_media_type="application/json",
-                parser_version="v5.2.1",
-                parent_query_id=None,
-                run_spec_sha256=RUN_SHA,
-                acquisition_contract_sha256=CONTRACT_SHA,
+            d1_queries = [
+                query
+                for query in batches[1].queries
+                if query.source == "mlb_stats_pitching"
+            ]
+            self.assertEqual(len(d1_queries), 1)
+            self.assertEqual(
+                d1_queries[0].parameters,
+                {
+                    "stats": "byDateRange",
+                    "group": "pitching",
+                    "sportIds": 1,
+                    "gameType": "R",
+                    "playerPool": "ALL",
+                    "limit": 5000,
+                    "startDate": "2024-03-20",
+                    "endDate": "2024-04-01",
+                },
             )
-            mixed = _make_batch(
-                "REFERENCE_INPUTS", None, [*batches[1].queries, unrelated]
-            )
-            publish_query_batch(root, mixed)
             self.assertEqual(
                 main(
                     [
@@ -910,7 +923,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--batch-id",
                         batches[0].batch_id,
                         "--batch-id",
-                        mixed.batch_id,
+                        batches[1].batch_id,
                         "--output",
                         (AUDIT_NAMESPACE / "mixed.json").as_posix(),
                     ]
@@ -931,7 +944,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            base, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            base, _, venue = _sealed_candidate_fixture(root, evidence_root)
             statcast_root = build_statcast_root_batch(RUN_SPEC, CONTRACT)
             unrelated = bisect_statcast_query(statcast_root.queries[0])[0]
             schedule_batch = base[0]
@@ -965,7 +978,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             duplicate_relevant = _make_batch(
                 "REFERENCE_INPUTS",
                 "1" * 64,
-                [venue_batch.queries[0]],
+                [venue],
             )
             publish_query_batch(root, duplicate_relevant)
             with self.assertRaisesRegex(ValueError, "query.*duplicate|duplicate.*query"):
@@ -995,7 +1008,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            batches, schedule, _ = _sealed_candidate_fixture(root, evidence_root)
+            batches, schedule, venue = _sealed_candidate_fixture(root, evidence_root)
             wrong_stage = _make_batch("REFERENCE_INPUTS", "2" * 64, [schedule])
             publish_query_batch(root, wrong_stage)
             with self.assertRaisesRegex(ValueError, "STATIC_SCHEDULES|stage"):
@@ -1015,9 +1028,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     ]
                 )
 
-            mismatched_venue = replace(
-                batches[1].queries[0], run_spec_sha256="9" * 64
-            )
+            mismatched_venue = replace(venue, run_spec_sha256="9" * 64)
             mixed = _make_batch("REFERENCE_INPUTS", "3" * 64, [mismatched_venue])
             publish_query_batch(root, mixed)
             with self.assertRaisesRegex(ValueError, "binding|run|contract"):

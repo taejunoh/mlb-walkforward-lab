@@ -39,6 +39,15 @@ _PLAN_A_AMENDMENT_RELATIVE = Path(
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
 _PRESEASON_DISPOSITION_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+_ALLOWED_STAGES = frozenset(
+    {
+        "STATIC_SCHEDULES",
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+        "REMAINING",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,24 @@ class QueryBatch:
     stage: str
     derived_from_sha256: str | None
     queries: tuple[LogicalQuery, ...]
+
+
+@dataclass(frozen=True)
+class _StaticSeason:
+    year: int
+    first: date
+    last: date
+
+
+@dataclass(frozen=True)
+class _StaticQueryInputs:
+    seasons: tuple[_StaticSeason, ...]
+    schedule_grain: str
+    schedule_parser_version: str
+    statcast_grain: str
+    statcast_parser_version: str
+    run_spec_sha256: str
+    acquisition_contract_sha256: str
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -196,6 +223,8 @@ def _batch_payload(
 ) -> dict[str, object]:
     if not isinstance(stage, str) or not stage:
         raise ValueError("batch stage must be nonempty text")
+    if stage not in _ALLOWED_STAGES:
+        raise ValueError("batch stage is not an approved acquisition stage")
     if derived_from_sha256 is not None:
         _validate_sha256(derived_from_sha256, "derived_from_sha256")
     if not isinstance(queries, Sequence) or any(
@@ -547,6 +576,15 @@ def _source_contract(contract: Mapping[str, object], name: str) -> dict[str, obj
     return matches[0]
 
 
+def _source_identity_text(
+    source_contract: Mapping[str, object], key: str, label: str
+) -> str:
+    value = source_contract.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"acquisition {label} differs")
+    return value
+
+
 def _statcast_parameters(first: str, last: str) -> dict[str, object]:
     return {
         "all": "true",
@@ -566,14 +604,7 @@ def _statcast_parameters(first: str, last: str) -> dict[str, object]:
 def _validated_static_query_inputs(
     run_spec_path: Path,
     acquisition_contract_path: Path,
-) -> tuple[
-    list[int],
-    dict[int, tuple[date, date]],
-    dict[str, object],
-    dict[str, object],
-    str,
-    str,
-]:
+) -> _StaticQueryInputs:
     run_spec, run_sha, contract, contract_sha = _load_static_contracts(
         run_spec_path, acquisition_contract_path
     )
@@ -607,8 +638,7 @@ def _validated_static_query_inputs(
     if set(by_year) != set(years):
         raise ValueError("season boundary years differ")
 
-    validated_years: list[int] = []
-    validated_boundaries: dict[int, tuple[date, date]] = {}
+    seasons: list[_StaticSeason] = []
     for year in years:
         if isinstance(year, bool) or not isinstance(year, int):
             raise ValueError("season boundary year differs")
@@ -622,15 +652,23 @@ def _validated_static_query_inputs(
             or (first, last) != SEASON_BOUNDARIES[year]
         ):
             raise ValueError("season boundary range differs")
-        validated_years.append(year)
-        validated_boundaries[year] = (first, last)
-    return (
-        validated_years,
-        validated_boundaries,
-        schedule_contract,
-        statcast_contract,
-        run_sha,
-        contract_sha,
+        seasons.append(_StaticSeason(year=year, first=first, last=last))
+    return _StaticQueryInputs(
+        seasons=tuple(seasons),
+        schedule_grain=_source_identity_text(
+            schedule_contract, "grain", "schedule grain"
+        ),
+        schedule_parser_version=_source_identity_text(
+            schedule_contract, "parser_version", "schedule parser version"
+        ),
+        statcast_grain=_source_identity_text(
+            statcast_contract, "grain", "Statcast grain"
+        ),
+        statcast_parser_version=_source_identity_text(
+            statcast_contract, "parser_version", "Statcast parser version"
+        ),
+        run_spec_sha256=run_sha,
+        acquisition_contract_sha256=contract_sha,
     )
 
 
@@ -638,39 +676,31 @@ def build_static_batch(
     run_spec_path: Path,
     acquisition_contract_path: Path,
 ) -> QueryBatch:
-    (
-        years,
-        by_year,
-        schedule_contract,
-        _statcast_contract,
-        run_sha,
-        contract_sha,
-    ) = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+    inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
 
     queries: list[LogicalQuery] = []
-    for year in years:
-        first, last = by_year[year]
+    for season in inputs.seasons:
         queries.append(
             _logical_query(
                 source="mlb_schedule_game_feed",
-                grain=str(schedule_contract["grain"]),
+                grain=inputs.schedule_grain,
                 endpoint=_SCHEDULE_ENDPOINT,
                 parameters={
                     "sportId": 1,
                     "gameType": "R",
-                    "startDate": first.isoformat(),
-                    "endDate": last.isoformat(),
+                    "startDate": season.first.isoformat(),
+                    "endDate": season.last.isoformat(),
                     "hydrate": "probablePitcher,lineups,venue,linescore",
                 },
                 requested_range={
-                    "year": year,
-                    "start_date": first.isoformat(),
-                    "end_date": last.isoformat(),
+                    "year": season.year,
+                    "start_date": season.first.isoformat(),
+                    "end_date": season.last.isoformat(),
                 },
                 expected_media_type="application/json",
-                parser_version=str(schedule_contract["parser_version"]),
-                run_spec_sha256=run_sha,
-                acquisition_contract_sha256=contract_sha,
+                parser_version=inputs.schedule_parser_version,
+                run_spec_sha256=inputs.run_spec_sha256,
+                acquisition_contract_sha256=inputs.acquisition_contract_sha256,
             )
         )
     return _make_batch("STATIC_SCHEDULES", None, queries)
@@ -680,36 +710,28 @@ def build_statcast_root_batch(
     run_spec_path: Path,
     acquisition_contract_path: Path,
 ) -> QueryBatch:
-    (
-        years,
-        by_year,
-        _schedule_contract,
-        statcast_contract,
-        run_sha,
-        contract_sha,
-    ) = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+    inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
 
     queries: list[LogicalQuery] = []
-    for year in years:
-        first, last = by_year[year]
-        for chunk_start, chunk_end in monthly_ranges(first, last):
+    for season in inputs.seasons:
+        for chunk_start, chunk_end in monthly_ranges(season.first, season.last):
             start_text = chunk_start.isoformat()
             end_text = chunk_end.isoformat()
             queries.append(
                 _logical_query(
                     source="baseball_savant_statcast",
-                    grain=str(statcast_contract["grain"]),
+                    grain=inputs.statcast_grain,
                     endpoint=_STATCAST_ENDPOINT,
                     parameters=_statcast_parameters(start_text, end_text),
                     requested_range={
-                        "year": year,
+                        "year": season.year,
                         "start_date": start_text,
                         "end_date": end_text,
                     },
                     expected_media_type="text/csv",
-                    parser_version=str(statcast_contract["parser_version"]),
-                    run_spec_sha256=run_sha,
-                    acquisition_contract_sha256=contract_sha,
+                    parser_version=inputs.statcast_parser_version,
+                    run_spec_sha256=inputs.run_spec_sha256,
+                    acquisition_contract_sha256=inputs.acquisition_contract_sha256,
                 )
             )
     return _make_batch("REMAINING", None, queries)
