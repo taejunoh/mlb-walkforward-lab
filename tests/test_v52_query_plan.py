@@ -125,9 +125,9 @@ class V52QueryPlanTest(unittest.TestCase):
 
         inventory = {
             "anchors": [
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31},
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31},
-                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 8, "official_date": "2024-04-02", "venue_id": 31},
+                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31, "played": True},
+                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 7, "official_date": "2024-04-02", "venue_id": 31, "played": True},
+                {"season": 2024, "season_start_date": "2024-03-20", "game_pk": 8, "official_date": "2024-04-02", "venue_id": 31, "played": False},
             ]
         }
         batch = build_schedule_reference_batch(
@@ -135,7 +135,9 @@ class V52QueryPlanTest(unittest.TestCase):
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         sources = [query.source for query in batch.queries]
-        self.assertEqual(sources.count("mlb_schedule_game_feed"), 2)
+        self.assertEqual(sources.count("mlb_schedule_game_feed"), 1)
+        boxscore = next(q for q in batch.queries if q.source == "mlb_schedule_game_feed")
+        self.assertEqual(boxscore.requested_range["game_pk"], 7)
         self.assertEqual(sources.count("mlb_stats_pitching"), 1)
         pitching = next(q for q in batch.queries if q.source == "mlb_stats_pitching")
         self.assertEqual(pitching.requested_range["consuming_game_pks"], [7, 8])
@@ -160,6 +162,7 @@ class V52QueryPlanTest(unittest.TestCase):
             "game_pk": 7,
             "official_date": "2024-04-02",
             "venue_id": 31,
+            "played": True,
         }
         invalid_inventories = [
             {"anchors": [{**base, "season_start_date": "2024-03-21"}]},
@@ -192,6 +195,7 @@ class V52QueryPlanTest(unittest.TestCase):
             "game_pk": 1,
             "official_date": "2024-03-20",
             "venue_id": 31,
+            "played": True,
         }]}
         batch = build_schedule_reference_batch(
             inventory, run_spec_sha256=RUN_SHA,
@@ -208,6 +212,28 @@ class V52QueryPlanTest(unittest.TestCase):
             "PRESEASON_NO_CURRENT_SEASON_PITCHING",
         )
         self.assertNotIn("startDate", pitching[0].parameters)
+
+    def test_schedule_reference_requires_played_and_rejects_conflicting_duplicate(self):
+        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+
+        base = {
+            "season": 2024,
+            "season_start_date": "2024-03-20",
+            "game_pk": 7,
+            "official_date": "2024-04-02",
+            "venue_id": 31,
+        }
+        invalid_anchors = [
+            [base],
+            [{**base, "played": True}, {**base, "played": False}],
+        ]
+        for anchors in invalid_anchors:
+            with self.subTest(anchors=anchors), self.assertRaises(ValueError):
+                build_schedule_reference_batch(
+                    {"anchors": anchors},
+                    run_spec_sha256=RUN_SHA,
+                    acquisition_contract_sha256=CONTRACT_SHA,
+                )
 
     def test_participant_batch_uses_only_verified_actual_starters_and_deduplicates(self):
         from mlb_backtest.v52_query_plan import build_participant_derived_batch

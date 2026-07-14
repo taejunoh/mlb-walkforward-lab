@@ -315,7 +315,7 @@ def build_schedule_reference_batch(
     if not isinstance(anchors, list):
         raise ValueError("anchor_inventory.anchors must be a list")
 
-    unique_games: dict[int, tuple[int, date, date, int]] = {}
+    unique_games: dict[int, tuple[int, date, date, int, bool]] = {}
     seasons: set[int] = set()
     venues: set[int] = set()
     pitching_consumers: dict[tuple[int, date, date], set[int]] = {}
@@ -325,16 +325,19 @@ def build_schedule_reference_batch(
         season = raw.get("season")
         game_pk = raw.get("game_pk")
         venue_id = raw.get("venue_id")
+        played = raw.get("played")
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (season, game_pk, venue_id)):
             raise ValueError("schedule anchor IDs must be positive integers")
         if season not in range(2018, 2025):
             raise ValueError("schedule anchor season is outside 2018-2024")
+        if type(played) is not bool:
+            raise ValueError("schedule anchor played must be explicitly boolean")
         official = _iso_date(raw.get("official_date"), "anchor official_date")
         season_start = _iso_date(raw.get("season_start_date"), "anchor season_start_date")
         frozen_start, frozen_end = _SEASON_BOUNDARIES[season]
         if season_start != frozen_start or not frozen_start <= official <= frozen_end:
             raise ValueError("schedule anchor dates differ from season")
-        identity = (season, season_start, official, venue_id)
+        identity = (season, season_start, official, venue_id, played)
         if game_pk in unique_games and unique_games[game_pk] != identity:
             raise ValueError("conflicting duplicate schedule game_pk")
         unique_games[game_pk] = identity
@@ -345,7 +348,11 @@ def build_schedule_reference_batch(
         ).add(game_pk)
 
     queries: list[LogicalQuery] = []
-    for game_pk, (season, _season_start, official, _venue_id) in sorted(unique_games.items()):
+    for game_pk, (season, _season_start, official, _venue_id, played) in sorted(
+        unique_games.items()
+    ):
+        if not played:
+            continue
         queries.append(
             _logical_query(
                 source="mlb_schedule_game_feed",
