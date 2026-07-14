@@ -79,6 +79,116 @@ def _query_record(query: LogicalQuery) -> dict[str, object]:
     return record
 
 
+def _validate_shared_query_bindings(
+    queries: Sequence[LogicalQuery], label: str
+) -> None:
+    bindings = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in queries
+    }
+    if len(bindings) != 1:
+        raise ValueError(f"{label} queries must share run/contract bindings")
+    run_spec_sha256, acquisition_contract_sha256 = next(iter(bindings))
+    _validate_sha256(run_spec_sha256, f"{label} run_spec_sha256")
+    _validate_sha256(
+        acquisition_contract_sha256,
+        f"{label} acquisition_contract_sha256",
+    )
+
+
+def _validate_static_schedule_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if derived_from_sha256 is not None:
+        raise ValueError("STATIC_SCHEDULES root cannot be derived")
+    years = list(range(2018, 2025))
+    if len(queries) != len(years):
+        raise ValueError(
+            "STATIC_SCHEDULES stage must contain the seven canonical season roots"
+        )
+    _validate_shared_query_bindings(queries, "STATIC_SCHEDULES")
+    for query, year in zip(queries, years):
+        first, last = SEASON_BOUNDARIES[year]
+        expected_parameters = {
+            "sportId": 1,
+            "gameType": "R",
+            "startDate": first.isoformat(),
+            "endDate": last.isoformat(),
+            "hydrate": "probablePitcher,lineups,venue,linescore",
+        }
+        expected_range = {
+            "year": year,
+            "start_date": first.isoformat(),
+            "end_date": last.isoformat(),
+        }
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or query.endpoint != _SCHEDULE_ENDPOINT
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or query.parent_query_id is not None
+            or dict(query.parameters) != expected_parameters
+            or dict(query.requested_range) != expected_range
+        ):
+            raise ValueError(
+                "STATIC_SCHEDULES queries must be the ordered canonical "
+                "2018-2024 season roots"
+            )
+
+
+def _validate_remaining_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if not queries:
+        raise ValueError("REMAINING stage must contain nonempty Statcast queries")
+    _validate_shared_query_bindings(queries, "REMAINING")
+    ranges = [_canonical_statcast_parent_range(query) for query in queries]
+    if derived_from_sha256 is not None:
+        for query in queries:
+            _validate_sha256(query.parent_query_id, "REMAINING parent_query_id")
+        return
+
+    expected = [
+        (year, first, last)
+        for year in range(2018, 2025)
+        for first, last in monthly_ranges(*SEASON_BOUNDARIES[year])
+    ]
+    if len(queries) != len(expected):
+        raise ValueError(
+            "REMAINING Statcast root must contain all 46 canonical monthly queries"
+        )
+    for query, (first, last), (year, expected_first, expected_last) in zip(
+        queries, ranges, expected
+    ):
+        if (
+            query.parent_query_id is not None
+            or (first, last) != (expected_first, expected_last)
+            or dict(query.requested_range)
+            != {
+                "year": year,
+                "start_date": expected_first.isoformat(),
+                "end_date": expected_last.isoformat(),
+            }
+        ):
+            raise ValueError(
+                "REMAINING Statcast root must be the ordered canonical monthly coverage"
+            )
+
+
+def _validate_stage_batch(
+    stage: str,
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if stage == "STATIC_SCHEDULES":
+        _validate_static_schedule_stage(derived_from_sha256, queries)
+    elif stage == "REMAINING":
+        _validate_remaining_stage(derived_from_sha256, queries)
+
+
 def _batch_payload(
     stage: str,
     derived_from_sha256: str | None,
@@ -96,22 +206,7 @@ def _batch_payload(
     query_ids = [logical_query_id(query) for query in queries]
     if len(query_ids) != len(set(query_ids)):
         raise ValueError("query batch contains duplicate logical queries")
-    sources = {query.source for query in queries}
-    if stage == "STATIC_SCHEDULES" and (
-        len(queries) != 7 or sources != {"mlb_schedule_game_feed"}
-    ):
-        raise ValueError(
-            "STATIC_SCHEDULES stage must contain exactly seven "
-            "mlb_schedule_game_feed queries"
-        )
-    if (
-        stage == "REMAINING"
-        and queries
-        and sources != {"baseball_savant_statcast"}
-    ):
-        raise ValueError(
-            "REMAINING stage must contain only baseball_savant_statcast queries"
-        )
+    _validate_stage_batch(stage, derived_from_sha256, queries)
     return {
         "stage": stage,
         "derived_from_sha256": derived_from_sha256,

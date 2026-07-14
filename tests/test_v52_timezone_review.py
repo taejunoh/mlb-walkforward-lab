@@ -16,6 +16,10 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
+RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
+CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
 CANDIDATE_SCHEMA = ROOT / "schemas/v5_2_timezone_candidate.schema.json"
 MAPPING_SCHEMA = ROOT / "schemas/v5_2_venue_timezones.schema.json"
@@ -129,43 +133,28 @@ def _resolve_candidate(candidate: dict[str, object]):
     return candidate
 
 
-def _complete_static_schedule_queries(schedule):
-    return (
-        schedule,
-        *(
-            replace(
-                schedule,
-                parameters={"fixture": True, "year": year},
-                requested_range={"year": year},
-            )
-            for year in range(2018, 2024)
-        ),
-    )
-
-
 def _sealed_candidate_fixture(root: Path, evidence_root: Path):
     from mlb_backtest.v52_evidence import (
         AttemptCapture,
         LogicalQuery,
         V52EvidenceStore,
     )
-    from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
+    from mlb_backtest.v52_query_plan import (
+        _make_batch,
+        build_static_batch,
+        publish_query_batch,
+    )
 
+    schedule_batch = build_static_batch(RUN_SPEC, CONTRACT)
+    schedule_queries = schedule_batch.queries
+    schedule = schedule_queries[-1]
     common = {
         "expected_media_type": "application/json",
         "parser_version": "v5.2.1",
         "parent_query_id": None,
-        "run_spec_sha256": "a" * 64,
-        "acquisition_contract_sha256": "b" * 64,
+        "run_spec_sha256": RUN_SHA,
+        "acquisition_contract_sha256": CONTRACT_SHA,
     }
-    schedule = LogicalQuery(
-        source="mlb_schedule_game_feed",
-        grain="season_schedule_and_game",
-        endpoint="https://statsapi.mlb.com/api/v1/schedule",
-        parameters={"fixture": True},
-        requested_range={"year": 2024},
-        **common,
-    )
     venues = tuple(
         LogicalQuery(
             source="venue_team_timezone_table",
@@ -177,8 +166,6 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
         )
         for venue_id in (31, 99)
     )
-    schedule_queries = _complete_static_schedule_queries(schedule)
-    schedule_batch = _make_batch("STATIC_SCHEDULES", None, schedule_queries)
     reference_batch = _make_batch("REFERENCE_INPUTS", None, list(venues))
     publish_query_batch(root, schedule_batch)
     publish_query_batch(root, reference_batch)
@@ -197,11 +184,12 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
         row["venue_id"]: row
         for row in _inputs()[1][0]["semantics"]["venues"]
     }
-    evidence = [(schedule, schedule_semantics)]
-    evidence.extend(
+    evidence = [
         (
             query,
-            {
+            schedule_semantics
+            if query is schedule
+            else {
                 "anchors": [
                     {
                         "alternate_site": False,
@@ -216,8 +204,8 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
                 ]
             },
         )
-        for query in schedule_queries[1:]
-    )
+        for query in schedule_queries
+    ]
     evidence.extend(
         (query, {"venues": [venue_records[query.requested_range["venue_id"]]]})
         for query in venues
@@ -820,8 +808,8 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 candidate["query_batch_ids"],
                 sorted(batch.batch_id for batch in batches),
             )
-            self.assertEqual(candidate["run_spec_sha256"], "a" * 64)
-            self.assertEqual(candidate["acquisition_contract_sha256"], "b" * 64)
+            self.assertEqual(candidate["run_spec_sha256"], RUN_SHA)
+            self.assertEqual(candidate["acquisition_contract_sha256"], CONTRACT_SHA)
             with self.assertRaises(FileExistsError):
                 main(
                     [
@@ -904,8 +892,8 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 expected_media_type="application/json",
                 parser_version="v5.2.1",
                 parent_query_id=None,
-                run_spec_sha256="a" * 64,
-                acquisition_contract_sha256="b" * 64,
+                run_spec_sha256=RUN_SHA,
+                acquisition_contract_sha256=CONTRACT_SHA,
             )
             mixed = _make_batch(
                 "REFERENCE_INPUTS", None, [*batches[1].queries, unrelated]
@@ -931,31 +919,25 @@ class V52TimezoneReviewTest(unittest.TestCase):
             )
 
     def test_candidate_cli_ignores_duplicate_unrelated_query_across_batches(self):
-        from mlb_backtest.v52_evidence import LogicalQuery
-        from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
+        from mlb_backtest.v52_query_plan import (
+            _make_batch,
+            bisect_statcast_query,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
         from mlb_backtest.v52_timezone_review import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            base, schedule, _ = _sealed_candidate_fixture(root, evidence_root)
-            unrelated = LogicalQuery(
-                source="baseball_savant_statcast",
-                grain="pitch",
-                endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
-                parameters={},
-                requested_range={"start_date": "2024-04-01", "end_date": "2024-04-02"},
-                expected_media_type="text/csv",
-                parser_version="v5.2.1",
-                parent_query_id=None,
-                run_spec_sha256="a" * 64,
-                acquisition_contract_sha256="b" * 64,
-            )
+            base, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            statcast_root = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            unrelated = bisect_statcast_query(statcast_root.queries[0])[0]
             schedule_batch = base[0]
             venue_batch = base[1]
-            remaining_batch = _make_batch("REMAINING", None, [unrelated])
-            other_remaining_batch = _make_batch("REMAINING", "4" * 64, [unrelated])
+            remaining_batch = _make_batch("REMAINING", "4" * 64, [unrelated])
+            other_remaining_batch = _make_batch("REMAINING", "5" * 64, [unrelated])
             publish_query_batch(root, remaining_batch)
             publish_query_batch(root, other_remaining_batch)
             self.assertEqual(
@@ -981,9 +963,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 0,
             )
             duplicate_relevant = _make_batch(
-                "STATIC_SCHEDULES",
+                "REFERENCE_INPUTS",
                 "1" * 64,
-                _complete_static_schedule_queries(schedule),
+                [venue_batch.queries[0]],
             )
             publish_query_batch(root, duplicate_relevant)
             with self.assertRaisesRegex(ValueError, "query.*duplicate|duplicate.*query"):

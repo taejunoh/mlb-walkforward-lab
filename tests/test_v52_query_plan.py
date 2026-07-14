@@ -39,6 +39,28 @@ def _canonical_json_bytes(value: object) -> bytes:
     )
 
 
+def _write_forged_canonical_batch(
+    root: Path,
+    *,
+    stage: str,
+    derived_from_sha256: str | None,
+    queries: tuple[LogicalQuery, ...],
+) -> str:
+    payload = {
+        "stage": stage,
+        "derived_from_sha256": derived_from_sha256,
+        "queries": [json.loads(canonical_query_bytes(query)) for query in queries],
+    }
+    batch_id = hashlib.sha256(
+        _canonical_json_bytes(payload).removesuffix(b"\n")
+    ).hexdigest()
+    record = {"schema_version": 1, "batch_id": batch_id, **payload}
+    batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / f"{batch_id}.json").write_bytes(_canonical_json_bytes(record))
+    return batch_id
+
+
 def _parent(start: str, end: str) -> LogicalQuery:
     query = LogicalQuery(
         source="baseball_savant_statcast",
@@ -158,7 +180,7 @@ class V52QueryPlanTest(unittest.TestCase):
             reconstructed = LogicalQuery(**json.loads(canonical_query_bytes(query)))
             self.assertEqual(reconstructed, query)
 
-    def test_split_batches_publish_and_load_independently(self):
+    def test_root_batches_publish_and_load_independently(self):
         from mlb_backtest.v52_query_plan import (
             build_statcast_root_batch,
             build_static_batch,
@@ -178,6 +200,144 @@ class V52QueryPlanTest(unittest.TestCase):
                 [load_query_batch(root, batch.batch_id) for batch in batches],
                 list(batches),
             )
+
+    def test_load_recomputation_rejects_semantically_forged_static_root_batches(self):
+        from mlb_backtest.v52_query_plan import build_static_batch, load_query_batch
+
+        batch = build_static_batch(RUN_SPEC, CONTRACT)
+        queries = batch.queries
+        attacks = {
+            "derived": ("c" * 64, queries),
+            "order": (None, (queries[1], queries[0], *queries[2:])),
+            "parent": (
+                None,
+                (dataclasses.replace(queries[0], parent_query_id="d" * 64), *queries[1:]),
+            ),
+            "endpoint": (
+                None,
+                (dataclasses.replace(queries[0], endpoint=queries[0].endpoint + "/x"), *queries[1:]),
+            ),
+            "grain": (
+                None,
+                (dataclasses.replace(queries[0], grain="pitch"), *queries[1:]),
+            ),
+            "media": (
+                None,
+                (dataclasses.replace(queries[0], expected_media_type="text/csv"), *queries[1:]),
+            ),
+            "parser": (
+                None,
+                (dataclasses.replace(queries[0], parser_version="v0"), *queries[1:]),
+            ),
+            "parameters": (
+                None,
+                (dataclasses.replace(queries[0], parameters={**queries[0].parameters, "extra": True}), *queries[1:]),
+            ),
+            "range": (
+                None,
+                (dataclasses.replace(queries[0], requested_range={**queries[0].requested_range, "extra": True}), *queries[1:]),
+            ),
+            "binding": (
+                None,
+                (dataclasses.replace(queries[0], run_spec_sha256="e" * 64), *queries[1:]),
+            ),
+        }
+        for attack, (derived, forged_queries) in attacks.items():
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                batch_id = _write_forged_canonical_batch(
+                    root,
+                    stage="STATIC_SCHEDULES",
+                    derived_from_sha256=derived,
+                    queries=tuple(forged_queries),
+                )
+                with self.assertRaisesRegex(ValueError, "STATIC_SCHEDULES|static"):
+                    load_query_batch(root, batch_id)
+
+    def test_load_recomputation_rejects_semantically_forged_statcast_root_batches(self):
+        from mlb_backtest.v52_query_plan import (
+            build_statcast_root_batch,
+            load_query_batch,
+        )
+
+        queries = build_statcast_root_batch(RUN_SPEC, CONTRACT).queries
+        attacks = {
+            "empty": (),
+            "coverage": queries[:-1],
+            "order": (queries[1], queries[0], *queries[2:]),
+            "parent": (
+                dataclasses.replace(queries[0], parent_query_id="d" * 64),
+                *queries[1:],
+            ),
+            "parameters": (
+                dataclasses.replace(
+                    queries[0], parameters={**queries[0].parameters, "hfGT": "P|"}
+                ),
+                *queries[1:],
+            ),
+            "range": (
+                dataclasses.replace(
+                    queries[0],
+                    requested_range={**queries[0].requested_range, "end_date": "2018-04-01"},
+                    parameters={**queries[0].parameters, "game_date_lt": "2018-04-01"},
+                ),
+                *queries[1:],
+            ),
+            "binding": (
+                dataclasses.replace(queries[0], acquisition_contract_sha256="e" * 64),
+                *queries[1:],
+            ),
+        }
+        for attack, forged_queries in attacks.items():
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                batch_id = _write_forged_canonical_batch(
+                    root,
+                    stage="REMAINING",
+                    derived_from_sha256=None,
+                    queries=tuple(forged_queries),
+                )
+                with self.assertRaisesRegex(ValueError, "REMAINING|Statcast|root"):
+                    load_query_batch(root, batch_id)
+
+    def test_remaining_derived_batches_require_valid_parented_statcast_queries(self):
+        from mlb_backtest.v52_query_plan import (
+            _make_batch,
+            bisect_statcast_query,
+            build_statcast_root_batch,
+            load_query_batch,
+        )
+
+        root_query = build_statcast_root_batch(RUN_SPEC, CONTRACT).queries[0]
+        left, right = bisect_statcast_query(root_query)
+        left_left, left_right = bisect_statcast_query(left)
+        valid = _make_batch("REMAINING", "c" * 64, [left_left, left_right, right])
+        self.assertTrue(all(query.parent_query_id is not None for query in valid.queries))
+
+        attacks = {
+            "empty": (),
+            "missing_parent": (root_query,),
+            "parameters": (
+                dataclasses.replace(
+                    left, parameters={**left.parameters, "hfGT": "P|"}
+                ),
+            ),
+            "binding": (
+                left,
+                dataclasses.replace(right, run_spec_sha256="e" * 64),
+            ),
+        }
+        for attack, forged_queries in attacks.items():
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                batch_id = _write_forged_canonical_batch(
+                    root,
+                    stage="REMAINING",
+                    derived_from_sha256="f" * 64,
+                    queries=tuple(forged_queries),
+                )
+                with self.assertRaisesRegex(ValueError, "REMAINING|Statcast|parent"):
+                    load_query_batch(root, batch_id)
 
     def test_load_recomputation_rejects_static_remaining_source_mixing(self):
         from mlb_backtest.v52_query_plan import (
@@ -211,7 +371,9 @@ class V52QueryPlanTest(unittest.TestCase):
                 (batch_dir / f"{batch_id}.json").write_bytes(
                     _canonical_json_bytes(record)
                 )
-                with self.assertRaisesRegex(ValueError, "stage|source|STATIC_SCHEDULES"):
+                with self.assertRaisesRegex(
+                    ValueError, "stage|source|STATIC_SCHEDULES|Statcast"
+                ):
                     load_query_batch(root, batch_id)
 
     def test_static_batch_rehashes_the_bound_plan_a_amendment(self):
@@ -1096,7 +1258,7 @@ class V52QueryPlanTest(unittest.TestCase):
             ):
                 self.assertEqual(load_query_batch(root, first.batch_id), first)
             conflicting = dataclasses.replace(first, stage="REMAINING")
-            with self.assertRaisesRegex(ValueError, "REMAINING stage"):
+            with self.assertRaisesRegex(ValueError, "REMAINING|Statcast"):
                 publish_query_batch(root, conflicting)
 
     def test_load_query_batch_rejects_id_path_alias_and_canonical_binding_attacks(self):
