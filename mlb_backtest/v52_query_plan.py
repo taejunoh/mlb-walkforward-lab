@@ -96,6 +96,22 @@ def _batch_payload(
     query_ids = [logical_query_id(query) for query in queries]
     if len(query_ids) != len(set(query_ids)):
         raise ValueError("query batch contains duplicate logical queries")
+    sources = {query.source for query in queries}
+    if stage == "STATIC_SCHEDULES" and (
+        len(queries) != 7 or sources != {"mlb_schedule_game_feed"}
+    ):
+        raise ValueError(
+            "STATIC_SCHEDULES stage must contain exactly seven "
+            "mlb_schedule_game_feed queries"
+        )
+    if (
+        stage == "REMAINING"
+        and queries
+        and sources != {"baseball_savant_statcast"}
+    ):
+        raise ValueError(
+            "REMAINING stage must contain only baseball_savant_statcast queries"
+        )
     return {
         "stage": stage,
         "derived_from_sha256": derived_from_sha256,
@@ -452,10 +468,17 @@ def _statcast_parameters(first: str, last: str) -> dict[str, object]:
     }
 
 
-def build_static_batch(
+def _validated_static_query_inputs(
     run_spec_path: Path,
     acquisition_contract_path: Path,
-) -> QueryBatch:
+) -> tuple[
+    list[int],
+    dict[int, tuple[date, date]],
+    dict[str, object],
+    dict[str, object],
+    str,
+    str,
+]:
     run_spec, run_sha, contract, contract_sha = _load_static_contracts(
         run_spec_path, acquisition_contract_path
     )
@@ -489,8 +512,11 @@ def build_static_batch(
     if set(by_year) != set(years):
         raise ValueError("season boundary years differ")
 
-    queries: list[LogicalQuery] = []
+    validated_years: list[int] = []
+    validated_boundaries: dict[int, tuple[date, date]] = {}
     for year in years:
+        if isinstance(year, bool) or not isinstance(year, int):
+            raise ValueError("season boundary year differs")
         boundary = by_year[year]
         first = _iso_date(boundary.get("start_date"), "season start")
         last = _iso_date(boundary.get("end_date"), "season end")
@@ -501,6 +527,34 @@ def build_static_batch(
             or (first, last) != SEASON_BOUNDARIES[year]
         ):
             raise ValueError("season boundary range differs")
+        validated_years.append(year)
+        validated_boundaries[year] = (first, last)
+    return (
+        validated_years,
+        validated_boundaries,
+        schedule_contract,
+        statcast_contract,
+        run_sha,
+        contract_sha,
+    )
+
+
+def build_static_batch(
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    (
+        years,
+        by_year,
+        schedule_contract,
+        _statcast_contract,
+        run_sha,
+        contract_sha,
+    ) = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+
+    queries: list[LogicalQuery] = []
+    for year in years:
+        first, last = by_year[year]
         queries.append(
             _logical_query(
                 source="mlb_schedule_game_feed",
@@ -524,6 +578,25 @@ def build_static_batch(
                 acquisition_contract_sha256=contract_sha,
             )
         )
+    return _make_batch("STATIC_SCHEDULES", None, queries)
+
+
+def build_statcast_root_batch(
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    (
+        years,
+        by_year,
+        _schedule_contract,
+        statcast_contract,
+        run_sha,
+        contract_sha,
+    ) = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+
+    queries: list[LogicalQuery] = []
+    for year in years:
+        first, last = by_year[year]
         for chunk_start, chunk_end in monthly_ranges(first, last):
             start_text = chunk_start.isoformat()
             end_text = chunk_end.isoformat()
@@ -544,7 +617,7 @@ def build_static_batch(
                     acquisition_contract_sha256=contract_sha,
                 )
             )
-    return _make_batch("STATIC_SCHEDULES", None, queries)
+    return _make_batch("REMAINING", None, queries)
 
 
 def _canonical_mapping_sha256(value: Mapping[str, object], label: str) -> str:

@@ -90,6 +90,11 @@ class V52QueryPlanTest(unittest.TestCase):
         from mlb_backtest.v52_query_plan import build_static_batch
 
         batch = build_static_batch(RUN_SPEC, CONTRACT)
+        self.assertEqual(len(batch.queries), 7)
+        self.assertEqual(
+            {query.source for query in batch.queries},
+            {"mlb_schedule_game_feed"},
+        )
         years = {
             int(str(query.requested_range["start_date"])[:4]) for query in batch.queries
         }
@@ -99,28 +104,115 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         self.assertEqual(batch.stage, "STATIC_SCHEDULES")
 
-    def test_static_batch_uses_only_official_endpoints_and_monthly_statcast_parents(
-        self,
-    ):
-        from mlb_backtest.v52_query_plan import build_static_batch
+    def test_statcast_root_batch_uses_monthly_official_parents_only(self):
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch
 
-        batch = build_static_batch(RUN_SPEC, CONTRACT)
-        endpoints = {query.endpoint for query in batch.queries}
+        batch = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        self.assertEqual(batch.stage, "REMAINING")
+        self.assertIsNone(batch.derived_from_sha256)
+        self.assertEqual(len(batch.queries), 46)
         self.assertEqual(
-            endpoints,
-            {
-                "https://statsapi.mlb.com/api/v1/schedule",
-                "https://baseballsavant.mlb.com/statcast_search/csv",
-            },
+            {query.source for query in batch.queries},
+            {"baseball_savant_statcast"},
         )
-        statcast = [q for q in batch.queries if q.source == "baseball_savant_statcast"]
-        self.assertTrue(statcast)
-        for query in statcast:
+        self.assertEqual(
+            {query.endpoint for query in batch.queries},
+            {"https://baseballsavant.mlb.com/statcast_search/csv"},
+        )
+        for query in batch.queries:
             first = date.fromisoformat(str(query.requested_range["start_date"]))
             last = date.fromisoformat(str(query.requested_range["end_date"]))
             self.assertEqual(first.month, last.month)
             self.assertIsNone(query.parent_query_id)
             self.assertEqual(query.parameters["hfGT"], "R|")
+
+    def test_static_and_statcast_root_batches_are_a_lossless_deterministic_split(self):
+        from mlb_backtest.v52_query_plan import (
+            build_statcast_root_batch,
+            build_static_batch,
+        )
+
+        static = build_static_batch(RUN_SPEC, CONTRACT)
+        statcast = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        self.assertNotEqual(static.batch_id, statcast.batch_id)
+        self.assertEqual(static, build_static_batch(RUN_SPEC, CONTRACT))
+        self.assertEqual(statcast, build_statcast_root_batch(RUN_SPEC, CONTRACT))
+        self.assertEqual(static.stage, "STATIC_SCHEDULES")
+        self.assertEqual(statcast.stage, "REMAINING")
+
+        static_ids = {logical_query_id(query) for query in static.queries}
+        statcast_ids = {logical_query_id(query) for query in statcast.queries}
+        self.assertTrue(static_ids.isdisjoint(statcast_ids))
+        combined_ids = sorted(static_ids | statcast_ids)
+        self.assertEqual(len(combined_ids), 53)
+        population_digest = hashlib.sha256(
+            ("\n".join(combined_ids) + "\n").encode()
+        ).hexdigest()
+        self.assertEqual(
+            population_digest,
+            "1b1564e1fea24924d1a434443f97f19cfbee3452d5ec1b5b1b397c63fb775b4d",
+        )
+        for query in (*static.queries, *statcast.queries):
+            self.assertEqual(query.run_spec_sha256, RUN_SHA)
+            self.assertEqual(query.acquisition_contract_sha256, CONTRACT_SHA)
+            reconstructed = LogicalQuery(**json.loads(canonical_query_bytes(query)))
+            self.assertEqual(reconstructed, query)
+
+    def test_split_batches_publish_and_load_independently(self):
+        from mlb_backtest.v52_query_plan import (
+            build_statcast_root_batch,
+            build_static_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+
+        batches = (
+            build_static_batch(RUN_SPEC, CONTRACT),
+            build_statcast_root_batch(RUN_SPEC, CONTRACT),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            paths = [publish_query_batch(root, batch) for batch in batches]
+            self.assertEqual(len(set(paths)), 2)
+            self.assertEqual(
+                [load_query_batch(root, batch.batch_id) for batch in batches],
+                list(batches),
+            )
+
+    def test_load_recomputation_rejects_static_remaining_source_mixing(self):
+        from mlb_backtest.v52_query_plan import (
+            build_statcast_root_batch,
+            build_static_batch,
+            load_query_batch,
+        )
+
+        static = build_static_batch(RUN_SPEC, CONTRACT)
+        statcast = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        attacks = (
+            ("REMAINING", static.queries),
+            ("STATIC_SCHEDULES", (*static.queries[:-1], statcast.queries[0])),
+        )
+        for stage, queries in attacks:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as td:
+                payload = {
+                    "stage": stage,
+                    "derived_from_sha256": None,
+                    "queries": [json.loads(canonical_query_bytes(q)) for q in queries],
+                }
+                batch_id = hashlib.sha256(
+                    _canonical_json_bytes(payload).removesuffix(b"\n")
+                ).hexdigest()
+                record = {"schema_version": 1, "batch_id": batch_id, **payload}
+                root = Path(td).resolve()
+                batch_dir = (
+                    root / "audit/v5_2_qd/historical/acquisition/query_batches"
+                )
+                batch_dir.mkdir(parents=True)
+                (batch_dir / f"{batch_id}.json").write_bytes(
+                    _canonical_json_bytes(record)
+                )
+                with self.assertRaisesRegex(ValueError, "stage|source|STATIC_SCHEDULES"):
+                    load_query_batch(root, batch_id)
 
     def test_static_batch_rehashes_the_bound_plan_a_amendment(self):
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -1004,7 +1096,7 @@ class V52QueryPlanTest(unittest.TestCase):
             ):
                 self.assertEqual(load_query_batch(root, first.batch_id), first)
             conflicting = dataclasses.replace(first, stage="REMAINING")
-            with self.assertRaisesRegex(ValueError, "batch_id"):
+            with self.assertRaisesRegex(ValueError, "REMAINING stage"):
                 publish_query_batch(root, conflicting)
 
     def test_load_query_batch_rejects_id_path_alias_and_canonical_binding_attacks(self):
