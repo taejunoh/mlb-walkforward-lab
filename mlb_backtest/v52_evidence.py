@@ -133,6 +133,14 @@ class _RegularSnapshot:
 
 
 @dataclass(frozen=True)
+class _RepositoryFileSnapshot:
+    label: str
+    relative_path: str
+    ancestor_identities: tuple[tuple[int, int], ...]
+    file: _RegularSnapshot
+
+
+@dataclass(frozen=True)
 class QueryLease:
     query_id: str
     source: str
@@ -1710,26 +1718,63 @@ class V52EvidenceStore:
             raise ValueError(f"{label} path is invalid")
         return Path(value)
 
-    def _read_repository_relative(
+    def _read_repository_snapshot(
         self, repository: Path, value: object, label: str
-    ) -> bytes:
+    ) -> _RepositoryFileSnapshot:
         relative = self._validated_relative_path(value, label)
-        root_fd = _open_root_path(repository, create=False)
-        descriptors = [root_fd]
+        if not repository.is_absolute():
+            raise ValueError("protected legacy repository must be absolute")
+        descriptors = [os.open(os.sep, _directory_flags())]
+        ancestor_identities: list[tuple[int, int]] = []
         try:
-            for component in relative.parts[:-1]:
+            root_metadata = os.fstat(descriptors[0])
+            ancestor_identities.append(
+                (root_metadata.st_dev, root_metadata.st_ino)
+            )
+            for component in (*repository.parts[1:], *relative.parts[:-1]):
                 child = _open_directory_at(descriptors[-1], component, create=False)
                 descriptors.append(child)
-            return _read_regular_at(descriptors[-1], relative.name, label)
+                metadata = os.fstat(child)
+                ancestor_identities.append((metadata.st_dev, metadata.st_ino))
+            file_snapshot = _read_regular_snapshot_at(
+                descriptors[-1], relative.name, label
+            )
+            if file_snapshot is None:
+                raise RuntimeError(f"{label} is missing")
+            return _RepositoryFileSnapshot(
+                label=label,
+                relative_path=relative.as_posix(),
+                ancestor_identities=tuple(ancestor_identities),
+                file=file_snapshot,
+            )
         finally:
             self._close_fds(descriptors)
+
+    def _rebind_legacy_lineage(
+        self, expected: tuple[_RepositoryFileSnapshot, ...]
+    ) -> None:
+        repository = self._legacy_repository_root()
+        for snapshot in expected:
+            current = self._read_repository_snapshot(
+                repository,
+                snapshot.relative_path,
+                snapshot.label,
+            )
+            if current != snapshot:
+                raise ValueError(
+                    f"{snapshot.label} lineage identity or bytes changed"
+                )
 
     def _validated_legacy_reference(
         self,
         query: LogicalQuery,
         legacy_reference: Mapping[str, object],
         semantics: Mapping[str, object] | None,
-    ) -> tuple[dict[str, object], bytes]:
+    ) -> tuple[
+        dict[str, object],
+        bytes,
+        tuple[_RepositoryFileSnapshot, ...],
+    ]:
         reference = _normalized_json_object(legacy_reference, "legacy_reference")
         if set(reference) != _LEGACY_REFERENCE_KEYS:
             raise ValueError("legacy reference lineage keys differ")
@@ -1743,11 +1788,12 @@ class V52EvidenceStore:
             reference["protected_inventory_sha256"],
             "protected_inventory_sha256",
         )
-        inventory_bytes = self._read_repository_relative(
+        inventory_snapshot = self._read_repository_snapshot(
             repository,
             reference["protected_inventory_path"],
             "protected raw inventory",
         )
+        inventory_bytes = inventory_snapshot.file.contents
         if _sha256_bytes(inventory_bytes) != inventory_sha256:
             raise ValueError("protected inventory lineage hash differs")
         inventory = verify_protected_raw_inventory(
@@ -1755,12 +1801,12 @@ class V52EvidenceStore:
             repository / _PROTECTED_INVENTORY_RELATIVE,
         )
         if (
-            self._read_repository_relative(
+            self._read_repository_snapshot(
                 repository,
                 reference["protected_inventory_path"],
                 "protected raw inventory",
             )
-            != inventory_bytes
+            != inventory_snapshot
         ):
             raise ValueError("protected inventory changed during verification")
         if (
@@ -1804,21 +1850,24 @@ class V52EvidenceStore:
         ]
         if len(matches) != 1:
             raise ValueError("legacy reference is not an exact Task0 inventory record")
-        manifest_bytes = self._read_repository_relative(
+        manifest_snapshot = self._read_repository_snapshot(
             repository,
             reference["legacy_manifest_path"],
             "protected legacy manifest",
         )
-        seal_bytes = self._read_repository_relative(
+        seal_snapshot = self._read_repository_snapshot(
             repository,
             reference["legacy_seal_path"],
             "protected legacy seal",
         )
-        payload = self._read_repository_relative(
+        payload_snapshot = self._read_repository_snapshot(
             repository,
             reference["payload_path"],
             "protected legacy payload",
         )
+        manifest_bytes = manifest_snapshot.file.contents
+        seal_bytes = seal_snapshot.file.contents
+        payload = payload_snapshot.file.contents
         if _sha256_bytes(manifest_bytes) != reference["legacy_manifest_sha256"]:
             raise ValueError("protected legacy manifest hash differs")
         if _sha256_bytes(seal_bytes) != reference["legacy_seal_sha256"]:
@@ -1848,7 +1897,12 @@ class V52EvidenceStore:
                 != reference["semantic_sha256"]
             ):
                 raise ValueError("legacy semantic hash binding differs")
-        return reference, payload
+        return reference, payload, (
+            inventory_snapshot,
+            manifest_snapshot,
+            seal_snapshot,
+            payload_snapshot,
+        )
 
     def publish_legacy_reference(
         self,
@@ -1858,7 +1912,7 @@ class V52EvidenceStore:
     ) -> PublishedEvidence:
         self._require_lease(query)
         self._ensure_unpublished(query)
-        reference, payload = self._validated_legacy_reference(
+        reference, payload, _ = self._validated_legacy_reference(
             query, legacy_reference, query_sidecar
         )
         raw_sha256 = _validate_sha256(reference["raw_sha256"], "raw_sha256")
@@ -2236,6 +2290,9 @@ class V52EvidenceStore:
                     raise ValueError("success attempt history binding differs")
 
                 legacy_reference_record: dict[str, object] | None = None
+                legacy_lineage_snapshots: tuple[
+                    _RepositoryFileSnapshot, ...
+                ] = ()
                 raw_sha256: str | None
                 raw_bytes: bytes | None
                 if mode == "FETCHED_RAW":
@@ -2312,7 +2369,11 @@ class V52EvidenceStore:
                     reference = _json_object(
                         object_contents, "protected legacy reference"
                     )
-                    legacy_reference_record, raw_bytes = (
+                    (
+                        legacy_reference_record,
+                        raw_bytes,
+                        legacy_lineage_snapshots,
+                    ) = (
                         self._validated_legacy_reference(query, reference, None)
                     )
                 else:
@@ -2482,6 +2543,8 @@ class V52EvidenceStore:
                 or final_query_snapshot != query_snapshot
             ):
                 raise ValueError("logical query registration changed during read")
+            if legacy_lineage_snapshots:
+                self._rebind_legacy_lineage(legacy_lineage_snapshots)
             published = PublishedEvidence(
                 query_id=query_id,
                 success_receipt_path=self.root

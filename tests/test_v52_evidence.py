@@ -1259,6 +1259,45 @@ class V52EvidenceTest(unittest.TestCase):
                     store.verify_success(query)
                 self.assertTrue(published.success_receipt_path.exists())
 
+    def test_verified_legacy_read_rejects_lineage_mutation_after_validation(
+        self,
+    ) -> None:
+        for mutation in ("payload", "manifest"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                store, query, reference = _legacy_fixture(_tmp(td))
+                with store.acquire_query(query):
+                    store.publish_legacy_reference(query, reference, _sidecar())
+                repository = store.root.parents[3]
+                target = repository / reference[
+                    "payload_path"
+                    if mutation == "payload"
+                    else "legacy_manifest_path"
+                ]
+                original = store._validated_legacy_reference
+                mutated = False
+
+                def mutate_after_validation(*args: object, **kwargs: object):
+                    nonlocal mutated
+                    result = original(*args, **kwargs)  # type: ignore[arg-type]
+                    if not mutated:
+                        mutated = True
+                        contents = target.read_bytes()
+                        target.write_bytes(contents[:-1] + bytes([contents[-1] ^ 1]))
+                    return result
+
+                with (
+                    patch.object(
+                        store,
+                        "_validated_legacy_reference",
+                        side_effect=mutate_after_validation,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "legacy|lineage|payload|manifest|identity|changed",
+                    ),
+                ):
+                    store.read_verified_success(query)
+
     def test_legacy_reference_rejects_symlink_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store, query, reference = _legacy_fixture(_tmp(td))
