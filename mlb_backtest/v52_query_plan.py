@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 from urllib.parse import urlencode
 
 from .v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
+from .v52_seasons import SEASON_BOUNDARIES
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -26,17 +27,6 @@ _MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/query_batches"
 )
-_SEASON_BOUNDARIES = {
-    2018: (date(2018, 3, 29), date(2018, 9, 30)),
-    2019: (date(2019, 3, 20), date(2019, 9, 29)),
-    2020: (date(2020, 7, 23), date(2020, 9, 27)),
-    2021: (date(2021, 4, 1), date(2021, 10, 3)),
-    2022: (date(2022, 4, 7), date(2022, 10, 5)),
-    2023: (date(2023, 3, 30), date(2023, 10, 1)),
-    2024: (date(2024, 3, 20), date(2024, 9, 30)),
-}
-
-
 @dataclass(frozen=True)
 class QueryBatch:
     batch_id: str
@@ -244,7 +234,12 @@ def build_static_batch(
         boundary = by_year[year]
         first = _iso_date(boundary.get("start_date"), "season start")
         last = _iso_date(boundary.get("end_date"), "season end")
-        if first.year != year or last.year != year or first > last:
+        if (
+            first.year != year
+            or last.year != year
+            or first > last
+            or (first, last) != SEASON_BOUNDARIES[year]
+        ):
             raise ValueError("season boundary range differs")
         queries.append(
             _logical_query(
@@ -334,7 +329,7 @@ def build_schedule_reference_batch(
             raise ValueError("schedule anchor played must be explicitly boolean")
         official = _iso_date(raw.get("official_date"), "anchor official_date")
         season_start = _iso_date(raw.get("season_start_date"), "anchor season_start_date")
-        frozen_start, frozen_end = _SEASON_BOUNDARIES[season]
+        frozen_start, frozen_end = SEASON_BOUNDARIES[season]
         if season_start != frozen_start or not frozen_start <= official <= frozen_end:
             raise ValueError("schedule anchor dates differ from season")
         identity = (season, season_start, official, venue_id, played)
@@ -474,13 +469,13 @@ def build_participant_derived_batch(
         if (
             isinstance(season, bool)
             or not isinstance(season, int)
-            or season not in _SEASON_BOUNDARIES
+            or season not in SEASON_BOUNDARIES
         ):
             raise ValueError("game evidence season must be within 2018-2024")
         official_date = _iso_date(
             game.get("official_date"), "game evidence official_date"
         )
-        season_start, season_end = _SEASON_BOUNDARIES[season]
+        season_start, season_end = SEASON_BOUNDARIES[season]
         if not season_start <= official_date <= season_end:
             raise ValueError("game evidence official_date differs from season")
         if (
@@ -551,14 +546,14 @@ def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
     if (
         isinstance(year, bool)
         or not isinstance(year, int)
-        or year not in _SEASON_BOUNDARIES
+        or year not in SEASON_BOUNDARIES
         or first.year != year
         or last.year != year
     ):
         raise ValueError("Statcast parent year must be within 2018-2024")
     if first.month != last.month:
         raise ValueError("Statcast parent must stay within one calendar month")
-    season_start, season_end = _SEASON_BOUNDARIES[year]
+    season_start, season_end = SEASON_BOUNDARIES[year]
     if not season_start <= first <= last <= season_end:
         raise ValueError("Statcast parent range is outside regular-season bounds")
     allowed_requested = {

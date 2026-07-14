@@ -4,16 +4,19 @@ import copy
 import json
 import hashlib
 import unittest
+from datetime import date
 from pathlib import Path
 
 import jsonschema
 
-from mlb_backtest.v52_evidence import LogicalQuery
+from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/v5_2_qd/sources/pitching_mini.json"
 SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
+RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 
 
 def _statcast_source_sidecar(
@@ -61,20 +64,41 @@ def _statcast_source_sidecar(
     }
 
 
-def _complete_statcast_sidecars(
-    cutoff: str, *, start_year: int = 2018
+def _planned_statcast_sidecars(
+    cutoff: str,
+    *,
+    start_year: int = 2018,
+    omit_ranges: set[tuple[str, str]] | None = None,
+    omit_years: set[int] | None = None,
 ) -> list[dict[str, object]]:
-    cutoff_year = int(cutoff[:4])
-    sidecars = []
-    for year in range(start_year, cutoff_year + 1):
-        end = cutoff if year == cutoff_year else f"{year}-12-31"
-        sidecars.append(
-            _statcast_source_sidecar(
-                f"{year}-01-01",
-                end,
-                include_target_pa=year == cutoff_year,
-            )
+    from mlb_backtest.v52_query_plan import build_static_batch
+
+    cutoff_date = date.fromisoformat(cutoff)
+    omitted_ranges = omit_ranges or set()
+    omitted_years = omit_years or set()
+    queries = [
+        query
+        for query in build_static_batch(RUN_SPEC, CONTRACT).queries
+        if query.source == "baseball_savant_statcast"
+        and start_year <= int(query.requested_range["year"]) <= cutoff_date.year
+        and date.fromisoformat(str(query.requested_range["end_date"]))
+        <= cutoff_date
+        and int(query.requested_range["year"]) not in omitted_years
+        and (
+            str(query.requested_range["start_date"]),
+            str(query.requested_range["end_date"]),
         )
+        not in omitted_ranges
+    ]
+    sidecars = []
+    for index, query in enumerate(queries):
+        sidecar = _statcast_source_sidecar(
+            str(query.requested_range["start_date"]),
+            str(query.requested_range["end_date"]),
+            include_target_pa=index == len(queries) - 1,
+        )
+        sidecar["query_id"] = logical_query_id(query)
+        sidecars.append(sidecar)
     return sidecars
 
 
@@ -193,16 +217,16 @@ class V52PitchingSourceTest(unittest.TestCase):
         query = _query(
             source="mlb_stats_pitcher_bf",
             grain="player_career_batters_faced_reference",
-            requested={"pitcher_id": 101, "inclusive_end": "2017-12-31", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-01"}},
+            requested={"pitcher_id": 101, "inclusive_end": "2017-12-31", "consuming_game_pks": [9001], "consumer_cutoff_dates": {"9001": "2024-04-30"}},
         )
         baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
         with self.assertRaisesRegex(ValueError, "Statcast BF"):
             recompute_career_bf_season_snapshot([baseline], [])
-        statcast_sidecars = _complete_statcast_sidecars("2024-04-01")
+        statcast_sidecars = _planned_statcast_sidecars("2024-04-30")
         addition = {
             "pitcher_id": 101,
             "game_pk": 9001,
-            "consumer_cutoff_date": "2024-04-01",
+            "consumer_cutoff_date": "2024-04-30",
             "statcast_bf": 1,
             "statcast_query_sidecars": statcast_sidecars,
             "statcast_query_sidecar_sha256s": [
@@ -230,15 +254,15 @@ class V52PitchingSourceTest(unittest.TestCase):
                 "pitcher_id": 101,
                 "inclusive_end": "2017-12-31",
                 "consuming_game_pks": [9001],
-                "consumer_cutoff_dates": {"9001": "2024-04-01"},
+                "consumer_cutoff_dates": {"9001": "2024-04-30"},
             },
         )
         baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
-        statcast_sidecars = _complete_statcast_sidecars("2024-04-01")
+        statcast_sidecars = _planned_statcast_sidecars("2024-04-30")
         forged = {
             "pitcher_id": 101,
             "game_pk": 9001,
-            "consumer_cutoff_date": "2024-04-01",
+            "consumer_cutoff_date": "2024-04-30",
             "statcast_bf": 600,
             "statcast_query_sidecars": statcast_sidecars,
             "statcast_query_sidecar_sha256s": [
@@ -264,26 +288,26 @@ class V52PitchingSourceTest(unittest.TestCase):
             recompute_career_bf_season_snapshot,
         )
 
-        baseline = _career_baseline("2017-12-31", "2024-04-01")
-        sidecars = [_statcast_source_sidecar("2024-01-01", "2024-04-01")]
-        with self.assertRaisesRegex(ValueError, "coverage gap"):
+        baseline = _career_baseline("2017-12-31", "2024-04-30")
+        sidecars = [_statcast_source_sidecar("2024-03-20", "2024-04-30")]
+        with self.assertRaisesRegex(ValueError, "whole regular season"):
             recompute_career_bf_season_snapshot(
-                [baseline], [_career_addition(sidecars, "2024-04-01")]
+                [baseline], [_career_addition(sidecars, "2024-04-30")]
             )
     def test_career_aggregate_rejects_2021_baseline_with_only_2024_evidence(self) -> None:
         from mlb_backtest.v52_sources.pitching import (
             recompute_career_bf_season_snapshot,
         )
 
-        baseline = _career_baseline("2021-12-31", "2024-04-01")
-        sidecars = [_statcast_source_sidecar("2024-01-01", "2024-04-01")]
-        with self.assertRaisesRegex(ValueError, "coverage gap"):
+        baseline = _career_baseline("2021-12-31", "2024-04-30")
+        sidecars = [_statcast_source_sidecar("2024-03-20", "2024-04-30")]
+        with self.assertRaisesRegex(ValueError, "whole regular season"):
             recompute_career_bf_season_snapshot(
-                [baseline], [_career_addition(sidecars, "2024-04-01")]
+                [baseline], [_career_addition(sidecars, "2024-04-30")]
             )
-        complete = _complete_statcast_sidecars("2024-04-01", start_year=2022)
+        complete = _planned_statcast_sidecars("2024-04-30", start_year=2022)
         snapshot = recompute_career_bf_season_snapshot(
-            [baseline], [_career_addition(complete, "2024-04-01")]
+            [baseline], [_career_addition(complete, "2024-04-30")]
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
 
@@ -292,16 +316,16 @@ class V52PitchingSourceTest(unittest.TestCase):
             recompute_career_bf_season_snapshot,
         )
 
-        baseline = _career_baseline("2017-12-31", "2018-04-02")
+        baseline = _career_baseline("2017-12-31", "2018-05-31")
         sidecars = [
             _statcast_source_sidecar(
-                "2018-01-01", "2018-03-31", include_target_pa=False
+                "2018-03-29", "2018-04-30", include_target_pa=False
             ),
-            _statcast_source_sidecar("2018-04-02", "2018-04-02"),
+            _statcast_source_sidecar("2018-05-02", "2018-05-31"),
         ]
-        with self.assertRaisesRegex(ValueError, "coverage gap"):
+        with self.assertRaisesRegex(ValueError, "regular-season coverage gap"):
             recompute_career_bf_season_snapshot(
-                [baseline], [_career_addition(sidecars, "2018-04-02")]
+                [baseline], [_career_addition(sidecars, "2018-05-31")]
             )
 
     def test_career_aggregate_rejects_internal_year_gap(self) -> None:
@@ -309,16 +333,66 @@ class V52PitchingSourceTest(unittest.TestCase):
             recompute_career_bf_season_snapshot,
         )
 
-        baseline = _career_baseline("2017-12-31", "2020-01-01")
-        sidecars = [
-            _statcast_source_sidecar(
-                "2018-01-01", "2018-12-31", include_target_pa=False
-            ),
-            _statcast_source_sidecar("2020-01-01", "2020-01-01"),
-        ]
-        with self.assertRaisesRegex(ValueError, "coverage gap"):
+        cutoff = "2020-08-31"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff, omit_years={2019})
+        with self.assertRaisesRegex(ValueError, "whole regular season"):
             recompute_career_bf_season_snapshot(
-                [baseline], [_career_addition(sidecars, "2020-01-01")]
+                [baseline], [_career_addition(sidecars, cutoff)]
+            )
+
+    def test_career_aggregate_accepts_task3_regular_season_query_population(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_task3_within_season_month_omission(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-05-31"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(
+            cutoff, omit_ranges={("2024-04-01", "2024-04-30")}
+        )
+        with self.assertRaisesRegex(ValueError, "regular-season coverage gap"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, cutoff)]
+            )
+
+    def test_career_aggregate_rejects_task3_whole_season_omission(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff, omit_years={2019})
+        with self.assertRaisesRegex(ValueError, "whole regular season"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, cutoff)]
+            )
+
+    def test_career_aggregate_rejects_consumer_d1_outside_regular_season(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-03-19"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        with self.assertRaisesRegex(ValueError, "outside the regular season"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, cutoff)]
             )
     def test_pitching_sidecar_checks_completeness_totals_and_consumers(self) -> None:
         from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar

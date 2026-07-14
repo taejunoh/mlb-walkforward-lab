@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
 from ..v52_evidence import LogicalQuery
+from ..v52_seasons import SEASON_BOUNDARIES
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
     canonical_json_bytes,
@@ -20,15 +21,6 @@ from ..v52_source_contracts import (
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
-_SEASON_OPEN = {
-    2018: "2018-03-29",
-    2019: "2019-03-20",
-    2020: "2020-07-23",
-    2021: "2021-04-01",
-    2022: "2022-04-07",
-    2023: "2023-03-30",
-    2024: "2024-03-20",
-}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -125,10 +117,10 @@ def recompute_pitching_sidecar(
         expected_media_type="application/json",
     )
     season = query.requested_range.get("season")
-    if isinstance(season, bool) or not isinstance(season, int) or season not in _SEASON_OPEN:
+    if isinstance(season, bool) or not isinstance(season, int) or season not in SEASON_BOUNDARIES:
         raise ValueError("pitching season must be within 2018-2024")
     season_open = _day(query.requested_range.get("start_date"), "pitching season open")
-    if season_open.isoformat() != _SEASON_OPEN[season]:
+    if season_open != SEASON_BOUNDARIES[season][0]:
         raise ValueError("pitching query must use the exact season open")
     as_of = _day(query.requested_range.get("as_of_date"), "pitching as-of date")
     if as_of < season_open or as_of.year != season:
@@ -311,6 +303,43 @@ def recompute_pitching_season_snapshot(
     }
 
 
+def _validate_career_statcast_coverage(
+    baseline_end: date,
+    cutoff: date,
+    source_ranges: Sequence[tuple[date, date]],
+) -> None:
+    boundary = SEASON_BOUNDARIES.get(cutoff.year)
+    if boundary is None or not boundary[0] <= cutoff <= boundary[1]:
+        raise ValueError("career consumer D-1 is outside the regular season")
+    first_year = baseline_end.year + 1
+    if first_year not in SEASON_BOUNDARIES or first_year > cutoff.year:
+        raise ValueError("career baseline does not precede an approved Statcast season")
+
+    source_index = 0
+    for year in range(first_year, cutoff.year + 1):
+        season_start, season_end = SEASON_BOUNDARIES[year]
+        required_end = cutoff if year == cutoff.year else season_end
+        if (
+            source_index >= len(source_ranges)
+            or source_ranges[source_index][0] > required_end
+        ):
+            raise ValueError(f"whole regular season {year} is omitted")
+        cursor = season_start
+        while (
+            source_index < len(source_ranges)
+            and source_ranges[source_index][0] <= required_end
+        ):
+            first, last = source_ranges[source_index]
+            if first != cursor or last > required_end:
+                raise ValueError("regular-season coverage gap or overlap")
+            cursor = last + timedelta(days=1)
+            source_index += 1
+        if cursor != required_end + timedelta(days=1):
+            raise ValueError("regular-season coverage gap remains")
+    if source_index != len(source_ranges):
+        raise ValueError("Statcast BF source range is outside required seasons")
+
+
 def recompute_career_bf_season_snapshot(
     baseline_sidecars: Sequence[Mapping[str, object]],
     statcast_bf_additions: Sequence[Mapping[str, object]],
@@ -422,15 +451,8 @@ def recompute_career_bf_season_snapshot(
         ):
             raise ValueError("Statcast BF source hash differs from canonical sidecar")
         for previous, current in zip(source_ranges, source_ranges[1:]):
-            expected_start = previous[1] + timedelta(days=1)
-            if current[0] != expected_start:
-                if current[0] <= previous[1]:
-                    raise ValueError(
-                        "Statcast BF source coverage overlaps or is unordered"
-                    )
-                raise ValueError("Statcast BF source coverage gap is not explicit")
-        if source_ranges[-1][1] != cutoff:
-            raise ValueError("Statcast BF source coverage must end at consumer D-1")
+            if current[0] <= previous[1]:
+                raise ValueError("Statcast BF source coverage overlaps or is unordered")
         if not target_pitcher_found:
             raise ValueError("Statcast BF source does not contain target pitcher PA evidence")
         if bf != recomputed_bf:
@@ -441,7 +463,7 @@ def recompute_career_bf_season_snapshot(
         additions[key] = {
             **row,
             "consumer_cutoff_date": cutoff.isoformat(),
-            "source_first_date": source_ranges[0][0].isoformat(),
+            "source_ranges": source_ranges,
             "verified_statcast_bf": recomputed_bf,
         }
     records = []
@@ -488,14 +510,9 @@ def recompute_career_bf_season_snapshot(
                 raise ValueError("verified Statcast BF addition is missing")
             if addition["consumer_cutoff_date"] != cutoffs.get(str(game_pk)):
                 raise ValueError("Statcast BF cutoff differs from career consumer D-1")
-            expected_source_start = inclusive_end + timedelta(days=1)
-            if (
-                _day(addition["source_first_date"], "Statcast BF source start")
-                != expected_source_start
-            ):
-                raise ValueError(
-                    "Statcast BF source coverage gap follows career baseline"
-                )
+            _validate_career_statcast_coverage(
+                inclusive_end, cutoff, addition["source_ranges"]
+            )
             used.add((pitcher_id, game_pk))
             records.append(
                 {
