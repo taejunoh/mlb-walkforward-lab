@@ -6,12 +6,13 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
 from ..v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
+from ..v52_query_plan import validate_statcast_query
 from ..v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
@@ -22,7 +23,6 @@ from ..v52_source_contracts import (
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
-_STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_QUERY_KEYS = {
     "acquisition_contract_sha256",
@@ -252,7 +252,7 @@ def _require_task2_sidecar(
 
 def _statcast_query_lineage(
     sidecar: Mapping[str, object], semantics: Mapping[str, object]
-) -> tuple[date, date, LogicalQuery]:
+) -> tuple[date, date, LogicalQuery, str]:
     canonical = semantics.get("canonical_query")
     coverage = semantics.get("coverage")
     if (
@@ -283,11 +283,6 @@ def _statcast_query_lineage(
         raise ValueError("Statcast BF source canonical query lineage is invalid") from exc
     if (
         normalized != dict(canonical)
-        or query.source != "baseball_savant_statcast"
-        or query.grain != "pitch"
-        or query.endpoint != _STATCAST_ENDPOINT
-        or query.expected_media_type != "text/csv"
-        or query.parser_version != "v5.2.1"
         or not isinstance(query.run_spec_sha256, str)
         or not _SHA256.fullmatch(query.run_spec_sha256)
         or not isinstance(query.acquisition_contract_sha256, str)
@@ -302,36 +297,195 @@ def _statcast_query_lineage(
         or sidecar.get("query_id") != logical_query_id(query)
     ):
         raise ValueError("Statcast BF source canonical query lineage is invalid")
-    requested = query.requested_range
-    if set(requested) != {"year", "start_date", "end_date"}:
-        raise ValueError("Statcast BF source requested range is invalid")
-    first = _day(requested.get("start_date"), "Statcast BF requested start")
-    last = _day(requested.get("end_date"), "Statcast BF requested end")
+    try:
+        first, last = validate_statcast_query(query)
+    except ValueError as exc:
+        raise ValueError(
+            "Statcast BF whole regular season or regular-season coverage gap: "
+            f"{exc}"
+        ) from exc
     if (
-        isinstance(requested.get("year"), bool)
-        or requested.get("year") != first.year
-        or last.year != first.year
-        or coverage.get("inclusive_start") != first.isoformat()
+        coverage.get("inclusive_start") != first.isoformat()
         or coverage.get("inclusive_end") != last.isoformat()
-        or dict(query.parameters)
-        != {
-            "all": "true",
-            "type": "details",
-            "player_type": "batter",
-            "game_date_gt": first.isoformat(),
-            "game_date_lt": last.isoformat(),
-            "hfGT": "R|",
-            "group_by": "name-year",
-            "sort_col": "pitches",
-            "player_event_sort": "api_p_release_speed",
-            "sort_order": "desc",
-            "min_pitches": "0",
-        }
     ):
         raise ValueError("Statcast BF source requested range is invalid")
-    if semantics.get("split_disposition") != "READY":
+    disposition = semantics.get("split_disposition")
+    if disposition not in {"READY", "SPLIT_REQUIRED"}:
         raise ValueError("Statcast BF source split state is not terminal READY")
-    return first, last, query
+    return first, last, query, disposition
+
+
+@dataclass(frozen=True)
+class _StatcastNode:
+    query_id: str
+    first: date
+    last: date
+    query: LogicalQuery
+    disposition: str
+
+
+def _reject_statcast_graph_duplicates_and_cycles(
+    source_sidecars: Sequence[Mapping[str, object]],
+) -> None:
+    parents: dict[str, str | None] = {}
+    for sidecar in source_sidecars:
+        semantics = _require_task2_sidecar(
+            sidecar,
+            source="baseball_savant_statcast",
+            grain="pitch",
+            label="Statcast BF addition",
+        )
+        query_id = sidecar["query_id"]
+        if query_id in parents:
+            raise ValueError("Statcast split graph has an ambiguous duplicate node")
+        canonical = semantics.get("canonical_query")
+        if not isinstance(canonical, Mapping):
+            continue
+        parent = canonical.get("parent_query_id")
+        parents[query_id] = parent if isinstance(parent, str) else None
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(query_id: str) -> None:
+        if query_id in visiting:
+            raise ValueError("Statcast split graph contains a cycle")
+        if query_id in visited:
+            return
+        visiting.add(query_id)
+        parent = parents.get(query_id)
+        if parent in parents:
+            visit(parent)
+        visiting.remove(query_id)
+        visited.add(query_id)
+
+    for query_id in parents:
+        visit(query_id)
+
+
+def _monthly_root_query(
+    node: _StatcastNode,
+) -> tuple[date, date, LogicalQuery]:
+    season = SEASON_BOUNDARIES.get(node.first.year)
+    if season is None:
+        raise ValueError("Statcast split node is outside required monthly roots")
+    parent_range = next(
+        (
+            (first, last)
+            for first, last in monthly_ranges(*season)
+            if first <= node.first <= node.last <= last
+        ),
+        None,
+    )
+    if parent_range is None:
+        raise ValueError("Statcast split node has wrong root coverage")
+    parent_first, parent_last = parent_range
+    requested = {
+        key: value
+        for key, value in node.query.requested_range.items()
+        if key not in {"acquisition", "protected_inventory_sha256"}
+    }
+    requested.update(
+        {
+            "start_date": parent_first.isoformat(),
+            "end_date": parent_last.isoformat(),
+        }
+    )
+    parameters = {
+        **node.query.parameters,
+        "game_date_gt": parent_first.isoformat(),
+        "game_date_lt": parent_last.isoformat(),
+    }
+    return (
+        parent_first,
+        parent_last,
+        replace(
+            node.query,
+            parameters=parameters,
+            requested_range=requested,
+            parent_query_id=None,
+        ),
+    )
+
+
+def _validate_statcast_split_graph(
+    nodes: Sequence[_StatcastNode],
+) -> list[_StatcastNode]:
+    by_id = {node.query_id: node for node in nodes}
+    children: dict[str, list[_StatcastNode]] = {}
+    roots: dict[str, str] = {}
+    for node in nodes:
+        parent_first, parent_last, root_query = _monthly_root_query(node)
+        root_id = logical_query_id(root_query)
+        roots[node.query_id] = root_id
+        parent_id = node.query.parent_query_id
+        if parent_id is None:
+            if (
+                node.query_id != root_id
+                or node.first != parent_first
+                or node.last != parent_last
+            ):
+                raise ValueError("Statcast split graph has a wrong root")
+            continue
+        children.setdefault(parent_id, []).append(node)
+        if parent_id == root_id:
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            raise ValueError(
+                "Statcast split graph has a wrong parent, orphan, or missing intermediate"
+            )
+        if roots.get(parent.query_id) is None:
+            _parent_first, _parent_last, parent_root = _monthly_root_query(parent)
+            roots[parent.query_id] = logical_query_id(parent_root)
+        if roots[parent.query_id] != root_id:
+            raise ValueError("Statcast split graph has a wrong root")
+        if not parent.first <= node.first <= node.last <= parent.last:
+            raise ValueError("Statcast split graph has a wrong root")
+        if parent.disposition != "SPLIT_REQUIRED":
+            raise ValueError("Statcast split graph has an ambiguous READY parent")
+        expected = replace(
+            parent.query,
+            parameters={
+                **parent.query.parameters,
+                "game_date_gt": node.first.isoformat(),
+                "game_date_lt": node.last.isoformat(),
+            },
+            requested_range={
+                **parent.query.requested_range,
+                "start_date": node.first.isoformat(),
+                "end_date": node.last.isoformat(),
+            },
+            parent_query_id=parent.query_id,
+        )
+        if canonical_query_bytes(expected) != canonical_query_bytes(node.query):
+            raise ValueError("Statcast split graph child lineage differs from parent")
+
+    ready_leaves = []
+    for node in nodes:
+        node_children = sorted(
+            children.get(node.query_id, []), key=lambda child: (child.first, child.last)
+        )
+        if node.disposition == "READY":
+            if node_children:
+                raise ValueError("Statcast split graph has an ambiguous READY parent")
+            ready_leaves.append(node)
+            continue
+        if not node_children:
+            raise ValueError(
+                "Statcast split graph lacks complete READY leaf cover; "
+                "split state is not terminal READY"
+            )
+        cursor = node.first
+        for child in node_children:
+            if child.first != cursor or child.last > node.last:
+                raise ValueError(
+                    "Statcast split graph lacks complete READY leaf cover"
+                )
+            cursor = child.last + timedelta(days=1)
+        if cursor != node.last + timedelta(days=1):
+            raise ValueError("Statcast split graph lacks complete READY leaf cover")
+    return sorted(ready_leaves, key=lambda node: (node.first, node.last))
 
 
 def recompute_pitching_season_snapshot(
@@ -465,33 +619,6 @@ def _validate_career_statcast_coverage(
                 raise ValueError(
                     "regular-season coverage gap: Statcast split child gap"
                 )
-            direct_parent = (
-                len(children) == 1
-                and children[0][0] == parent_first
-                and children[0][1] == parent_last
-                and children[0][2].parent_query_id is None
-            )
-            if direct_parent:
-                continue
-            for _first, _last, child_query in children:
-                parent_parameters = {
-                    **child_query.parameters,
-                    "game_date_gt": parent_first.isoformat(),
-                    "game_date_lt": parent_last.isoformat(),
-                }
-                parent_requested_range = {
-                    **child_query.requested_range,
-                    "start_date": parent_first.isoformat(),
-                    "end_date": parent_last.isoformat(),
-                }
-                expected_parent = replace(
-                    child_query,
-                    parameters=parent_parameters,
-                    requested_range=parent_requested_range,
-                    parent_query_id=None,
-                )
-                if child_query.parent_query_id != logical_query_id(expected_parent):
-                    raise ValueError("Statcast split child has wrong parent lineage")
         if index != len(actual):
             raise ValueError("Statcast BF source range is outside monthly parents")
     if actual_by_year:
@@ -531,7 +658,8 @@ def recompute_career_bf_season_snapshot(
             raise ValueError("Statcast BF addition value/source lineage is invalid")
         computed_hashes = []
         recomputed_bf = 0
-        source_queries = []
+        nodes: list[_StatcastNode] = []
+        _reject_statcast_graph_duplicates_and_cycles(source_sidecars)
         for sidecar in source_sidecars:
             semantics = _require_task2_sidecar(
                 sidecar,
@@ -552,7 +680,9 @@ def recompute_career_bf_season_snapshot(
                 or not isinstance(game_pks, list)
             ):
                 raise ValueError("Statcast BF source pitcher population is invalid")
-            first, last, source_query = _statcast_query_lineage(sidecar, semantics)
+            first, last, source_query, disposition = _statcast_query_lineage(
+                sidecar, semantics
+            )
             if (
                 first > last
                 or first.year not in range(2018, 2025)
@@ -598,14 +728,26 @@ def recompute_career_bf_season_snapshot(
             canonical_counts = {str(key): counts[key] for key in sorted(counts)}
             if dict(pitcher_bf) != canonical_counts:
                 raise ValueError("Statcast BF evidence summary differs from PA evidence")
-            if pitcher_id in eligible_counts:
+            if disposition == "READY" and pitcher_id in eligible_counts:
                 recomputed_bf += eligible_counts[pitcher_id]
-            source_queries.append((first, last, source_query))
+            nodes.append(
+                _StatcastNode(
+                    query_id=sidecar["query_id"],
+                    first=first,
+                    last=last,
+                    query=source_query,
+                    disposition=disposition,
+                )
+            )
             computed_hashes.append(_artifact_sha256(sidecar))
         if list(source_hashes) != computed_hashes or len(set(computed_hashes)) != len(
             computed_hashes
         ):
             raise ValueError("Statcast BF source hash differs from canonical sidecar")
+        ready_leaves = _validate_statcast_split_graph(nodes)
+        source_queries = [
+            (node.first, node.last, node.query) for node in ready_leaves
+        ]
         for previous, current in zip(source_queries, source_queries[1:]):
             if current[0] <= previous[1]:
                 raise ValueError("Statcast BF source coverage overlaps or is unordered")

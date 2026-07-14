@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlencode
 
 import jsonschema
 
@@ -205,6 +206,72 @@ def _replace_april_2024_parent_with_children(
         ),
     ]
     return [*sidecars[:-1], *children]
+
+
+def _legacy_catalog_record(
+    parent: LogicalQuery, start: str, end: str
+) -> dict[str, object]:
+    parameters = {
+        **parent.parameters,
+        "game_date_gt": start,
+        "game_date_lt": end,
+    }
+    return {
+        "source": "baseball_savant_statcast",
+        "rawstore_verified": True,
+        "canonical_query": {
+            "start": start,
+            "end": end,
+            "game_type": "R",
+            "url": f"{parent.endpoint}?{urlencode(parameters)}",
+        },
+    }
+
+
+def _task3_legacy_queries(*, protected: bool) -> tuple[LogicalQuery, ...]:
+    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+
+    parent = _planned_statcast_query("2024-04-01", "2024-04-30")
+    catalog = (
+        [_legacy_catalog_record(parent, "2024-04-01", "2024-04-30")]
+        if protected
+        else []
+    )
+    return build_legacy_partition_batch(
+        [parent], catalog, protected_inventory_sha256="c" * 64
+    ).queries
+
+
+def _replace_april_parent_with_query_nodes(
+    sidecars: list[dict[str, object]],
+    nodes: list[tuple[LogicalQuery, str, bool]],
+) -> list[dict[str, object]]:
+    replacements = [
+        _statcast_source_sidecar(
+            str(query.requested_range["start_date"]),
+            str(query.requested_range["end_date"]),
+            include_target_pa=include_target_pa,
+            query=query,
+            split_disposition=disposition,
+        )
+        for query, disposition, include_target_pa in nodes
+    ]
+    return [*sidecars[:-1], *replacements]
+
+
+def _task3_recursive_april_nodes() -> tuple[
+    LogicalQuery,
+    LogicalQuery,
+    LogicalQuery,
+    LogicalQuery,
+    LogicalQuery,
+]:
+    from mlb_backtest.v52_query_plan import bisect_statcast_query
+
+    root = _planned_statcast_query("2024-04-01", "2024-04-30")
+    left, right = bisect_statcast_query(root)
+    left_left, left_right = bisect_statcast_query(left)
+    return root, left, left_left, left_right, right
 
 
 def _artifact_sha(sidecar: dict[str, object]) -> str:
@@ -473,6 +540,163 @@ class V52PitchingSourceTest(unittest.TestCase):
             [baseline], [_career_addition(sidecars, cutoff)]
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_accepts_task3_fetch_and_protected_legacy_queries(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        for protected in (False, True):
+            query = _task3_legacy_queries(protected=protected)[0]
+            sidecars = _replace_april_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff),
+                [(query, "READY", True)],
+            )
+            with self.subTest(protected=protected):
+                snapshot = recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
+                self.assertEqual(
+                    snapshot["records"][0]["verified_statcast_bf"], 1
+                )
+
+    def test_career_aggregate_rejects_malformed_task3_acquisition_metadata(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        fetch = _task3_legacy_queries(protected=False)[0]
+        protected = _task3_legacy_queries(protected=True)[0]
+        cases = {
+            "extra fields": replace(
+                fetch,
+                requested_range={**fetch.requested_range, "unknown": "value"},
+            ),
+            "acquisition": replace(
+                fetch,
+                requested_range={**fetch.requested_range, "acquisition": "UNKNOWN"},
+            ),
+            "inventory lineage": replace(
+                fetch,
+                requested_range={
+                    **fetch.requested_range,
+                    "protected_inventory_sha256": "c" * 64,
+                },
+            ),
+            "protected_inventory_sha256": replace(
+                protected,
+                requested_range={
+                    **protected.requested_range,
+                    "protected_inventory_sha256": "bad",
+                },
+            ),
+        }
+        for label, query in cases.items():
+            sidecars = _replace_april_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff),
+                [(query, "READY", True)],
+            )
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
+
+    def test_career_aggregate_accepts_recursive_task3_split_ancestry(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        root, left, left_left, left_right, right = _task3_recursive_april_nodes()
+        sidecars = _replace_april_parent_with_query_nodes(
+            _planned_statcast_sidecars(cutoff),
+            [
+                (root, "SPLIT_REQUIRED", True),
+                (left, "SPLIT_REQUIRED", True),
+                (left_left, "READY", False),
+                (left_right, "READY", False),
+                (right, "READY", True),
+            ],
+        )
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_invalid_recursive_split_graphs(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        root, left, left_left, left_right, right = _task3_recursive_april_nodes()
+        complete_nodes = [
+            (root, "SPLIT_REQUIRED", True),
+            (left, "SPLIT_REQUIRED", True),
+            (left_left, "READY", False),
+            (left_right, "READY", False),
+            (right, "READY", True),
+        ]
+        missing_intermediate = [
+            complete_nodes[0],
+            *complete_nodes[2:],
+        ]
+        orphan_leaf = replace(left_left, parent_query_id="f" * 64)
+        orphan = [
+            complete_nodes[0],
+            complete_nodes[1],
+            (orphan_leaf, "READY", False),
+            complete_nodes[3],
+            complete_nodes[4],
+        ]
+        may_root = _planned_statcast_query("2024-05-01", "2024-05-31")
+        wrong_left = replace(left, parent_query_id=logical_query_id(may_root))
+        from mlb_backtest.v52_query_plan import bisect_statcast_query
+
+        wrong_left_left, wrong_left_right = bisect_statcast_query(wrong_left)
+        wrong_root = [
+            complete_nodes[0],
+            (may_root, "SPLIT_REQUIRED", False),
+            (wrong_left, "SPLIT_REQUIRED", False),
+            (wrong_left_left, "READY", False),
+            (wrong_left_right, "READY", False),
+            complete_nodes[4],
+        ]
+        cases = {
+            "missing intermediate": missing_intermediate,
+            "orphan": orphan,
+            "wrong root": wrong_root,
+            "ambiguous duplicate": [*complete_nodes, complete_nodes[-1]],
+            "complete READY leaf cover": [complete_nodes[0]],
+        }
+        for label, nodes in cases.items():
+            sidecars = _replace_april_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff), nodes
+            )
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
+
+        cycle_sidecars = _replace_april_parent_with_query_nodes(
+            _planned_statcast_sidecars(cutoff), complete_nodes
+        )
+        april_start = len(cycle_sidecars) - len(complete_nodes)
+        root_sidecar = cycle_sidecars[april_start]
+        left_sidecar = cycle_sidecars[april_start + 1]
+        root_sidecar["semantics"]["canonical_query"]["parent_query_id"] = left_sidecar[
+            "query_id"
+        ]
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(cycle_sidecars, cutoff)]
+            )
 
     def test_career_aggregate_rejects_nonready_monthly_parent(self) -> None:
         from mlb_backtest.v52_sources.pitching import (

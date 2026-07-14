@@ -578,6 +578,11 @@ def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
     return first, last
 
 
+def validate_statcast_query(query: LogicalQuery) -> tuple[date, date]:
+    """Validate one Task3 Statcast query, including acquisition metadata."""
+    return _canonical_statcast_parent_range(query)
+
+
 def _statcast_child(
     parent: LogicalQuery,
     first: date,
