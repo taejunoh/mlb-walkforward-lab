@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -396,6 +397,15 @@ def _career_reference_fixture(
 
 
 class V52EvidenceTest(unittest.TestCase):
+    def _read_progress(
+        self, store: V52EvidenceStore, query: LogicalQuery
+    ) -> object:
+        self.assertTrue(
+            hasattr(store, "read_verified_query_progress"),
+            "verified query progress API must exist",
+        )
+        return store.read_verified_query_progress(query)  # type: ignore[attr-defined]
+
     def test_task6_publisher_requires_exact_source_specific_legacy_relation(
         self,
     ) -> None:
@@ -654,6 +664,1040 @@ class V52EvidenceTest(unittest.TestCase):
                     tuple(field.name for field in dataclasses.fields(record)), fields
                 )
                 self.assertTrue(record.__dataclass_params__.frozen)
+
+    def test_verified_query_progress_records_are_frozen_exported_and_exact(self) -> None:
+        self.assertTrue(hasattr(v52_evidence, "VerifiedQuarantineRead"))
+        self.assertTrue(hasattr(v52_evidence, "VerifiedQueryProgress"))
+        quarantine_record = v52_evidence.VerifiedQuarantineRead
+        progress_record = v52_evidence.VerifiedQueryProgress
+        expected = {
+            quarantine_record: (
+                "attempt_number",
+                "receipt_path",
+                "receipt_sha256",
+                "raw_path",
+                "raw_sha256",
+                "raw_byte_count",
+                "error_classification",
+            ),
+            progress_record: (
+                "query_id",
+                "status",
+                "registered_query",
+                "published_evidence",
+                "attempt_receipts",
+                "pending_attempt_numbers",
+                "quarantines",
+            ),
+        }
+        for record, fields in expected.items():
+            with self.subTest(record=record.__name__):
+                self.assertEqual(
+                    tuple(field.name for field in dataclasses.fields(record)), fields
+                )
+                self.assertTrue(record.__dataclass_params__.frozen)
+                self.assertIn(record.__name__, v52_evidence.__all__)
+
+    def test_verified_query_progress_absent_query_is_read_only_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            before = sorted(path.relative_to(root) for path in root.rglob("*"))
+            progress = self._read_progress(store, query)
+            after = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+            self.assertEqual(progress.query_id, logical_query_id(query))
+            self.assertEqual(progress.status, "PENDING")
+            self.assertIsNone(progress.registered_query)
+            self.assertIsNone(progress.published_evidence)
+            self.assertEqual(progress.attempt_receipts, ())
+            self.assertEqual(progress.pending_attempt_numbers, ())
+            self.assertEqual(progress.quarantines, ())
+            self.assertEqual(after, before)
+
+    def test_verified_query_progress_restarts_when_query_registers_after_absence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            registering_store = V52EvidenceStore(root)
+            query = _query()
+            original = store._query_fds
+            calls = 0
+
+            def register_after_first_miss(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    registering_store.register_query(query)
+                    raise FileNotFoundError("injected initial absence")
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(
+                store, "_query_fds", side_effect=register_after_first_miss
+            ):
+                progress = self._read_progress(store, query)
+            self.assertGreaterEqual(calls, 2)
+            self.assertEqual(progress.status, "PENDING")
+            self.assertEqual(progress.registered_query, query)
+
+    def test_verified_query_progress_rechecks_orphan_after_absent_query(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            query_id = logical_query_id(query)
+            original = store._quarantine_fds
+            calls = 0
+
+            def hide_first_orphan(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    (root / "quarantine" / query.source / query_id).mkdir(parents=True)
+                    raise FileNotFoundError("injected quarantine absence")
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(
+                    store, "_quarantine_fds", side_effect=hide_first_orphan
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "quarantine|orphan|registered"
+                ),
+            ):
+                self._read_progress(store, query)
+            self.assertGreaterEqual(calls, 2)
+
+    def test_absent_probe_uses_one_root_generation_before_registered_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = _tmp(td)
+            first_root = base / "generation-a"
+            second_root = base / "generation-b"
+            store = V52EvidenceStore(first_root)
+            second_store = V52EvidenceStore(second_root)
+            query = _query()
+            second_store.register_query(query)
+            root_sequence = [first_root, second_root, second_root, second_root]
+            root_calls = 0
+            original_quarantine = store._quarantine_fds
+            observed_root_descriptors: list[int | None] = []
+
+            def alternating_root() -> int:
+                nonlocal root_calls
+                selected = (
+                    root_sequence[root_calls]
+                    if root_calls < len(root_sequence)
+                    else second_root
+                )
+                root_calls += 1
+                return v52_evidence._open_root_path(selected, create=False)
+
+            def observe_quarantine_root(*args: object, **kwargs: object):
+                observed_root_descriptors.append(kwargs.get("root_descriptor"))
+                return original_quarantine(*args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(store, "_root_fd", side_effect=alternating_root),
+                patch.object(
+                    store,
+                    "_quarantine_fds",
+                    side_effect=observe_quarantine_root,
+                ),
+            ):
+                progress = self._read_progress(store, query)
+            self.assertEqual(progress.registered_query, query)
+            self.assertTrue(observed_root_descriptors)
+            self.assertTrue(all(fd is not None for fd in observed_root_descriptors))
+
+    def test_absent_probe_uses_one_root_generation_before_orphan_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = _tmp(td)
+            first_root = base / "generation-a"
+            second_root = base / "generation-b"
+            store = V52EvidenceStore(first_root)
+            query = _query()
+            query_id = logical_query_id(query)
+            second_root.mkdir()
+            (second_root / "quarantine" / query.source / query_id).mkdir(parents=True)
+            root_sequence = [first_root, second_root, second_root, second_root]
+            root_calls = 0
+            original_quarantine = store._quarantine_fds
+            observed_root_descriptors: list[int | None] = []
+
+            def alternating_root() -> int:
+                nonlocal root_calls
+                selected = (
+                    root_sequence[root_calls]
+                    if root_calls < len(root_sequence)
+                    else second_root
+                )
+                root_calls += 1
+                return v52_evidence._open_root_path(selected, create=False)
+
+            def observe_quarantine_root(*args: object, **kwargs: object):
+                observed_root_descriptors.append(kwargs.get("root_descriptor"))
+                return original_quarantine(*args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(store, "_root_fd", side_effect=alternating_root),
+                patch.object(
+                    store,
+                    "_quarantine_fds",
+                    side_effect=observe_quarantine_root,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "quarantine|orphan|root|stable"
+                ),
+            ):
+                self._read_progress(store, query)
+            self.assertTrue(observed_root_descriptors)
+            self.assertTrue(all(fd is not None for fd in observed_root_descriptors))
+
+    def test_verified_query_progress_pending_is_reservations_minus_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                self.assertEqual(store.next_attempt_number(lease), 1)
+                transient = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    transient,
+                    _capture(None, status=None, error="TIMEOUT"),
+                    outcome="TRANSIENT_NETWORK",
+                )
+                split = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    split,
+                    _capture(None, status=None, error="TOO_WIDE"),
+                    outcome="SPLIT_REQUIRED",
+                )
+                permanent = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    permanent,
+                    _capture(b"not found", status=404, error="NOT_FOUND"),
+                    outcome="PERMANENT_HTTP",
+                )
+
+            progress = self._read_progress(store, query)
+            self.assertEqual(progress.status, "PENDING")
+            self.assertEqual(progress.registered_query, query)
+            self.assertEqual(progress.pending_attempt_numbers, (1,))
+            self.assertEqual(
+                tuple(record["attempt_number"] for record in progress.attempt_receipts),
+                (2, 3, 4),
+            )
+            self.assertEqual(progress.quarantines, ())
+
+    def test_verified_query_progress_quarantine_then_success_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            quarantined_body = b"invalid-but-owned"
+            with store.acquire_query(query) as lease:
+                quarantined = store.next_attempt_number(lease)
+                quarantine_path = store.quarantine_attempt(
+                    query,
+                    quarantined,
+                    _capture(quarantined_body),
+                    error_classification="SEMANTIC_INVALID",
+                )
+
+            progress = self._read_progress(store, query)
+            self.assertEqual(progress.status, "QUARANTINED")
+            self.assertIsNone(progress.published_evidence)
+            self.assertEqual(len(progress.quarantines), 1)
+            quarantine = progress.quarantines[0]
+            self.assertEqual(quarantine.attempt_number, 1)
+            self.assertEqual(quarantine.receipt_path, quarantine_path)
+            self.assertEqual(
+                quarantine.receipt_sha256,
+                hashlib.sha256(quarantine_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(quarantine.raw_path.read_bytes(), quarantined_body)
+            self.assertEqual(quarantine.raw_byte_count, len(quarantined_body))
+            self.assertEqual(quarantine.error_classification, "SEMANTIC_INVALID")
+
+            with store.acquire_query(query) as lease:
+                published = store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b'{"dates":[]}'),
+                    _sidecar(),
+                )
+            progress = self._read_progress(store, query)
+            self.assertEqual(progress.status, "SUCCESS")
+            self.assertEqual(progress.published_evidence, published)
+            self.assertEqual(tuple(q.attempt_number for q in progress.quarantines), (1,))
+
+    def test_verified_query_progress_streams_shared_quarantine_body_once_per_pass(
+        self,
+    ) -> None:
+        self.assertTrue(hasattr(v52_evidence, "_read_streamed_regular_snapshot_at"))
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            body = b"x" * (2 * 1024 * 1024 + 137)
+            with store.acquire_query(query) as lease:
+                for _ in range(2):
+                    store.quarantine_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(body),
+                        error_classification="SEMANTIC_INVALID",
+                    )
+
+            original_stream = v52_evidence._read_streamed_regular_snapshot_at
+            original_read = v52_evidence.os.read
+            body_streams = 0
+            requested_sizes: list[int] = []
+
+            def tracking_stream(*args: object, **kwargs: object):
+                nonlocal body_streams
+                label = args[2] if len(args) > 2 else kwargs.get("label")
+                if label == "quarantined response body":
+                    body_streams += 1
+                return original_stream(*args, **kwargs)  # type: ignore[arg-type]
+
+            def tracking_read(descriptor: int, size: int) -> bytes:
+                requested_sizes.append(size)
+                return original_read(descriptor, size)
+
+            with (
+                patch.object(
+                    v52_evidence,
+                    "_read_streamed_regular_snapshot_at",
+                    side_effect=tracking_stream,
+                ),
+                patch.object(v52_evidence.os, "read", side_effect=tracking_read),
+            ):
+                progress = self._read_progress(store, query)
+
+            self.assertEqual(progress.status, "QUARANTINED")
+            self.assertEqual(len(progress.quarantines), 2)
+            self.assertEqual(body_streams, 2)
+            self.assertTrue(requested_sizes)
+            self.assertLessEqual(max(requested_sizes), 1024 * 1024)
+
+    def test_verified_query_progress_rejects_declared_body_over_source_cap_before_stream(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                receipt_path = store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"bounded"),
+                    error_classification="SEMANTIC_INVALID",
+                )
+            attempt_path = (
+                root
+                / "queries"
+                / query.source
+                / logical_query_id(query)
+                / "attempts/000001.json"
+            )
+            for path in (receipt_path, attempt_path):
+                receipt = json.loads(path.read_bytes())
+                receipt["byte_count"] = 134_217_729
+                path.write_bytes(_canonical_file(receipt))
+
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "response byte limit|body size limit|cap"
+            ):
+                self._read_progress(store, query)
+
+    def test_verified_query_progress_caps_match_frozen_acquisition_contract(
+        self,
+    ) -> None:
+        contract = json.loads(
+            (
+                ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
+            ).read_bytes()
+        )
+        self.assertEqual(
+            v52_evidence._RESPONSE_BYTE_LIMITS,
+            contract["response_byte_limits"],
+        )
+        cases = (
+            (_query(), "schedule"),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="mlb_schedule_game_feed",
+                    endpoint="https://statsapi.mlb.com/api/v1/game/9001/boxscore",
+                ),
+                "boxscore",
+            ),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="baseball_savant_statcast",
+                    endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+                ),
+                "statcast",
+            ),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="mlb_stats_pitching",
+                    endpoint="https://statsapi.mlb.com/api/v1/stats",
+                ),
+                "league_pitching",
+            ),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="mlb_stats_pitcher_bf",
+                    endpoint="https://statsapi.mlb.com/api/v1/people/101/stats",
+                ),
+                "career_bf",
+            ),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="venue_team_timezone_table",
+                    endpoint="https://statsapi.mlb.com/api/v1/teams",
+                ),
+                "team",
+            ),
+            (
+                dataclasses.replace(
+                    _query(),
+                    source="venue_team_timezone_table",
+                    endpoint="https://statsapi.mlb.com/api/v1/venues/10",
+                ),
+                "venue",
+            ),
+        )
+        for query, key in cases:
+            with self.subTest(key=key):
+                limit = contract["response_byte_limits"][key]
+                self.assertEqual(
+                    v52_evidence._response_byte_limit(query),
+                    limit,
+                )
+                self.assertEqual(
+                    v52_evidence._validate_query_byte_count(query, limit),
+                    limit,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "source response byte limit"
+                ):
+                    v52_evidence._validate_query_byte_count(query, limit + 1)
+
+    def test_verified_query_progress_rejects_declared_quarantine_aggregate_cap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                for number in range(1, 8):
+                    store.quarantine_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(f"body-{number}".encode("ascii")),
+                        error_classification="SEMANTIC_INVALID",
+                    )
+            query_id = logical_query_id(query)
+            attempts = root / "queries" / query.source / query_id / "attempts"
+            quarantine = root / "quarantine" / query.source / query_id
+            for number in range(1, 8):
+                for path in (
+                    attempts / f"{number:06d}.json",
+                    quarantine / f"{number:06d}.json",
+                ):
+                    receipt = json.loads(path.read_bytes())
+                    receipt["byte_count"] = 134_217_728
+                    path.write_bytes(_canonical_file(receipt))
+
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "aggregate response byte limit"
+            ):
+                self._read_progress(store, query)
+
+    def test_attempt_global_cap_is_shared_by_verifier_and_all_writers(self) -> None:
+        valid = v52_evidence._attempt_record(
+            logical_query_id(_query()),
+            1,
+            _capture(b"four"),
+            "SUCCESS",
+        )
+        valid["byte_count"] = 268_435_457
+        with self.assertRaisesRegex(ValueError, "response byte limit|maximum"):
+            v52_evidence._validate_attempt_record(
+                valid,
+                logical_query_id(_query()),
+                1,
+            )
+
+        operations = ("record", "publish")
+        for operation in operations:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    attempt = store.next_attempt_number(lease)
+                    with (
+                        patch.object(
+                            v52_evidence, "_MAX_RESPONSE_BYTE_COUNT", 3
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "response byte limit|maximum"
+                        ),
+                    ):
+                        if operation == "record":
+                            store.record_attempt(
+                                query,
+                                attempt,
+                                _capture(b"four", status=500, error="HTTP_500"),
+                                outcome="TRANSIENT_HTTP",
+                            )
+                        else:
+                            store.publish_fetched(
+                                query,
+                                attempt,
+                                _capture(b"four"),
+                                _sidecar(),
+                            )
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                self.assertFalse((query_root / "attempts/000001.json").exists())
+                self.assertEqual(list((query_root / "objects").iterdir()), [])
+                self.assertFalse((query_root / "success.json").exists())
+
+    def test_source_cap_is_shared_by_attempt_writers_before_artifacts(self) -> None:
+        for operation in ("record", "publish"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    attempt = store.next_attempt_number(lease)
+                    with (
+                        patch.object(
+                            v52_evidence, "_response_byte_limit", return_value=3
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "source response byte limit"
+                        ),
+                    ):
+                        if operation == "record":
+                            store.record_attempt(
+                                query,
+                                attempt,
+                                _capture(b"four", status=500, error="HTTP_500"),
+                                outcome="TRANSIENT_HTTP",
+                            )
+                        else:
+                            store.publish_fetched(
+                                query,
+                                attempt,
+                                _capture(b"four"),
+                                _sidecar(),
+                            )
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                self.assertFalse((query_root / "attempts/000001.json").exists())
+                self.assertEqual(list((query_root / "objects").iterdir()), [])
+                self.assertEqual(list((query_root / "sidecars").iterdir()), [])
+                self.assertFalse((query_root / "success.json").exists())
+
+    def test_verified_readers_reject_source_oversized_attempt_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.record_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"four", status=500, error="HTTP_500"),
+                    outcome="TRANSIENT_HTTP",
+                )
+            with (
+                patch.object(v52_evidence, "_response_byte_limit", return_value=3),
+                self.assertRaisesRegex(ValueError, "source response byte limit"),
+            ):
+                self._read_progress(store, query)
+
+        for reader in ("success", "progress"):
+            with self.subTest(reader=reader), tempfile.TemporaryDirectory() as td:
+                store = V52EvidenceStore(_tmp(td) / "raw")
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"four"),
+                        _sidecar(),
+                    )
+                with (
+                    patch.object(
+                        v52_evidence, "_response_byte_limit", return_value=3
+                    ),
+                    self.assertRaisesRegex(ValueError, "source response byte limit"),
+                ):
+                    if reader == "success":
+                        store.read_verified_success(query)
+                    else:
+                        self._read_progress(store, query)
+
+    def test_attempt_writers_reject_oversized_existing_history_before_artifacts(
+        self,
+    ) -> None:
+        for operation in ("record", "publish"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    store.record_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"four", status=500, error="HTTP_500"),
+                        outcome="TRANSIENT_HTTP",
+                    )
+
+                with (
+                    patch.object(
+                        v52_evidence, "_response_byte_limit", return_value=3
+                    ),
+                    store.acquire_query(query) as lease,
+                ):
+                    attempt = store.next_attempt_number(lease)
+                    with self.assertRaisesRegex(
+                        ValueError, "source response byte limit"
+                    ):
+                        if operation == "record":
+                            store.record_attempt(
+                                query,
+                                attempt,
+                                _capture(None, status=None, error="TIMEOUT"),
+                                outcome="TRANSIENT_NETWORK",
+                            )
+                        else:
+                            store.publish_fetched(
+                                query,
+                                attempt,
+                                _capture(b"ok"),
+                                _sidecar(),
+                            )
+
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                attempts = query_root / "attempts"
+                self.assertTrue((attempts / "000002.reservation.json").exists())
+                self.assertFalse((attempts / "000002.json").exists())
+                self.assertEqual(list((query_root / "objects").iterdir()), [])
+                self.assertEqual(list((query_root / "sidecars").iterdir()), [])
+                self.assertFalse((query_root / "success.json").exists())
+
+    def test_quarantine_writer_rejects_projected_aggregate_before_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with patch.object(v52_evidence, "_response_byte_limit", return_value=4):
+                with store.acquire_query(query) as lease:
+                    bodies = (b"aaaa", b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee", b"ffff")
+                    for body in bodies:
+                        store.quarantine_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            _capture(body),
+                            error_classification="SEMANTIC_INVALID",
+                        )
+                    rejected_attempt = store.next_attempt_number(lease)
+                    rejected_body = b"gggg"
+                    with self.assertRaisesRegex(
+                        ValueError, "aggregate response byte limit|projected"
+                    ):
+                        store.quarantine_attempt(
+                            query,
+                            rejected_attempt,
+                            _capture(rejected_body),
+                            error_classification="SEMANTIC_INVALID",
+                        )
+
+            query_id = logical_query_id(query)
+            attempts = root / "queries" / query.source / query_id / "attempts"
+            quarantine = root / "quarantine" / query.source / query_id
+            rejected_digest = hashlib.sha256(rejected_body).hexdigest()
+            self.assertTrue(
+                (attempts / f"{rejected_attempt:06d}.reservation.json").exists()
+            )
+            self.assertFalse((attempts / f"{rejected_attempt:06d}.json").exists())
+            self.assertFalse((quarantine / f"{rejected_attempt:06d}.json").exists())
+            self.assertFalse((quarantine / f"{rejected_digest}.raw").exists())
+            self.assertEqual(
+                len(list(quarantine.glob("*.raw"))),
+                6,
+                "the duplicate digest must not count twice",
+            )
+
+    def test_quarantine_duplicate_digest_reuses_streaming_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            body = b"same quarantined body"
+            original_read = v52_evidence._read_regular_at
+
+            def reject_duplicate_whole_file_read(
+                parent_fd: int,
+                name: str,
+                label: str,
+                *args: object,
+                **kwargs: object,
+            ) -> bytes | None:
+                if label == "quarantined response body":
+                    raise AssertionError(
+                        "verified duplicate raw body must not be read whole again"
+                    )
+                return original_read(
+                    parent_fd,
+                    name,
+                    label,
+                    *args,
+                    **kwargs,
+                )
+
+            with store.acquire_query(query) as lease:
+                store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(body),
+                    error_classification="SEMANTIC_INVALID",
+                )
+                with patch.object(
+                    v52_evidence,
+                    "_read_regular_at",
+                    side_effect=reject_duplicate_whole_file_read,
+                ):
+                    store.quarantine_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(body),
+                        error_classification="SEMANTIC_INVALID",
+                    )
+
+    def test_verified_query_progress_rejects_mixed_canonical_root_generations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = _tmp(td)
+            first_root = base / "first"
+            second_root = base / "second"
+            store = V52EvidenceStore(first_root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"invalid-but-owned"),
+                    error_classification="SEMANTIC_INVALID",
+                )
+            shutil.copytree(first_root, second_root)
+            roots = (first_root, second_root, second_root, first_root)
+            calls = 0
+
+            def alternating_root() -> int:
+                nonlocal calls
+                selected = roots[calls] if calls < len(roots) else first_root
+                calls += 1
+                return v52_evidence._open_root_path(selected, create=False)
+
+            with (
+                patch.object(store, "_root_fd", side_effect=alternating_root),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "root|generation|stitch|identity"
+                ),
+            ):
+                self._read_progress(store, query)
+
+    def test_verified_query_progress_rejects_quarantine_receipt_and_body_tamper(
+        self,
+    ) -> None:
+        mutations = ("path", "attempt", "body")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    receipt_path = store.quarantine_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"invalid-but-owned"),
+                        error_classification="SEMANTIC_INVALID",
+                    )
+                receipt = json.loads(receipt_path.read_bytes())
+                raw_path = root / receipt["quarantined_body_path"]
+                if mutation == "path":
+                    receipt["quarantined_body_path"] = (
+                        f"quarantine/{query.source}/{logical_query_id(query)}/"
+                        + "0" * 64
+                        + ".raw"
+                    )
+                    receipt_path.write_bytes(_canonical_file(receipt))
+                elif mutation == "attempt":
+                    receipt["error_classification"] = "DIFFERENT"
+                    receipt_path.write_bytes(_canonical_file(receipt))
+                else:
+                    raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "quarantine|quarantined|body|attempt|hash|binding|path|identity",
+                ):
+                    self._read_progress(store, query)
+
+    def test_verified_query_progress_rejects_orphan_missing_and_aliased_quarantine(
+        self,
+    ) -> None:
+        mutations = (
+            "orphan-without-query",
+            "orphan-directory",
+            "missing-receipt",
+            "missing-body",
+            "extra-member",
+            "symlink",
+            "hardlink",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                query_id = logical_query_id(query)
+                if mutation in {"orphan-without-query", "orphan-directory"}:
+                    if mutation == "orphan-directory":
+                        store.register_query(query)
+                    (root / "quarantine" / query.source / query_id).mkdir(parents=True)
+                else:
+                    with store.acquire_query(query) as lease:
+                        receipt_path = store.quarantine_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            _capture(b"invalid-but-owned"),
+                            error_classification="SEMANTIC_INVALID",
+                        )
+                    receipt = json.loads(receipt_path.read_bytes())
+                    raw_path = root / receipt["quarantined_body_path"]
+                    if mutation == "missing-receipt":
+                        receipt_path.unlink()
+                    elif mutation == "missing-body":
+                        raw_path.unlink()
+                    elif mutation == "extra-member":
+                        (receipt_path.parent / "unexpected.raw").write_bytes(b"orphan")
+                    elif mutation == "symlink":
+                        outside = root / "outside.raw"
+                        outside.write_bytes(raw_path.read_bytes())
+                        raw_path.unlink()
+                        raw_path.symlink_to(outside)
+                    else:
+                        os.link(raw_path, root / "hardlink-alias.raw")
+
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "quarantine|quarantined|missing|ambiguous|regular|membership|alias",
+                ):
+                    self._read_progress(store, query)
+
+    def test_verified_query_progress_shared_lock_hides_inflight_writer(self) -> None:
+        self.assertTrue(hasattr(V52EvidenceStore, "read_verified_query_progress"))
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            store.register_query(query)
+            entered = threading.Event()
+            release = threading.Event()
+            reader_done = threading.Event()
+            result: list[object] = []
+
+            def writer() -> None:
+                with store.acquire_query(query):
+                    entered.set()
+                    release.wait(5)
+
+            def reader() -> None:
+                result.append(self._read_progress(store, query))
+                reader_done.set()
+
+            writer_thread = threading.Thread(target=writer)
+            reader_thread = threading.Thread(target=reader)
+            writer_thread.start()
+            self.assertTrue(entered.wait(2))
+            reader_thread.start()
+            self.assertFalse(reader_done.wait(0.1))
+            release.set()
+            writer_thread.join(2)
+            reader_thread.join(2)
+            self.assertFalse(writer_thread.is_alive())
+            self.assertFalse(reader_thread.is_alive())
+            self.assertEqual(result[0].status, "PENDING")
+
+    def test_verified_query_progress_shared_lock_blocks_writer_until_read_finishes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            store.register_query(query)
+            reader_holds_lock = threading.Event()
+            release_reader = threading.Event()
+            writer_entered = threading.Event()
+            thread_errors: list[BaseException] = []
+            original = store._verified_attempt_bundle
+            blocked = False
+
+            def block_reader(*args: object, **kwargs: object):
+                nonlocal blocked
+                result = original(*args, **kwargs)  # type: ignore[arg-type]
+                if not blocked:
+                    blocked = True
+                    reader_holds_lock.set()
+                    release_reader.wait(5)
+                return result
+
+            def reader() -> None:
+                try:
+                    self._read_progress(store, query)
+                except BaseException as exc:
+                    thread_errors.append(exc)
+
+            def writer() -> None:
+                try:
+                    with store.acquire_query(query):
+                        writer_entered.set()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+
+            with patch.object(
+                store, "_verified_attempt_bundle", side_effect=block_reader
+            ):
+                reader_thread = threading.Thread(target=reader)
+                writer_thread = threading.Thread(target=writer)
+                reader_thread.start()
+                self.assertTrue(reader_holds_lock.wait(2))
+                writer_thread.start()
+                self.assertFalse(writer_entered.wait(0.1))
+                release_reader.set()
+                reader_thread.join(2)
+                writer_thread.join(2)
+            self.assertFalse(reader_thread.is_alive())
+            self.assertFalse(writer_thread.is_alive())
+            self.assertTrue(writer_entered.is_set())
+            self.assertEqual(thread_errors, [])
+
+    def test_verified_query_progress_repeated_exceptions_do_not_leak_descriptors(
+        self,
+    ) -> None:
+        descriptor_directory = Path("/dev/fd")
+        if not descriptor_directory.is_dir():
+            self.skipTest("descriptor inventory is unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                receipt_path = store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"invalid-but-owned"),
+                    error_classification="SEMANTIC_INVALID",
+                )
+            receipt = json.loads(receipt_path.read_bytes())
+            raw_path = root / receipt["quarantined_body_path"]
+            raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+            before = len(list(descriptor_directory.iterdir()))
+            for _ in range(20):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self._read_progress(store, query)
+            after = len(list(descriptor_directory.iterdir()))
+            self.assertEqual(after, before)
+
+    def test_verified_query_progress_rejects_quarantine_mutation_during_rebind(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                receipt_path = store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"invalid-but-owned"),
+                    error_classification="SEMANTIC_INVALID",
+                )
+            receipt = json.loads(receipt_path.read_bytes())
+            raw_path = root / receipt["quarantined_body_path"]
+            original = v52_evidence._read_streamed_regular_snapshot_at
+            body_passes = 0
+
+            def mutate_before_final_stream(*args: object, **kwargs: object):
+                nonlocal body_passes
+                label = args[2] if len(args) > 2 else kwargs.get("label")
+                if label == "quarantined response body":
+                    body_passes += 1
+                if body_passes == 2:
+                    raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(
+                    v52_evidence,
+                    "_read_streamed_regular_snapshot_at",
+                    side_effect=mutate_before_final_stream,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "quarantine|body|identity|changed"
+                ),
+            ):
+                self._read_progress(store, query)
+
+    def test_quarantine_receipt_schema_is_closed_and_branch_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                receipt_path = store.quarantine_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(b"invalid-but-owned"),
+                    error_classification="SEMANTIC_INVALID",
+                )
+            schema = json.loads(MANIFEST_SCHEMA.read_bytes())
+            receipt = json.loads(receipt_path.read_bytes())
+            jsonschema.Draft202012Validator.check_schema(schema)
+            jsonschema.validate(receipt, schema)
+            receipt["unknown"] = "forbidden"
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(receipt, schema)
+            oversized = json.loads(receipt_path.read_bytes())
+            oversized["byte_count"] = 268_435_457
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(oversized, schema)
+
+    def test_evidence_manifest_schema_uses_canonical_sorted_json_bytes(self) -> None:
+        contents = MANIFEST_SCHEMA.read_bytes()
+        self.assertEqual(contents, _canonical_file(json.loads(contents)))
 
     def test_verified_read_returns_one_fully_bound_fetched_and_legacy_bundle(self):
         with tempfile.TemporaryDirectory() as td:

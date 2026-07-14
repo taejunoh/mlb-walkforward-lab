@@ -82,6 +82,19 @@ _V52_RAW_RELATIVE = Path("data/v5_2_qd/historical/raw")
 _PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
 _DERIVED_ENDPOINT = "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
 _DERIVED_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+_STREAM_CHUNK_BYTES = 1024 * 1024
+_RESPONSE_BYTE_LIMITS = {
+    "boxscore": 16_777_216,
+    "career_bf": 16_777_216,
+    "league_pitching": 16_777_216,
+    "schedule": 134_217_728,
+    "statcast": 268_435_456,
+    "team": 16_777_216,
+    "venue": 16_777_216,
+}
+_MAX_RESPONSE_BYTE_COUNT = max(_RESPONSE_BYTE_LIMITS.values())
+# The frozen retry policy has five retry delays, hence at most six owned bodies.
+_MAX_QUARANTINE_BODIES_PER_QUERY = 6
 
 
 @dataclass(frozen=True)
@@ -132,6 +145,28 @@ class VerifiedEvidenceRead:
     attempt_receipts: tuple[Mapping[str, object], ...]
 
 
+@dataclass(frozen=True)
+class VerifiedQuarantineRead:
+    attempt_number: int
+    receipt_path: Path
+    receipt_sha256: str
+    raw_path: Path
+    raw_sha256: str
+    raw_byte_count: int
+    error_classification: str
+
+
+@dataclass(frozen=True)
+class VerifiedQueryProgress:
+    query_id: str
+    status: Literal["SUCCESS", "QUARANTINED", "PENDING"]
+    registered_query: LogicalQuery | None
+    published_evidence: PublishedEvidence | None
+    attempt_receipts: tuple[Mapping[str, object], ...]
+    pending_attempt_numbers: tuple[int, ...]
+    quarantines: tuple[VerifiedQuarantineRead, ...]
+
+
 class ProtectedLegacyPublishReverifyError(ValueError):
     """Final protected-lineage revalidation failed during publication."""
 
@@ -139,6 +174,13 @@ class ProtectedLegacyPublishReverifyError(ValueError):
 @dataclass(frozen=True)
 class _RegularSnapshot:
     contents: bytes
+    identity: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _StreamedRegularSnapshot:
+    sha256: str
+    byte_count: int
     identity: tuple[int, ...]
 
 
@@ -257,6 +299,58 @@ def canonical_query_bytes(query: LogicalQuery) -> bytes:
 
 def logical_query_id(query: LogicalQuery) -> str:
     return hashlib.sha256(canonical_query_bytes(query)).hexdigest()
+
+
+def _response_byte_limit(query: LogicalQuery) -> int:
+    endpoint = query.endpoint
+    if query.source == "baseball_savant_statcast" and endpoint == (
+        "https://baseballsavant.mlb.com/statcast_search/csv"
+    ):
+        key = "statcast"
+    elif query.source in {"mlb_schedule", "mlb_schedule_game_feed"}:
+        if endpoint == "https://statsapi.mlb.com/api/v1/schedule":
+            key = "schedule"
+        elif re.fullmatch(
+            r"https://statsapi\.mlb\.com/api/v1/game/[1-9][0-9]*/boxscore",
+            endpoint,
+        ):
+            key = "boxscore"
+        else:
+            raise ValueError("query has no frozen response byte limit")
+    elif query.source == "mlb_stats_pitching" and endpoint == (
+        "https://statsapi.mlb.com/api/v1/stats"
+    ):
+        key = "league_pitching"
+    elif query.source == "mlb_stats_pitcher_bf" and re.fullmatch(
+        r"https://statsapi\.mlb\.com/api/v1/people/[1-9][0-9]*/stats",
+        endpoint,
+    ):
+        key = "career_bf"
+    elif query.source == "venue_team_timezone_table":
+        if endpoint == "https://statsapi.mlb.com/api/v1/teams":
+            key = "team"
+        elif re.fullmatch(
+            r"https://statsapi\.mlb\.com/api/v1/venues/[1-9][0-9]*",
+            endpoint,
+        ):
+            key = "venue"
+        else:
+            raise ValueError("query has no frozen response byte limit")
+    else:
+        raise ValueError("query has no frozen response byte limit")
+    return _RESPONSE_BYTE_LIMITS[key]
+
+
+def _validate_query_byte_count(query: LogicalQuery, byte_count: object) -> int:
+    limit = _response_byte_limit(query)
+    if (
+        isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+        or byte_count > limit
+    ):
+        raise ValueError("attempt exceeds its source response byte limit")
+    return limit
 
 
 def _registration_contents(query: LogicalQuery, lock_metadata: os.stat_result) -> bytes:
@@ -474,6 +568,65 @@ def _rebind_regular_snapshot_at(
         raise ValueError(f"{label} identity or bytes changed during verification")
 
 
+def _read_streamed_regular_snapshot_at(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    expected_byte_count: int,
+    maximum_byte_count: int,
+) -> _StreamedRegularSnapshot:
+    _validate_segment(name, f"{label} filename")
+    descriptor = -1
+    try:
+        descriptor = os.open(name, _regular_read_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise RuntimeError(f"{label} is missing") from None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENXIO}:
+            raise ValueError(f"{label} must be a no-follow regular file") from exc
+        raise ValueError(f"{label} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or _identity(before) != _identity(linked)
+        ):
+            raise ValueError(f"{label} must be an unaliased regular file")
+        if (
+            isinstance(expected_byte_count, bool)
+            or not isinstance(expected_byte_count, int)
+            or expected_byte_count < 0
+            or expected_byte_count > maximum_byte_count
+            or before.st_size != expected_byte_count
+        ):
+            raise ValueError(f"{label} response byte limit or declared size differs")
+        digest = hashlib.sha256()
+        byte_count = 0
+        while chunk := os.read(descriptor, _STREAM_CHUNK_BYTES):
+            byte_count += len(chunk)
+            if byte_count > expected_byte_count:
+                raise ValueError(f"{label} exceeded its declared byte count")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _identity(before) != _identity(after)
+            or _identity(after) != _identity(rebound)
+            or byte_count != expected_byte_count
+        ):
+            raise ValueError(f"{label} identity or size changed while streaming")
+        return _StreamedRegularSnapshot(
+            sha256=digest.hexdigest(),
+            byte_count=byte_count,
+            identity=_identity(after),
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _cleanup_created_file(
     parent_fd: int, descriptor: int, name: str, label: str
 ) -> None:
@@ -647,8 +800,12 @@ def _validate_attempt_record(
     if status is not None and (type(status) is not int or not 100 <= status <= 599):
         raise ValueError("attempt receipt HTTP status differs")
     byte_count = record["byte_count"]
-    if type(byte_count) is not int or byte_count < 0:
-        raise ValueError("attempt receipt byte count differs")
+    if (
+        type(byte_count) is not int
+        or byte_count < 0
+        or byte_count > _MAX_RESPONSE_BYTE_COUNT
+    ):
+        raise ValueError("attempt receipt exceeds the maximum response byte limit")
     body_sha256 = record["body_sha256"]
     if body_sha256 is None:
         if byte_count != 0:
@@ -768,10 +925,20 @@ class V52EvidenceStore:
     def _root_fd(self) -> int:
         return _open_root_path(self._canonical_root, create=False)
 
-    def _query_fds(self, query: LogicalQuery, *, create: bool) -> tuple[str, list[int]]:
+    def _query_fds(
+        self,
+        query: LogicalQuery,
+        *,
+        create: bool,
+        root_descriptor: int | None = None,
+    ) -> tuple[str, list[int]]:
         query_id = logical_query_id(query)
         descriptors: list[int] = []
-        root_fd = self._root_fd()
+        root_fd = (
+            self._root_fd()
+            if root_descriptor is None
+            else os.dup(root_descriptor)
+        )
         descriptors.append(root_fd)
         try:
             queries_fd = _open_directory_at(root_fd, "queries", create=create)
@@ -779,6 +946,109 @@ class V52EvidenceStore:
             source_fd = _open_directory_at(queries_fd, query.source, create=create)
             descriptors.append(source_fd)
             query_fd = _open_directory_at(source_fd, query_id, create=create)
+            descriptors.append(query_fd)
+            return query_id, descriptors
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            raise
+
+    def _probe_progress_namespaces(
+        self,
+        query: LogicalQuery,
+    ) -> tuple[list[int] | None, bool, bool]:
+        root_fd = self._root_fd()
+        query_descriptors: list[int] | None = None
+        quarantine_descriptors: list[int] | None = None
+        try:
+            try:
+                _, query_descriptors = self._query_fds(
+                    query,
+                    create=False,
+                    root_descriptor=root_fd,
+                )
+            except FileNotFoundError:
+                query_descriptors = None
+            try:
+                _, quarantine_descriptors = self._quarantine_fds(
+                    query,
+                    root_descriptor=root_fd,
+                )
+            except FileNotFoundError:
+                quarantine_descriptors = None
+            quarantine_exists = quarantine_descriptors is not None
+            if query_descriptors is None:
+                try:
+                    _, query_descriptors = self._query_fds(
+                        query,
+                        create=False,
+                        root_descriptor=root_fd,
+                    )
+                except FileNotFoundError:
+                    query_descriptors = None
+                if query_descriptors is None:
+                    repeated_quarantine: list[int] | None = None
+                    try:
+                        _, repeated_quarantine = self._quarantine_fds(
+                            query,
+                            root_descriptor=root_fd,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        quarantine_exists = True
+                    finally:
+                        if repeated_quarantine is not None:
+                            self._close_fds(repeated_quarantine)
+            fresh_root = self._root_fd()
+            try:
+                opened = os.fstat(root_fd)
+                fresh = os.fstat(fresh_root)
+                stable = (opened.st_dev, opened.st_ino) == (
+                    fresh.st_dev,
+                    fresh.st_ino,
+                )
+            finally:
+                os.close(fresh_root)
+            if quarantine_descriptors is not None:
+                self._close_fds(quarantine_descriptors)
+                quarantine_descriptors = None
+            if not stable:
+                if query_descriptors is not None:
+                    self._close_fds(query_descriptors)
+                return None, False, False
+            return query_descriptors, quarantine_exists, True
+        except BaseException:
+            if quarantine_descriptors is not None:
+                self._close_fds(quarantine_descriptors)
+            if query_descriptors is not None:
+                self._close_fds(query_descriptors)
+            raise
+        finally:
+            os.close(root_fd)
+
+    def _quarantine_fds(
+        self,
+        query: LogicalQuery,
+        *,
+        root_descriptor: int | None = None,
+    ) -> tuple[str, list[int]]:
+        query_id = logical_query_id(query)
+        descriptors: list[int] = []
+        root_fd = (
+            self._root_fd()
+            if root_descriptor is None
+            else os.dup(root_descriptor)
+        )
+        descriptors.append(root_fd)
+        try:
+            quarantine_fd = _open_directory_at(root_fd, "quarantine", create=False)
+            descriptors.append(quarantine_fd)
+            source_fd = _open_directory_at(
+                quarantine_fd, query.source, create=False
+            )
+            descriptors.append(source_fd)
+            query_fd = _open_directory_at(source_fd, query_id, create=False)
             descriptors.append(query_fd)
             return query_id, descriptors
         except BaseException:
@@ -823,6 +1093,59 @@ class V52EvidenceStore:
                     raise ValueError("query directory identity changed")
         except OSError as exc:
             raise ValueError("query directory identity changed") from exc
+
+    def _verify_quarantine_descriptor_chain(
+        self,
+        source: str,
+        query_id: str,
+        descriptors: tuple[int, ...] | list[int],
+    ) -> None:
+        if len(descriptors) != 4:
+            raise ValueError("quarantine descriptor chain differs")
+        fresh_root = self._root_fd()
+        try:
+            if (
+                os.fstat(fresh_root).st_dev,
+                os.fstat(fresh_root).st_ino,
+            ) != (
+                os.fstat(descriptors[0]).st_dev,
+                os.fstat(descriptors[0]).st_ino,
+            ):
+                raise ValueError("evidence root identity changed")
+        finally:
+            os.close(fresh_root)
+        try:
+            for index, name in enumerate(("quarantine", source, query_id)):
+                opened = os.fstat(descriptors[index + 1])
+                linked = os.stat(name, dir_fd=descriptors[index], follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("quarantine directory identity changed")
+        except OSError as exc:
+            raise ValueError("quarantine directory identity changed") from exc
+
+    def _verify_progress_root_stitch(
+        self,
+        query_descriptors: tuple[int, ...] | list[int],
+        quarantine_descriptors: tuple[int, ...] | list[int] | None,
+    ) -> None:
+        query_root = os.fstat(query_descriptors[0])
+        expected = (query_root.st_dev, query_root.st_ino)
+        if quarantine_descriptors is not None:
+            quarantine_root = os.fstat(quarantine_descriptors[0])
+            if (quarantine_root.st_dev, quarantine_root.st_ino) != expected:
+                raise ValueError("query and quarantine root generations differ")
+        fresh_root = self._root_fd()
+        try:
+            fresh = os.fstat(fresh_root)
+            if (fresh.st_dev, fresh.st_ino) != expected:
+                raise ValueError("progress evidence root generation changed")
+        finally:
+            os.close(fresh_root)
 
     def _verify_query_chain(self, query: LogicalQuery, descriptors: list[int]) -> None:
         self._verify_query_descriptor_chain(
@@ -1204,12 +1527,14 @@ class V52EvidenceStore:
     ) -> Path:
         self._require_lease(query)
         self._ensure_unpublished(query)
+        record = _attempt_record(
+            logical_query_id(query), attempt_number, capture, outcome
+        )
+        _validate_query_byte_count(query, record["byte_count"])
         attempts_fd, descriptors = self._attempts_fd(query)
         try:
             self._validate_attempt_reservation(query, attempt_number, attempts_fd)
-            record = _attempt_record(
-                logical_query_id(query), attempt_number, capture, outcome
-            )
+            self._verified_attempt_bundle(query, attempts_fd)
             name = f"{attempt_number:06d}.json"
             _write_once_at(
                 attempts_fd,
@@ -1240,30 +1565,77 @@ class V52EvidenceStore:
         if capture.body is None:
             raise ValueError("a quarantined attempt must own body bytes")
         query_id = logical_query_id(query)
-        attempts_fd, attempt_descriptors = self._attempts_fd(query)
-        try:
-            self._validate_attempt_reservation(query, attempt_number, attempts_fd)
-        finally:
-            os.close(attempts_fd)
-            self._close_fds(attempt_descriptors)
         body = capture.body
         digest = _sha256_bytes(body)
-        root_fd = self._root_fd()
-        descriptors = [root_fd]
+        attempt_record = _attempt_record(
+            query_id,
+            attempt_number,
+            capture,
+            "QUARANTINED",
+            error_classification=error_classification,
+        )
+        body_limit = _validate_query_byte_count(query, len(body))
+        attempts_fd, attempt_descriptors = self._attempts_fd(query)
+        quarantine_descriptors: list[int] | None = None
         try:
-            for name in ("quarantine", query.source, query_id):
-                child = _open_directory_at(descriptors[-1], name, create=True)
-                descriptors.append(child)
-            quarantine_fd = descriptors[-1]
-            body_name = f"{digest}.raw"
-            _write_once_at(quarantine_fd, body_name, body, "quarantined response body")
-            attempt_record = _attempt_record(
-                query_id,
-                attempt_number,
-                capture,
-                "QUARANTINED",
-                error_classification=error_classification,
+            self._validate_attempt_reservation(query, attempt_number, attempts_fd)
+            _, _, attempt_receipts, _ = self._verified_attempt_bundle(
+                query, attempts_fd
             )
+            quarantined_attempts = tuple(
+                record
+                for record in attempt_receipts
+                if record.get("outcome") == "QUARANTINED"
+            )
+            try:
+                _, quarantine_descriptors = self._quarantine_fds(
+                    query,
+                    root_descriptor=attempt_descriptors[0],
+                )
+            except FileNotFoundError:
+                if quarantined_attempts:
+                    raise RuntimeError("quarantine directory is missing") from None
+            existing_bodies: dict[str, int] = {}
+            if quarantine_descriptors is not None:
+                verified, _, _, _ = self._verified_quarantine_bundle(
+                    query,
+                    quarantine_descriptors[-1],
+                    attempt_receipts,
+                )
+                for item in verified:
+                    prior = existing_bodies.setdefault(
+                        item.raw_sha256, item.raw_byte_count
+                    )
+                    if prior != item.raw_byte_count:
+                        raise ValueError("shared quarantine body byte count differs")
+            projected_byte_count = sum(existing_bodies.values())
+            if digest in existing_bodies:
+                if existing_bodies[digest] != len(body):
+                    raise ValueError("shared quarantine body byte count differs")
+            else:
+                projected_byte_count += len(body)
+            if (
+                projected_byte_count
+                > body_limit * _MAX_QUARANTINE_BODIES_PER_QUERY
+            ):
+                raise ValueError("quarantine aggregate response byte limit exceeded")
+
+            if quarantine_descriptors is None:
+                quarantine_descriptors = [os.dup(attempt_descriptors[0])]
+                for name in ("quarantine", query.source, query_id):
+                    child = _open_directory_at(
+                        quarantine_descriptors[-1], name, create=True
+                    )
+                    quarantine_descriptors.append(child)
+            quarantine_fd = quarantine_descriptors[-1]
+            body_name = f"{digest}.raw"
+            if digest not in existing_bodies:
+                _write_once_at(
+                    quarantine_fd,
+                    body_name,
+                    body,
+                    "quarantined response body",
+                )
             receipt = {
                 **attempt_record,
                 "quarantined_body_path": Path(
@@ -1278,23 +1650,18 @@ class V52EvidenceStore:
                 _canonical_file_bytes(receipt),
                 "quarantine receipt",
             )
+            _write_once_at(
+                attempts_fd,
+                receipt_name,
+                _canonical_file_bytes(attempt_record),
+                "attempt receipt",
+            )
+            self._require_lease(query)
         finally:
-            self._close_fds(descriptors)
-        classified_capture = AttemptCapture(
-            started_at_utc=capture.started_at_utc,
-            ended_at_utc=capture.ended_at_utc,
-            final_url=capture.final_url,
-            http_status=capture.http_status,
-            response_headers=capture.response_headers,
-            body=capture.body,
-            error_classification=error_classification,
-        )
-        self.record_attempt(
-            query,
-            attempt_number,
-            classified_capture,
-            outcome="QUARANTINED",
-        )
+            if quarantine_descriptors is not None:
+                self._close_fds(quarantine_descriptors)
+            os.close(attempts_fd)
+            self._close_fds(attempt_descriptors)
         return self.root / "quarantine" / query.source / query_id / receipt_name
 
     def _attempt_history(self, query: LogicalQuery) -> list[dict[str, object]]:
@@ -1380,6 +1747,7 @@ class V52EvidenceStore:
                 contents = snapshot.contents
                 record = _json_object(contents, "attempt receipt")
                 _validate_attempt_record(record, query_id, number)
+                _validate_query_byte_count(query, record["byte_count"])
                 receipts[number] = (record, contents)
                 artifact_snapshots.append((name, snapshot))
             else:
@@ -1404,6 +1772,156 @@ class V52EvidenceStore:
             )
             records.append(record)
         return reservations, history, tuple(records), tuple(artifact_snapshots)
+
+    def _verified_quarantine_bundle(
+        self,
+        query: LogicalQuery,
+        quarantine_fd: int,
+        attempt_receipts: tuple[Mapping[str, object], ...],
+    ) -> tuple[
+        tuple[VerifiedQuarantineRead, ...],
+        tuple[tuple[str, _RegularSnapshot], ...],
+        tuple[tuple[str, _StreamedRegularSnapshot], ...],
+        tuple[str, ...],
+    ]:
+        query_id = logical_query_id(query)
+        body_limit = _response_byte_limit(query)
+        quarantined_attempts = {
+            int(record["attempt_number"]): record
+            for record in attempt_receipts
+            if record.get("outcome") == "QUARANTINED"
+        }
+        try:
+            membership = tuple(sorted(os.listdir(quarantine_fd)))
+        except OSError as exc:
+            raise ValueError("quarantine directory cannot be listed safely") from exc
+
+        validated: list[
+            tuple[int, str, _RegularSnapshot, str, str, int, str]
+        ] = []
+        receipt_snapshots: dict[str, _RegularSnapshot] = {}
+        expected_members: set[str] = set()
+        declared_bodies: dict[str, int] = {}
+        for attempt_number, attempt_record in sorted(quarantined_attempts.items()):
+            receipt_name = f"{attempt_number:06d}.json"
+            expected_members.add(receipt_name)
+            receipt_snapshot = _read_regular_snapshot_at(
+                quarantine_fd,
+                receipt_name,
+                "quarantine receipt",
+            )
+            if receipt_snapshot is None:
+                raise RuntimeError("quarantine receipt is missing")
+            receipt_snapshots[receipt_name] = receipt_snapshot
+            receipt = _json_object(receipt_snapshot.contents, "quarantine receipt")
+            if set(receipt) != _ATTEMPT_KEYS | {
+                "quarantined_body_path",
+                "raw_sha256",
+            }:
+                raise ValueError("quarantine receipt keys differ")
+            projected_attempt = {
+                key: receipt[key]
+                for key in _ATTEMPT_KEYS
+            }
+            _validate_attempt_record(projected_attempt, query_id, attempt_number)
+            if projected_attempt != dict(attempt_record):
+                raise ValueError("quarantine attempt binding differs")
+            if projected_attempt["outcome"] != "QUARANTINED":
+                raise ValueError("quarantine outcome binding differs")
+            raw_sha256 = _validate_sha256(
+                receipt["raw_sha256"], "quarantine raw SHA-256"
+            )
+            if raw_sha256 != projected_attempt["body_sha256"]:
+                raise ValueError("quarantine body hash binding differs")
+            body_name = f"{raw_sha256}.raw"
+            body_relative = Path(
+                "quarantine", query.source, query_id, body_name
+            ).as_posix()
+            if receipt["quarantined_body_path"] != body_relative:
+                raise ValueError("quarantine body path binding differs")
+            expected_members.add(body_name)
+            raw_byte_count = projected_attempt["byte_count"]
+            if (
+                type(raw_byte_count) is not int
+                or raw_byte_count > body_limit
+            ):
+                raise ValueError(
+                    "quarantine response body exceeds its response byte limit"
+                )
+            prior_count = declared_bodies.setdefault(body_name, raw_byte_count)
+            if prior_count != raw_byte_count:
+                raise ValueError("shared quarantine body byte count differs")
+            classification = projected_attempt["error_classification"]
+            if not isinstance(classification, str):
+                raise ValueError("quarantine error classification differs")
+            validated.append(
+                (
+                    attempt_number,
+                    receipt_name,
+                    receipt_snapshot,
+                    raw_sha256,
+                    body_relative,
+                    raw_byte_count,
+                    classification,
+                )
+            )
+
+        if (
+            sum(declared_bodies.values())
+            > body_limit * _MAX_QUARANTINE_BODIES_PER_QUERY
+        ):
+            raise ValueError("quarantine aggregate response byte limit exceeded")
+        if set(membership) != expected_members:
+            raise ValueError("quarantine directory membership is ambiguous")
+
+        body_snapshots = {
+            body_name: _read_streamed_regular_snapshot_at(
+                quarantine_fd,
+                body_name,
+                "quarantined response body",
+                expected_byte_count=raw_byte_count,
+                maximum_byte_count=body_limit,
+            )
+            for body_name, raw_byte_count in sorted(declared_bodies.items())
+        }
+        reads: list[VerifiedQuarantineRead] = []
+        for (
+            attempt_number,
+            receipt_name,
+            receipt_snapshot,
+            raw_sha256,
+            body_relative,
+            raw_byte_count,
+            classification,
+        ) in validated:
+            body_name = f"{raw_sha256}.raw"
+            body_snapshot = body_snapshots[body_name]
+            if (
+                body_snapshot.sha256 != raw_sha256
+                or body_snapshot.byte_count != raw_byte_count
+            ):
+                raise ValueError("quarantine response body binding differs")
+            reads.append(
+                VerifiedQuarantineRead(
+                    attempt_number=attempt_number,
+                    receipt_path=self.root
+                    / "quarantine"
+                    / query.source
+                    / query_id
+                    / receipt_name,
+                    receipt_sha256=_sha256_bytes(receipt_snapshot.contents),
+                    raw_path=self.root / body_relative,
+                    raw_sha256=raw_sha256,
+                    raw_byte_count=raw_byte_count,
+                    error_classification=classification,
+                )
+            )
+        return (
+            tuple(reads),
+            tuple(sorted(receipt_snapshots.items())),
+            tuple(sorted(body_snapshots.items())),
+            membership,
+        )
 
     def _validated_fetched_success_attempt(
         self,
@@ -1612,6 +2130,10 @@ class V52EvidenceStore:
             raise ValueError("fetched success requires response bytes")
         if capture.http_status is None or not 200 <= capture.http_status <= 299:
             raise ValueError("fetched success requires a successful HTTP status")
+        attempt = _attempt_record(
+            logical_query_id(query), attempt_number, capture, "SUCCESS"
+        )
+        _validate_query_byte_count(query, attempt["byte_count"])
         query_id, descriptors = self._query_fds(query, create=False)
         try:
             query_fd = descriptors[-1]
@@ -1624,6 +2146,7 @@ class V52EvidenceStore:
                 sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
                 opened.callback(os.close, sidecars_fd)
                 self._validate_attempt_reservation(query, attempt_number, attempts_fd)
+                self._verified_attempt_bundle(query, attempts_fd)
                 body = capture.body
                 raw_sha256 = _sha256_bytes(body)
                 raw_name = f"{raw_sha256}.raw"
@@ -1640,7 +2163,6 @@ class V52EvidenceStore:
                     sidecar_contents,
                     "query sidecar",
                 )
-                attempt = _attempt_record(query_id, attempt_number, capture, "SUCCESS")
                 _write_once_at(
                     attempts_fd,
                     f"{attempt_number:06d}.json",
@@ -2687,6 +3209,285 @@ class V52EvidenceStore:
             raise RuntimeError("success receipt is missing")
         return verified
 
+    def read_verified_query_progress(
+        self, query: LogicalQuery
+    ) -> VerifiedQueryProgress:
+        query_id = logical_query_id(query)
+        descriptors: list[int] = []
+        for _ in range(2):
+            probed_descriptors, quarantine_exists, stable = (
+                self._probe_progress_namespaces(query)
+            )
+            if not stable:
+                continue
+            if probed_descriptors is not None:
+                descriptors = probed_descriptors
+                break
+            if quarantine_exists:
+                raise ValueError(
+                    "quarantine directory has no registered query"
+                )
+            return VerifiedQueryProgress(
+                query_id=query_id,
+                status="PENDING",
+                registered_query=None,
+                published_evidence=None,
+                attempt_receipts=(),
+                pending_attempt_numbers=(),
+                quarantines=(),
+            )
+        else:
+            raise RuntimeError("progress evidence root could not be read stably")
+
+        lock_descriptor = -1
+        quarantine_descriptors: list[int] | None = None
+        try:
+            query_fd = descriptors[-1]
+            try:
+                lock_descriptor = self._open_query_lock(query_fd, create=False)
+            except FileNotFoundError:
+                raise RuntimeError("query registration lock is missing") from None
+            fcntl.flock(lock_descriptor, fcntl.LOCK_SH)
+            (
+                registration_sha256,
+                registered_query,
+                query_snapshot,
+            ) = self._validated_registered_query(
+                query,
+                query_fd,
+                lock_descriptor=lock_descriptor,
+            )
+            attempts_fd = _open_directory_at(query_fd, "attempts", create=False)
+            try:
+                (
+                    reservations,
+                    history,
+                    attempt_receipts,
+                    attempt_snapshots,
+                ) = self._verified_attempt_bundle(query, attempts_fd)
+                del history
+                success_snapshot = _read_regular_snapshot_at(
+                    query_fd,
+                    "success.json",
+                    "success receipt",
+                    missing_ok=True,
+                )
+                verified_success = (
+                    self._read_verified_success(query, missing_ok=False)
+                    if success_snapshot is not None
+                    else None
+                )
+                if (
+                    verified_success is not None
+                    and verified_success.attempt_receipts != attempt_receipts
+                ):
+                    raise ValueError(
+                        "success attempt history changed during progress read"
+                    )
+
+                quarantine_attempts = tuple(
+                    record
+                    for record in attempt_receipts
+                    if record.get("outcome") == "QUARANTINED"
+                )
+                try:
+                    _, quarantine_descriptors = self._quarantine_fds(
+                        query,
+                        root_descriptor=descriptors[0],
+                    )
+                except FileNotFoundError:
+                    if quarantine_attempts:
+                        raise RuntimeError(
+                            "quarantine directory is missing"
+                        ) from None
+                    quarantine_descriptors = None
+                if quarantine_descriptors is None:
+                    quarantines: tuple[VerifiedQuarantineRead, ...] = ()
+                    quarantine_snapshots: tuple[
+                        tuple[str, _RegularSnapshot], ...
+                    ] = ()
+                    quarantine_body_snapshots: tuple[
+                        tuple[str, _StreamedRegularSnapshot], ...
+                    ] = ()
+                    quarantine_membership: tuple[str, ...] = ()
+                else:
+                    if not quarantine_attempts:
+                        raise ValueError(
+                            "quarantine directory has no bound attempt receipt"
+                        )
+                    (
+                        quarantines,
+                        quarantine_snapshots,
+                        quarantine_body_snapshots,
+                        quarantine_membership,
+                    ) = self._verified_quarantine_bundle(
+                        query,
+                        quarantine_descriptors[-1],
+                        attempt_receipts,
+                    )
+
+                (
+                    final_reservations,
+                    final_history,
+                    final_attempt_receipts,
+                    final_attempt_snapshots,
+                ) = self._verified_attempt_bundle(query, attempts_fd)
+                if (
+                    final_reservations != reservations
+                    or final_attempt_receipts != attempt_receipts
+                    or final_attempt_snapshots != attempt_snapshots
+                ):
+                    raise ValueError(
+                        "attempt namespace changed during progress read"
+                    )
+                del final_history
+                for name, snapshot in attempt_snapshots:
+                    _rebind_regular_snapshot_at(
+                        attempts_fd,
+                        name,
+                        snapshot,
+                        "attempt progress artifact",
+                    )
+
+                if success_snapshot is None:
+                    if (
+                        _read_regular_snapshot_at(
+                            query_fd,
+                            "success.json",
+                            "success receipt",
+                            missing_ok=True,
+                        )
+                        is not None
+                    ):
+                        raise ValueError(
+                            "success receipt appeared during progress read"
+                        )
+                else:
+                    _rebind_regular_snapshot_at(
+                        query_fd,
+                        "success.json",
+                        success_snapshot,
+                        "success receipt",
+                    )
+                    if (
+                        verified_success is None
+                        or _canonical_file_bytes(
+                            dict(verified_success.success_receipt)
+                        )
+                        != success_snapshot.contents
+                    ):
+                        raise ValueError(
+                            "success receipt changed during progress read"
+                        )
+
+                if quarantine_descriptors is None:
+                    try:
+                        _, appeared_descriptors = self._quarantine_fds(
+                            query,
+                            root_descriptor=descriptors[0],
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        self._close_fds(appeared_descriptors)
+                        raise ValueError(
+                            "quarantine directory appeared during progress read"
+                        )
+                else:
+                    (
+                        final_quarantines,
+                        final_quarantine_snapshots,
+                        final_quarantine_body_snapshots,
+                        final_quarantine_membership,
+                    ) = self._verified_quarantine_bundle(
+                        query,
+                        quarantine_descriptors[-1],
+                        attempt_receipts,
+                    )
+                    if (
+                        final_quarantines != quarantines
+                        or final_quarantine_snapshots != quarantine_snapshots
+                        or final_quarantine_body_snapshots
+                        != quarantine_body_snapshots
+                        or final_quarantine_membership != quarantine_membership
+                    ):
+                        raise ValueError(
+                            "quarantine namespace changed during progress read"
+                        )
+                    for name, snapshot in quarantine_snapshots:
+                        _rebind_regular_snapshot_at(
+                            quarantine_descriptors[-1],
+                            name,
+                            snapshot,
+                            "quarantine receipt",
+                        )
+                    self._verify_progress_root_stitch(
+                        descriptors,
+                        quarantine_descriptors,
+                    )
+                    self._verify_quarantine_descriptor_chain(
+                        query.source,
+                        query_id,
+                        quarantine_descriptors,
+                    )
+
+                if quarantine_descriptors is None:
+                    self._verify_progress_root_stitch(descriptors, None)
+
+                (
+                    final_registration_sha256,
+                    final_registered_query,
+                    final_query_snapshot,
+                ) = self._validated_registered_query(
+                    query,
+                    query_fd,
+                    lock_descriptor=lock_descriptor,
+                )
+                if (
+                    final_registration_sha256 != registration_sha256
+                    or final_registered_query != registered_query
+                    or final_query_snapshot != query_snapshot
+                ):
+                    raise ValueError(
+                        "logical query registration changed during progress read"
+                    )
+                self._verify_query_chain(query, descriptors)
+            finally:
+                os.close(attempts_fd)
+
+            receipt_numbers = {
+                int(record["attempt_number"])
+                for record in attempt_receipts
+            }
+            pending_attempt_numbers = tuple(sorted(reservations - receipt_numbers))
+            if verified_success is not None:
+                status: Literal["SUCCESS", "QUARANTINED", "PENDING"] = "SUCCESS"
+                published_evidence = verified_success.published_evidence
+            elif quarantines:
+                status = "QUARANTINED"
+                published_evidence = None
+            else:
+                status = "PENDING"
+                published_evidence = None
+            return VerifiedQueryProgress(
+                query_id=query_id,
+                status=status,
+                registered_query=registered_query,
+                published_evidence=published_evidence,
+                attempt_receipts=attempt_receipts,
+                pending_attempt_numbers=pending_attempt_numbers,
+                quarantines=quarantines,
+            )
+        finally:
+            if quarantine_descriptors is not None:
+                self._close_fds(quarantine_descriptors)
+            if lock_descriptor >= 0:
+                try:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_descriptor)
+            self._close_fds(descriptors)
+
     def verify_success(self, query: LogicalQuery) -> PublishedEvidence:
         return self.read_verified_success(query).published_evidence
 
@@ -2699,6 +3500,8 @@ __all__ = [
     "QueryLease",
     "V52EvidenceStore",
     "VerifiedEvidenceRead",
+    "VerifiedQuarantineRead",
+    "VerifiedQueryProgress",
     "canonical_query_bytes",
     "logical_query_id",
 ]
