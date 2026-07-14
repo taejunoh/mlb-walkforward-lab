@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "acquisition_contract_sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
     "artifact_kind": {"const": "VENUE_TIMEZONE_CANDIDATE"},
     "observed_venue_dates": {
       "items": {
@@ -19,6 +20,8 @@
       "type": "array"
     },
     "schedule_sidecar_sha256s": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "query_batch_ids": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "run_spec_sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
     "schema_version": {"const": 1},
     "timezone_rows": {
       "items": {
@@ -55,6 +58,6 @@
       "type": "array"
     }
   },
-  "required": ["artifact_kind", "observed_venue_dates", "schedule_sidecar_sha256s", "schema_version", "timezone_rows", "venue_scope", "venue_sidecar_sha256s", "venues"],
+  "required": ["acquisition_contract_sha256", "artifact_kind", "observed_venue_dates", "query_batch_ids", "run_spec_sha256", "schedule_sidecar_sha256s", "schema_version", "timezone_rows", "venue_scope", "venue_sidecar_sha256s", "venues"],
   "type": "object"
 }

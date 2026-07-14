@@ -8,6 +8,7 @@ import os
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,11 @@ SEAL_SCHEMA = ROOT / "schemas/v5_2_timezone_seal_receipt.schema.json"
 PRODUCTION_MAPPING = ROOT / "config/v5_2_qd/venue_timezones.json"
 FORBIDDEN_MAPPING = ROOT / "config/v5_2_qd_venue_timezones.json"
 AUDIT_NAMESPACE = Path("audit/v5_2_qd/historical/acquisition")
+PROVENANCE = {
+    "query_batch_ids": ["c" * 64, "d" * 64],
+    "run_spec_sha256": "a" * 64,
+    "acquisition_contract_sha256": "b" * 64,
+}
 
 
 def _canonical(value: object) -> bytes:
@@ -107,18 +113,11 @@ def _write(root: Path, relative: Path, value: object) -> Path:
     return path
 
 
-def _candidate():
-    from mlb_backtest.v52_timezone_review import build_timezone_candidate
-
-    return build_timezone_candidate(*_inputs())
-
-
 def _mapping():
     return json.loads((FIXTURES / "venue_timezones_mini.json").read_bytes())
 
 
-def _resolved_candidate():
-    candidate = _candidate()
+def _resolve_candidate(candidate: dict[str, object]):
     mapping_by_venue = {
         row["venue_id"]: row for row in _mapping()["timezone_rows"]
     }
@@ -128,8 +127,6 @@ def _resolved_candidate():
         row["effective_end"] = resolved["effective_end"]
         row["time_zone"] = resolved["time_zone"]
     return candidate
-
-
 def _sealed_candidate_fixture(root: Path, evidence_root: Path):
     from mlb_backtest.v52_evidence import (
         AttemptCapture,
@@ -164,10 +161,10 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
         )
         for venue_id in (31, 99)
     )
-    batch = _make_batch(
-        "TIMEZONE_CANDIDATE_INPUTS", None, [schedule, *venues]
-    )
-    publish_query_batch(root, batch)
+    schedule_batch = _make_batch("STATIC_SCHEDULES", None, [schedule])
+    reference_batch = _make_batch("REFERENCE_INPUTS", None, list(venues))
+    publish_query_batch(root, schedule_batch)
+    publish_query_batch(root, reference_batch)
     store = V52EvidenceStore(evidence_root)
     capture = AttemptCapture(
         started_at_utc="2026-07-14T00:00:00.000000Z",
@@ -196,15 +193,108 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
                 capture,
                 semantics,
             )
-    return batch, schedule, venues[0]
+    return (schedule_batch, reference_batch), schedule, venues[0]
+
+
+def _verified_candidate_fixture(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    batches=None,
+):
+    from mlb_backtest.v52_timezone_review import build_timezone_candidate
+
+    if evidence_root is None:
+        evidence_root = root / "evidence"
+    evidence_root.mkdir(exist_ok=True)
+    if batches is None:
+        batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+    candidate = build_timezone_candidate(
+        root=root,
+        evidence_root=evidence_root,
+        batch_ids=[batch.batch_id for batch in batches],
+    )
+    return candidate, batches, evidence_root
+
+
+def _resolved_verified_candidate_fixture(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    batches=None,
+):
+    candidate, batches, evidence_root = _verified_candidate_fixture(
+        root,
+        evidence_root=evidence_root,
+        batches=batches,
+    )
+    return _resolve_candidate(candidate), batches, evidence_root
+
+
+def _reviewed_candidate_fixture(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    batches=None,
+):
+    from mlb_backtest.v52_timezone_review import write_timezone_review_receipt
+
+    candidate = AUDIT_NAMESPACE / "resolved.json"
+    resolved, _, _ = _resolved_verified_candidate_fixture(
+        root,
+        evidence_root=evidence_root,
+        batches=batches,
+    )
+    _write(root, candidate, resolved)
+    reviews = []
+    for leaf, identity, role in (
+        ("semantic.json", "reviewer-a", "TIMEZONE_SEMANTIC_REVIEW"),
+        ("coverage.json", "reviewer-b", "TIMEZONE_COVERAGE_REVIEW"),
+    ):
+        reviews.append(
+            write_timezone_review_receipt(
+                root,
+                candidate_path=candidate,
+                output=AUDIT_NAMESPACE / "reviews" / leaf,
+                reviewer_identity=identity,
+                reviewer_role=role,
+                decision="APPROVED",
+            ).relative_to(root)
+        )
+    return candidate, reviews
 
 
 class V52TimezoneReviewTest(unittest.TestCase):
-    def test_candidate_covers_exact_observed_scope_without_guessing(self) -> None:
+    def test_public_candidate_builder_requires_verified_sealed_batches(self) -> None:
         from mlb_backtest.v52_timezone_review import build_timezone_candidate
 
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            candidate = build_timezone_candidate(
+                root=root,
+                evidence_root=evidence_root,
+                batch_ids=[batch.batch_id for batch in batches],
+            )
+            self.assertEqual(
+                candidate["query_batch_ids"],
+                sorted(batch.batch_id for batch in batches),
+            )
+            resolved = _resolve_candidate(copy.deepcopy(candidate))
+            self.assertEqual(
+                {key: value for key, value in resolved.items() if key != "timezone_rows"},
+                {key: value for key, value in candidate.items() if key != "timezone_rows"},
+            )
+            with self.assertRaises(TypeError):
+                build_timezone_candidate(*_inputs(), **PROVENANCE)
+
+    def test_candidate_covers_exact_observed_scope_without_guessing(self) -> None:
+        from mlb_backtest.v52_timezone_review import _project_timezone_candidate
+
         schedules, venues = _inputs()
-        candidate = build_timezone_candidate(schedules, venues)
+        candidate = _project_timezone_candidate(schedules, venues, **PROVENANCE)
         jsonschema.validate(candidate, json.loads(CANDIDATE_SCHEMA.read_bytes()))
         self.assertEqual(candidate["venue_scope"], [31, 99])
         self.assertEqual(
@@ -237,7 +327,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
         )
 
     def test_candidate_rejects_missing_extra_conflicting_or_unverified_identity(self):
-        from mlb_backtest.v52_timezone_review import build_timezone_candidate
+        from mlb_backtest.v52_timezone_review import _project_timezone_candidate
 
         schedules, venues = _inputs()
         cases = []
@@ -267,7 +357,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(
                 ValueError, message
             ):
-                build_timezone_candidate(schedules, bad)
+                _project_timezone_candidate(schedules, bad, **PROVENANCE)
 
         conflicting_schedule = copy.deepcopy(schedules)
         conflicting_schedule.append(copy.deepcopy(schedules[0]))
@@ -276,7 +366,47 @@ class V52TimezoneReviewTest(unittest.TestCase):
             "neutral_site"
         ] = True
         with self.assertRaisesRegex(ValueError, "conflict"):
-            build_timezone_candidate(conflicting_schedule, venues)
+            _project_timezone_candidate(conflicting_schedule, venues, **PROVENANCE)
+
+    def test_candidate_requires_closed_provenance_and_rejects_same_value_duplicates(self):
+        from mlb_backtest.v52_timezone_review import _project_timezone_candidate
+
+        schedules, venues = _inputs()
+        candidate = _project_timezone_candidate(
+            schedules,
+            venues,
+            query_batch_ids=["c" * 64, "d" * 64],
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+        self.assertEqual(candidate["query_batch_ids"], ["c" * 64, "d" * 64])
+        self.assertEqual(candidate["run_spec_sha256"], "a" * 64)
+        self.assertEqual(candidate["acquisition_contract_sha256"], "b" * 64)
+        jsonschema.validate(candidate, json.loads(CANDIDATE_SCHEMA.read_bytes()))
+
+        duplicate_schedule = copy.deepcopy(schedules[0])
+        duplicate_schedule["query_id"] = "e" * 64
+        duplicate_schedule["raw_sha256"] = "e" * 64
+        with self.assertRaisesRegex(ValueError, "duplicate.*game|game.*duplicate"):
+            _project_timezone_candidate(
+                [schedules[0], duplicate_schedule],
+                venues,
+                query_batch_ids=["c" * 64, "d" * 64],
+                run_spec_sha256="a" * 64,
+                acquisition_contract_sha256="b" * 64,
+            )
+
+        duplicate_venue = copy.deepcopy(venues[0])
+        duplicate_venue["query_id"] = "f" * 64
+        duplicate_venue["raw_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "duplicate.*venue|venue.*duplicate"):
+            _project_timezone_candidate(
+                schedules,
+                [venues[0], duplicate_venue],
+                query_batch_ids=["c" * 64, "d" * 64],
+                run_spec_sha256="a" * 64,
+                acquisition_contract_sha256="b" * 64,
+            )
 
     def test_mapping_fixture_is_valid_closed_and_covers_every_observation(self):
         from mlb_backtest.v52_timezone_review import validate_timezone_mapping
@@ -324,9 +454,10 @@ class V52TimezoneReviewTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             candidate_relative = AUDIT_NAMESPACE / "candidate.json"
-            candidate_path = _write(root, candidate_relative, _resolved_candidate())
+            resolved, _, _ = _resolved_verified_candidate_fixture(root)
+            candidate_path = _write(root, candidate_relative, resolved)
             output = AUDIT_NAMESPACE / "reviews/semantic.json"
             path = write_timezone_review_receipt(
                 root,
@@ -369,9 +500,10 @@ class V52TimezoneReviewTest(unittest.TestCase):
 
         for failure in ("partial_write", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 candidate = AUDIT_NAMESPACE / "candidate.json"
-                _write(root, candidate, _resolved_candidate())
+                resolved, _, _ = _resolved_verified_candidate_fixture(root)
+                _write(root, candidate, resolved)
                 (root / AUDIT_NAMESPACE / "reviews").mkdir(parents=True)
                 output = AUDIT_NAMESPACE / f"reviews/{failure}.json"
                 if failure == "partial_write":
@@ -418,9 +550,11 @@ class V52TimezoneReviewTest(unittest.TestCase):
         from mlb_backtest.v52_timezone_review import write_timezone_review_receipt
 
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            unresolved_value, _, _ = _verified_candidate_fixture(root)
+            resolved_value = _resolve_candidate(copy.deepcopy(unresolved_value))
             candidate_relative = AUDIT_NAMESPACE / "candidate.json"
-            candidate_path = _write(root, candidate_relative, _resolved_candidate())
+            candidate_path = _write(root, candidate_relative, resolved_value)
             kwargs = {
                 "candidate_path": candidate_relative,
                 "reviewer_identity": "reviewer-a",
@@ -435,7 +569,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     **kwargs,
                 )
             unresolved = AUDIT_NAMESPACE / "unresolved.json"
-            _write(root, unresolved, _candidate())
+            _write(root, unresolved, unresolved_value)
             with self.assertRaisesRegex(ValueError, "unresolved|time_zone"):
                 write_timezone_review_receipt(
                     root,
@@ -482,18 +616,20 @@ class V52TimezoneReviewTest(unittest.TestCase):
     def test_review_writer_revalidates_candidate_venue_and_observation_semantics(self):
         from mlb_backtest.v52_timezone_review import write_timezone_review_receipt
 
-        cases = []
-        malformed_venue = _resolved_candidate()
-        malformed_venue["venues"][0]["latitude"] = "north"
-        cases.append((malformed_venue, "coordinate|numeric|latitude"))
-        duplicate_observation = _resolved_candidate()
-        duplicate_observation["observed_venue_dates"].insert(
-            1, copy.deepcopy(duplicate_observation["observed_venue_dates"][0])
+        cases = (
+            ("malformed-venue", "coordinate|numeric|latitude"),
+            ("duplicate-observation", "duplicate|observation"),
         )
-        cases.append((duplicate_observation, "duplicate|observation"))
-        for index, (candidate, message) in enumerate(cases):
+        for index, (mutation, message) in enumerate(cases):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
+                candidate, _, _ = _resolved_verified_candidate_fixture(root)
+                if mutation == "malformed-venue":
+                    candidate["venues"][0]["latitude"] = "north"
+                else:
+                    candidate["observed_venue_dates"].insert(
+                        1, copy.deepcopy(candidate["observed_venue_dates"][0])
+                    )
                 candidate_path = AUDIT_NAMESPACE / "candidate.json"
                 _write(root, candidate_path, candidate)
                 with self.assertRaisesRegex(ValueError, message):
@@ -516,9 +652,10 @@ class V52TimezoneReviewTest(unittest.TestCase):
         self.assertFalse(PRODUCTION_MAPPING.exists())
         self.assertFalse(FORBIDDEN_MAPPING.exists())
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             candidate_relative = AUDIT_NAMESPACE / "candidate.json"
-            _write(root, candidate_relative, _resolved_candidate())
+            resolved, _, _ = _resolved_verified_candidate_fixture(root)
+            _write(root, candidate_relative, resolved)
             reviews = []
             for name, identity, role in (
                 ("semantic", "reviewer-a", "TIMEZONE_SEMANTIC_REVIEW"),
@@ -575,10 +712,11 @@ class V52TimezoneReviewTest(unittest.TestCase):
         )
         for label, second_identity, second_role, decision, mutate in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 candidate_relative = AUDIT_NAMESPACE / "candidate.json"
+                resolved, _, _ = _resolved_verified_candidate_fixture(root)
                 candidate_path = _write(
-                    root, candidate_relative, _resolved_candidate()
+                    root, candidate_relative, resolved
                 )
                 first = write_timezone_review_receipt(
                     root,
@@ -618,7 +756,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            batch, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
             output = AUDIT_NAMESPACE / "timezone-candidate.json"
             self.assertEqual(
                 main(
@@ -629,7 +767,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--evidence-root",
                         str(evidence_root),
                         "--batch-id",
-                        batch.batch_id,
+                        batches[0].batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
                         "--output",
                         output.as_posix(),
                     ]
@@ -639,6 +779,12 @@ class V52TimezoneReviewTest(unittest.TestCase):
             candidate = json.loads((root / output).read_bytes())
             jsonschema.validate(candidate, json.loads(CANDIDATE_SCHEMA.read_bytes()))
             self.assertEqual(candidate["venue_scope"], [31, 99])
+            self.assertEqual(
+                candidate["query_batch_ids"],
+                sorted(batch.batch_id for batch in batches),
+            )
+            self.assertEqual(candidate["run_spec_sha256"], "a" * 64)
+            self.assertEqual(candidate["acquisition_contract_sha256"], "b" * 64)
             with self.assertRaises(FileExistsError):
                 main(
                     [
@@ -648,7 +794,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--evidence-root",
                         str(evidence_root),
                         "--batch-id",
-                        batch.batch_id,
+                        batches[0].batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
                         "--output",
                         output.as_posix(),
                     ]
@@ -662,7 +810,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            batch, _, venue = _sealed_candidate_fixture(root, evidence_root)
+            batches, _, venue = _sealed_candidate_fixture(root, evidence_root)
             duplicate = [
                 "candidate",
                 "--root",
@@ -670,9 +818,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 "--evidence-root",
                 str(evidence_root),
                 "--batch-id",
-                batch.batch_id,
+                batches[0].batch_id,
                 "--batch-id",
-                batch.batch_id,
+                batches[0].batch_id,
                 "--output",
                 (AUDIT_NAMESPACE / "duplicate.json").as_posix(),
             ]
@@ -692,7 +840,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--evidence-root",
                         str(evidence_root),
                         "--batch-id",
-                        batch.batch_id,
+                        batches[0].batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
                         "--output",
                         (AUDIT_NAMESPACE / "missing.json").as_posix(),
                     ]
@@ -707,7 +857,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
-            batch, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            batches, schedule, _ = _sealed_candidate_fixture(root, evidence_root)
             unrelated = LogicalQuery(
                 source="baseball_savant_statcast",
                 grain="pitch",
@@ -720,9 +870,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 run_spec_sha256="a" * 64,
                 acquisition_contract_sha256="b" * 64,
             )
-            mixed = _make_batch(
-                "MIXED_TIMEZONE_INPUTS", None, [*batch.queries, unrelated]
-            )
+            mixed = _make_batch("STATIC_SCHEDULES", None, [schedule, unrelated])
             publish_query_batch(root, mixed)
             self.assertEqual(
                 main(
@@ -734,6 +882,8 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         str(evidence_root),
                         "--batch-id",
                         mixed.batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
                         "--output",
                         (AUDIT_NAMESPACE / "mixed.json").as_posix(),
                     ]
@@ -753,7 +903,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             base, schedule, _ = _sealed_candidate_fixture(root, evidence_root)
             venue_queries = [
                 query
-                for query in base.queries
+                for query in base[1].queries
                 if query.source == "venue_team_timezone_table"
             ]
             unrelated = LogicalQuery(
@@ -769,10 +919,10 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 acquisition_contract_sha256="b" * 64,
             )
             schedule_batch = _make_batch(
-                "TIMEZONE_SCHEDULE_INPUTS", None, [schedule, unrelated]
+                "STATIC_SCHEDULES", None, [schedule, unrelated]
             )
             venue_batch = _make_batch(
-                "TIMEZONE_VENUE_INPUTS", None, [*venue_queries, unrelated]
+                "REFERENCE_INPUTS", None, [*venue_queries, unrelated]
             )
             publish_query_batch(root, schedule_batch)
             publish_query_batch(root, venue_batch)
@@ -795,7 +945,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 0,
             )
             duplicate_relevant = _make_batch(
-                "DUPLICATE_TIMEZONE_SCHEDULE", None, [schedule]
+                "STATIC_SCHEDULES", "1" * 64, [schedule]
             )
             publish_query_batch(root, duplicate_relevant)
             with self.assertRaisesRegex(ValueError, "query.*duplicate|duplicate.*query"):
@@ -817,13 +967,64 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     ]
                 )
 
+    def test_candidate_cli_rejects_wrong_stage_and_mixed_relevant_binding(self):
+        from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
+        from mlb_backtest.v52_timezone_review import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, schedule, _ = _sealed_candidate_fixture(root, evidence_root)
+            wrong_stage = _make_batch("REFERENCE_INPUTS", "2" * 64, [schedule])
+            publish_query_batch(root, wrong_stage)
+            with self.assertRaisesRegex(ValueError, "STATIC_SCHEDULES|stage"):
+                main(
+                    [
+                        "candidate",
+                        "--root",
+                        str(root),
+                        "--evidence-root",
+                        str(evidence_root),
+                        "--batch-id",
+                        wrong_stage.batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
+                        "--output",
+                        (AUDIT_NAMESPACE / "wrong-stage.json").as_posix(),
+                    ]
+                )
+
+            mismatched_venue = replace(
+                batches[1].queries[0], run_spec_sha256="9" * 64
+            )
+            mixed = _make_batch("REFERENCE_INPUTS", "3" * 64, [mismatched_venue])
+            publish_query_batch(root, mixed)
+            with self.assertRaisesRegex(ValueError, "binding|run|contract"):
+                main(
+                    [
+                        "candidate",
+                        "--root",
+                        str(root),
+                        "--evidence-root",
+                        str(evidence_root),
+                        "--batch-id",
+                        batches[0].batch_id,
+                        "--batch-id",
+                        mixed.batch_id,
+                        "--output",
+                        (AUDIT_NAMESPACE / "mixed-binding.json").as_posix(),
+                    ]
+                )
+
     def test_review_and_seal_cli_use_exact_namespaces_and_candidate_scope(self):
         from mlb_backtest.v52_timezone_review import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             candidate = AUDIT_NAMESPACE / "resolved-candidate.json"
-            _write(root, candidate, _resolved_candidate())
+            resolved, _, _ = _resolved_verified_candidate_fixture(root)
+            _write(root, candidate, resolved)
             reviews = []
             for name, identity, role in (
                 ("semantic", "reviewer-a", "TIMEZONE_SEMANTIC_REVIEW"),
@@ -883,8 +1084,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
+            resolved, _, _ = _resolved_verified_candidate_fixture(root)
             bad_candidate = Path("audit/arbitrary.json")
-            _write(root, bad_candidate, _resolved_candidate())
+            _write(root, bad_candidate, resolved)
             with self.assertRaisesRegex(ValueError, "namespace|acquisition"):
                 write_timezone_review_receipt(
                     root,
@@ -896,7 +1098,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     decision="APPROVED",
                 )
             candidate = AUDIT_NAMESPACE / "candidate.json"
-            _write(root, candidate, _resolved_candidate())
+            _write(root, candidate, copy.deepcopy(resolved))
             with self.assertRaisesRegex(ValueError, "namespace|acquisition"):
                 write_timezone_review_receipt(
                     root,
@@ -933,6 +1135,219 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     output=Path("config/v5_2_qd/venue_timezones.json"),
                     receipt_output=Path("audit/seal.json"),
                 )
+
+    def test_public_candidate_review_and_seal_reject_symlink_root(self) -> None:
+        from mlb_backtest.v52_timezone_review import (
+            main,
+            seal_timezone_mapping,
+            write_timezone_review_receipt,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "real"
+            root.mkdir()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            candidate, reviews = _reviewed_candidate_fixture(
+                root,
+                evidence_root=evidence_root,
+                batches=batches,
+            )
+            alias = base / "root-alias"
+            alias.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "root|symlink"):
+                main(
+                    [
+                        "candidate",
+                        "--root",
+                        str(alias),
+                        "--evidence-root",
+                        str(evidence_root),
+                        "--batch-id",
+                        batches[0].batch_id,
+                        "--batch-id",
+                        batches[1].batch_id,
+                        "--output",
+                        (AUDIT_NAMESPACE / "symlink-candidate.json").as_posix(),
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, "root|symlink"):
+                write_timezone_review_receipt(
+                    alias,
+                    candidate_path=candidate,
+                    output=AUDIT_NAMESPACE / "symlink-review.json",
+                    reviewer_identity="reviewer-c",
+                    reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
+                    decision="APPROVED",
+                )
+            with self.assertRaisesRegex(ValueError, "root|symlink"):
+                seal_timezone_mapping(
+                    alias,
+                    candidate_path=candidate,
+                    review_receipt_paths=reviews,
+                    output=Path("config/v5_2_qd/venue_timezones.json"),
+                    receipt_output=AUDIT_NAMESPACE / "symlink-seal.json",
+                )
+
+    def test_write_safe_parent_fsync_failure_preserves_replacement(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            relative = AUDIT_NAMESPACE / "replacement.json"
+            path = root / relative
+            path.parent.mkdir(parents=True)
+            replacement = b"replacement\n"
+            original_fsync = os.fsync
+            replaced = False
+
+            def fail_parent_fsync(descriptor: int) -> None:
+                nonlocal replaced
+                metadata = os.fstat(descriptor)
+                if stat.S_ISDIR(metadata.st_mode) and path.exists() and not replaced:
+                    replaced = True
+                    path.unlink()
+                    path.write_bytes(replacement)
+                    raise OSError("injected parent fsync failure")
+                original_fsync(descriptor)
+
+            with (
+                patch.object(timezone_review.os, "fsync", side_effect=fail_parent_fsync),
+                self.assertRaises(OSError),
+            ):
+                timezone_review._write_safe(
+                    root, relative, b"created\n", "replacement test"
+                )
+            self.assertEqual(path.read_bytes(), replacement)
+
+    def test_seal_recovers_exact_mapping_left_before_receipt(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, reviews = _reviewed_candidate_fixture(root)
+            mapping = root / "config/v5_2_qd/venue_timezones.json"
+
+            def interrupt() -> None:
+                raise KeyboardInterrupt("injected after mapping")
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_after_mapping_publish_before_seal",
+                    side_effect=interrupt,
+                    create=True,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                timezone_review.seal_timezone_mapping(
+                    root,
+                    candidate_path=candidate,
+                    review_receipt_paths=reviews,
+                    output=Path("config/v5_2_qd/venue_timezones.json"),
+                    receipt_output=AUDIT_NAMESPACE / "seal.json",
+                )
+            self.assertTrue(mapping.is_file())
+            original_mapping = mapping.read_bytes()
+            mapping.write_bytes(original_mapping + b" ")
+            with self.assertRaisesRegex(RuntimeError, "immutable.*mapping|mapping.*differs"):
+                timezone_review.seal_timezone_mapping(
+                    root,
+                    candidate_path=candidate,
+                    review_receipt_paths=reviews,
+                    output=Path("config/v5_2_qd/venue_timezones.json"),
+                    receipt_output=AUDIT_NAMESPACE / "seal.json",
+                )
+            self.assertFalse((root / AUDIT_NAMESPACE / "seal.json").exists())
+            mapping.write_bytes(original_mapping)
+            mapping_path, seal_path = timezone_review.seal_timezone_mapping(
+                root,
+                candidate_path=candidate,
+                review_receipt_paths=reviews,
+                output=Path("config/v5_2_qd/venue_timezones.json"),
+                receipt_output=AUDIT_NAMESPACE / "seal.json",
+            )
+            self.assertEqual(mapping_path.read_bytes(), original_mapping)
+            self.assertTrue(seal_path.is_file())
+            original_seal = seal_path.read_bytes()
+            retry_mapping, retry_seal = timezone_review.seal_timezone_mapping(
+                root,
+                candidate_path=candidate,
+                review_receipt_paths=reviews,
+                output=Path("config/v5_2_qd/venue_timezones.json"),
+                receipt_output=AUDIT_NAMESPACE / "seal.json",
+            )
+            self.assertEqual(retry_mapping.read_bytes(), original_mapping)
+            self.assertEqual(retry_seal.read_bytes(), original_seal)
+
+    def test_review_and_seal_reject_input_replacement_at_publish_boundary(self):
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, reviews = _reviewed_candidate_fixture(root)
+            candidate_path = root / candidate
+
+            def replace_candidate() -> None:
+                contents = candidate_path.read_bytes()
+                replacement = candidate_path.with_suffix(".replacement")
+                replacement.write_bytes(contents)
+                os.replace(replacement, candidate_path)
+
+            review_output = AUDIT_NAMESPACE / "boundary-review.json"
+            with (
+                patch.object(
+                    timezone_review,
+                    "_before_review_final_rebind",
+                    side_effect=replace_candidate,
+                    create=True,
+                ),
+                self.assertRaisesRegex(ValueError, "candidate|identity|changed"),
+            ):
+                timezone_review.write_timezone_review_receipt(
+                    root,
+                    candidate_path=candidate,
+                    output=review_output,
+                    reviewer_identity="reviewer-c",
+                    reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
+                    decision="APPROVED",
+                )
+            self.assertFalse((root / review_output).exists())
+
+        for label, target_index in (("candidate", None), ("review-0", 0), ("review-1", 1)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                candidate, reviews = _reviewed_candidate_fixture(root)
+                target = root / (candidate if target_index is None else reviews[target_index])
+
+                def replace_input() -> None:
+                    contents = target.read_bytes()
+                    replacement = target.with_suffix(".replacement")
+                    replacement.write_bytes(contents)
+                    os.replace(replacement, target)
+
+                seal_output = AUDIT_NAMESPACE / "boundary-seal.json"
+                with (
+                    patch.object(
+                        timezone_review,
+                        "_before_seal_final_rebind",
+                        side_effect=replace_input,
+                        create=True,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "candidate|review|identity|changed"
+                    ),
+                ):
+                    timezone_review.seal_timezone_mapping(
+                        root,
+                        candidate_path=candidate,
+                        review_receipt_paths=reviews,
+                        output=Path("config/v5_2_qd/venue_timezones.json"),
+                        receipt_output=seal_output,
+                    )
+                self.assertFalse((root / seal_output).exists())
 
     def test_cli_help_lists_all_offline_subcommands(self) -> None:
         from mlb_backtest.v52_timezone_review import main

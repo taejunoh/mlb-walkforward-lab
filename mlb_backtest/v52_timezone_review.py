@@ -10,7 +10,8 @@ import math
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -34,12 +35,37 @@ _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _VENUE_ENDPOINT_PREFIX = "https://statsapi.mlb.com/api/v1/venues/"
 
 
+@dataclass(frozen=True)
+class _SafeSnapshot:
+    relative: Path
+    contents: bytes
+    identity: tuple[int, ...]
+
+
+def _before_review_final_rebind() -> None:
+    """Deterministic review publication race-test hook."""
+
+
+def _after_mapping_publish_before_seal() -> None:
+    """Deterministic mapping/seal interruption-test hook."""
+
+
+def _before_seal_final_rebind() -> None:
+    """Deterministic seal publication race-test hook."""
+
+
 def _canonical_file_bytes(value: object) -> bytes:
     return canonical_json_bytes(value) + b"\n"
 
 
 def _sha256(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
+
+
+def _sha256_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
 
 
 def _positive(value: object, label: str) -> int:
@@ -122,6 +148,7 @@ def _observed_from_schedules(
     ) or not schedule_sidecars:
         raise ValueError("schedule sidecars must be a nonempty sequence")
     observed: dict[tuple[int, str], tuple[bool, bool]] = {}
+    games: dict[int, tuple[int, str, bool, bool, bool]] = {}
     hashes: list[str] = []
     for sidecar in schedule_sidecars:
         semantics = _sidecar_semantics(
@@ -136,7 +163,7 @@ def _observed_from_schedules(
         for anchor in anchors:
             if not isinstance(anchor, Mapping):
                 raise ValueError("schedule anchor must be a mapping")
-            _positive(anchor.get("game_pk"), "schedule game_pk")
+            game_pk = _positive(anchor.get("game_pk"), "schedule game_pk")
             venue_id = _positive(anchor.get("venue_id"), "schedule venue_id")
             official = _day(anchor.get("official_date"), "schedule official_date")
             neutral = anchor.get("neutral_site")
@@ -146,6 +173,18 @@ def _observed_from_schedules(
                 raise ValueError("schedule neutral/alternate flags must be boolean")
             if type(played) is not bool:
                 raise ValueError("schedule played must be boolean")
+            game_record = (
+                venue_id,
+                official.isoformat(),
+                neutral,
+                alternate,
+                played,
+            )
+            if game_pk in games:
+                if games[game_pk] != game_record:
+                    raise ValueError("conflicting schedule game observation")
+                raise ValueError("duplicate schedule game observation")
+            games[game_pk] = game_record
             key = (venue_id, official.isoformat())
             disposition = (neutral, alternate)
             if key in observed and observed[key] != disposition:
@@ -203,6 +242,8 @@ def _venues_from_sidecars(
             venue_id = int(record["venue_id"])
             if venue_id in venues and venues[venue_id] != record:
                 raise ValueError("conflicting venue identity")
+            if venue_id in venues:
+                raise ValueError("duplicate venue identity")
             venues[venue_id] = record
         hashes.append(_sidecar_hash(sidecar))
     if len(hashes) != len(set(hashes)):
@@ -210,10 +251,30 @@ def _venues_from_sidecars(
     return venues, sorted(hashes)
 
 
-def build_timezone_candidate(
+def _project_timezone_candidate(
     schedule_sidecars: Sequence[Mapping[str, object]],
     venue_sidecars: Sequence[Mapping[str, object]],
+    *,
+    query_batch_ids: Sequence[str],
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
 ) -> Mapping[str, object]:
+    if (
+        isinstance(query_batch_ids, (str, bytes))
+        or not isinstance(query_batch_ids, Sequence)
+        or not query_batch_ids
+        or list(query_batch_ids) != sorted(set(query_batch_ids))
+    ):
+        raise ValueError("candidate query_batch_ids must be nonempty sorted unique")
+    batch_ids = [
+        _sha256_text(value, "candidate query batch ID")
+        for value in query_batch_ids
+    ]
+    run_hash = _sha256_text(run_spec_sha256, "candidate run_spec_sha256")
+    contract_hash = _sha256_text(
+        acquisition_contract_sha256,
+        "candidate acquisition_contract_sha256",
+    )
     observed, schedule_hashes = _observed_from_schedules(schedule_sidecars)
     venues, venue_hashes = _venues_from_sidecars(venue_sidecars)
     observed_scope = {venue_id for venue_id, _ in observed}
@@ -247,7 +308,10 @@ def build_timezone_candidate(
     ]
     return {
         "artifact_kind": "VENUE_TIMEZONE_CANDIDATE",
+        "acquisition_contract_sha256": contract_hash,
         "observed_venue_dates": observed_rows,
+        "query_batch_ids": batch_ids,
+        "run_spec_sha256": run_hash,
         "schedule_sidecar_sha256s": schedule_hashes,
         "schema_version": 1,
         "timezone_rows": timezone_rows,
@@ -358,8 +422,11 @@ def validate_timezone_mapping(
 
 def _candidate_object(value: object) -> dict[str, object]:
     expected_keys = {
+        "acquisition_contract_sha256",
         "artifact_kind",
         "observed_venue_dates",
+        "query_batch_ids",
+        "run_spec_sha256",
         "schedule_sidecar_sha256s",
         "schema_version",
         "timezone_rows",
@@ -374,6 +441,22 @@ def _candidate_object(value: object) -> dict[str, object]:
         or value.get("schema_version") != 1
     ):
         raise ValueError("timezone candidate identity differs")
+    batch_ids = value.get("query_batch_ids")
+    if (
+        not isinstance(batch_ids, list)
+        or not batch_ids
+        or batch_ids != sorted(set(batch_ids))
+        or any(
+            not isinstance(item, str) or not _SHA256.fullmatch(item)
+            for item in batch_ids
+        )
+    ):
+        raise ValueError("timezone candidate query_batch_ids differ")
+    _sha256_text(value.get("run_spec_sha256"), "candidate run_spec_sha256")
+    _sha256_text(
+        value.get("acquisition_contract_sha256"),
+        "candidate acquisition_contract_sha256",
+    )
     scope = value.get("venue_scope")
     if not isinstance(scope, list) or scope != sorted(set(scope)) or any(
         isinstance(item, bool) or not isinstance(item, int) or item <= 0
@@ -482,6 +565,23 @@ def _relative(root: Path, path: Path, label: str) -> Path:
     return candidate
 
 
+def _trusted_root(root: Path) -> Path:
+    supplied = Path(os.path.abspath(os.fspath(root)))
+    try:
+        final = supplied.lstat()
+    except OSError as exc:
+        raise ValueError("timezone root is unavailable") from exc
+    if stat.S_ISLNK(final.st_mode):
+        raise ValueError("timezone root final component cannot be a symlink")
+    if not stat.S_ISDIR(final.st_mode):
+        raise ValueError("timezone root must be a directory")
+    try:
+        canonical = supplied.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("timezone root is unavailable") from exc
+    return canonical
+
+
 def _acquisition_audit_relative(root: Path, path: Path, label: str) -> Path:
     relative = _relative(root, path, label)
     prefix = _ACQUISITION_AUDIT.parts
@@ -572,9 +672,16 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
+def _read_safe_snapshot(
+    root: Path, path: Path, label: str, *, missing_ok: bool = False
+) -> _SafeSnapshot | None:
     relative = _relative(root, path, label)
-    parent, descriptors = _open_parent(root, relative, create=False)
+    try:
+        parent, descriptors = _open_parent(root, relative, create=False)
+    except ValueError:
+        if missing_ok:
+            return None
+        raise
     descriptor = -1
     try:
         flags = (
@@ -585,6 +692,10 @@ def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
         )
         try:
             descriptor = os.open(relative.name, flags, dir_fd=parent)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise ValueError(f"{label} is missing") from None
         except OSError as exc:
             raise ValueError(f"{label} must be a no-follow regular file") from exc
         before = os.fstat(descriptor)
@@ -602,7 +713,11 @@ def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
         rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
         if _file_identity(before) != _file_identity(after) or _file_identity(after) != _file_identity(rebound):
             raise ValueError(f"{label} identity changed while reading")
-        return relative, b"".join(chunks)
+        return _SafeSnapshot(
+            relative=relative,
+            contents=b"".join(chunks),
+            identity=_file_identity(after),
+        )
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -610,11 +725,36 @@ def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
             os.close(item)
 
 
-def _write_safe(root: Path, path: Path, contents: bytes, label: str) -> Path:
+def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
+    snapshot = _read_safe_snapshot(root, path, label)
+    if snapshot is None:
+        raise ValueError(f"{label} is missing")
+    return snapshot.relative, snapshot.contents
+
+
+def _rebind_safe_snapshot(
+    root: Path, expected: _SafeSnapshot, label: str
+) -> None:
+    current = _read_safe_snapshot(root, expected.relative, label)
+    if current != expected:
+        raise ValueError(f"{label} identity or bytes changed")
+
+
+def _write_safe(
+    root: Path,
+    path: Path,
+    contents: bytes,
+    label: str,
+    *,
+    final_rebind: Callable[[], None] | None = None,
+    after_parent_fsync: Callable[[], None] | None = None,
+) -> Path:
+    root = _trusted_root(root)
     relative = _relative(root, path, label)
     parent, descriptors = _open_parent(root, relative, create=True)
     descriptor = -1
     created = False
+    created_identity: tuple[int, int] | None = None
     try:
         flags = (
             os.O_WRONLY
@@ -628,6 +768,7 @@ def _write_safe(root: Path, path: Path, contents: bytes, label: str) -> Path:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise ValueError(f"{label} must be an unaliased regular file")
+        created_identity = (opened.st_dev, opened.st_ino)
         view = memoryview(contents)
         written = 0
         while written < len(view):
@@ -644,16 +785,28 @@ def _write_safe(root: Path, path: Path, contents: bytes, label: str) -> Path:
             or _file_identity(final) != _file_identity(linked)
         ):
             raise ValueError(f"{label} identity differs after write")
+        if final_rebind is not None:
+            final_rebind()
+        os.fsync(parent)
+        if after_parent_fsync is not None:
+            after_parent_fsync()
+        if final_rebind is not None:
+            final_rebind()
+        rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+        if _file_identity(os.fstat(descriptor)) != _file_identity(rebound):
+            raise ValueError(f"{label} identity changed before publication")
         os.close(descriptor)
         descriptor = -1
-        os.fsync(parent)
         return Path(os.path.abspath(root)) / relative
     except BaseException:
-        if created:
+        if created and descriptor >= 0 and created_identity is not None:
             try:
                 linked = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-                opened = os.fstat(descriptor) if descriptor >= 0 else linked
-                if (linked.st_dev, linked.st_ino) == (opened.st_dev, opened.st_ino):
+                opened = os.fstat(descriptor)
+                if (
+                    (linked.st_dev, linked.st_ino) == created_identity
+                    and (opened.st_dev, opened.st_ino) == created_identity
+                ):
                     os.unlink(relative.name, dir_fd=parent)
                     os.fsync(parent)
             except OSError:
@@ -664,6 +817,41 @@ def _write_safe(root: Path, path: Path, contents: bytes, label: str) -> Path:
             os.close(descriptor)
         for item in reversed(descriptors):
             os.close(item)
+
+
+def _reconcile_or_write(
+    root: Path,
+    path: Path,
+    contents: bytes,
+    label: str,
+    *,
+    final_rebind: Callable[[], None] | None = None,
+    after_parent_fsync: Callable[[], None] | None = None,
+) -> tuple[Path, _SafeSnapshot]:
+    existing = _read_safe_snapshot(root, path, label, missing_ok=True)
+    if existing is not None:
+        if existing.contents != contents:
+            raise RuntimeError(f"immutable {label} differs")
+        if final_rebind is not None:
+            final_rebind()
+        if after_parent_fsync is not None:
+            after_parent_fsync()
+        _rebind_safe_snapshot(root, existing, label)
+        if final_rebind is not None:
+            final_rebind()
+        return Path(os.path.abspath(root)) / existing.relative, existing
+    published = _write_safe(
+        root,
+        path,
+        contents,
+        label,
+        final_rebind=final_rebind,
+        after_parent_fsync=after_parent_fsync,
+    )
+    snapshot = _read_safe_snapshot(root, path, label)
+    if snapshot is None:
+        raise RuntimeError(f"{label} is missing after publication")
+    return published, snapshot
 
 
 def _utc_now() -> str:
@@ -680,6 +868,7 @@ def write_timezone_review_receipt(
     review_scope: Sequence[int] | None = None,
     decision: str,
 ) -> Path:
+    root = _trusted_root(root)
     if reviewer_role not in _ROLES:
         raise ValueError("timezone reviewer role differs")
     identity = _text(reviewer_identity, "reviewer identity")
@@ -691,9 +880,13 @@ def write_timezone_review_receipt(
     output_relative = _acquisition_audit_relative(
         root, output, "timezone review receipt"
     )
-    relative, contents = _read_safe(
+    candidate_snapshot = _read_safe_snapshot(
         root, candidate_relative, "timezone candidate"
     )
+    if candidate_snapshot is None:
+        raise ValueError("timezone candidate is missing")
+    relative = candidate_snapshot.relative
+    contents = candidate_snapshot.contents
     candidate = _candidate_object(_json_object(contents, "timezone candidate", canonical=True))
     scope = candidate["venue_scope"]
     if review_scope is not None and list(review_scope) != scope:
@@ -715,6 +908,10 @@ def write_timezone_review_receipt(
         output_relative,
         _canonical_file_bytes(receipt),
         "timezone review receipt",
+        final_rebind=lambda: _rebind_safe_snapshot(
+            root, candidate_snapshot, "timezone candidate"
+        ),
+        after_parent_fsync=_before_review_final_rebind,
     )
 
 
@@ -764,6 +961,7 @@ def seal_timezone_mapping(
     output: Path,
     receipt_output: Path,
 ) -> tuple[Path, Path]:
+    root = _trusted_root(root)
     output_relative = _relative(root, output, "timezone mapping output")
     if output_relative != _PRODUCTION_MAPPING:
         raise ValueError("timezone mapping output must use the production logical path")
@@ -773,9 +971,13 @@ def seal_timezone_mapping(
     receipt_output = _acquisition_audit_relative(
         root, receipt_output, "timezone mapping seal receipt"
     )
-    candidate_relative, candidate_contents = _read_safe(
+    candidate_snapshot = _read_safe_snapshot(
         root, candidate_path, "timezone candidate"
     )
+    if candidate_snapshot is None:
+        raise ValueError("timezone candidate is missing")
+    candidate_relative = candidate_snapshot.relative
+    candidate_contents = candidate_snapshot.contents
     candidate = _candidate_object(
         _json_object(candidate_contents, "timezone candidate", canonical=True)
     )
@@ -788,6 +990,7 @@ def seal_timezone_mapping(
     ):
         raise ValueError("timezone seal requires exactly two review receipts")
     review_bindings = []
+    review_snapshots: list[_SafeSnapshot] = []
     identities = set()
     roles = set()
     seen_paths = set()
@@ -799,12 +1002,17 @@ def seal_timezone_mapping(
         review_path = _acquisition_audit_relative(
             root, path, "timezone review receipt"
         )
-        relative, contents = _read_safe(
+        review_snapshot = _read_safe_snapshot(
             root, review_path, "timezone review receipt"
         )
+        if review_snapshot is None:
+            raise ValueError("timezone review receipt is missing")
+        relative = review_snapshot.relative
+        contents = review_snapshot.contents
         if relative in seen_paths:
             raise ValueError("timezone review receipt paths must be distinct")
         seen_paths.add(relative)
+        review_snapshots.append(review_snapshot)
         review = _review_object(contents)
         if review["decision"] != "APPROVED":
             raise ValueError("timezone seal requires APPROVED reviews")
@@ -828,43 +1036,71 @@ def seal_timezone_mapping(
         raise ValueError("timezone reviewer identity values must be distinct")
     review_bindings.sort(key=lambda item: item["reviewer_role"])
     mapping_contents = _canonical_file_bytes(mapping)
+    existing_seal = _read_safe_snapshot(
+        root, receipt_output, "timezone mapping seal receipt", missing_ok=True
+    )
+    occurred_at = _utc_now()
+    if existing_seal is not None:
+        existing_value = _json_object(
+            existing_seal.contents,
+            "timezone mapping seal receipt",
+            canonical=True,
+        )
+        existing_occurred = existing_value.get("occurred_at_utc")
+        if not isinstance(existing_occurred, str) or not _UTC.fullmatch(
+            existing_occurred
+        ):
+            raise ValueError("timezone mapping seal receipt timestamp differs")
+        occurred_at = existing_occurred
     seal = {
         "candidate": candidate_binding,
         "mapping": {
             "path": _PRODUCTION_MAPPING.as_posix(),
             "sha256": _sha256(mapping_contents),
         },
-        "occurred_at_utc": _utc_now(),
+        "occurred_at_utc": occurred_at,
         "receipt_kind": "TIMEZONE_MAPPING_SEAL",
         "reviews": review_bindings,
         "schema_version": 1,
         "venue_scope": scope,
     }
     seal_contents = _canonical_file_bytes(seal)
-    mapping_path = _write_safe(root, output_relative, mapping_contents, "timezone mapping")
-    try:
-        seal_path = _write_safe(
-            root, receipt_output, seal_contents, "timezone mapping seal receipt"
-        )
-    except BaseException:
-        try:
-            mapping_path.unlink()
-            parent_fd = os.open(mapping_path.parent, _directory_flags())
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        except OSError:
-            pass
-        raise
+    def rebind_inputs() -> None:
+        _rebind_safe_snapshot(root, candidate_snapshot, "timezone candidate")
+        for snapshot in review_snapshots:
+            _rebind_safe_snapshot(root, snapshot, "timezone review receipt")
+
+    mapping_path, mapping_snapshot = _reconcile_or_write(
+        root,
+        output_relative,
+        mapping_contents,
+        "timezone mapping",
+        final_rebind=rebind_inputs,
+    )
+    _after_mapping_publish_before_seal()
+
+    def rebind_seal_inputs() -> None:
+        rebind_inputs()
+        _rebind_safe_snapshot(root, mapping_snapshot, "timezone mapping")
+
+    seal_path, _ = _reconcile_or_write(
+        root,
+        receipt_output,
+        seal_contents,
+        "timezone mapping seal receipt",
+        final_rebind=rebind_seal_inputs,
+        after_parent_fsync=_before_seal_final_rebind,
+    )
     return mapping_path, seal_path
 
 
-def _candidate_from_verified_batches(
+def build_timezone_candidate(
+    *,
     root: Path,
     evidence_root: Path,
     batch_ids: Sequence[str],
 ) -> Mapping[str, object]:
+    root = _trusted_root(root)
     if (
         isinstance(batch_ids, (str, bytes))
         or not isinstance(batch_ids, Sequence)
@@ -877,6 +1113,8 @@ def _candidate_from_verified_batches(
     schedule_sidecars: list[Mapping[str, object]] = []
     venue_sidecars: list[Mapping[str, object]] = []
     seen_queries: set[str] = set()
+    contributing_batch_ids: set[str] = set()
+    binding: tuple[str, str] | None = None
     for batch_id in batch_ids:
         batch = load_query_batch(root, batch_id)
         for query in batch.queries:
@@ -902,6 +1140,24 @@ def _candidate_from_verified_batches(
                 kind = "venue"
             if kind is None:
                 continue
+            required_stage = (
+                "STATIC_SCHEDULES" if kind == "schedule" else "REFERENCE_INPUTS"
+            )
+            if batch.stage != required_stage:
+                raise ValueError(
+                    f"candidate {kind} query requires {required_stage} batch stage"
+                )
+            current_binding = (
+                query.run_spec_sha256,
+                query.acquisition_contract_sha256,
+            )
+            if binding is None:
+                binding = current_binding
+            elif binding != current_binding:
+                raise ValueError(
+                    "candidate relevant query run/contract binding differs"
+                )
+            contributing_batch_ids.add(batch.batch_id)
             if query_id in seen_queries:
                 raise ValueError("candidate query population contains a duplicate")
             seen_queries.add(query_id)
@@ -956,7 +1212,15 @@ def _candidate_from_verified_batches(
         raise ValueError(
             "candidate requires schedule anchors and venue reference evidence"
         )
-    return build_timezone_candidate(schedule_sidecars, venue_sidecars)
+    if binding is None:
+        raise AssertionError("unreachable candidate provenance binding")
+    return _project_timezone_candidate(
+        schedule_sidecars,
+        venue_sidecars,
+        query_batch_ids=sorted(contributing_batch_ids),
+        run_spec_sha256=binding[0],
+        acquisition_contract_sha256=binding[1],
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -993,10 +1257,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = _acquisition_audit_relative(
             arguments.root, arguments.output, "timezone candidate"
         )
-        candidate = _candidate_from_verified_batches(
-            arguments.root,
-            arguments.evidence_root,
-            arguments.batch_id,
+        candidate = build_timezone_candidate(
+            root=arguments.root,
+            evidence_root=arguments.evidence_root,
+            batch_ids=arguments.batch_id,
         )
         _write_safe(
             arguments.root,
