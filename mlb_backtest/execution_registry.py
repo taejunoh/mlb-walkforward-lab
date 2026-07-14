@@ -73,6 +73,10 @@ _QUARANTINE_ERROR_CLASSIFICATIONS = frozenset(
         "SOURCE_GATE_EVIDENCE_INVALID",
     }
 )
+_AUTOMATIC_QUARANTINE_CLASSIFICATION_BY_PHASE = {
+    "ACQUIRING": "DIRECT_INVENTORY_MISMATCH",
+    "SOURCES_READY": "SOURCE_GATE_EVIDENCE_INVALID",
+}
 _BINDING_KEYS = frozenset({"path", "sha256"})
 _PLAN_BINDING_KEYS = frozenset({"path", "sha256", "git_blob_id"})
 _LINEAGE_KEYS = frozenset({"baseline_inventory", "protected_inventory"})
@@ -118,9 +122,28 @@ class _RegistryPaths:
 
 
 @dataclass(frozen=True)
+class _ArtifactSnapshot:
+    path: str
+    contents: bytes
+    sha256: str
+    identity: tuple[int, ...]
+
+    @property
+    def binding(self) -> dict[str, str]:
+        return {"path": self.path, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class _GitFileSnapshot:
+    artifact: _ArtifactSnapshot
+    blob_id: str
+    mode: str
+
+
+@dataclass(frozen=True)
 class _GitSnapshot:
     head: str
-    file_sha256: tuple[tuple[str, str], ...]
+    files: tuple[_GitFileSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -325,7 +348,9 @@ def _read_fd_all(descriptor: int) -> bytes:
     return b"".join(chunks)
 
 
-def _read_file_at(parent_fd: int, name: str, label: str) -> bytes:
+def _read_file_at(
+    parent_fd: int, name: str, label: str
+) -> tuple[bytes, tuple[int, ...]]:
     descriptor = -1
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -342,7 +367,7 @@ def _read_file_at(parent_fd: int, name: str, label: str) -> bytes:
         final_opened = os.fstat(descriptor)
         if _identity(after) != _identity(before) or _identity(final_opened) != _identity(before):
             raise ValueError(f"{label} identity changed during read")
-        return contents
+        return contents, _identity(final_opened)
     except OSError as exc:
         raise ValueError(f"{label} is unsafe or unreadable") from exc
     finally:
@@ -353,7 +378,7 @@ def _read_file_at(parent_fd: int, name: str, label: str) -> bytes:
 def _read_relative(root: Path, relative: Path, label: str) -> bytes:
     parent_fd, descriptors = _open_directory(root, relative.parent, create=False)
     try:
-        return _read_file_at(parent_fd, relative.name, label)
+        return _read_file_at(parent_fd, relative.name, label)[0]
     finally:
         _close_directories(descriptors)
 
@@ -365,7 +390,7 @@ def _read_relative_at(
         directory_descriptor, relative.parent
     )
     try:
-        return _read_file_at(parent_fd, relative.name, label)
+        return _read_file_at(parent_fd, relative.name, label)[0]
     finally:
         _close_directories(descriptors)
 
@@ -383,6 +408,30 @@ def _execution_child(paths: _RegistryPaths, relative: Path) -> Path:
 def _read_path(root: Path, path: Path, label: str) -> tuple[str, bytes]:
     relative = _relative_path(root, path, label)
     return relative.as_posix(), _read_relative(root, relative, label)
+
+
+def _capture_artifact(root: Path, path: Path, label: str) -> _ArtifactSnapshot:
+    relative = _relative_path(root, path, label)
+    parent_fd, descriptors = _open_directory(root, relative.parent, create=False)
+    try:
+        contents, identity = _read_file_at(parent_fd, relative.name, label)
+    finally:
+        _close_directories(descriptors)
+    lexical = relative.as_posix()
+    _validate_artifact_path(lexical, label)
+    return _ArtifactSnapshot(
+        path=lexical,
+        contents=contents,
+        sha256=_sha256_bytes(contents),
+        identity=identity,
+    )
+
+
+def _verify_artifact_snapshot(
+    root: Path, snapshot: _ArtifactSnapshot, label: str
+) -> None:
+    if _capture_artifact(root, root / snapshot.path, label) != snapshot:
+        raise ValueError(f"{label} identity or bytes changed after trusted snapshot")
 
 
 def _canonical_object(contents: bytes, label: str) -> Mapping[str, object]:
@@ -417,9 +466,16 @@ def _string_list(value: object, label: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _sorted_string_list(value: object, label: str) -> tuple[str, ...]:
+    values = _string_list(value, label)
+    if tuple(sorted(values)) != values:
+        raise ValueError(f"{label} must be canonically sorted")
+    return values
+
+
 def _source_inventory_payload(
     contents: bytes, *, run_id: str
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     payload = _canonical_object(contents, "source inventory")
     if (
         type(payload.get("schema_version")) is not int
@@ -432,7 +488,10 @@ def _source_inventory_payload(
         or payload.get("source_gate_ready") is not True
     ):
         raise ValueError("source inventory is not ready for the source gate")
-    return _sha256_list(payload.get("snapshot_sha256s"), "source snapshots")
+    return (
+        _sha256_list(payload.get("snapshot_sha256s"), "source snapshots"),
+        _sorted_string_list(payload.get("logical_query_ids"), "inventory query IDs"),
+    )
 
 
 def _source_receipt_payload(
@@ -479,25 +538,26 @@ def _source_receipt_payload(
 
 
 def _validate_sources_ready_evidence(
-    inventory: Mapping[str, str],
-    inventory_contents: bytes,
-    validation_values: Sequence[tuple[Mapping[str, str], bytes]],
+    inventory: _ArtifactSnapshot,
+    validation_values: Sequence[_ArtifactSnapshot],
     *,
     run_id: str,
 ) -> None:
-    if inventory.get("path") != _SOURCE_INVENTORY_PATH:
+    if inventory.path != _SOURCE_INVENTORY_PATH:
         raise ValueError("SOURCES_READY requires the canonical source inventory")
-    snapshots = _source_inventory_payload(inventory_contents, run_id=run_id)
+    snapshots, inventory_query_ids = _source_inventory_payload(
+        inventory.contents, run_id=run_id
+    )
     reviews = 0
     replay_paths: set[str] = set()
     replay_hashes: set[str] = set()
     reviewed_query_ids: tuple[str, ...] | None = None
-    for binding, contents in validation_values:
+    for artifact in validation_values:
         kind, receipt_queries = _source_receipt_payload(
-            contents,
-            path=binding["path"],
+            artifact.contents,
+            path=artifact.path,
             run_id=run_id,
-            inventory_sha256=inventory["sha256"],
+            inventory_sha256=inventory.sha256,
             snapshot_sha256s=snapshots,
         )
         if reviewed_query_ids is None:
@@ -508,25 +568,29 @@ def _validate_sources_ready_evidence(
             reviews += 1
         else:
             if (
-                binding["path"] in replay_paths
-                or binding["sha256"] in replay_hashes
+                artifact.path in replay_paths
+                or artifact.sha256 in replay_hashes
             ):
                 raise ValueError("clean source replay receipt is duplicated")
-            replay_paths.add(binding["path"])
-            replay_hashes.add(binding["sha256"])
+            replay_paths.add(artifact.path)
+            replay_hashes.add(artifact.sha256)
     if reviews < 1 or len(replay_paths) != 2:
         raise ValueError(
             "SOURCES_READY requires an approved review and two clean replays"
         )
+    if reviewed_query_ids != inventory_query_ids:
+        raise ValueError("source evidence reviewed query IDs differ from inventory")
 
 
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:
-    relative, contents = _read_path(root, path, label)
-    _validate_artifact_path(relative, label)
-    return {"path": relative, "sha256": _sha256_bytes(contents)}
+    return _capture_artifact(root, path, label).binding
 
 
 def _git(root: Path, *args: str) -> str:
+    return _git_bytes(root, *args).decode().strip()
+
+
+def _git_bytes(root: Path, *args: str) -> bytes:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     completed = subprocess.run(
@@ -534,20 +598,15 @@ def _git(root: Path, *args: str) -> str:
     )
     if completed.returncode:
         raise ValueError(completed.stderr.decode(errors="replace").strip() or "git evidence unavailable")
-    return completed.stdout.decode().strip()
+    return completed.stdout
 
 
 def _require_tracked_clean(root: Path, relative: str, label: str) -> None:
-    _git(root, "ls-files", "--error-unmatch", "--", relative)
-    status_output = _git(root, "status", "--porcelain=v1", "--untracked-files=all", "--", relative)
-    if status_output:
-        raise ValueError(f"{label} is dirty")
-    _git(root, "rev-parse", f"HEAD:{relative}")
+    _capture_git_file(root, relative, label)
 
 
 def _require_bound_execution_code_clean(root: Path) -> None:
     for relative in _BOUND_EXECUTION_CODE:
-        _read_relative(root, Path(relative), "bound execution code")
         _require_tracked_clean(root, relative, "bound execution code")
 
 
@@ -577,25 +636,105 @@ def _capture_git_snapshot(
     root: Path, evidence: Mapping[str, object]
 ) -> _GitSnapshot:
     head = _git(root, "rev-parse", "HEAD")
-    bindings: list[tuple[str, str]] = []
+    if not _GIT_HEAD.fullmatch(head):
+        raise ValueError("Git HEAD identity differs")
+    expected_bindings: dict[str, Mapping[str, object]] = {}
+    for key in (
+        "run_spec",
+        "approved_design",
+        "implementation_plan",
+        "acquisition_contract",
+    ):
+        binding = _validate_binding_value(
+            evidence[key], key, plan=key == "implementation_plan"
+        )
+        expected_bindings[str(binding["path"])] = binding
+    lineage = _exact_object(
+        evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
+    )
+    for key in ("baseline_inventory", "protected_inventory"):
+        binding = _validate_binding_value(lineage[key], key)
+        expected_bindings[str(binding["path"])] = binding
+    files: list[_GitFileSnapshot] = []
     for relative in _git_bound_paths(evidence):
-        _require_tracked_clean(root, relative, "bound Git evidence")
-        binding = _binding(root, root / relative, "bound Git evidence")
-        bindings.append((relative, binding["sha256"]))
+        captured = _capture_git_file(root, relative, "bound Git evidence")
+        expected = expected_bindings.get(relative)
+        if expected is not None and captured.artifact.binding != {
+            "path": expected["path"],
+            "sha256": expected["sha256"],
+        }:
+            raise ValueError("bound Git evidence differs from receipt binding")
+        if (
+            expected is not None
+            and "git_blob_id" in expected
+            and captured.blob_id != expected["git_blob_id"]
+        ):
+            raise ValueError("implementation plan Git blob binding differs")
+        files.append(captured)
     if _git(root, "rev-parse", "HEAD") != head:
         raise ValueError("Git HEAD changed during trusted snapshot")
-    return _GitSnapshot(head=head, file_sha256=tuple(bindings))
+    return _GitSnapshot(head=head, files=tuple(files))
 
 
 def _verify_git_snapshot(root: Path, snapshot: _GitSnapshot) -> None:
     if _git(root, "rev-parse", "HEAD") != snapshot.head:
         raise ValueError("Git HEAD changed after trusted snapshot")
-    for relative, digest in snapshot.file_sha256:
-        _require_tracked_clean(root, relative, "bound Git evidence")
-        if _binding(root, root / relative, "bound Git evidence")["sha256"] != digest:
+    for expected in snapshot.files:
+        current = _capture_git_file(
+            root, expected.artifact.path, "bound Git evidence"
+        )
+        if current != expected:
             raise ValueError("bound Git file identity changed after trusted snapshot")
     if _git(root, "rev-parse", "HEAD") != snapshot.head:
         raise ValueError("Git HEAD changed after trusted snapshot")
+
+
+def _parse_git_tree_entry(value: str, label: str) -> tuple[str, str]:
+    try:
+        metadata, _path = value.split("\t", 1)
+        mode, kind, blob = metadata.split(" ")
+    except ValueError as exc:
+        raise ValueError(f"{label} Git tree entry differs") from exc
+    if kind != "blob" or mode not in {"100644", "100755"} or not _GIT_HEAD.fullmatch(blob):
+        raise ValueError(f"{label} Git tree entry differs")
+    return mode, blob
+
+
+def _parse_git_index_entry(value: str, label: str) -> tuple[str, str]:
+    lines = value.splitlines()
+    if len(lines) != 1:
+        raise ValueError(f"{label} Git index entry differs")
+    try:
+        metadata, _path = lines[0].split("\t", 1)
+        mode, blob, stage = metadata.split(" ")
+    except ValueError as exc:
+        raise ValueError(f"{label} Git index entry differs") from exc
+    if stage != "0" or mode not in {"100644", "100755"} or not _GIT_HEAD.fullmatch(blob):
+        raise ValueError(f"{label} Git index entry differs")
+    return mode, blob
+
+
+def _capture_git_file(root: Path, relative: str, label: str) -> _GitFileSnapshot:
+    _validate_artifact_path(relative, label)
+    head_mode, head_blob = _parse_git_tree_entry(
+        _git(root, "ls-tree", "HEAD", "--", relative), label
+    )
+    index_mode, index_blob = _parse_git_index_entry(
+        _git(root, "ls-files", "--stage", "--", relative), label
+    )
+    artifact = _capture_artifact(root, root / relative, label)
+    worktree_mode = "100755" if artifact.identity[2] & 0o111 else "100644"
+    head_bytes = _git_bytes(root, "cat-file", "blob", head_blob)
+    index_bytes = _git_bytes(root, "cat-file", "blob", index_blob)
+    if (
+        head_blob != index_blob
+        or head_mode != index_mode
+        or head_mode != worktree_mode
+        or head_bytes != index_bytes
+        or head_bytes != artifact.contents
+    ):
+        raise ValueError(f"{label} HEAD, index, or worktree differs")
+    return _GitFileSnapshot(artifact=artifact, blob_id=head_blob, mode=head_mode)
 
 
 def _before_registry_publish() -> None:
@@ -621,6 +760,59 @@ def _validate_timestamp(value: object, label: str) -> None:
         raise ValueError(f"{label} timestamp differs")
 
 
+def _cleanup_created_receipt(
+    parent_fd: int, descriptor: int, name: str, label: str
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _identity(opened) != _identity(linked)
+        ):
+            raise ValueError(f"{label} ownership changed before cleanup")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} could not be safely cleaned up") from exc
+
+
+def _verify_published_receipt(
+    execution_descriptor: int,
+    relative: Path,
+    parent_fd: int,
+    parent_identity: tuple[int, ...],
+    descriptor: int,
+    contents: bytes,
+    label: str,
+) -> None:
+    rebound_parent, descriptors = _open_directory_at(
+        execution_descriptor, relative.parent
+    )
+    try:
+        if (
+            _identity(os.fstat(parent_fd)) != parent_identity
+            or _identity(os.fstat(rebound_parent)) != parent_identity
+        ):
+            raise ValueError(f"{label} parent identity changed after publication")
+    finally:
+        _close_directories(descriptors)
+    opened = os.fstat(descriptor)
+    linked = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or _identity(opened) != _identity(linked)
+    ):
+        raise ValueError(f"{label} identity changed after publication")
+    published, published_identity = _read_file_at(
+        parent_fd, relative.name, label
+    )
+    if published_identity != _identity(opened) or published != contents:
+        raise ValueError(f"{label} bytes changed after publication")
+
+
 def _write_exclusive(
     execution_descriptor: int,
     relative: Path,
@@ -632,10 +824,12 @@ def _write_exclusive(
         execution_descriptor, relative.parent
     )
     descriptor = -1
+    created = False
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(relative.name, flags, 0o600, dir_fd=parent_fd)
+        created = True
         view = memoryview(contents)
         while view:
             written = os.write(descriptor, view)
@@ -650,24 +844,33 @@ def _write_exclusive(
         if _identity(linked) != _identity(metadata):
             raise ValueError(f"{label} identity changed during publication")
         os.fsync(parent_fd)
-        try:
-            _after_registry_publish()
-            verify_after_publish()
-        except BaseException:
-            linked = os.stat(
-                relative.name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if _identity(linked) != _identity(os.fstat(descriptor)):
-                raise ValueError(
-                    f"{label} identity changed before failed publication cleanup"
-                )
-            os.unlink(relative.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-            raise
+        parent_identity = _identity(os.fstat(parent_fd))
+        _after_registry_publish()
+        verify_after_publish()
+        _verify_published_receipt(
+            execution_descriptor,
+            relative,
+            parent_fd,
+            parent_identity,
+            descriptor,
+            contents,
+            label,
+        )
     except FileExistsError:
         raise
-    except OSError as exc:
-        raise ValueError(f"{label} could not be published safely") from exc
+    except BaseException as exc:
+        if created:
+            try:
+                _cleanup_created_receipt(
+                    parent_fd, descriptor, relative.name, label
+                )
+            except BaseException as cleanup_exc:
+                raise ValueError(
+                    f"{label} failed publication cleanup ownership verification"
+                ) from cleanup_exc
+        if isinstance(exc, OSError):
+            raise ValueError(f"{label} could not be published safely") from exc
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -854,12 +1057,57 @@ def _validation_bindings(root: Path, paths: Sequence[Path]) -> list[dict[str, st
     return bindings
 
 
-def _binding_with_contents(
-    root: Path, path: Path, label: str
-) -> tuple[dict[str, str], bytes]:
-    relative, contents = _read_path(root, path, label)
-    _validate_artifact_path(relative, label)
-    return {"path": relative, "sha256": _sha256_bytes(contents)}, contents
+def _artifact_snapshots(
+    root: Path,
+    paths: Sequence[Path],
+    label: str,
+    *,
+    allow_duplicate_paths: bool = False,
+) -> tuple[_ArtifactSnapshot, ...]:
+    snapshots = tuple(_capture_artifact(root, path, label) for path in paths)
+    if (
+        not allow_duplicate_paths
+        and len({snapshot.path for snapshot in snapshots}) != len(snapshots)
+    ):
+        raise ValueError(f"{label} paths must be unique")
+    return snapshots
+
+
+def _verify_artifact_snapshots(
+    root: Path, snapshots: Sequence[_ArtifactSnapshot], label: str
+) -> None:
+    for snapshot in snapshots:
+        _verify_artifact_snapshot(root, snapshot, label)
+
+
+def _validate_phase_evidence(
+    phase: str,
+    base: Mapping[str, object],
+    inventory: _ArtifactSnapshot,
+    validations: Sequence[_ArtifactSnapshot],
+    *,
+    run_id: str,
+) -> None:
+    if phase in {"DESIGN_ACCEPTED", "ACQUIRING"}:
+        lineage = _exact_object(
+            base["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
+        )
+        protected = _validate_binding_value(
+            lineage["protected_inventory"], "protected inventory"
+        )
+        if inventory.binding != dict(protected) or validations:
+            raise ValueError(
+                f"{phase} must bind the Task0 protected inventory directly"
+            )
+        return
+    if phase == "SOURCES_READY":
+        _validate_sources_ready_evidence(
+            inventory,
+            validations,
+            run_id=run_id,
+        )
+        return
+    raise ValueError(f"execution phase {phase} has no implemented evidence validator")
 
 
 def _validate_stored_artifacts(
@@ -885,6 +1133,30 @@ def _validate_stored_artifacts(
         seen.add(path)
         if _binding(root, root / path, label) != dict(binding):
             raise ValueError(f"{label} hash binding differs")
+
+
+def _snapshots_from_bindings(
+    root: Path,
+    values: object,
+    label: str,
+    *,
+    allow_duplicate_paths: bool = False,
+) -> tuple[_ArtifactSnapshot, ...]:
+    if not isinstance(values, list):
+        raise ValueError(f"{label} must be a list")
+    snapshots: list[_ArtifactSnapshot] = []
+    seen: set[str] = set()
+    for value in values:
+        binding = _validate_binding_value(value, label)
+        path = str(binding["path"])
+        if path in seen and not allow_duplicate_paths:
+            raise ValueError(f"{label} binding differs")
+        seen.add(path)
+        snapshot = _capture_artifact(root, root / path, label)
+        if snapshot.binding != dict(binding):
+            raise ValueError(f"{label} hash binding differs")
+        snapshots.append(snapshot)
+    return tuple(snapshots)
 
 
 def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, filename_sequence: int) -> Mapping[str, object]:
@@ -973,8 +1245,14 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
         or receipt.get("attempted_phase") not in PHASES
         or (
             automatic
-            and receipt.get("error_classification")
-            not in _QUARANTINE_ERROR_CLASSIFICATIONS
+            and (
+                receipt.get("error_classification")
+                not in _QUARANTINE_ERROR_CLASSIFICATIONS
+                or _AUTOMATIC_QUARANTINE_CLASSIFICATION_BY_PHASE.get(
+                    str(receipt.get("attempted_phase"))
+                )
+                != receipt.get("error_classification")
+            )
         )
         or not isinstance(current_hash, str)
         or not _SHA256.fullmatch(current_hash)
@@ -1089,6 +1367,7 @@ def _load_locked(
     phase_receipt_sha: dict[str, str] = {}
     prior_sha: str | None = None
     stable_bindings: dict[str, object] | None = None
+    trusted_git: _GitSnapshot | None = None
     for expected_sequence, name in enumerate(names):
         match = _SUCCESS_NAME.fullmatch(name)
         if match is None:
@@ -1111,12 +1390,25 @@ def _load_locked(
             raise ValueError("execution receipt Git head differs")
         _validate_common_bindings(paths.root, payload, run_spec)
         inventory = _exact_object(payload.get("inventory"), _BINDING_KEYS, "phase inventory")
-        if _binding(paths.root, paths.root / str(inventory["path"]), "phase inventory") != dict(inventory):
+        inventory_snapshot = _capture_artifact(
+            paths.root, paths.root / str(inventory["path"]), "phase inventory"
+        )
+        if inventory_snapshot.binding != dict(inventory):
             raise ValueError("phase inventory hash binding differs")
-        _validate_stored_artifacts(paths.root, payload.get("validation_receipts"), "validation receipts")
+        validation_snapshots = _snapshots_from_bindings(
+            paths.root, payload.get("validation_receipts"), "validation receipts"
+        )
+        _validate_phase_evidence(
+            phase,
+            payloads[0] if payloads else payload,
+            inventory_snapshot,
+            validation_snapshots,
+            run_id=run_spec.run_id,
+        )
         current_bindings = {key: payload[key] for key in ("run_spec", "approved_design", "implementation_plan", "acquisition_contract", "task0_lineage")}
         if stable_bindings is None:
             stable_bindings = current_bindings
+            trusted_git = _capture_git_snapshot(paths.root, payload)
         elif current_bindings != stable_bindings:
             raise ValueError("execution registry binding fork differs")
         payloads.append(payload)
@@ -1131,6 +1423,9 @@ def _load_locked(
         lock_binding,
     )
     inventory = _exact_object(last["inventory"], _BINDING_KEYS, "phase inventory")
+    if trusted_git is None:
+        raise ValueError("execution registry trusted Git snapshot is missing")
+    _verify_git_snapshot(paths.root, trusted_git)
     _verify_lock_binding(paths, lock_binding)
     return (
         ExecutionRegistryState(
@@ -1193,15 +1488,22 @@ def _publish_locked(
     relative: Path,
     contents: bytes,
     label: str,
+    evidence_snapshots: Sequence[_ArtifactSnapshot] = (),
 ) -> None:
     child = _execution_child(paths, relative)
     _before_registry_publish()
     _verify_git_snapshot(paths.root, snapshot)
     _verify_lock_binding(paths, lock_binding)
+    _verify_artifact_snapshots(
+        paths.root, evidence_snapshots, "dynamic phase evidence"
+    )
 
     def verify_after_publish() -> None:
         _verify_git_snapshot(paths.root, snapshot)
         _verify_lock_binding(paths, lock_binding)
+        _verify_artifact_snapshots(
+            paths.root, evidence_snapshots, "dynamic phase evidence"
+        )
 
     _write_exclusive(
         lock_binding.execution_descriptor,
@@ -1224,6 +1526,7 @@ def _publish_quarantine_locked(
     *,
     inventory: Mapping[str, object] | None = None,
     error_classification: str | None = None,
+    evidence_snapshots: Sequence[_ArtifactSnapshot] = (),
 ) -> Path:
     payload = {
         "schema_version": 1,
@@ -1256,6 +1559,7 @@ def _publish_quarantine_locked(
         relative,
         contents,
         "quarantine receipt",
+        evidence_snapshots,
     )
     return paths.root / relative
 
@@ -1289,6 +1593,13 @@ def initialize_execution_registry(
             return state
         protected = _exact_object(evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage")["protected_inventory"]
         snapshot = _capture_git_snapshot(paths.root, evidence)
+        protected_snapshot = _capture_artifact(
+            paths.root,
+            paths.root / str(protected["path"]),
+            "phase inventory",
+        )
+        if protected_snapshot.binding != dict(protected):
+            raise ValueError("protected inventory differs from trusted binding")
         payload = {
             "schema_version": 1,
             "receipt_kind": "PHASE_TRANSITION",
@@ -1311,6 +1622,7 @@ def initialize_execution_registry(
             relative,
             contents,
             "execution receipt",
+            (protected_snapshot,),
         )
         return ExecutionRegistryState("DESIGN_ACCEPTED", 0, digest, str(protected["sha256"]))
 
@@ -1345,33 +1657,25 @@ def advance_execution_phase(
             )
         base = payloads[0]
         snapshot = _capture_git_snapshot(paths.root, base)
-        inventory, inventory_contents = _binding_with_contents(
+        inventory_snapshot = _capture_artifact(
             paths.root, inventory_path, "phase inventory"
         )
-        validation_values = [
-            _binding_with_contents(paths.root, path, "validation receipt")
-            for path in validation_receipts
-        ]
-        validations = [binding for binding, _contents in validation_values]
+        validation_snapshots = _artifact_snapshots(
+            paths.root,
+            validation_receipts,
+            "validation receipt",
+            allow_duplicate_paths=True,
+        )
+        inventory = inventory_snapshot.binding
+        validations = [artifact.binding for artifact in validation_snapshots]
         try:
-            if next_phase == "ACQUIRING":
-                lineage = _exact_object(
-                    base["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
-                )
-                protected = _validate_binding_value(
-                    lineage["protected_inventory"], "protected inventory"
-                )
-                if inventory != protected or validation_values:
-                    raise ValueError(
-                        "ACQUIRING must bind the Task0 protected inventory directly"
-                    )
-            else:
-                _validate_sources_ready_evidence(
-                    inventory,
-                    inventory_contents,
-                    validation_values,
-                    run_id=run_spec.run_id,
-                )
+            _validate_phase_evidence(
+                next_phase,
+                base,
+                inventory_snapshot,
+                validation_snapshots,
+                run_id=run_spec.run_id,
+            )
             payload = {
                 "schema_version": 1,
                 "receipt_kind": "PHASE_TRANSITION",
@@ -1412,6 +1716,7 @@ def advance_execution_phase(
                 lock_binding,
                 inventory=inventory,
                 error_classification=error_classification,
+                evidence_snapshots=(inventory_snapshot, *validation_snapshots),
             )
             raise ValueError("direct phase artifact evidence failed") from exc
         relative = paths.receipts_relative / f"{state.sequence + 1:06d}-{next_phase}-{digest}.json"
@@ -1422,6 +1727,7 @@ def advance_execution_phase(
             relative,
             contents,
             "execution receipt",
+            (inventory_snapshot, *validation_snapshots),
         )
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 
@@ -1435,7 +1741,10 @@ def quarantine_execution_transition(
 ) -> Path:
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
-        validations = _validation_bindings(paths.root, validation_receipts)
+        validation_snapshots = _artifact_snapshots(
+            paths.root, validation_receipts, "validation receipt"
+        )
+        validations = [snapshot.binding for snapshot in validation_snapshots]
         if not validations:
             raise ValueError("quarantine transition requires validation evidence")
         state, payloads = _load_locked(paths, run_spec, lock_binding)
@@ -1451,6 +1760,7 @@ def quarantine_execution_transition(
             validations,
             snapshot,
             lock_binding,
+            evidence_snapshots=validation_snapshots,
         )
 
 

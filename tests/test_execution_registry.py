@@ -11,13 +11,34 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import jsonschema
+from jsonschema import FormatChecker
 
 from mlb_backtest.diagnostics import canonical_json_bytes
 from mlb_backtest.protocols import load_run_spec
+
+
+FORMAT_CHECKER = FormatChecker()
+
+
+def _valid_date_time(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+FORMAT_CHECKER.checkers = {
+    **FORMAT_CHECKER.checkers,
+    "date-time": (_valid_date_time, ()),
+}
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,6 +162,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             SOURCE_INVENTORY_RELATIVE.as_posix(),
             {
                 "critical_errors": [],
+                "logical_query_ids": reviewed_query_ids,
                 "network_attempts": 0,
                 "run_id": "historical_walkforward_500",
                 "schema_version": 1,
@@ -182,6 +204,222 @@ class ExecutionRegistryTest(unittest.TestCase):
             for index in (1, 2)
         )
         return inventory, (review, *replays)
+
+    def replace_receipt_payload(self, receipt: Path, payload: object) -> Path:
+        contents = canonical_json_bytes(payload) + b"\n"
+        digest = hashlib.sha256(contents).hexdigest()
+        prefix = receipt.name.rsplit("-", 1)[0]
+        replacement = receipt.with_name(f"{prefix}-{digest}.json")
+        receipt.unlink()
+        replacement.write_bytes(contents)
+        return replacement
+
+    def test_sources_ready_rejects_consistent_review_ids_unrelated_to_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            for receipt in evidence:
+                payload = json.loads(receipt.read_bytes())
+                payload["reviewed_query_ids"] = ["unrelated-query"]
+                receipt.write_bytes(canonical_json_bytes(payload) + b"\n")
+
+            with self.assertRaisesRegex(ValueError, "artifact|evidence|query"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+
+    def test_dynamic_phase_evidence_is_stable_through_publication(self) -> None:
+        for artifact_kind in ("inventory", "review", "replay"):
+            with self.subTest(artifact_kind=artifact_kind), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+                inventory, evidence = self.write_real_source_evidence(root)
+                target = inventory if artifact_kind == "inventory" else evidence[0 if artifact_kind == "review" else 1]
+
+                def mutate_evidence() -> None:
+                    target.write_bytes(target.read_bytes() + b" ")
+
+                with patch.object(
+                    self.registry,
+                    "_before_registry_publish",
+                    side_effect=mutate_evidence,
+                ), self.assertRaisesRegex(ValueError, "evidence|identity|snapshot|changed"):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="ACQUIRING",
+                        next_phase="SOURCES_READY",
+                        inventory_path=inventory,
+                        validation_receipts=evidence,
+                    )
+                self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 2)
+                target.write_bytes(target.read_bytes()[:-1])
+                self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+
+    def test_publication_rejects_receipt_parent_or_file_replacement_after_hook(self) -> None:
+        for attack in ("parent", "file"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                initial = self.initialize(root, run_spec)
+                receipts = root / RECEIPTS_RELATIVE
+                displaced = receipts.with_name("phase_receipts-displaced")
+
+                def replace_published_path() -> None:
+                    published = next(path for path in receipts.iterdir() if path.name.startswith("000001-"))
+                    if attack == "parent":
+                        receipts.rename(displaced)
+                        receipts.mkdir()
+                    else:
+                        replacement = published.with_suffix(".replacement")
+                        replacement.write_bytes(published.read_bytes())
+                        os.replace(replacement, published)
+
+                with patch.object(
+                    self.registry,
+                    "_after_registry_publish",
+                    side_effect=replace_published_path,
+                ), self.assertRaisesRegex(ValueError, "identity|receipt|publication"):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="DESIGN_ACCEPTED",
+                        next_phase="ACQUIRING",
+                        inventory_path=root / PROTECTED_RELATIVE,
+                        validation_receipts=(),
+                    )
+                if attack == "parent":
+                    self.assertEqual(list(receipts.iterdir()), [])
+                    self.assertEqual(len(list(displaced.iterdir())), 1)
+                self.assertEqual(initial.phase, "DESIGN_ACCEPTED")
+
+    def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
+        for failure in ("partial_write", "fsync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                initial = self.initialize(root, run_spec)
+                receipts = root / RECEIPTS_RELATIVE
+                execution_fd, descriptors = self.registry._open_directory(
+                    root,
+                    Path("audit/v5_2_qd/historical/execution"),
+                    create=False,
+                )
+                if failure == "partial_write":
+                    original_write = os.write
+                    calls = 0
+
+                    def fail_write(descriptor: int, contents: object) -> int:
+                        nonlocal calls
+                        calls += 1
+                        if calls == 1:
+                            return original_write(descriptor, bytes(contents[:8]))
+                        raise OSError("injected partial write failure")
+
+                    context = patch.object(self.registry.os, "write", side_effect=fail_write)
+                else:
+                    original_fsync = os.fsync
+
+                    def fail_receipt_fsync(descriptor: int) -> None:
+                        metadata = os.fstat(descriptor)
+                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size:
+                            raise OSError("injected receipt fsync failure")
+                        original_fsync(descriptor)
+
+                    context = patch.object(self.registry.os, "fsync", side_effect=fail_receipt_fsync)
+                try:
+                    with context, self.assertRaisesRegex(ValueError, "published|publication|safely"):
+                        self.registry._write_exclusive(
+                            execution_fd,
+                            Path("phase_receipts/injected.json"),
+                            b"receipt contents\n",
+                            "execution receipt",
+                            lambda: None,
+                        )
+                finally:
+                    self.registry._close_directories(descriptors)
+                self.assertEqual(len(list(receipts.iterdir())), 1)
+                self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+
+    def test_git_binding_cannot_change_between_evidence_validation_and_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            original_capture = self.registry._capture_git_snapshot
+
+            def mutate_and_commit(repo: Path, evidence: object):
+                (root / DESIGN_RELATIVE).write_bytes((root / DESIGN_RELATIVE).read_bytes() + b"changed\n")
+                _git(root, "add", DESIGN_RELATIVE.as_posix())
+                _git(root, "commit", "-qm", "racing design")
+                return original_capture(repo, evidence)
+
+            with patch.object(
+                self.registry,
+                "_capture_git_snapshot",
+                side_effect=mutate_and_commit,
+            ), self.assertRaisesRegex(ValueError, "binding|Git|snapshot|design"):
+                self.initialize(root, run_spec)
+            self.assertEqual(list((root / RECEIPTS_RELATIVE).iterdir()), [])
+
+    def test_skip_worktree_cannot_hide_dirty_bound_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            relative = BOUND_EXECUTION_CODE[0]
+            _git(root, "update-index", "--skip-worktree", relative.as_posix())
+            (root / relative).write_bytes((root / relative).read_bytes() + b"dirty\n")
+            self.assertEqual(
+                _git(root, "status", "--porcelain=v1", "--", relative.as_posix()),
+                "",
+            )
+            with self.assertRaisesRegex(ValueError, "dirty|Git|index|HEAD|worktree"):
+                self.initialize(root, run_spec)
+
+    def test_load_rejects_forged_semantically_impossible_phase_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            receipt = next(path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000001-"))
+            unrelated = self.write_artifact(root, "unrelated-inventory.json", {"rows": 1})
+            payload = json.loads(receipt.read_bytes())
+            payload["inventory"] = {
+                "path": unrelated.relative_to(root).as_posix(),
+                "sha256": _sha256(unrelated),
+            }
+            self.replace_receipt_payload(receipt, payload)
+            with self.assertRaisesRegex(ValueError, "ACQUIRING|phase|inventory|evidence"):
+                self.registry.load_execution_registry(root, run_spec)
+
+    def test_load_rejects_forged_sources_ready_review_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            self.registry.advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="ACQUIRING",
+                next_phase="SOURCES_READY",
+                inventory_path=inventory,
+                validation_receipts=evidence,
+            )
+            review = evidence[0]
+            review_payload = json.loads(review.read_bytes())
+            review_payload["reviewed_query_ids"] = ["unrelated-query"]
+            review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+            receipt = next(path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000002-"))
+            payload = json.loads(receipt.read_bytes())
+            payload["validation_receipts"][0]["sha256"] = _sha256(review)
+            self.replace_receipt_payload(receipt, payload)
+            with self.assertRaisesRegex(ValueError, "source|query|phase|evidence"):
+                self.registry.load_execution_registry(root, run_spec)
 
     def test_acquiring_binds_actual_protected_inventory_without_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -414,7 +652,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             schema = json.loads(
                 (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
             )
-            jsonschema.validate(payload, schema)
+            jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
             self.assertEqual(
                 receipts[0].read_bytes(), canonical_json_bytes(payload) + b"\n"
             )
@@ -503,7 +741,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             schema = json.loads(
                 (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
             )
-            jsonschema.validate(payload, schema)
+            jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
 
     def test_publication_rejects_replaced_execution_namespace(self) -> None:
         for operation in ("initialize", "advance", "quarantine"):
@@ -850,7 +1088,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.initialize(root, run_spec)
             receipt = next((root / RECEIPTS_RELATIVE).iterdir())
             payload = json.loads(receipt.read_bytes())
-            jsonschema.validate(payload, schema)
+            jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
             self.assertEqual(receipt.read_bytes(), canonical_json_bytes(payload) + b"\n")
 
             failed = self.write_artifact(root, "failed.json", {"status": "FAIL"})
@@ -860,7 +1098,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                 attempted_phase="ACQUIRING",
                 validation_receipts=(failed,),
             )
-            jsonschema.validate(json.loads(quarantine.read_bytes()), schema)
+            jsonschema.validate(
+                json.loads(quarantine.read_bytes()),
+                schema,
+                format_checker=FORMAT_CHECKER,
+            )
 
             self.registry.advance_execution_phase(
                 root,
@@ -875,7 +1117,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                 for path in (root / RECEIPTS_RELATIVE).iterdir()
                 if path.name.startswith("000001-")
             )
-            jsonschema.validate(json.loads(transition.read_bytes()), schema)
+            jsonschema.validate(
+                json.loads(transition.read_bytes()),
+                schema,
+                format_checker=FORMAT_CHECKER,
+            )
 
     def test_schema_rejects_impossible_phase_sequence_and_prior_combinations(self) -> None:
         schema = json.loads(
@@ -900,7 +1146,47 @@ class ExecutionRegistryTest(unittest.TestCase):
                 with self.subTest(payload=payload), self.assertRaises(
                     jsonschema.ValidationError
                 ):
-                    jsonschema.validate(payload, schema)
+                    jsonschema.validate(
+                        payload, schema, format_checker=FORMAT_CHECKER
+                    )
+
+    def test_automatic_quarantine_schema_and_runtime_enforce_phase_classification_parity(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            wrong = self.write_artifact(root, "wrong.json", {"wrong": True})
+            with self.assertRaises(ValueError):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=wrong,
+                    validation_receipts=(),
+                )
+            quarantine = next(
+                (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+            )
+            payload = json.loads(quarantine.read_bytes())
+            payload["error_classification"] = "SOURCE_GATE_EVIDENCE_INVALID"
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    payload, schema, format_checker=FORMAT_CHECKER
+                )
+            with self.assertRaisesRegex(ValueError, "classification|phase|schema"):
+                self.registry._validate_quarantine_receipt(payload)
+
+            invalid_timestamp = json.loads(quarantine.read_bytes())
+            invalid_timestamp["recorded_at_utc"] = "2026-02-30T00:00:00.000000Z"
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    invalid_timestamp,
+                    schema,
+                    format_checker=FORMAT_CHECKER,
+                )
 
     def test_rejects_invalid_receipt_paths_on_emit_and_load(self) -> None:
         schema = json.loads(
@@ -943,7 +1229,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             (root / invalid_path).write_bytes((root / PROTECTED_RELATIVE).read_bytes())
             payload["inventory"]["path"] = invalid_path
             with self.assertRaises(jsonschema.ValidationError):
-                jsonschema.validate(payload, schema)
+                jsonschema.validate(
+                    payload, schema, format_checker=FORMAT_CHECKER
+                )
             contents = canonical_json_bytes(payload) + b"\n"
             digest = hashlib.sha256(contents).hexdigest()
             replacement = receipt.with_name(
@@ -988,7 +1276,9 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             (root / DESIGN_RELATIVE).write_text("dirty\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "dirty|binding|hash"):
+            with self.assertRaisesRegex(
+                ValueError, "dirty|binding|hash|HEAD|index|worktree"
+            ):
                 self.initialize(root, run_spec)
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
