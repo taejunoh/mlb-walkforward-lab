@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "v5.2 closed grain-specific season source snapshot",
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "date": {"type": "string", "format": "date"},
+    "positiveId": {"type": "integer", "minimum": 1},
+    "nullableNonnegative": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+    "gameEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "actual_starter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
+        "away_score": {"$ref": "#/$defs/nullableNonnegative"},
+        "away_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
+        "away_team_id": {"$ref": "#/$defs/positiveId"},
+        "boxscore_sha256": {"$ref": "#/$defs/sha256"},
+        "completed_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "doubleheader_order": {"type": "integer", "minimum": 1},
+        "feature_history_cutoff": {"$ref": "#/$defs/date"},
+        "game_pk": {"$ref": "#/$defs/positiveId"},
+        "home_score": {"$ref": "#/$defs/nullableNonnegative"},
+        "home_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "uniqueItems": true},
+        "home_team_id": {"$ref": "#/$defs/positiveId"},
+        "official_date": {"$ref": "#/$defs/date"},
+        "participant_provenance": {"enum": ["RECONSTRUCTED_FINAL_PARTICIPANTS", "HISTORICAL_NO_PARTICIPANTS"]},
+        "played": {"type": "boolean"},
+        "scheduled_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "scheduled_start_utc": {"type": "string", "format": "date-time"},
+        "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+        "season_start_date": {"$ref": "#/$defs/date"},
+        "source_game_sha256": {"$ref": "#/$defs/sha256"},
+        "terminal_status": {"type": "string", "minLength": 1},
+        "venue_id": {"$ref": "#/$defs/positiveId"},
+        "verification_status": {"enum": ["VERIFIED", "INELIGIBLE_UNPLAYED"]},
+        "winner_team_id": {"oneOf": [{"$ref": "#/$defs/positiveId"}, {"type": "null"}]}
+      },
+      "required": ["away_team_id", "completed_innings", "doubleheader_order", "feature_history_cutoff", "game_pk", "home_team_id", "official_date", "participant_provenance", "played", "scheduled_innings", "scheduled_start_utc", "season", "source_game_sha256", "terminal_status", "venue_id", "verification_status"],
+      "oneOf": [
+        {
+          "properties": {
+            "actual_starter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "minItems": 2, "maxItems": 2, "uniqueItems": true},
+            "away_score": {"type": "integer", "minimum": 0},
+            "away_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "minItems": 9, "maxItems": 9, "uniqueItems": true},
+            "home_score": {"type": "integer", "minimum": 0},
+            "home_starting_hitter_ids": {"type": "array", "items": {"$ref": "#/$defs/positiveId"}, "minItems": 9, "maxItems": 9, "uniqueItems": true},
+            "participant_provenance": {"const": "RECONSTRUCTED_FINAL_PARTICIPANTS"},
+            "played": {"const": true},
+            "verification_status": {"const": "VERIFIED"},
+            "winner_team_id": {"$ref": "#/$defs/positiveId"}
+          },
+          "required": ["actual_starter_ids", "away_score", "away_starting_hitter_ids", "boxscore_sha256", "home_score", "home_starting_hitter_ids", "winner_team_id"]
+        },
+        {
+          "properties": {
+            "actual_starter_ids": {"type": "array", "maxItems": 0},
+            "away_score": {"type": "null"},
+            "away_starting_hitter_ids": {"type": "array", "maxItems": 0},
+            "home_score": {"type": "null"},
+            "home_starting_hitter_ids": {"type": "array", "maxItems": 0},
+            "participant_provenance": {"const": "HISTORICAL_NO_PARTICIPANTS"},
+            "played": {"const": false},
+            "verification_status": {"const": "INELIGIBLE_UNPLAYED"},
+            "winner_team_id": {"type": "null"}
+          },
+          "required": ["actual_starter_ids", "away_score", "away_starting_hitter_ids", "home_score", "home_starting_hitter_ids", "winner_team_id"]
+        }
+      ]
+    },
+    "team": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "home_venue_id": {"$ref": "#/$defs/positiveId"},
+        "location_name": {"type": "string", "minLength": 1},
+        "team_id": {"$ref": "#/$defs/positiveId"},
+        "team_name": {"type": "string", "minLength": 1}
+      },
+      "required": ["home_venue_id", "location_name", "team_id", "team_name"]
+    },
+    "venue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "city": {"type": "string", "minLength": 1},
+        "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+        "longitude": {"type": "number", "minimum": -180, "maximum": 180},
+        "venue_id": {"$ref": "#/$defs/positiveId"},
+        "venue_name": {"type": "string", "minLength": 1}
+      },
+      "required": ["city", "latitude", "longitude", "venue_id", "venue_name"]
+    },
+    "timezone": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "effective_end": {"$ref": "#/$defs/date"},
+        "effective_start": {"$ref": "#/$defs/date"},
+        "time_zone": {"type": "string", "minLength": 1},
+        "venue_id": {"$ref": "#/$defs/positiveId"}
+      },
+      "required": ["effective_end", "effective_start", "time_zone", "venue_id"]
+    },
+    "observedMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "neutral_site": {"type": "boolean"},
+        "official_date": {"$ref": "#/$defs/date"},
+        "time_zone": {"type": "string", "minLength": 1},
+        "venue_id": {"$ref": "#/$defs/positiveId"}
+      },
+      "required": ["neutral_site", "official_date", "time_zone", "venue_id"]
+    },
+    "historyGame": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "away_team_id": {"$ref": "#/$defs/positiveId"},
+        "completed_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "doubleheader_order": {"type": "integer", "minimum": 1},
+        "game_pk": {"$ref": "#/$defs/positiveId"},
+        "history_cutoff": {"$ref": "#/$defs/date"},
+        "home_team_id": {"$ref": "#/$defs/positiveId"},
+        "official_date": {"$ref": "#/$defs/date"},
+        "projection_sha256": {"$ref": "#/$defs/sha256"},
+        "scheduled_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "scheduled_start_utc": {"type": "string", "format": "date-time"},
+        "source_game_sha256": {"$ref": "#/$defs/sha256"},
+        "terminal_status": {"type": "string", "minLength": 1},
+        "venue_id": {"$ref": "#/$defs/positiveId"}
+      },
+      "required": ["away_team_id", "completed_innings", "doubleheader_order", "game_pk", "history_cutoff", "home_team_id", "official_date", "projection_sha256", "scheduled_innings", "scheduled_start_utc", "source_game_sha256", "terminal_status", "venue_id"]
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "games": {"type": "array", "items": {"$ref": "#/$defs/gameEvidence"}},
+        "grain": {"const": "season_game_evidence_snapshot"},
+        "schema_version": {"const": 1},
+        "source_query_sidecar_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true}
+      },
+      "required": ["games", "grain", "schema_version", "source_query_sidecar_sha256s"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "grain": {"const": "effective_dated_venue_team_reference"},
+        "observed_venue_date_mappings": {"type": "array", "items": {"$ref": "#/$defs/observedMapping"}},
+        "schema_version": {"const": 1},
+        "team_payload_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "teams": {"type": "array", "items": {"$ref": "#/$defs/team"}},
+        "timezone_rows": {"type": "array", "items": {"$ref": "#/$defs/timezone"}},
+        "venue_payload_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "venues": {"type": "array", "items": {"$ref": "#/$defs/venue"}}
+      },
+      "required": ["grain", "observed_venue_date_mappings", "schema_version", "team_payload_sha256s", "teams", "timezone_rows", "venue_payload_sha256s", "venues"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "games": {"type": "array", "items": {"$ref": "#/$defs/historyGame"}},
+        "grain": {"const": "verified_game_projection"},
+        "schema_version": {"const": 1},
+        "source_game_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "source_snapshot_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["games", "grain", "schema_version", "source_game_sha256s", "source_snapshot_sha256"]
+    }
+  ]
+}
