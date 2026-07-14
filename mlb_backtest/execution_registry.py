@@ -79,26 +79,14 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/verify_v52_design.py",
     "schemas/v5_2_execution_receipt.schema.json",
 )
-_PHASE_INVENTORY_KEYS = frozenset(
-    {
-        "critical_errors",
-        "inventory_kind",
-        "run_id",
-        "schema_version",
-        "source_gate_ready",
-        "status",
-        "target_phase",
-    }
+_SOURCE_INVENTORY_PATH = (
+    "data/v5_2_qd/historical/sources/source_inventory.json"
 )
-_VALIDATION_EVIDENCE_KEYS = frozenset(
-    {
-        "critical_errors",
-        "inventory_sha256",
-        "run_id",
-        "schema_version",
-        "status",
-        "validated_phase",
-    }
+_SOURCE_REVIEW_PREFIX = (
+    "audit/v5_2_qd/historical/acquisition/source_reviews/"
+)
+_SOURCE_REPLAY_PREFIX = (
+    "audit/v5_2_qd/historical/acquisition/source_replays/"
 )
 
 
@@ -265,22 +253,17 @@ def _relative_path(root: Path, path: Path, label: str) -> Path:
         candidate = root / candidate
     try:
         lexical = Path(os.path.abspath(candidate))
-        try:
-            lexical_relative = lexical.relative_to(root)
-        except ValueError:
-            lexical_relative = None
-        if lexical_relative is not None:
-            current = root
-            for component in lexical_relative.parts:
-                current = current / component
-                component_stat = current.lstat()
-                if stat.S_ISLNK(component_stat.st_mode):
-                    raise ValueError(f"{label} symlink ancestor is forbidden")
-        linked = candidate.lstat()
-        if stat.S_ISLNK(linked.st_mode):
-            raise ValueError(f"{label} symlink is forbidden")
-        normalized = candidate.resolve(strict=True)
+        lexical_relative = lexical.relative_to(root)
+        current = root
+        for component in lexical_relative.parts:
+            current = current / component
+            component_stat = current.lstat()
+            if stat.S_ISLNK(component_stat.st_mode):
+                raise ValueError(f"{label} symlink ancestor is forbidden")
+        normalized = lexical.resolve(strict=True)
         relative = normalized.relative_to(root)
+        if normalized != lexical:
+            raise ValueError(f"{label} must not resolve through an alias")
     except (OSError, ValueError) as exc:
         raise ValueError(f"{label} must be an existing path under repository root") from exc
     if not relative.parts:
@@ -333,39 +316,133 @@ def _canonical_object(contents: bytes, label: str) -> Mapping[str, object]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} is not JSON") from exc
     if not isinstance(payload, Mapping) or canonical_json_bytes(payload) + b"\n" != contents:
-        raise ValueError(f"{label} is not canonical closed JSON with one newline")
+        raise ValueError(f"{label} is not canonical JSON with one newline")
     return payload
 
 
-def _phase_evidence_payload(
-    contents: bytes, *, phase: str, run_id: str, inventory_sha256: str | None
-) -> Mapping[str, object]:
-    label = "phase inventory" if inventory_sha256 is None else "validation receipt"
-    payload = _canonical_object(contents, label)
-    if inventory_sha256 is None:
-        _exact_object(payload, _PHASE_INVENTORY_KEYS, label)
+def _sha256_list(value: object, label: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError(f"{label} must be a non-empty unique SHA-256 list")
+    return tuple(value)
+
+
+def _string_list(value: object, label: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError(f"{label} must be a non-empty unique string list")
+    return tuple(value)
+
+
+def _source_inventory_payload(
+    contents: bytes, *, run_id: str
+) -> tuple[str, ...]:
+    payload = _canonical_object(contents, "source inventory")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("run_id") != run_id
+        or payload.get("status") != "READY_CANDIDATE"
+        or payload.get("critical_errors") != []
+        or type(payload.get("network_attempts")) is not int
+        or payload.get("network_attempts") != 0
+        or payload.get("source_gate_ready") is not True
+    ):
+        raise ValueError("source inventory is not ready for the source gate")
+    return _sha256_list(payload.get("snapshot_sha256s"), "source snapshots")
+
+
+def _source_receipt_payload(
+    contents: bytes,
+    *,
+    path: str,
+    run_id: str,
+    inventory_sha256: str,
+    snapshot_sha256s: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    payload = _canonical_object(contents, "source evidence receipt")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("run_id") != run_id
+        or payload.get("inventory_sha256") != inventory_sha256
+        or payload.get("critical_errors") != []
+        or _sha256_list(payload.get("snapshot_sha256s"), "receipt snapshots")
+        != snapshot_sha256s
+    ):
+        raise ValueError("source evidence receipt binding failed")
+    reviewed_query_ids = _string_list(
+        payload.get("reviewed_query_ids"), "reviewed query IDs"
+    )
+    kind = payload.get("receipt_kind")
+    if kind == "SOURCE_REVIEW":
         if (
-            payload.get("schema_version") != 1
-            or payload.get("inventory_kind") != "EXECUTION_PHASE_INVENTORY"
-            or payload.get("run_id") != run_id
-            or payload.get("target_phase") != phase
-            or payload.get("status") != "PASS"
-            or payload.get("critical_errors") != []
-            or payload.get("source_gate_ready") is not (phase == "SOURCES_READY")
+            not path.startswith(_SOURCE_REVIEW_PREFIX)
+            or payload.get("reviewer_identity") != "independent-source-auditor"
+            or payload.get("decision") != "APPROVED"
         ):
-            raise ValueError("phase inventory validation failed")
-    else:
-        _exact_object(payload, _VALIDATION_EVIDENCE_KEYS, label)
+            raise ValueError("independent source review is not approved")
+        return kind, reviewed_query_ids
+    if kind == "CLEAN_SOURCE_REPLAY":
         if (
-            payload.get("schema_version") != 1
-            or payload.get("run_id") != run_id
-            or payload.get("validated_phase") != phase
-            or payload.get("inventory_sha256") != inventory_sha256
+            not path.startswith(_SOURCE_REPLAY_PREFIX)
             or payload.get("status") != "PASS"
-            or payload.get("critical_errors") != []
+            or type(payload.get("network_attempts")) is not int
+            or payload.get("network_attempts") != 0
         ):
-            raise ValueError("validation receipt failed")
-    return payload
+            raise ValueError("clean source replay failed")
+        return kind, reviewed_query_ids
+    raise ValueError("unknown source evidence receipt kind")
+
+
+def _validate_sources_ready_evidence(
+    inventory: Mapping[str, str],
+    inventory_contents: bytes,
+    validation_values: Sequence[tuple[Mapping[str, str], bytes]],
+    *,
+    run_id: str,
+) -> None:
+    if inventory.get("path") != _SOURCE_INVENTORY_PATH:
+        raise ValueError("SOURCES_READY requires the canonical source inventory")
+    snapshots = _source_inventory_payload(inventory_contents, run_id=run_id)
+    reviews = 0
+    replay_paths: set[str] = set()
+    replay_hashes: set[str] = set()
+    reviewed_query_ids: tuple[str, ...] | None = None
+    for binding, contents in validation_values:
+        kind, receipt_queries = _source_receipt_payload(
+            contents,
+            path=binding["path"],
+            run_id=run_id,
+            inventory_sha256=inventory["sha256"],
+            snapshot_sha256s=snapshots,
+        )
+        if reviewed_query_ids is None:
+            reviewed_query_ids = receipt_queries
+        elif receipt_queries != reviewed_query_ids:
+            raise ValueError("source evidence reviewed query IDs differ")
+        if kind == "SOURCE_REVIEW":
+            reviews += 1
+        else:
+            if (
+                binding["path"] in replay_paths
+                or binding["sha256"] in replay_hashes
+            ):
+                raise ValueError("clean source replay receipt is duplicated")
+            replay_paths.add(binding["path"])
+            replay_hashes.add(binding["sha256"])
+    if reviews < 1 or len(replay_paths) != 2:
+        raise ValueError(
+            "SOURCES_READY requires an approved review and two clean replays"
+        )
 
 
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:
@@ -1024,20 +1101,23 @@ def advance_execution_phase(
         ]
         validations = [binding for binding, _contents in validation_values]
         try:
-            _phase_evidence_payload(
-                inventory_contents,
-                phase=next_phase,
-                run_id=run_spec.run_id,
-                inventory_sha256=None,
-            )
-            if not validation_values:
-                raise ValueError("validation receipt evidence is required")
-            for _binding_value, contents in validation_values:
-                _phase_evidence_payload(
-                    contents,
-                    phase=next_phase,
+            if next_phase == "ACQUIRING":
+                lineage = _exact_object(
+                    base["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
+                )
+                protected = _validate_binding_value(
+                    lineage["protected_inventory"], "protected inventory"
+                )
+                if inventory != protected or validation_values:
+                    raise ValueError(
+                        "ACQUIRING must bind the Task0 protected inventory directly"
+                    )
+            else:
+                _validate_sources_ready_evidence(
+                    inventory,
+                    inventory_contents,
+                    validation_values,
                     run_id=run_spec.run_id,
-                    inventory_sha256=inventory["sha256"],
                 )
         except ValueError as exc:
             if validations:
@@ -1051,7 +1131,7 @@ def advance_execution_phase(
                     snapshot,
                     lock_descriptor,
                 )
-            raise ValueError("phase inventory or validation evidence failed") from exc
+            raise ValueError("direct phase artifact evidence failed") from exc
         payload = {
             "schema_version": 1,
             "receipt_kind": "PHASE_TRANSITION",

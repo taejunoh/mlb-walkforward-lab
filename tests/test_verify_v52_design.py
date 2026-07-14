@@ -62,6 +62,7 @@ from tests.test_execution_registry import (
     CONTRACT_RELATIVE as REGISTRY_CONTRACT_RELATIVE,
     DESIGN_RELATIVE as REGISTRY_DESIGN_RELATIVE,
     PLAN_RELATIVE as REGISTRY_PLAN_RELATIVE,
+    PROTECTED_RELATIVE as REGISTRY_PROTECTED_RELATIVE,
     ExecutionRegistryTest,
 )
 import mlb_backtest.verify_v52_design as verifier_module
@@ -117,16 +118,13 @@ class DesignVerificationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "DESIGN_ACCEPTED|namespace"):
                 verify_historical_phase_namespaces(root, run_spec)
             source.unlink()
-            inventory, validation = ExecutionRegistryTest().write_phase_evidence(
-                root, "ACQUIRING", stem="acquiring"
-            )
             advance_execution_phase(
                 root,
                 run_spec,
                 expected_phase="DESIGN_ACCEPTED",
                 next_phase="ACQUIRING",
-                inventory_path=inventory,
-                validation_receipts=(validation,),
+                inventory_path=root / REGISTRY_PROTECTED_RELATIVE,
+                validation_receipts=(),
             )
             source.write_text("{}\n", encoding="utf-8")
             self.assertEqual(
