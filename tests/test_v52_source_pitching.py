@@ -644,6 +644,28 @@ class V52PitchingSourceTest(unittest.TestCase):
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
 
+    def test_career_aggregate_accepts_same_root_task3_legacy_hybrid(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        protected, fetched = _task3_legacy_partition_queries(
+            protected_inventory_sha256="c" * 64
+        )
+        sidecars = _replace_april_parent_with_query_nodes(
+            _planned_statcast_sidecars(cutoff),
+            [
+                (protected, "READY", False),
+                (fetched, "READY", True),
+            ],
+        )
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
     def test_career_aggregate_rejects_mixed_monthly_root_bindings(self) -> None:
         from mlb_backtest.v52_query_plan import bisect_statcast_query
         from mlb_backtest.v52_sources.pitching import (
@@ -660,7 +682,7 @@ class V52PitchingSourceTest(unittest.TestCase):
         _contract_left, other_contract_right = bisect_statcast_query(
             other_contract_root
         )
-        protected, fetched = _task3_legacy_partition_queries(
+        protected, _fetched = _task3_legacy_partition_queries(
             protected_inventory_sha256="c" * 64
         )
         _fetched_other, protected_other = _task3_legacy_partition_queries(
@@ -676,10 +698,6 @@ class V52PitchingSourceTest(unittest.TestCase):
             "root contract": [
                 (left, "READY", False),
                 (other_contract_right, "READY", True),
-            ],
-            "acquisition/protected contract": [
-                (protected, "READY", False),
-                (fetched, "READY", True),
             ],
             "protected contract": [
                 (protected, "READY", False),

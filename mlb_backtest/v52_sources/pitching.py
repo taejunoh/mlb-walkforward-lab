@@ -507,7 +507,7 @@ def _validate_statcast_split_graph(
                 "root_ids": set(),
                 "run_specs": set(),
                 "acquisition_contracts": set(),
-                "legacy_contracts": set(),
+                "protected_inventories": set(),
             },
         )
         binding["root_ids"].add(logical_query_id(root_query))
@@ -515,12 +515,11 @@ def _validate_statcast_split_graph(
         binding["acquisition_contracts"].add(
             root_query.acquisition_contract_sha256
         )
-        binding["legacy_contracts"].add(
-            (
-                leaf.query.requested_range.get("acquisition"),
-                leaf.query.requested_range.get("protected_inventory_sha256"),
-            )
+        protected_inventory = leaf.query.requested_range.get(
+            "protected_inventory_sha256"
         )
+        if protected_inventory is not None:
+            binding["protected_inventories"].add(protected_inventory)
     for binding in monthly_bindings.values():
         if len(binding["root_ids"]) != 1:
             if len(binding["run_specs"]) != 1:
@@ -533,9 +532,9 @@ def _validate_statcast_split_graph(
             or len(binding["acquisition_contracts"]) != 1
         ):
             raise ValueError("Statcast monthly root contract differs across leaves")
-        if len(binding["legacy_contracts"]) != 1:
+        if len(binding["protected_inventories"]) > 1:
             raise ValueError(
-                "Statcast monthly acquisition/protected contract differs across leaves"
+                "Statcast monthly protected contract differs across leaves"
             )
     return ready_leaves
 
