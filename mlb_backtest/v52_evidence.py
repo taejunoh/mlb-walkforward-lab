@@ -1912,7 +1912,7 @@ class V52EvidenceStore:
     ) -> PublishedEvidence:
         self._require_lease(query)
         self._ensure_unpublished(query)
-        reference, payload, _ = self._validated_legacy_reference(
+        reference, payload, lineage_snapshots = self._validated_legacy_reference(
             query, legacy_reference, query_sidecar
         )
         raw_sha256 = _validate_sha256(reference["raw_sha256"], "raw_sha256")
@@ -1970,6 +1970,20 @@ class V52EvidenceStore:
                     sidecar_contents,
                     "query sidecar",
                 )
+                reference_snapshot = _read_regular_snapshot_at(
+                    objects_fd,
+                    reference_name,
+                    "protected legacy reference",
+                )
+                if reference_snapshot is None:
+                    raise RuntimeError("protected legacy reference is missing")
+                sidecar_snapshot = _read_regular_snapshot_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    "query semantic sidecar",
+                )
+                if sidecar_snapshot is None:
+                    raise RuntimeError("query semantic sidecar is missing")
                 manifest = {
                     **self._manifest_base(
                         query,
@@ -1989,6 +2003,19 @@ class V52EvidenceStore:
                     "protected_legacy_reference_sha256": reference_sha256,
                 }
                 _before_success_publish()
+                self._rebind_legacy_lineage(lineage_snapshots)
+                _rebind_regular_snapshot_at(
+                    objects_fd,
+                    reference_name,
+                    reference_snapshot,
+                    "protected legacy reference",
+                )
+                _rebind_regular_snapshot_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_snapshot,
+                    "query semantic sidecar",
+                )
                 self._verify_query_chain(query, descriptors)
                 self._require_lease(query)
                 _write_once_at(

@@ -1298,6 +1298,44 @@ class V52EvidenceTest(unittest.TestCase):
                 ):
                     store.read_verified_success(query)
 
+    def test_legacy_publish_rejects_hook_payload_mutation_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            repository = store.root.parents[3]
+            payload_path = repository / reference["payload_path"]
+            original_payload = payload_path.read_bytes()
+            success_path = (
+                store.root
+                / "queries"
+                / query.source
+                / logical_query_id(query)
+                / "success.json"
+            )
+
+            def corrupt_payload() -> None:
+                payload_path.write_bytes(original_payload + b"corrupt")
+
+            with store.acquire_query(query):
+                with (
+                    patch(
+                        "mlb_backtest.v52_evidence._before_success_publish",
+                        side_effect=corrupt_payload,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "legacy|lineage|payload|identity|changed",
+                    ),
+                ):
+                    store.publish_legacy_reference(query, reference, _sidecar())
+            self.assertFalse(success_path.exists())
+
+            payload_path.write_bytes(original_payload)
+            with store.acquire_query(query):
+                published = store.publish_legacy_reference(
+                    query, reference, _sidecar()
+                )
+            self.assertEqual(store.verify_success(query), published)
+
     def test_legacy_reference_rejects_symlink_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store, query, reference = _legacy_fixture(_tmp(td))
