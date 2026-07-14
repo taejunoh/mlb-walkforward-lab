@@ -69,10 +69,20 @@ def _box_query() -> LogicalQuery:
 
 def _boxscore_raw() -> bytes:
     payload = json.loads((FIXTURES / "boxscore_9001.json").read_bytes())
-    payload["status"] = {"detailedState": "Final"}
-    payload["completedInnings"] = 9
     payload["teams"]["away"]["teamStats"] = {"batting": {"runs": 2}}
     payload["teams"]["home"]["teamStats"] = {"batting": {"runs": 4}}
+    payload["teams"]["away"]["players"]["ID1011"] = {
+        "person": {"id": 1011, "fullName": "Away Substitute"},
+        "battingOrder": "101",
+    }
+    payload["teams"]["home"]["players"]["ID2011"] = {
+        "person": {"id": 2011, "fullName": "Home Substitute"},
+        "battingOrder": "401",
+    }
+    payload["teams"]["home"]["players"]["ID2012"] = {
+        "person": {"id": 2012, "fullName": "Home Substitute 2"},
+        "battingOrder": "902",
+    }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
 
 
@@ -94,6 +104,8 @@ class V52ScheduleSourceTest(unittest.TestCase):
         self.assertEqual(semantics["unplayed_game_pks"], [9002])
         self.assertEqual(semantics["unique_game_count"], 2)
         self.assertEqual(semantics["anchors"][1]["doubleheader_order"], 2)
+        self.assertTrue(semantics["anchors"][1]["neutral_site"])
+        self.assertTrue(semantics["anchors"][1]["alternate_site"])
         self.assertEqual(
             semantics["anchors"][0]["winner_team_id"], 20
         )
@@ -134,10 +146,29 @@ class V52ScheduleSourceTest(unittest.TestCase):
         truncated["totalGames"] = 3
         with self.assertRaisesRegex(ValueError, "population"):
             recompute_schedule_anchor_sidecar(json.dumps(truncated).encode(), _query())
-        missing_site = _schedule_payload()
-        missing_site["dates"][0]["games"][0].pop("isAlternateSite")
-        with self.assertRaisesRegex(ValueError, "isAlternateSite"):
-            recompute_schedule_anchor_sidecar(json.dumps(missing_site).encode(), _query())
+        for field in ("neutralSite", "isAlternateSite"):
+            non_boolean_site = _schedule_payload()
+            non_boolean_site["dates"][0]["games"][0][field] = 0
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                recompute_schedule_anchor_sidecar(
+                    json.dumps(non_boolean_site).encode(), _query()
+                )
+
+    def test_schedule_anchor_defaults_omitted_official_site_flags_to_false(self) -> None:
+        from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
+
+        payload = _schedule_payload()
+        ordinary = payload["dates"][0]["games"][0]
+        ordinary.pop("neutralSite")
+        ordinary.pop("isAlternateSite")
+        sidecar = recompute_schedule_anchor_sidecar(
+            json.dumps(payload).encode(), _query()
+        )
+        ordinary_anchor, special_anchor = sidecar["semantics"]["anchors"]
+        self.assertFalse(ordinary_anchor["neutral_site"])
+        self.assertFalse(ordinary_anchor["alternate_site"])
+        self.assertTrue(special_anchor["neutral_site"])
+        self.assertTrue(special_anchor["alternate_site"])
 
     def test_completed_early_rejects_tied_or_contradictory_winner_evidence(self) -> None:
         from mlb_backtest.v52_sources.schedule import (
@@ -154,7 +185,6 @@ class V52ScheduleSourceTest(unittest.TestCase):
             recompute_schedule_anchor_sidecar(json.dumps(contradiction).encode(), _query())
 
         tied = json.loads(_boxscore_raw())
-        tied["status"]["detailedState"] = "Completed Early"
         tied["teams"]["away"]["teamStats"]["batting"]["runs"] = 4
         with self.assertRaisesRegex(ValueError, "winner"):
             recompute_boxscore_sidecar(json.dumps(tied).encode(), _box_query())
@@ -182,6 +212,8 @@ class V52ScheduleSourceTest(unittest.TestCase):
         )
         self.assertNotEqual(played["participant_provenance"], "T_MINUS_45")
         self.assertEqual(played["actual_starter_ids"], [101, 201])
+        self.assertEqual(played["terminal_status"], "Final")
+        self.assertEqual(played["completed_innings"], 9)
         self.assertEqual(len(played["away_starting_hitter_ids"]), 9)
         self.assertEqual(len(played["home_starting_hitter_ids"]), 9)
         self.assertEqual(
@@ -256,8 +288,35 @@ class V52ScheduleSourceTest(unittest.TestCase):
         )
         self.assertEqual(semantics["game_pk"], 9001)
         self.assertEqual(semantics["actual_starter_ids"], [101, 201])
-        self.assertEqual(semantics["terminal_status"], "Final")
-        self.assertEqual(semantics["completed_innings"], 9)
+        self.assertNotIn("terminal_status", semantics)
+        self.assertNotIn("completed_innings", semantics)
+
+    def test_official_boxscore_ignores_substitution_orders_and_rejects_bad_slots(self) -> None:
+        from mlb_backtest.v52_sources.schedule import recompute_boxscore_sidecar
+
+        sidecar = recompute_boxscore_sidecar(_boxscore_raw(), _box_query())
+        self.assertEqual(
+            sidecar["semantics"]["away_starting_hitter_ids"],
+            list(range(1001, 1010)),
+        )
+        payload = json.loads(_boxscore_raw())
+        duplicate = copy.deepcopy(payload)
+        duplicate["teams"]["away"]["players"]["ID1099"] = {
+            "person": {"id": 1099},
+            "battingOrder": "100",
+        }
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            recompute_boxscore_sidecar(json.dumps(duplicate).encode(), _box_query())
+        missing = copy.deepcopy(payload)
+        missing["teams"]["away"]["players"]["ID1001"].pop("battingOrder")
+        with self.assertRaisesRegex(ValueError, "nine unique"):
+            recompute_boxscore_sidecar(json.dumps(missing).encode(), _box_query())
+
+    def test_game_snapshot_rejects_empty_schedule_population(self) -> None:
+        from mlb_backtest.v52_sources.schedule import recompute_game_evidence_snapshot
+
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            recompute_game_evidence_snapshot([], {})
 
 
 if __name__ == "__main__":

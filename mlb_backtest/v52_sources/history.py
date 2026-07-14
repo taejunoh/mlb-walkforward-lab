@@ -40,6 +40,8 @@ def recompute_prior_history_sidecar(
     raw_games = schedule_sidecar.get("games")
     if not isinstance(raw_games, list):
         raise ValueError("game-evidence snapshot games must be a list")
+    if not raw_games:
+        raise ValueError("prior history requires a nonempty game population")
     games = []
     source_hashes = []
     seen: set[int] = set()

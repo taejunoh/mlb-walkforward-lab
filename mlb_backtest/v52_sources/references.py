@@ -213,6 +213,11 @@ def recompute_reference_sidecar(
         for values in (team_payloads, venue_payloads, timezone_rows, schedules)
     ):
         raise ValueError("reference inputs must be sequences")
+    if any(
+        not values
+        for values in (team_payloads, venue_payloads, timezone_rows, schedules)
+    ):
+        raise ValueError("reference aggregate requires nonempty source populations")
     teams = _team_records(team_payloads)
     venues = _venue_records(venue_payloads)
     timezones = _timezone_records(timezone_rows)

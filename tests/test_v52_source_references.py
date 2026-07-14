@@ -82,6 +82,24 @@ class V52ReferenceSourceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "effective"):
             recompute_reference_sidecar(teams, venues, reversed_rows, schedules)
 
+    def test_reference_rejects_empty_population_at_runtime_and_schema(self) -> None:
+        from mlb_backtest.v52_sources.references import recompute_reference_sidecar
+
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            recompute_reference_sidecar([], [], [], [])
+        empty = {
+            "grain": "effective_dated_venue_team_reference",
+            "observed_venue_date_mappings": [],
+            "schema_version": 1,
+            "team_payload_sha256s": [],
+            "teams": [],
+            "timezone_rows": [],
+            "venue_payload_sha256s": [],
+            "venues": [],
+        }
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(empty, json.loads(SCHEMA.read_text()))
+
     def test_query_dispatch_seals_team_and_venue_responses_without_generic_game_fields(self) -> None:
         from mlb_backtest.v52_source_contracts import recompute_query_sidecar
 

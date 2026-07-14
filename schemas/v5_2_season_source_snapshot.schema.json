@@ -142,10 +142,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "games": {"type": "array", "items": {"$ref": "#/$defs/gameEvidence"}},
+        "games": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/gameEvidence"}},
         "grain": {"const": "season_game_evidence_snapshot"},
         "schema_version": {"const": 1},
-        "source_query_sidecar_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true}
+        "source_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true}
       },
       "required": ["games", "grain", "schema_version", "source_query_sidecar_sha256s"]
     },
@@ -154,13 +154,13 @@
       "additionalProperties": false,
       "properties": {
         "grain": {"const": "effective_dated_venue_team_reference"},
-        "observed_venue_date_mappings": {"type": "array", "items": {"$ref": "#/$defs/observedMapping"}},
+        "observed_venue_date_mappings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/observedMapping"}},
         "schema_version": {"const": 1},
-        "team_payload_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
-        "teams": {"type": "array", "items": {"$ref": "#/$defs/team"}},
-        "timezone_rows": {"type": "array", "items": {"$ref": "#/$defs/timezone"}},
-        "venue_payload_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
-        "venues": {"type": "array", "items": {"$ref": "#/$defs/venue"}}
+        "team_payload_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}},
+        "teams": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/team"}},
+        "timezone_rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/timezone"}},
+        "venue_payload_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}},
+        "venues": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/venue"}}
       },
       "required": ["grain", "observed_venue_date_mappings", "schema_version", "team_payload_sha256s", "teams", "timezone_rows", "venue_payload_sha256s", "venues"]
     },
@@ -168,10 +168,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "games": {"type": "array", "items": {"$ref": "#/$defs/historyGame"}},
+        "games": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/historyGame"}},
         "grain": {"const": "verified_game_projection"},
         "schema_version": {"const": 1},
-        "source_game_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "source_game_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}},
         "source_snapshot_sha256": {"$ref": "#/$defs/sha256"}
       },
       "required": ["games", "grain", "schema_version", "source_game_sha256s", "source_snapshot_sha256"]

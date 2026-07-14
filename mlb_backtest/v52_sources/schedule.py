@@ -21,6 +21,9 @@ from ..v52_source_contracts import (
 
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _PLAYED = frozenset({"Final", "Completed Early"})
+_STARTING_BATTING_ORDERS = frozenset(
+    str(slot) for slot in range(100, 1000, 100)
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -54,6 +57,16 @@ def _json_object(raw: bytes, label: str) -> dict[str, object]:
     return value
 
 
+def _official_optional_bool(
+    record: Mapping[str, object], field: str, label: str
+) -> bool:
+    """MLB Stats API omits ordinary false site flags; explicit values stay strict."""
+    value = record.get(field, False)
+    if type(value) is not bool:
+        raise ValueError(f"schedule {label} must be boolean when present")
+    return value
+
+
 def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]:
     payload = _json_object(raw, "schedule")
     total_games = payload.get("totalGames")
@@ -79,12 +92,10 @@ def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]
             if game_pk in seen:
                 raise ValueError("schedule contains duplicate gamePk")
             seen.add(game_pk)
-            neutral = game.get("neutralSite")
-            alternate = game.get("isAlternateSite")
-            if type(neutral) is not bool:
-                raise ValueError("schedule neutralSite must be explicitly boolean")
-            if type(alternate) is not bool:
-                raise ValueError("schedule isAlternateSite must be explicitly boolean")
+            neutral = _official_optional_bool(game, "neutralSite", "neutralSite")
+            alternate = _official_optional_bool(
+                game, "isAlternateSite", "isAlternateSite"
+            )
             site_flags[game_pk] = {
                 "alternate_site": alternate,
                 "neutral_site": neutral,
@@ -251,8 +262,10 @@ def _boxscore_side(raw: object, label: str) -> tuple[int, int, list[int]]:
             continue
         if not isinstance(order, str) or not order.isdecimal():
             raise ValueError(f"boxscore {label} battingOrder must be decimal")
+        if order not in _STARTING_BATTING_ORDERS:
+            continue
         slot = int(order)
-        if slot not in range(100, 1000, 100) or slot in hitters:
+        if slot in hitters:
             raise ValueError(f"boxscore {label} starting lineup is ambiguous")
         person = player.get("person")
         if not isinstance(person, dict):
@@ -272,13 +285,6 @@ def _boxscore(raw: bytes) -> dict[str, object]:
     home_team, home_starter, home_hitters = _boxscore_side(teams["home"], "home")
     if away_team == home_team or away_starter == home_starter:
         raise ValueError("boxscore sides must have distinct teams and starters")
-    status = payload.get("status")
-    completed_innings = payload.get("completedInnings")
-    if not isinstance(status, dict) or status.get("detailedState") not in _PLAYED:
-        raise ValueError("boxscore requires terminal status evidence")
-    if type(completed_innings) is not int or completed_innings <= 0:
-        raise ValueError("boxscore requires positive completed innings")
-
     def runs(side: object, label: str) -> int:
         team_stats = side.get("teamStats") if isinstance(side, dict) else None
         batting = team_stats.get("batting") if isinstance(team_stats, dict) else None
@@ -298,8 +304,6 @@ def _boxscore(raw: bytes) -> dict[str, object]:
         "away_team_id": away_team,
         "home_starting_hitter_ids": home_hitters,
         "home_team_id": home_team,
-        "terminal_status": status["detailedState"],
-        "completed_innings": completed_innings,
         "away_score": away_score,
         "home_score": home_score,
         "winner_team_id": winner_team_id,
@@ -346,6 +350,8 @@ def recompute_game_evidence_snapshot(
         raise ValueError("schedule_anchors must be a sequence")
     if not isinstance(boxscores, Mapping):
         raise ValueError("boxscores must be a mapping")
+    if not schedule_anchors:
+        raise ValueError("schedule game snapshot requires a nonempty anchor population")
     anchors_by_pk: dict[int, tuple[dict[str, object], str]] = {}
     sidecar_hashes: list[str] = []
     for sidecar in schedule_anchors:
@@ -386,6 +392,9 @@ def recompute_game_evidence_snapshot(
             if game_pk in anchors_by_pk:
                 raise ValueError("schedule snapshots contain duplicate gamePk")
             anchors_by_pk[game_pk] = (dict(raw_anchor), sidecar_hash)
+
+    if not anchors_by_pk:
+        raise ValueError("schedule game snapshot requires a nonempty game population")
 
     played_anchor_pks = {
         game_pk for game_pk, (anchor, _hash) in anchors_by_pk.items()
@@ -466,8 +475,6 @@ def recompute_game_evidence_snapshot(
             participants.get(field) != anchor.get(field)
             for field in (
                 "official_date",
-                "terminal_status",
-                "completed_innings",
                 "away_score",
                 "home_score",
                 "winner_team_id",

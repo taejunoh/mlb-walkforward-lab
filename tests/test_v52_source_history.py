@@ -86,6 +86,30 @@ class V52HistorySourceTest(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(incomplete, schema)
 
+    def test_schedule_and_history_aggregates_reject_empty_populations(self) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        empty_schedule = {
+            "games": [],
+            "grain": "season_game_evidence_snapshot",
+            "schema_version": 1,
+            "source_query_sidecar_sha256s": [],
+        }
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            recompute_prior_history_sidecar(empty_schedule)
+        schema = json.loads(SCHEMA.read_text())
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(empty_schedule, schema)
+        empty_history = {
+            "games": [],
+            "grain": "verified_game_projection",
+            "schema_version": 1,
+            "source_game_sha256s": [],
+            "source_snapshot_sha256": "a" * 64,
+        }
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(empty_history, schema)
+
     def test_dispatch_returns_task2_compatible_query_envelope(self) -> None:
         from mlb_backtest.v52_source_contracts import recompute_query_sidecar
         from mlb_backtest.v52_evidence import LogicalQuery
