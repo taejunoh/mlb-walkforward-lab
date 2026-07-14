@@ -416,6 +416,52 @@ class ExecutionRegistryTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.registry.load_execution_registry(root, run_spec)
 
+    def test_publication_rolls_back_equivalent_receipt_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            initial = self.initialize(root, run_spec)
+            receipts = root / RECEIPTS_RELATIVE
+
+            def replace_with_equivalent_inode() -> None:
+                published = next(
+                    path
+                    for path in receipts.iterdir()
+                    if path.name.startswith("000001-")
+                )
+                intended = published.read_bytes()
+                original_inode = published.stat().st_ino
+                replacement = published.with_suffix(".replacement")
+                replacement.write_bytes(intended)
+                self.assertEqual(replacement.stat().st_nlink, 1)
+                self.assertNotEqual(replacement.stat().st_ino, original_inode)
+                os.replace(replacement, published)
+
+            with patch.object(
+                self.registry,
+                "_after_registry_receipt_read",
+                side_effect=replace_with_equivalent_inode,
+            ), self.assertRaisesRegex(
+                ValueError, "identity|receipt|publication|cleanup"
+            ):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
+
+            self.assertFalse(
+                any(
+                    path.name.startswith("000001-")
+                    for path in receipts.iterdir()
+                )
+            )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
         for failure in ("partial_write", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:

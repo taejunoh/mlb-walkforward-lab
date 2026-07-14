@@ -770,17 +770,33 @@ def _validate_timestamp(value: object, label: str) -> None:
 
 
 def _cleanup_created_receipt(
-    parent_fd: int, descriptor: int, name: str, label: str
+    parent_fd: int,
+    descriptor: int,
+    name: str,
+    expected_contents: bytes,
+    label: str,
 ) -> None:
     try:
         opened = os.fstat(descriptor)
         linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or _identity(opened) != _identity(linked)
-        ):
+        if not stat.S_ISREG(opened.st_mode):
             raise ValueError(f"{label} ownership changed before cleanup")
+        if _identity(opened) == _identity(linked):
+            if opened.st_nlink != 1:
+                raise ValueError(f"{label} ownership changed before cleanup")
+        else:
+            replacement, replacement_identity = _read_file_at(
+                parent_fd, name, label
+            )
+            if (
+                len(replacement) != len(expected_contents)
+                or _sha256_bytes(replacement) != _sha256_bytes(expected_contents)
+                or replacement != expected_contents
+            ):
+                raise ValueError(f"{label} ownership changed before cleanup")
+            rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if _identity(rebound) != replacement_identity:
+                raise ValueError(f"{label} identity changed before cleanup")
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
     except OSError as exc:
@@ -901,7 +917,7 @@ def _write_exclusive(
         if created:
             try:
                 _cleanup_created_receipt(
-                    parent_fd, descriptor, relative.name, label
+                    parent_fd, descriptor, relative.name, contents, label
                 )
             except BaseException as cleanup_exc:
                 raise ValueError(
