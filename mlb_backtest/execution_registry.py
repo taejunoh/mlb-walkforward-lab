@@ -265,6 +265,7 @@ def _open_directory(root: Path, relative: Path, *, create: bool) -> tuple[int, l
                 except FileExistsError:
                     pass
                 child = os.open(component, _directory_flags(), dir_fd=current)
+            descriptors.append(child)
             linked = os.stat(component, dir_fd=current, follow_symlinks=False)
             opened = os.fstat(child)
             if (
@@ -272,11 +273,9 @@ def _open_directory(root: Path, relative: Path, *, create: bool) -> tuple[int, l
                 or not stat.S_ISDIR(opened.st_mode)
                 or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
             ):
-                os.close(child)
                 raise ValueError("execution registry directory identity changed")
             if created:
                 os.fsync(current)
-            descriptors.append(child)
             current = child
         return current, descriptors
     except BaseException:
@@ -295,6 +294,7 @@ def _open_directory_at(
             if component in {"", ".", ".."}:
                 raise ValueError("execution registry path traversal is forbidden")
             child = os.open(component, _directory_flags(), dir_fd=current)
+            descriptors.append(child)
             linked = os.stat(component, dir_fd=current, follow_symlinks=False)
             opened = os.fstat(child)
             if (
@@ -302,9 +302,7 @@ def _open_directory_at(
                 or not stat.S_ISDIR(opened.st_mode)
                 or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
             ):
-                os.close(child)
                 raise ValueError("execution registry directory identity changed")
-            descriptors.append(child)
             current = child
         return current, descriptors
     except BaseException:

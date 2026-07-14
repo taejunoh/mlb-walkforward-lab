@@ -380,6 +380,30 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dirty|Git|index|HEAD|worktree"):
                 self.initialize(root, run_spec)
 
+    @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
+    def test_directory_child_stat_failures_do_not_leak_fds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            child = root / "child"
+            child.mkdir()
+            child_inode = child.stat().st_ino
+            original_fstat = os.fstat
+            before = len(os.listdir("/dev/fd"))
+
+            def fail_child(descriptor: int):
+                metadata = original_fstat(descriptor)
+                if metadata.st_ino == child_inode:
+                    raise OSError("injected child fstat failure")
+                return metadata
+
+            with patch.object(self.registry.os, "fstat", side_effect=fail_child):
+                for _ in range(20):
+                    with self.assertRaises(OSError):
+                        self.registry._open_directory(
+                            root, Path("child"), create=False
+                        )
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
+
     def test_load_rejects_forged_semantically_impossible_phase_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))

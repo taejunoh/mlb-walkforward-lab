@@ -161,12 +161,66 @@ class DesignVerificationTest(unittest.TestCase):
         required_docs = {
             "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
             "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+            "mlb_backtest/execution_registry.py",
+            "tests/test_execution_registry.py",
         }
         self.assertTrue(
             required_docs.issubset(set(verifier_module.CURRENT_SCOPE_SINGLE_FILES))
         )
         scope = verifier_module.capture_current_scope(ROOT)
         self.assertTrue(required_docs.issubset(set(scope["single_files"])))
+
+    def test_namespace_second_recursive_scan_detects_prior_subtree_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            namespace = root / "data/v5_2_qd/historical"
+            prior = namespace / "raw/prior.json"
+            later = namespace / "sources/later.json"
+            prior.parent.mkdir(parents=True)
+            later.parent.mkdir(parents=True)
+            prior.write_text("before\n", encoding="utf-8")
+            later.write_text("stable\n", encoding="utf-8")
+
+            def mutate_prior(_root: Path, relative: str) -> None:
+                self.assertEqual(relative, "data/v5_2_qd/historical")
+                prior.write_text("after!\n", encoding="utf-8")
+
+            with patch.object(
+                verifier_module,
+                "_namespace_scan_hook",
+                side_effect=mutate_prior,
+            ), self.assertRaisesRegex(ValueError, "changed|snapshot|identity"):
+                verifier_module._verify_namespace_children(
+                    root,
+                    "data/v5_2_qd/historical",
+                    frozenset({"raw", "sources"}),
+                )
+
+    @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
+    def test_namespace_path_open_stat_failures_do_not_leak_fds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "namespace"
+            target.mkdir()
+            target_inode = target.stat().st_ino
+            original_fstat = os.fstat
+            before = len(os.listdir("/dev/fd"))
+
+            def fail_target(descriptor: int):
+                metadata = original_fstat(descriptor)
+                if metadata.st_ino == target_inode:
+                    raise OSError("injected target fstat failure")
+                return metadata
+
+            with patch.object(
+                verifier_module.os, "fstat", side_effect=fail_target
+            ):
+                for _ in range(20):
+                    with self.assertRaisesRegex(ValueError, "unavailable"):
+                        verifier_module._verify_namespace_children(
+                            root, "namespace", frozenset()
+                        )
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_change_contract_rejects_working_design_that_differs_from_pin(self) -> None:
         design_relative = (
