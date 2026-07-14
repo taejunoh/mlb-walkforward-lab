@@ -338,6 +338,32 @@ class V52EvidenceTest(unittest.TestCase):
             self.assertEqual(registration, _canonical_file(json.loads(registration)))
             self.assertEqual(len(list(folder.glob("query.json"))), 1)
 
+    def test_nested_same_thread_lease_fails_before_registration_and_outer_survives(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            other_query = _query(grain="other-grain")
+            with store.acquire_query(query) as outer_lease:
+                with patch.object(
+                    store,
+                    "register_query",
+                    side_effect=AssertionError(
+                        "nested acquire must fail before registration"
+                    ),
+                ):
+                    for nested_query in (query, other_query):
+                        with self.subTest(query_id=logical_query_id(nested_query)):
+                            with self.assertRaisesRegex(
+                                RuntimeError, "lease|active|reentrant"
+                            ):
+                                with store.acquire_query(nested_query):
+                                    self.fail("nested lease unexpectedly entered")
+                self.assertEqual(store.next_attempt_number(outer_lease), 1)
+            with store.acquire_query(query) as reopened_lease:
+                self.assertEqual(store.next_attempt_number(reopened_lease), 2)
+
     def test_directory_open_helpers_close_child_fd_on_identity_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             directory = _tmp(td)

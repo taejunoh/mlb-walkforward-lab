@@ -938,10 +938,10 @@ class V52EvidenceStore:
 
     @contextmanager
     def _acquire_query_context(self, query: LogicalQuery) -> Iterator[QueryLease]:
-        query_id = self.register_query(query)
         active = self._active_leases()
-        if query_id in active:
+        if active:
             raise RuntimeError("query lease is not reentrant")
+        query_id = self.register_query(query)
         _, descriptors = self._query_fds(query, create=False)
         query_fd = descriptors[-1]
         lock_descriptor = -1
