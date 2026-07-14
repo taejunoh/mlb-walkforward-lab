@@ -318,7 +318,7 @@ def build_schedule_reference_batch(
     unique_games: dict[int, tuple[int, date, date, int]] = {}
     seasons: set[int] = set()
     venues: set[int] = set()
-    pitching_dates: set[tuple[int, date, date]] = set()
+    pitching_consumers: dict[tuple[int, date, date], set[int]] = {}
     for raw in anchors:
         if not isinstance(raw, dict):
             raise ValueError("schedule anchor must be an object")
@@ -340,7 +340,9 @@ def build_schedule_reference_batch(
         unique_games[game_pk] = identity
         seasons.add(season)
         venues.add(venue_id)
-        pitching_dates.add((season, season_start, official - timedelta(days=1)))
+        pitching_consumers.setdefault(
+            (season, season_start, official - timedelta(days=1)), set()
+        ).add(game_pk)
 
     queries: list[LogicalQuery] = []
     for game_pk, (season, _season_start, official, _venue_id) in sorted(unique_games.items()):
@@ -361,13 +363,17 @@ def build_schedule_reference_batch(
                 acquisition_contract_sha256=acquisition_contract_sha256,
             )
         )
-    for season, season_start, as_of in sorted(pitching_dates):
+    for season, season_start, as_of in sorted(pitching_consumers):
+        consumers = sorted(pitching_consumers[(season, season_start, as_of)])
+        consumer_cutoffs = {str(game_pk): as_of.isoformat() for game_pk in consumers}
         if as_of < season_start:
             endpoint = "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
             parameters: dict[str, object] = {}
             requested = {
                 "season": season,
                 "as_of_date": as_of.isoformat(),
+                "consumer_cutoff_dates": consumer_cutoffs,
+                "consuming_game_pks": consumers,
                 "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
             }
         else:
@@ -386,6 +392,8 @@ def build_schedule_reference_batch(
                 "season": season,
                 "start_date": season_start.isoformat(),
                 "as_of_date": as_of.isoformat(),
+                "consumer_cutoff_dates": consumer_cutoffs,
+                "consuming_game_pks": consumers,
             }
         queries.append(
             _logical_query(
@@ -444,7 +452,7 @@ def build_participant_derived_batch(
     games = game_evidence_inventory.get("games")
     if not isinstance(games, list):
         raise ValueError("game_evidence_inventory.games must be a list")
-    pitchers: set[int] = set()
+    pitcher_consumers: dict[int, dict[int, date]] = {}
     seen_game_pks: set[int] = set()
     for game in games:
         if not isinstance(game, dict):
@@ -480,12 +488,16 @@ def build_participant_derived_batch(
         for pitcher_id in starters:
             if isinstance(pitcher_id, bool) or not isinstance(pitcher_id, int) or pitcher_id <= 0:
                 raise ValueError("actual starter IDs must be positive integers")
-            pitchers.add(pitcher_id)
+            pitcher_consumers.setdefault(pitcher_id, {})[game_pk] = (
+                official_date - timedelta(days=1)
+            )
         if starters[0] == starters[1]:
             raise ValueError("verified game actual starter IDs must be distinct")
 
-    queries = [
-        _logical_query(
+    queries = []
+    for pitcher_id in sorted(pitcher_consumers):
+        consumers = pitcher_consumers[pitcher_id]
+        queries.append(_logical_query(
             source="mlb_stats_pitcher_bf",
             grain="player_career_batters_faced_reference",
             endpoint=_STATS_ENDPOINT,
@@ -499,6 +511,11 @@ def build_participant_derived_batch(
                 "endDate": "2017-12-31",
             },
             requested_range={
+                "consumer_cutoff_dates": {
+                    str(game_pk): consumers[game_pk].isoformat()
+                    for game_pk in sorted(consumers)
+                },
+                "consuming_game_pks": sorted(consumers),
                 "pitcher_id": pitcher_id,
                 "inclusive_end": "2017-12-31",
             },
@@ -506,9 +523,7 @@ def build_participant_derived_batch(
             parser_version="v5.2.1",
             run_spec_sha256=run_spec_sha256,
             acquisition_contract_sha256=acquisition_contract_sha256,
-        )
-        for pitcher_id in sorted(pitchers)
-    ]
+        ))
     return _make_batch("PARTICIPANT_DERIVED", derived, queries)
 
 

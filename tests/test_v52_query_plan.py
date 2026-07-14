@@ -137,6 +137,12 @@ class V52QueryPlanTest(unittest.TestCase):
         sources = [query.source for query in batch.queries]
         self.assertEqual(sources.count("mlb_schedule_game_feed"), 2)
         self.assertEqual(sources.count("mlb_stats_pitching"), 1)
+        pitching = next(q for q in batch.queries if q.source == "mlb_stats_pitching")
+        self.assertEqual(pitching.requested_range["consuming_game_pks"], [7, 8])
+        self.assertEqual(
+            pitching.requested_range["consumer_cutoff_dates"],
+            {"7": "2024-04-01", "8": "2024-04-01"},
+        )
         self.assertEqual(
             sum(q.endpoint.endswith("/teams") for q in batch.queries), 1
         )
@@ -242,6 +248,18 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         self.assertTrue(all(q.parameters["endDate"] == "2017-12-31" for q in batch.queries))
         self.assertFalse(any(q.parameters.get("personId") == 999 for q in batch.queries))
+        by_pitcher = {q.parameters["personId"]: q for q in batch.queries}
+        self.assertEqual(
+            by_pitcher[100].requested_range["consuming_game_pks"], [1, 2]
+        )
+        self.assertEqual(
+            by_pitcher[100].requested_range["consumer_cutoff_dates"],
+            {"1": "2024-04-01", "2": "2024-04-01"},
+        )
+        self.assertEqual(
+            by_pitcher[200].requested_range["consumer_cutoff_dates"],
+            {"1": "2024-04-01"},
+        )
 
     def test_participant_batch_validates_2018_2024_season_and_game_date_boundaries(self):
         from mlb_backtest.v52_query_plan import build_participant_derived_batch
