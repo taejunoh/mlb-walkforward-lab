@@ -20,6 +20,7 @@ from mlb_backtest.diagnostics import (
     load_v51_evidence,
     sha256_file,
 )
+from mlb_backtest.execution_registry import load_execution_registry
 from mlb_backtest.preflight import (
     PREFLIGHT_REQUIRED_KEYS,
     build_preflight,
@@ -122,6 +123,7 @@ EXPECTED_CURRENT_FILES = (
     "schemas/v5_2_run_spec.schema.json",
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_preflight.schema.json",
+    "schemas/v5_2_execution_receipt.schema.json",
     "protocols/v5_2_qd/change_contract.json",
     "protocols/v5_2_qd/historical_walkforward_500.json",
     "protocols/v5_2_qd/prospective_2026.json",
@@ -140,6 +142,7 @@ CANONICAL_JSON_FILES = (
     "reports/v5_1_bt/diagnostic_100_chart_map.json",
     "reports/v5_2_qd/walkforward_500_preflight.json",
     "schemas/v5_2_preflight.schema.json",
+    "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_qd.schema.json",
     "schemas/v5_2_run_spec.schema.json",
@@ -1049,6 +1052,68 @@ def historical_execution_status(root: Path) -> str:
     return _namespace_status(root, HISTORICAL_NAMESPACE_ROOTS, "NOT_EXECUTED")
 
 
+def authenticated_historical_phase(root: Path, run_spec: RunSpec) -> str | None:
+    execution = root / "audit/v5_2_qd/historical/execution"
+    try:
+        metadata = execution.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("execution registry namespace is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("execution registry namespace must be a no-follow directory")
+    return load_execution_registry(root, run_spec).phase
+
+
+def _verify_namespace_children(
+    root: Path, relative: str, allowed: frozenset[str]
+) -> None:
+    namespace = root / relative
+    try:
+        metadata = namespace.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError(f"phase namespace is unavailable: {relative}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"phase namespace is unsafe: {relative}")
+    with os.scandir(namespace) as entries:
+        for entry in entries:
+            if entry.name not in allowed:
+                raise ValueError(
+                    f"forbidden phase namespace child: {relative}/{entry.name}"
+                )
+            _namespace_regular_file_count(root, f"{relative}/{entry.name}")
+
+
+def verify_historical_phase_namespaces(root: Path, run_spec: RunSpec) -> str | None:
+    phase = authenticated_historical_phase(root, run_spec)
+    if phase is None:
+        if historical_execution_status(root) != "NOT_EXECUTED":
+            raise ValueError("historical namespace exists without an execution registry")
+        if fitted_model_card_count(root):
+            raise ValueError("fitted model-card namespace exists without a registry")
+        return None
+    if phase not in {"DESIGN_ACCEPTED", "ACQUIRING", "SOURCES_READY"}:
+        raise ValueError(f"execution phase {phase} fails closed until Task 10")
+    data_allowed = (
+        frozenset()
+        if phase == "DESIGN_ACCEPTED"
+        else frozenset({"raw", "sources"})
+    )
+    audit_allowed = (
+        frozenset({"execution"})
+        if phase == "DESIGN_ACCEPTED"
+        else frozenset({"acquisition", "execution"})
+    )
+    _verify_namespace_children(root, "data/v5_2_qd/historical", data_allowed)
+    _verify_namespace_children(root, "audit/v5_2_qd/historical", audit_allowed)
+    _verify_namespace_children(root, "reports/v5_2_qd/historical", frozenset())
+    if _namespace_tree_present(root, FITTED_NAMESPACE_ROOT):
+        raise ValueError("model-card namespace is forbidden before Task 10")
+    return phase
+
+
 def observation_namespace_status(root: Path) -> str:
     return _namespace_status(root, PROSPECTIVE_OBSERVATION_ROOTS, "NOT_STARTED")
 
@@ -1284,11 +1349,16 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     verify_prospective_pin(root, prospective, contract)
     verify_forbidden_claims(root)
     verify_namespaces_differ(historical, prospective)
+    registry_phase = verify_historical_phase_namespaces(root, historical)
     fitted_count = fitted_model_card_count(root)
     if fitted_count:
         raise ValueError("fitted fold card exists before source acquisition")
-    execution = historical_execution_status(root)
-    if execution != "NOT_EXECUTED":
+    execution = (
+        historical_execution_status(root)
+        if registry_phase is None
+        else registry_phase
+    )
+    if registry_phase is None and execution != "NOT_EXECUTED":
         raise ValueError("historical outputs exist in design-only phase")
     observation = observation_namespace_status(root)
     if observation != "NOT_STARTED":
@@ -1308,9 +1378,16 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     final_fitted_count = fitted_model_card_count(root)
     if final_fitted_count:
         raise ValueError("fitted fold card exists before source acquisition")
-    final_execution = historical_execution_status(root)
-    if final_execution != "NOT_EXECUTED":
+    final_registry_phase = verify_historical_phase_namespaces(root, historical)
+    final_execution = (
+        historical_execution_status(root)
+        if final_registry_phase is None
+        else final_registry_phase
+    )
+    if final_registry_phase is None and final_execution != "NOT_EXECUTED":
         raise ValueError("historical outputs exist in design-only phase")
+    if final_registry_phase != registry_phase or final_execution != execution:
+        raise ValueError("authenticated execution phase changed during verification")
     final_observation = observation_namespace_status(root)
     if final_observation != "NOT_STARTED":
         raise ValueError(

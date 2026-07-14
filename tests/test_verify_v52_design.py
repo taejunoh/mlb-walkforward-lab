@@ -16,6 +16,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
+from mlb_backtest.execution_registry import (
+    advance_execution_phase,
+    initialize_execution_registry,
+)
 from mlb_backtest.preflight import build_preflight, parse_preflight, protected_inventory
 from mlb_backtest.protocols import (
     expected_historical_run,
@@ -31,6 +35,7 @@ from mlb_backtest.verify_v52_design import (
     build_git_inventory,
     fitted_model_card_count,
     historical_execution_status,
+    authenticated_historical_phase,
     load_canonical_json,
     make_tiny_git_fixture,
     main,
@@ -39,6 +44,7 @@ from mlb_backtest.verify_v52_design import (
     verify_contract_schemas,
     verify_design_deliverables,
     verify_html_payload,
+    verify_historical_phase_namespaces,
     validate_delivery_paths,
     validate_delivery_receipt_payload,
     verify_leakage_evidence,
@@ -52,6 +58,12 @@ from mlb_backtest.verify_v52_design import (
     write_git_inventory,
 )
 from tests.test_preflight import make_complete_inventory
+from tests.test_execution_registry import (
+    CONTRACT_RELATIVE as REGISTRY_CONTRACT_RELATIVE,
+    DESIGN_RELATIVE as REGISTRY_DESIGN_RELATIVE,
+    PLAN_RELATIVE as REGISTRY_PLAN_RELATIVE,
+    ExecutionRegistryTest,
+)
 import mlb_backtest.verify_v52_design as verifier_module
 
 
@@ -59,6 +71,48 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DesignVerificationTest(unittest.TestCase):
+    def test_design_verifier_reads_phase_from_registry_not_file_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = ExecutionRegistryTest().make_repo(Path(directory))
+            initialize_execution_registry(
+                root,
+                run_spec,
+                design_path=root / REGISTRY_DESIGN_RELATIVE,
+                plan_path=root / REGISTRY_PLAN_RELATIVE,
+                acquisition_contract_path=root / REGISTRY_CONTRACT_RELATIVE,
+            )
+            source = root / "data/v5_2_qd/historical/sources/apparent_ready.json"
+            source.parent.mkdir(parents=True)
+            source.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(
+                authenticated_historical_phase(root, run_spec), "DESIGN_ACCEPTED"
+            )
+            with self.assertRaisesRegex(ValueError, "DESIGN_ACCEPTED|namespace"):
+                verify_historical_phase_namespaces(root, run_spec)
+            source.unlink()
+            inventory = root / "acquiring_inventory.json"
+            inventory.write_text("{}\n", encoding="utf-8")
+            advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="DESIGN_ACCEPTED",
+                next_phase="ACQUIRING",
+                inventory_path=inventory,
+                validation_receipts=(),
+            )
+            source.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(
+                authenticated_historical_phase(root, run_spec), "ACQUIRING"
+            )
+            self.assertEqual(
+                verify_historical_phase_namespaces(root, run_spec), "ACQUIRING"
+            )
+            forbidden = root / "data/v5_2_qd/historical/outcomes/too_early.json"
+            forbidden.parent.mkdir(parents=True)
+            forbidden.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "forbidden|namespace"):
+                verify_historical_phase_namespaces(root, run_spec)
+
     def test_design_and_v51_baseline_use_distinct_reviewed_commits(self) -> None:
         self.assertEqual(
             getattr(verifier_module, "CURRENT_APPROVED_DESIGN_COMMIT", None),
