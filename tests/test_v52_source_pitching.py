@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import date
@@ -1218,6 +1219,53 @@ class V52PitchingSourceTest(unittest.TestCase):
         snapshot = recompute_pitching_season_snapshot(
             [query_sidecar(b"", query, semantics)]
         )
+        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        self.assertEqual(
+            snapshot["records"][0]["disposition"],
+            "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+        )
+
+    def test_verified_derived_store_sidecar_feeds_pitching_snapshot(self) -> None:
+        from mlb_backtest.v52_evidence import V52EvidenceStore
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_pitching_season_snapshot,
+        )
+
+        query = LogicalQuery(
+            source="mlb_stats_pitching",
+            grain="season_d1_league_pitching_reference",
+            endpoint="disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING",
+            parameters={},
+            requested_range={
+                "as_of_date": "2024-03-19",
+                "consumer_cutoff_dates": {"9001": "2024-03-19"},
+                "consuming_game_pks": [9001],
+                "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+                "season": 2024,
+            },
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+        semantics = {
+            "as_of_date": "2024-03-19",
+            "consumer_cutoff_dates": {"9001": "2024-03-19"},
+            "consuming_game_pks": [9001],
+            "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+            "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+            "season": 2024,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with store.acquire_query(query):
+                store.publish_derived_disposition(query, semantics)
+            verified = store.read_verified_success(query)
+            snapshot = recompute_pitching_season_snapshot(
+                [verified.query_sidecar]
+            )
         jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
         self.assertEqual(
             snapshot["records"][0]["disposition"],

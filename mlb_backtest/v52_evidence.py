@@ -127,6 +127,12 @@ class VerifiedEvidenceRead:
 
 
 @dataclass(frozen=True)
+class _RegularSnapshot:
+    contents: bytes
+    identity: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class QueryLease:
     query_id: str
     source: str
@@ -381,13 +387,13 @@ def _open_directory_at(parent_fd: int, name: str, *, create: bool) -> int:
         raise
 
 
-def _read_regular_at(
+def _read_regular_snapshot_at(
     parent_fd: int,
     name: str,
     label: str,
     *,
     missing_ok: bool = False,
-) -> bytes | None:
+) -> _RegularSnapshot | None:
     _validate_segment(name, f"{label} filename")
     descriptor = -1
     try:
@@ -421,9 +427,33 @@ def _read_regular_at(
             rebound
         ):
             raise ValueError(f"{label} identity changed while reading")
-        return b"".join(chunks)
+        return _RegularSnapshot(b"".join(chunks), _identity(after))
     finally:
         os.close(descriptor)
+
+
+def _read_regular_at(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    missing_ok: bool = False,
+) -> bytes | None:
+    snapshot = _read_regular_snapshot_at(
+        parent_fd, name, label, missing_ok=missing_ok
+    )
+    return None if snapshot is None else snapshot.contents
+
+
+def _rebind_regular_snapshot_at(
+    parent_fd: int,
+    name: str,
+    expected: _RegularSnapshot,
+    label: str,
+) -> None:
+    current = _read_regular_snapshot_at(parent_fd, name, label)
+    if current != expected:
+        raise ValueError(f"{label} identity or bytes changed during verification")
 
 
 def _cleanup_created_file(
@@ -840,9 +870,14 @@ class V52EvidenceStore:
         query_fd: int,
         *,
         lock_descriptor: int | None = None,
-    ) -> tuple[str, LogicalQuery]:
+    ) -> tuple[str, LogicalQuery, _RegularSnapshot]:
         query_id = logical_query_id(query)
-        contents = _read_regular_at(query_fd, "query.json", "logical query")
+        snapshot = _read_regular_snapshot_at(
+            query_fd, "query.json", "logical query"
+        )
+        if snapshot is None:
+            raise RuntimeError("logical query is missing")
+        contents = snapshot.contents
         registered_query, lock_identity = _decode_registration(contents)
         if canonical_query_bytes(registered_query) != canonical_query_bytes(query):
             raise RuntimeError("registered logical query differs or is ambiguous")
@@ -869,7 +904,7 @@ class V52EvidenceStore:
             raise ValueError("query directory membership is ambiguous")
         if logical_query_id(registered_query) != query_id:
             raise RuntimeError("registered logical query identity differs")
-        return _sha256_bytes(contents), registered_query
+        return _sha256_bytes(contents), registered_query, snapshot
 
     def _validate_registered(
         self,
@@ -1285,12 +1320,14 @@ class V52EvidenceStore:
         set[int],
         list[dict[str, object]],
         tuple[Mapping[str, object], ...],
+        tuple[tuple[str, _RegularSnapshot], ...],
     ]:
         query_id = logical_query_id(query)
         reservations: set[int] = set()
         receipts: dict[int, tuple[dict[str, object], bytes]] = {}
+        artifact_snapshots: list[tuple[str, _RegularSnapshot]] = []
         try:
-            names = os.listdir(attempts_fd)
+            names = sorted(os.listdir(attempts_fd))
         except OSError as exc:
             raise ValueError("attempt directory cannot be listed safely") from exc
         for name in names:
@@ -1298,10 +1335,13 @@ class V52EvidenceStore:
             receipt = _ATTEMPT_NAME.fullmatch(name)
             if reservation:
                 number = int(reservation.group("number"))
+                snapshot = _read_regular_snapshot_at(
+                    attempts_fd, name, "attempt reservation"
+                )
+                if snapshot is None:
+                    raise RuntimeError("attempt reservation is missing")
                 value = _json_object(
-                    _read_regular_at(
-                        attempts_fd, name, "attempt reservation"
-                    ),
+                    snapshot.contents,
                     "attempt reservation",
                 )
                 if value != {
@@ -1311,14 +1351,19 @@ class V52EvidenceStore:
                 }:
                     raise ValueError("attempt reservation binding differs")
                 reservations.add(number)
+                artifact_snapshots.append((name, snapshot))
             elif receipt:
                 number = int(receipt.group("number"))
-                contents = _read_regular_at(
+                snapshot = _read_regular_snapshot_at(
                     attempts_fd, name, "attempt receipt"
                 )
+                if snapshot is None:
+                    raise RuntimeError("attempt receipt is missing")
+                contents = snapshot.contents
                 record = _json_object(contents, "attempt receipt")
                 _validate_attempt_record(record, query_id, number)
                 receipts[number] = (record, contents)
+                artifact_snapshots.append((name, snapshot))
             else:
                 raise ValueError("attempt directory contains an ambiguous entry")
         if not set(receipts) <= reservations:
@@ -1340,7 +1385,7 @@ class V52EvidenceStore:
                 }
             )
             records.append(record)
-        return reservations, history, tuple(records)
+        return reservations, history, tuple(records), tuple(artifact_snapshots)
 
     def _validated_fetched_success_attempt(
         self,
@@ -1953,6 +1998,34 @@ class V52EvidenceStore:
                     sidecar_contents,
                     "query sidecar",
                 )
+                sidecar_snapshot = _read_regular_snapshot_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    "derived disposition sidecar",
+                )
+                if sidecar_snapshot is None:
+                    raise RuntimeError("derived disposition sidecar is missing")
+                sidecar_descriptor = os.open(
+                    sidecar_name,
+                    _regular_read_flags(),
+                    dir_fd=sidecars_fd,
+                )
+                opened.callback(os.close, sidecar_descriptor)
+                opened_sidecar = os.fstat(sidecar_descriptor)
+                linked_sidecar = os.stat(
+                    sidecar_name,
+                    dir_fd=sidecars_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(opened_sidecar.st_mode)
+                    or opened_sidecar.st_nlink != 1
+                    or _identity(opened_sidecar) != _identity(linked_sidecar)
+                    or _identity(opened_sidecar) != sidecar_snapshot.identity
+                ):
+                    raise ValueError(
+                        "derived disposition sidecar ownership differs"
+                    )
                 manifest = {
                     "attempt_history": [],
                     "attempt_number": None,
@@ -1970,23 +2043,55 @@ class V52EvidenceStore:
                     "source": query.source,
                     "storage_mode": "DERIVED_DISPOSITION",
                 }
-                _before_success_publish()
-                self._verify_query_chain(query, descriptors)
-                self._require_lease(query)
-                reservations, receipts = self._attempt_numbers(
-                    attempts_fd, query_id
-                )
-                if reservations or receipts:
-                    raise ValueError(
-                        "derived disposition attempt inventory changed"
+                try:
+                    _before_success_publish()
+                    self._verify_query_chain(query, descriptors)
+                    self._require_lease(query)
+                    reservations, receipts = self._attempt_numbers(
+                        attempts_fd, query_id
                     )
-                self._ensure_empty_inventory(objects_fd, "query object")
-                _write_once_at(
-                    query_fd,
-                    "success.json",
-                    _canonical_file_bytes(manifest),
-                    "success receipt",
-                )
+                    if reservations or receipts:
+                        raise ValueError(
+                            "derived disposition attempt inventory changed"
+                        )
+                    self._ensure_empty_inventory(objects_fd, "query object")
+                    _rebind_regular_snapshot_at(
+                        sidecars_fd,
+                        sidecar_name,
+                        sidecar_snapshot,
+                        "derived disposition sidecar",
+                    )
+                    _write_once_at(
+                        query_fd,
+                        "success.json",
+                        _canonical_file_bytes(manifest),
+                        "success receipt",
+                    )
+                except BaseException:
+                    try:
+                        os.stat(
+                            "success.json",
+                            dir_fd=query_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        current_sidecar = _read_regular_snapshot_at(
+                            sidecars_fd,
+                            sidecar_name,
+                            "derived disposition sidecar",
+                            missing_ok=True,
+                        )
+                        if (
+                            current_sidecar is not None
+                            and current_sidecar != sidecar_snapshot
+                        ):
+                            _cleanup_created_file(
+                                sidecars_fd,
+                                sidecar_descriptor,
+                                sidecar_name,
+                                "derived disposition sidecar",
+                            )
+                    raise
         finally:
             self._close_fds(descriptors)
         published = self.verify_success(query)
@@ -2060,17 +2165,18 @@ class V52EvidenceStore:
             raise
         try:
             query_fd = descriptors[-1]
-            registration_sha256, registered_query = (
+            registration_sha256, registered_query, query_snapshot = (
                 self._validated_registered_query(query, query_fd)
             )
-            success_contents = _read_regular_at(
+            success_snapshot = _read_regular_snapshot_at(
                 query_fd,
                 "success.json",
                 "success receipt",
                 missing_ok=missing_ok,
             )
-            if success_contents is None:
+            if success_snapshot is None:
                 return None
+            success_contents = success_snapshot.contents
             manifest = _json_object(success_contents, "success receipt")
             raw_common_keys = {
                 "attempt_history",
@@ -2123,7 +2229,7 @@ class V52EvidenceStore:
                 opened.callback(os.close, objects_fd)
                 sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
                 opened.callback(os.close, sidecars_fd)
-                reservations, history, attempt_receipts = (
+                reservations, history, attempt_receipts, attempt_snapshots = (
                     self._verified_attempt_bundle(query, attempts_fd)
                 )
                 if manifest.get("attempt_history") != history:
@@ -2168,9 +2274,12 @@ class V52EvidenceStore:
                         raise ValueError(
                             "fetched raw content-addressed path binding differs"
                         )
-                    raw_bytes = _read_regular_at(
+                    object_snapshot = _read_regular_snapshot_at(
                         objects_fd, object_name, "fetched raw object"
                     )
+                    if object_snapshot is None:
+                        raise RuntimeError("fetched raw object is missing")
+                    raw_bytes = object_snapshot.contents
                     object_contents = raw_bytes
                 elif mode == "PROTECTED_LEGACY_REFERENCE":
                     if manifest.get("attempt_number") is not None:
@@ -2192,9 +2301,12 @@ class V52EvidenceStore:
                         raise ValueError(
                             "protected reference content-addressed path binding differs"
                         )
-                    object_contents = _read_regular_at(
+                    object_snapshot = _read_regular_snapshot_at(
                         objects_fd, object_name, "protected legacy reference"
                     )
+                    if object_snapshot is None:
+                        raise RuntimeError("protected legacy reference is missing")
+                    object_contents = object_snapshot.contents
                     if _sha256_bytes(object_contents) != reference_sha256:
                         raise ValueError("protected legacy reference hash differs")
                     reference = _json_object(
@@ -2215,6 +2327,7 @@ class V52EvidenceStore:
                     self._ensure_empty_inventory(objects_fd, "query object")
                     object_name = None
                     object_contents = None
+                    object_snapshot = None
                     raw_sha256 = None
                     raw_byte_count = None
                     raw_bytes = None
@@ -2247,9 +2360,12 @@ class V52EvidenceStore:
                     raise ValueError(
                         "query sidecar content-addressed path binding differs"
                     )
-                sidecar_contents = _read_regular_at(
+                sidecar_snapshot = _read_regular_snapshot_at(
                     sidecars_fd, sidecar_name, "query semantic sidecar"
                 )
+                if sidecar_snapshot is None:
+                    raise RuntimeError("query semantic sidecar is missing")
+                sidecar_contents = sidecar_snapshot.contents
                 if _sha256_bytes(sidecar_contents) != sidecar_sha256:
                     raise ValueError("query sidecar hash differs")
                 self._ensure_content_slot(
@@ -2323,18 +2439,48 @@ class V52EvidenceStore:
                     final_reservations,
                     final_history,
                     final_attempt_receipts,
+                    final_attempt_snapshots,
                 ) = self._verified_attempt_bundle(query, attempts_fd)
                 if (
                     final_reservations != reservations
                     or final_history != history
                     or final_attempt_receipts != attempt_receipts
+                    or final_attempt_snapshots != attempt_snapshots
                 ):
                     raise ValueError(
                         "attempt namespace or history changed during verified read"
                     )
+                _rebind_regular_snapshot_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_snapshot,
+                    "query semantic sidecar",
+                )
+                if object_snapshot is not None and object_name is not None:
+                    _rebind_regular_snapshot_at(
+                        objects_fd,
+                        object_name,
+                        object_snapshot,
+                        "query object",
+                    )
 
             self._verify_query_chain(query, descriptors)
-            if self._validate_registered(query, query_fd) != registration_sha256:
+            _rebind_regular_snapshot_at(
+                query_fd,
+                "success.json",
+                success_snapshot,
+                "success receipt",
+            )
+            (
+                final_registration_sha256,
+                final_registered_query,
+                final_query_snapshot,
+            ) = self._validated_registered_query(query, query_fd)
+            if (
+                final_registration_sha256 != registration_sha256
+                or final_registered_query != registered_query
+                or final_query_snapshot != query_snapshot
+            ):
                 raise ValueError("logical query registration changed during read")
             published = PublishedEvidence(
                 query_id=query_id,

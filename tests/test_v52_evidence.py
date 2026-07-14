@@ -368,6 +368,42 @@ class V52EvidenceTest(unittest.TestCase):
             ):
                 store.read_verified_success(query)
 
+    def test_verified_read_rejects_success_mutation_during_final_attempt_rebind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                published = store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            original = store._verified_attempt_bundle
+            calls = 0
+
+            def mutate_success(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    published.success_receipt_path.write_bytes(
+                        published.success_receipt_path.read_bytes() + b" "
+                    )
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(
+                    store,
+                    "_verified_attempt_bundle",
+                    side_effect=mutate_success,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "success|identity|changed|canonical"
+                ),
+            ):
+                store.read_verified_success(query)
+
     def test_derived_disposition_has_no_raw_or_attempt_and_is_retry_safe(self):
         with tempfile.TemporaryDirectory() as td:
             root = _tmp(td) / "raw"
@@ -406,6 +442,45 @@ class V52EvidenceTest(unittest.TestCase):
             jsonschema.Draft202012Validator.check_schema(derived_schema)
             jsonschema.validate(verified.success_receipt, manifest_schema)
             jsonschema.validate(verified.query_sidecar, derived_schema)
+
+    def test_derived_publisher_rejects_hook_sidecar_corruption_before_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _derived_query()
+            query_id = logical_query_id(query)
+            sidecars = root / "queries" / query.source / query_id / "sidecars"
+
+            def corrupt_sidecar() -> None:
+                paths = list(sidecars.iterdir())
+                self.assertEqual(len(paths), 1)
+                paths[0].write_bytes(paths[0].read_bytes() + b" ")
+
+            with store.acquire_query(query):
+                with (
+                    patch(
+                        "mlb_backtest.v52_evidence._before_success_publish",
+                        side_effect=corrupt_sidecar,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "sidecar|identity|changed|canonical|content",
+                    ),
+                ):
+                    store.publish_derived_disposition(
+                        query, _derived_semantics()
+                    )
+            folder = root / "queries" / query.source / query_id
+            self.assertFalse((folder / "success.json").exists())
+            self.assertEqual(list(sidecars.iterdir()), [])
+            with store.acquire_query(query):
+                published = store.publish_derived_disposition(
+                    query, _derived_semantics()
+                )
+            self.assertEqual(
+                store.read_verified_success(query).published_evidence,
+                published,
+            )
 
     def test_derived_disposition_rejects_query_semantic_attempt_and_content_tamper(self):
         query_mutations = (

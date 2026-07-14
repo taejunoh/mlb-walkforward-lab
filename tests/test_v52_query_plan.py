@@ -871,6 +871,38 @@ class V52QueryPlanTest(unittest.TestCase):
             ):
                 query_plan.load_query_batch(root, batch.batch_id)
 
+    def test_load_query_batch_rejects_final_file_replacement_during_parse(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            path = query_plan.publish_query_batch(root, batch)
+            original_parse = query_plan._parse_json_object
+            replaced = False
+
+            def replace_final(*args: object, **kwargs: object):
+                nonlocal replaced
+                result = original_parse(*args, **kwargs)  # type: ignore[arg-type]
+                if not replaced:
+                    replaced = True
+                    contents = path.read_bytes()
+                    path.unlink()
+                    path.write_bytes(contents)
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_parse_json_object",
+                    side_effect=replace_final,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "batch|identity|changed|replaced"
+                ),
+            ):
+                query_plan.load_query_batch(root, batch.batch_id)
+
     def test_publish_rejects_symlink_ancestors_and_hardlinked_existing_file(self):
         from mlb_backtest.v52_query_plan import build_static_batch, publish_query_batch
 

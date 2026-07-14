@@ -37,6 +37,25 @@ _CANONICAL_QUERY_KEYS = {
     "run_spec_sha256",
     "source",
 }
+_DERIVED_SIDECAR_KEYS = {
+    "grain",
+    "parser_version",
+    "query_id",
+    "schema_version",
+    "semantics",
+    "source",
+    "storage_mode",
+}
+_DERIVED_SEMANTIC_KEYS = {
+    "as_of_date",
+    "consumer_cutoff_dates",
+    "consuming_game_pks",
+    "disposition",
+    "reason",
+    "season",
+}
+_PRESEASON_DISPOSITION = "PRESEASON_NO_CURRENT_SEASON_PITCHING"
+_PRESEASON_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
 
 
 def _day(value: object, label: str) -> date:
@@ -238,6 +257,46 @@ def _artifact_sha256(sidecar: Mapping[str, object]) -> str:
 def _require_task2_sidecar(
     sidecar: Mapping[str, object], *, source: str, grain: str, label: str
 ) -> Mapping[str, object]:
+    if isinstance(sidecar, Mapping) and sidecar.get("storage_mode") is not None:
+        semantics = sidecar.get("semantics")
+        if (
+            set(sidecar) != _DERIVED_SIDECAR_KEYS
+            or sidecar.get("storage_mode") != "DERIVED_DISPOSITION"
+            or source != "mlb_stats_pitching"
+            or grain != "season_d1_league_pitching_reference"
+            or sidecar.get("source") != source
+            or sidecar.get("grain") != grain
+            or sidecar.get("parser_version") != "v5.2.1"
+            or sidecar.get("schema_version") != 1
+            or not isinstance(sidecar.get("query_id"), str)
+            or not _SHA256.fullmatch(sidecar["query_id"])
+            or not isinstance(semantics, Mapping)
+            or set(semantics) != _DERIVED_SEMANTIC_KEYS
+        ):
+            raise ValueError(
+                f"{label} requires a closed verified derived disposition sidecar"
+            )
+        season = semantics.get("season")
+        as_of = _day(semantics.get("as_of_date"), "derived pitching as-of")
+        consumers = semantics.get("consuming_game_pks")
+        cutoffs = semantics.get("consumer_cutoff_dates")
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in SEASON_BOUNDARIES
+            or as_of != SEASON_BOUNDARIES[season][0] - timedelta(days=1)
+            or not isinstance(consumers, list)
+            or consumers != sorted(set(consumers))
+            or not consumers
+            or any(type(value) is not int or value <= 0 for value in consumers)
+            or not isinstance(cutoffs, Mapping)
+            or cutoffs
+            != {str(game_pk): as_of.isoformat() for game_pk in consumers}
+            or semantics.get("disposition") != _PRESEASON_DISPOSITION
+            or semantics.get("reason") != _PRESEASON_REASON
+        ):
+            raise ValueError(f"{label} derived disposition semantics differ")
+        return semantics
     if (
         not isinstance(sidecar, Mapping)
         or set(sidecar) != QUERY_SIDECAR_KEYS

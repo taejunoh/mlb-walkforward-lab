@@ -1319,6 +1319,18 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
+        rebound = _read_linked_regular(
+            current, f"{requested_id}.json", "query batch"
+        )
+        if rebound is None:
+            raise ValueError("query batch is missing after reconstruction")
+        rebound_contents, rebound_metadata = rebound
+        if (
+            rebound_contents != contents
+            or _batch_file_identity(rebound_metadata)
+            != _batch_file_identity(metadata)
+        ):
+            raise ValueError("query batch identity or bytes changed during load")
         _verify_opened_batch_chain(root, descriptors)
         return batch
     finally:
