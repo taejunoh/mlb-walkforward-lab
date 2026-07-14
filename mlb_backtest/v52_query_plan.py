@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
+import time
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -24,6 +26,15 @@ _MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/query_batches"
 )
+_SEASON_BOUNDARIES = {
+    2018: (date(2018, 3, 29), date(2018, 9, 30)),
+    2019: (date(2019, 3, 20), date(2019, 9, 29)),
+    2020: (date(2020, 7, 23), date(2020, 9, 27)),
+    2021: (date(2021, 4, 1), date(2021, 10, 3)),
+    2022: (date(2022, 4, 7), date(2022, 10, 5)),
+    2023: (date(2023, 3, 30), date(2023, 10, 1)),
+    2024: (date(2024, 3, 20), date(2024, 9, 30)),
+}
 
 
 @dataclass(frozen=True)
@@ -436,6 +447,22 @@ def build_participant_derived_batch(
     for game in games:
         if not isinstance(game, dict):
             raise ValueError("game evidence must be an object")
+        game_pk = game.get("game_pk")
+        season = game.get("season")
+        if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+            raise ValueError("game evidence game_pk must be a positive integer")
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in _SEASON_BOUNDARIES
+        ):
+            raise ValueError("game evidence season must be within 2018-2024")
+        official_date = _iso_date(
+            game.get("official_date"), "game evidence official_date"
+        )
+        season_start, season_end = _SEASON_BOUNDARIES[season]
+        if not season_start <= official_date <= season_end:
+            raise ValueError("game evidence official_date differs from season")
         if (
             game.get("verification_status") != "VERIFIED"
             or game.get("participant_provenance")
@@ -478,22 +505,45 @@ def build_participant_derived_batch(
     return _make_batch("PARTICIPANT_DERIVED", derived, queries)
 
 
-def _statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
+def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
     if (
         parent.source != "baseball_savant_statcast"
+        or parent.grain != "pitch"
         or parent.endpoint != _STATCAST_ENDPOINT
         or parent.expected_media_type != "text/csv"
+        or parent.parser_version != "v5.2.1"
     ):
         raise ValueError("parent must be an official Statcast query")
     first = _iso_date(parent.requested_range.get("start_date"), "parent start")
     last = _iso_date(parent.requested_range.get("end_date"), "parent end")
     if first > last:
         raise ValueError("parent query range is reversed")
+    year = parent.requested_range.get("year")
     if (
-        parent.parameters.get("game_date_gt") != first.isoformat()
-        or parent.parameters.get("game_date_lt") != last.isoformat()
+        isinstance(year, bool)
+        or not isinstance(year, int)
+        or year not in _SEASON_BOUNDARIES
+        or first.year != year
+        or last.year != year
     ):
-        raise ValueError("parent query range differs from parameters")
+        raise ValueError("Statcast parent year must be within 2018-2024")
+    if first.month != last.month:
+        raise ValueError("Statcast parent must stay within one calendar month")
+    season_start, season_end = _SEASON_BOUNDARIES[year]
+    if not season_start <= first <= last <= season_end:
+        raise ValueError("Statcast parent range is outside regular-season bounds")
+    allowed_requested = {"year", "start_date", "end_date", "acquisition"}
+    if not set(parent.requested_range) <= allowed_requested:
+        raise ValueError("Statcast parent requested range contains extra fields")
+    acquisition = parent.requested_range.get("acquisition")
+    if acquisition is not None and acquisition not in {
+        "FETCH_REQUIRED",
+        "PROTECTED_LEGACY_REFERENCE",
+    }:
+        raise ValueError("Statcast parent acquisition disposition differs")
+    expected_parameters = _statcast_parameters(first.isoformat(), last.isoformat())
+    if dict(parent.parameters) != expected_parameters:
+        raise ValueError("Statcast parent parameters differ from canonical filters")
     return first, last
 
 
@@ -512,6 +562,8 @@ def _statcast_child(
     requested.update({"start_date": first.isoformat(), "end_date": last.isoformat()})
     if acquisition is not None:
         requested["acquisition"] = acquisition
+    elif parent.requested_range.get("acquisition") is not None:
+        requested["acquisition"] = parent.requested_range["acquisition"]
     parameters = dict(parent.parameters)
     parameters["game_date_gt"] = first.isoformat()
     parameters["game_date_lt"] = last.isoformat()
@@ -526,7 +578,7 @@ def _statcast_child(
 def bisect_statcast_query(
     parent: LogicalQuery,
 ) -> tuple[LogicalQuery, LogicalQuery]:
-    first, last = _statcast_parent_range(parent)
+    first, last = _canonical_statcast_parent_range(parent)
     if first == last:
         raise ValueError("single-day Statcast query cannot be bisected")
     midpoint = first + timedelta(days=(last - first).days // 2)
@@ -542,17 +594,28 @@ def _legacy_ranges(
     for record in protected_catalog:
         if not isinstance(record, Mapping):
             raise ValueError("protected catalog records must be mappings")
-        if record.get("source") != "baseball_savant_statcast" or record.get("rawstore_verified") is not True:
+        if record.get("source") != "baseball_savant_statcast":
+            continue
+        if record.get("rawstore_verified") is not True:
             continue
         query = record.get("canonical_query")
-        if not isinstance(query, Mapping) or query.get("game_type") != "R":
-            continue
+        if not isinstance(query, Mapping) or set(query) != {
+            "start",
+            "end",
+            "game_type",
+            "url",
+        }:
+            raise ValueError("legacy Statcast canonical query fields differ")
+        if query.get("game_type") != "R":
+            raise ValueError("legacy Statcast game type differs")
         first = _iso_date(query.get("start"), "legacy start")
         last = _iso_date(query.get("end"), "legacy end")
         if first > last:
             raise ValueError("legacy Statcast range is reversed")
         if first.year not in {2022, 2023, 2024} or last.year != first.year:
-            continue
+            raise ValueError("legacy Statcast range must be within 2022-2024")
+        if first.month != last.month:
+            raise ValueError("legacy Statcast child must stay within one month")
         expected_url = (
             f"{_STATCAST_ENDPOINT}?"
             f"{urlencode(_statcast_parameters(first.isoformat(), last.isoformat()))}"
@@ -576,29 +639,46 @@ def build_legacy_partition_batch(
     for parent in parents:
         if not isinstance(parent, LogicalQuery):
             raise ValueError("parents must contain LogicalQuery values")
-        first, last = _statcast_parent_range(parent)
+        first, last = _canonical_statcast_parent_range(parent)
         parent_ranges.append((first, last, parent))
-    ordered_parents = sorted(parent_ranges, key=lambda item: (item[0], item[1]))
-    for previous, current in zip(ordered_parents, ordered_parents[1:]):
+    for previous, current in zip(parent_ranges, parent_ranges[1:]):
+        if current[0] <= previous[0]:
+            raise ValueError("Statcast parent ranges must be strictly ordered")
         if current[0] <= previous[1]:
             raise ValueError("Statcast parent ranges overlap")
 
     legacy = _legacy_ranges(protected_catalog)
-    queries: list[LogicalQuery] = []
-    for first, last, parent in ordered_parents:
-        candidate_rows = [
-            (start, end) for start, end in legacy if first <= start <= end <= last
+    candidates_by_parent: list[list[tuple[date, date]]] = [
+        [] for _ in parent_ranges
+    ]
+    prior_parent_index = -1
+    for child_first, child_last in legacy:
+        matches = [
+            index
+            for index, (first, last, _parent) in enumerate(parent_ranges)
+            if first <= child_first <= child_last <= last
         ]
-        if len(candidate_rows) != len(set(candidate_rows)):
-            raise ValueError("duplicate legacy Statcast child mapping")
-        candidates = sorted(candidate_rows)
+        if len(matches) != 1:
+            raise ValueError("verified legacy Statcast child maps to no unique parent")
+        parent_index = matches[0]
+        if parent_index < prior_parent_index:
+            raise ValueError("legacy Statcast children must be ordered by parent")
+        prior_parent_index = parent_index
+        candidates_by_parent[parent_index].append((child_first, child_last))
+
+    queries: list[LogicalQuery] = []
+    for (first, last, parent), candidates in zip(
+        parent_ranges, candidates_by_parent
+    ):
         exact = [(start, end) for start, end in candidates if start == first and end == last]
         strict = [(start, end) for start, end in candidates if (start, end) != (first, last)]
         if exact and strict:
             raise ValueError("mixed parent/child legacy ambiguity")
-        if len(exact) > 1:
-            raise ValueError("duplicate legacy parent ambiguity")
         for previous, current in zip(candidates, candidates[1:]):
+            if current == previous:
+                raise ValueError("duplicate legacy Statcast child mapping")
+            if current[0] < previous[0]:
+                raise ValueError("legacy Statcast children must be strictly ordered")
             if current[0] <= previous[1]:
                 raise ValueError("legacy Statcast child ranges overlap")
 
@@ -613,14 +693,17 @@ def build_legacy_partition_batch(
                         acquisition="FETCH_REQUIRED",
                     )
                 )
-            queries.append(
-                _statcast_child(
-                    parent,
-                    child_first,
-                    child_last,
-                    acquisition="PROTECTED_LEGACY_REFERENCE",
-                )
+            promoted = _statcast_child(
+                parent,
+                child_first,
+                child_last,
+                acquisition="PROTECTED_LEGACY_REFERENCE",
             )
+            promoted_range = dict(promoted.requested_range)
+            promoted_range["protected_inventory_sha256"] = (
+                protected_inventory_sha256
+            )
+            queries.append(replace(promoted, requested_range=promoted_range))
             cursor = child_last + timedelta(days=1)
         if cursor <= last:
             queries.append(
@@ -701,6 +784,36 @@ def _read_existing(parent_fd: int, name: str) -> bytes | None:
         os.close(descriptor)
 
 
+def _unlink_owned_temp(parent_fd: int, name: str, descriptor: int) -> None:
+    try:
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError("query batch temp ownership changed")
+    os.unlink(name, dir_fd=parent_fd)
+
+
+def _read_concurrent_final(parent_fd: int, name: str) -> bytes:
+    last_error: ValueError | None = None
+    for _ in range(100):
+        try:
+            contents = _read_existing(parent_fd, name)
+        except ValueError as exc:
+            last_error = exc
+            time.sleep(0)
+            continue
+        if contents is None:
+            raise ValueError("concurrent query batch final disappeared")
+        return contents
+    raise ValueError("concurrent query batch final remained aliased") from last_error
+
+
 def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     if not isinstance(batch, QueryBatch):
         raise TypeError("batch must be a QueryBatch")
@@ -724,8 +837,16 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
             if existing != contents:
                 raise RuntimeError("immutable query batch differs")
             return root / _ACQUISITION_BATCH_ROOT / name
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        descriptor = os.open(name, flags, 0o600, dir_fd=current)
+        temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(temp_name, flags, 0o600, dir_fd=current)
+        temp_exists = True
         try:
             view = memoryview(contents)
             while view:
@@ -735,14 +856,39 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
                 view = view[written:]
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("query batch publication was aliased")
+                raise ValueError("query batch temp publication was aliased")
             os.fsync(descriptor)
+            if _read_existing(current, temp_name) != contents:
+                raise ValueError("query batch temp bytes differ")
+            try:
+                os.link(
+                    temp_name,
+                    name,
+                    src_dir_fd=current,
+                    dst_dir_fd=current,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                _unlink_owned_temp(current, temp_name, descriptor)
+                temp_exists = False
+                os.fsync(current)
+                concurrent = _read_concurrent_final(current, name)
+                if concurrent != contents:
+                    raise RuntimeError("immutable query batch differs") from None
+                return root / _ACQUISITION_BATCH_ROOT / name
+            _unlink_owned_temp(current, temp_name, descriptor)
+            temp_exists = False
+            os.fsync(current)
+            if _read_existing(current, name) != contents:
+                raise ValueError("query batch bytes changed after publication")
+            return root / _ACQUISITION_BATCH_ROOT / name
         finally:
-            os.close(descriptor)
-        os.fsync(current)
-        if _read_existing(current, name) != contents:
-            raise ValueError("query batch bytes changed after publication")
-        return root / _ACQUISITION_BATCH_ROOT / name
+            try:
+                if temp_exists:
+                    _unlink_owned_temp(current, temp_name, descriptor)
+                    os.fsync(current)
+            finally:
+                os.close(descriptor)
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
