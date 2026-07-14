@@ -6,11 +6,12 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import date, timedelta
 
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
-from ..v52_evidence import LogicalQuery
+from ..v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
 from ..v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
@@ -21,7 +22,20 @@ from ..v52_source_contracts import (
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
+_STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_QUERY_KEYS = {
+    "acquisition_contract_sha256",
+    "endpoint",
+    "expected_media_type",
+    "grain",
+    "parameters",
+    "parent_query_id",
+    "parser_version",
+    "requested_range",
+    "run_spec_sha256",
+    "source",
+}
 
 
 def _day(value: object, label: str) -> date:
@@ -236,6 +250,90 @@ def _require_task2_sidecar(
     return sidecar["semantics"]
 
 
+def _statcast_query_lineage(
+    sidecar: Mapping[str, object], semantics: Mapping[str, object]
+) -> tuple[date, date, LogicalQuery]:
+    canonical = semantics.get("canonical_query")
+    coverage = semantics.get("coverage")
+    if (
+        not isinstance(canonical, Mapping)
+        or set(canonical) != _CANONICAL_QUERY_KEYS
+        or not isinstance(canonical.get("parameters"), Mapping)
+        or not isinstance(canonical.get("requested_range"), Mapping)
+        or not isinstance(coverage, Mapping)
+    ):
+        raise ValueError("Statcast BF source canonical query lineage is invalid")
+    try:
+        query = LogicalQuery(
+            source=canonical["source"],
+            grain=canonical["grain"],
+            endpoint=canonical["endpoint"],
+            parameters=dict(canonical["parameters"]),
+            requested_range=dict(canonical["requested_range"]),
+            expected_media_type=canonical["expected_media_type"],
+            parser_version=canonical["parser_version"],
+            parent_query_id=canonical["parent_query_id"],
+            run_spec_sha256=canonical["run_spec_sha256"],
+            acquisition_contract_sha256=canonical[
+                "acquisition_contract_sha256"
+            ],
+        )
+        normalized = json.loads(canonical_query_bytes(query))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Statcast BF source canonical query lineage is invalid") from exc
+    if (
+        normalized != dict(canonical)
+        or query.source != "baseball_savant_statcast"
+        or query.grain != "pitch"
+        or query.endpoint != _STATCAST_ENDPOINT
+        or query.expected_media_type != "text/csv"
+        or query.parser_version != "v5.2.1"
+        or not isinstance(query.run_spec_sha256, str)
+        or not _SHA256.fullmatch(query.run_spec_sha256)
+        or not isinstance(query.acquisition_contract_sha256, str)
+        or not _SHA256.fullmatch(query.acquisition_contract_sha256)
+        or (
+            query.parent_query_id is not None
+            and (
+                not isinstance(query.parent_query_id, str)
+                or not _SHA256.fullmatch(query.parent_query_id)
+            )
+        )
+        or sidecar.get("query_id") != logical_query_id(query)
+    ):
+        raise ValueError("Statcast BF source canonical query lineage is invalid")
+    requested = query.requested_range
+    if set(requested) != {"year", "start_date", "end_date"}:
+        raise ValueError("Statcast BF source requested range is invalid")
+    first = _day(requested.get("start_date"), "Statcast BF requested start")
+    last = _day(requested.get("end_date"), "Statcast BF requested end")
+    if (
+        isinstance(requested.get("year"), bool)
+        or requested.get("year") != first.year
+        or last.year != first.year
+        or coverage.get("inclusive_start") != first.isoformat()
+        or coverage.get("inclusive_end") != last.isoformat()
+        or dict(query.parameters)
+        != {
+            "all": "true",
+            "type": "details",
+            "player_type": "batter",
+            "game_date_gt": first.isoformat(),
+            "game_date_lt": last.isoformat(),
+            "hfGT": "R|",
+            "group_by": "name-year",
+            "sort_col": "pitches",
+            "player_event_sort": "api_p_release_speed",
+            "sort_order": "desc",
+            "min_pitches": "0",
+        }
+    ):
+        raise ValueError("Statcast BF source requested range is invalid")
+    if semantics.get("split_disposition") != "READY":
+        raise ValueError("Statcast BF source split state is not terminal READY")
+    return first, last, query
+
+
 def recompute_pitching_season_snapshot(
     query_sidecars: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
@@ -306,7 +404,7 @@ def recompute_pitching_season_snapshot(
 def _validate_career_statcast_coverage(
     baseline_end: date,
     cutoff: date,
-    source_ranges: Sequence[tuple[date, date]],
+    source_queries: Sequence[tuple[date, date, LogicalQuery]],
 ) -> None:
     boundary = SEASON_BOUNDARIES.get(cutoff.year)
     if boundary is None:
@@ -328,18 +426,74 @@ def _validate_career_statcast_coverage(
             expected = [item for item in expected if item[0] <= cutoff]
         expected_by_year[year] = expected
 
-    actual_by_year: dict[int, list[tuple[date, date]]] = {}
-    for first, last in source_ranges:
+    actual_by_year: dict[int, list[tuple[date, date, LogicalQuery]]] = {}
+    for first, last, query in source_queries:
         if first.year != last.year:
             raise ValueError("Statcast BF source range crosses a season boundary")
-        actual_by_year.setdefault(first.year, []).append((first, last))
+        actual_by_year.setdefault(first.year, []).append((first, last, query))
 
     for year, expected in expected_by_year.items():
         actual = actual_by_year.pop(year, [])
         if expected and not actual:
             raise ValueError(f"whole regular season {year} is omitted")
-        if actual != expected:
-            raise ValueError("regular-season coverage gap or overlap")
+        index = 0
+        for parent_first, parent_last in expected:
+            cursor = parent_first
+            children: list[tuple[date, date, LogicalQuery]] = []
+            while index < len(actual) and actual[index][0] <= parent_last:
+                first, last, query = actual[index]
+                if first < cursor:
+                    raise ValueError(
+                        "regular-season coverage gap or overlap: "
+                        "Statcast split child overlap"
+                    )
+                if first > cursor:
+                    raise ValueError(
+                        "regular-season coverage gap: Statcast split child gap"
+                    )
+                if last < first or last > parent_last:
+                    raise ValueError(
+                        "regular-season coverage gap or overlap: "
+                        "Statcast split child overlap"
+                    )
+                children.append((first, last, query))
+                cursor = last + timedelta(days=1)
+                index += 1
+                if cursor > parent_last:
+                    break
+            if cursor != parent_last + timedelta(days=1):
+                raise ValueError(
+                    "regular-season coverage gap: Statcast split child gap"
+                )
+            direct_parent = (
+                len(children) == 1
+                and children[0][0] == parent_first
+                and children[0][1] == parent_last
+                and children[0][2].parent_query_id is None
+            )
+            if direct_parent:
+                continue
+            for _first, _last, child_query in children:
+                parent_parameters = {
+                    **child_query.parameters,
+                    "game_date_gt": parent_first.isoformat(),
+                    "game_date_lt": parent_last.isoformat(),
+                }
+                parent_requested_range = {
+                    **child_query.requested_range,
+                    "start_date": parent_first.isoformat(),
+                    "end_date": parent_last.isoformat(),
+                }
+                expected_parent = replace(
+                    child_query,
+                    parameters=parent_parameters,
+                    requested_range=parent_requested_range,
+                    parent_query_id=None,
+                )
+                if child_query.parent_query_id != logical_query_id(expected_parent):
+                    raise ValueError("Statcast split child has wrong parent lineage")
+        if index != len(actual):
+            raise ValueError("Statcast BF source range is outside monthly parents")
     if actual_by_year:
         raise ValueError("Statcast BF source range is outside required seasons")
 
@@ -377,8 +531,7 @@ def recompute_career_bf_season_snapshot(
             raise ValueError("Statcast BF addition value/source lineage is invalid")
         computed_hashes = []
         recomputed_bf = 0
-        target_pitcher_found = False
-        source_ranges = []
+        source_queries = []
         for sidecar in source_sidecars:
             semantics = _require_task2_sidecar(
                 sidecar,
@@ -390,7 +543,6 @@ def recompute_career_bf_season_snapshot(
             pitcher_bf = semantics.get("pitcher_batters_faced")
             plate_appearances = semantics.get("plate_appearance_evidence")
             game_pks = semantics.get("game_pks")
-            coverage = semantics.get("coverage")
             if (
                 not isinstance(pitcher_ids, list)
                 or pitcher_ids != sorted(set(pitcher_ids))
@@ -398,11 +550,9 @@ def recompute_career_bf_season_snapshot(
                 or not isinstance(pitcher_bf, Mapping)
                 or not isinstance(plate_appearances, list)
                 or not isinstance(game_pks, list)
-                or not isinstance(coverage, Mapping)
             ):
                 raise ValueError("Statcast BF source pitcher population is invalid")
-            first = _day(coverage.get("inclusive_start"), "Statcast BF source start")
-            last = _day(coverage.get("inclusive_end"), "Statcast BF source end")
+            first, last, source_query = _statcast_query_lineage(sidecar, semantics)
             if (
                 first > last
                 or first.year not in range(2018, 2025)
@@ -449,19 +599,16 @@ def recompute_career_bf_season_snapshot(
             if dict(pitcher_bf) != canonical_counts:
                 raise ValueError("Statcast BF evidence summary differs from PA evidence")
             if pitcher_id in eligible_counts:
-                target_pitcher_found = True
                 recomputed_bf += eligible_counts[pitcher_id]
-            source_ranges.append((first, last))
+            source_queries.append((first, last, source_query))
             computed_hashes.append(_artifact_sha256(sidecar))
         if list(source_hashes) != computed_hashes or len(set(computed_hashes)) != len(
             computed_hashes
         ):
             raise ValueError("Statcast BF source hash differs from canonical sidecar")
-        for previous, current in zip(source_ranges, source_ranges[1:]):
+        for previous, current in zip(source_queries, source_queries[1:]):
             if current[0] <= previous[1]:
                 raise ValueError("Statcast BF source coverage overlaps or is unordered")
-        if source_sidecars and not target_pitcher_found:
-            raise ValueError("Statcast BF source does not contain target pitcher PA evidence")
         if bf != recomputed_bf:
             raise ValueError("claimed Statcast BF differs from canonical PA evidence")
         key = (pitcher_id, game_pk)
@@ -470,7 +617,7 @@ def recompute_career_bf_season_snapshot(
         additions[key] = {
             **row,
             "consumer_cutoff_date": cutoff.isoformat(),
-            "source_ranges": source_ranges,
+            "source_queries": source_queries,
             "verified_statcast_bf": recomputed_bf,
         }
     records = []
@@ -518,7 +665,7 @@ def recompute_career_bf_season_snapshot(
             if addition["consumer_cutoff_date"] != cutoffs.get(str(game_pk)):
                 raise ValueError("Statcast BF cutoff differs from career consumer D-1")
             _validate_career_statcast_coverage(
-                inclusive_end, cutoff, addition["source_ranges"]
+                inclusive_end, cutoff, addition["source_queries"]
             )
             used.add((pitcher_id, game_pk))
             records.append(

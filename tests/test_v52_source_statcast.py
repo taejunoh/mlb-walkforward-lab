@@ -10,7 +10,7 @@ from pathlib import Path
 import jsonschema
 
 from mlb_backtest.statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP
-from mlb_backtest.v52_evidence import LogicalQuery
+from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +105,8 @@ class V52StatcastSourceTest(unittest.TestCase):
         self.assertEqual(semantics["terminal_plate_appearance_count"], 2)
         self.assertRegex(semantics["games"][0]["terminal_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(semantics["split_disposition"], "READY")
+        self.assertEqual(semantics["canonical_query"]["parent_query_id"], None)
+        self.assertEqual(sidecar["query_id"], logical_query_id(_query()))
 
     def test_statcast_missing_field_and_conflicting_pitch_are_rejected(self) -> None:
         from mlb_backtest.v52_sources.statcast import recompute_statcast_sidecar

@@ -5,12 +5,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
 from ..statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
-from ..v52_evidence import LogicalQuery
+from ..v52_evidence import LogicalQuery, canonical_query_bytes
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
     canonical_json_bytes,
@@ -137,6 +138,7 @@ def recompute_statcast_sidecar(
         )
     semantics = {
         "batter_ids": sorted({int(row["batter_id"]) for row in parsed.pitches}),
+        "canonical_query": json.loads(canonical_query_bytes(query)),
         "coverage": {
             "inclusive_end": last.isoformat(),
             "inclusive_start": first.isoformat(),

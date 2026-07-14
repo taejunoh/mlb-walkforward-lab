@@ -4,12 +4,17 @@ import copy
 import json
 import hashlib
 import unittest
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 import jsonschema
 
-from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
+from mlb_backtest.v52_evidence import (
+    LogicalQuery,
+    canonical_query_bytes,
+    logical_query_id,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +29,35 @@ def _statcast_source_sidecar(
     end: str = "2024-04-01",
     *,
     include_target_pa: bool = True,
+    query: LogicalQuery | None = None,
+    split_disposition: str = "READY",
 ) -> dict[str, object]:
-    identity = hashlib.sha256(f"{start}:{end}".encode()).hexdigest()
+    if query is None:
+        query = LogicalQuery(
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            parameters={
+                "all": "true",
+                "type": "details",
+                "player_type": "batter",
+                "game_date_gt": start,
+                "game_date_lt": end,
+                "hfGT": "R|",
+                "group_by": "name-year",
+                "sort_col": "pitches",
+                "player_event_sort": "api_p_release_speed",
+                "sort_order": "desc",
+                "min_pitches": "0",
+            },
+            requested_range={"year": int(start[:4]), "start_date": start, "end_date": end},
+            expected_media_type="text/csv",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+    identity = logical_query_id(query)
     game_pks = [9001] if include_target_pa else []
     pitcher_ids = [101] if include_target_pa else []
     plate_appearances = []
@@ -55,10 +87,12 @@ def _statcast_source_sidecar(
                 "inclusive_start": start,
                 "inclusive_end": end,
             },
+            "canonical_query": json.loads(canonical_query_bytes(query)),
             "game_pks": game_pks,
             "plate_appearance_evidence": plate_appearances,
             "pitcher_ids": pitcher_ids,
             "pitcher_batters_faced": pitcher_bf,
+            "split_disposition": split_disposition,
         },
         "source": "baseball_savant_statcast",
     }
@@ -96,10 +130,81 @@ def _planned_statcast_sidecars(
             str(query.requested_range["start_date"]),
             str(query.requested_range["end_date"]),
             include_target_pa=index == len(queries) - 1,
+            query=query,
         )
-        sidecar["query_id"] = logical_query_id(query)
         sidecars.append(sidecar)
     return sidecars
+
+
+def _planned_statcast_query(start: str, end: str) -> LogicalQuery:
+    from mlb_backtest.v52_query_plan import build_static_batch
+
+    for query in build_static_batch(RUN_SPEC, CONTRACT).queries:
+        if (
+            query.source == "baseball_savant_statcast"
+            and query.requested_range.get("start_date") == start
+            and query.requested_range.get("end_date") == end
+        ):
+            return query
+    raise AssertionError(f"planned Statcast query is missing: {start}..{end}")
+
+
+def _statcast_child_query(
+    parent: LogicalQuery,
+    start: str,
+    end: str,
+    *,
+    parent_query_id: str | None = None,
+) -> LogicalQuery:
+    return replace(
+        parent,
+        parameters={
+            **parent.parameters,
+            "game_date_gt": start,
+            "game_date_lt": end,
+        },
+        requested_range={
+            **parent.requested_range,
+            "start_date": start,
+            "end_date": end,
+        },
+        parent_query_id=(
+            logical_query_id(parent)
+            if parent_query_id is None
+            else parent_query_id
+        ),
+    )
+
+
+def _replace_april_2024_parent_with_children(
+    sidecars: list[dict[str, object]],
+    *,
+    second_start: str = "2024-04-16",
+    first_end: str = "2024-04-15",
+    parent_query_id: str | None = None,
+) -> list[dict[str, object]]:
+    parent = _planned_statcast_query("2024-04-01", "2024-04-30")
+    left_query = _statcast_child_query(parent, "2024-04-01", first_end)
+    right_query = _statcast_child_query(
+        parent,
+        second_start,
+        "2024-04-30",
+        parent_query_id=parent_query_id,
+    )
+    children = [
+        _statcast_source_sidecar(
+            "2024-04-01",
+            first_end,
+            include_target_pa=False,
+            query=left_query,
+        ),
+        _statcast_source_sidecar(
+            second_start,
+            "2024-04-30",
+            query=right_query,
+        ),
+    ]
+    return [*sidecars[:-1], *children]
 
 
 def _artifact_sha(sidecar: dict[str, object]) -> str:
@@ -280,7 +385,7 @@ class V52PitchingSourceTest(unittest.TestCase):
             "pitcher_id"
         ] = 102
         absent["statcast_query_sidecar_sha256s"][-1] = _artifact_sha(absent_sidecar)
-        with self.assertRaisesRegex(ValueError, "target pitcher"):
+        with self.assertRaisesRegex(ValueError, "claimed Statcast BF differs"):
             recompute_career_bf_season_snapshot([baseline], [absent])
 
     def test_career_aggregate_rejects_2017_baseline_with_only_2024_evidence(self) -> None:
@@ -353,6 +458,97 @@ class V52PitchingSourceTest(unittest.TestCase):
             [baseline], [_career_addition(sidecars, cutoff)]
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_accepts_ready_children_covering_monthly_parent(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _replace_april_2024_parent_with_children(
+            _planned_statcast_sidecars(cutoff)
+        )
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_nonready_monthly_parent(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        sidecars[-1]["semantics"]["split_disposition"] = "SPLIT_REQUIRED"
+        with self.assertRaisesRegex(ValueError, "terminal READY"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, cutoff)]
+            )
+
+    def test_career_aggregate_rejects_gapped_overlapping_or_wrong_parent_children(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        planned = _planned_statcast_sidecars(cutoff)
+        cases = {
+            "gap": _replace_april_2024_parent_with_children(
+                planned, second_start="2024-04-17"
+            ),
+            "overlap": _replace_april_2024_parent_with_children(
+                planned, second_start="2024-04-15"
+            ),
+            "wrong parent": _replace_april_2024_parent_with_children(
+                planned, parent_query_id="f" * 64
+            ),
+        }
+        for label, sidecars in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
+
+    def test_career_aggregate_allows_complete_inseason_rookie_zero_bf(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        final_semantics = sidecars[-1]["semantics"]
+        final_semantics["game_pks"] = []
+        final_semantics["pitcher_ids"] = []
+        final_semantics["plate_appearance_evidence"] = []
+        final_semantics["pitcher_batters_faced"] = {}
+        snapshot = recompute_career_bf_season_snapshot(
+            [baseline], [_career_addition(sidecars, cutoff, statcast_bf=0)]
+        )
+        self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 0)
+        self.assertEqual(snapshot["records"][0]["total_batters_faced"], 0)
+
+    def test_career_aggregate_rejects_positive_claim_for_absent_rookie(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff)
+        final_semantics = sidecars[-1]["semantics"]
+        final_semantics["game_pks"] = []
+        final_semantics["pitcher_ids"] = []
+        final_semantics["plate_appearance_evidence"] = []
+        final_semantics["pitcher_batters_faced"] = {}
+        with self.assertRaisesRegex(ValueError, "claimed Statcast BF differs"):
+            recompute_career_bf_season_snapshot(
+                [baseline], [_career_addition(sidecars, cutoff, statcast_bf=1)]
+            )
 
     def test_career_aggregate_rejects_task3_within_season_month_omission(self) -> None:
         from mlb_backtest.v52_sources.pitching import (
