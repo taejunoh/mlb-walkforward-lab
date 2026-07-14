@@ -73,7 +73,7 @@ _QUERY_TYPES: dict[str, dict[str, type]] = {
 _STREAM_CHUNK_BYTES = 1024 * 1024
 _LINE_BREAK = re.compile(rb"\r\n|\r|\n")
 _NON_STRIPPED_BYTE = re.compile(rb"[^ \t\n\r\v\f]")
-_LeafIdentity = tuple[int, int, int, int, int, int]
+_LeafIdentity = tuple[int, int, int, int, int, int, int]
 _SourceMembership = dict[str, dict[str, _LeafIdentity]]
 
 
@@ -257,8 +257,8 @@ class _BoundLegacyTree:
     def source_membership(self) -> _SourceMembership:
         """Snapshot every source leaf identity through its bound directory FD.
 
-        The local threat boundary cannot distinguish a privileged in-place rewrite
-        that restores all six observed metadata fields between snapshots.
+        The local threat boundary cannot distinguish a mutation capable of restoring
+        all seven observed metadata fields, including ctime, between snapshots.
         """
         self.assert_bound()
         expected_root_names = set(self._source_fds) | {
@@ -283,6 +283,7 @@ class _BoundLegacyTree:
                     metadata.st_ino,
                     metadata.st_size,
                     metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
                     metadata.st_mode,
                     metadata.st_nlink,
                 )

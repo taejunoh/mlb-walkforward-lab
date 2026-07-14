@@ -235,7 +235,7 @@ class V52ProtectedInventoryTest(unittest.TestCase):
 
     def test_build_rejects_raw_identity_change_after_cached_hash(self) -> None:
         original_records = inventory_module._records_from_verified_catalog
-        for mutation_kind in ("replace", "rewrite"):
+        for mutation_kind in ("replace", "rewrite", "rewrite_restore_mtime"):
             with (
                 self.subTest(mutation_kind=mutation_kind),
                 tempfile.TemporaryDirectory() as directory,
@@ -252,31 +252,46 @@ class V52ProtectedInventoryTest(unittest.TestCase):
                         replacement = raw_path.with_name(raw_path.name + ".replacement")
                         replacement.write_bytes(content)
                         os.replace(replacement, raw_path)
-                    else:
+                    elif mutation_kind == "rewrite":
                         raw_path.write_bytes(content[::-1])
                         os.utime(
                             raw_path,
                             ns=(before.st_atime_ns, before.st_mtime_ns + 1),
                         )
+                    else:
+                        for _ in range(100):
+                            raw_path.write_bytes(content[::-1])
+                            os.utime(
+                                raw_path,
+                                ns=(before.st_atime_ns, before.st_mtime_ns),
+                            )
+                            if (
+                                raw_path.stat(follow_symlinks=False).st_ctime_ns
+                                != before.st_ctime_ns
+                            ):
+                                break
                     after = raw_path.stat(follow_symlinks=False)
-                    self.assertNotEqual(
-                        (
-                            before.st_dev,
-                            before.st_ino,
-                            before.st_size,
-                            before.st_mtime_ns,
-                            before.st_mode,
-                            before.st_nlink,
-                        ),
-                        (
-                            after.st_dev,
-                            after.st_ino,
-                            after.st_size,
-                            after.st_mtime_ns,
-                            after.st_mode,
-                            after.st_nlink,
-                        ),
+                    before_six = (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_mode,
+                        before.st_nlink,
                     )
+                    after_six = (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_mode,
+                        after.st_nlink,
+                    )
+                    if mutation_kind == "rewrite_restore_mtime":
+                        self.assertEqual(after_six, before_six)
+                        self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+                    else:
+                        self.assertNotEqual(after_six, before_six)
                     return records
 
                 with (
