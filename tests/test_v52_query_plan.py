@@ -294,6 +294,67 @@ class V52QueryPlanTest(unittest.TestCase):
             self.assertEqual(child.parameters["hfGT"], "R|")
             self.assertEqual(child.parent_query_id, logical_query_id(valid))
 
+    def test_bisect_preserves_valid_promoted_lineage_and_rejects_malformed_metadata(self):
+        from mlb_backtest.v52_query_plan import (
+            bisect_statcast_query,
+            build_legacy_partition_batch,
+        )
+
+        parent = _parent("2024-06-01", "2024-06-30")
+        promoted = build_legacy_partition_batch(
+            [parent],
+            [_legacy("2024-06-01", "2024-06-30")],
+            protected_inventory_sha256="a" * 64,
+        ).queries[0]
+        left, right = bisect_statcast_query(promoted)
+        for child in (left, right):
+            self.assertEqual(
+                child.requested_range["protected_inventory_sha256"], "a" * 64
+            )
+            self.assertEqual(
+                child.requested_range["acquisition"],
+                "PROTECTED_LEGACY_REFERENCE",
+            )
+            self.assertEqual(child.parent_query_id, logical_query_id(promoted))
+
+        for malformed in (None, 7, "a" * 63, "G" * 64):
+            candidate = dataclasses.replace(
+                promoted,
+                requested_range={
+                    **promoted.requested_range,
+                    "protected_inventory_sha256": malformed,
+                },
+            )
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                bisect_statcast_query(candidate)
+
+        for candidate in (
+            dataclasses.replace(
+                parent,
+                requested_range={
+                    **parent.requested_range,
+                    "protected_inventory_sha256": "a" * 64,
+                },
+            ),
+            dataclasses.replace(
+                parent,
+                requested_range={
+                    **parent.requested_range,
+                    "acquisition": "FETCH_REQUIRED",
+                    "protected_inventory_sha256": "a" * 64,
+                },
+            ),
+            dataclasses.replace(
+                parent,
+                requested_range={
+                    **parent.requested_range,
+                    "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                },
+            ),
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                bisect_statcast_query(candidate)
+
     def test_legacy_partition_maps_verified_children_and_fetches_only_uncovered_gaps(self):
         from mlb_backtest.v52_query_plan import build_legacy_partition_batch
 
@@ -500,37 +561,22 @@ class V52QueryPlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             barrier = threading.Barrier(6)
-            seen: set[int] = set()
-            lock = threading.Lock()
-            original_read = query_plan._read_existing
-
-            def synchronized_first_read(parent_fd, name):
-                identity = threading.get_ident()
-                with lock:
-                    first = identity not in seen
-                    seen.add(identity)
-                if first:
-                    barrier.wait(timeout=5)
-                    return None
-                return original_read(parent_fd, name)
 
             paths = []
             errors = []
 
             def worker():
                 try:
+                    barrier.wait(timeout=5)
                     paths.append(query_plan.publish_query_batch(root, batch))
                 except BaseException as exc:
                     errors.append(exc)
 
-            with mock.patch.object(
-                query_plan, "_read_existing", side_effect=synchronized_first_read
-            ):
-                threads = [threading.Thread(target=worker) for _ in range(6)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=10)
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
             self.assertEqual(errors, [])
             self.assertEqual(len(paths), 6)
             self.assertEqual(len(set(paths)), 1)
@@ -571,6 +617,107 @@ class V52QueryPlanTest(unittest.TestCase):
                 race(root, b"{}\n")
             batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
             self.assertEqual(list(batch_dir.glob("*.tmp")), [])
+
+    def test_publish_serializes_the_post_link_window_before_reconciling(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            entered = threading.Event()
+            release = threading.Event()
+            second_done = threading.Event()
+            original_unlink = query_plan._unlink_owned_temp
+            pause_lock = threading.Lock()
+            paused = False
+
+            def pause_after_link(parent_fd, name, descriptor):
+                nonlocal paused
+                with pause_lock:
+                    should_pause = not paused
+                    if should_pause:
+                        paused = True
+                if should_pause:
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("test did not release publisher")
+                return original_unlink(parent_fd, name, descriptor)
+
+            results = []
+            errors = []
+
+            def publish(*, mark_done=False):
+                try:
+                    results.append(query_plan.publish_query_batch(root, batch))
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    if mark_done:
+                        second_done.set()
+
+            with mock.patch.object(
+                query_plan, "_unlink_owned_temp", side_effect=pause_after_link
+            ):
+                first = threading.Thread(target=publish)
+                first.start()
+                self.assertTrue(entered.wait(timeout=5))
+                second = threading.Thread(target=publish, kwargs={"mark_done": True})
+                second.start()
+                second_was_blocked = not second_done.wait(timeout=0.1)
+                release.set()
+                first.join(timeout=10)
+                second.join(timeout=10)
+
+            self.assertTrue(second_was_blocked)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            final = results[0]
+            self.assertEqual(os.stat(final).st_nlink, 1)
+            self.assertEqual(list(final.parent.glob("*.tmp")), [])
+
+    def test_publish_retry_recovers_only_owned_stale_temp_hardlink(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(
+                query_plan,
+                "_unlink_owned_temp",
+                side_effect=OSError("injected crash after link"),
+            ), self.assertRaisesRegex(OSError, "injected crash"):
+                query_plan.publish_query_batch(root, batch)
+
+            batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+            final = batch_dir / f"{batch.batch_id}.json"
+            stale = list(batch_dir.glob("*.tmp"))
+            self.assertTrue(final.is_file())
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(os.stat(final).st_nlink, 2)
+            self.assertEqual(os.stat(stale[0]).st_ino, os.stat(final).st_ino)
+
+            self.assertEqual(query_plan.publish_query_batch(root, batch), final)
+            self.assertEqual(os.stat(final).st_nlink, 1)
+            self.assertEqual(list(batch_dir.glob("*.tmp")), [])
+
+    def test_publish_recovery_rejects_conflicting_final_and_temp_without_deleting(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        batch = query_plan.build_static_batch(RUN_SPEC, CONTRACT)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
+            batch_dir.mkdir(parents=True)
+            final = batch_dir / f"{batch.batch_id}.json"
+            final.write_bytes(b"{}\n")
+            stale = batch_dir / f".{batch.batch_id}.{'b' * 32}.tmp"
+            os.link(final, stale)
+
+            with self.assertRaisesRegex(RuntimeError, "differs"):
+                query_plan.publish_query_batch(root, batch)
+            self.assertEqual(final.read_bytes(), b"{}\n")
+            self.assertTrue(stale.exists())
+            self.assertEqual(os.stat(final).st_nlink, 2)
 
 
 if __name__ == "__main__":

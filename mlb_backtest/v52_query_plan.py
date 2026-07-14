@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import stat
-import time
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -532,7 +532,13 @@ def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
     season_start, season_end = _SEASON_BOUNDARIES[year]
     if not season_start <= first <= last <= season_end:
         raise ValueError("Statcast parent range is outside regular-season bounds")
-    allowed_requested = {"year", "start_date", "end_date", "acquisition"}
+    allowed_requested = {
+        "year",
+        "start_date",
+        "end_date",
+        "acquisition",
+        "protected_inventory_sha256",
+    }
     if not set(parent.requested_range) <= allowed_requested:
         raise ValueError("Statcast parent requested range contains extra fields")
     acquisition = parent.requested_range.get("acquisition")
@@ -541,6 +547,18 @@ def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
         "PROTECTED_LEGACY_REFERENCE",
     }:
         raise ValueError("Statcast parent acquisition disposition differs")
+    protected_inventory_sha256 = parent.requested_range.get(
+        "protected_inventory_sha256"
+    )
+    if acquisition == "PROTECTED_LEGACY_REFERENCE":
+        _validate_sha256(
+            protected_inventory_sha256,
+            "Statcast protected_inventory_sha256",
+        )
+    elif protected_inventory_sha256 is not None:
+        raise ValueError(
+            "only protected legacy Statcast queries may bind inventory lineage"
+        )
     expected_parameters = _statcast_parameters(first.isoformat(), last.isoformat())
     if dict(parent.parameters) != expected_parameters:
         raise ValueError("Statcast parent parameters differ from canonical filters")
@@ -799,19 +817,114 @@ def _unlink_owned_temp(parent_fd: int, name: str, descriptor: int) -> None:
     os.unlink(name, dir_fd=parent_fd)
 
 
-def _read_concurrent_final(parent_fd: int, name: str) -> bytes:
-    last_error: ValueError | None = None
-    for _ in range(100):
-        try:
-            contents = _read_existing(parent_fd, name)
-        except ValueError as exc:
-            last_error = exc
-            time.sleep(0)
+def _batch_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_linked_regular(
+    parent_fd: int, name: str, label: str
+) -> tuple[bytes, os.stat_result] | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{label} must be a no-follow regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or _batch_file_identity(before) != _batch_file_identity(linked)
+        ):
+            raise ValueError(f"{label} identity differs")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _batch_file_identity(before) != _batch_file_identity(after)
+            or _batch_file_identity(after) != _batch_file_identity(rebound)
+        ):
+            raise ValueError(f"{label} identity changed while reading")
+        return b"".join(chunks), after
+    finally:
+        os.close(descriptor)
+
+
+def _reconcile_batch_final(
+    parent_fd: int,
+    batch_id: str,
+    expected_contents: bytes,
+) -> bytes | None:
+    final_name = f"{batch_id}.json"
+    final = _read_linked_regular(parent_fd, final_name, "query batch final")
+    if final is None:
+        return None
+    final_contents, final_metadata = final
+    if final_contents != expected_contents:
+        raise RuntimeError("immutable query batch differs")
+    if final_metadata.st_nlink == 1:
+        return final_contents
+
+    stale_name = re.compile(
+        rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$"
+    )
+    removed = False
+    for candidate_name in os.listdir(parent_fd):
+        if stale_name.fullmatch(candidate_name) is None:
             continue
-        if contents is None:
-            raise ValueError("concurrent query batch final disappeared")
-        return contents
-    raise ValueError("concurrent query batch final remained aliased") from last_error
+        candidate = _read_linked_regular(
+            parent_fd, candidate_name, "query batch stale temp"
+        )
+        if candidate is None:
+            continue
+        candidate_contents, candidate_metadata = candidate
+        if (
+            (candidate_metadata.st_dev, candidate_metadata.st_ino)
+            != (final_metadata.st_dev, final_metadata.st_ino)
+        ):
+            continue
+        if candidate_contents != expected_contents:
+            raise ValueError("query batch stale temp bytes differ")
+        rebound = os.stat(
+            candidate_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (
+            rebound.st_dev,
+            rebound.st_ino,
+        ) != (
+            candidate_metadata.st_dev,
+            candidate_metadata.st_ino,
+        ):
+            raise ValueError("query batch stale temp identity changed")
+        os.unlink(candidate_name, dir_fd=parent_fd)
+        removed = True
+    if removed:
+        os.fsync(parent_fd)
+    reconciled = _read_existing(parent_fd, final_name)
+    if reconciled != expected_contents:
+        raise ValueError("query batch final did not reconcile to one link")
+    return reconciled
 
 
 def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
@@ -831,64 +944,71 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
         for component in _ACQUISITION_BATCH_ROOT.parts:
             current = _open_or_create_directory(current, component)
             descriptors.append(current)
-        name = f"{batch.batch_id}.json"
-        existing = _read_existing(current, name)
-        if existing is not None:
-            if existing != contents:
-                raise RuntimeError("immutable query batch differs")
-            return root / _ACQUISITION_BATCH_ROOT / name
-        temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        descriptor = os.open(temp_name, flags, 0o600, dir_fd=current)
-        temp_exists = True
+        fcntl.flock(current, fcntl.LOCK_EX)
         try:
-            view = memoryview(contents)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("query batch publication made no progress")
-                view = view[written:]
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("query batch temp publication was aliased")
-            os.fsync(descriptor)
-            if _read_existing(current, temp_name) != contents:
-                raise ValueError("query batch temp bytes differ")
+            name = f"{batch.batch_id}.json"
+            existing = _reconcile_batch_final(current, batch.batch_id, contents)
+            if existing is not None:
+                return root / _ACQUISITION_BATCH_ROOT / name
+            temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(temp_name, flags, 0o600, dir_fd=current)
+            temp_exists = True
             try:
-                os.link(
-                    temp_name,
-                    name,
-                    src_dir_fd=current,
-                    dst_dir_fd=current,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
+                view = memoryview(contents)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("query batch publication made no progress")
+                    view = view[written:]
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("query batch temp publication was aliased")
+                os.fsync(descriptor)
+                if _read_existing(current, temp_name) != contents:
+                    raise ValueError("query batch temp bytes differ")
+                try:
+                    os.link(
+                        temp_name,
+                        name,
+                        src_dir_fd=current,
+                        dst_dir_fd=current,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    _unlink_owned_temp(current, temp_name, descriptor)
+                    temp_exists = False
+                    os.fsync(current)
+                    concurrent = _reconcile_batch_final(
+                        current, batch.batch_id, contents
+                    )
+                    if concurrent is None:
+                        raise ValueError("concurrent query batch final disappeared")
+                    return root / _ACQUISITION_BATCH_ROOT / name
                 _unlink_owned_temp(current, temp_name, descriptor)
                 temp_exists = False
                 os.fsync(current)
-                concurrent = _read_concurrent_final(current, name)
-                if concurrent != contents:
-                    raise RuntimeError("immutable query batch differs") from None
+                if (
+                    _reconcile_batch_final(current, batch.batch_id, contents)
+                    != contents
+                ):
+                    raise ValueError("query batch bytes changed after publication")
                 return root / _ACQUISITION_BATCH_ROOT / name
-            _unlink_owned_temp(current, temp_name, descriptor)
-            temp_exists = False
-            os.fsync(current)
-            if _read_existing(current, name) != contents:
-                raise ValueError("query batch bytes changed after publication")
-            return root / _ACQUISITION_BATCH_ROOT / name
-        finally:
-            try:
-                if temp_exists:
-                    _unlink_owned_temp(current, temp_name, descriptor)
-                    os.fsync(current)
             finally:
-                os.close(descriptor)
+                try:
+                    if temp_exists:
+                        _unlink_owned_temp(current, temp_name, descriptor)
+                        os.fsync(current)
+                finally:
+                    os.close(descriptor)
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
