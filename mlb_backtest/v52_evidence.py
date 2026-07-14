@@ -13,12 +13,13 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import ContextManager, Literal
+from typing import Callable, ContextManager, Literal
 
 from .v52_protected_inventory import verify_protected_raw_inventory
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ASCII_DECIMAL = re.compile(r"^[0-9]+$")
 _TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"\.[0-9]{6}Z$"
@@ -290,6 +291,7 @@ def _open_root_path(path: Path, *, create: bool) -> int:
     try:
         for component in parts[1:]:
             _validate_segment(component, "evidence root component")
+            child = -1
             try:
                 child = os.open(component, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
@@ -307,15 +309,18 @@ def _open_root_path(path: Path, *, create: bool) -> int:
                         "evidence root ancestors must be no-follow directories"
                     ) from exc
                 raise
-            opened = os.fstat(child)
-            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(linked.st_mode)
-                or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-            ):
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("evidence root directory identity differs")
+            except BaseException:
                 os.close(child)
-                raise ValueError("evidence root directory identity differs")
+                raise
             os.close(current)
             current = child
         return current
@@ -326,33 +331,38 @@ def _open_root_path(path: Path, *, create: bool) -> int:
 
 def _open_directory_at(parent_fd: int, name: str, *, create: bool) -> int:
     _validate_segment(name, "directory name")
+    descriptor = -1
     try:
-        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
-    except FileNotFoundError:
-        if not create:
-            raise
         try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        except FileExistsError:
-            pass
-        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-            raise ValueError(
-                "evidence directory must be a no-follow directory"
-            ) from exc
+            descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                pass
+            descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError(
+                    "evidence directory must be a no-follow directory"
+                ) from exc
+            raise
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("evidence directory identity differs")
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise
-    opened = os.fstat(descriptor)
-    linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(opened.st_mode)
-        or not stat.S_ISDIR(linked.st_mode)
-        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-    ):
-        os.close(descriptor)
-        raise ValueError("evidence directory identity differs")
-    return descriptor
 
 
 def _read_regular_at(
@@ -415,7 +425,14 @@ def _cleanup_created_file(
     os.fsync(parent_fd)
 
 
-def _write_once_at(parent_fd: int, name: str, contents: bytes, label: str) -> None:
+def _write_once_at(
+    parent_fd: int,
+    name: str,
+    contents: bytes,
+    label: str,
+    *,
+    after_create: Callable[[], None] | None = None,
+) -> None:
     existing = _read_regular_at(parent_fd, name, label, missing_ok=True)
     if existing is not None:
         if existing != contents:
@@ -433,6 +450,8 @@ def _write_once_at(parent_fd: int, name: str, contents: bytes, label: str) -> No
     try:
         descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
         created = True
+        if after_create is not None:
+            after_create()
         view = memoryview(contents)
         while view:
             written = os.write(descriptor, view)
@@ -583,7 +602,7 @@ def _validate_attempt_record(
     ):
         raise ValueError("attempt receipt selected headers differ")
     content_length = headers.get("Content-Length")
-    if content_length is not None and not content_length.isdigit():
+    if content_length is not None and not _ASCII_DECIMAL.fullmatch(content_length):
         raise ValueError("attempt receipt Content-Length syntax differs")
     outcome = record["outcome"]
     if outcome not in _ATTEMPT_OUTCOMES:
@@ -652,6 +671,10 @@ def _attempt_record(
 
 def _before_success_publish() -> None:
     """Deterministic interruption-test hook; production intentionally does nothing."""
+
+
+def _during_query_registration_publish() -> None:
+    """Deterministic partial-registration test hook; production does nothing."""
 
 
 class V52EvidenceStore:
@@ -841,15 +864,31 @@ class V52EvidenceStore:
                 os.close(descriptor)
             lock_descriptor = self._open_query_lock(query_fd, create=True)
             try:
-                _write_once_at(
-                    query_fd,
-                    "query.json",
-                    _registration_contents(query, os.fstat(lock_descriptor)),
-                    "logical query registration",
-                )
-                self._validate_registered(
-                    query, query_fd, lock_descriptor=lock_descriptor
-                )
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                try:
+                    lock_metadata = os.fstat(lock_descriptor)
+                    lock_identity = {
+                        "device": lock_metadata.st_dev,
+                        "inode": lock_metadata.st_ino,
+                    }
+                    self._verify_registered_lock(
+                        query_fd, lock_descriptor, lock_identity
+                    )
+                    _write_once_at(
+                        query_fd,
+                        "query.json",
+                        _registration_contents(query, lock_metadata),
+                        "logical query registration",
+                        after_create=_during_query_registration_publish,
+                    )
+                    self._validate_registered(
+                        query, query_fd, lock_descriptor=lock_descriptor
+                    )
+                    self._verify_registered_lock(
+                        query_fd, lock_descriptor, lock_identity
+                    )
+                finally:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(lock_descriptor)
             return query_id
@@ -1211,6 +1250,41 @@ class V52EvidenceStore:
             os.close(attempts_fd)
             self._close_fds(descriptors)
 
+    def _validated_fetched_success_attempt(
+        self,
+        query: LogicalQuery,
+        attempt_number: int,
+        raw_sha256: str,
+        raw_byte_count: int,
+    ) -> list[dict[str, object]]:
+        attempts_fd, descriptors = self._attempts_fd(query)
+        try:
+            query_id = logical_query_id(query)
+            reservations, receipts = self._attempt_numbers(attempts_fd, query_id)
+            if (
+                not reservations
+                or not receipts
+                or attempt_number != max(reservations)
+                or attempt_number != max(receipts)
+            ):
+                raise ValueError("successful attempt is not the current finalized tail")
+            name = f"{attempt_number:06d}.json"
+            record = _json_object(
+                _read_regular_at(attempts_fd, name, "successful attempt receipt"),
+                "successful attempt receipt",
+            )
+            _validate_attempt_record(record, query_id, attempt_number)
+            if (
+                record["outcome"] != "SUCCESS"
+                or record["body_sha256"] != raw_sha256
+                or record["byte_count"] != raw_byte_count
+            ):
+                raise ValueError("successful attempt raw binding differs")
+        finally:
+            os.close(attempts_fd)
+            self._close_fds(descriptors)
+        return self._attempt_history(query)
+
     def _sidecar_artifact(
         self,
         query: LogicalQuery,
@@ -1335,6 +1409,9 @@ class V52EvidenceStore:
                     _canonical_file_bytes(attempt),
                     "attempt receipt",
                 )
+                self._validated_fetched_success_attempt(
+                    query, attempt_number, raw_sha256, len(body)
+                )
                 _write_once_at(objects_fd, raw_name, body, "fetched raw object")
                 _write_once_at(
                     sidecars_fd,
@@ -1366,6 +1443,13 @@ class V52EvidenceStore:
                 _before_success_publish()
                 self._verify_query_chain(query, descriptors)
                 self._require_lease(query)
+                current_history = self._validated_fetched_success_attempt(
+                    query, attempt_number, raw_sha256, len(body)
+                )
+                if manifest["attempt_history"] != current_history:
+                    raise ValueError(
+                        "successful attempt history changed before publish"
+                    )
                 _write_once_at(
                     query_fd,
                     "success.json",
@@ -1786,6 +1870,10 @@ class V52EvidenceStore:
         legacy_reference_record: dict[str, object] | None = None
         if mode == "FETCHED_RAW":
             object_path = manifest["fetched_raw_path"]
+            if object_path != _relative_path(
+                query.source, query_id, "objects", f"{raw_sha256}.raw"
+            ):
+                raise ValueError("fetched raw content-addressed path binding differs")
             raw = self._read_bound_relative(
                 object_path,  # type: ignore[arg-type]
                 (*expected_query_prefix, "objects"),
@@ -1794,16 +1882,25 @@ class V52EvidenceStore:
             object_contents = raw
         else:
             object_path = manifest["protected_legacy_reference_path"]
+            reference_sha256 = _validate_sha256(
+                manifest.get("protected_legacy_reference_sha256"),
+                "protected reference SHA-256",
+            )
+            if object_path != _relative_path(
+                query.source,
+                query_id,
+                "objects",
+                f"{reference_sha256}.legacy-reference.json",
+            ):
+                raise ValueError(
+                    "protected reference content-addressed path binding differs"
+                )
             reference_contents = self._read_bound_relative(
                 object_path,  # type: ignore[arg-type]
                 (*expected_query_prefix, "objects"),
                 "protected legacy reference",
             )
             object_contents = reference_contents
-            reference_sha256 = _validate_sha256(
-                manifest.get("protected_legacy_reference_sha256"),
-                "protected reference SHA-256",
-            )
             if _sha256_bytes(reference_contents) != reference_sha256:
                 raise ValueError("protected legacy reference hash differs")
             reference = _json_object(reference_contents, "protected legacy reference")
@@ -1814,13 +1911,17 @@ class V52EvidenceStore:
             raise ValueError("success raw binding differs")
 
         sidecar_path = manifest.get("query_sidecar_path")
+        sidecar_sha256 = _validate_sha256(
+            manifest.get("query_sidecar_sha256"), "query sidecar SHA-256"
+        )
+        if sidecar_path != _relative_path(
+            query.source, query_id, "sidecars", f"{sidecar_sha256}.json"
+        ):
+            raise ValueError("query sidecar content-addressed path binding differs")
         sidecar_contents = self._read_bound_relative(
             sidecar_path,  # type: ignore[arg-type]
             (*expected_query_prefix, "sidecars"),
             "query semantic sidecar",
-        )
-        sidecar_sha256 = _validate_sha256(
-            manifest.get("query_sidecar_sha256"), "query sidecar SHA-256"
         )
         if _sha256_bytes(sidecar_contents) != sidecar_sha256:
             raise ValueError("query sidecar hash differs")
@@ -1864,7 +1965,15 @@ class V52EvidenceStore:
         history = manifest.get("attempt_history")
         if not isinstance(history, list):
             raise ValueError("attempt history must be an array")
-        current_history = self._attempt_history(query)
+        if mode == "FETCHED_RAW":
+            current_history = self._validated_fetched_success_attempt(
+                query,
+                manifest["attempt_number"],  # type: ignore[arg-type]
+                raw_sha256,
+                raw_byte_count,
+            )
+        else:
+            current_history = self._attempt_history(query)
         if history != current_history:
             raise ValueError("success attempt history binding differs")
         if mode == "FETCHED_RAW" and (

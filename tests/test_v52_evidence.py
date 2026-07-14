@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import jsonschema
 
+from mlb_backtest import v52_evidence
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.v52_evidence import (
     AttemptCapture,
@@ -292,6 +293,105 @@ class V52EvidenceTest(unittest.TestCase):
                 },
             )
 
+    def test_concurrent_first_registration_never_observes_partial_query_json(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            query = _query()
+            partial_created = threading.Event()
+            allow_completion = threading.Event()
+            results: list[str] = []
+            errors: list[BaseException] = []
+
+            def pause_first_registration() -> None:
+                partial_created.set()
+                self.assertTrue(allow_completion.wait(timeout=5))
+
+            def worker() -> None:
+                try:
+                    results.append(V52EvidenceStore(root).register_query(query))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch(
+                "mlb_backtest.v52_evidence._during_query_registration_publish",
+                side_effect=pause_first_registration,
+            ):
+                first = threading.Thread(target=worker)
+                second = threading.Thread(target=worker)
+                first.start()
+                self.assertTrue(partial_created.wait(timeout=5))
+                second.start()
+                time.sleep(0.1)
+                self.assertEqual(results, [])
+                self.assertEqual(errors, [])
+                self.assertTrue(second.is_alive())
+                allow_completion.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [logical_query_id(query)] * 2)
+            folder = root / "queries" / query.source / logical_query_id(query)
+            registration = (folder / "query.json").read_bytes()
+            self.assertEqual(registration, _canonical_file(json.loads(registration)))
+            self.assertEqual(len(list(folder.glob("query.json"))), 1)
+
+    def test_directory_open_helpers_close_child_fd_on_identity_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            directory = _tmp(td)
+            child = directory / "child"
+            child.mkdir()
+            real_open = os.open
+            for helper in ("root", "child"):
+                with self.subTest(helper=helper):
+                    opened: list[int] = []
+
+                    def track_open(*args: object, **kwargs: object) -> int:
+                        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+                        opened.append(descriptor)
+                        return descriptor
+
+                    if helper == "root":
+                        with (
+                            patch.object(
+                                v52_evidence.os, "open", side_effect=track_open
+                            ),
+                            patch.object(
+                                v52_evidence.os,
+                                "stat",
+                                side_effect=OSError("injected identity failure"),
+                            ),
+                        ):
+                            for _ in range(5):
+                                with self.assertRaisesRegex(OSError, "injected"):
+                                    v52_evidence._open_root_path(child, create=False)
+                    else:
+                        parent_fd = real_open(directory, os.O_RDONLY)
+                        try:
+                            with (
+                                patch.object(
+                                    v52_evidence.os, "open", side_effect=track_open
+                                ),
+                                patch.object(
+                                    v52_evidence.os,
+                                    "stat",
+                                    side_effect=OSError("injected identity failure"),
+                                ),
+                            ):
+                                for _ in range(5):
+                                    with self.assertRaisesRegex(OSError, "injected"):
+                                        v52_evidence._open_directory_at(
+                                            parent_fd, "child", create=False
+                                        )
+                        finally:
+                            os.close(parent_fd)
+                    self.assertTrue(opened)
+                    for descriptor in set(opened):
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+
     def test_lock_bound_query_registration_rejects_tamper_and_aliases(self) -> None:
         for attack in ("tamper", "symlink", "hardlink"):
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
@@ -449,6 +549,21 @@ class V52EvidenceTest(unittest.TestCase):
             with store.acquire_query(query) as lease:
                 self.assertEqual(store.next_attempt_number(lease), 2)
 
+    def test_content_length_rejects_unicode_decimal_digits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            capture = dataclasses.replace(
+                _capture(b"short", status=503, error="TRANSIENT_HTTP"),
+                response_headers=(("Content-Length", "١٠٠"),),
+            )
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                with self.assertRaisesRegex(ValueError, "Content-Length|syntax"):
+                    store.record_attempt(
+                        query, number, capture, outcome="TRANSIENT_HTTP"
+                    )
+
     def test_attempt_schema_is_closed_and_enforces_branch_semantics(self) -> None:
         schema = json.loads(MANIFEST_SCHEMA.read_bytes())
         receipt = {
@@ -605,6 +720,78 @@ class V52EvidenceTest(unittest.TestCase):
             self.assertEqual(sidecar["semantics"], _sidecar())
             self.assertEqual(sidecar["byte_count"], len(capture.body or b""))
             self.assertEqual(sidecar["raw_sha256"], published.raw_sha256)
+
+    def test_fetched_success_rejects_failure_or_raw_mismatched_tail_receipt(
+        self,
+    ) -> None:
+        for attack in ("failure", "raw_mismatch"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    published = store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(),
+                        _sidecar(),
+                    )
+                manifest = json.loads(published.success_receipt_path.read_bytes())
+                attempt_path = root / manifest["attempt_history"][-1]["path"]
+                attempt = json.loads(attempt_path.read_bytes())
+                if attack == "failure":
+                    attempt.update(
+                        {
+                            "error_classification": "TRANSIENT_HTTP",
+                            "http_status": 503,
+                            "outcome": "TRANSIENT_HTTP",
+                        }
+                    )
+                else:
+                    attempt["body_sha256"] = hashlib.sha256(b"other").hexdigest()
+                attempt_contents = _canonical_file(attempt)
+                attempt_path.write_bytes(attempt_contents)
+                manifest["attempt_history"][-1]["sha256"] = hashlib.sha256(
+                    attempt_contents
+                ).hexdigest()
+                published.success_receipt_path.write_bytes(_canonical_file(manifest))
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "attempt|success|raw|body|tail"
+                ):
+                    store.verify_success(query)
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "attempt|success|raw|body|tail"
+                ):
+                    store.load_success(query)
+
+    def test_publish_rejects_old_finalized_attempt_before_success_and_recovers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            folder = root / "queries" / query.source / logical_query_id(query)
+            with store.acquire_query(query) as lease:
+                old_number = store.next_attempt_number(lease)
+                store.record_attempt(query, old_number, _capture(), outcome="SUCCESS")
+                newer_number = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    newer_number,
+                    _capture(None, status=None, error="TIMEOUT"),
+                    outcome="TRANSIENT_NETWORK",
+                )
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "attempt|tail|current|success"
+                ):
+                    store.publish_fetched(query, old_number, _capture(), _sidecar())
+                self.assertFalse((folder / "success.json").exists())
+                recovery_number = store.next_attempt_number(lease)
+                published = store.publish_fetched(
+                    query, recovery_number, _capture(), _sidecar()
+                )
+            self.assertEqual(store.verify_success(query), published)
 
     def test_legacy_success_uses_exactly_one_protected_reference(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -869,6 +1056,51 @@ class V52EvidenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "duplicate|ambiguous"):
                     store.load_success(query)
 
+    def test_fetched_success_rejects_non_content_addressed_object_names(self) -> None:
+        for member, path_key, suffix in (
+            ("objects", "fetched_raw_path", ".raw"),
+            ("sidecars", "query_sidecar_path", ".json"),
+        ):
+            with self.subTest(member=member), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    published = store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(),
+                        _sidecar(),
+                    )
+                manifest = json.loads(published.success_receipt_path.read_bytes())
+                original = root / manifest[path_key]
+                renamed = original.with_name(f"{'0' * 64}{suffix}")
+                original.rename(renamed)
+                manifest[path_key] = renamed.relative_to(root).as_posix()
+                published.success_receipt_path.write_bytes(_canonical_file(manifest))
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "content|address|path|name|binding"
+                ):
+                    store.verify_success(query)
+
+    def test_legacy_success_rejects_non_content_addressed_reference_name(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            with store.acquire_query(query):
+                published = store.publish_legacy_reference(query, reference, _sidecar())
+            manifest = json.loads(published.success_receipt_path.read_bytes())
+            original = store.root / manifest["protected_legacy_reference_path"]
+            renamed = original.with_name(f"{'0' * 64}.legacy-reference.json")
+            original.rename(renamed)
+            manifest["protected_legacy_reference_path"] = renamed.relative_to(
+                store.root
+            ).as_posix()
+            published.success_receipt_path.write_bytes(_canonical_file(manifest))
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "content|address|path|name|binding"
+            ):
+                store.verify_success(query)
+
     def test_content_slot_open_failure_closes_already_opened_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = _tmp(td) / "raw"
@@ -886,8 +1118,6 @@ class V52EvidenceTest(unittest.TestCase):
             sidecar_path = root / manifest["query_sidecar_path"]
             opened: list[int] = []
             object_open_count = 0
-            from mlb_backtest import v52_evidence
-
             real_open = v52_evidence._open_directory_at
 
             def fail_sidecar(parent_fd: int, name: str, *, create: bool) -> int:
