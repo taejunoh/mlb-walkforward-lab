@@ -74,6 +74,11 @@ _GIT_HEAD = re.compile(r"^[0-9a-f]{40}$")
 _TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$"
 )
+_BOUND_EXECUTION_CODE = (
+    "mlb_backtest/execution_registry.py",
+    "mlb_backtest/verify_v52_design.py",
+    "schemas/v5_2_execution_receipt.schema.json",
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,35 @@ def _exact_object(value: object, keys: frozenset[str], label: str) -> Mapping[st
 
 def _sha256_bytes(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
+
+
+def _validate_artifact_path(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("/")
+        or "\\" in value
+        or ".." in Path(value).parts
+    ):
+        raise ValueError(f"{label} path violates the receipt schema")
+    return value
+
+
+def _validate_binding_value(
+    value: object, label: str, *, plan: bool = False
+) -> Mapping[str, object]:
+    binding = _exact_object(
+        value, _PLAN_BINDING_KEYS if plan else _BINDING_KEYS, label
+    )
+    _validate_artifact_path(binding.get("path"), label)
+    digest = binding.get("sha256")
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise ValueError(f"{label} SHA-256 violates the receipt schema")
+    if plan:
+        blob = binding.get("git_blob_id")
+        if not isinstance(blob, str) or not _GIT_HEAD.fullmatch(blob):
+            raise ValueError(f"{label} Git blob violates the receipt schema")
+    return binding
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -278,6 +312,7 @@ def _canonical_object(contents: bytes, label: str) -> Mapping[str, object]:
 
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:
     relative, contents = _read_path(root, path, label)
+    _validate_artifact_path(relative, label)
     return {"path": relative, "sha256": _sha256_bytes(contents)}
 
 
@@ -298,6 +333,12 @@ def _require_tracked_clean(root: Path, relative: str, label: str) -> None:
     if status_output:
         raise ValueError(f"{label} is dirty")
     _git(root, "rev-parse", f"HEAD:{relative}")
+
+
+def _require_bound_execution_code_clean(root: Path) -> None:
+    for relative in _BOUND_EXECUTION_CODE:
+        _read_relative(root, Path(relative), "bound execution code")
+        _require_tracked_clean(root, relative, "bound execution code")
 
 
 def _utc_now() -> str:
@@ -397,12 +438,9 @@ def _registry_lock(paths: _RegistryPaths, *, create: bool, exclusive: bool) -> I
 
 
 def _artifact_binding(root: Path, raw: object, label: str, *, plan: bool = False) -> Mapping[str, object]:
-    keys = _PLAN_BINDING_KEYS if plan else _BINDING_KEYS
-    binding = _exact_object(raw, keys, label)
-    path = binding["path"]
-    digest = binding["sha256"]
-    if not isinstance(path, str) or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-        raise ValueError(f"{label} binding differs")
+    binding = _validate_binding_value(raw, label, plan=plan)
+    path = str(binding["path"])
+    digest = str(binding["sha256"])
     actual = _binding(root, root / path, label)
     if actual != {"path": path, "sha256": digest}:
         raise ValueError(f"{label} hash binding differs")
@@ -459,7 +497,7 @@ def _validate_stored_artifacts(root: Path, values: object, label: str) -> None:
         raise ValueError(f"{label} must be a list")
     seen: set[str] = set()
     for value in values:
-        binding = _exact_object(value, _BINDING_KEYS, label)
+        binding = _validate_binding_value(value, label)
         path = binding.get("path")
         digest = binding.get("sha256")
         if not isinstance(path, str) or path in seen or not isinstance(digest, str):
@@ -473,7 +511,7 @@ def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, fi
     if _sha256_bytes(contents) != expected_sha:
         raise ValueError("execution receipt filename hash differs")
     payload = _canonical_object(contents, "execution receipt")
-    _exact_object(payload, _SUCCESS_KEYS, "execution receipt")
+    _validate_success_receipt(payload)
     if (
         payload.get("schema_version") != 1
         or payload.get("receipt_kind") != "PHASE_TRANSITION"
@@ -484,6 +522,87 @@ def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, fi
         raise ValueError("execution receipt identity differs")
     _validate_timestamp(payload.get("recorded_at_utc"), "execution receipt")
     return payload
+
+
+def _validate_success_receipt(payload: object) -> Mapping[str, object]:
+    receipt = _exact_object(payload, _SUCCESS_KEYS, "execution receipt")
+    sequence = receipt.get("sequence")
+    phase = receipt.get("phase")
+    prior = receipt.get("prior_receipt_sha256")
+    git_head = receipt.get("git_head")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("receipt_kind") != "PHASE_TRANSITION"
+        or receipt.get("run_id") != "historical_walkforward_500"
+        or type(sequence) is not int
+        or not 0 <= sequence < len(PHASES)
+        or phase != PHASES[sequence]
+        or (sequence == 0 and prior is not None)
+        or (
+            sequence > 0
+            and (not isinstance(prior, str) or not _SHA256.fullmatch(prior))
+        )
+        or not isinstance(git_head, str)
+        or not _GIT_HEAD.fullmatch(git_head)
+    ):
+        raise ValueError("execution receipt violates the receipt schema")
+    _validate_timestamp(receipt.get("recorded_at_utc"), "execution receipt")
+    _validate_binding_value(receipt.get("run_spec"), "run spec")
+    _validate_binding_value(receipt.get("approved_design"), "approved design")
+    _validate_binding_value(
+        receipt.get("implementation_plan"), "implementation plan", plan=True
+    )
+    _validate_binding_value(
+        receipt.get("acquisition_contract"), "acquisition contract"
+    )
+    lineage = _exact_object(
+        receipt.get("task0_lineage"), _LINEAGE_KEYS, "Task0 lineage"
+    )
+    _validate_binding_value(lineage.get("baseline_inventory"), "baseline inventory")
+    _validate_binding_value(
+        lineage.get("protected_inventory"), "protected inventory"
+    )
+    _validate_binding_value(receipt.get("inventory"), "phase inventory")
+    validations = receipt.get("validation_receipts")
+    if not isinstance(validations, list):
+        raise ValueError("validation receipts violate the receipt schema")
+    paths = [
+        str(_validate_binding_value(value, "validation receipt")["path"])
+        for value in validations
+    ]
+    if len(paths) != len(set(paths)):
+        raise ValueError("validation receipts violate the receipt schema")
+    return receipt
+
+
+def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
+    receipt = _exact_object(payload, _QUARANTINE_KEYS, "quarantine receipt")
+    git_head = receipt.get("git_head")
+    current_hash = receipt.get("current_receipt_sha256")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("receipt_kind") != "QUARANTINED_TRANSITION"
+        or receipt.get("run_id") != "historical_walkforward_500"
+        or receipt.get("current_phase") not in PHASES
+        or receipt.get("attempted_phase") not in PHASES
+        or not isinstance(current_hash, str)
+        or not _SHA256.fullmatch(current_hash)
+        or not isinstance(git_head, str)
+        or not _GIT_HEAD.fullmatch(git_head)
+    ):
+        raise ValueError("quarantine receipt violates the receipt schema")
+    _validate_timestamp(receipt.get("recorded_at_utc"), "quarantine receipt")
+    _validate_binding_value(receipt.get("run_spec"), "run spec")
+    validations = receipt.get("validation_receipts")
+    if not isinstance(validations, list) or not validations:
+        raise ValueError("quarantine receipt requires validation evidence")
+    paths = [
+        str(_validate_binding_value(value, "validation receipt")["path"])
+        for value in validations
+    ]
+    if len(paths) != len(set(paths)):
+        raise ValueError("validation receipts violate the receipt schema")
+    return receipt
 
 
 def _validate_quarantine_locked(
@@ -509,7 +628,7 @@ def _validate_quarantine_locked(
         if _sha256_bytes(contents) != match.group("sha"):
             raise ValueError("quarantine receipt filename hash differs")
         payload = _canonical_object(contents, "quarantine receipt")
-        _exact_object(payload, _QUARANTINE_KEYS, "quarantine receipt")
+        _validate_quarantine_receipt(payload)
         current_phase = payload.get("current_phase")
         attempted = payload.get("attempted_phase")
         if (
@@ -540,6 +659,7 @@ def _validate_quarantine_locked(
 
 
 def _load_locked(paths: _RegistryPaths, run_spec: RunSpec) -> tuple[ExecutionRegistryState, list[Mapping[str, object]]]:
+    _require_bound_execution_code_clean(paths.root)
     receipt_fd, descriptors = _open_directory(paths.root, paths.receipts_relative, create=False)
     try:
         names = sorted(os.listdir(receipt_fd))
@@ -595,6 +715,7 @@ def _load_locked(paths: _RegistryPaths, run_spec: RunSpec) -> tuple[ExecutionReg
 
 
 def _initial_evidence(root: Path, run_spec: RunSpec, design_path: Path, plan_path: Path, acquisition_contract_path: Path) -> dict[str, object]:
+    _require_bound_execution_code_clean(root)
     contract_binding = _binding(root, acquisition_contract_path, "acquisition contract")
     _require_tracked_clean(root, contract_binding["path"], "acquisition contract")
     contract = _canonical_object(_read_path(root, acquisition_contract_path, "acquisition contract")[1], "acquisition contract")
@@ -631,6 +752,7 @@ def _initial_evidence(root: Path, run_spec: RunSpec, design_path: Path, plan_pat
 
 
 def _success_contents(payload: Mapping[str, object]) -> tuple[bytes, str]:
+    _validate_success_receipt(payload)
     contents = canonical_json_bytes(payload) + b"\n"
     return contents, _sha256_bytes(contents)
 
@@ -702,17 +824,11 @@ def advance_execution_phase(
         inventory = _binding(paths.root, inventory_path, "phase inventory")
         validations = _validation_bindings(paths.root, validation_receipts)
         state, payloads = _load_locked(paths, run_spec)
-        if state.phase == next_phase and state.sequence > 0:
-            last = payloads[-1]
-            if (
-                payloads[-2]["phase"] == expected_phase
-                and last["inventory"] == inventory
-                and last["validation_receipts"] == validations
-            ):
-                return state
-            raise ValueError("execution transition was already attested differently")
         if state.phase != expected_phase:
-            raise ValueError("execution transition expected phase differs from authenticated head")
+            raise ValueError(
+                "execution transition replay or expected phase differs from "
+                "authenticated head"
+            )
         base = payloads[0]
         payload = {
             "schema_version": 1,
@@ -760,6 +876,7 @@ def quarantine_execution_transition(
             "run_spec": payloads[0]["run_spec"],
             "validation_receipts": validations,
         }
+        _validate_quarantine_receipt(payload)
         contents = canonical_json_bytes(payload) + b"\n"
         digest = _sha256_bytes(contents)
         relative = paths.quarantine_relative / f"{state.sequence + 1:06d}-{attempted_phase}-{digest}.json"
