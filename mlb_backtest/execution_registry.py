@@ -79,6 +79,27 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/verify_v52_design.py",
     "schemas/v5_2_execution_receipt.schema.json",
 )
+_PHASE_INVENTORY_KEYS = frozenset(
+    {
+        "critical_errors",
+        "inventory_kind",
+        "run_id",
+        "schema_version",
+        "source_gate_ready",
+        "status",
+        "target_phase",
+    }
+)
+_VALIDATION_EVIDENCE_KEYS = frozenset(
+    {
+        "critical_errors",
+        "inventory_sha256",
+        "run_id",
+        "schema_version",
+        "status",
+        "validated_phase",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -96,6 +117,12 @@ class _RegistryPaths:
     receipts_relative: Path
     quarantine_relative: Path
     lock_relative: Path
+
+
+@dataclass(frozen=True)
+class _GitSnapshot:
+    head: str
+    file_sha256: tuple[tuple[str, str], ...]
 
 
 def _exact_object(value: object, keys: frozenset[str], label: str) -> Mapping[str, object]:
@@ -150,17 +177,17 @@ def _identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 
 def _root_path(root: Path) -> Path:
-    supplied = Path(root)
-    if supplied.is_symlink():
-        raise ValueError("execution registry root symlink is forbidden")
+    supplied = Path(os.path.abspath(os.fspath(root)))
     try:
-        resolved = supplied.resolve(strict=True)
-        metadata = resolved.stat(follow_symlinks=False)
+        for node in (*reversed(supplied.parents), supplied):
+            metadata = node.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(
+                    "execution registry root ancestor must be a no-follow directory"
+                )
     except OSError as exc:
         raise ValueError("execution registry root is unavailable") from exc
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("execution registry root must be a directory")
-    return resolved
+    return supplied
 
 
 def _paths(root: Path, run_spec: RunSpec) -> _RegistryPaths:
@@ -310,6 +337,37 @@ def _canonical_object(contents: bytes, label: str) -> Mapping[str, object]:
     return payload
 
 
+def _phase_evidence_payload(
+    contents: bytes, *, phase: str, run_id: str, inventory_sha256: str | None
+) -> Mapping[str, object]:
+    label = "phase inventory" if inventory_sha256 is None else "validation receipt"
+    payload = _canonical_object(contents, label)
+    if inventory_sha256 is None:
+        _exact_object(payload, _PHASE_INVENTORY_KEYS, label)
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("inventory_kind") != "EXECUTION_PHASE_INVENTORY"
+            or payload.get("run_id") != run_id
+            or payload.get("target_phase") != phase
+            or payload.get("status") != "PASS"
+            or payload.get("critical_errors") != []
+            or payload.get("source_gate_ready") is not (phase == "SOURCES_READY")
+        ):
+            raise ValueError("phase inventory validation failed")
+    else:
+        _exact_object(payload, _VALIDATION_EVIDENCE_KEYS, label)
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("run_id") != run_id
+            or payload.get("validated_phase") != phase
+            or payload.get("inventory_sha256") != inventory_sha256
+            or payload.get("status") != "PASS"
+            or payload.get("critical_errors") != []
+        ):
+            raise ValueError("validation receipt failed")
+    return payload
+
+
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:
     relative, contents = _read_path(root, path, label)
     _validate_artifact_path(relative, label)
@@ -339,6 +397,57 @@ def _require_bound_execution_code_clean(root: Path) -> None:
     for relative in _BOUND_EXECUTION_CODE:
         _read_relative(root, Path(relative), "bound execution code")
         _require_tracked_clean(root, relative, "bound execution code")
+
+
+def _git_bound_paths(evidence: Mapping[str, object]) -> tuple[str, ...]:
+    paths = list(_BOUND_EXECUTION_CODE)
+    for key in (
+        "run_spec",
+        "approved_design",
+        "implementation_plan",
+        "acquisition_contract",
+    ):
+        binding = _validate_binding_value(
+            evidence[key], key, plan=key == "implementation_plan"
+        )
+        paths.append(str(binding["path"]))
+    lineage = _exact_object(
+        evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
+    )
+    for key in ("baseline_inventory", "protected_inventory"):
+        paths.append(
+            str(_validate_binding_value(lineage[key], key)["path"])
+        )
+    return tuple(dict.fromkeys(paths))
+
+
+def _capture_git_snapshot(
+    root: Path, evidence: Mapping[str, object]
+) -> _GitSnapshot:
+    head = _git(root, "rev-parse", "HEAD")
+    bindings: list[tuple[str, str]] = []
+    for relative in _git_bound_paths(evidence):
+        _require_tracked_clean(root, relative, "bound Git evidence")
+        binding = _binding(root, root / relative, "bound Git evidence")
+        bindings.append((relative, binding["sha256"]))
+    if _git(root, "rev-parse", "HEAD") != head:
+        raise ValueError("Git HEAD changed during trusted snapshot")
+    return _GitSnapshot(head=head, file_sha256=tuple(bindings))
+
+
+def _verify_git_snapshot(root: Path, snapshot: _GitSnapshot) -> None:
+    if _git(root, "rev-parse", "HEAD") != snapshot.head:
+        raise ValueError("Git HEAD changed after trusted snapshot")
+    for relative, digest in snapshot.file_sha256:
+        _require_tracked_clean(root, relative, "bound Git evidence")
+        if _binding(root, root / relative, "bound Git evidence")["sha256"] != digest:
+            raise ValueError("bound Git file identity changed after trusted snapshot")
+    if _git(root, "rev-parse", "HEAD") != snapshot.head:
+        raise ValueError("Git HEAD changed after trusted snapshot")
+
+
+def _before_registry_publish() -> None:
+    """Deterministic race-test hook; production intentionally does nothing."""
 
 
 def _utc_now() -> str:
@@ -426,12 +535,37 @@ def _open_lock(paths: _RegistryPaths, *, create: bool) -> int:
         _close_directories(descriptors)
 
 
+def _verify_lock_binding(paths: _RegistryPaths, descriptor: int) -> None:
+    parent_fd, descriptors = _open_directory(
+        paths.root, paths.execution_relative, create=False
+    )
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(
+            paths.lock_relative.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+            or _identity(opened) != _identity(linked)
+        ):
+            raise ValueError("execution registry lock identity was replaced")
+    except OSError as exc:
+        raise ValueError("execution registry lock identity was replaced") from exc
+    finally:
+        _close_directories(descriptors)
+
+
 @contextmanager
-def _registry_lock(paths: _RegistryPaths, *, create: bool, exclusive: bool) -> Iterator[None]:
+def _registry_lock(paths: _RegistryPaths, *, create: bool, exclusive: bool) -> Iterator[int]:
     descriptor = _open_lock(paths, create=create)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        yield
+        _verify_lock_binding(paths, descriptor)
+        yield descriptor
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
@@ -490,6 +624,14 @@ def _validation_bindings(root: Path, paths: Sequence[Path]) -> list[dict[str, st
     if len({item["path"] for item in bindings}) != len(bindings):
         raise ValueError("validation receipt paths must be unique")
     return bindings
+
+
+def _binding_with_contents(
+    root: Path, path: Path, label: str
+) -> tuple[dict[str, str], bytes]:
+    relative, contents = _read_path(root, path, label)
+    _validate_artifact_path(relative, label)
+    return {"path": relative, "sha256": _sha256_bytes(contents)}, contents
 
 
 def _validate_stored_artifacts(root: Path, values: object, label: str) -> None:
@@ -757,6 +899,44 @@ def _success_contents(payload: Mapping[str, object]) -> tuple[bytes, str]:
     return contents, _sha256_bytes(contents)
 
 
+def _publish_quarantine_locked(
+    paths: _RegistryPaths,
+    run_spec: RunSpec,
+    state: ExecutionRegistryState,
+    base: Mapping[str, object],
+    attempted_phase: str,
+    validations: list[dict[str, str]],
+    snapshot: _GitSnapshot,
+    lock_descriptor: int,
+) -> Path:
+    if not validations:
+        raise ValueError("quarantine transition requires validation evidence")
+    payload = {
+        "schema_version": 1,
+        "receipt_kind": "QUARANTINED_TRANSITION",
+        "run_id": run_spec.run_id,
+        "attempted_phase": attempted_phase,
+        "current_phase": state.phase,
+        "current_receipt_sha256": state.receipt_sha256,
+        "recorded_at_utc": _utc_now(),
+        "git_head": snapshot.head,
+        "run_spec": base["run_spec"],
+        "validation_receipts": validations,
+    }
+    _validate_quarantine_receipt(payload)
+    contents = canonical_json_bytes(payload) + b"\n"
+    digest = _sha256_bytes(contents)
+    relative = (
+        paths.quarantine_relative
+        / f"{state.sequence + 1:06d}-{attempted_phase}-{digest}.json"
+    )
+    _before_registry_publish()
+    _verify_git_snapshot(paths.root, snapshot)
+    _verify_lock_binding(paths, lock_descriptor)
+    _write_exclusive(paths.root, relative, contents, "quarantine receipt")
+    return paths.root / relative
+
+
 def initialize_execution_registry(
     root: Path,
     run_spec: RunSpec,
@@ -768,7 +948,7 @@ def initialize_execution_registry(
     paths = _paths(root, run_spec)
     evidence = _initial_evidence(paths.root, run_spec, design_path, plan_path, acquisition_contract_path)
     _ensure_registry_directories(paths)
-    with _registry_lock(paths, create=True, exclusive=True):
+    with _registry_lock(paths, create=True, exclusive=True) as lock_descriptor:
         receipt_fd, descriptors = _open_directory(paths.root, paths.receipts_relative, create=False)
         try:
             existing = os.listdir(receipt_fd)
@@ -782,6 +962,7 @@ def initialize_execution_registry(
                 raise ValueError("execution registry is already initialized and differs")
             return state
         protected = _exact_object(evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage")["protected_inventory"]
+        snapshot = _capture_git_snapshot(paths.root, evidence)
         payload = {
             "schema_version": 1,
             "receipt_kind": "PHASE_TRANSITION",
@@ -790,13 +971,16 @@ def initialize_execution_registry(
             "phase": "DESIGN_ACCEPTED",
             "prior_receipt_sha256": None,
             "recorded_at_utc": _utc_now(),
-            "git_head": _git(paths.root, "rev-parse", "HEAD"),
+            "git_head": snapshot.head,
             **evidence,
             "inventory": protected,
             "validation_receipts": [],
         }
         contents, digest = _success_contents(payload)
         relative = paths.receipts_relative / f"000000-DESIGN_ACCEPTED-{digest}.json"
+        _before_registry_publish()
+        _verify_git_snapshot(paths.root, snapshot)
+        _verify_lock_binding(paths, lock_descriptor)
         _write_exclusive(paths.root, relative, contents, "execution receipt")
         return ExecutionRegistryState("DESIGN_ACCEPTED", 0, digest, str(protected["sha256"]))
 
@@ -820,9 +1004,9 @@ def advance_execution_phase(
     paths = _paths(root, run_spec)
     if expected_phase not in PHASES or next_phase not in PHASES or PHASES.index(next_phase) != PHASES.index(expected_phase) + 1:
         raise ValueError("execution transition must use the immediate next phase")
-    with _registry_lock(paths, create=False, exclusive=True):
-        inventory = _binding(paths.root, inventory_path, "phase inventory")
-        validations = _validation_bindings(paths.root, validation_receipts)
+    if next_phase not in {"ACQUIRING", "SOURCES_READY"}:
+        raise ValueError("execution transition fails closed until a phase validator exists")
+    with _registry_lock(paths, create=False, exclusive=True) as lock_descriptor:
         state, payloads = _load_locked(paths, run_spec)
         if state.phase != expected_phase:
             raise ValueError(
@@ -830,6 +1014,44 @@ def advance_execution_phase(
                 "authenticated head"
             )
         base = payloads[0]
+        snapshot = _capture_git_snapshot(paths.root, base)
+        inventory, inventory_contents = _binding_with_contents(
+            paths.root, inventory_path, "phase inventory"
+        )
+        validation_values = [
+            _binding_with_contents(paths.root, path, "validation receipt")
+            for path in validation_receipts
+        ]
+        validations = [binding for binding, _contents in validation_values]
+        try:
+            _phase_evidence_payload(
+                inventory_contents,
+                phase=next_phase,
+                run_id=run_spec.run_id,
+                inventory_sha256=None,
+            )
+            if not validation_values:
+                raise ValueError("validation receipt evidence is required")
+            for _binding_value, contents in validation_values:
+                _phase_evidence_payload(
+                    contents,
+                    phase=next_phase,
+                    run_id=run_spec.run_id,
+                    inventory_sha256=inventory["sha256"],
+                )
+        except ValueError as exc:
+            if validations:
+                _publish_quarantine_locked(
+                    paths,
+                    run_spec,
+                    state,
+                    base,
+                    next_phase,
+                    validations,
+                    snapshot,
+                    lock_descriptor,
+                )
+            raise ValueError("phase inventory or validation evidence failed") from exc
         payload = {
             "schema_version": 1,
             "receipt_kind": "PHASE_TRANSITION",
@@ -838,13 +1060,16 @@ def advance_execution_phase(
             "phase": next_phase,
             "prior_receipt_sha256": state.receipt_sha256,
             "recorded_at_utc": _utc_now(),
-            "git_head": _git(paths.root, "rev-parse", "HEAD"),
+            "git_head": snapshot.head,
             **{key: base[key] for key in ("run_spec", "approved_design", "implementation_plan", "acquisition_contract", "task0_lineage")},
             "inventory": inventory,
             "validation_receipts": validations,
         }
         contents, digest = _success_contents(payload)
         relative = paths.receipts_relative / f"{state.sequence + 1:06d}-{next_phase}-{digest}.json"
+        _before_registry_publish()
+        _verify_git_snapshot(paths.root, snapshot)
+        _verify_lock_binding(paths, lock_descriptor)
         _write_exclusive(paths.root, relative, contents, "execution receipt")
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 
@@ -857,31 +1082,24 @@ def quarantine_execution_transition(
     validation_receipts: Sequence[Path],
 ) -> Path:
     paths = _paths(root, run_spec)
-    with _registry_lock(paths, create=False, exclusive=True):
+    with _registry_lock(paths, create=False, exclusive=True) as lock_descriptor:
         validations = _validation_bindings(paths.root, validation_receipts)
         if not validations:
             raise ValueError("quarantine transition requires validation evidence")
         state, payloads = _load_locked(paths, run_spec)
         if state.sequence + 1 >= len(PHASES) or attempted_phase != PHASES[state.sequence + 1]:
             raise ValueError("quarantine attempted phase must be the immediate next phase")
-        payload = {
-            "schema_version": 1,
-            "receipt_kind": "QUARANTINED_TRANSITION",
-            "run_id": run_spec.run_id,
-            "attempted_phase": attempted_phase,
-            "current_phase": state.phase,
-            "current_receipt_sha256": state.receipt_sha256,
-            "recorded_at_utc": _utc_now(),
-            "git_head": _git(paths.root, "rev-parse", "HEAD"),
-            "run_spec": payloads[0]["run_spec"],
-            "validation_receipts": validations,
-        }
-        _validate_quarantine_receipt(payload)
-        contents = canonical_json_bytes(payload) + b"\n"
-        digest = _sha256_bytes(contents)
-        relative = paths.quarantine_relative / f"{state.sequence + 1:06d}-{attempted_phase}-{digest}.json"
-        _write_exclusive(paths.root, relative, contents, "quarantine receipt")
-        return paths.root / relative
+        snapshot = _capture_git_snapshot(paths.root, payloads[0])
+        return _publish_quarantine_locked(
+            paths,
+            run_spec,
+            state,
+            payloads[0],
+            attempted_phase,
+            validations,
+            snapshot,
+            lock_descriptor,
+        )
 
 
 # A local-only append log detects an interior deletion while a later receipt survives.

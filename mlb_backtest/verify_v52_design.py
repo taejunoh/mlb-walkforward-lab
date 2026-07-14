@@ -1065,25 +1065,106 @@ def authenticated_historical_phase(root: Path, run_spec: RunSpec) -> str | None:
     return load_execution_registry(root, run_spec).phase
 
 
+def _namespace_scan_hook(_root: Path, _relative: str) -> None:
+    """Deterministic race-test hook; production intentionally does nothing."""
+
+
+def _scan_namespace_tree_fd(parent_fd: int, name: str, label: str) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(linked.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ValueError(f"phase namespace identity changed: {label}")
+        names = sorted(os.listdir(descriptor))
+        count = 0
+        for child in names:
+            metadata = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"phase namespace contains symlink: {label}/{child}")
+            if stat.S_ISDIR(metadata.st_mode):
+                count += _scan_namespace_tree_fd(
+                    descriptor, child, f"{label}/{child}"
+                )
+            elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                count += 1
+            elif stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"phase namespace contains hardlink: {label}/{child}")
+            else:
+                raise ValueError(f"phase namespace contains special node: {label}/{child}")
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _stat_identity(after) != _stat_identity(opened)
+            or (rebound.st_dev, rebound.st_ino) != (opened.st_dev, opened.st_ino)
+            or sorted(os.listdir(descriptor)) != names
+        ):
+            raise ValueError(f"phase namespace identity or membership changed: {label}")
+        return count
+    finally:
+        os.close(descriptor)
+
+
 def _verify_namespace_children(
     root: Path, relative: str, allowed: frozenset[str]
 ) -> None:
-    namespace = root / relative
+    root = _lexical_root(root)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
     try:
-        metadata = namespace.lstat()
-    except FileNotFoundError:
-        return
+        current = os.open(root, flags)
+        descriptors.append(current)
+        parent = current
+        final_name = ""
+        for component in Path(relative).parts:
+            final_name = component
+            try:
+                child = os.open(component, flags, dir_fd=parent)
+            except FileNotFoundError:
+                return
+            linked = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(linked.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                os.close(child)
+                raise ValueError(f"phase namespace identity changed: {relative}")
+            descriptors.append(child)
+            parent = child
+        target = descriptors[-1]
+        target_before = os.fstat(target)
+        names = sorted(os.listdir(target))
+        _namespace_scan_hook(root, relative)
+        for name in names:
+            if name not in allowed:
+                raise ValueError(
+                    f"forbidden phase namespace child: {relative}/{name}"
+                )
+            _scan_namespace_tree_fd(target, name, f"{relative}/{name}")
+        target_after = os.fstat(target)
+        parent_fd = descriptors[-2]
+        rebound = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _stat_identity(target_before) != _stat_identity(target_after)
+            or (rebound.st_dev, rebound.st_ino)
+            != (target_before.st_dev, target_before.st_ino)
+            or sorted(os.listdir(target)) != names
+        ):
+            raise ValueError(f"phase namespace identity or membership changed: {relative}")
     except OSError as exc:
         raise ValueError(f"phase namespace is unavailable: {relative}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError(f"phase namespace is unsafe: {relative}")
-    with os.scandir(namespace) as entries:
-        for entry in entries:
-            if entry.name not in allowed:
-                raise ValueError(
-                    f"forbidden phase namespace child: {relative}/{entry.name}"
-                )
-            _namespace_regular_file_count(root, f"{relative}/{entry.name}")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def verify_historical_phase_namespaces(root: Path, run_spec: RunSpec) -> str | None:

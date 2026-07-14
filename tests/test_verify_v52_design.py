@@ -71,6 +71,33 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DesignVerificationTest(unittest.TestCase):
+    def test_phase_namespace_scan_rejects_directory_identity_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = ExecutionRegistryTest().make_repo(Path(directory))
+            initialize_execution_registry(
+                root,
+                run_spec,
+                design_path=root / REGISTRY_DESIGN_RELATIVE,
+                plan_path=root / REGISTRY_PLAN_RELATIVE,
+                acquisition_contract_path=root / REGISTRY_CONTRACT_RELATIVE,
+            )
+            namespace = root / "data/v5_2_qd/historical"
+            namespace.mkdir(parents=True)
+            hook = getattr(verifier_module, "_namespace_scan_hook", None)
+            self.assertIsNotNone(hook, "descriptor namespace scan hook is missing")
+            raced = False
+
+            def replace(_root: Path, relative: str) -> None:
+                nonlocal raced
+                if raced or relative != "data/v5_2_qd/historical":
+                    return
+                raced = True
+                namespace.rename(namespace.with_name("historical-old"))
+                namespace.mkdir()
+
+            with patch.object(verifier_module, "_namespace_scan_hook", side_effect=replace), self.assertRaisesRegex(ValueError, "identity|changed"):
+                verify_historical_phase_namespaces(root, run_spec)
+
     def test_design_verifier_reads_phase_from_registry_not_file_presence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = ExecutionRegistryTest().make_repo(Path(directory))
@@ -90,15 +117,16 @@ class DesignVerificationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "DESIGN_ACCEPTED|namespace"):
                 verify_historical_phase_namespaces(root, run_spec)
             source.unlink()
-            inventory = root / "acquiring_inventory.json"
-            inventory.write_text("{}\n", encoding="utf-8")
+            inventory, validation = ExecutionRegistryTest().write_phase_evidence(
+                root, "ACQUIRING", stem="acquiring"
+            )
             advance_execution_phase(
                 root,
                 run_spec,
                 expected_phase="DESIGN_ACCEPTED",
                 next_phase="ACQUIRING",
                 inventory_path=inventory,
-                validation_receipts=(),
+                validation_receipts=(validation,),
             )
             source.write_text("{}\n", encoding="utf-8")
             self.assertEqual(

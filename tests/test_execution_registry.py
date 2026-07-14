@@ -128,6 +128,131 @@ class ExecutionRegistryTest(unittest.TestCase):
         path.write_bytes(canonical_json_bytes(value) + b"\n")
         return path
 
+    def write_phase_evidence(
+        self, root: Path, phase: str, *, stem: str = "phase"
+    ) -> tuple[Path, Path]:
+        inventory = self.write_artifact(
+            root,
+            f"{stem}_inventory.json",
+            {
+                "critical_errors": [],
+                "inventory_kind": "EXECUTION_PHASE_INVENTORY",
+                "run_id": "historical_walkforward_500",
+                "schema_version": 1,
+                "source_gate_ready": phase == "SOURCES_READY",
+                "status": "PASS",
+                "target_phase": phase,
+            },
+        )
+        validation = self.write_artifact(
+            root,
+            f"{stem}_validation.json",
+            {
+                "critical_errors": [],
+                "inventory_sha256": _sha256(inventory),
+                "run_id": "historical_walkforward_500",
+                "schema_version": 1,
+                "status": "PASS",
+                "validated_phase": phase,
+            },
+        )
+        return inventory, validation
+
+    def advance(self, root: Path, run_spec: object, expected: str, phase: str, *, stem: str = "phase"):
+        inventory, validation = self.write_phase_evidence(root, phase, stem=stem)
+        return self.registry.advance_execution_phase(
+            root,
+            run_spec,
+            expected_phase=expected,
+            next_phase=phase,
+            inventory_path=inventory,
+            validation_receipts=(validation,),
+        )
+
+    def test_failed_or_invalid_validation_evidence_quarantines_and_cannot_advance(self) -> None:
+        cases = ("status", "critical_errors", "non_inventory")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                initial = self.initialize(root, run_spec)
+                inventory, validation = self.write_phase_evidence(
+                    root, "ACQUIRING"
+                )
+                if case == "status":
+                    payload = json.loads(validation.read_bytes())
+                    payload["status"] = "FAIL"
+                    validation.write_bytes(canonical_json_bytes(payload) + b"\n")
+                elif case == "critical_errors":
+                    payload = json.loads(validation.read_bytes())
+                    payload["critical_errors"] = [{"code": "FAILED"}]
+                    validation.write_bytes(canonical_json_bytes(payload) + b"\n")
+                else:
+                    inventory.write_bytes(canonical_json_bytes({"rows": 1}) + b"\n")
+                    payload = json.loads(validation.read_bytes())
+                    payload["inventory_sha256"] = _sha256(inventory)
+                    validation.write_bytes(canonical_json_bytes(payload) + b"\n")
+                with self.assertRaisesRegex(ValueError, "validation|inventory"):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="DESIGN_ACCEPTED",
+                        next_phase="ACQUIRING",
+                        inventory_path=inventory,
+                        validation_receipts=(validation,),
+                    )
+                self.assertEqual(
+                    self.registry.load_execution_registry(root, run_spec), initial
+                )
+                quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+                self.assertEqual(len(list(quarantine.iterdir())), 1)
+
+    def test_rejects_git_head_identity_race_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            initial = self.initialize(root, run_spec)
+            inventory, validation = self.write_phase_evidence(root, "ACQUIRING")
+            hook = getattr(self.registry, "_before_registry_publish", None)
+            self.assertIsNotNone(hook, "registry publish race hook is missing")
+
+            def race():
+                _git(root, "commit", "--allow-empty", "-qm", "racing head")
+
+            with patch.object(self.registry, "_before_registry_publish", side_effect=race), self.assertRaisesRegex(ValueError, "HEAD|identity|snapshot"):
+                self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inventory, validation_receipts=(validation,))
+            self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 1)
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+
+    def test_rejects_lock_inode_replacement_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            inventory, validation = self.write_phase_evidence(root, "ACQUIRING")
+            original = self.registry._success_contents
+            lock = root / "audit/v5_2_qd/historical/execution/.registry.lock"
+
+            def replace_lock(payload):
+                contents = original(payload)
+                lock.unlink()
+                lock.write_bytes(b"")
+                return contents
+
+            with patch.object(self.registry, "_success_contents", side_effect=replace_lock), self.assertRaisesRegex(ValueError, "lock.*identity|lock.*replaced"):
+                self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inventory, validation_receipts=(validation,))
+            self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 1)
+
+    def test_rejects_root_with_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            real_parent = base / "real"
+            real_parent.mkdir()
+            root, run_spec = self.make_repo(real_parent)
+            self.initialize(root, run_spec)
+            alias = base / "alias"
+            alias.symlink_to(real_parent, target_is_directory=True)
+            aliased_root = alias / root.name
+            with self.assertRaisesRegex(ValueError, "ancestor|symlink"):
+                self.registry.load_execution_registry(aliased_root, run_spec)
+
     def test_initializes_design_accepted_receipt_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
@@ -186,8 +311,9 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             initial = self.initialize(root, run_spec)
-            inventory = self.write_artifact(root, "inventory.json", {"rows": 1})
-            validation = self.write_artifact(root, "validation.json", {"status": "PASS"})
+            inventory, validation = self.write_phase_evidence(
+                root, "ACQUIRING", stem="transition"
+            )
             state = self.registry.advance_execution_phase(
                 root,
                 run_spec,
@@ -203,8 +329,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(payload["prior_receipt_sha256"], initial.receipt_sha256)
             self.assertEqual(payload["git_head"], _git(root, "rev-parse", "HEAD"))
             self.assertEqual(payload["run_spec"], {"path": RUN_SPEC_RELATIVE.as_posix(), "sha256": _sha256(root / RUN_SPEC_RELATIVE)})
-            self.assertEqual(payload["inventory"], {"path": "inventory.json", "sha256": _sha256(inventory)})
-            self.assertEqual(payload["validation_receipts"], [{"path": "validation.json", "sha256": _sha256(validation)}])
+            self.assertEqual(payload["inventory"], {"path": "transition_inventory.json", "sha256": _sha256(inventory)})
+            self.assertEqual(payload["validation_receipts"], [{"path": "transition_validation.json", "sha256": _sha256(validation)}])
             self.assertEqual(payload["implementation_plan"]["git_blob_id"], _git(root, "rev-parse", f"HEAD:{PLAN_RELATIVE}"))
             self.assertEqual(state.inventory_sha256, _sha256(inventory))
 
@@ -237,10 +363,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                 receipts = root / RECEIPTS_RELATIVE
                 first = next(receipts.iterdir())
                 if attack == "rollback":
-                    inv1 = self.write_artifact(root, "inv1.json", {"n": 1})
-                    self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inv1, validation_receipts=())
-                    inv2 = self.write_artifact(root, "inv2.json", {"n": 2})
-                    self.registry.advance_execution_phase(root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY", inventory_path=inv2, validation_receipts=())
+                    self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING", stem="one")
+                    self.advance(root, run_spec, "ACQUIRING", "SOURCES_READY", stem="two")
                     next(path for path in receipts.iterdir() if path.name.startswith("000001-")).unlink()
                 elif attack == "gap":
                     first.rename(receipts / first.name.replace("000000", "000001", 1))
@@ -268,14 +392,14 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
-            inventory = self.write_artifact(root, "inventory.json", {"rows": 1})
+            inventory, validation = self.write_phase_evidence(root, "ACQUIRING")
 
             barrier = threading.Barrier(2)
 
             def transition():
                 barrier.wait()
                 try:
-                    state = self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inventory, validation_receipts=())
+                    state = self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inventory, validation_receipts=(validation,))
                 except ValueError as exc:
                     return "failure", str(exc)
                 return "success", state
@@ -289,12 +413,12 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
-            inventory = self.write_artifact(root, "inventory.json", {"rows": 1})
+            inventory, validation = self.write_phase_evidence(root, "ACQUIRING")
             arguments = {
                 "expected_phase": "DESIGN_ACCEPTED",
                 "next_phase": "ACQUIRING",
                 "inventory_path": inventory,
-                "validation_receipts": (),
+                "validation_receipts": (validation,),
             }
             self.registry.advance_execution_phase(root, run_spec, **arguments)
             with self.assertRaisesRegex(ValueError, "replay|expected phase"):
@@ -333,14 +457,14 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             jsonschema.validate(json.loads(quarantine.read_bytes()), schema)
 
-            inventory = self.write_artifact(root, "inventory.json", {"rows": 1})
+            inventory, validation = self.write_phase_evidence(root, "ACQUIRING")
             self.registry.advance_execution_phase(
                 root,
                 run_spec,
                 expected_phase="DESIGN_ACCEPTED",
                 next_phase="ACQUIRING",
                 inventory_path=inventory,
-                validation_receipts=(),
+                validation_receipts=(validation,),
             )
             transition = next(
                 path
@@ -348,6 +472,31 @@ class ExecutionRegistryTest(unittest.TestCase):
                 if path.name.startswith("000001-")
             )
             jsonschema.validate(json.loads(transition.read_bytes()), schema)
+
+    def test_schema_rejects_impossible_phase_sequence_and_prior_combinations(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            receipt = next((root / RECEIPTS_RELATIVE).iterdir())
+            initial = json.loads(receipt.read_bytes())
+            impossible = (
+                {**initial, "phase": "ACQUIRING"},
+                {
+                    **initial,
+                    "sequence": 1,
+                    "prior_receipt_sha256": "0" * 64,
+                },
+            )
+            for payload in impossible:
+                with self.subTest(payload=payload), self.assertRaises(
+                    jsonschema.ValidationError
+                ):
+                    jsonschema.validate(payload, schema)
 
     def test_rejects_invalid_receipt_paths_on_emit_and_load(self) -> None:
         schema = json.loads(
