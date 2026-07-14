@@ -26,6 +26,16 @@ RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
 CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+
+
 def _parent(start: str, end: str) -> LogicalQuery:
     query = LogicalQuery(
         source="baseball_savant_statcast",
@@ -105,6 +115,63 @@ class V52QueryPlanTest(unittest.TestCase):
             self.assertEqual(first.month, last.month)
             self.assertIsNone(query.parent_query_id)
             self.assertEqual(query.parameters["hfGT"], "R|")
+
+    def test_static_batch_rehashes_the_bound_plan_a_amendment(self):
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        contract = json.loads(CONTRACT.read_bytes())
+        contract["bindings"]["plan_a_amendment"]["sha256"] = "0" * 64
+        contents = _canonical_json_bytes(contract)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            forged_contract = Path(directory) / "acquisition-contract.json"
+            forged_contract.write_bytes(contents)
+            with self.assertRaisesRegex(ValueError, "amendment.*hash|binding"):
+                build_static_batch(RUN_SPEC, forged_contract)
+
+    def test_static_batch_rehashes_the_bound_design_and_plan(self):
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        cases = (
+            ("approved_design", "sha256", "0" * 64, "approved design|binding"),
+            (
+                "implementation_plan",
+                "working_tree_sha256",
+                "0" * 64,
+                "implementation plan|binding",
+            ),
+            (
+                "implementation_plan",
+                "git_blob_id",
+                "0" * 40,
+                "implementation plan|Git|binding",
+            ),
+        )
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for index, (binding, key, forged, error) in enumerate(cases):
+                with self.subTest(binding=binding, key=key):
+                    contract = json.loads(CONTRACT.read_bytes())
+                    contract["bindings"][binding][key] = forged
+                    contents = _canonical_json_bytes(contract)
+                    forged_contract = Path(directory) / f"contract-{index}.json"
+                    forged_contract.write_bytes(contents)
+                    with self.assertRaisesRegex(ValueError, error):
+                        build_static_batch(RUN_SPEC, forged_contract)
+
+    def test_static_batch_rejects_noncanonical_acquisition_contract(self):
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        pretty = json.dumps(
+            json.loads(CONTRACT.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            noncanonical_contract = Path(directory) / "acquisition-contract.json"
+            noncanonical_contract.write_bytes(pretty)
+            with self.assertRaisesRegex(ValueError, "canonical JSON"):
+                build_static_batch(RUN_SPEC, noncanonical_contract)
 
     def test_bisect_children_bind_parent_and_cover_without_gap_or_overlap(self):
         from mlb_backtest.v52_query_plan import bisect_statcast_query

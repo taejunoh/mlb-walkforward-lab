@@ -90,6 +90,22 @@ class V52AcquisitionContractTest(unittest.TestCase):
         self.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 
+    def test_contract_and_schema_use_canonical_json_bytes(self) -> None:
+        for path in (CONTRACT_PATH, SCHEMA_PATH):
+            with self.subTest(path=path):
+                value = json.loads(path.read_bytes())
+                expected = (
+                    json.dumps(
+                        value,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                self.assertEqual(path.read_bytes(), expected)
+
     def test_acquisition_contract_binds_approved_design_plan_and_run_spec(self) -> None:
         bindings = self.contract["bindings"]
         self.assertEqual(

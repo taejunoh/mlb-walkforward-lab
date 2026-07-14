@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -19,11 +20,24 @@ from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_BLOB = re.compile(r"^[0-9a-f]{40}$")
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
 _TEAMS_ENDPOINT = "https://statsapi.mlb.com/api/v1/teams"
 _MLB_BASE = "https://statsapi.mlb.com/api/v1"
+_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500.json"
+)
+_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
+)
+_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
+)
+_PLAN_A_AMENDMENT_RELATIVE = Path(
+    "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+)
 _ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/query_batches"
 )
@@ -104,7 +118,9 @@ def _make_batch(
     )
 
 
-def _load_json_object(path: Path, label: str) -> tuple[dict[str, object], str]:
+def _load_json_object(
+    path: Path, label: str, *, canonical: bool = False
+) -> tuple[dict[str, object], str]:
     if not isinstance(path, Path):
         path = Path(path)
     contents = path.read_bytes()
@@ -114,7 +130,167 @@ def _load_json_object(path: Path, label: str) -> tuple[dict[str, object], str]:
         raise ValueError(f"{label} must be UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
+    if canonical and contents != _canonical_json_bytes(value) + b"\n":
+        raise ValueError(f"{label} must be canonical JSON with one newline")
     return value, _sha256_bytes(contents)
+
+
+def _repository_root(run_spec_path: Path) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(run_spec_path)))
+    if absolute.parts[-len(_RUN_SPEC_RELATIVE.parts) :] != _RUN_SPEC_RELATIVE.parts:
+        raise ValueError("RunSpec path differs from the repository contract")
+    root = absolute
+    for _ in _RUN_SPEC_RELATIVE.parts:
+        root = root.parent
+    return root
+
+
+def _read_repository_file(root: Path, relative: Path, label: str) -> bytes:
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(component in {"", ".", ".."} for component in relative.parts)
+    ):
+        raise ValueError(f"{label} path must stay under the repository root")
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in relative.parent.parts:
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except OSError as exc:
+                raise ValueError(
+                    f"{label} ancestors must be no-follow directories"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError(f"{label} ancestor identity differs")
+            except BaseException:
+                os.close(child)
+                raise
+            descriptors.append(child)
+            current = child
+        result = _read_linked_regular(current, relative.name, label)
+        if result is None:
+            raise ValueError(f"{label} is missing")
+        contents, metadata = result
+        if metadata.st_nlink != 1:
+            raise ValueError(f"{label} must be an unaliased regular file")
+        return contents
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _verify_repository_binding(
+    root: Path,
+    raw: object,
+    *,
+    expected_path: Path,
+    label: str,
+    digest_key: str = "sha256",
+    extra_keys: frozenset[str] = frozenset(),
+) -> bytes:
+    expected_keys = {"path", digest_key, *extra_keys}
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError(f"{label} binding differs")
+    if raw.get("path") != expected_path.as_posix():
+        raise ValueError(f"{label} path binding differs")
+    digest = raw.get(digest_key)
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise ValueError(f"{label} hash binding differs")
+    contents = _read_repository_file(root, expected_path, label)
+    if _sha256_bytes(contents) != digest:
+        raise ValueError(f"{label} hash binding differs")
+    return contents
+
+
+def _verify_implementation_plan_git_blob(
+    root: Path, raw: dict[str, object], contents: bytes
+) -> None:
+    expected = raw.get("git_blob_id")
+    if not isinstance(expected, str) or not _GIT_BLOB.fullmatch(expected):
+        raise ValueError("implementation plan Git blob binding differs")
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    resolved = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{_IMPLEMENTATION_PLAN_RELATIVE.as_posix()}"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    blob = subprocess.run(
+        ["git", "cat-file", "blob", expected],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    if (
+        resolved.returncode
+        or resolved.stdout.decode("ascii", errors="replace").strip() != expected
+        or blob.returncode
+        or blob.stdout != contents
+    ):
+        raise ValueError("implementation plan Git blob binding differs")
+
+
+def _load_static_contracts(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> tuple[dict[str, object], str, dict[str, object], str]:
+    run_spec, run_sha = _load_json_object(run_spec_path, "RunSpec")
+    contract, contract_sha = _load_json_object(
+        acquisition_contract_path,
+        "acquisition contract",
+        canonical=True,
+    )
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, dict):
+        raise ValueError("acquisition contract bindings must be an object")
+    root = _repository_root(run_spec_path)
+    _verify_repository_binding(
+        root,
+        bindings.get("run_spec"),
+        expected_path=_RUN_SPEC_RELATIVE,
+        label="RunSpec",
+    )
+    if bindings["run_spec"]["sha256"] != run_sha:
+        raise ValueError("acquisition contract RunSpec binding differs")
+    _verify_repository_binding(
+        root,
+        bindings.get("approved_design"),
+        expected_path=_APPROVED_DESIGN_RELATIVE,
+        label="approved design",
+    )
+    plan_binding = bindings.get("implementation_plan")
+    plan_contents = _verify_repository_binding(
+        root,
+        plan_binding,
+        expected_path=_IMPLEMENTATION_PLAN_RELATIVE,
+        label="implementation plan",
+        digest_key="working_tree_sha256",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    if not isinstance(plan_binding, dict):
+        raise AssertionError("validated implementation plan binding must be an object")
+    _verify_implementation_plan_git_blob(root, plan_binding, plan_contents)
+    _verify_repository_binding(
+        root,
+        bindings.get("plan_a_amendment"),
+        expected_path=_PLAN_A_AMENDMENT_RELATIVE,
+        label="Plan A amendment",
+    )
+    return run_spec, run_sha, contract, contract_sha
 
 
 def _iso_date(value: object, label: str) -> date:
@@ -186,24 +362,12 @@ def build_static_batch(
     run_spec_path: Path,
     acquisition_contract_path: Path,
 ) -> QueryBatch:
-    run_spec, run_sha = _load_json_object(run_spec_path, "RunSpec")
-    contract, contract_sha = _load_json_object(
-        acquisition_contract_path, "acquisition contract"
+    run_spec, run_sha, contract, contract_sha = _load_static_contracts(
+        run_spec_path, acquisition_contract_path
     )
     bindings = contract.get("bindings")
     if not isinstance(bindings, dict):
         raise ValueError("acquisition contract bindings must be an object")
-    if contract.get("schema_version") != 2:
-        raise ValueError("acquisition contract must use schema version 2")
-    amendment = bindings.get("plan_a_amendment")
-    if (
-        not isinstance(amendment, dict)
-        or amendment.get("path")
-        != "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
-        or not isinstance(amendment.get("sha256"), str)
-        or not _SHA256.fullmatch(amendment["sha256"])
-    ):
-        raise ValueError("acquisition contract Plan A amendment binding differs")
     run_binding = bindings.get("run_spec")
     if not isinstance(run_binding, dict) or run_binding.get("sha256") != run_sha:
         raise ValueError("acquisition contract RunSpec binding differs")
