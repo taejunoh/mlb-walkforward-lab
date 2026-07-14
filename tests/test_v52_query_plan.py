@@ -173,6 +173,99 @@ class V52QueryPlanTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "canonical JSON"):
                 build_static_batch(RUN_SPEC, noncanonical_contract)
 
+    def test_static_batch_requires_the_frozen_acquisition_contract_schema(self):
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        def mutate_statcast_limit(contract):
+            contract["response_byte_limits"]["statcast"] = 1
+
+        def mutate_timezone_path(contract):
+            contract["timezone_mapping_path"] = (
+                "config/v5_2_qd_venue_timezones.json"
+            )
+
+        def mutate_completeness_limit(contract):
+            contract["response_completeness_limits"][
+                "statcast_data_row_limit"
+            ] = 24_999
+
+        def mutate_source_grain(contract):
+            source = next(
+                item
+                for item in contract["sources"]
+                if item["name"] == "mlb_stats_pitcher_bf"
+            )
+            source["grain"] = "forged_grain"
+
+        def add_unknown_key(contract):
+            contract["unexpected"] = True
+
+        def mutate_schema_version_to_equal_float(contract):
+            contract["schema_version"] = 2.0
+
+        def mutate_split_limit_to_equal_float(contract):
+            contract["response_completeness_limits"][
+                "league_pitching_split_limit"
+            ] = 5000.0
+
+        cases = (
+            ("statcast response cap", mutate_statcast_limit),
+            ("timezone mapping path", mutate_timezone_path),
+            ("response completeness", mutate_completeness_limit),
+            ("source grain", mutate_source_grain),
+            ("unknown top-level key", add_unknown_key),
+            ("float schema version", mutate_schema_version_to_equal_float),
+            ("float split limit", mutate_split_limit_to_equal_float),
+        )
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for index, (label, mutate) in enumerate(cases):
+                with self.subTest(label=label):
+                    contract = json.loads(CONTRACT.read_bytes())
+                    mutate(contract)
+                    forged_contract = Path(directory) / f"contract-{index}.json"
+                    forged_contract.write_bytes(_canonical_json_bytes(contract))
+                    with self.assertRaisesRegex(
+                        ValueError, "schema|frozen|contract"
+                    ):
+                        build_static_batch(RUN_SPEC, forged_contract)
+
+    def test_static_batch_ignores_poisoned_git_repository_environment(self):
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        poison = {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(ROOT / "missing-objects"),
+            "GIT_COMMON_DIR": str(ROOT / "missing-common-dir"),
+            "GIT_DIR": str(ROOT / "missing-git-dir"),
+            "GIT_INDEX_FILE": str(ROOT / "missing-index"),
+            "GIT_OBJECT_DIRECTORY": str(ROOT / "missing-object-dir"),
+            "GIT_WORK_TREE": str(ROOT / "missing-work-tree"),
+        }
+        with mock.patch.dict(os.environ, poison, clear=False):
+            batch = build_static_batch(RUN_SPEC, CONTRACT)
+        self.assertTrue(batch.queries)
+
+    def test_static_batch_rejects_an_uncommitted_matching_schema(self):
+        from mlb_backtest import v52_query_plan as query_plan
+
+        contract = json.loads(CONTRACT.read_bytes())
+        contract["response_byte_limits"]["statcast"] = 1
+        schema_path = ROOT / "schemas/v5_2_acquisition_contract.schema.json"
+        schema = json.loads(schema_path.read_bytes())
+        schema["const"] = contract
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            temporary = Path(directory)
+            forged_contract = temporary / "contract.json"
+            forged_schema = temporary / "schema.json"
+            forged_contract.write_bytes(_canonical_json_bytes(contract))
+            forged_schema.write_bytes(_canonical_json_bytes(schema))
+            relative_schema = forged_schema.relative_to(ROOT)
+            with mock.patch.object(
+                query_plan,
+                "_ACQUISITION_SCHEMA_RELATIVE",
+                relative_schema,
+            ), self.assertRaisesRegex(ValueError, "schema.*Git|blob|committed"):
+                query_plan.build_static_batch(RUN_SPEC, forged_contract)
+
     def test_bisect_children_bind_parent_and_cover_without_gap_or_overlap(self):
         from mlb_backtest.v52_query_plan import bisect_statcast_query
 

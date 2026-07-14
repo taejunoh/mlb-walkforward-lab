@@ -38,6 +38,9 @@ _IMPLEMENTATION_PLAN_RELATIVE = Path(
 _PLAN_A_AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
+_ACQUISITION_SCHEMA_RELATIVE = Path(
+    "schemas/v5_2_acquisition_contract.schema.json"
+)
 _ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/query_batches"
 )
@@ -118,12 +121,9 @@ def _make_batch(
     )
 
 
-def _load_json_object(
-    path: Path, label: str, *, canonical: bool = False
-) -> tuple[dict[str, object], str]:
-    if not isinstance(path, Path):
-        path = Path(path)
-    contents = path.read_bytes()
+def _parse_json_object(
+    contents: bytes, label: str, *, canonical: bool = False
+) -> dict[str, object]:
     try:
         value = json.loads(contents)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -132,7 +132,19 @@ def _load_json_object(
         raise ValueError(f"{label} must be a JSON object")
     if canonical and contents != _canonical_json_bytes(value) + b"\n":
         raise ValueError(f"{label} must be canonical JSON with one newline")
-    return value, _sha256_bytes(contents)
+    return value
+
+
+def _load_json_object(
+    path: Path, label: str, *, canonical: bool = False
+) -> tuple[dict[str, object], str]:
+    if not isinstance(path, Path):
+        path = Path(path)
+    contents = path.read_bytes()
+    return (
+        _parse_json_object(contents, label, canonical=canonical),
+        _sha256_bytes(contents),
+    )
 
 
 def _repository_root(run_spec_path: Path) -> Path:
@@ -212,35 +224,127 @@ def _verify_repository_binding(
     return contents
 
 
-def _verify_implementation_plan_git_blob(
-    root: Path, raw: dict[str, object], contents: bytes
-) -> None:
-    expected = raw.get("git_blob_id")
-    if not isinstance(expected, str) or not _GIT_BLOB.fullmatch(expected):
-        raise ValueError("implementation plan Git blob binding differs")
-    environment = os.environ.copy()
+def _clean_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    resolved = subprocess.run(
-        ["git", "rev-parse", f"HEAD:{_IMPLEMENTATION_PLAN_RELATIVE.as_posix()}"],
+    return environment
+
+
+def _verify_head_blob(
+    root: Path,
+    relative: Path,
+    contents: bytes,
+    label: str,
+    *,
+    expected_blob: object | None = None,
+) -> str:
+    if expected_blob is not None and (
+        not isinstance(expected_blob, str)
+        or not _GIT_BLOB.fullmatch(expected_blob)
+    ):
+        raise ValueError(f"{label} Git blob binding differs")
+    environment = _clean_git_environment()
+    top_level = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
         cwd=root,
         check=False,
         capture_output=True,
         env=environment,
     )
+    resolved = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{relative.as_posix()}"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    resolved_blob = resolved.stdout.decode("ascii", errors="replace").strip()
+    blob_identity = expected_blob if expected_blob is not None else resolved_blob
     blob = subprocess.run(
-        ["git", "cat-file", "blob", expected],
+        ["git", "cat-file", "blob", str(blob_identity)],
         cwd=root,
         check=False,
         capture_output=True,
         env=environment,
     )
     if (
-        resolved.returncode
-        or resolved.stdout.decode("ascii", errors="replace").strip() != expected
+        top_level.returncode
+        or Path(
+            os.path.abspath(
+                top_level.stdout.decode("utf-8", errors="replace").strip()
+            )
+        )
+        != Path(os.path.abspath(root))
+        or resolved.returncode
+        or not _GIT_BLOB.fullmatch(resolved_blob)
+        or resolved_blob != blob_identity
         or blob.returncode
         or blob.stdout != contents
     ):
-        raise ValueError("implementation plan Git blob binding differs")
+        raise ValueError(f"{label} Git blob binding differs")
+    return resolved_blob
+
+
+def _verify_implementation_plan_git_blob(
+    root: Path, raw: dict[str, object], contents: bytes
+) -> None:
+    _verify_head_blob(
+        root,
+        _IMPLEMENTATION_PLAN_RELATIVE,
+        contents,
+        "implementation plan",
+        expected_blob=raw.get("git_blob_id"),
+    )
+
+
+def _verify_frozen_acquisition_schema(
+    root: Path, contract: dict[str, object]
+) -> None:
+    contents = _read_repository_file(
+        root,
+        _ACQUISITION_SCHEMA_RELATIVE,
+        "acquisition contract schema",
+    )
+    schema = _parse_json_object(
+        contents,
+        "acquisition contract schema",
+        canonical=True,
+    )
+    required = schema.get("required")
+    properties = schema.get("properties")
+    if (
+        set(schema)
+        != {
+            "$schema",
+            "additionalProperties",
+            "const",
+            "properties",
+            "required",
+            "type",
+        }
+        or schema.get("$schema")
+        != "https://json-schema.org/draft/2020-12/schema"
+        or schema.get("additionalProperties") is not False
+        or schema.get("type") != "object"
+        or _canonical_json_bytes(schema.get("const"))
+        != _canonical_json_bytes(contract)
+        or not isinstance(required, list)
+        or set(required) != set(contract)
+        or len(required) != len(contract)
+        or not isinstance(properties, dict)
+        or set(properties) != set(contract)
+    ):
+        raise ValueError("acquisition contract differs from its frozen schema")
+    _verify_head_blob(
+        root,
+        _ACQUISITION_SCHEMA_RELATIVE,
+        contents,
+        "acquisition contract schema",
+    )
 
 
 def _load_static_contracts(
@@ -290,6 +394,7 @@ def _load_static_contracts(
         expected_path=_PLAN_A_AMENDMENT_RELATIVE,
         label="Plan A amendment",
     )
+    _verify_frozen_acquisition_schema(root, contract)
     return run_spec, run_sha, contract, contract_sha
 
 
