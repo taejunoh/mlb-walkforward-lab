@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -121,6 +121,16 @@ class _RegistryPaths:
 class _GitSnapshot:
     head: str
     file_sha256: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _RegistryLockBinding:
+    lock_descriptor: int
+    directory_descriptors: tuple[int, ...]
+
+    @property
+    def execution_descriptor(self) -> int:
+        return self.directory_descriptors[-1]
 
 
 def _exact_object(value: object, keys: frozenset[str], label: str) -> Mapping[str, object]:
@@ -252,6 +262,33 @@ def _open_directory(root: Path, relative: Path, *, create: bool) -> tuple[int, l
         raise
 
 
+def _open_directory_at(
+    directory_descriptor: int, relative: Path
+) -> tuple[int, list[int]]:
+    descriptors = [os.dup(directory_descriptor)]
+    current = descriptors[0]
+    try:
+        for component in relative.parts:
+            if component in {"", ".", ".."}:
+                raise ValueError("execution registry path traversal is forbidden")
+            child = os.open(component, _directory_flags(), dir_fd=current)
+            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(linked.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                os.close(child)
+                raise ValueError("execution registry directory identity changed")
+            descriptors.append(child)
+            current = child
+        return current, descriptors
+    except BaseException:
+        _close_directories(descriptors)
+        raise
+
+
 def _close_directories(descriptors: Sequence[int]) -> None:
     for descriptor in reversed(descriptors):
         os.close(descriptor)
@@ -288,21 +325,20 @@ def _read_fd_all(descriptor: int) -> bytes:
     return b"".join(chunks)
 
 
-def _read_relative(root: Path, relative: Path, label: str) -> bytes:
-    parent_fd, descriptors = _open_directory(root, relative.parent, create=False)
+def _read_file_at(parent_fd: int, name: str, label: str) -> bytes:
     descriptor = -1
     try:
-        before = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ValueError(f"{label} must be an unaliased regular file")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(relative.name, flags, dir_fd=parent_fd)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
         opened = os.fstat(descriptor)
         if _identity(opened) != _identity(before):
             raise ValueError(f"{label} identity changed before read")
         contents = _read_fd_all(descriptor)
-        after = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         final_opened = os.fstat(descriptor)
         if _identity(after) != _identity(before) or _identity(final_opened) != _identity(before):
             raise ValueError(f"{label} identity changed during read")
@@ -312,7 +348,36 @@ def _read_relative(root: Path, relative: Path, label: str) -> bytes:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _read_relative(root: Path, relative: Path, label: str) -> bytes:
+    parent_fd, descriptors = _open_directory(root, relative.parent, create=False)
+    try:
+        return _read_file_at(parent_fd, relative.name, label)
+    finally:
         _close_directories(descriptors)
+
+
+def _read_relative_at(
+    directory_descriptor: int, relative: Path, label: str
+) -> bytes:
+    parent_fd, descriptors = _open_directory_at(
+        directory_descriptor, relative.parent
+    )
+    try:
+        return _read_file_at(parent_fd, relative.name, label)
+    finally:
+        _close_directories(descriptors)
+
+
+def _execution_child(paths: _RegistryPaths, relative: Path) -> Path:
+    try:
+        child = relative.relative_to(paths.execution_relative)
+    except ValueError as exc:
+        raise ValueError("execution registry path escaped its namespace") from exc
+    if not child.parts:
+        raise ValueError("execution registry child path is required")
+    return child
 
 
 def _read_path(root: Path, path: Path, label: str) -> tuple[str, bytes]:
@@ -537,6 +602,10 @@ def _before_registry_publish() -> None:
     """Deterministic race-test hook; production intentionally does nothing."""
 
 
+def _after_registry_publish() -> None:
+    """Deterministic late-race test hook; production intentionally does nothing."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -552,8 +621,16 @@ def _validate_timestamp(value: object, label: str) -> None:
         raise ValueError(f"{label} timestamp differs")
 
 
-def _write_exclusive(root: Path, relative: Path, contents: bytes, label: str) -> None:
-    parent_fd, descriptors = _open_directory(root, relative.parent, create=False)
+def _write_exclusive(
+    execution_descriptor: int,
+    relative: Path,
+    contents: bytes,
+    label: str,
+    verify_after_publish: Callable[[], None],
+) -> None:
+    parent_fd, descriptors = _open_directory_at(
+        execution_descriptor, relative.parent
+    )
     descriptor = -1
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
@@ -573,6 +650,20 @@ def _write_exclusive(root: Path, relative: Path, contents: bytes, label: str) ->
         if _identity(linked) != _identity(metadata):
             raise ValueError(f"{label} identity changed during publication")
         os.fsync(parent_fd)
+        try:
+            _after_registry_publish()
+            verify_after_publish()
+        except BaseException:
+            linked = os.stat(
+                relative.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if _identity(linked) != _identity(os.fstat(descriptor)):
+                raise ValueError(
+                    f"{label} identity changed before failed publication cleanup"
+                )
+            os.unlink(relative.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            raise
     except FileExistsError:
         raise
     except OSError as exc:
@@ -589,8 +680,11 @@ def _ensure_registry_directories(paths: _RegistryPaths) -> None:
         _close_directories(descriptors)
 
 
-def _open_lock(paths: _RegistryPaths, *, create: bool) -> int:
-    parent_fd, descriptors = _open_directory(paths.root, paths.execution_relative, create=False)
+def _open_lock(paths: _RegistryPaths, *, create: bool) -> _RegistryLockBinding:
+    parent_fd, descriptors = _open_directory(
+        paths.root, paths.execution_relative, create=False
+    )
+    descriptor = -1
     try:
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         created = False
@@ -610,27 +704,70 @@ def _open_lock(paths: _RegistryPaths, *, create: bool) -> int:
             or metadata.st_size != 0
             or _identity(metadata) != _identity(linked)
         ):
-            os.close(descriptor)
             raise ValueError("execution registry lock must be an empty unaliased regular file")
         if created:
             os.fsync(descriptor)
             os.fsync(parent_fd)
-        return descriptor
+        return _RegistryLockBinding(descriptor, tuple(descriptors))
     except OSError as exc:
-        raise ValueError("execution registry lock is unsafe") from exc
-    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         _close_directories(descriptors)
+        raise ValueError("execution registry lock is unsafe") from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _close_directories(descriptors)
+        raise
 
 
-def _verify_lock_binding(paths: _RegistryPaths, descriptor: int) -> None:
-    parent_fd, descriptors = _open_directory(
-        paths.root, paths.execution_relative, create=False
-    )
+def _verify_namespace_binding(
+    paths: _RegistryPaths, binding: _RegistryLockBinding
+) -> None:
+    descriptors = binding.directory_descriptors
+    if len(descriptors) != len(paths.execution_relative.parts) + 1:
+        raise ValueError("execution registry descriptor chain differs")
     try:
-        opened = os.fstat(descriptor)
+        root_opened = os.fstat(descriptors[0])
+        root_linked = os.stat(paths.root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(root_opened.st_mode)
+            or not stat.S_ISDIR(root_linked.st_mode)
+            or (root_opened.st_dev, root_opened.st_ino)
+            != (root_linked.st_dev, root_linked.st_ino)
+        ):
+            raise ValueError("execution registry root identity was replaced")
+        for index, component in enumerate(paths.execution_relative.parts):
+            opened = os.fstat(descriptors[index + 1])
+            linked = os.stat(
+                component,
+                dir_fd=descriptors[index],
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (linked.st_dev, linked.st_ino)
+            ):
+                raise ValueError(
+                    "execution registry namespace identity was replaced"
+                )
+    except OSError as exc:
+        raise ValueError(
+            "execution registry namespace identity was replaced"
+        ) from exc
+
+
+def _verify_lock_binding(
+    paths: _RegistryPaths, binding: _RegistryLockBinding
+) -> None:
+    _verify_namespace_binding(paths, binding)
+    try:
+        opened = os.fstat(binding.lock_descriptor)
         linked = os.stat(
             paths.lock_relative.name,
-            dir_fd=parent_fd,
+            dir_fd=binding.execution_descriptor,
             follow_symlinks=False,
         )
         if (
@@ -642,20 +779,24 @@ def _verify_lock_binding(paths: _RegistryPaths, descriptor: int) -> None:
             raise ValueError("execution registry lock identity was replaced")
     except OSError as exc:
         raise ValueError("execution registry lock identity was replaced") from exc
-    finally:
-        _close_directories(descriptors)
 
 
 @contextmanager
-def _registry_lock(paths: _RegistryPaths, *, create: bool, exclusive: bool) -> Iterator[int]:
-    descriptor = _open_lock(paths, create=create)
+def _registry_lock(
+    paths: _RegistryPaths, *, create: bool, exclusive: bool
+) -> Iterator[_RegistryLockBinding]:
+    binding = _open_lock(paths, create=create)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        _verify_lock_binding(paths, descriptor)
-        yield descriptor
+        fcntl.flock(
+            binding.lock_descriptor,
+            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+        _verify_lock_binding(paths, binding)
+        yield binding
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        fcntl.flock(binding.lock_descriptor, fcntl.LOCK_UN)
+        os.close(binding.lock_descriptor)
+        _close_directories(binding.directory_descriptors)
 
 
 def _artifact_binding(root: Path, raw: object, label: str, *, plan: bool = False) -> Mapping[str, object]:
@@ -721,7 +862,13 @@ def _binding_with_contents(
     return {"path": relative, "sha256": _sha256_bytes(contents)}, contents
 
 
-def _validate_stored_artifacts(root: Path, values: object, label: str) -> None:
+def _validate_stored_artifacts(
+    root: Path,
+    values: object,
+    label: str,
+    *,
+    allow_duplicate_paths: bool = False,
+) -> None:
     if not isinstance(values, list):
         raise ValueError(f"{label} must be a list")
     seen: set[str] = set()
@@ -729,7 +876,11 @@ def _validate_stored_artifacts(root: Path, values: object, label: str) -> None:
         binding = _validate_binding_value(value, label)
         path = binding.get("path")
         digest = binding.get("sha256")
-        if not isinstance(path, str) or path in seen or not isinstance(digest, str):
+        if (
+            not isinstance(path, str)
+            or (path in seen and not allow_duplicate_paths)
+            or not isinstance(digest, str)
+        ):
             raise ValueError(f"{label} binding differs")
         seen.add(path)
         if _binding(root, root / path, label) != dict(binding):
@@ -842,7 +993,7 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
         str(_validate_binding_value(value, "validation receipt")["path"])
         for value in validations
     ]
-    if len(paths) != len(set(paths)):
+    if not automatic and len(paths) != len(set(paths)):
         raise ValueError("validation receipts violate the receipt schema")
     return receipt
 
@@ -852,9 +1003,11 @@ def _validate_quarantine_locked(
     run_spec: RunSpec,
     payloads: Sequence[Mapping[str, object]],
     phase_receipt_sha: Mapping[str, str],
+    lock_binding: _RegistryLockBinding,
 ) -> None:
-    quarantine_fd, descriptors = _open_directory(
-        paths.root, paths.quarantine_relative, create=False
+    quarantine_relative = _execution_child(paths, paths.quarantine_relative)
+    quarantine_fd, descriptors = _open_directory_at(
+        lock_binding.execution_descriptor, quarantine_relative
     )
     try:
         names = sorted(os.listdir(quarantine_fd))
@@ -864,8 +1017,10 @@ def _validate_quarantine_locked(
         match = _SUCCESS_NAME.fullmatch(name)
         if match is None:
             raise ValueError("execution quarantine contains an ambiguous or partial receipt")
-        contents = _read_relative(
-            paths.root, paths.quarantine_relative / name, "quarantine receipt"
+        contents = _read_relative_at(
+            lock_binding.execution_descriptor,
+            quarantine_relative / name,
+            "quarantine receipt",
         )
         if _sha256_bytes(contents) != match.group("sha"):
             raise ValueError("quarantine receipt filename hash differs")
@@ -906,13 +1061,24 @@ def _validate_quarantine_locked(
         if not isinstance(validation_values, list):
             raise ValueError("quarantine receipt validation evidence differs")
         _validate_stored_artifacts(
-            paths.root, validation_values, "validation receipts"
+            paths.root,
+            validation_values,
+            "validation receipts",
+            allow_duplicate_paths="inventory" in payload,
         )
 
 
-def _load_locked(paths: _RegistryPaths, run_spec: RunSpec) -> tuple[ExecutionRegistryState, list[Mapping[str, object]]]:
+def _load_locked(
+    paths: _RegistryPaths,
+    run_spec: RunSpec,
+    lock_binding: _RegistryLockBinding,
+) -> tuple[ExecutionRegistryState, list[Mapping[str, object]]]:
+    _verify_lock_binding(paths, lock_binding)
     _require_bound_execution_code_clean(paths.root)
-    receipt_fd, descriptors = _open_directory(paths.root, paths.receipts_relative, create=False)
+    receipts_relative = _execution_child(paths, paths.receipts_relative)
+    receipt_fd, descriptors = _open_directory_at(
+        lock_binding.execution_descriptor, receipts_relative
+    )
     try:
         names = sorted(os.listdir(receipt_fd))
     finally:
@@ -932,7 +1098,11 @@ def _load_locked(paths: _RegistryPaths, run_spec: RunSpec) -> tuple[ExecutionReg
         receipt_sha = match.group("sha")
         if sequence != expected_sequence or sequence >= len(PHASES) or phase != PHASES[sequence]:
             raise ValueError("execution registry chain has a gap, fork, replay, or rollback anchor")
-        contents = _read_relative(paths.root, paths.receipts_relative / name, "execution receipt")
+        contents = _read_relative_at(
+            lock_binding.execution_descriptor,
+            receipts_relative / name,
+            "execution receipt",
+        )
         payload = _receipt_payload(contents, receipt_sha, phase, sequence)
         if payload.get("run_id") != run_spec.run_id or payload.get("prior_receipt_sha256") != prior_sha:
             raise ValueError("execution registry prior hash or run identity differs")
@@ -953,8 +1123,15 @@ def _load_locked(paths: _RegistryPaths, run_spec: RunSpec) -> tuple[ExecutionReg
         phase_receipt_sha[phase] = receipt_sha
         prior_sha = receipt_sha
     last = payloads[-1]
-    _validate_quarantine_locked(paths, run_spec, payloads, phase_receipt_sha)
+    _validate_quarantine_locked(
+        paths,
+        run_spec,
+        payloads,
+        phase_receipt_sha,
+        lock_binding,
+    )
     inventory = _exact_object(last["inventory"], _BINDING_KEYS, "phase inventory")
+    _verify_lock_binding(paths, lock_binding)
     return (
         ExecutionRegistryState(
             phase=str(last["phase"]),
@@ -1009,6 +1186,32 @@ def _success_contents(payload: Mapping[str, object]) -> tuple[bytes, str]:
     return contents, _sha256_bytes(contents)
 
 
+def _publish_locked(
+    paths: _RegistryPaths,
+    snapshot: _GitSnapshot,
+    lock_binding: _RegistryLockBinding,
+    relative: Path,
+    contents: bytes,
+    label: str,
+) -> None:
+    child = _execution_child(paths, relative)
+    _before_registry_publish()
+    _verify_git_snapshot(paths.root, snapshot)
+    _verify_lock_binding(paths, lock_binding)
+
+    def verify_after_publish() -> None:
+        _verify_git_snapshot(paths.root, snapshot)
+        _verify_lock_binding(paths, lock_binding)
+
+    _write_exclusive(
+        lock_binding.execution_descriptor,
+        child,
+        contents,
+        label,
+        verify_after_publish,
+    )
+
+
 def _publish_quarantine_locked(
     paths: _RegistryPaths,
     run_spec: RunSpec,
@@ -1017,7 +1220,7 @@ def _publish_quarantine_locked(
     attempted_phase: str,
     validations: list[dict[str, str]],
     snapshot: _GitSnapshot,
-    lock_descriptor: int,
+    lock_binding: _RegistryLockBinding,
     *,
     inventory: Mapping[str, object] | None = None,
     error_classification: str | None = None,
@@ -1046,10 +1249,14 @@ def _publish_quarantine_locked(
         paths.quarantine_relative
         / f"{state.sequence + 1:06d}-{attempted_phase}-{digest}.json"
     )
-    _before_registry_publish()
-    _verify_git_snapshot(paths.root, snapshot)
-    _verify_lock_binding(paths, lock_descriptor)
-    _write_exclusive(paths.root, relative, contents, "quarantine receipt")
+    _publish_locked(
+        paths,
+        snapshot,
+        lock_binding,
+        relative,
+        contents,
+        "quarantine receipt",
+    )
     return paths.root / relative
 
 
@@ -1064,14 +1271,17 @@ def initialize_execution_registry(
     paths = _paths(root, run_spec)
     evidence = _initial_evidence(paths.root, run_spec, design_path, plan_path, acquisition_contract_path)
     _ensure_registry_directories(paths)
-    with _registry_lock(paths, create=True, exclusive=True) as lock_descriptor:
-        receipt_fd, descriptors = _open_directory(paths.root, paths.receipts_relative, create=False)
+    with _registry_lock(paths, create=True, exclusive=True) as lock_binding:
+        receipt_fd, descriptors = _open_directory_at(
+            lock_binding.execution_descriptor,
+            _execution_child(paths, paths.receipts_relative),
+        )
         try:
             existing = os.listdir(receipt_fd)
         finally:
             _close_directories(descriptors)
         if existing:
-            state, payloads = _load_locked(paths, run_spec)
+            state, payloads = _load_locked(paths, run_spec, lock_binding)
             expected = {key: evidence[key] for key in evidence}
             actual = {key: payloads[0][key] for key in evidence}
             if state.phase not in PHASES or actual != expected:
@@ -1094,17 +1304,21 @@ def initialize_execution_registry(
         }
         contents, digest = _success_contents(payload)
         relative = paths.receipts_relative / f"000000-DESIGN_ACCEPTED-{digest}.json"
-        _before_registry_publish()
-        _verify_git_snapshot(paths.root, snapshot)
-        _verify_lock_binding(paths, lock_descriptor)
-        _write_exclusive(paths.root, relative, contents, "execution receipt")
+        _publish_locked(
+            paths,
+            snapshot,
+            lock_binding,
+            relative,
+            contents,
+            "execution receipt",
+        )
         return ExecutionRegistryState("DESIGN_ACCEPTED", 0, digest, str(protected["sha256"]))
 
 
 def load_execution_registry(root: Path, run_spec: RunSpec) -> ExecutionRegistryState:
     paths = _paths(root, run_spec)
-    with _registry_lock(paths, create=False, exclusive=False):
-        state, _ = _load_locked(paths, run_spec)
+    with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
+        state, _ = _load_locked(paths, run_spec, lock_binding)
         return state
 
 
@@ -1122,8 +1336,8 @@ def advance_execution_phase(
         raise ValueError("execution transition must use the immediate next phase")
     if next_phase not in {"ACQUIRING", "SOURCES_READY"}:
         raise ValueError("execution transition fails closed until a phase validator exists")
-    with _registry_lock(paths, create=False, exclusive=True) as lock_descriptor:
-        state, payloads = _load_locked(paths, run_spec)
+    with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
+        state, payloads = _load_locked(paths, run_spec, lock_binding)
         if state.phase != expected_phase:
             raise ValueError(
                 "execution transition replay or expected phase differs from "
@@ -1158,6 +1372,29 @@ def advance_execution_phase(
                     validation_values,
                     run_id=run_spec.run_id,
                 )
+            payload = {
+                "schema_version": 1,
+                "receipt_kind": "PHASE_TRANSITION",
+                "run_id": run_spec.run_id,
+                "sequence": state.sequence + 1,
+                "phase": next_phase,
+                "prior_receipt_sha256": state.receipt_sha256,
+                "recorded_at_utc": _utc_now(),
+                "git_head": snapshot.head,
+                **{
+                    key: base[key]
+                    for key in (
+                        "run_spec",
+                        "approved_design",
+                        "implementation_plan",
+                        "acquisition_contract",
+                        "task0_lineage",
+                    )
+                },
+                "inventory": inventory,
+                "validation_receipts": validations,
+            }
+            contents, digest = _success_contents(payload)
         except ValueError as exc:
             error_classification = (
                 "DIRECT_INVENTORY_MISMATCH"
@@ -1172,30 +1409,20 @@ def advance_execution_phase(
                 next_phase,
                 validations,
                 snapshot,
-                lock_descriptor,
+                lock_binding,
                 inventory=inventory,
                 error_classification=error_classification,
             )
             raise ValueError("direct phase artifact evidence failed") from exc
-        payload = {
-            "schema_version": 1,
-            "receipt_kind": "PHASE_TRANSITION",
-            "run_id": run_spec.run_id,
-            "sequence": state.sequence + 1,
-            "phase": next_phase,
-            "prior_receipt_sha256": state.receipt_sha256,
-            "recorded_at_utc": _utc_now(),
-            "git_head": snapshot.head,
-            **{key: base[key] for key in ("run_spec", "approved_design", "implementation_plan", "acquisition_contract", "task0_lineage")},
-            "inventory": inventory,
-            "validation_receipts": validations,
-        }
-        contents, digest = _success_contents(payload)
         relative = paths.receipts_relative / f"{state.sequence + 1:06d}-{next_phase}-{digest}.json"
-        _before_registry_publish()
-        _verify_git_snapshot(paths.root, snapshot)
-        _verify_lock_binding(paths, lock_descriptor)
-        _write_exclusive(paths.root, relative, contents, "execution receipt")
+        _publish_locked(
+            paths,
+            snapshot,
+            lock_binding,
+            relative,
+            contents,
+            "execution receipt",
+        )
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 
 
@@ -1207,11 +1434,11 @@ def quarantine_execution_transition(
     validation_receipts: Sequence[Path],
 ) -> Path:
     paths = _paths(root, run_spec)
-    with _registry_lock(paths, create=False, exclusive=True) as lock_descriptor:
+    with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
         validations = _validation_bindings(paths.root, validation_receipts)
         if not validations:
             raise ValueError("quarantine transition requires validation evidence")
-        state, payloads = _load_locked(paths, run_spec)
+        state, payloads = _load_locked(paths, run_spec, lock_binding)
         if state.sequence + 1 >= len(PHASES) or attempted_phase != PHASES[state.sequence + 1]:
             raise ValueError("quarantine attempted phase must be the immediate next phase")
         snapshot = _capture_git_snapshot(paths.root, payloads[0])
@@ -1223,7 +1450,7 @@ def quarantine_execution_transition(
             attempted_phase,
             validations,
             snapshot,
-            lock_descriptor,
+            lock_binding,
         )
 
 

@@ -456,6 +456,161 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "SOURCE_GATE_EVIDENCE_INVALID",
             )
 
+    def test_duplicate_source_review_quarantines_without_advancing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(
+                root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+            )
+            inventory, evidence = self.write_real_source_evidence(root)
+            review, replay_one, replay_two = evidence
+            with self.assertRaisesRegex(ValueError, "artifact|evidence"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=(
+                        review,
+                        review,
+                        replay_one,
+                        replay_two,
+                    ),
+                )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            quarantine_dir = root / "audit/v5_2_qd/historical/execution/quarantine"
+            receipts = list(quarantine_dir.iterdir())
+            self.assertEqual(len(receipts), 1)
+            payload = json.loads(receipts[0].read_bytes())
+            self.assertEqual(
+                payload["error_classification"],
+                "SOURCE_GATE_EVIDENCE_INVALID",
+            )
+            self.assertEqual(
+                payload["validation_receipts"],
+                [
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "sha256": _sha256(path),
+                    }
+                    for path in (review, review, replay_one, replay_two)
+                ],
+            )
+            schema = json.loads(
+                (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
+            )
+            jsonschema.validate(payload, schema)
+
+    def test_publication_rejects_replaced_execution_namespace(self) -> None:
+        for operation in ("initialize", "advance", "quarantine"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                initial = None
+                if operation != "initialize":
+                    initial = self.initialize(root, run_spec)
+                execution = root / "audit/v5_2_qd/historical/execution"
+                displaced = execution.with_name("execution-displaced")
+
+                def replace_namespace() -> None:
+                    execution.rename(displaced)
+                    (execution / "phase_receipts").mkdir(parents=True)
+                    (execution / "quarantine").mkdir()
+                    (displaced / ".registry.lock").rename(
+                        execution / ".registry.lock"
+                    )
+
+                hook = getattr(self.registry, "_before_registry_publish", None)
+                self.assertIsNotNone(hook, "registry publish race hook is missing")
+                with patch.object(
+                    self.registry,
+                    "_before_registry_publish",
+                    side_effect=replace_namespace,
+                ), self.assertRaisesRegex(ValueError, "identity|namespace|lock"):
+                    if operation == "initialize":
+                        self.initialize(root, run_spec)
+                    elif operation == "advance":
+                        self.registry.advance_execution_phase(
+                            root,
+                            run_spec,
+                            expected_phase="DESIGN_ACCEPTED",
+                            next_phase="ACQUIRING",
+                            inventory_path=root / PROTECTED_RELATIVE,
+                            validation_receipts=(),
+                        )
+                    else:
+                        failed = self.write_artifact(
+                            root, "failed.json", {"status": "FAIL"}
+                        )
+                        self.registry.quarantine_execution_transition(
+                            root,
+                            run_spec,
+                            attempted_phase="ACQUIRING",
+                            validation_receipts=(failed,),
+                        )
+
+                self.assertEqual(list((execution / "phase_receipts").iterdir()), [])
+                self.assertEqual(list((execution / "quarantine").iterdir()), [])
+                (execution / ".registry.lock").rename(
+                    displaced / ".registry.lock"
+                )
+                shutil.rmtree(execution)
+                displaced.rename(execution)
+                if initial is None:
+                    self.assertEqual(
+                        list((execution / "phase_receipts").iterdir()), []
+                    )
+                else:
+                    self.assertEqual(
+                        self.registry.load_execution_registry(root, run_spec),
+                        initial,
+                    )
+
+    def test_publication_rolls_back_after_late_namespace_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            initial = self.initialize(root, run_spec)
+            execution = root / "audit/v5_2_qd/historical/execution"
+            displaced = execution.with_name("execution-displaced")
+
+            def replace_namespace() -> None:
+                execution.rename(displaced)
+                (execution / "phase_receipts").mkdir(parents=True)
+                (execution / "quarantine").mkdir()
+                (displaced / ".registry.lock").rename(
+                    execution / ".registry.lock"
+                )
+
+            hook = getattr(self.registry, "_after_registry_publish", None)
+            self.assertIsNotNone(hook, "late registry publish hook is missing")
+            with patch.object(
+                self.registry,
+                "_after_registry_publish",
+                side_effect=replace_namespace,
+            ), self.assertRaisesRegex(ValueError, "identity|namespace|lock"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
+
+            self.assertEqual(list((execution / "phase_receipts").iterdir()), [])
+            self.assertEqual(
+                len(list((displaced / "phase_receipts").iterdir())), 1
+            )
+            (execution / ".registry.lock").rename(displaced / ".registry.lock")
+            shutil.rmtree(execution)
+            displaced.rename(execution)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+
     def test_rejects_git_head_identity_race_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
