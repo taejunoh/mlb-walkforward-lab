@@ -215,24 +215,6 @@ def recompute_career_bf_sidecar(
         "pitcher_id": pitcher_id,
         "requires_verified_statcast_bf_through_consumer_d1": True,
     }
-    verified = query.requested_range.get("verified_statcast_bf")
-    if verified is not None:
-        if not isinstance(verified, Mapping):
-            raise ValueError("verified Statcast BF must be a mapping")
-        try:
-            additions = {int(key): value for key, value in verified.items()}
-        except (TypeError, ValueError) as exc:
-            raise ValueError("verified Statcast BF keys must be gamePks") from exc
-        if set(additions) != set(consumers) or any(
-            type(value) is not int or value < 0 for value in additions.values()
-        ):
-            raise ValueError("verified Statcast BF must cover every consumer")
-        semantics["consumer_batters_faced"] = {
-            str(game_pk): baseline + additions[game_pk] for game_pk in consumers
-        }
-        semantics["verified_statcast_bf"] = {
-            str(game_pk): additions[game_pk] for game_pk in consumers
-        }
     return query_sidecar(raw, query, semantics)
 
 
@@ -267,6 +249,7 @@ def recompute_pitching_season_snapshot(
 ) -> Mapping[str, object]:
     records = []
     seen_as_of: set[str] = set()
+    seen_consumers: set[int] = set()
     for sidecar in query_sidecars:
         semantics = _require_task2_sidecar(
             sidecar,
@@ -291,6 +274,12 @@ def recompute_pitching_season_snapshot(
             or any(value != as_of_text for value in cutoffs.values())
         ):
             raise ValueError("pitching aggregate consumer cutoffs differ from as-of")
+        duplicate_consumers = seen_consumers.intersection(consumers)
+        if duplicate_consumers:
+            raise ValueError(
+                "pitching aggregate consumer gamePk maps to multiple D-1 records"
+            )
+        seen_consumers.update(consumers)
         record = {
             "as_of_date": as_of_text,
             "consumer_cutoff_dates": dict(cutoffs),
@@ -354,6 +343,8 @@ def recompute_career_bf_season_snapshot(
         ):
             raise ValueError("Statcast BF addition value/source lineage is invalid")
         computed_hashes = []
+        recomputed_bf = 0
+        target_pitcher_found = False
         source_ranges = []
         for sidecar in source_sidecars:
             semantics = _require_task2_sidecar(
@@ -363,11 +354,17 @@ def recompute_career_bf_season_snapshot(
                 label="Statcast BF addition",
             )
             pitcher_ids = semantics.get("pitcher_ids")
+            pitcher_bf = semantics.get("pitcher_batters_faced")
+            plate_appearances = semantics.get("plate_appearance_evidence")
+            game_pks = semantics.get("game_pks")
             coverage = semantics.get("coverage")
             if (
                 not isinstance(pitcher_ids, list)
                 or pitcher_ids != sorted(set(pitcher_ids))
                 or any(type(value) is not int or value <= 0 for value in pitcher_ids)
+                or not isinstance(pitcher_bf, Mapping)
+                or not isinstance(plate_appearances, list)
+                or not isinstance(game_pks, list)
                 or not isinstance(coverage, Mapping)
             ):
                 raise ValueError("Statcast BF source pitcher population is invalid")
@@ -375,6 +372,45 @@ def recompute_career_bf_season_snapshot(
             last = _day(coverage.get("inclusive_end"), "Statcast BF source end")
             if first > last:
                 raise ValueError("Statcast BF source coverage is reversed")
+            counts: dict[int, int] = {}
+            seen_plate_appearances: set[tuple[int, int]] = set()
+            required_pa_keys = {
+                "at_bat_number",
+                "batter_id",
+                "events",
+                "game_date",
+                "game_pk",
+                "pitch_number",
+                "pitcher_id",
+            }
+            for pa in plate_appearances:
+                if not isinstance(pa, Mapping) or set(pa) != required_pa_keys:
+                    raise ValueError("Statcast PA evidence fields are invalid")
+                pa_game = _positive(pa.get("game_pk"), "Statcast PA game_pk")
+                at_bat = _positive(
+                    pa.get("at_bat_number"), "Statcast PA at_bat_number"
+                )
+                pa_pitcher = _positive(pa.get("pitcher_id"), "Statcast PA pitcher_id")
+                _positive(pa.get("batter_id"), "Statcast PA batter_id")
+                _positive(pa.get("pitch_number"), "Statcast PA pitch_number")
+                pa_date = _day(pa.get("game_date"), "Statcast PA game_date")
+                if (
+                    pa_game not in game_pks
+                    or pa_pitcher not in pitcher_ids
+                    or not first <= pa_date <= last
+                    or not isinstance(pa.get("events"), str)
+                    or not pa["events"]
+                    or (pa_game, at_bat) in seen_plate_appearances
+                ):
+                    raise ValueError("Statcast PA evidence is inconsistent")
+                seen_plate_appearances.add((pa_game, at_bat))
+                counts[pa_pitcher] = counts.get(pa_pitcher, 0) + 1
+            canonical_counts = {str(key): counts[key] for key in sorted(counts)}
+            if dict(pitcher_bf) != canonical_counts:
+                raise ValueError("Statcast BF evidence summary differs from PA evidence")
+            if pitcher_id in counts:
+                target_pitcher_found = True
+                recomputed_bf += counts[pitcher_id]
             source_ranges.append((first, last))
             computed_hashes.append(_artifact_sha256(sidecar))
         if list(source_hashes) != computed_hashes or len(set(computed_hashes)) != len(
@@ -386,6 +422,10 @@ def recompute_career_bf_season_snapshot(
                 raise ValueError("Statcast BF source coverage overlaps or is unordered")
         if source_ranges[-1][1] != cutoff:
             raise ValueError("Statcast BF source coverage must end at consumer D-1")
+        if not target_pitcher_found:
+            raise ValueError("Statcast BF source does not contain target pitcher PA evidence")
+        if bf != recomputed_bf:
+            raise ValueError("claimed Statcast BF differs from canonical PA evidence")
         key = (pitcher_id, game_pk)
         if key in additions:
             raise ValueError("duplicate Statcast BF addition")
@@ -393,6 +433,7 @@ def recompute_career_bf_season_snapshot(
             **row,
             "consumer_cutoff_date": cutoff.isoformat(),
             "source_first_date": source_ranges[0][0].isoformat(),
+            "verified_statcast_bf": recomputed_bf,
         }
     records = []
     used: set[tuple[int, int]] = set()
@@ -448,8 +489,9 @@ def recompute_career_bf_season_snapshot(
                     "consumer_cutoff_date": addition["consumer_cutoff_date"],
                     "baseline_inclusive_end_date": inclusive_end.isoformat(),
                     "baseline_batters_faced": baseline,
-                    "verified_statcast_bf": addition["statcast_bf"],
-                    "total_batters_faced": baseline + addition["statcast_bf"],
+                    "verified_statcast_bf": addition["verified_statcast_bf"],
+                    "total_batters_faced": baseline
+                    + addition["verified_statcast_bf"],
                     "baseline_query_sidecar_sha256": _artifact_sha256(sidecar),
                     "statcast_query_sidecar_sha256s": list(
                         addition["statcast_query_sidecar_sha256s"]

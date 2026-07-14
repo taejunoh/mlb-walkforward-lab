@@ -99,6 +99,8 @@ class V52StatcastSourceTest(unittest.TestCase):
         self.assertEqual(semantics["unique_pitch_count"], 3)
         self.assertEqual(semantics["game_pks"], [9001])
         self.assertEqual(semantics["pitcher_ids"], [101, 201])
+        self.assertEqual(semantics["pitcher_batters_faced"], {"101": 1, "201": 1})
+        self.assertEqual(len(semantics["plate_appearance_evidence"]), 2)
         self.assertEqual(semantics["batter_ids"], [1001, 2001])
         self.assertEqual(semantics["terminal_plate_appearance_count"], 2)
         self.assertRegex(semantics["games"][0]["terminal_digest"], r"^[0-9a-f]{64}$")

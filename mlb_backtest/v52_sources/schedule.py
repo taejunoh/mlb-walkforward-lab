@@ -159,6 +159,16 @@ def recompute_schedule_anchor_sidecar(
                 if game["away_is_winner"]
                 else game["home_team_id"]
             )
+            score_winner_team_id = (
+                game["away_team_id"]
+                if game["away_score"] > game["home_score"]
+                else game["home_team_id"]
+            )
+            if (
+                game["away_score"] == game["home_score"]
+                or winner_team_id != score_winner_team_id
+            ):
+                raise ValueError("terminal schedule winner disagrees with final runs")
         anchor = {
             "away_score": game["away_score"],
             "alternate_site": site_flags[int(game["game_pk"])]["alternate_site"],
@@ -277,6 +287,11 @@ def _boxscore(raw: bytes) -> dict[str, object]:
             raise ValueError(f"boxscore {label} requires nonnegative terminal runs")
         return value
 
+    away_score = runs(teams["away"], "away")
+    home_score = runs(teams["home"], "home")
+    if away_score == home_score:
+        raise ValueError("boxscore terminal winner requires unequal final runs")
+    winner_team_id = away_team if away_score > home_score else home_team
     return {
         "actual_starter_ids": [away_starter, home_starter],
         "away_starting_hitter_ids": away_hitters,
@@ -285,8 +300,9 @@ def _boxscore(raw: bytes) -> dict[str, object]:
         "home_team_id": home_team,
         "terminal_status": status["detailedState"],
         "completed_innings": completed_innings,
-        "away_score": runs(teams["away"], "away"),
-        "home_score": runs(teams["home"], "home"),
+        "away_score": away_score,
+        "home_score": home_score,
+        "winner_team_id": winner_team_id,
     }
 
 
@@ -454,6 +470,7 @@ def recompute_game_evidence_snapshot(
                 "completed_innings",
                 "away_score",
                 "home_score",
+                "winner_team_id",
             )
         ):
             raise ValueError("boxscore terminal evidence disagrees with schedule anchor")

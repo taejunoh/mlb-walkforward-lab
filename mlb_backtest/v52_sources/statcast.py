@@ -150,6 +150,30 @@ def recompute_statcast_sidecar(
         "last_game_date": max(
             (str(row["game_date"]) for row in parsed.pitches), default=None
         ),
+        "plate_appearance_evidence": sorted(
+            [
+                {
+                    "at_bat_number": row["at_bat_number"],
+                    "batter_id": row["batter_id"],
+                    "events": row["events"],
+                    "game_date": row["game_date"],
+                    "game_pk": row["game_pk"],
+                    "pitch_number": row["pitch_number"],
+                    "pitcher_id": row["pitcher_id"],
+                }
+                for row in parsed.plate_appearances
+            ],
+            key=lambda row: (row["game_pk"], row["at_bat_number"]),
+        ),
+        "pitcher_batters_faced": {
+            str(pitcher_id): sum(
+                row["pitcher_id"] == pitcher_id
+                for row in parsed.plate_appearances
+            )
+            for pitcher_id in sorted(
+                {int(row["pitcher_id"]) for row in parsed.plate_appearances}
+            )
+        },
         "pitcher_ids": sorted({int(row["pitcher_id"]) for row in parsed.pitches}),
         "required_fields": sorted(REQUIRED_FIELDS),
         "split_disposition": (

@@ -139,6 +139,26 @@ class V52ScheduleSourceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "isAlternateSite"):
             recompute_schedule_anchor_sidecar(json.dumps(missing_site).encode(), _query())
 
+    def test_completed_early_rejects_tied_or_contradictory_winner_evidence(self) -> None:
+        from mlb_backtest.v52_sources.schedule import (
+            recompute_boxscore_sidecar,
+            recompute_schedule_anchor_sidecar,
+        )
+
+        contradiction = _schedule_payload()
+        game = contradiction["dates"][0]["games"][0]
+        game["status"]["detailedState"] = "Completed Early"
+        game["teams"]["away"]["score"] = 5
+        game["teams"]["home"]["score"] = 4
+        with self.assertRaisesRegex(ValueError, "winner"):
+            recompute_schedule_anchor_sidecar(json.dumps(contradiction).encode(), _query())
+
+        tied = json.loads(_boxscore_raw())
+        tied["status"]["detailedState"] = "Completed Early"
+        tied["teams"]["away"]["teamStats"]["batting"]["runs"] = 4
+        with self.assertRaisesRegex(ValueError, "winner"):
+            recompute_boxscore_sidecar(json.dumps(tied).encode(), _box_query())
+
     def test_game_snapshot_joins_verified_anchors_and_final_participants(self) -> None:
         from mlb_backtest.v52_sources.schedule import (
             recompute_game_evidence_snapshot,

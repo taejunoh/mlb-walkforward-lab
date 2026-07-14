@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import unittest
@@ -29,7 +30,19 @@ def _statcast_source_sidecar() -> dict[str, object]:
                 "inclusive_end": "2024-04-01",
             },
             "game_pks": [9001],
+            "plate_appearance_evidence": [
+                {
+                    "at_bat_number": 1,
+                    "batter_id": 2001,
+                    "events": "strikeout",
+                    "game_date": "2024-04-01",
+                    "game_pk": 9001,
+                    "pitch_number": 3,
+                    "pitcher_id": 101,
+                }
+            ],
             "pitcher_ids": [101],
+            "pitcher_batters_faced": {"101": 1},
         },
         "source": "baseball_savant_statcast",
     }
@@ -88,6 +101,28 @@ class V52PitchingSourceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate as-of"):
             recompute_pitching_season_snapshot([child, child])
 
+    def test_pitching_season_snapshot_rejects_consumer_bound_to_multiple_as_of_dates(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_pitching_season_snapshot,
+            recompute_pitching_sidecar,
+        )
+
+        first = recompute_pitching_sidecar(FIXTURE.read_bytes(), _query(), [9001])
+        second_query = _query(
+            requested={
+                "season": 2024,
+                "start_date": "2024-03-20",
+                "as_of_date": "2024-04-02",
+                "consuming_game_pks": [9001],
+                "consumer_cutoff_dates": {"9001": "2024-04-02"},
+            }
+        )
+        second = recompute_pitching_sidecar(
+            FIXTURE.read_bytes(), second_query, [9001]
+        )
+        with self.assertRaisesRegex(ValueError, "consumer gamePk"):
+            recompute_pitching_season_snapshot([first, second])
+
     def test_career_season_snapshot_requires_verified_statcast_additions(self) -> None:
         from mlb_backtest.v52_sources.pitching import (
             recompute_career_bf_season_snapshot,
@@ -107,17 +142,57 @@ class V52PitchingSourceTest(unittest.TestCase):
             "pitcher_id": 101,
             "game_pk": 9001,
             "consumer_cutoff_date": "2024-04-01",
-            "statcast_bf": 600,
+            "statcast_bf": 1,
             "statcast_query_sidecars": [statcast],
             "statcast_query_sidecar_sha256s": [_artifact_sha(statcast)],
         }
         snapshot = recompute_career_bf_season_snapshot([baseline], [addition])
         jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
         self.assertEqual(snapshot["grain"], "player_career_batters_faced_reference")
-        self.assertEqual(snapshot["records"][0]["total_batters_faced"], 600)
+        self.assertEqual(snapshot["records"][0]["total_batters_faced"], 1)
         wrong_hash = {**addition, "statcast_query_sidecar_sha256s": ["f" * 64]}
         with self.assertRaisesRegex(ValueError, "source hash"):
             recompute_career_bf_season_snapshot([baseline], [wrong_hash])
+
+    def test_career_aggregate_recomputes_and_rejects_forged_statcast_bf(self) -> None:
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+            recompute_career_bf_sidecar,
+        )
+
+        query = _query(
+            source="mlb_stats_pitcher_bf",
+            grain="player_career_batters_faced_reference",
+            requested={
+                "pitcher_id": 101,
+                "inclusive_end": "2017-12-31",
+                "consuming_game_pks": [9001],
+                "consumer_cutoff_dates": {"9001": "2024-04-01"},
+            },
+        )
+        baseline = recompute_career_bf_sidecar(b'{"stats":[]}', query, [9001])
+        statcast = _statcast_source_sidecar()
+        forged = {
+            "pitcher_id": 101,
+            "game_pk": 9001,
+            "consumer_cutoff_date": "2024-04-01",
+            "statcast_bf": 600,
+            "statcast_query_sidecars": [statcast],
+            "statcast_query_sidecar_sha256s": [_artifact_sha(statcast)],
+        }
+        with self.assertRaisesRegex(ValueError, "Statcast BF.*differs"):
+            recompute_career_bf_season_snapshot([baseline], [forged])
+        absent = copy.deepcopy(forged)
+        absent["statcast_bf"] = 1
+        absent_sidecar = absent["statcast_query_sidecars"][0]
+        absent_sidecar["semantics"]["pitcher_ids"] = [102]
+        absent_sidecar["semantics"]["pitcher_batters_faced"] = {"102": 1}
+        absent_sidecar["semantics"]["plate_appearance_evidence"][0][
+            "pitcher_id"
+        ] = 102
+        absent["statcast_query_sidecar_sha256s"] = [_artifact_sha(absent_sidecar)]
+        with self.assertRaisesRegex(ValueError, "target pitcher"):
+            recompute_career_bf_season_snapshot([baseline], [absent])
     def test_pitching_sidecar_checks_completeness_totals_and_consumers(self) -> None:
         from mlb_backtest.v52_sources.pitching import recompute_pitching_sidecar
 
@@ -233,7 +308,8 @@ class V52PitchingSourceTest(unittest.TestCase):
         self.assertEqual(semantics["pitcher_id"], 101)
         self.assertEqual(semantics["inclusive_end_date"], "2017-12-31")
         self.assertEqual(semantics["baseline_batters_faced"], 400)
-        self.assertEqual(semantics["consumer_batters_faced"], {"9001": 1000})
+        self.assertNotIn("consumer_batters_faced", semantics)
+        self.assertNotIn("verified_statcast_bf", semantics)
         self.assertNotEqual(sidecar["grain"], "season_d1_league_pitching_reference")
 
     def test_career_bf_allows_legacy_2021_only_for_2022_plus_and_proves_cutoff(self) -> None:
