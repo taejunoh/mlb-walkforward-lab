@@ -164,6 +164,12 @@ def _legacy_fixture(
     inventory_path.write_bytes(_canonical_file(inventory))
     record = inventory["records"][0]
     manifest = json.loads(artifact.manifest_path.read_bytes())
+    current_query = dataclasses.replace(
+        _query(),
+        source="mlb_schedule_game_feed",
+        grain="season_schedule_and_game",
+        parser_version="v5.2.1",
+    )
     reference = {
         "canonical_query": record["canonical_query"],
         "legacy_source": "mlb_schedule",
@@ -171,7 +177,7 @@ def _legacy_fixture(
         "legacy_manifest_sha256": record["manifest"]["sha256"],
         "legacy_seal_path": record["seal"]["path"],
         "legacy_seal_sha256": record["seal"]["sha256"],
-        "parser_version": "schedule-v1",
+        "parser_version": current_query.parser_version,
         "payload_path": record["raw"]["path"],
         "protected_inventory_path": "audit/v5_1_bt/protected_raw_inventory.json",
         "protected_inventory_sha256": hashlib.sha256(
@@ -189,14 +195,29 @@ def _legacy_fixture(
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest(),
-        "source": "mlb_schedule",
+        "source": current_query.source,
     }
     evidence_root = repository / "data/v5_2_qd/historical/raw"
     evidence_root.parent.mkdir(parents=True)
-    return V52EvidenceStore(evidence_root), _query(), reference
+    return V52EvidenceStore(evidence_root), current_query, reference
 
 
 class V52EvidenceTest(unittest.TestCase):
+    def test_quality_i5_schedule_alias_requires_exact_current_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            forbidden = dataclasses.replace(
+                query,
+                source="mlb_schedule_game_feed",
+                grain="game_boxscore",
+                endpoint="https://statsapi.mlb.com/api/v1/game/1/boxscore",
+            )
+            reference["source"] = forbidden.source
+            with store.acquire_query(forbidden), self.assertRaisesRegex(
+                ValueError, "source|alias|binding|contract"
+            ):
+                store.publish_legacy_reference(forbidden, reference, _sidecar())
+
     def test_legacy_reference_allows_only_closed_schedule_source_alias(self) -> None:
         from dataclasses import replace
 

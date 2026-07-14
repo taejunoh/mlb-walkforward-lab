@@ -18,10 +18,17 @@ from urllib.parse import urlencode
 from .v52_evidence import (
     LogicalQuery,
     PublishedEvidence,
+    ProtectedLegacyPublishReverifyError,
     V52EvidenceStore,
     logical_query_id,
 )
-from .v52_protected_inventory import verify_protected_raw_inventory
+from .v52_legacy_relation import is_approved_legacy_source_relation
+from .v52_protected_inventory import (
+    ProtectedMembershipSnapshot,
+    parse_protected_raw_inventory_document,
+    snapshot_protected_inventory_membership,
+    verify_protected_raw_inventory,
+)
 from .v52_seasons import SEASON_BOUNDARIES
 from .v52_source_contracts import canonical_json_bytes, recompute_query_sidecar
 
@@ -40,6 +47,9 @@ class PromotionDisposition(StrEnum):
 class PromotionReasonCode(StrEnum):
     NO_EXACT_PROTECTED_CANDIDATE = "NO_EXACT_PROTECTED_CANDIDATE"
     CURRENT_QUERY_INVALID = "CURRENT_QUERY_INVALID"
+    CURRENT_PARSER_CONTRACT_UNSATISFIED = (
+        "CURRENT_PARSER_CONTRACT_UNSATISFIED"
+    )
     CURRENT_SEMANTIC_CONTRACT_UNSATISFIED = "CURRENT_SEMANTIC_CONTRACT_UNSATISFIED"
     PROTECTED_PATH_INVALID = "PROTECTED_PATH_INVALID"
     PROTECTED_INVENTORY_INVALID = "PROTECTED_INVENTORY_INVALID"
@@ -52,6 +62,7 @@ class PromotionReasonCode(StrEnum):
     LEGACY_RAW_BYTES_INVALID = "LEGACY_RAW_BYTES_INVALID"
     LEGACY_ROW_COUNT_INVALID = "LEGACY_ROW_COUNT_INVALID"
     CATALOG_NOT_UNIQUE = "CATALOG_NOT_UNIQUE"
+    PROTECTED_PUBLISH_REVERIFY_FAILED = "PROTECTED_PUBLISH_REVERIFY_FAILED"
 
 
 @dataclass(frozen=True)
@@ -72,6 +83,8 @@ class ProtectedLegacyCatalog:
     protected_inventory_sha256: str
     protected_inventory_identity: tuple[int, ...]
     candidates: tuple[LegacyCandidate, ...]
+    records: tuple[_CatalogRecord, ...]
+    membership: ProtectedMembershipSnapshot
 
 
 @dataclass(frozen=True)
@@ -88,11 +101,35 @@ class ProtectedLegacyIntegrityError(RuntimeError):
         super().__init__(reason_code.value)
 
 
+class LegacyPromotionNotEligibleError(RuntimeError):
+    def __init__(self, reason_code: PromotionReasonCode) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code.value)
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     contents: bytes
     identity: tuple[int, ...]
     binding: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _ProtectedObjectBinding:
+    relative_path: str
+    sha256: str
+    byte_size: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _CatalogRecord:
+    candidate: LegacyCandidate
+    canonical_query_json: str
+    manifest: _ProtectedObjectBinding
+    seal: _ProtectedObjectBinding
+    raw: _ProtectedObjectBinding
 
 
 @dataclass(frozen=True)
@@ -275,50 +312,115 @@ def _sha(value: object, reason: PromotionReasonCode) -> str:
     return value
 
 
-def _reason_for_inventory_failure(exc: BaseException) -> PromotionReasonCode:
-    message = str(exc).lower()
-    if any(
-        token in message for token in ("symlink", "hardlink", "regular", "link count")
-    ):
-        return PromotionReasonCode.LEGACY_LINK_TYPE_INVALID
-    if any(token in message for token in ("inode", "identity", "changed")):
-        return PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
-    if "filename" in message:
-        return PromotionReasonCode.LEGACY_FILENAME_INVALID
-    if "row_count" in message or "row count" in message:
-        return PromotionReasonCode.LEGACY_ROW_COUNT_INVALID
-    if "seal" in message or "integrity mismatch" in message:
-        return PromotionReasonCode.LEGACY_SEAL_INVALID
-    if "raw payload" in message or "raw digest" in message:
-        return PromotionReasonCode.LEGACY_RAW_BYTES_INVALID
-    if "manifest" in message:
-        return PromotionReasonCode.LEGACY_MANIFEST_INVALID
-    if any(token in message for token in ("membership", "orphan", "unexpected leaves")):
-        return PromotionReasonCode.PROTECTED_MEMBERSHIP_INVALID
-    return PromotionReasonCode.PROTECTED_INVENTORY_INVALID
-
-
-def _assert_inventory_object_identity(
-    item: Mapping[str, object], snapshot: _Snapshot
-) -> None:
+def _object_binding(item: Mapping[str, object]) -> _ProtectedObjectBinding:
     fingerprint = item.get("inode_fingerprint")
-    if (
-        not isinstance(fingerprint, Mapping)
-        or set(fingerprint) != {"device", "inode"}
-        or fingerprint.get("device") != snapshot.identity[0]
-        or fingerprint.get("inode") != snapshot.identity[1]
-        or item.get("byte_size") != len(snapshot.contents)
-    ):
+    if not isinstance(fingerprint, Mapping):
         raise ProtectedLegacyIntegrityError(
-            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
         )
+    try:
+        return _ProtectedObjectBinding(
+            relative_path=str(item["path"]),
+            sha256=str(item["sha256"]),
+            byte_size=int(item["byte_size"]),
+            device=int(fingerprint["device"]),
+            inode=int(fingerprint["inode"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+        ) from exc
 
 
-def _load_verified_records(
-    catalog: ProtectedLegacyCatalog,
-) -> tuple[_VerifiedRecord, ...]:
+def _catalog_records(
+    root: Path, inventory: Mapping[str, object]
+) -> tuple[_CatalogRecord, ...]:
+    raw_records = inventory.get("records")
+    if not isinstance(raw_records, list):
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+        )
+    records: list[_CatalogRecord] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_record in raw_records:
+        if not isinstance(raw_record, Mapping):
+            raise ProtectedLegacyIntegrityError(
+                PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+            )
+        canonical_query = raw_record.get("canonical_query")
+        if not isinstance(canonical_query, Mapping):
+            raise ProtectedLegacyIntegrityError(
+                PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+            )
+        source = str(raw_record.get("source"))
+        canonical_query_json = json.dumps(
+            canonical_query,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        key = (source, canonical_query_json)
+        if key in seen:
+            raise ProtectedLegacyIntegrityError(PromotionReasonCode.CATALOG_NOT_UNIQUE)
+        seen.add(key)
+        try:
+            manifest = _object_binding(raw_record["manifest"])
+            seal = _object_binding(raw_record["seal"])
+            raw = _object_binding(raw_record["raw"])
+        except (KeyError, TypeError) as exc:
+            raise ProtectedLegacyIntegrityError(
+                PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+            ) from exc
+        manifest_path = _exact_path(
+            root, root / manifest.relative_path, Path(manifest.relative_path)
+        )
+        seal_path = _exact_path(root, root / seal.relative_path, Path(seal.relative_path))
+        payload_path = _exact_path(root, root / raw.relative_path, Path(raw.relative_path))
+        records.append(
+            _CatalogRecord(
+                candidate=LegacyCandidate(
+                    source=source,
+                    manifest_path=manifest_path,
+                    manifest_sha256=manifest.sha256,
+                    seal_path=seal_path,
+                    payload_path=payload_path,
+                    raw_sha256=raw.sha256,
+                ),
+                canonical_query_json=canonical_query_json,
+                manifest=manifest,
+                seal=seal,
+                raw=raw,
+            )
+        )
+    return tuple(sorted(records, key=lambda item: item.manifest.relative_path))
+
+
+def _catalog_inventory_record(record: _CatalogRecord) -> dict[str, object]:
+    def item(binding: _ProtectedObjectBinding) -> dict[str, object]:
+        return {
+            "byte_size": binding.byte_size,
+            "inode_fingerprint": {
+                "device": binding.device,
+                "inode": binding.inode,
+            },
+            "path": binding.relative_path,
+            "sha256": binding.sha256,
+        }
+
+    return {
+        "canonical_query": json.loads(record.canonical_query_json),
+        "manifest": item(record.manifest),
+        "raw": item(record.raw),
+        "rawstore_verified": True,
+        "seal": item(record.seal),
+        "source": record.candidate.source,
+    }
+
+
+def _revalidate_catalog(catalog: ProtectedLegacyCatalog) -> tuple[Path, _Snapshot]:
     root = _trusted_root(catalog.repository_root)
-    legacy_root = _exact_path(root, root / catalog.legacy_root, _LEGACY_ROOT)
+    _exact_path(root, root / catalog.legacy_root, _LEGACY_ROOT)
     inventory_path = _exact_path(
         root, root / catalog.protected_inventory_path, _INVENTORY_PATH
     )
@@ -334,147 +436,111 @@ def _load_verified_records(
         raise ProtectedLegacyIntegrityError(
             PromotionReasonCode.PROTECTED_INVENTORY_INVALID
         )
+    if catalog.candidates != tuple(record.candidate for record in catalog.records) or len(
+        catalog.candidates
+    ) != len(set(catalog.candidates)):
+        raise ProtectedLegacyIntegrityError(PromotionReasonCode.CATALOG_NOT_UNIQUE)
     try:
-        inventory = verify_protected_raw_inventory(root, inventory_path)
+        inventory = parse_protected_raw_inventory_document(inventory_snapshot.contents)
+        membership = snapshot_protected_inventory_membership(root, inventory)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ProtectedLegacyIntegrityError(_reason_for_inventory_failure(exc)) from exc
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        ) from exc
+    if membership != catalog.membership:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        )
     _rebind(root, inventory_path, inventory_snapshot)
-    if Path(str(inventory.get("legacy_root"))) != _LEGACY_ROOT:
+    return root, inventory_snapshot
+
+
+def _assert_object_binding(
+    binding: _ProtectedObjectBinding,
+    snapshot: _Snapshot,
+    reason: PromotionReasonCode,
+) -> None:
+    if (
+        snapshot.identity[0] != binding.device
+        or snapshot.identity[1] != binding.inode
+        or len(snapshot.contents) != binding.byte_size
+        or hashlib.sha256(snapshot.contents).hexdigest() != binding.sha256
+    ):
+        raise ProtectedLegacyIntegrityError(reason)
+
+
+def _verify_selected(
+    catalog: ProtectedLegacyCatalog, record: _CatalogRecord
+) -> _VerifiedRecord:
+    root, inventory_snapshot = _revalidate_catalog(catalog)
+    manifest_snapshot = _snapshot(root, record.candidate.manifest_path)
+    seal_snapshot = _snapshot(root, record.candidate.seal_path)
+    payload_snapshot = _snapshot(root, record.candidate.payload_path)
+    _assert_object_binding(
+        record.manifest, manifest_snapshot, PromotionReasonCode.LEGACY_MANIFEST_INVALID
+    )
+    _assert_object_binding(
+        record.seal, seal_snapshot, PromotionReasonCode.LEGACY_SEAL_INVALID
+    )
+    _assert_object_binding(
+        record.raw, payload_snapshot, PromotionReasonCode.LEGACY_RAW_BYTES_INVALID
+    )
+    if seal_snapshot.contents != f"{record.manifest.sha256}\n".encode("ascii"):
+        raise ProtectedLegacyIntegrityError(PromotionReasonCode.LEGACY_SEAL_INVALID)
+    try:
+        manifest = json.loads(manifest_snapshot.contents)
+        canonical_query = json.loads(record.canonical_query_json)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtectedLegacyIntegrityError(
-            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
-        )
-    records = inventory.get("records")
-    if not isinstance(records, list):
+            PromotionReasonCode.LEGACY_MANIFEST_INVALID
+        ) from exc
+    if (
+        not isinstance(manifest, Mapping)
+        or not isinstance(canonical_query, Mapping)
+        or manifest.get("source") != record.candidate.source
+        or manifest.get("query") != canonical_query
+        or manifest.get("sha256") != record.raw.sha256
+    ):
         raise ProtectedLegacyIntegrityError(
-            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+            PromotionReasonCode.LEGACY_MANIFEST_INVALID
         )
-    verified: list[_VerifiedRecord] = []
-    collective_snapshots: list[tuple[Path, _Snapshot]] = [
-        (inventory_path, inventory_snapshot)
-    ]
-    seen: set[tuple[str, bytes]] = set()
-    for raw_record in records:
-        if not isinstance(raw_record, Mapping):
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.PROTECTED_INVENTORY_INVALID
-            )
-        try:
-            source = str(raw_record["source"])
-            canonical_query = raw_record["canonical_query"]
-            manifest_item = raw_record["manifest"]
-            seal_item = raw_record["seal"]
-            raw_item = raw_record["raw"]
-            if not all(
-                isinstance(item, Mapping)
-                for item in (manifest_item, seal_item, raw_item)
-            ) or not isinstance(canonical_query, Mapping):
-                raise TypeError
-            manifest_path = _exact_path(
-                root,
-                root / str(manifest_item["path"]),
-                Path(str(manifest_item["path"])),
-            )
-            seal_path = _exact_path(
-                root, root / str(seal_item["path"]), Path(str(seal_item["path"]))
-            )
-            payload_path = _exact_path(
-                root, root / str(raw_item["path"]), Path(str(raw_item["path"]))
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.PROTECTED_INVENTORY_INVALID
-            ) from exc
-        manifest_snapshot = _snapshot(root, manifest_path)
-        seal_snapshot = _snapshot(root, seal_path)
-        payload_snapshot = _snapshot(root, payload_path)
-        _assert_inventory_object_identity(manifest_item, manifest_snapshot)
-        _assert_inventory_object_identity(seal_item, seal_snapshot)
-        _assert_inventory_object_identity(raw_item, payload_snapshot)
-        manifest_sha = _sha(
-            manifest_item.get("sha256"), PromotionReasonCode.LEGACY_MANIFEST_INVALID
+    expected_name = (
+        f"{record.raw.sha256}."
+        f"{hashlib.sha256(canonical_json_bytes(canonical_query)).hexdigest()}"
+        ".manifest.json"
+    )
+    if record.candidate.manifest_path.name != expected_name:
+        raise ProtectedLegacyIntegrityError(PromotionReasonCode.LEGACY_FILENAME_INVALID)
+    row_count = sum(bool(line.strip()) for line in payload_snapshot.contents.splitlines())
+    if manifest.get("row_count") != row_count:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_ROW_COUNT_INVALID
         )
-        seal_sha = _sha(
-            seal_item.get("sha256"), PromotionReasonCode.LEGACY_SEAL_INVALID
-        )
-        raw_sha = _sha(
-            raw_item.get("sha256"), PromotionReasonCode.LEGACY_RAW_BYTES_INVALID
-        )
-        if hashlib.sha256(manifest_snapshot.contents).hexdigest() != manifest_sha:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_MANIFEST_INVALID
-            )
-        if hashlib.sha256(seal_snapshot.contents).hexdigest() != seal_sha:
-            raise ProtectedLegacyIntegrityError(PromotionReasonCode.LEGACY_SEAL_INVALID)
-        if seal_snapshot.contents != f"{manifest_sha}\n".encode("ascii"):
-            raise ProtectedLegacyIntegrityError(PromotionReasonCode.LEGACY_SEAL_INVALID)
-        if hashlib.sha256(payload_snapshot.contents).hexdigest() != raw_sha:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_RAW_BYTES_INVALID
-            )
-        try:
-            manifest = json.loads(manifest_snapshot.contents)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_MANIFEST_INVALID
-            ) from exc
-        if (
-            not isinstance(manifest, Mapping)
-            or manifest.get("source") != source
-            or manifest.get("query") != canonical_query
-            or manifest.get("sha256") != raw_sha
-        ):
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_MANIFEST_INVALID
-            )
-        expected_manifest_name = (
-            f"{raw_sha}.{hashlib.sha256(canonical_json_bytes(canonical_query)).hexdigest()}"
-            ".manifest.json"
-        )
-        if manifest_path.name != expected_manifest_name:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_FILENAME_INVALID
-            )
-        row_count = sum(
-            bool(line.strip()) for line in payload_snapshot.contents.splitlines()
-        )
-        if manifest.get("row_count") != row_count:
-            raise ProtectedLegacyIntegrityError(
-                PromotionReasonCode.LEGACY_ROW_COUNT_INVALID
-            )
-        key = (source, canonical_json_bytes(canonical_query))
-        if key in seen:
-            raise ProtectedLegacyIntegrityError(PromotionReasonCode.CATALOG_NOT_UNIQUE)
-        seen.add(key)
-        candidate = LegacyCandidate(
-            source=source,
-            manifest_path=manifest_path,
-            manifest_sha256=manifest_sha,
-            seal_path=seal_path,
-            payload_path=payload_path,
-            raw_sha256=raw_sha,
-        )
-        verified.append(
-            _VerifiedRecord(
-                candidate=candidate,
-                canonical_query=dict(canonical_query),
-                manifest=dict(manifest),
-                inventory_record=dict(raw_record),
-                payload=payload_snapshot.contents,
-            )
-        )
-        collective_snapshots.extend(
-            (
-                (manifest_path, manifest_snapshot),
-                (seal_path, seal_snapshot),
-                (payload_path, payload_snapshot),
-            )
-        )
-    for path, snapshot in collective_snapshots:
+    _rebind(root, root / catalog.protected_inventory_path, inventory_snapshot)
+    for path, snapshot in (
+        (record.candidate.manifest_path, manifest_snapshot),
+        (record.candidate.seal_path, seal_snapshot),
+        (record.candidate.payload_path, payload_snapshot),
+    ):
         _rebind(root, path, snapshot)
-    if legacy_root != root / _LEGACY_ROOT:
-        raise ProtectedLegacyIntegrityError(PromotionReasonCode.PROTECTED_PATH_INVALID)
-    return tuple(
-        sorted(verified, key=lambda item: item.candidate.manifest_path.as_posix())
+    try:
+        current_membership = snapshot_protected_inventory_membership(
+            root, parse_protected_raw_inventory_document(inventory_snapshot.contents)
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        ) from exc
+    if current_membership != catalog.membership:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        )
+    return _VerifiedRecord(
+        candidate=record.candidate,
+        canonical_query=dict(canonical_query),
+        manifest=dict(manifest),
+        inventory_record=_catalog_inventory_record(record),
+        payload=payload_snapshot.contents,
     )
 
 
@@ -487,30 +553,40 @@ def load_protected_legacy_catalog(
 ) -> ProtectedLegacyCatalog:
     root = _trusted_root(repository_root)
     _exact_path(root, legacy_root, _LEGACY_ROOT)
-    inventory = _exact_path(root, protected_inventory_path, _INVENTORY_PATH)
-    _sha(
+    inventory_path = _exact_path(root, protected_inventory_path, _INVENTORY_PATH)
+    expected_sha = _sha(
         protected_inventory_sha256,
         PromotionReasonCode.PROTECTED_INVENTORY_INVALID,
     )
-    inventory_snapshot = _snapshot(root, inventory)
-    catalog = ProtectedLegacyCatalog(
-        repository_root=root,
-        legacy_root=_LEGACY_ROOT,
-        protected_inventory_path=_INVENTORY_PATH,
-        protected_inventory_sha256=protected_inventory_sha256,
-        protected_inventory_identity=inventory_snapshot.identity,
-        candidates=(),
-    )
-    records = _load_verified_records(catalog)
-    if inventory != root / _INVENTORY_PATH:
-        raise ProtectedLegacyIntegrityError(PromotionReasonCode.PROTECTED_PATH_INVALID)
+    inventory_snapshot = _snapshot(root, inventory_path)
+    if hashlib.sha256(inventory_snapshot.contents).hexdigest() != expected_sha:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+        )
+    try:
+        inventory = verify_protected_raw_inventory(root, inventory_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+        ) from exc
+    _rebind(root, inventory_path, inventory_snapshot)
+    records = _catalog_records(root, inventory)
+    try:
+        membership = snapshot_protected_inventory_membership(root, inventory)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        ) from exc
+    _rebind(root, inventory_path, inventory_snapshot)
     return ProtectedLegacyCatalog(
         repository_root=root,
         legacy_root=_LEGACY_ROOT,
         protected_inventory_path=_INVENTORY_PATH,
-        protected_inventory_sha256=protected_inventory_sha256,
+        protected_inventory_sha256=expected_sha,
         protected_inventory_identity=inventory_snapshot.identity,
         candidates=tuple(record.candidate for record in records),
+        records=records,
+        membership=membership,
     )
 
 
@@ -575,13 +651,26 @@ def _career_baseline_eligible(requested: Mapping[str, object], baseline: str) ->
     return False
 
 
+def _ordered_url(
+    endpoint: str, parameters: Mapping[str, object], keys: tuple[str, ...]
+) -> str:
+    return f"{endpoint}?{urlencode(tuple((key, parameters[key]) for key in keys))}"
+
+
 def _exact_match(
     query: LogicalQuery,
-    record: _VerifiedRecord,
+    record: _CatalogRecord,
     catalog: ProtectedLegacyCatalog,
 ) -> bool:
-    legacy = record.canonical_query
-    if query.parser_version != "v5.2.1":
+    legacy = json.loads(record.canonical_query_json)
+    if not isinstance(legacy, Mapping) or not is_approved_legacy_source_relation(
+        current_source=query.source,
+        endpoint=query.endpoint,
+        grain=query.grain,
+        parser_version=query.parser_version,
+        expected_media_type=query.expected_media_type,
+        legacy_source=record.candidate.source,
+    ):
         return False
     if (
         query.source == "mlb_schedule_game_feed"
@@ -594,6 +683,7 @@ def _exact_match(
             set(query.requested_range) == {"year", "start_date", "end_date"}
             and query.expected_media_type == "application/json"
             and query.parent_query_id is None
+            and type(year) is int
             and year in {2022, 2023, 2024}
             and query.requested_range.get("start_date")
             == SEASON_BOUNDARIES[year][0].isoformat()
@@ -603,7 +693,12 @@ def _exact_match(
             and legacy.get("gameType") == "R"
             and legacy.get("start") == query.requested_range.get("start_date")
             and legacy.get("end") == query.requested_range.get("end_date")
-            and legacy.get("url") == f"{query.endpoint}?{urlencode(query.parameters)}"
+            and legacy.get("url")
+            == _ordered_url(
+                query.endpoint,
+                query.parameters,
+                ("sportId", "gameType", "startDate", "endDate", "hydrate"),
+            )
             and query.parameters
             == {
                 "sportId": 1,
@@ -729,7 +824,21 @@ def _exact_match(
                 )
             )
             and (
-                legacy.get("url") == f"{query.endpoint}?{urlencode(query.parameters)}"
+                legacy.get("url")
+                == _ordered_url(
+                    query.endpoint,
+                    query.parameters,
+                    (
+                        "stats",
+                        "group",
+                        "sportIds",
+                        "gameType",
+                        "playerPool",
+                        "limit",
+                        "startDate",
+                        "endDate",
+                    ),
+                )
                 and query.requested_range.get("season") in {2022, 2023, 2024}
             )
         )
@@ -757,6 +866,7 @@ def _exact_match(
                 "https://statsapi.mlb.com/api/v1/people/"
                 f"{query.requested_range.get('pitcher_id')}/stats"
             )
+            and isinstance(baseline, str)
             and baseline in {"2017-12-31", "2021-12-31"}
             and query.parameters
             == {
@@ -770,7 +880,19 @@ def _exact_match(
             and _career_baseline_eligible(query.requested_range, str(baseline))
             and legacy.get("pitcher_id") == query.requested_range.get("pitcher_id")
             and legacy.get("endDate") == query.requested_range.get("inclusive_end")
-            and legacy.get("url") == f"{query.endpoint}?{urlencode(query.parameters)}"
+            and legacy.get("url")
+            == _ordered_url(
+                query.endpoint,
+                query.parameters,
+                (
+                    "stats",
+                    "group",
+                    "gameType",
+                    "sportIds",
+                    "startDate",
+                    "endDate",
+                ),
+            )
             and all(
                 legacy.get(key) == query.parameters.get(key)
                 for key in (
@@ -800,16 +922,120 @@ def _decision(
     )
 
 
+def _current_query_fields_valid(query: LogicalQuery) -> bool:
+    parameters = query.parameters
+    requested = query.requested_range
+    if not isinstance(parameters, Mapping) or not isinstance(requested, Mapping):
+        return False
+    if query.source == "mlb_schedule_game_feed":
+        return (
+            type(requested.get("year")) is int
+            and isinstance(requested.get("start_date"), str)
+            and isinstance(requested.get("end_date"), str)
+            and type(parameters.get("sportId")) is int
+            and isinstance(parameters.get("gameType"), str)
+            and isinstance(parameters.get("startDate"), str)
+            and isinstance(parameters.get("endDate"), str)
+            and isinstance(parameters.get("hydrate"), str)
+        )
+    if query.source == "mlb_stats_pitching":
+        response = requested.get("response_completeness")
+        return (
+            type(requested.get("season")) is int
+            and isinstance(requested.get("start_date"), str)
+            and isinstance(requested.get("as_of_date"), str)
+            and isinstance(requested.get("consuming_game_pks"), list)
+            and isinstance(requested.get("consumer_cutoff_dates"), Mapping)
+            and isinstance(response, Mapping)
+            and type(parameters.get("sportIds")) is int
+            and type(parameters.get("limit")) is int
+            and all(
+                isinstance(parameters.get(key), str)
+                for key in (
+                    "stats",
+                    "group",
+                    "gameType",
+                    "playerPool",
+                    "startDate",
+                    "endDate",
+                )
+            )
+        )
+    if query.source == "mlb_stats_pitcher_bf":
+        return (
+            type(requested.get("pitcher_id")) is int
+            and isinstance(requested.get("inclusive_end"), str)
+            and isinstance(requested.get("consuming_game_pks"), list)
+            and isinstance(requested.get("consumer_cutoff_dates"), Mapping)
+            and type(parameters.get("sportIds")) is int
+            and all(
+                isinstance(parameters.get(key), str)
+                for key in (
+                    "stats",
+                    "group",
+                    "gameType",
+                    "startDate",
+                    "endDate",
+                )
+            )
+        )
+    if query.source == "baseball_savant_statcast":
+        try:
+            from .v52_query_plan import validate_statcast_query
+
+            validate_statcast_query(query)
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _audit_with_record(
     query: LogicalQuery, catalog: ProtectedLegacyCatalog
 ) -> tuple[PromotionDecision, _VerifiedRecord | None, Mapping[str, object] | None]:
     try:
-        logical_query_id(query)
-    except (TypeError, ValueError):
+        _revalidate_catalog(catalog)
+    except ProtectedLegacyIntegrityError as exc:
         return (
             PromotionDecision(
                 query_id="0" * 64,
                 disposition=PromotionDisposition.FATAL_INTEGRITY,
+                reason_codes=(exc.reason_code,),
+                candidate=None,
+            ),
+            None,
+            None,
+        )
+    try:
+        query_id = logical_query_id(query)
+    except (TypeError, ValueError):
+        return (
+            PromotionDecision(
+                query_id="0" * 64,
+                disposition=PromotionDisposition.FETCH_REQUIRED,
+                reason_codes=(PromotionReasonCode.CURRENT_QUERY_INVALID,),
+                candidate=None,
+            ),
+            None,
+            None,
+        )
+    if query.parser_version != "v5.2.1":
+        return (
+            PromotionDecision(
+                query_id=query_id,
+                disposition=PromotionDisposition.FETCH_REQUIRED,
+                reason_codes=(
+                    PromotionReasonCode.CURRENT_PARSER_CONTRACT_UNSATISFIED,
+                ),
+                candidate=None,
+            ),
+            None,
+            None,
+        )
+    if not _current_query_fields_valid(query):
+        return (
+            PromotionDecision(
+                query_id=query_id,
+                disposition=PromotionDisposition.FETCH_REQUIRED,
                 reason_codes=(PromotionReasonCode.CURRENT_QUERY_INVALID,),
                 candidate=None,
             ),
@@ -817,27 +1043,20 @@ def _audit_with_record(
             None,
         )
     try:
-        records = _load_verified_records(catalog)
-    except ProtectedLegacyIntegrityError as exc:
+        matches = [
+            record for record in catalog.records if _exact_match(query, record, catalog)
+        ]
+    except (KeyError, TypeError, ValueError, OverflowError):
         return (
-            _decision(query, PromotionDisposition.FATAL_INTEGRITY, exc.reason_code),
-            None,
-            None,
-        )
-    verified_candidates = tuple(record.candidate for record in records)
-    if catalog.candidates != verified_candidates or len(catalog.candidates) != len(
-        set(catalog.candidates)
-    ):
-        return (
-            _decision(
-                query,
-                PromotionDisposition.FATAL_INTEGRITY,
-                PromotionReasonCode.CATALOG_NOT_UNIQUE,
+            PromotionDecision(
+                query_id=query_id,
+                disposition=PromotionDisposition.FETCH_REQUIRED,
+                reason_codes=(PromotionReasonCode.CURRENT_QUERY_INVALID,),
+                candidate=None,
             ),
             None,
             None,
         )
-    matches = [record for record in records if _exact_match(query, record, catalog)]
     if len(matches) > 1:
         return (
             _decision(
@@ -858,7 +1077,15 @@ def _audit_with_record(
             None,
             None,
         )
-    record = matches[0]
+    catalog_record = matches[0]
+    try:
+        record = _verify_selected(catalog, catalog_record)
+    except ProtectedLegacyIntegrityError as exc:
+        return (
+            _decision(query, PromotionDisposition.FATAL_INTEGRITY, exc.reason_code),
+            None,
+            None,
+        )
     try:
         semantics = recompute_query_sidecar(query, record.payload)
         if (
@@ -912,18 +1139,18 @@ def promote_legacy_candidate(
     ):
         raise ValueError("promotion decision is not an exact PROMOTED decision")
     current, record, semantics = _audit_with_record(query, catalog)
+    if current.disposition is PromotionDisposition.FATAL_INTEGRITY:
+        raise ProtectedLegacyIntegrityError(current.reason_codes[0])
+    if current.disposition is PromotionDisposition.FETCH_REQUIRED:
+        raise LegacyPromotionNotEligibleError(current.reason_codes[0])
     if (
-        current.disposition is not PromotionDisposition.PROMOTED
-        or current.candidate != decision.candidate
+        current.candidate != decision.candidate
         or record is None
         or semantics is None
     ):
-        reason = (
-            current.reason_codes[0]
-            if current.reason_codes
-            else PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+        raise LegacyPromotionNotEligibleError(
+            PromotionReasonCode.NO_EXACT_PROTECTED_CANDIDATE
         )
-        raise ProtectedLegacyIntegrityError(reason)
     manifest_item = record.inventory_record["manifest"]
     seal_item = record.inventory_record["seal"]
     raw_item = record.inventory_record["raw"]
@@ -959,14 +1186,15 @@ def promote_legacy_candidate(
     try:
         with store.acquire_query(query):
             return store.publish_legacy_reference(query, reference, semantics)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except ProtectedLegacyPublishReverifyError as exc:
         raise ProtectedLegacyIntegrityError(
-            PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED
+            PromotionReasonCode.PROTECTED_PUBLISH_REVERIFY_FAILED
         ) from exc
 
 
 __all__ = [
     "LegacyCandidate",
+    "LegacyPromotionNotEligibleError",
     "PromotionDecision",
     "PromotionDisposition",
     "PromotionReasonCode",

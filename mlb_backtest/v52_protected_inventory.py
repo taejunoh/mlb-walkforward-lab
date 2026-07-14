@@ -75,6 +75,7 @@ _LINE_BREAK = re.compile(rb"\r\n|\r|\n")
 _NON_STRIPPED_BYTE = re.compile(rb"[^ \t\n\r\v\f]")
 _LeafIdentity = tuple[int, int, int, int, int, int, int]
 _SourceMembership = dict[str, dict[str, _LeafIdentity]]
+ProtectedMembershipSnapshot = tuple[tuple[str, str, _LeafIdentity], ...]
 
 
 class _NonemptyRowCounter:
@@ -168,9 +169,27 @@ class _BoundLegacyTree:
         directory_flags |= getattr(os, "O_DIRECTORY", 0)
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            root_fd = os.open(root, directory_flags)
-            self._fds.append(root_fd)
-            parent_fd = root_fd
+            filesystem_fd = os.open(os.sep, directory_flags)
+            self._fds.append(filesystem_fd)
+            parent_fd = filesystem_fd
+            for component in root.parts[1:]:
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                self._fds.append(child_fd)
+                linked = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+                opened = os.fstat(child_fd)
+                self._require_bound_directory(linked, opened, "repository ancestor")
+                self._directory_bindings.append(
+                    (
+                        parent_fd,
+                        component,
+                        child_fd,
+                        opened,
+                        "repository ancestor",
+                    )
+                )
+                parent_fd = child_fd
             relative = legacy_root.absolute().relative_to(root)
             for index, component in enumerate(relative.parts):
                 child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
@@ -809,6 +828,62 @@ def _validate_inventory_shape(inventory: object) -> dict[str, Any]:
     return inventory
 
 
+def parse_protected_raw_inventory_document(content: bytes) -> Mapping[str, object]:
+    """Parse and validate one canonical protected-inventory document."""
+    if not isinstance(content, bytes):
+        raise TypeError("protected raw inventory content must be bytes")
+    try:
+        inventory = _validate_inventory_shape(json.loads(content.decode("utf-8")))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("protected raw inventory must be canonical JSON") from exc
+    if content != _canonical_json_bytes(inventory):
+        raise ValueError("protected raw inventory must use canonical JSON")
+    return inventory
+
+
+def snapshot_protected_inventory_membership(
+    root: Path, inventory: Mapping[str, object]
+) -> ProtectedMembershipSnapshot:
+    """Bind every protected leaf by metadata without reading payload contents."""
+    repository_root = _repository_root(root)
+    validated = _validate_inventory_shape(inventory)
+    legacy_path = repository_root / str(validated["legacy_root"])
+    expected: dict[str, dict[str, Mapping[str, object]]] = {}
+    for record in validated["records"]:
+        source = str(record["source"])
+        source_items = expected.setdefault(source, {})
+        for kind in ("manifest", "raw", "seal"):
+            item = record[kind]
+            relative = Path(str(item["path"]))
+            if relative.parent != Path(str(validated["legacy_root"])) / source:
+                raise ValueError("protected raw inventory object source path is invalid")
+            previous = source_items.setdefault(relative.name, item)
+            if previous != item:
+                raise ValueError("protected raw inventory object binding conflicts")
+    with _BoundLegacyTree(repository_root, legacy_path) as bound_tree:
+        membership = bound_tree.source_membership()
+        if set(membership) != set(expected):
+            raise RuntimeError("protected raw source membership differs")
+        for source, leaves in membership.items():
+            if set(leaves) != set(expected[source]):
+                raise RuntimeError("protected raw leaf membership differs")
+            for name, identity in leaves.items():
+                item = expected[source][name]
+                fingerprint = item["inode_fingerprint"]
+                if (
+                    identity[0] != fingerprint["device"]
+                    or identity[1] != fingerprint["inode"]
+                    or identity[2] != item["byte_size"]
+                ):
+                    raise RuntimeError("protected raw leaf identity differs")
+        bound_tree.assert_bound()
+    return tuple(
+        (source, name, identity)
+        for source, leaves in sorted(membership.items())
+        for name, identity in sorted(leaves.items())
+    )
+
+
 def verify_protected_raw_inventory(
     root: Path, inventory_path: Path
 ) -> Mapping[str, object]:
@@ -816,15 +891,19 @@ def verify_protected_raw_inventory(
     repository_root = _repository_root(root)
     path, _ = _under_root(repository_root, Path(inventory_path), "inventory path")
     content = _read_regular(repository_root, path, "protected raw inventory")
-    try:
-        inventory = _validate_inventory_shape(json.loads(content.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("protected raw inventory must be canonical JSON") from exc
-    if content != _canonical_json_bytes(inventory):
-        raise ValueError("protected raw inventory must use canonical JSON")
+    inventory = parse_protected_raw_inventory_document(content)
     rebuilt = build_protected_raw_inventory(
         repository_root, repository_root / inventory["legacy_root"]
     )
     if content != _canonical_json_bytes(rebuilt):
         raise ValueError("protected raw inventory mismatch")
     return inventory
+
+
+__all__ = [
+    "ProtectedMembershipSnapshot",
+    "build_protected_raw_inventory",
+    "parse_protected_raw_inventory_document",
+    "snapshot_protected_inventory_membership",
+    "verify_protected_raw_inventory",
+]

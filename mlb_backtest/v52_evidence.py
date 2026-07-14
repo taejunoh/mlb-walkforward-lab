@@ -15,7 +15,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, ContextManager, Literal
 
-from .v52_protected_inventory import verify_protected_raw_inventory
+from .v52_legacy_relation import is_approved_legacy_source_relation
+from .v52_protected_inventory import (
+    parse_protected_raw_inventory_document,
+    snapshot_protected_inventory_membership,
+)
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -125,6 +129,10 @@ class VerifiedEvidenceRead:
     query_sidecar: Mapping[str, object]
     success_receipt: Mapping[str, object]
     attempt_receipts: tuple[Mapping[str, object], ...]
+
+
+class ProtectedLegacyPublishReverifyError(ValueError):
+    """Final protected-lineage revalidation failed during publication."""
 
 
 @dataclass(frozen=True)
@@ -1789,41 +1797,58 @@ class V52EvidenceStore:
             reference["protected_inventory_sha256"],
             "protected_inventory_sha256",
         )
-        inventory_snapshot = self._read_repository_snapshot(
-            repository,
-            reference["protected_inventory_path"],
-            "protected raw inventory",
-        )
-        inventory_bytes = inventory_snapshot.file.contents
-        if _sha256_bytes(inventory_bytes) != inventory_sha256:
-            raise ValueError("protected inventory lineage hash differs")
-        inventory = verify_protected_raw_inventory(
-            repository,
-            repository / _PROTECTED_INVENTORY_RELATIVE,
-        )
-        if (
-            self._read_repository_snapshot(
+        try:
+            inventory_snapshot = self._read_repository_snapshot(
                 repository,
                 reference["protected_inventory_path"],
                 "protected raw inventory",
             )
-            != inventory_snapshot
-        ):
-            raise ValueError("protected inventory changed during verification")
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                f"protected publisher inventory snapshot failed: {exc}"
+            ) from exc
+        inventory_bytes = inventory_snapshot.file.contents
+        if _sha256_bytes(inventory_bytes) != inventory_sha256:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected inventory lineage hash differs"
+            )
+        try:
+            inventory = parse_protected_raw_inventory_document(inventory_bytes)
+            membership = snapshot_protected_inventory_membership(
+                repository, inventory
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected publisher inventory revalidation failed"
+            ) from exc
+        try:
+            rebound_inventory = self._read_repository_snapshot(
+                repository,
+                reference["protected_inventory_path"],
+                "protected raw inventory",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected publisher inventory rebound failed"
+            ) from exc
+        if rebound_inventory != inventory_snapshot:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected inventory changed during verification"
+            )
         legacy_source = _validate_segment(
             reference["legacy_source"], "legacy_source"
         )
-        allowed_legacy_sources = {
-            "baseball_savant_statcast": {"baseball_savant_statcast"},
-            "mlb_schedule": {"mlb_schedule"},
-            "mlb_schedule_game_feed": {"mlb_schedule"},
-            "mlb_stats_pitcher_bf": {"mlb_stats_pitcher_bf"},
-            "mlb_stats_pitching": {"mlb_stats_pitching"},
-        }
         if (
             reference["source"] != query.source
-            or legacy_source not in allowed_legacy_sources.get(query.source, set())
             or reference["parser_version"] != query.parser_version
+            or not is_approved_legacy_source_relation(
+                current_source=query.source,
+                endpoint=query.endpoint,
+                grain=query.grain,
+                parser_version=query.parser_version,
+                expected_media_type=query.expected_media_type,
+                legacy_source=legacy_source,
+            )
         ):
             raise ValueError("legacy reference parser or source binding differs")
         canonical_query = _normalized_json_object(
@@ -1861,35 +1886,50 @@ class V52EvidenceStore:
             and record["raw"]["byte_size"] == byte_count
         ]
         if len(matches) != 1:
-            raise ValueError("legacy reference is not an exact Task0 inventory record")
-        manifest_snapshot = self._read_repository_snapshot(
-            repository,
-            reference["legacy_manifest_path"],
-            "protected legacy manifest",
-        )
-        seal_snapshot = self._read_repository_snapshot(
-            repository,
-            reference["legacy_seal_path"],
-            "protected legacy seal",
-        )
-        payload_snapshot = self._read_repository_snapshot(
-            repository,
-            reference["payload_path"],
-            "protected legacy payload",
-        )
+            raise ProtectedLegacyPublishReverifyError(
+                "legacy reference is not an exact Task0 inventory record"
+            )
+        try:
+            manifest_snapshot = self._read_repository_snapshot(
+                repository,
+                reference["legacy_manifest_path"],
+                "protected legacy manifest",
+            )
+            seal_snapshot = self._read_repository_snapshot(
+                repository,
+                reference["legacy_seal_path"],
+                "protected legacy seal",
+            )
+            payload_snapshot = self._read_repository_snapshot(
+                repository,
+                reference["payload_path"],
+                "protected legacy payload",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected publisher selected lineage snapshot failed"
+            ) from exc
         manifest_bytes = manifest_snapshot.file.contents
         seal_bytes = seal_snapshot.file.contents
         payload = payload_snapshot.file.contents
         if _sha256_bytes(manifest_bytes) != reference["legacy_manifest_sha256"]:
-            raise ValueError("protected legacy manifest hash differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy manifest hash differs"
+            )
         if _sha256_bytes(seal_bytes) != reference["legacy_seal_sha256"]:
-            raise ValueError("protected legacy seal hash differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy seal hash differs"
+            )
         if seal_bytes != f"{_sha256_bytes(manifest_bytes)}\n".encode("ascii"):
-            raise ValueError("protected legacy manifest seal differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy manifest seal differs"
+            )
         try:
             manifest = json.loads(manifest_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("protected legacy manifest is invalid") from exc
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy manifest is invalid"
+            ) from exc
         if (
             not isinstance(manifest, dict)
             or manifest.get("source") != legacy_source
@@ -1897,11 +1937,17 @@ class V52EvidenceStore:
             or manifest.get("sha256") != digest
             or manifest.get("row_count") != row_count
         ):
-            raise ValueError("protected legacy manifest binding differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy manifest binding differs"
+            )
         if len(payload) != byte_count or _sha256_bytes(payload) != digest:
-            raise ValueError("protected legacy payload binding differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy payload binding differs"
+            )
         if sum(bool(line.strip()) for line in payload.splitlines()) != row_count:
-            raise ValueError("protected legacy payload row count differs")
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy payload row count differs"
+            )
         if semantics is not None:
             semantic_record = _normalized_json_object(semantics, "query_sidecar")
             if (
@@ -1909,6 +1955,18 @@ class V52EvidenceStore:
                 != reference["semantic_sha256"]
             ):
                 raise ValueError("legacy semantic hash binding differs")
+        try:
+            rebound_membership = snapshot_protected_inventory_membership(
+                repository, inventory
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected publisher membership revalidation failed"
+            ) from exc
+        if rebound_membership != membership:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected legacy membership changed during validation"
+            )
         return reference, payload, (
             inventory_snapshot,
             manifest_snapshot,
@@ -2015,7 +2073,12 @@ class V52EvidenceStore:
                     "protected_legacy_reference_sha256": reference_sha256,
                 }
                 _before_success_publish()
-                self._rebind_legacy_lineage(lineage_snapshots)
+                try:
+                    self._rebind_legacy_lineage(lineage_snapshots)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ProtectedLegacyPublishReverifyError(
+                        "protected publisher lineage revalidation failed"
+                    ) from exc
                 _rebind_regular_snapshot_at(
                     objects_fd,
                     reference_name,
@@ -2038,7 +2101,14 @@ class V52EvidenceStore:
                 )
         finally:
             self._close_fds(descriptors)
-        published = self.verify_success(query)
+        try:
+            published = self.verify_success(query)
+        except ProtectedLegacyPublishReverifyError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtectedLegacyPublishReverifyError(
+                "protected publisher success verification failed"
+            ) from exc
         self._require_lease(query)
         return published
 
@@ -2620,6 +2690,7 @@ __all__ = [
     "AttemptCapture",
     "LogicalQuery",
     "PublishedEvidence",
+    "ProtectedLegacyPublishReverifyError",
     "QueryLease",
     "V52EvidenceStore",
     "VerifiedEvidenceRead",

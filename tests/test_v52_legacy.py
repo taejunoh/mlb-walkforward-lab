@@ -7,12 +7,18 @@ import os
 import shutil
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
 
 from mlb_backtest.manifest import RawStore
-from mlb_backtest.v52_evidence import LogicalQuery, V52EvidenceStore, logical_query_id
+from mlb_backtest.v52_evidence import (
+    LogicalQuery,
+    V52EvidenceStore,
+    canonical_query_bytes,
+    logical_query_id,
+)
 from mlb_backtest.v52_protected_inventory import build_protected_raw_inventory
 from mlb_backtest.statcast import statcast_url
 
@@ -240,7 +246,350 @@ def _store(repository: Path) -> V52EvidenceStore:
     return V52EvidenceStore(evidence_root)
 
 
+def _repository_records(
+    base: Path,
+    records: tuple[tuple[str, dict[str, object], bytes], ...],
+) -> tuple[Path, Path, Path, str]:
+    repository = (base / "repository").resolve()
+    repository.mkdir()
+    legacy_root = repository / LEGACY_RELATIVE
+    for source, legacy_query, raw in records:
+        RawStore(legacy_root).put(source, legacy_query, raw)
+    inventory = build_protected_raw_inventory(repository, legacy_root)
+    inventory_path = repository / INVENTORY_RELATIVE
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_bytes(_canonical_file(inventory))
+    return (
+        repository,
+        legacy_root,
+        inventory_path,
+        hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+    )
+
+
 class V52LegacyTest(unittest.TestCase):
+    def test_quality_i1_canonical_roundtrip_preserves_nonstatcast_matches(self) -> None:
+        cases = (
+            (
+                "schedule",
+                "mlb_schedule",
+                _legacy_schedule_query(),
+                _schedule_raw(),
+                _schedule_query(),
+            ),
+            (
+                "d1",
+                "mlb_stats_pitching",
+                {
+                    **_pitching_query().parameters,
+                    "url": (
+                        "https://statsapi.mlb.com/api/v1/stats?"
+                        + urlencode(tuple(_pitching_query().parameters.items()))
+                    ),
+                },
+                (SOURCE_FIXTURES / "pitching_mini.json").read_bytes(),
+                _pitching_query(),
+            ),
+            (
+                "career",
+                "mlb_stats_pitcher_bf",
+                {
+                    **_career_query().parameters,
+                    "pitcher_id": 101,
+                    "url": (
+                        "https://statsapi.mlb.com/api/v1/people/101/stats?"
+                        + urlencode(tuple(_career_query().parameters.items()))
+                    ),
+                },
+                b'{"stats":[]}',
+                _career_query(),
+            ),
+        )
+        from mlb_backtest.v52_legacy import (
+            PromotionDisposition,
+            audit_legacy_candidate,
+        )
+
+        for label, source, legacy_query, raw, original in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                repository, legacy_root, inventory, digest = _repository_records(
+                    Path(directory), ((source, legacy_query, raw),)
+                )
+                catalog = _load(repository, legacy_root, inventory, digest)
+                round_tripped = LogicalQuery(
+                    **json.loads(canonical_query_bytes(original))
+                )
+                self.assertIs(
+                    audit_legacy_candidate(round_tripped, catalog).disposition,
+                    PromotionDisposition.PROMOTED,
+                )
+
+    def test_quality_i2_audit_and_promotion_never_full_verify_or_read_unrelated(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_legacy import (
+            PromotionDisposition,
+            audit_legacy_candidate,
+            promote_legacy_candidate,
+        )
+
+        query = _schedule_query()
+        unrelated = _legacy_schedule_query(role="unrelated")
+        unrelated["url"] = str(unrelated["url"]) + "&unused=1"
+        with tempfile.TemporaryDirectory() as directory:
+            repository, legacy_root, inventory, digest = _repository_records(
+                Path(directory),
+                (
+                    ("mlb_schedule", _legacy_schedule_query(), _schedule_raw()),
+                    ("mlb_schedule", unrelated, b"unrelated protected payload\n"),
+                ),
+            )
+            from mlb_backtest import v52_legacy
+
+            original_verifier = v52_legacy.verify_protected_raw_inventory
+            with patch.object(
+                v52_legacy,
+                "verify_protected_raw_inventory",
+                wraps=original_verifier,
+            ) as verifier:
+                catalog = _load(repository, legacy_root, inventory, digest)
+            self.assertEqual(verifier.call_count, 1)
+
+            def assert_metadata_only(value: object) -> None:
+                self.assertNotIsInstance(value, (bytes, bytearray, memoryview))
+                if dataclasses.is_dataclass(value):
+                    for field in dataclasses.fields(value):
+                        assert_metadata_only(getattr(value, field.name))
+                elif isinstance(value, Mapping):
+                    for key, item in value.items():
+                        assert_metadata_only(key)
+                        assert_metadata_only(item)
+                elif isinstance(value, (tuple, list, set, frozenset)):
+                    for item in value:
+                        assert_metadata_only(item)
+
+            assert_metadata_only(catalog)
+            inventory_document = json.loads(inventory.read_bytes())
+            unrelated_path = repository / next(
+                record["raw"]["path"]
+                for record in inventory_document["records"]
+                if record["canonical_query"].get("role") == "unrelated"
+            )
+            unrelated_candidate = next(
+                candidate
+                for candidate in catalog.candidates
+                if candidate.payload_path == unrelated_path
+            )
+            original_snapshot = v52_legacy._snapshot
+            from mlb_backtest import v52_evidence
+
+            self.assertFalse(
+                hasattr(v52_evidence, "verify_protected_raw_inventory")
+            )
+
+            def reject_unrelated(root: Path, path: Path):
+                if path == unrelated_candidate.payload_path:
+                    raise AssertionError("audit opened unrelated payload")
+                return original_snapshot(root, path)
+
+            with (
+                patch(
+                    "mlb_backtest.v52_legacy.verify_protected_raw_inventory",
+                    side_effect=AssertionError("audit reran full verifier"),
+                ),
+                patch("mlb_backtest.v52_legacy._snapshot", side_effect=reject_unrelated),
+            ):
+                decision = audit_legacy_candidate(query, catalog)
+                self.assertIs(decision.disposition, PromotionDisposition.PROMOTED)
+                published = promote_legacy_candidate(
+                    _store(repository), query, catalog, decision
+                )
+            self.assertEqual(published.storage_mode, "PROTECTED_LEGACY_REFERENCE")
+
+    def test_quality_i3_i4_malformed_current_query_is_closed_fetch(self) -> None:
+        from mlb_backtest.v52_legacy import (
+            PromotionDisposition,
+            PromotionReasonCode,
+            audit_legacy_candidate,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository, legacy_root, inventory, digest = _repository(Path(directory))
+            catalog = _load(repository, legacy_root, inventory, digest)
+            malformed = dataclasses.replace(
+                _schedule_query(),
+                requested_range={
+                    **_schedule_query().requested_range,
+                    "year": [],
+                },
+            )
+            decision = audit_legacy_candidate(malformed, catalog)
+            self.assertIs(decision.disposition, PromotionDisposition.FETCH_REQUIRED)
+            self.assertEqual(
+                decision.reason_codes,
+                (PromotionReasonCode.CURRENT_QUERY_INVALID,),
+            )
+
+            wrong_parser = dataclasses.replace(
+                _schedule_query(), parser_version="v5.2.0"
+            )
+            parser_decision = audit_legacy_candidate(wrong_parser, catalog)
+            self.assertIs(
+                parser_decision.disposition, PromotionDisposition.FETCH_REQUIRED
+            )
+            self.assertEqual(
+                parser_decision.reason_codes,
+                (PromotionReasonCode.CURRENT_PARSER_CONTRACT_UNSATISFIED,),
+            )
+
+    def test_quality_i3_all_json_matcher_fields_have_deterministic_decisions(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_legacy import (
+            PromotionDisposition,
+            audit_legacy_candidate,
+        )
+
+        cases = (
+            (
+                "schedule",
+                "mlb_schedule",
+                _legacy_schedule_query(),
+                _schedule_raw(),
+                lambda _digest: _schedule_query(),
+            ),
+            (
+                "d1",
+                "mlb_stats_pitching",
+                {
+                    **_pitching_query().parameters,
+                    "url": (
+                        "https://statsapi.mlb.com/api/v1/stats?"
+                        + urlencode(tuple(_pitching_query().parameters.items()))
+                    ),
+                },
+                (SOURCE_FIXTURES / "pitching_mini.json").read_bytes(),
+                lambda _digest: _pitching_query(),
+            ),
+            (
+                "career",
+                "mlb_stats_pitcher_bf",
+                {
+                    **_career_query().parameters,
+                    "pitcher_id": 101,
+                    "url": (
+                        "https://statsapi.mlb.com/api/v1/people/101/stats?"
+                        + urlencode(tuple(_career_query().parameters.items()))
+                    ),
+                },
+                b'{"stats":[]}',
+                lambda _digest: _career_query(),
+            ),
+            (
+                "statcast",
+                "baseball_savant_statcast",
+                {
+                    "start": "2024-04-02",
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "url": statcast_url("2024-04-02", "2024-04-02"),
+                },
+                (SOURCE_FIXTURES / "statcast_mini.csv").read_bytes(),
+                _statcast_query,
+            ),
+        )
+        malformed_values: tuple[object, ...] = (None, [], {}, "wrong", 7)
+        for label, source, legacy_query, raw, query_factory in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                repository, legacy_root, inventory, digest = _repository_records(
+                    Path(directory), ((source, legacy_query, raw),)
+                )
+                catalog = _load(repository, legacy_root, inventory, digest)
+                query = query_factory(digest)
+                for field_name in ("parameters", "requested_range"):
+                    original = getattr(query, field_name)
+                    for key in tuple(original):
+                        for malformed in malformed_values:
+                            if malformed == original[key]:
+                                continue
+                            with self.subTest(
+                                label=label,
+                                field=field_name,
+                                key=key,
+                                malformed=malformed,
+                            ):
+                                changed = dataclasses.replace(
+                                    query,
+                                    **{
+                                        field_name: {
+                                            **original,
+                                            key: malformed,
+                                        }
+                                    },
+                                )
+                                decision = audit_legacy_candidate(changed, catalog)
+                                self.assertIs(
+                                    decision.disposition,
+                                    PromotionDisposition.FETCH_REQUIRED,
+                                )
+
+    def test_quality_i4_promotion_noneligibility_and_publisher_failures_are_typed(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_evidence import ProtectedLegacyPublishReverifyError
+        from mlb_backtest.v52_legacy import (
+            LegacyPromotionNotEligibleError,
+            PromotionReasonCode,
+            ProtectedLegacyIntegrityError,
+            audit_legacy_candidate,
+            promote_legacy_candidate,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository, legacy_root, inventory, digest = _repository(Path(directory))
+            catalog = _load(repository, legacy_root, inventory, digest)
+            query = _schedule_query()
+            decision = audit_legacy_candidate(query, catalog)
+            store = _store(repository)
+            with (
+                patch(
+                    "mlb_backtest.v52_legacy.recompute_query_sidecar",
+                    side_effect=ValueError("fresh semantic rejection"),
+                ),
+                self.assertRaises(LegacyPromotionNotEligibleError) as noneligible,
+            ):
+                promote_legacy_candidate(store, query, catalog, decision)
+            self.assertEqual(
+                noneligible.exception.reason_code,
+                PromotionReasonCode.CURRENT_SEMANTIC_CONTRACT_UNSATISFIED,
+            )
+
+            with (
+                patch.object(
+                    store,
+                    "publish_legacy_reference",
+                    side_effect=ProtectedLegacyPublishReverifyError("changed"),
+                ),
+                self.assertRaises(ProtectedLegacyIntegrityError) as protected,
+            ):
+                promote_legacy_candidate(store, query, catalog, decision)
+            self.assertEqual(
+                protected.exception.reason_code,
+                PromotionReasonCode.PROTECTED_PUBLISH_REVERIFY_FAILED,
+            )
+
+            with patch.object(
+                store,
+                "publish_legacy_reference",
+                side_effect=ValueError("generic publisher rejection"),
+            ), self.assertRaisesRegex(ValueError, "generic publisher rejection"):
+                promote_legacy_candidate(store, query, catalog, decision)
+
+    def test_quality_m1_has_no_exception_message_classifier(self) -> None:
+        from mlb_backtest import v52_legacy
+
+        self.assertFalse(hasattr(v52_legacy, "_reason_for_inventory_failure"))
+
     def test_public_records_are_frozen_and_catalog_is_inventory_bound(self) -> None:
         from mlb_backtest.v52_legacy import (
             LegacyCandidate,
@@ -624,7 +973,7 @@ class V52LegacyTest(unittest.TestCase):
             )
             self.assertIs(
                 structurally_invalid.disposition,
-                PromotionDisposition.FATAL_INTEGRITY,
+                PromotionDisposition.FETCH_REQUIRED,
             )
             self.assertEqual(structurally_invalid.query_id, "0" * 64)
             self.assertEqual(
@@ -1004,9 +1353,19 @@ class V52LegacyTest(unittest.TestCase):
                             decision.disposition,
                             PromotionDisposition.FETCH_REQUIRED,
                         )
+                        if "parser_version" in mutation:
+                            expected_reason = (
+                                PromotionReasonCode.CURRENT_PARSER_CONTRACT_UNSATISFIED
+                            )
+                        elif "source" in mutation and label != "schedule":
+                            expected_reason = PromotionReasonCode.CURRENT_QUERY_INVALID
+                        else:
+                            expected_reason = (
+                                PromotionReasonCode.NO_EXACT_PROTECTED_CANDIDATE
+                            )
                         self.assertEqual(
                             decision.reason_codes,
-                            (PromotionReasonCode.NO_EXACT_PROTECTED_CANDIDATE,),
+                            (expected_reason,),
                         )
 
         noncanonical_pairs = (
@@ -1236,7 +1595,6 @@ class V52LegacyTest(unittest.TestCase):
         self,
     ) -> None:
         import mlb_backtest.v52_legacy as legacy_module
-        from mlb_backtest.v52_legacy import ProtectedLegacyIntegrityError
 
         with tempfile.TemporaryDirectory() as directory:
             repository, legacy_root, inventory, digest = _repository(Path(directory))
@@ -1281,16 +1639,15 @@ class V52LegacyTest(unittest.TestCase):
                     side_effect=mark_verified,
                 ),
                 patch.object(legacy_module.os, "read", side_effect=swapping_read),
-                self.assertRaises(ProtectedLegacyIntegrityError),
             ):
-                _load(repository, legacy_root, inventory, digest)
-            self.assertTrue(swapped)
+                catalog = _load(repository, legacy_root, inventory, digest)
+            self.assertFalse(swapped)
+            self.assertEqual(len(catalog.candidates), 1)
 
     def test_catalog_final_collective_rebind_rechecks_earlier_record_after_later_read(
         self,
     ) -> None:
         import mlb_backtest.v52_legacy as legacy_module
-        from mlb_backtest.v52_legacy import ProtectedLegacyIntegrityError
 
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repository"
@@ -1355,14 +1712,10 @@ class V52LegacyTest(unittest.TestCase):
                     side_effect=mark_verified,
                 ),
                 patch.object(legacy_module.os, "read", side_effect=swapping_read),
-                self.assertRaises(ProtectedLegacyIntegrityError) as caught,
             ):
-                _load(repository, legacy_root, inventory, digest)
-            self.assertTrue(swapped)
-            self.assertEqual(
-                caught.exception.reason_code,
-                legacy_module.PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED,
-            )
+                catalog = _load(repository, legacy_root, inventory, digest)
+            self.assertFalse(swapped)
+            self.assertEqual(len(catalog.candidates), 2)
 
     def test_catalog_rejects_same_bytes_member_replacement_after_inventory_verifier(
         self,
@@ -1489,11 +1842,11 @@ class V52LegacyTest(unittest.TestCase):
                     (),
                     PromotionDisposition.FETCH_REQUIRED,
                     (PromotionReasonCode.NO_EXACT_PROTECTED_CANDIDATE,),
-                    PromotionDisposition.FATAL_INTEGRITY,
+                    PromotionDisposition.FETCH_REQUIRED,
                     (PromotionReasonCode.CURRENT_QUERY_INVALID,),
                     PromotionDisposition.FATAL_INTEGRITY,
                     (PromotionReasonCode.CATALOG_NOT_UNIQUE,),
-                    PromotionDisposition.FATAL_INTEGRITY,
+                    PromotionDisposition.FETCH_REQUIRED,
                     (PromotionReasonCode.CURRENT_QUERY_INVALID,),
                 ),
             )
@@ -1504,8 +1857,10 @@ class V52LegacyTest(unittest.TestCase):
                 if reason
                 not in {
                     PromotionReasonCode.NO_EXACT_PROTECTED_CANDIDATE,
+                    PromotionReasonCode.CURRENT_PARSER_CONTRACT_UNSATISFIED,
                     PromotionReasonCode.CURRENT_SEMANTIC_CONTRACT_UNSATISFIED,
                     PromotionReasonCode.CURRENT_QUERY_INVALID,
+                    PromotionReasonCode.PROTECTED_PUBLISH_REVERIFY_FAILED,
                 }
             )
             for reason in propagated:
@@ -1513,7 +1868,7 @@ class V52LegacyTest(unittest.TestCase):
                     self.subTest(reason=reason),
                     patch.object(
                         legacy_module,
-                        "_load_verified_records",
+                        "_revalidate_catalog",
                         side_effect=ProtectedLegacyIntegrityError(reason),
                     ),
                 ):
@@ -1552,10 +1907,10 @@ class V52LegacyTest(unittest.TestCase):
                 side_effect=verify_then_replace,
             ):
                 member_reverify = audit_legacy_candidate(_schedule_query(), catalog)
-            self.assertTrue(replaced)
+            self.assertFalse(replaced)
             self.assertEqual(
-                member_reverify.reason_codes,
-                (PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED,),
+                member_reverify.disposition,
+                PromotionDisposition.PROMOTED,
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1581,7 +1936,7 @@ class V52LegacyTest(unittest.TestCase):
                 promote_legacy_candidate(_store(repository), query, catalog, decision)
             self.assertEqual(
                 caught.exception.reason_code,
-                PromotionReasonCode.LEGACY_RAW_BYTES_INVALID,
+                PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED,
             )
 
     def test_promotion_fails_fatal_when_payload_changes_after_audit(self) -> None:
