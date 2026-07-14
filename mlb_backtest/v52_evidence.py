@@ -9,10 +9,13 @@ import re
 import stat
 import threading
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import ContextManager, Literal
+
+from .v52_protected_inventory import verify_protected_raw_inventory
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -29,6 +32,47 @@ _SELECTED_HEADERS = {
     "last-modified": "Last-Modified",
     "retry-after": "Retry-After",
 }
+_ATTEMPT_KEYS = {
+    "attempt_number",
+    "body_sha256",
+    "byte_count",
+    "ended_at_utc",
+    "error_classification",
+    "final_url",
+    "http_status",
+    "outcome",
+    "query_id",
+    "response_headers",
+    "schema_version",
+    "started_at_utc",
+}
+_ATTEMPT_OUTCOMES = {
+    "PERMANENT_HTTP",
+    "PERMANENT_NETWORK",
+    "QUARANTINED",
+    "SPLIT_REQUIRED",
+    "SUCCESS",
+    "TRANSIENT_HTTP",
+    "TRANSIENT_NETWORK",
+}
+_LEGACY_REFERENCE_KEYS = {
+    "canonical_query",
+    "legacy_manifest_path",
+    "legacy_manifest_sha256",
+    "legacy_seal_path",
+    "legacy_seal_sha256",
+    "parser_version",
+    "payload_path",
+    "protected_inventory_path",
+    "protected_inventory_sha256",
+    "raw_byte_count",
+    "raw_row_count",
+    "raw_sha256",
+    "semantic_sha256",
+    "source",
+}
+_V52_RAW_RELATIVE = Path("data/v5_2_qd/historical/raw")
+_PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
 
 
 @dataclass(frozen=True)
@@ -72,6 +116,7 @@ class QueryLease:
     _store_identity: int
     _descriptor: int
     _owner_thread: int
+    _directory_descriptors: tuple[int, ...]
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -149,7 +194,7 @@ def _query_record(query: LogicalQuery) -> dict[str, object]:
     )
     parameters = _normalized_json_object(query.parameters, "parameters")
     requested_range = _normalized_json_object(query.requested_range, "requested_range")
-    return {
+    record = {
         "acquisition_contract_sha256": query.acquisition_contract_sha256,
         "endpoint": query.endpoint,
         "expected_media_type": query.expected_media_type,
@@ -161,6 +206,7 @@ def _query_record(query: LogicalQuery) -> dict[str, object]:
         "run_spec_sha256": query.run_spec_sha256,
         "source": query.source,
     }
+    return record
 
 
 def canonical_query_bytes(query: LogicalQuery) -> bytes:
@@ -447,6 +493,95 @@ def _selected_headers(capture: AttemptCapture) -> dict[str, str]:
     return dict(sorted(selected.items()))
 
 
+def _parsed_utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
+        raise ValueError(f"attempt {label} timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"attempt {label} timestamp is invalid") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError(f"attempt {label} timestamp is invalid")
+    return parsed
+
+
+def _validate_attempt_record(
+    record: object, expected_query_id: str, expected_number: int
+) -> dict[str, object]:
+    if not isinstance(record, dict) or set(record) != _ATTEMPT_KEYS:
+        raise ValueError("attempt receipt keys differ")
+    if record["schema_version"] != 1:
+        raise ValueError("attempt receipt schema version differs")
+    if record["query_id"] != expected_query_id:
+        raise ValueError("attempt receipt query binding differs")
+    if (
+        type(record["attempt_number"]) is not int
+        or record["attempt_number"] != expected_number
+    ):
+        raise ValueError("attempt receipt number binding differs")
+    started = _parsed_utc_timestamp(record["started_at_utc"], "start")
+    ended = _parsed_utc_timestamp(record["ended_at_utc"], "end")
+    if ended < started:
+        raise ValueError("attempt receipt timestamp order differs")
+    final_url = record["final_url"]
+    if final_url is not None and (type(final_url) is not str or not final_url):
+        raise ValueError("attempt receipt final URL differs")
+    status = record["http_status"]
+    if status is not None and (type(status) is not int or not 100 <= status <= 599):
+        raise ValueError("attempt receipt HTTP status differs")
+    byte_count = record["byte_count"]
+    if type(byte_count) is not int or byte_count < 0:
+        raise ValueError("attempt receipt byte count differs")
+    body_sha256 = record["body_sha256"]
+    if body_sha256 is None:
+        if byte_count != 0:
+            raise ValueError("attempt receipt body binding differs")
+    else:
+        _validate_sha256(body_sha256, "attempt body_sha256")
+    headers = record["response_headers"]
+    if not isinstance(headers, dict) or not set(headers) <= set(
+        _SELECTED_HEADERS.values()
+    ):
+        raise ValueError("attempt receipt selected headers differ")
+    if any(
+        type(name) is not str or type(value) is not str
+        for name, value in headers.items()
+    ):
+        raise ValueError("attempt receipt selected headers differ")
+    content_length = headers.get("Content-Length")
+    if content_length is not None and (
+        not content_length.isdigit() or int(content_length) != byte_count
+    ):
+        raise ValueError("attempt receipt byte count differs from Content-Length")
+    outcome = record["outcome"]
+    if outcome not in _ATTEMPT_OUTCOMES:
+        raise ValueError("attempt receipt outcome differs")
+    classification = record["error_classification"]
+    if classification is not None and (
+        type(classification) is not str or not classification
+    ):
+        raise ValueError("attempt receipt error classification differs")
+    if outcome == "SUCCESS":
+        if (
+            status is None
+            or not 200 <= status <= 299
+            or final_url is None
+            or body_sha256 is None
+            or classification is not None
+        ):
+            raise ValueError("successful attempt branch semantics differ")
+    elif outcome == "QUARANTINED":
+        if body_sha256 is None or classification is None:
+            raise ValueError("quarantined attempt branch semantics differ")
+    elif classification is None:
+        raise ValueError("failed attempt classification is missing")
+    if outcome.endswith("_HTTP") and (status is None or final_url is None):
+        raise ValueError("HTTP attempt branch semantics differ")
+    if outcome.endswith("_NETWORK") and status is not None:
+        raise ValueError("network attempt branch semantics differ")
+    return record
+
+
 def _attempt_record(
     query_id: str,
     attempt_number: int,
@@ -465,10 +600,10 @@ def _attempt_record(
     if classification is not None:
         _validate_text(classification, "error_classification")
     body = capture.body
-    return {
+    record = {
         "attempt_number": attempt_number,
         "body_sha256": _sha256_bytes(body) if body is not None else None,
-        "bytes_received": len(body) if body is not None else 0,
+        "byte_count": len(body) if body is not None else 0,
         "ended_at_utc": capture.ended_at_utc,
         "error_classification": classification,
         "final_url": capture.final_url,
@@ -479,6 +614,8 @@ def _attempt_record(
         "schema_version": 1,
         "started_at_utc": capture.started_at_utc,
     }
+    _validate_attempt_record(record, query_id, attempt_number)
+    return record
 
 
 def _before_success_publish() -> None:
@@ -501,12 +638,10 @@ class V52EvidenceStore:
                 raise ValueError("evidence root ancestors must be directories")
             if node == supplied and not stat.S_ISDIR(metadata.st_mode):
                 raise ValueError("evidence root must be a directory")
-        try:
-            canonical_parent = supplied.parent.resolve(strict=True)
-        except OSError as exc:
-            raise ValueError("evidence root parent is unavailable") from exc
+        if not supplied.parent.is_dir():
+            raise ValueError("evidence root parent is unavailable")
         self.root = supplied
-        self._canonical_root = canonical_parent / supplied.name
+        self._canonical_root = supplied
         descriptor = _open_root_path(self._canonical_root, create=True)
         os.close(descriptor)
         self._local = threading.local()
@@ -537,10 +672,14 @@ class V52EvidenceStore:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
 
-    def _verify_query_chain(self, query: LogicalQuery, descriptors: list[int]) -> None:
+    def _verify_query_descriptor_chain(
+        self,
+        source: str,
+        query_id: str,
+        descriptors: tuple[int, ...] | list[int],
+    ) -> None:
         if len(descriptors) != 4:
             raise ValueError("query descriptor chain differs")
-        query_id = logical_query_id(query)
         fresh_root = self._root_fd()
         try:
             if (
@@ -554,7 +693,7 @@ class V52EvidenceStore:
         finally:
             os.close(fresh_root)
         try:
-            for index, name in enumerate(("queries", query.source, query_id)):
+            for index, name in enumerate(("queries", source, query_id)):
                 opened = os.fstat(descriptors[index + 1])
                 linked = os.stat(name, dir_fd=descriptors[index], follow_symlinks=False)
                 if (
@@ -566,6 +705,11 @@ class V52EvidenceStore:
         except OSError as exc:
             raise ValueError("query directory identity changed") from exc
 
+    def _verify_query_chain(self, query: LogicalQuery, descriptors: list[int]) -> None:
+        self._verify_query_descriptor_chain(
+            query.source, logical_query_id(query), descriptors
+        )
+
     def _validate_registered(self, query: LogicalQuery, query_fd: int) -> str:
         query_id = logical_query_id(query)
         contents = _read_regular_at(query_fd, "query.json", "logical query")
@@ -574,6 +718,16 @@ class V52EvidenceStore:
         for name in ("attempts", "objects", "sidecars"):
             descriptor = _open_directory_at(query_fd, name, create=False)
             os.close(descriptor)
+        allowed = {
+            ".query.lock",
+            "attempts",
+            "objects",
+            "query.json",
+            "sidecars",
+            "success.json",
+        }
+        if not set(os.listdir(query_fd)) <= allowed:
+            raise ValueError("query directory membership is ambiguous")
         return query_id
 
     def register_query(self, query: LogicalQuery) -> str:
@@ -610,17 +764,36 @@ class V52EvidenceStore:
             or lease._owner_thread != threading.get_ident()
         ):
             raise RuntimeError("operation requires the active per-query lease")
-        metadata = os.fstat(lease._descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise ValueError("query lease lock is unsafe")
+        self._verify_lease_binding(lease)
         return lease
+
+    def _verify_lease_binding(self, lease: QueryLease) -> None:
+        self._verify_query_descriptor_chain(
+            lease.source, lease.query_id, lease._directory_descriptors
+        )
+        query_fd = lease._directory_descriptors[-1]
+        try:
+            metadata = os.fstat(lease._descriptor)
+            linked = os.stat(".query.lock", dir_fd=query_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("query lease lock identity changed") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != 0
+            or _identity(metadata) != _identity(linked)
+        ):
+            raise ValueError("query lease lock identity changed")
 
     def _ensure_unpublished(self, query: LogicalQuery) -> None:
         if self.load_success(query) is not None:
             raise RuntimeError("query success is already published and terminal")
 
+    def acquire_query(self, query: LogicalQuery) -> ContextManager[QueryLease]:
+        return self._acquire_query_context(query)
+
     @contextmanager
-    def acquire_query(self, query: LogicalQuery) -> Iterator[QueryLease]:
+    def _acquire_query_context(self, query: LogicalQuery) -> Iterator[QueryLease]:
         query_id = self.register_query(query)
         active = self._active_leases()
         if query_id in active:
@@ -663,13 +836,18 @@ class V52EvidenceStore:
                 id(self),
                 lock_descriptor,
                 threading.get_ident(),
+                tuple(descriptors),
             )
+            self._verify_lease_binding(lease)
             active[query_id] = lease
             try:
                 yield lease
             finally:
                 active.pop(query_id, None)
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                try:
+                    self._verify_lease_binding(lease)
+                finally:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         finally:
             if lock_descriptor >= 0:
                 os.close(lock_descriptor)
@@ -714,15 +892,18 @@ class V52EvidenceStore:
                 reservations.add(number)
             elif receipt:
                 number = int(receipt.group("number"))
-                _json_object(
+                record = _json_object(
                     _read_regular_at(attempts_fd, name, "attempt receipt"),
                     "attempt receipt",
                 )
+                _validate_attempt_record(record, expected_query_id, number)
                 receipts.add(number)
             else:
                 raise ValueError("attempt directory contains an ambiguous entry")
         if not receipts <= reservations:
             raise ValueError("attempt receipt has no immutable reservation")
+        if reservations and reservations != set(range(1, max(reservations) + 1)):
+            raise ValueError("attempt reservation order has a gap")
         return reservations, receipts
 
     def next_attempt_number(self, lease: QueryLease) -> int:
@@ -731,6 +912,7 @@ class V52EvidenceStore:
         active = self._active_leases().get(lease.query_id)
         if active is not lease or lease._owner_thread != threading.get_ident():
             raise RuntimeError("attempt reservation requires the active query lease")
+        self._verify_lease_binding(lease)
         query = self._query_from_registered_lease(lease)
         self._ensure_unpublished(query)
         attempts_fd, descriptors = self._attempts_fd(query)
@@ -752,6 +934,7 @@ class V52EvidenceStore:
                 _canonical_file_bytes(record),
                 "attempt reservation",
             )
+            self._require_lease(query)
             return number
         finally:
             os.close(attempts_fd)
@@ -823,6 +1006,7 @@ class V52EvidenceStore:
                 _canonical_file_bytes(record),
                 "attempt receipt",
             )
+            self._require_lease(query)
             return self.root / _relative_path(
                 query.source, logical_query_id(query), "attempts", name
             )
@@ -935,14 +1119,13 @@ class V52EvidenceStore:
             os.close(attempts_fd)
             self._close_fds(descriptors)
 
-    def _publish_sidecar(
+    def _sidecar_artifact(
         self,
         query: LogicalQuery,
         raw_sha256: str,
         byte_count: int,
         semantics: Mapping[str, object],
-        sidecars_fd: int,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, bytes]:
         semantic_record = _normalized_json_object(semantics, "query_sidecar")
         sidecar = {
             "byte_count": byte_count,
@@ -957,8 +1140,28 @@ class V52EvidenceStore:
         contents = _canonical_file_bytes(sidecar)
         digest = _sha256_bytes(contents)
         name = f"{digest}.json"
-        _write_once_at(sidecars_fd, name, contents, "query semantic sidecar")
-        return name, digest
+        return name, digest, contents
+
+    @staticmethod
+    def _ensure_content_slot(
+        directory_fd: int,
+        expected_name: str,
+        expected_contents: bytes,
+        label: str,
+    ) -> None:
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise ValueError(f"{label} inventory cannot be read safely") from exc
+        if len(names) > 1:
+            for name in names:
+                _read_regular_at(directory_fd, name, label)
+            raise RuntimeError(f"duplicate ambiguous {label} inventory")
+        if names:
+            existing_name = names[0]
+            existing = _read_regular_at(directory_fd, existing_name, label)
+            if existing_name != expected_name or existing != expected_contents:
+                raise RuntimeError(f"conflicting ambiguous {label} inventory")
 
     def _manifest_base(
         self,
@@ -1008,11 +1211,30 @@ class V52EvidenceStore:
         try:
             query_fd = descriptors[-1]
             self._validate_registered(query, query_fd)
-            attempts_fd = _open_directory_at(query_fd, "attempts", create=False)
-            objects_fd = _open_directory_at(query_fd, "objects", create=False)
-            sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
-            try:
+            with ExitStack() as opened:
+                attempts_fd = _open_directory_at(query_fd, "attempts", create=False)
+                opened.callback(os.close, attempts_fd)
+                objects_fd = _open_directory_at(query_fd, "objects", create=False)
+                opened.callback(os.close, objects_fd)
+                sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
+                opened.callback(os.close, sidecars_fd)
                 self._validate_attempt_reservation(query, attempt_number, attempts_fd)
+                body = capture.body
+                raw_sha256 = _sha256_bytes(body)
+                raw_name = f"{raw_sha256}.raw"
+                sidecar_name, sidecar_sha256, sidecar_contents = self._sidecar_artifact(
+                    query,
+                    raw_sha256,
+                    len(body),
+                    query_sidecar,
+                )
+                self._ensure_content_slot(objects_fd, raw_name, body, "query object")
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
                 attempt = _attempt_record(query_id, attempt_number, capture, "SUCCESS")
                 _write_once_at(
                     attempts_fd,
@@ -1020,16 +1242,19 @@ class V52EvidenceStore:
                     _canonical_file_bytes(attempt),
                     "attempt receipt",
                 )
-                body = capture.body
-                raw_sha256 = _sha256_bytes(body)
-                raw_name = f"{raw_sha256}.raw"
                 _write_once_at(objects_fd, raw_name, body, "fetched raw object")
-                sidecar_name, sidecar_sha256 = self._publish_sidecar(
-                    query,
-                    raw_sha256,
-                    len(body),
-                    query_sidecar,
+                _write_once_at(
                     sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query semantic sidecar",
+                )
+                self._ensure_content_slot(objects_fd, raw_name, body, "query object")
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
                 )
                 manifest = {
                     **self._manifest_base(
@@ -1047,47 +1272,109 @@ class V52EvidenceStore:
                 }
                 _before_success_publish()
                 self._verify_query_chain(query, descriptors)
+                self._require_lease(query)
                 _write_once_at(
                     query_fd,
                     "success.json",
                     _canonical_file_bytes(manifest),
                     "success receipt",
                 )
-            finally:
-                os.close(sidecars_fd)
-                os.close(objects_fd)
-                os.close(attempts_fd)
         finally:
             self._close_fds(descriptors)
-        return self.verify_success(query)
+        published = self.verify_success(query)
+        self._require_lease(query)
+        return published
 
-    def _read_external_payload(self, value: object) -> bytes:
-        if not isinstance(value, str) or not value or "\x00" in value:
-            raise ValueError("legacy payload_path must be nonempty text")
-        path = Path(value)
-        if not path.is_absolute():
-            if ".." in path.parts or "\\" in value:
-                raise ValueError("legacy payload path traversal is forbidden")
-            path = self.root / path
-        if path.is_symlink():
-            raise ValueError("protected legacy payload cannot be a symlink")
+    def _legacy_repository_root(self) -> Path:
+        if self.root.parts[-len(_V52_RAW_RELATIVE.parts) :] != _V52_RAW_RELATIVE.parts:
+            raise ValueError(
+                "protected legacy reference requires the canonical raw root"
+            )
+        repository = self.root
+        for _ in _V52_RAW_RELATIVE.parts:
+            repository = repository.parent
+        if self.root.relative_to(repository) != _V52_RAW_RELATIVE:
+            raise ValueError("protected legacy repository binding differs")
+        for node in (*reversed(repository.parents), repository):
+            metadata = node.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("protected legacy root has a symlink ancestor")
+        return repository
+
+    @staticmethod
+    def _validated_relative_path(value: object, label: str) -> Path:
+        if (
+            type(value) is not str
+            or not value
+            or value.startswith("/")
+            or "\\" in value
+            or any(part in {"", ".", ".."} for part in Path(value).parts)
+        ):
+            raise ValueError(f"{label} path is invalid")
+        return Path(value)
+
+    def _read_repository_relative(
+        self, repository: Path, value: object, label: str
+    ) -> bytes:
+        relative = self._validated_relative_path(value, label)
+        root_fd = _open_root_path(repository, create=False)
+        descriptors = [root_fd]
         try:
-            path = path.parent.resolve(strict=True) / path.name
-        except OSError as exc:
-            raise ValueError("protected legacy payload parent is unavailable") from exc
-        parent_fd = _open_root_path(path.parent, create=False)
-        try:
-            return _read_regular_at(parent_fd, path.name, "protected legacy payload")
+            for component in relative.parts[:-1]:
+                child = _open_directory_at(descriptors[-1], component, create=False)
+                descriptors.append(child)
+            return _read_regular_at(descriptors[-1], relative.name, label)
         finally:
-            os.close(parent_fd)
+            self._close_fds(descriptors)
 
     def _validated_legacy_reference(
-        self, legacy_reference: Mapping[str, object]
+        self,
+        query: LogicalQuery,
+        legacy_reference: Mapping[str, object],
+        semantics: Mapping[str, object] | None,
     ) -> tuple[dict[str, object], bytes]:
         reference = _normalized_json_object(legacy_reference, "legacy_reference")
-        required = {"payload_path", "raw_byte_count", "raw_sha256"}
-        if not required <= set(reference):
-            raise ValueError("legacy_reference lacks payload binding fields")
+        if set(reference) != _LEGACY_REFERENCE_KEYS:
+            raise ValueError("legacy reference lineage keys differ")
+        repository = self._legacy_repository_root()
+        if (
+            reference["protected_inventory_path"]
+            != _PROTECTED_INVENTORY_RELATIVE.as_posix()
+        ):
+            raise ValueError("protected inventory lineage path differs")
+        inventory_sha256 = _validate_sha256(
+            reference["protected_inventory_sha256"],
+            "protected_inventory_sha256",
+        )
+        inventory_bytes = self._read_repository_relative(
+            repository,
+            reference["protected_inventory_path"],
+            "protected raw inventory",
+        )
+        if _sha256_bytes(inventory_bytes) != inventory_sha256:
+            raise ValueError("protected inventory lineage hash differs")
+        inventory = verify_protected_raw_inventory(
+            repository,
+            repository / _PROTECTED_INVENTORY_RELATIVE,
+        )
+        if (
+            self._read_repository_relative(
+                repository,
+                reference["protected_inventory_path"],
+                "protected raw inventory",
+            )
+            != inventory_bytes
+        ):
+            raise ValueError("protected inventory changed during verification")
+        if (
+            reference["source"] != query.source
+            or reference["parser_version"] != query.parser_version
+        ):
+            raise ValueError("legacy reference parser or source binding differs")
+        canonical_query = _normalized_json_object(
+            reference["canonical_query"],
+            "legacy canonical_query",  # type: ignore[arg-type]
+        )
         digest = _validate_sha256(reference.get("raw_sha256"), "raw_sha256")
         byte_count = reference.get("raw_byte_count")
         if (
@@ -1096,9 +1383,74 @@ class V52EvidenceStore:
             or byte_count < 0
         ):
             raise ValueError("raw_byte_count must be a nonnegative integer")
-        payload = self._read_external_payload(reference.get("payload_path"))
+        row_count = reference.get("raw_row_count")
+        if type(row_count) is not int or row_count < 0:
+            raise ValueError("raw_row_count must be a nonnegative integer")
+        for key in (
+            "legacy_manifest_sha256",
+            "legacy_seal_sha256",
+            "semantic_sha256",
+        ):
+            _validate_sha256(reference[key], key)
+        matches = [
+            record
+            for record in inventory["records"]  # type: ignore[index]
+            if record["source"] == reference["source"]
+            and record["canonical_query"] == canonical_query
+            and record["manifest"]["path"] == reference["legacy_manifest_path"]
+            and record["manifest"]["sha256"] == reference["legacy_manifest_sha256"]
+            and record["seal"]["path"] == reference["legacy_seal_path"]
+            and record["seal"]["sha256"] == reference["legacy_seal_sha256"]
+            and record["raw"]["path"] == reference["payload_path"]
+            and record["raw"]["sha256"] == digest
+            and record["raw"]["byte_size"] == byte_count
+        ]
+        if len(matches) != 1:
+            raise ValueError("legacy reference is not an exact Task0 inventory record")
+        manifest_bytes = self._read_repository_relative(
+            repository,
+            reference["legacy_manifest_path"],
+            "protected legacy manifest",
+        )
+        seal_bytes = self._read_repository_relative(
+            repository,
+            reference["legacy_seal_path"],
+            "protected legacy seal",
+        )
+        payload = self._read_repository_relative(
+            repository,
+            reference["payload_path"],
+            "protected legacy payload",
+        )
+        if _sha256_bytes(manifest_bytes) != reference["legacy_manifest_sha256"]:
+            raise ValueError("protected legacy manifest hash differs")
+        if _sha256_bytes(seal_bytes) != reference["legacy_seal_sha256"]:
+            raise ValueError("protected legacy seal hash differs")
+        if seal_bytes != f"{_sha256_bytes(manifest_bytes)}\n".encode("ascii"):
+            raise ValueError("protected legacy manifest seal differs")
+        try:
+            manifest = json.loads(manifest_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("protected legacy manifest is invalid") from exc
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("source") != reference["source"]
+            or manifest.get("query") != canonical_query
+            or manifest.get("sha256") != digest
+            or manifest.get("row_count") != row_count
+        ):
+            raise ValueError("protected legacy manifest binding differs")
         if len(payload) != byte_count or _sha256_bytes(payload) != digest:
             raise ValueError("protected legacy payload binding differs")
+        if sum(bool(line.strip()) for line in payload.splitlines()) != row_count:
+            raise ValueError("protected legacy payload row count differs")
+        if semantics is not None:
+            semantic_record = _normalized_json_object(semantics, "query_sidecar")
+            if (
+                _sha256_bytes(_canonical_json_bytes(semantic_record))
+                != reference["semantic_sha256"]
+            ):
+                raise ValueError("legacy semantic hash binding differs")
         return reference, payload
 
     def publish_legacy_reference(
@@ -1109,30 +1461,63 @@ class V52EvidenceStore:
     ) -> PublishedEvidence:
         self._require_lease(query)
         self._ensure_unpublished(query)
-        reference, payload = self._validated_legacy_reference(legacy_reference)
+        reference, payload = self._validated_legacy_reference(
+            query, legacy_reference, query_sidecar
+        )
         raw_sha256 = _validate_sha256(reference["raw_sha256"], "raw_sha256")
         query_id, descriptors = self._query_fds(query, create=False)
         try:
             query_fd = descriptors[-1]
             self._validate_registered(query, query_fd)
-            objects_fd = _open_directory_at(query_fd, "objects", create=False)
-            sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
-            try:
+            with ExitStack() as opened:
+                objects_fd = _open_directory_at(query_fd, "objects", create=False)
+                opened.callback(os.close, objects_fd)
+                sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
+                opened.callback(os.close, sidecars_fd)
                 reference_contents = _canonical_file_bytes(reference)
                 reference_sha256 = _sha256_bytes(reference_contents)
                 reference_name = f"{reference_sha256}.legacy-reference.json"
+                sidecar_name, sidecar_sha256, sidecar_contents = self._sidecar_artifact(
+                    query,
+                    raw_sha256,
+                    len(payload),
+                    query_sidecar,
+                )
+                self._ensure_content_slot(
+                    objects_fd,
+                    reference_name,
+                    reference_contents,
+                    "query object",
+                )
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
                 _write_once_at(
                     objects_fd,
                     reference_name,
                     reference_contents,
                     "protected legacy reference",
                 )
-                sidecar_name, sidecar_sha256 = self._publish_sidecar(
-                    query,
-                    raw_sha256,
-                    len(payload),
-                    query_sidecar,
+                _write_once_at(
                     sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query semantic sidecar",
+                )
+                self._ensure_content_slot(
+                    objects_fd,
+                    reference_name,
+                    reference_contents,
+                    "query object",
+                )
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
                 )
                 manifest = {
                     **self._manifest_base(
@@ -1154,18 +1539,18 @@ class V52EvidenceStore:
                 }
                 _before_success_publish()
                 self._verify_query_chain(query, descriptors)
+                self._require_lease(query)
                 _write_once_at(
                     query_fd,
                     "success.json",
                     _canonical_file_bytes(manifest),
                     "success receipt",
                 )
-            finally:
-                os.close(sidecars_fd)
-                os.close(objects_fd)
         finally:
             self._close_fds(descriptors)
-        return self.verify_success(query)
+        published = self.verify_success(query)
+        self._require_lease(query)
+        return published
 
     def load_success(self, query: LogicalQuery) -> PublishedEvidence | None:
         logical_query_id(query)
@@ -1201,6 +1586,36 @@ class V52EvidenceStore:
                 child = _open_directory_at(descriptors[-1], component, create=False)
                 descriptors.append(child)
             return _read_regular_at(descriptors[-1], parts[-1], label)
+        finally:
+            self._close_fds(descriptors)
+
+    def _verify_published_content_slots(
+        self,
+        query: LogicalQuery,
+        *,
+        object_name: str,
+        object_contents: bytes,
+        sidecar_name: str,
+        sidecar_contents: bytes,
+    ) -> None:
+        _, descriptors = self._query_fds(query, create=False)
+        try:
+            query_fd = descriptors[-1]
+            self._validate_registered(query, query_fd)
+            with ExitStack() as opened:
+                objects_fd = _open_directory_at(query_fd, "objects", create=False)
+                opened.callback(os.close, objects_fd)
+                sidecars_fd = _open_directory_at(query_fd, "sidecars", create=False)
+                opened.callback(os.close, sidecars_fd)
+                self._ensure_content_slot(
+                    objects_fd, object_name, object_contents, "query object"
+                )
+                self._ensure_content_slot(
+                    sidecars_fd,
+                    sidecar_name,
+                    sidecar_contents,
+                    "query sidecar",
+                )
         finally:
             self._close_fds(descriptors)
 
@@ -1275,18 +1690,23 @@ class V52EvidenceStore:
             raise ValueError("success raw_byte_count differs")
 
         expected_query_prefix = ("queries", query.source, query_id)
+        legacy_reference_record: dict[str, object] | None = None
         if mode == "FETCHED_RAW":
+            object_path = manifest["fetched_raw_path"]
             raw = self._read_bound_relative(
-                manifest["fetched_raw_path"],  # type: ignore[arg-type]
+                object_path,  # type: ignore[arg-type]
                 (*expected_query_prefix, "objects"),
                 "fetched raw object",
             )
+            object_contents = raw
         else:
+            object_path = manifest["protected_legacy_reference_path"]
             reference_contents = self._read_bound_relative(
-                manifest["protected_legacy_reference_path"],  # type: ignore[arg-type]
+                object_path,  # type: ignore[arg-type]
                 (*expected_query_prefix, "objects"),
                 "protected legacy reference",
             )
+            object_contents = reference_contents
             reference_sha256 = _validate_sha256(
                 manifest.get("protected_legacy_reference_sha256"),
                 "protected reference SHA-256",
@@ -1294,12 +1714,15 @@ class V52EvidenceStore:
             if _sha256_bytes(reference_contents) != reference_sha256:
                 raise ValueError("protected legacy reference hash differs")
             reference = _json_object(reference_contents, "protected legacy reference")
-            _, raw = self._validated_legacy_reference(reference)
+            legacy_reference_record, raw = self._validated_legacy_reference(
+                query, reference, None
+            )
         if len(raw) != raw_byte_count or _sha256_bytes(raw) != raw_sha256:
             raise ValueError("success raw binding differs")
 
+        sidecar_path = manifest.get("query_sidecar_path")
         sidecar_contents = self._read_bound_relative(
-            manifest.get("query_sidecar_path"),  # type: ignore[arg-type]
+            sidecar_path,  # type: ignore[arg-type]
             (*expected_query_prefix, "sidecars"),
             "query semantic sidecar",
         )
@@ -1308,6 +1731,13 @@ class V52EvidenceStore:
         )
         if _sha256_bytes(sidecar_contents) != sidecar_sha256:
             raise ValueError("query sidecar hash differs")
+        self._verify_published_content_slots(
+            query,
+            object_name=Path(object_path).name,  # type: ignore[arg-type]
+            object_contents=object_contents,
+            sidecar_name=Path(sidecar_path).name,  # type: ignore[arg-type]
+            sidecar_contents=sidecar_contents,
+        )
         sidecar = _json_object(sidecar_contents, "query semantic sidecar")
         if set(sidecar) != {
             "byte_count",
@@ -1331,6 +1761,12 @@ class V52EvidenceStore:
             )
         ):
             raise ValueError("query sidecar binding differs")
+        if (
+            legacy_reference_record is not None
+            and _sha256_bytes(_canonical_json_bytes(sidecar["semantics"]))
+            != legacy_reference_record["semantic_sha256"]
+        ):
+            raise ValueError("legacy semantic hash binding differs")
 
         history = manifest.get("attempt_history")
         if not isinstance(history, list):
