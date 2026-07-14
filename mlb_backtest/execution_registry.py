@@ -750,6 +750,10 @@ def _after_registry_publish() -> None:
     """Deterministic late-race test hook; production intentionally does nothing."""
 
 
+def _after_registry_receipt_read() -> None:
+    """Deterministic final-rebind race hook; production intentionally does nothing."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -783,15 +787,14 @@ def _cleanup_created_receipt(
         raise ValueError(f"{label} could not be safely cleaned up") from exc
 
 
-def _verify_published_receipt(
+def _verify_visible_receipt_binding(
     execution_descriptor: int,
     relative: Path,
     parent_fd: int,
     parent_identity: tuple[int, ...],
     descriptor: int,
-    contents: bytes,
     label: str,
-) -> None:
+) -> tuple[int, ...]:
     rebound_parent, descriptors = _open_directory_at(
         execution_descriptor, relative.parent
     )
@@ -811,11 +814,42 @@ def _verify_published_receipt(
         or _identity(opened) != _identity(linked)
     ):
         raise ValueError(f"{label} identity changed after publication")
+    return _identity(opened)
+
+
+def _verify_published_receipt(
+    execution_descriptor: int,
+    relative: Path,
+    parent_fd: int,
+    parent_identity: tuple[int, ...],
+    descriptor: int,
+    contents: bytes,
+    label: str,
+) -> None:
+    """Prove visibility at return; external mutations after return are out of scope."""
+    opened_identity = _verify_visible_receipt_binding(
+        execution_descriptor,
+        relative,
+        parent_fd,
+        parent_identity,
+        descriptor,
+        label,
+    )
     published, published_identity = _read_file_at(
         parent_fd, relative.name, label
     )
-    if published_identity != _identity(opened) or published != contents:
+    if published_identity != opened_identity or published != contents:
         raise ValueError(f"{label} bytes changed after publication")
+    _after_registry_receipt_read()
+    if _verify_visible_receipt_binding(
+        execution_descriptor,
+        relative,
+        parent_fd,
+        parent_identity,
+        descriptor,
+        label,
+    ) != opened_identity:
+        raise ValueError(f"{label} identity changed at publication return")
 
 
 def _write_exclusive(
@@ -994,17 +1028,24 @@ def _registry_lock(
     paths: _RegistryPaths, *, create: bool, exclusive: bool
 ) -> Iterator[_RegistryLockBinding]:
     binding = _open_lock(paths, create=create)
+    acquired = False
     try:
         fcntl.flock(
             binding.lock_descriptor,
             fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
         )
+        acquired = True
         _verify_lock_binding(paths, binding)
         yield binding
     finally:
-        fcntl.flock(binding.lock_descriptor, fcntl.LOCK_UN)
-        os.close(binding.lock_descriptor)
-        _close_directories(binding.directory_descriptors)
+        try:
+            if acquired:
+                fcntl.flock(binding.lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            try:
+                os.close(binding.lock_descriptor)
+            finally:
+                _close_directories(binding.directory_descriptors)
 
 
 def _artifact_binding(root: Path, raw: object, label: str, *, plan: bool = False) -> Mapping[str, object]:

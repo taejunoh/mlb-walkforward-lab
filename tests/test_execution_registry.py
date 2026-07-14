@@ -361,6 +361,61 @@ class ExecutionRegistryTest(unittest.TestCase):
                     self.assertEqual(len(list(displaced.iterdir())), 1)
                 self.assertEqual(initial.phase, "DESIGN_ACCEPTED")
 
+    def test_publication_final_rebind_rejects_disappeared_or_replaced_receipt(self) -> None:
+        for attack in ("disappear", "replace"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                initial = self.initialize(root, run_spec)
+                receipts = root / RECEIPTS_RELATIVE
+
+                def attack_after_final_read() -> None:
+                    published = next(
+                        path
+                        for path in receipts.iterdir()
+                        if path.name.startswith("000001-")
+                    )
+                    if attack == "disappear":
+                        published.unlink()
+                    else:
+                        replacement = published.with_suffix(".replacement")
+                        replacement.write_bytes(b"tampered\n")
+                        os.replace(replacement, published)
+
+                hook = getattr(
+                    self.registry, "_after_registry_receipt_read", None
+                )
+                self.assertIsNotNone(
+                    hook, "final receipt read/rebind race hook is missing"
+                )
+                with patch.object(
+                    self.registry,
+                    "_after_registry_receipt_read",
+                    side_effect=attack_after_final_read,
+                ), self.assertRaisesRegex(
+                    ValueError, "identity|receipt|publication|cleanup"
+                ):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="DESIGN_ACCEPTED",
+                        next_phase="ACQUIRING",
+                        inventory_path=root / PROTECTED_RELATIVE,
+                        validation_receipts=(),
+                    )
+                if attack == "disappear":
+                    self.assertFalse(
+                        any(
+                            path.name.startswith("000001-")
+                            for path in receipts.iterdir()
+                        )
+                    )
+                    self.assertEqual(
+                        self.registry.load_execution_registry(root, run_spec), initial
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        self.registry.load_execution_registry(root, run_spec)
+
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
         for failure in ("partial_write", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
@@ -463,6 +518,34 @@ class ExecutionRegistryTest(unittest.TestCase):
                             root, Path("child"), create=False
                         )
             self.assertEqual(len(os.listdir("/dev/fd")), before)
+
+    @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
+    def test_registry_lock_flock_errors_close_every_descriptor(self) -> None:
+        for failure in ("acquire", "release"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                paths = self.registry._paths(root, run_spec)
+                original_flock = self.registry.fcntl.flock
+                before = len(os.listdir("/dev/fd"))
+
+                def fail_flock(descriptor: int, operation: int) -> None:
+                    if failure == "acquire" or operation == self.registry.fcntl.LOCK_UN:
+                        raise OSError(f"injected {failure} flock failure")
+                    original_flock(descriptor, operation)
+
+                with patch.object(
+                    self.registry.fcntl, "flock", side_effect=fail_flock
+                ):
+                    for _ in range(20):
+                        with self.assertRaisesRegex(
+                            OSError, f"injected {failure} flock failure"
+                        ):
+                            with self.registry._registry_lock(
+                                paths, create=False, exclusive=True
+                            ):
+                                pass
+                self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_load_rejects_forged_semantically_impossible_phase_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1271,6 +1354,55 @@ class ExecutionRegistryTest(unittest.TestCase):
                     schema,
                     format_checker=FORMAT_CHECKER,
                 )
+
+    def test_automatic_quarantine_schema_accepts_only_supported_phase_mapping(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            wrong = self.write_artifact(root, "wrong.json", {"wrong": True})
+            with self.assertRaises(ValueError):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=wrong,
+                    validation_receipts=(),
+                )
+            quarantine = next(
+                (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+            )
+            acquiring = json.loads(quarantine.read_bytes())
+            sources_ready = {
+                **acquiring,
+                "attempted_phase": "SOURCES_READY",
+                "error_classification": "SOURCE_GATE_EVIDENCE_INVALID",
+            }
+            for valid in (acquiring, sources_ready):
+                jsonschema.validate(
+                    valid, schema, format_checker=FORMAT_CHECKER
+                )
+            invalid = (
+                {**acquiring, "attempted_phase": "OOF_SEALED"},
+                {
+                    **acquiring,
+                    "error_classification": "SOURCE_GATE_EVIDENCE_INVALID",
+                },
+                {
+                    **sources_ready,
+                    "error_classification": "DIRECT_INVENTORY_MISMATCH",
+                },
+            )
+            for payload in invalid:
+                with self.subTest(payload=payload), self.assertRaises(
+                    jsonschema.ValidationError
+                ):
+                    jsonschema.validate(
+                        payload, schema, format_checker=FORMAT_CHECKER
+                    )
 
     def test_rejects_invalid_receipt_paths_on_emit_and_load(self) -> None:
         schema = json.loads(
