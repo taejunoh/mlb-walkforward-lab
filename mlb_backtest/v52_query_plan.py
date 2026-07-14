@@ -15,7 +15,7 @@ from typing import Mapping, Sequence
 from urllib.parse import urlencode
 
 from .v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
-from .v52_seasons import SEASON_BOUNDARIES
+from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -127,17 +127,6 @@ def _iso_date(value: object, label: str) -> date:
     if parsed.isoformat() != value:
         raise ValueError(f"{label} must be a canonical ISO date")
     return parsed
-
-
-def _monthly_ranges(first: date, last: date) -> list[tuple[date, date]]:
-    result = []
-    cursor = first
-    while cursor <= last:
-        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
-        chunk_end = min(last, next_month - timedelta(days=1))
-        result.append((cursor, chunk_end))
-        cursor = next_month
-    return result
 
 
 def _logical_query(
@@ -264,7 +253,7 @@ def build_static_batch(
                 acquisition_contract_sha256=contract_sha,
             )
         )
-        for chunk_start, chunk_end in _monthly_ranges(first, last):
+        for chunk_start, chunk_end in monthly_ranges(first, last):
             start_text = chunk_start.isoformat()
             end_text = chunk_end.isoformat()
             queries.append(

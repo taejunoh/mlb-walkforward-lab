@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from types import MappingProxyType
 from typing import Final, Mapping
 
@@ -20,4 +20,18 @@ SEASON_BOUNDARIES: Final[Mapping[int, tuple[date, date]]] = MappingProxyType(
 )
 
 
-__all__ = ["SEASON_BOUNDARIES"]
+def monthly_ranges(first: date, last: date) -> tuple[tuple[date, date], ...]:
+    """Partition an inclusive interval into canonical calendar-month children."""
+    if not isinstance(first, date) or not isinstance(last, date) or first > last:
+        raise ValueError("monthly range must be a nonempty ordered date interval")
+    result = []
+    cursor = first
+    while cursor <= last:
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        chunk_end = min(last, next_month - timedelta(days=1))
+        result.append((cursor, chunk_end))
+        cursor = next_month
+    return tuple(result)
+
+
+__all__ = ["SEASON_BOUNDARIES", "monthly_ranges"]

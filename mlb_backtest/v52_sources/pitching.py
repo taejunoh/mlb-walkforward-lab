@@ -11,7 +11,7 @@ from datetime import date, timedelta
 from ..career_bf import parse_prior_career_bf
 from ..mlb_stats import parse_league_era
 from ..v52_evidence import LogicalQuery
-from ..v52_seasons import SEASON_BOUNDARIES
+from ..v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
     canonical_json_bytes,
@@ -309,34 +309,38 @@ def _validate_career_statcast_coverage(
     source_ranges: Sequence[tuple[date, date]],
 ) -> None:
     boundary = SEASON_BOUNDARIES.get(cutoff.year)
-    if boundary is None or not boundary[0] <= cutoff <= boundary[1]:
+    if boundary is None:
+        raise ValueError("career consumer D-1 is outside the regular season")
+    in_season = boundary[0] <= cutoff <= boundary[1]
+    opening_day_cutoff = cutoff == boundary[0] - timedelta(days=1)
+    if not in_season and not opening_day_cutoff:
         raise ValueError("career consumer D-1 is outside the regular season")
     first_year = baseline_end.year + 1
-    if first_year not in SEASON_BOUNDARIES or first_year > cutoff.year:
+    if first_year not in SEASON_BOUNDARIES:
         raise ValueError("career baseline does not precede an approved Statcast season")
 
-    source_index = 0
-    for year in range(first_year, cutoff.year + 1):
+    final_required_year = cutoff.year if in_season else cutoff.year - 1
+    expected_by_year: dict[int, list[tuple[date, date]]] = {}
+    for year in range(first_year, final_required_year + 1):
         season_start, season_end = SEASON_BOUNDARIES[year]
-        required_end = cutoff if year == cutoff.year else season_end
-        if (
-            source_index >= len(source_ranges)
-            or source_ranges[source_index][0] > required_end
-        ):
+        expected = list(monthly_ranges(season_start, season_end))
+        if in_season and year == cutoff.year:
+            expected = [item for item in expected if item[0] <= cutoff]
+        expected_by_year[year] = expected
+
+    actual_by_year: dict[int, list[tuple[date, date]]] = {}
+    for first, last in source_ranges:
+        if first.year != last.year:
+            raise ValueError("Statcast BF source range crosses a season boundary")
+        actual_by_year.setdefault(first.year, []).append((first, last))
+
+    for year, expected in expected_by_year.items():
+        actual = actual_by_year.pop(year, [])
+        if expected and not actual:
             raise ValueError(f"whole regular season {year} is omitted")
-        cursor = season_start
-        while (
-            source_index < len(source_ranges)
-            and source_ranges[source_index][0] <= required_end
-        ):
-            first, last = source_ranges[source_index]
-            if first != cursor or last > required_end:
-                raise ValueError("regular-season coverage gap or overlap")
-            cursor = last + timedelta(days=1)
-            source_index += 1
-        if cursor != required_end + timedelta(days=1):
-            raise ValueError("regular-season coverage gap remains")
-    if source_index != len(source_ranges):
+        if actual != expected:
+            raise ValueError("regular-season coverage gap or overlap")
+    if actual_by_year:
         raise ValueError("Statcast BF source range is outside required seasons")
 
 
@@ -366,9 +370,9 @@ def recompute_career_bf_season_snapshot(
             or bf < 0
             or not isinstance(source_sidecars, Sequence)
             or isinstance(source_sidecars, (str, bytes))
-            or not source_sidecars
             or not isinstance(source_hashes, Sequence)
             or isinstance(source_hashes, (str, bytes))
+            or (not source_sidecars and (source_hashes or bf != 0))
         ):
             raise ValueError("Statcast BF addition value/source lineage is invalid")
         computed_hashes = []
@@ -406,6 +410,7 @@ def recompute_career_bf_season_snapshot(
             ):
                 raise ValueError("Statcast BF source coverage is reversed or out of scope")
             counts: dict[int, int] = {}
+            eligible_counts: dict[int, int] = {}
             seen_plate_appearances: set[tuple[int, int]] = set()
             required_pa_keys = {
                 "at_bat_number",
@@ -438,12 +443,14 @@ def recompute_career_bf_season_snapshot(
                     raise ValueError("Statcast PA evidence is inconsistent")
                 seen_plate_appearances.add((pa_game, at_bat))
                 counts[pa_pitcher] = counts.get(pa_pitcher, 0) + 1
+                if pa_date <= cutoff:
+                    eligible_counts[pa_pitcher] = eligible_counts.get(pa_pitcher, 0) + 1
             canonical_counts = {str(key): counts[key] for key in sorted(counts)}
             if dict(pitcher_bf) != canonical_counts:
                 raise ValueError("Statcast BF evidence summary differs from PA evidence")
-            if pitcher_id in counts:
+            if pitcher_id in eligible_counts:
                 target_pitcher_found = True
-                recomputed_bf += counts[pitcher_id]
+                recomputed_bf += eligible_counts[pitcher_id]
             source_ranges.append((first, last))
             computed_hashes.append(_artifact_sha256(sidecar))
         if list(source_hashes) != computed_hashes or len(set(computed_hashes)) != len(
@@ -453,7 +460,7 @@ def recompute_career_bf_season_snapshot(
         for previous, current in zip(source_ranges, source_ranges[1:]):
             if current[0] <= previous[1]:
                 raise ValueError("Statcast BF source coverage overlaps or is unordered")
-        if not target_pitcher_found:
+        if source_sidecars and not target_pitcher_found:
             raise ValueError("Statcast BF source does not contain target pitcher PA evidence")
         if bf != recomputed_bf:
             raise ValueError("claimed Statcast BF differs from canonical PA evidence")
