@@ -485,7 +485,59 @@ def _validate_statcast_split_graph(
             cursor = child.last + timedelta(days=1)
         if cursor != node.last + timedelta(days=1):
             raise ValueError("Statcast split graph lacks complete READY leaf cover")
-    return sorted(ready_leaves, key=lambda node: (node.first, node.last))
+    ready_leaves.sort(key=lambda node: (node.first, node.last))
+    monthly_bindings: dict[
+        tuple[date, date],
+        dict[str, set[object]],
+    ] = {}
+    for leaf in ready_leaves:
+        parent_first, parent_last, root_query = _monthly_root_query(leaf)
+        validated_first, validated_last = validate_statcast_query(root_query)
+        if (
+            validated_first != parent_first
+            or validated_last != parent_last
+            or root_query.parent_query_id is not None
+            or set(root_query.requested_range)
+            != {"year", "start_date", "end_date"}
+        ):
+            raise ValueError("Statcast monthly root query contract is invalid")
+        binding = monthly_bindings.setdefault(
+            (parent_first, parent_last),
+            {
+                "root_ids": set(),
+                "run_specs": set(),
+                "acquisition_contracts": set(),
+                "legacy_contracts": set(),
+            },
+        )
+        binding["root_ids"].add(logical_query_id(root_query))
+        binding["run_specs"].add(root_query.run_spec_sha256)
+        binding["acquisition_contracts"].add(
+            root_query.acquisition_contract_sha256
+        )
+        binding["legacy_contracts"].add(
+            (
+                leaf.query.requested_range.get("acquisition"),
+                leaf.query.requested_range.get("protected_inventory_sha256"),
+            )
+        )
+    for binding in monthly_bindings.values():
+        if len(binding["root_ids"]) != 1:
+            if len(binding["run_specs"]) != 1:
+                raise ValueError(
+                    "Statcast monthly population must bind to a single Task3 root"
+                )
+            raise ValueError("Statcast monthly root contract differs across leaves")
+        if (
+            len(binding["run_specs"]) != 1
+            or len(binding["acquisition_contracts"]) != 1
+        ):
+            raise ValueError("Statcast monthly root contract differs across leaves")
+        if len(binding["legacy_contracts"]) != 1:
+            raise ValueError(
+                "Statcast monthly acquisition/protected contract differs across leaves"
+            )
+    return ready_leaves
 
 
 def recompute_pitching_season_snapshot(

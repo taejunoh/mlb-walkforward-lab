@@ -242,6 +242,22 @@ def _task3_legacy_queries(*, protected: bool) -> tuple[LogicalQuery, ...]:
     ).queries
 
 
+def _task3_legacy_partition_queries(
+    *,
+    protected_inventory_sha256: str,
+    protected_start: str = "2024-04-01",
+    protected_end: str = "2024-04-15",
+) -> tuple[LogicalQuery, ...]:
+    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+
+    parent = _planned_statcast_query("2024-04-01", "2024-04-30")
+    return build_legacy_partition_batch(
+        [parent],
+        [_legacy_catalog_record(parent, protected_start, protected_end)],
+        protected_inventory_sha256=protected_inventory_sha256,
+    ).queries
+
+
 def _replace_april_parent_with_query_nodes(
     sidecars: list[dict[str, object]],
     nodes: list[tuple[LogicalQuery, str, bool]],
@@ -627,6 +643,57 @@ class V52PitchingSourceTest(unittest.TestCase):
             [baseline], [_career_addition(sidecars, cutoff)]
         )
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
+
+    def test_career_aggregate_rejects_mixed_monthly_root_bindings(self) -> None:
+        from mlb_backtest.v52_query_plan import bisect_statcast_query
+        from mlb_backtest.v52_sources.pitching import (
+            recompute_career_bf_season_snapshot,
+        )
+
+        cutoff = "2024-04-30"
+        baseline = _career_baseline("2017-12-31", cutoff)
+        root = _planned_statcast_query("2024-04-01", "2024-04-30")
+        left, _right = bisect_statcast_query(root)
+        other_run_root = replace(root, run_spec_sha256="d" * 64)
+        _other_left, other_run_right = bisect_statcast_query(other_run_root)
+        other_contract_root = replace(root, acquisition_contract_sha256="e" * 64)
+        _contract_left, other_contract_right = bisect_statcast_query(
+            other_contract_root
+        )
+        protected, fetched = _task3_legacy_partition_queries(
+            protected_inventory_sha256="c" * 64
+        )
+        _fetched_other, protected_other = _task3_legacy_partition_queries(
+            protected_inventory_sha256="d" * 64,
+            protected_start="2024-04-16",
+            protected_end="2024-04-30",
+        )
+        cases = {
+            "single Task3 root": [
+                (left, "READY", False),
+                (other_run_right, "READY", True),
+            ],
+            "root contract": [
+                (left, "READY", False),
+                (other_contract_right, "READY", True),
+            ],
+            "acquisition/protected contract": [
+                (protected, "READY", False),
+                (fetched, "READY", True),
+            ],
+            "protected contract": [
+                (protected, "READY", False),
+                (protected_other, "READY", True),
+            ],
+        }
+        for label, nodes in cases.items():
+            sidecars = _replace_april_parent_with_query_nodes(
+                _planned_statcast_sidecars(cutoff), nodes
+            )
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                recompute_career_bf_season_snapshot(
+                    [baseline], [_career_addition(sidecars, cutoff)]
+                )
 
     def test_career_aggregate_rejects_invalid_recursive_split_graphs(self) -> None:
         from mlb_backtest.v52_sources.pitching import (
