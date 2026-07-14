@@ -413,13 +413,19 @@ class ExecutionRegistryTest(unittest.TestCase):
                         self.registry.load_execution_registry(root, run_spec), initial
                     )
                 else:
+                    self.assertTrue(
+                        any(
+                            path.name.startswith("000001-")
+                            for path in receipts.iterdir()
+                        )
+                    )
                     with self.assertRaises(ValueError):
                         self.registry.load_execution_registry(root, run_spec)
 
-    def test_publication_rolls_back_equivalent_receipt_replacement(self) -> None:
+    def test_publication_accepts_equivalent_receipt_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
-            initial = self.initialize(root, run_spec)
+            self.initialize(root, run_spec)
             receipts = root / RECEIPTS_RELATIVE
 
             def replace_with_equivalent_inode() -> None:
@@ -440,10 +446,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.registry,
                 "_after_registry_receipt_read",
                 side_effect=replace_with_equivalent_inode,
-            ), self.assertRaisesRegex(
-                ValueError, "identity|receipt|publication|cleanup"
             ):
-                self.registry.advance_execution_phase(
+                advanced = self.registry.advance_execution_phase(
                     root,
                     run_spec,
                     expected_phase="DESIGN_ACCEPTED",
@@ -452,14 +456,19 @@ class ExecutionRegistryTest(unittest.TestCase):
                     validation_receipts=(),
                 )
 
-            self.assertFalse(
-                any(
-                    path.name.startswith("000001-")
-                    for path in receipts.iterdir()
-                )
+            self.assertEqual(advanced.phase, "ACQUIRING")
+            self.assertEqual(
+                len(
+                    [
+                        path
+                        for path in receipts.iterdir()
+                        if path.name.startswith("000001-")
+                    ]
+                ),
+                1,
             )
             self.assertEqual(
-                self.registry.load_execution_registry(root, run_spec), initial
+                self.registry.load_execution_registry(root, run_spec), advanced
             )
 
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:

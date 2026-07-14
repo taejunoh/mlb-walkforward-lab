@@ -770,33 +770,17 @@ def _validate_timestamp(value: object, label: str) -> None:
 
 
 def _cleanup_created_receipt(
-    parent_fd: int,
-    descriptor: int,
-    name: str,
-    expected_contents: bytes,
-    label: str,
+    parent_fd: int, descriptor: int, name: str, label: str
 ) -> None:
     try:
         opened = os.fstat(descriptor)
         linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(opened.st_mode):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _identity(opened) != _identity(linked)
+        ):
             raise ValueError(f"{label} ownership changed before cleanup")
-        if _identity(opened) == _identity(linked):
-            if opened.st_nlink != 1:
-                raise ValueError(f"{label} ownership changed before cleanup")
-        else:
-            replacement, replacement_identity = _read_file_at(
-                parent_fd, name, label
-            )
-            if (
-                len(replacement) != len(expected_contents)
-                or _sha256_bytes(replacement) != _sha256_bytes(expected_contents)
-                or replacement != expected_contents
-            ):
-                raise ValueError(f"{label} ownership changed before cleanup")
-            rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if _identity(rebound) != replacement_identity:
-                raise ValueError(f"{label} identity changed before cleanup")
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
     except OSError as exc:
@@ -816,8 +800,8 @@ def _verify_visible_receipt_binding(
     )
     try:
         if (
-            _identity(os.fstat(parent_fd)) != parent_identity
-            or _identity(os.fstat(rebound_parent)) != parent_identity
+            _identity(os.fstat(parent_fd))[:2] != parent_identity[:2]
+            or _identity(os.fstat(rebound_parent))[:2] != parent_identity[:2]
         ):
             raise ValueError(f"{label} parent identity changed after publication")
     finally:
@@ -842,7 +826,10 @@ def _verify_published_receipt(
     contents: bytes,
     label: str,
 ) -> None:
-    """Prove visibility at return; external mutations after return are out of scope."""
+    """Use the final no-follow read as the operation's return snapshot.
+
+    Concurrent namespace changes after that read are post-check and out of scope.
+    """
     opened_identity = _verify_visible_receipt_binding(
         execution_descriptor,
         relative,
@@ -857,15 +844,26 @@ def _verify_published_receipt(
     if published_identity != opened_identity or published != contents:
         raise ValueError(f"{label} bytes changed after publication")
     _after_registry_receipt_read()
-    if _verify_visible_receipt_binding(
-        execution_descriptor,
-        relative,
-        parent_fd,
-        parent_identity,
-        descriptor,
-        label,
-    ) != opened_identity:
-        raise ValueError(f"{label} identity changed at publication return")
+    rebound_parent, descriptors = _open_directory_at(
+        execution_descriptor, relative.parent
+    )
+    try:
+        if (
+            _identity(os.fstat(parent_fd))[:2] != parent_identity[:2]
+            or _identity(os.fstat(rebound_parent))[:2] != parent_identity[:2]
+        ):
+            raise ValueError(f"{label} parent identity changed at publication return")
+        final_contents, _ = _read_file_at(
+            rebound_parent, relative.name, label
+        )
+    finally:
+        _close_directories(descriptors)
+    if (
+        len(final_contents) != len(contents)
+        or _sha256_bytes(final_contents) != _sha256_bytes(contents)
+        or final_contents != contents
+    ):
+        raise ValueError(f"{label} bytes changed at publication return")
 
 
 def _write_exclusive(
@@ -917,7 +915,7 @@ def _write_exclusive(
         if created:
             try:
                 _cleanup_created_receipt(
-                    parent_fd, descriptor, relative.name, contents, label
+                    parent_fd, descriptor, relative.name, label
                 )
             except BaseException as cleanup_exc:
                 raise ValueError(
