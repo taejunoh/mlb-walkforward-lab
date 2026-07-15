@@ -1901,7 +1901,7 @@ class ExecutionRegistryTest(unittest.TestCase):
     def test_rejects_git_head_identity_race_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
-            initial = self.initialize(root, run_spec)
+            self.initialize(root, run_spec)
             hook = getattr(self.registry, "_before_registry_publish", None)
             self.assertIsNotNone(hook, "registry publish race hook is missing")
 
@@ -1911,7 +1911,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             with patch.object(self.registry, "_before_registry_publish", side_effect=race), self.assertRaisesRegex(ValueError, "HEAD|identity|snapshot"):
                 self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=root / PROTECTED_RELATIVE, validation_receipts=())
             self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 1)
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            with self.assertRaisesRegex(ValueError, "Git HEAD|snapshot"):
+                self.registry.load_execution_registry(root, run_spec)
 
     def test_rejects_lock_inode_replacement_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2408,6 +2409,47 @@ class ExecutionRegistryTest(unittest.TestCase):
                             self.initialize(root, run_spec)
                         else:
                             self.registry.load_execution_registry(root, run_spec)
+
+    def test_rejects_committed_bound_code_head_drift_before_checkpoint(self) -> None:
+        for phase in ("DESIGN_ACCEPTED", "ACQUIRING"):
+            for relative in (
+                Path("mlb_backtest/v52_query_plan.py"),
+                Path("schemas/v5_2_split_receipt.schema.json"),
+            ):
+                with (
+                    self.subTest(phase=phase, relative=relative),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root, run_spec = self.make_repo(Path(directory))
+                    self.initialize(root, run_spec)
+                    if phase == "ACQUIRING":
+                        self.registry.advance_execution_phase(
+                            root,
+                            run_spec,
+                            expected_phase="DESIGN_ACCEPTED",
+                            next_phase="ACQUIRING",
+                            inventory_path=root / PROTECTED_RELATIVE,
+                            validation_receipts=(),
+                        )
+                    with (root / relative).open("ab") as handle:
+                        handle.write(b"committed drift\n")
+                    _git(root, "add", relative.as_posix())
+                    _git(root, "commit", "-qm", f"drift {relative.name}")
+
+                    with self.assertRaisesRegex(ValueError, "Git HEAD|snapshot"):
+                        self.registry.load_execution_registry(root, run_spec)
+
+    def test_rejects_committed_unrelated_head_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            unrelated = root / "unrelated.txt"
+            unrelated.write_text("committed drift\n", encoding="utf-8")
+            _git(root, "add", "unrelated.txt")
+            _git(root, "commit", "-qm", "unrelated head drift")
+
+            with self.assertRaisesRegex(ValueError, "Git HEAD|snapshot"):
+                self.registry.load_execution_registry(root, run_spec)
 
     def test_rejects_dirty_bound_input_and_identity_race(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

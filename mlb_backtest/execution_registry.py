@@ -1641,6 +1641,8 @@ def _load_locked(
             trusted_git = _capture_git_snapshot(paths.root, payload)
         elif current_bindings != stable_bindings:
             raise ValueError("execution registry binding fork differs")
+        if trusted_git is None or git_head != trusted_git.head:
+            raise ValueError("execution receipt Git HEAD differs from trusted snapshot")
         payloads.append(payload)
         phase_receipt_sha[phase] = receipt_sha
         prior_sha = receipt_sha
