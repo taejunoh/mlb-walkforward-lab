@@ -96,8 +96,10 @@ _TIMESTAMP = re.compile(
 _BOUND_EXECUTION_CODE = (
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/verify_v52_design.py",
+    "mlb_backtest/v52_query_plan.py",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
+    "schemas/v5_2_split_receipt.schema.json",
 )
 ACQUISITION_STAGES: tuple[str, ...] = (
     "STATIC_SCHEDULES",

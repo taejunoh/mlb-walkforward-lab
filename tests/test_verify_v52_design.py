@@ -170,6 +170,27 @@ class DesignVerificationTest(unittest.TestCase):
         scope = verifier_module.capture_current_scope(ROOT)
         self.assertTrue(required_docs.issubset(set(scope["single_files"])))
 
+    def test_task7c_files_are_required_canonical_and_current_scope_bound(self) -> None:
+        required_schemas = {
+            "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_split_receipt.schema.json",
+        }
+        required_code = {
+            "mlb_backtest/v52_query_plan.py",
+            "tests/test_v52_query_plan.py",
+        }
+        self.assertTrue(
+            required_schemas.issubset(set(verifier_module.EXPECTED_CURRENT_FILES))
+        )
+        self.assertTrue(required_schemas.issubset(set(CANONICAL_JSON_FILES)))
+        self.assertTrue(
+            required_code.issubset(set(verifier_module.CURRENT_SCOPE_SINGLE_FILES))
+        )
+        scope = verifier_module.capture_current_scope(ROOT)
+        self.assertTrue(required_code.issubset(set(scope["single_files"])))
+        schema_nodes = scope["trees"]["schemas"]["nodes"]
+        self.assertTrue(required_schemas.issubset(set(schema_nodes)))
+
     def test_namespace_second_recursive_scan_detects_prior_subtree_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1235,6 +1256,9 @@ class DesignVerificationTest(unittest.TestCase):
                 "v5_2_run_spec.schema.json",
                 "v5_2_prospective.schema.json",
                 "v5_2_preflight.schema.json",
+                "v5_2_split_receipt.schema.json",
+                "v5_2_acquisition_checkpoint.schema.json",
+                "v5_2_execution_receipt.schema.json",
             ):
                 shutil.copy2(ROOT / "schemas" / name, root / "schemas" / name)
             for mutation in ("const", "additionalProperties", "properties"):
@@ -1255,6 +1279,46 @@ class DesignVerificationTest(unittest.TestCase):
                         verify_contract_schemas(
                             root, config, historical, prospective, preflight
                         )
+
+    def test_task7c_closed_schema_semantic_tampering_fails(self) -> None:
+        config = load_v52_config(ROOT / "config/v5_2_qd.json")
+        historical = load_run_spec(
+            ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+        )
+        prospective = load_prospective_spec(
+            ROOT / "protocols/v5_2_qd/prospective_2026.json"
+        )
+        preflight = parse_preflight(
+            json.loads(
+                (
+                    ROOT / "reports/v5_2_qd/walkforward_500_preflight.json"
+                ).read_bytes()
+            )
+        )
+        filenames = (
+            "v5_2_split_receipt.schema.json",
+            "v5_2_acquisition_checkpoint.schema.json",
+            "v5_2_execution_receipt.schema.json",
+        )
+        malformed = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": False,
+            "type": "object",
+        }
+        verify_contract_schemas(ROOT, config, historical, prospective, preflight)
+        for filename in filenames:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                shutil.copytree(ROOT / "schemas", root / "schemas")
+                (root / "schemas" / filename).write_bytes(
+                    canonical_json_bytes(malformed) + b"\n"
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "schema/parser disagreement"
+                ):
+                    verify_contract_schemas(
+                        root, config, historical, prospective, preflight
+                    )
 
     def test_nested_schema_refs_closure_and_condition_tampering_fails(self) -> None:
         config = load_v52_config(ROOT / "config/v5_2_qd.json")

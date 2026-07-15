@@ -65,8 +65,10 @@ RECEIPTS_RELATIVE = Path(
 BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/execution_registry.py"),
     Path("mlb_backtest/verify_v52_design.py"),
+    Path("mlb_backtest/v52_query_plan.py"),
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
+    Path("schemas/v5_2_split_receipt.schema.json"),
 )
 
 
@@ -2367,6 +2369,45 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             (root / "unrelated.txt").write_text("dirty\n", encoding="utf-8")
             self.assertEqual(self.initialize(root, run_spec).phase, "DESIGN_ACCEPTED")
+
+    def test_task7c_runtime_authority_is_in_production_bound_code(self) -> None:
+        required = {
+            "mlb_backtest/execution_registry.py",
+            "mlb_backtest/verify_v52_design.py",
+            "mlb_backtest/v52_query_plan.py",
+            "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_execution_receipt.schema.json",
+            "schemas/v5_2_split_receipt.schema.json",
+        }
+        self.assertTrue(required.issubset(set(self.registry._BOUND_EXECUTION_CODE)))
+
+    def test_task7c_bound_runtime_rejects_dirty_initialize_and_load(self) -> None:
+        required = (
+            Path("mlb_backtest/v52_query_plan.py"),
+            Path("schemas/v5_2_split_receipt.schema.json"),
+        )
+        for relative in required:
+            for operation in ("initialize", "load"):
+                with (
+                    self.subTest(relative=relative, operation=operation),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root, run_spec = self.make_repo(Path(directory))
+                    target = root / relative
+                    if not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(ROOT / relative, target)
+                        _git(root, "add", relative.as_posix())
+                        _git(root, "commit", "-qm", f"add {relative.name}")
+                    if operation == "load":
+                        self.initialize(root, run_spec)
+                    with target.open("ab") as handle:
+                        handle.write(b"\n")
+                    with self.assertRaisesRegex(ValueError, "execution code|dirty"):
+                        if operation == "initialize":
+                            self.initialize(root, run_spec)
+                        else:
+                            self.registry.load_execution_registry(root, run_spec)
 
     def test_rejects_dirty_bound_input_and_identity_race(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

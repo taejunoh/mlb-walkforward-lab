@@ -10,6 +10,8 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+
 from mlb_backtest.diagnostic_report import render_markdown
 from mlb_backtest.diagnostics import (
     AUDITED_DIGEST_PATHS,
@@ -87,6 +89,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "mlb_backtest/diagnostics.py",
     "mlb_backtest/diagnostic_report.py",
     "mlb_backtest/execution_registry.py",
+    "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/notebook_artifact.py",
     "mlb_backtest/report_artifact.py",
     "mlb_backtest/protocols.py",
@@ -96,6 +99,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_diagnostics.py",
     "tests/test_diagnostic_report.py",
     "tests/test_execution_registry.py",
+    "tests/test_v52_query_plan.py",
     "tests/test_notebook_artifact.py",
     "tests/test_report_artifact.py",
     "tests/test_protocols.py",
@@ -126,6 +130,8 @@ EXPECTED_CURRENT_FILES = (
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
+    "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_split_receipt.schema.json",
     "protocols/v5_2_qd/change_contract.json",
     "protocols/v5_2_qd/historical_walkforward_500.json",
     "protocols/v5_2_qd/prospective_2026.json",
@@ -145,6 +151,8 @@ CANONICAL_JSON_FILES = (
     "reports/v5_2_qd/walkforward_500_preflight.json",
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
+    "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_qd.schema.json",
     "schemas/v5_2_run_spec.schema.json",
@@ -167,6 +175,18 @@ V51_REQUIRED_FILES = tuple(
         }
     )
 )
+
+TASK7C_SCHEMA_DOCUMENT_SHA256 = {
+    "schemas/v5_2_acquisition_checkpoint.schema.json": (
+        "eb4b810b420cb2454de00b0f0157bc3aa82e41872f8186c3c51da76bdd7c8c15"
+    ),
+    "schemas/v5_2_execution_receipt.schema.json": (
+        "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
+    ),
+    "schemas/v5_2_split_receipt.schema.json": (
+        "b9de7114410e036cd43a2530a8440dcdbc1b85d78699281e1c623d234102aeea"
+    ),
+}
 
 
 def _lexical_root(root: Path) -> Path:
@@ -893,6 +913,34 @@ def verify_contract_schemas(
         raise ValueError("schema/parser disagreement: parsed contract")
     for relative, expected in documents.items():
         if (root / relative).read_bytes() != canonical_json_bytes(expected) + b"\n":
+            raise ValueError(f"schema/parser disagreement: {relative}")
+    for relative, expected_sha256 in TASK7C_SCHEMA_DOCUMENT_SHA256.items():
+        path = require_regular_file(root, relative)
+        try:
+            contents = path.read_bytes()
+            schema = json.loads(contents)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"schema/parser disagreement: {relative}") from exc
+        if (
+            not isinstance(schema, Mapping)
+            or contents != canonical_json_bytes(schema) + b"\n"
+            or hashlib.sha256(contents).hexdigest() != expected_sha256
+        ):
+            raise ValueError(f"schema/parser disagreement: {relative}")
+        try:
+            Draft202012Validator.check_schema(schema)
+        except Exception as exc:
+            raise ValueError(f"schema/parser disagreement: {relative}") from exc
+        if relative.endswith("v5_2_execution_receipt.schema.json"):
+            variants = schema.get("oneOf")
+            closed = isinstance(variants, list) and bool(variants) and all(
+                isinstance(variant, Mapping)
+                and variant.get("additionalProperties") is False
+                for variant in variants
+            )
+        else:
+            closed = schema.get("additionalProperties") is False
+        if not closed:
             raise ValueError(f"schema/parser disagreement: {relative}")
 
 
