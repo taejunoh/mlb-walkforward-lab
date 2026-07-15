@@ -2091,6 +2091,106 @@ def _checkpoint_evidence_root(paths: _RegistryPaths, run_spec: RunSpec) -> Path:
     return paths.root / relative
 
 
+def _checkpoint_split_dag_active_leaves(
+    batch_records: Sequence[tuple[str, str, str | None, tuple[str, ...]]],
+    receipt_records: Sequence[tuple[str, str, str, str, tuple[str, ...]]],
+    split_query_ids: Sequence[str],
+) -> set[str]:
+    """Validate one checkpoint-bound split DAG and return its active leaves."""
+    fixed_prefix_length = 4
+    if len(batch_records) < fixed_prefix_length:
+        raise ValueError("checkpoint split DAG lacks its fixed batch prefix")
+    batch_ids = [record[0] for record in batch_records]
+    if len(batch_ids) != len(set(batch_ids)):
+        raise ValueError("checkpoint split DAG contains duplicate batch IDs")
+    if any(
+        stage != "REMAINING"
+        for _batch_id, stage, _derived, _query_ids in batch_records[
+            fixed_prefix_length:
+        ]
+    ):
+        raise ValueError("checkpoint split DAG suffix batch stage differs")
+    batch_index = {batch_id: index for index, batch_id in enumerate(batch_ids)}
+    batch_by_id = {record[0]: record for record in batch_records}
+    all_query_ids = [
+        query_id
+        for _batch_id, _stage, _derived, query_ids in batch_records
+        for query_id in query_ids
+    ]
+    if len(all_query_ids) != len(set(all_query_ids)):
+        raise ValueError("checkpoint split DAG query occurs in multiple batches")
+
+    receipt_ids = [record[0] for record in receipt_records]
+    receipt_parent_ids = [record[2] for record in receipt_records]
+    receipt_child_ids = [record[3] for record in receipt_records]
+    if (
+        len(receipt_ids) != len(set(receipt_ids))
+        or len(receipt_parent_ids) != len(set(receipt_parent_ids))
+        or len(receipt_child_ids) != len(set(receipt_child_ids))
+    ):
+        raise ValueError(
+            "checkpoint split DAG contains duplicate receipt, parent, or child"
+        )
+    suffix_ids = set(batch_ids[fixed_prefix_length:])
+    if set(receipt_child_ids) != suffix_ids:
+        raise ValueError("checkpoint split DAG suffix and receipt children differ")
+    supplied_split_ids = tuple(split_query_ids)
+    if (
+        len(supplied_split_ids) != len(set(supplied_split_ids))
+        or set(supplied_split_ids) != set(receipt_parent_ids)
+    ):
+        raise ValueError("checkpoint split DAG parents differ from split query IDs")
+
+    for (
+        _receipt_id,
+        parent_batch_id,
+        parent_query_id,
+        child_batch_id,
+        child_query_ids,
+    ) in receipt_records:
+        if parent_batch_id not in batch_by_id or child_batch_id not in batch_by_id:
+            raise ValueError("checkpoint split DAG receipt batch is orphaned")
+        parent = batch_by_id[parent_batch_id]
+        child = batch_by_id[child_batch_id]
+        if batch_index[child_batch_id] < fixed_prefix_length:
+            raise ValueError("checkpoint split DAG child cannot be in the fixed prefix")
+        if batch_index[parent_batch_id] >= batch_index[child_batch_id]:
+            raise ValueError("checkpoint split DAG parent must precede its child")
+        if child[2] != parent_batch_id:
+            raise ValueError("checkpoint split DAG child derivation differs")
+        if parent[3].count(parent_query_id) != 1:
+            raise ValueError("checkpoint split DAG parent query binding differs")
+        if tuple(child_query_ids) != child[3]:
+            raise ValueError("checkpoint split DAG ordered child query IDs differ")
+
+    remaining_query_ids = {
+        query_id
+        for _batch_id, _stage, _derived, query_ids in batch_records[3:]
+        for query_id in query_ids
+    }
+    if not set(supplied_split_ids) <= remaining_query_ids:
+        raise ValueError("checkpoint split DAG parent is outside REMAINING")
+    return remaining_query_ids - set(supplied_split_ids)
+
+
+def _validate_checkpoint_remaining_population(
+    *,
+    active_leaf_ids: set[str],
+    prefix_ids: set[str],
+    completed_query_ids: set[str],
+    pending_query_ids: set[str],
+    quarantined_query_ids: set[str],
+) -> None:
+    if (
+        not prefix_ids <= completed_query_ids
+        or pending_query_ids - active_leaf_ids
+        or quarantined_query_ids - active_leaf_ids
+    ):
+        raise ValueError(
+            "REMAINING requires a terminal prefix and exact active-leaf state"
+        )
+
+
 def _checkpoint_stage_authority(
     paths: _RegistryPaths,
     run_spec: RunSpec,
@@ -2403,7 +2503,14 @@ def _checkpoint_current_semantic(
             contract_binding=contract_binding,
         )
     )
-    if tuple(loaded_batch_sequence) != authoritative_batches:
+    if stage == "REMAINING":
+        authority_matches = (
+            tuple(loaded_batch_sequence[: len(authoritative_batches)])
+            == authoritative_batches
+        )
+    else:
+        authority_matches = tuple(loaded_batch_sequence) == authoritative_batches
+    if not authority_matches:
         raise ValueError(f"checkpoint {stage} batch authority differs")
 
     completed = tuple(sorted(completed_query_ids))
@@ -2444,24 +2551,6 @@ def _checkpoint_current_semantic(
             raise ValueError(
                 "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
             )
-    if stage == "REMAINING":
-        prefix_ids = set().union(
-            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
-        )
-        partition_ids = batch_query_ids[str(batches[3]["batch_id"])]
-        if (
-            len(batches) != 4
-            or not prefix_ids <= set(completed)
-            or set(pending) - partition_ids
-            or set(quarantined) - partition_ids
-            or split
-            or split_receipt_paths
-            or (not pending and quarantined)
-        ):
-            raise ValueError(
-                "REMAINING requires a terminal prefix and exact unsplit partition state"
-            )
-
     expected_split_paths = {
         Path("audit/v5_2_qd/historical/acquisition/split_receipts")
         / f"{parent_id}.json"
@@ -2475,6 +2564,7 @@ def _checkpoint_current_semantic(
         raise ValueError("checkpoint split receipt namespace differs")
     evidence_root = _checkpoint_evidence_root(paths, run_spec)
     split_bindings: list[dict[str, object]] = []
+    loaded_split_receipts: list[object] = []
     for parent_id in split:
         relative = (
             Path("audit/v5_2_qd/historical/acquisition/split_receipts")
@@ -2487,15 +2577,7 @@ def _checkpoint_current_semantic(
         )
         if receipt is None:
             raise ValueError("checkpoint split receipt is missing")
-        if (
-            receipt.parent_query_id != parent_id
-            or receipt.parent_batch_id not in loaded_batches
-            or receipt.child_batch_id not in loaded_batches
-            or parent_id not in batch_query_ids[receipt.parent_batch_id]
-            or set(receipt.child_query_ids)
-            != batch_query_ids[receipt.child_batch_id]
-        ):
-            raise ValueError("checkpoint split child graph differs")
+        loaded_split_receipts.append(receipt)
         artifact = _capture_artifact(
             paths.root, paths.root / relative, "checkpoint split receipt"
         )
@@ -2512,6 +2594,42 @@ def _checkpoint_current_semantic(
     split_bindings.sort(key=lambda item: str(item["parent_query_id"]))
     if {str(item["parent_query_id"]) for item in split_bindings} != set(split):
         raise ValueError("checkpoint split population differs from receipts")
+    if stage == "REMAINING":
+        active_leaf_ids = _checkpoint_split_dag_active_leaves(
+            tuple(
+                (
+                    batch.batch_id,  # type: ignore[attr-defined]
+                    batch.stage,  # type: ignore[attr-defined]
+                    batch.derived_from_sha256,  # type: ignore[attr-defined]
+                    tuple(
+                        logical_query_id(query)
+                        for query in batch.queries  # type: ignore[attr-defined]
+                    ),
+                )
+                for batch in loaded_batch_sequence
+            ),
+            tuple(
+                (
+                    receipt.split_receipt_id,  # type: ignore[attr-defined]
+                    receipt.parent_batch_id,  # type: ignore[attr-defined]
+                    receipt.parent_query_id,  # type: ignore[attr-defined]
+                    receipt.child_batch_id,  # type: ignore[attr-defined]
+                    tuple(receipt.child_query_ids),  # type: ignore[attr-defined]
+                )
+                for receipt in loaded_split_receipts
+            ),
+            split,
+        )
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
+        )
+        _validate_checkpoint_remaining_population(
+            active_leaf_ids=active_leaf_ids,
+            prefix_ids=prefix_ids,
+            completed_query_ids=set(completed),
+            pending_query_ids=set(pending),
+            quarantined_query_ids=set(quarantined),
+        )
 
     namespaces = run_spec.raw["namespaces"]
     assert isinstance(namespaces, Mapping)
@@ -2635,7 +2753,12 @@ def _checkpoint_artifacts_and_population(
         if batch.stage != item["stage"]:
             raise ValueError("checkpoint batch stage binding differs")
         loaded_batch_sequence.append(batch)
+        expected_relative = Path(
+            "audit/v5_2_qd/historical/acquisition/query_batches"
+        ) / f"{batch_id}.json"
         relative = Path(str(item["path"]))
+        if relative != expected_relative:
+            raise ValueError("checkpoint query batch namespace differs")
         actual = _checkpoint_artifact_binding(
             paths.root, relative, "checkpoint query batch"
         )
@@ -2662,7 +2785,14 @@ def _checkpoint_artifacts_and_population(
             contract_binding=contract_binding,
         )
     )
-    if tuple(loaded_batch_sequence) != authoritative_batches:
+    if stage == "REMAINING":
+        authority_matches = (
+            tuple(loaded_batch_sequence[: len(authoritative_batches)])
+            == authoritative_batches
+        )
+    else:
+        authority_matches = tuple(loaded_batch_sequence) == authoritative_batches
+    if not authority_matches:
         raise ValueError(f"checkpoint {stage} batch authority differs")
     populations = set().union(
         set(payload["completed_query_ids"]),
@@ -2704,25 +2834,6 @@ def _checkpoint_artifacts_and_population(
         ):
             raise ValueError(
                 "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
-            )
-    if stage == "REMAINING":
-        prefix_ids = set().union(
-            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
-        )
-        partition_ids = batch_query_ids[str(batches[3]["batch_id"])]
-        pending_ids = set(payload["pending_query_ids"])
-        quarantined_ids = set(payload["quarantined_query_ids"])
-        if (
-            len(batches) != 4
-            or not prefix_ids <= set(payload["completed_query_ids"])
-            or pending_ids - partition_ids
-            or quarantined_ids - partition_ids
-            or payload["split_query_ids"]
-            or payload["split_receipts"]
-            or (not pending_ids and quarantined_ids)
-        ):
-            raise ValueError(
-                "REMAINING requires a terminal prefix and exact unsplit partition state"
             )
     evidence = payload["query_evidence_receipts"]
     assert isinstance(evidence, list)
@@ -2813,6 +2924,7 @@ def _checkpoint_artifacts_and_population(
         raise ValueError(
             "checkpoint terminal status differs from bound query evidence"
         )
+    loaded_split_receipts: list[object] = []
     for key, label in (
         ("stage_evidence_receipts", "checkpoint stage evidence"),
         ("split_receipts", "checkpoint split receipt"),
@@ -2843,14 +2955,47 @@ def _checkpoint_artifacts_and_population(
                     or receipt.receipt_sha256 != item["sha256"]
                     or receipt.split_receipt_id != item["split_receipt_id"]
                     or receipt.parent_query_id != parent_id
-                    or parent_id not in payload["split_query_ids"]
-                    or receipt.parent_batch_id not in batch_query_ids
-                    or receipt.child_batch_id not in batch_query_ids
-                    or parent_id not in batch_query_ids[receipt.parent_batch_id]
-                    or set(receipt.child_query_ids)
-                    != batch_query_ids[receipt.child_batch_id]
                 ):
                     raise ValueError("checkpoint split receipt child graph differs")
+                loaded_split_receipts.append(receipt)
+    if stage == "REMAINING":
+        active_leaf_ids = _checkpoint_split_dag_active_leaves(
+            tuple(
+                (
+                    batch.batch_id,  # type: ignore[attr-defined]
+                    batch.stage,  # type: ignore[attr-defined]
+                    batch.derived_from_sha256,  # type: ignore[attr-defined]
+                    tuple(
+                        logical_query_id(query)
+                        for query in batch.queries  # type: ignore[attr-defined]
+                    ),
+                )
+                for batch in loaded_batch_sequence
+            ),
+            tuple(
+                (
+                    receipt.split_receipt_id,  # type: ignore[attr-defined]
+                    receipt.parent_batch_id,  # type: ignore[attr-defined]
+                    receipt.parent_query_id,  # type: ignore[attr-defined]
+                    receipt.child_batch_id,  # type: ignore[attr-defined]
+                    tuple(receipt.child_query_ids),  # type: ignore[attr-defined]
+                )
+                for receipt in loaded_split_receipts
+            ),
+            payload["split_query_ids"],  # type: ignore[arg-type]
+        )
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
+        )
+        pending_ids = set(payload["pending_query_ids"])
+        quarantined_ids = set(payload["quarantined_query_ids"])
+        _validate_checkpoint_remaining_population(
+            active_leaf_ids=active_leaf_ids,
+            prefix_ids=prefix_ids,
+            completed_query_ids=set(payload["completed_query_ids"]),
+            pending_query_ids=pending_ids,
+            quarantined_query_ids=quarantined_ids,
+        )
     stage_evidence = payload["stage_evidence_receipts"]
     assert isinstance(stage_evidence, list)
     if tuple(dict(item) for item in stage_evidence) != authoritative_stage_evidence:

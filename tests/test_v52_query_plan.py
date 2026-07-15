@@ -3425,7 +3425,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 )
                 self.assertFalse(receipt_path.exists())
 
-    def test_split_receipt_proves_recursive_depth_without_misclassifying_legacy(self):
+    def test_split_receipt_proves_recursive_depth_from_root_and_legacy_anchors(self):
         import mlb_backtest.v52_query_plan as query_plan
 
         with tempfile.TemporaryDirectory() as td:
@@ -3505,15 +3505,81 @@ class V52QueryPlanTest(unittest.TestCase):
             for batch in (legacy_batch, child_batch):
                 query_plan.publish_query_batch(root, batch)
             attempt_number = _record_split_attempt(root, legacy_parent, "SIZE_LIMIT")
+            legacy_receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=legacy_batch.batch_id,
+                parent_query_id=logical_query_id(legacy_parent),
+                reason="SIZE_LIMIT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            recursive_parent = next(
+                query
+                for query in child_batch.queries
+                if (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 1
+            )
+            recursive_batch = query_plan._make_batch(
+                "REMAINING",
+                child_batch.batch_id,
+                query_plan.bisect_statcast_query(recursive_parent),
+            )
+            query_plan.publish_query_batch(root, recursive_batch)
+            recursive_attempt = _record_split_attempt(
+                root, recursive_parent, "ROW_CAP"
+            )
+            recursive_receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=child_batch.batch_id,
+                parent_query_id=logical_query_id(recursive_parent),
+                reason="ROW_CAP",
+                exhausted_attempt_number=recursive_attempt,
+                child_batch_id=recursive_batch.batch_id,
+            )
+            self.assertEqual(legacy_receipt.depth, 1)
+            self.assertEqual(recursive_receipt.depth, 2)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            _statcast_authority_fixture(root, in_place=True)
+            root_batch = query_plan.build_statcast_root_batch(root)
+            root_parent = next(
+                query
+                for query in root_batch.queries
+                if (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 6
+            )
+            arbitrary_parent = query_plan.bisect_statcast_query(root_parent)[0]
+            arbitrary_batch = query_plan._make_batch(
+                "REMAINING", root_batch.batch_id, (arbitrary_parent,)
+            )
+            arbitrary_children = query_plan._make_batch(
+                "REMAINING",
+                arbitrary_batch.batch_id,
+                query_plan.bisect_statcast_query(arbitrary_parent),
+            )
+            for batch in (root_batch, arbitrary_batch, arbitrary_children):
+                query_plan.publish_query_batch(root, batch)
+            arbitrary_attempt = _record_split_attempt(
+                root, arbitrary_parent, "TIMEOUT"
+            )
             with self.assertRaisesRegex(ValueError, "ancestor receipt"):
                 query_plan.publish_split_receipt(
                     root,
                     evidence_root=_split_evidence_root(root),
-                    parent_batch_id=legacy_batch.batch_id,
-                    parent_query_id=logical_query_id(legacy_parent),
-                    reason="SIZE_LIMIT",
-                    exhausted_attempt_number=attempt_number,
-                    child_batch_id=child_batch.batch_id,
+                    parent_batch_id=arbitrary_batch.batch_id,
+                    parent_query_id=logical_query_id(arbitrary_parent),
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=arbitrary_attempt,
+                    child_batch_id=arbitrary_children.batch_id,
                 )
 
     def test_split_receipt_publication_is_idempotent_and_race_safe(self):

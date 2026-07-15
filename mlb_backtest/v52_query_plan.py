@@ -2897,9 +2897,15 @@ def _verified_split_lineage(
     if cursor != parent_last + timedelta(days=1):
         raise ValueError("split child ranges do not cover the parent exactly")
 
+    legacy_depth_one_anchor = (
+        _is_legacy_partition_batch_candidate(repository_root, parent_batch)
+        and parent_batch == build_legacy_partition_batch(repository_root)
+    )
     if parent.parent_query_id is None:
         if parent_batch.derived_from_sha256 is not None:
             raise ValueError("split root parent batch must not be derived")
+        depth = 1
+    elif legacy_depth_one_anchor:
         depth = 1
     else:
         ancestor = _load_split_receipt_locked(

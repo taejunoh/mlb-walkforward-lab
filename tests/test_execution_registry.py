@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -1065,7 +1066,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             <= set(self.registry._BOUND_EXECUTION_CODE)
         )
 
-    def test_remaining_checkpoint_schema_requires_exact_four_batch_prefix_and_ten_evidence_paths(
+    def test_remaining_checkpoint_schema_requires_fixed_four_batch_prefix_and_split_suffix(
         self,
     ) -> None:
         schema = json.loads(
@@ -1120,12 +1121,65 @@ class ExecutionRegistryTest(unittest.TestCase):
             query_batches=batches,
             stage_evidence=evidence,
         )
+        suffix_id = "a" * 64
+        suffix_sha = "b" * 64
+        parent_id = "c" * 64
+        split_id = "d" * 64
+        split_sha = "e" * 64
+        payload["query_batches"].append(
+            {
+                "batch_id": suffix_id,
+                "path": (
+                    "audit/v5_2_qd/historical/acquisition/query_batches/"
+                    f"{suffix_id}.json"
+                ),
+                "sha256": suffix_sha,
+                "stage": "REMAINING",
+            }
+        )
+        payload["split_query_ids"] = [parent_id]
+        payload["split_receipts"] = [
+            {
+                "parent_query_id": parent_id,
+                "path": (
+                    "audit/v5_2_qd/historical/acquisition/split_receipts/"
+                    f"{parent_id}.json"
+                ),
+                "sha256": split_sha,
+                "split_receipt_id": split_id,
+            }
+        ]
         jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
 
+        coupling_attacks = {
+            "suffix_without_splits": {
+                **payload,
+                "split_query_ids": [],
+                "split_receipts": [],
+            },
+            "splits_without_suffix": {
+                **payload,
+                "query_batches": payload["query_batches"][:4],
+            },
+            "split_ids_without_receipts": {
+                **payload,
+                "split_receipts": [],
+            },
+            "split_receipts_without_ids": {
+                **payload,
+                "split_query_ids": [],
+            },
+        }
+        for attack, forged in coupling_attacks.items():
+            with self.subTest(attack=attack):
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
+
         for collection, mutation in (
-            ("query_batches", "missing"),
-            ("query_batches", "extra"),
-            ("query_batches", "reordered"),
             ("stage_evidence_receipts", "missing"),
             ("stage_evidence_receipts", "extra"),
             ("stage_evidence_receipts", "reordered"),
@@ -1139,6 +1193,44 @@ class ExecutionRegistryTest(unittest.TestCase):
                     values.append(values[-1])
                 else:
                     values[-2:] = reversed(values[-2:])
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
+
+        for mutation in ("prefix_missing", "prefix_reordered"):
+            with self.subTest(mutation=mutation):
+                forged = json.loads(json.dumps(payload))
+                if mutation == "prefix_missing":
+                    forged["query_batches"].pop(2)
+                    forged["split_query_ids"] = []
+                    forged["split_receipts"] = []
+                else:
+                    forged["query_batches"][1:3] = reversed(
+                        forged["query_batches"][1:3]
+                    )
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
+
+        for mutation in ("suffix_stage", "batch_path", "split_path"):
+            with self.subTest(mutation=mutation):
+                forged = json.loads(json.dumps(payload))
+                if mutation == "suffix_stage":
+                    forged["query_batches"][-1]["stage"] = "REFERENCE_INPUTS"
+                elif mutation == "batch_path":
+                    forged["query_batches"][-1]["path"] = (
+                        f"audit/wrong/query_batches/{suffix_id}.json"
+                    )
+                else:
+                    forged["split_receipts"][0]["path"] = (
+                        f"audit/wrong/split_receipts/{parent_id}.json"
+                    )
                 with self.assertRaises(jsonschema.ValidationError):
                     jsonschema.validate(
                         forged,
@@ -1240,6 +1332,160 @@ class ExecutionRegistryTest(unittest.TestCase):
                     remaining_fixture,
                     expected_prior=terminal.receipt_sha256,
                     completed_partition_ids=partition_ids,
+                ),
+                terminal,
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                terminal,
+            )
+
+    def test_remaining_checkpoint_replays_split_history_to_idempotent_terminal(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_query_plan import (
+            _make_batch,
+            bisect_statcast_query,
+            publish_query_batch,
+            publish_split_receipt,
+        )
+        from tests.test_v52_query_plan import _record_split_attempt
+
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(Path(directory))
+            (
+                root,
+                run_spec,
+                fixture,
+                participant_batch,
+                participant_checkpoint,
+                _,
+                partition_batch,
+                partition_ids,
+                _,
+                remaining_evidence,
+            ) = remaining_fixture
+            initial = self.publish_remaining_checkpoint(
+                remaining_fixture,
+                expected_prior=participant_checkpoint.receipt_sha256,
+            )
+            parent = next(
+                query
+                for query in partition_batch.queries
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                and (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 6
+            )
+            parent_id = logical_query_id(parent)
+            child_batch = _make_batch(
+                "REMAINING",
+                partition_batch.batch_id,
+                bisect_statcast_query(parent),
+            )
+            publish_query_batch(root, child_batch)
+            attempt_number = _record_split_attempt(root, parent, "ROW_CAP")
+            split_receipt = publish_split_receipt(
+                root,
+                evidence_root=root / run_spec.raw["namespaces"]["raw"],
+                parent_batch_id=partition_batch.batch_id,
+                parent_query_id=parent_id,
+                reason="ROW_CAP",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            split_path = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                / f"{parent_id}.json"
+            )
+            static_batch, reference_batch, static_ids, reference_ids, *_ = fixture
+            prefix_ids = tuple(
+                sorted(
+                    (
+                        *static_ids,
+                        *reference_ids,
+                        *(
+                            logical_query_id(query)
+                            for query in participant_batch.queries
+                        ),
+                    )
+                )
+            )
+            child_ids = tuple(
+                logical_query_id(query) for query in child_batch.queries
+            )
+            active_ids = tuple(
+                sorted(
+                    (
+                        *(query_id for query_id in partition_ids if query_id != parent_id),
+                        *child_ids,
+                    )
+                )
+            )
+            batch_ids = (
+                static_batch.batch_id,
+                reference_batch.batch_id,
+                participant_batch.batch_id,
+                partition_batch.batch_id,
+                child_batch.batch_id,
+            )
+            split_checkpoint = self.registry.publish_acquisition_checkpoint(
+                root,
+                run_spec,
+                expected_prior_checkpoint_sha256=initial.receipt_sha256,
+                stage="REMAINING",
+                query_batch_ids=batch_ids,
+                completed_query_ids=prefix_ids,
+                pending_query_ids=active_ids,
+                quarantined_query_ids=(),
+                split_query_ids=(parent_id,),
+                stage_evidence_receipts=remaining_evidence,
+                split_receipt_paths=(split_path,),
+            )
+            self.assertEqual(split_checkpoint.split_query_ids, (parent_id,))
+            self.assertEqual(
+                split_checkpoint.split_receipt_sha256s,
+                (split_receipt.receipt_sha256,),
+            )
+
+            unsplit_partition = replace(
+                partition_batch,
+                queries=tuple(
+                    query
+                    for query in partition_batch.queries
+                    if logical_query_id(query) != parent_id
+                ),
+            )
+            self.complete_remaining_queries(root, run_spec, unsplit_partition)
+            self.complete_remaining_queries(root, run_spec, child_batch)
+            terminal_kwargs = {
+                "expected_prior_checkpoint_sha256": split_checkpoint.receipt_sha256,
+                "stage": "REMAINING",
+                "query_batch_ids": batch_ids,
+                "completed_query_ids": tuple(sorted((*prefix_ids, *active_ids))),
+                "pending_query_ids": (),
+                "quarantined_query_ids": (),
+                "split_query_ids": (parent_id,),
+                "stage_evidence_receipts": remaining_evidence,
+                "split_receipt_paths": (split_path,),
+            }
+            terminal = self.registry.publish_acquisition_checkpoint(
+                root,
+                run_spec,
+                **terminal_kwargs,
+            )
+            self.assertFalse(terminal.pending_query_ids)
+            self.assertFalse(terminal.quarantined_query_ids)
+            self.assertEqual(terminal.split_query_ids, (parent_id,))
+            self.assertEqual(
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    **terminal_kwargs,
                 ),
                 terminal,
             )
@@ -1815,6 +2061,160 @@ class ExecutionRegistryTest(unittest.TestCase):
                 forged[key] = [item, item]
                 with self.assertRaisesRegex(ValueError, "duplicate|unique|order"):
                     self.registry._validate_checkpoint_payload(forged)
+
+    def test_checkpoint_split_dag_validator_rejects_invalid_graphs(self) -> None:
+        fixed = (
+            ("batch-static", "STATIC_SCHEDULES", None, ("query-static",)),
+            ("batch-reference", "REFERENCE_INPUTS", None, ("query-reference",)),
+            ("batch-participant", "PARTICIPANT_DERIVED", None, ("query-participant",)),
+            ("batch-partition", "REMAINING", "decision", ("parent-root",)),
+        )
+        child = (
+            "batch-child",
+            "REMAINING",
+            "batch-partition",
+            ("parent-child", "leaf-a"),
+        )
+        grandchild = (
+            "batch-grandchild",
+            "REMAINING",
+            "batch-child",
+            ("leaf-b", "leaf-c"),
+        )
+        root_receipt = (
+            "receipt-root",
+            "batch-partition",
+            "parent-root",
+            "batch-child",
+            ("parent-child", "leaf-a"),
+        )
+        child_receipt = (
+            "receipt-child",
+            "batch-child",
+            "parent-child",
+            "batch-grandchild",
+            ("leaf-b", "leaf-c"),
+        )
+        batches = (*fixed, child, grandchild)
+        receipts = (root_receipt, child_receipt)
+        split_ids = ("parent-child", "parent-root")
+        self.assertEqual(
+            self.registry._checkpoint_split_dag_active_leaves(
+                batches,
+                receipts,
+                split_ids,
+            ),
+            {"leaf-a", "leaf-b", "leaf-c"},
+        )
+
+        attacks = {
+            "orphan": (
+                batches,
+                (root_receipt,),
+                ("parent-root",),
+            ),
+            "duplicate_child": (
+                batches,
+                (
+                    root_receipt,
+                    (
+                        *child_receipt[:3],
+                        "batch-child",
+                        child_receipt[4],
+                    ),
+                ),
+                split_ids,
+            ),
+            "duplicate_receipt_id": (
+                batches,
+                (
+                    root_receipt,
+                    (root_receipt[0], *child_receipt[1:]),
+                ),
+                split_ids,
+            ),
+            "forward": (
+                (*fixed, grandchild, child),
+                receipts,
+                split_ids,
+            ),
+            "cycle": (
+                (
+                    *fixed,
+                    (
+                        child[0],
+                        child[1],
+                        grandchild[0],
+                        child[3],
+                    ),
+                    grandchild,
+                ),
+                receipts,
+                split_ids,
+            ),
+            "wrong_derived": (
+                (*fixed, (child[0], child[1], "wrong", child[3]), grandchild),
+                receipts,
+                split_ids,
+            ),
+            "wrong_parent": (
+                batches,
+                (
+                    (
+                        root_receipt[0],
+                        "batch-reference",
+                        *root_receipt[2:],
+                    ),
+                    child_receipt,
+                ),
+                split_ids,
+            ),
+            "wrong_child_order": (
+                batches,
+                (
+                    (*root_receipt[:4], tuple(reversed(root_receipt[4]))),
+                    child_receipt,
+                ),
+                split_ids,
+            ),
+        }
+        for attack, (forged_batches, forged_receipts, forged_split_ids) in (
+            attacks.items()
+        ):
+            with (
+                self.subTest(attack=attack),
+                self.assertRaisesRegex(ValueError, "split|DAG|batch|parent|child"),
+            ):
+                self.registry._checkpoint_split_dag_active_leaves(
+                    forged_batches,
+                    forged_receipts,
+                    forged_split_ids,
+                )
+
+    def test_remaining_population_allows_quarantine_only_intermediate(self) -> None:
+        self.registry._validate_checkpoint_remaining_population(
+            active_leaf_ids={"leaf-success", "leaf-quarantined"},
+            prefix_ids={"prefix"},
+            completed_query_ids={"prefix", "leaf-success"},
+            pending_query_ids=set(),
+            quarantined_query_ids={"leaf-quarantined"},
+        )
+        with self.assertRaisesRegex(ValueError, "REMAINING|active-leaf|prefix"):
+            self.registry._validate_checkpoint_remaining_population(
+                active_leaf_ids={"leaf"},
+                prefix_ids={"prefix"},
+                completed_query_ids=set(),
+                pending_query_ids={"leaf"},
+                quarantined_query_ids=set(),
+            )
+        with self.assertRaisesRegex(ValueError, "REMAINING|active-leaf|prefix"):
+            self.registry._validate_checkpoint_remaining_population(
+                active_leaf_ids={"leaf"},
+                prefix_ids={"prefix"},
+                completed_query_ids={"prefix"},
+                pending_query_ids={"outside"},
+                quarantined_query_ids=set(),
+            )
 
     def test_checkpoint_split_requires_canonical_verified_split_graph(self) -> None:
         from mlb_backtest import v52_query_plan
