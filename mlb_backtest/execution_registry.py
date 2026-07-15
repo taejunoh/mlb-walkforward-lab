@@ -2319,6 +2319,10 @@ def _checkpoint_current_semantic(
             batch_query_ids[batch.batch_id].add(query_id)
     if not batches or batches[0]["stage"] != "STATIC_SCHEDULES":
         raise ValueError("checkpoint must bind the STATIC_SCHEDULES root batch")
+    if stage != "TIMEZONE_REVIEW" and not any(
+        batch["stage"] == stage for batch in batches
+    ):
+        raise ValueError(f"checkpoint {stage} stage lacks its batch")
     authoritative_batches, authoritative_stage_evidence = (
         _checkpoint_stage_authority(
             paths,

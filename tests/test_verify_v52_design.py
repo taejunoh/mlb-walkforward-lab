@@ -173,6 +173,7 @@ class DesignVerificationTest(unittest.TestCase):
     def test_task7d_timezone_authority_is_required_canonical_pinned_and_current_scope_bound(self) -> None:
         required_schemas = {
             "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_game_evidence_inventory.schema.json",
             "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
             "schemas/v5_2_timezone_candidate.schema.json",
@@ -181,10 +182,12 @@ class DesignVerificationTest(unittest.TestCase):
             "schemas/v5_2_venue_timezones.schema.json",
         }
         required_code = {
+            "mlb_backtest/v52_game_evidence_inventory.py",
             "mlb_backtest/v52_query_plan.py",
             "mlb_backtest/v52_schedule_inventory.py",
             "mlb_backtest/v52_timezone_review.py",
             "tests/test_v52_query_plan.py",
+            "tests/test_v52_game_evidence_inventory.py",
             "tests/test_v52_schedule_inventory.py",
             "tests/test_v52_timezone_review.py",
         }
@@ -202,11 +205,10 @@ class DesignVerificationTest(unittest.TestCase):
                 set(verifier_module.CURRENT_SCOPE_SINGLE_FILES)
             )
         )
-        self.assertTrue(
-            required_schemas.issubset(
-                set(getattr(verifier_module, "TASK7D_SCHEMA_DOCUMENT_SHA256", {}))
-            )
-        )
+        pins = getattr(verifier_module, "TASK7D_SCHEMA_DOCUMENT_SHA256", {})
+        self.assertTrue(required_schemas.issubset(set(pins)))
+        for relative in required_schemas:
+            self.assertEqual(pins[relative], sha256_file(ROOT / relative))
         scope = verifier_module.capture_current_scope(ROOT)
         self.assertTrue(
             (required_code | required_docs).issubset(set(scope["single_files"]))
@@ -1285,6 +1287,7 @@ class DesignVerificationTest(unittest.TestCase):
                 "v5_2_split_receipt.schema.json",
                 "v5_2_acquisition_checkpoint.schema.json",
                 "v5_2_execution_receipt.schema.json",
+                "v5_2_game_evidence_inventory.schema.json",
                 "v5_2_schedule_anchor_inventory.schema.json",
                 "v5_2_timezone_candidate.schema.json",
                 "v5_2_timezone_review_receipt.schema.json",
@@ -1330,6 +1333,7 @@ class DesignVerificationTest(unittest.TestCase):
             "v5_2_split_receipt.schema.json",
             "v5_2_acquisition_checkpoint.schema.json",
             "v5_2_execution_receipt.schema.json",
+            "v5_2_game_evidence_inventory.schema.json",
             "v5_2_schedule_anchor_inventory.schema.json",
             "v5_2_timezone_candidate.schema.json",
             "v5_2_timezone_review_receipt.schema.json",

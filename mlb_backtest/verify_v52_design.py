@@ -89,6 +89,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "mlb_backtest/diagnostics.py",
     "mlb_backtest/diagnostic_report.py",
     "mlb_backtest/execution_registry.py",
+    "mlb_backtest/v52_game_evidence_inventory.py",
     "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/v52_schedule_inventory.py",
     "mlb_backtest/v52_timezone_review.py",
@@ -101,6 +102,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_diagnostics.py",
     "tests/test_diagnostic_report.py",
     "tests/test_execution_registry.py",
+    "tests/test_v52_game_evidence_inventory.py",
     "tests/test_v52_query_plan.py",
     "tests/test_v52_schedule_inventory.py",
     "tests/test_v52_timezone_review.py",
@@ -138,6 +140,7 @@ EXPECTED_CURRENT_FILES = (
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_game_evidence_inventory.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_timezone_candidate.schema.json",
@@ -164,6 +167,7 @@ CANONICAL_JSON_FILES = (
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_game_evidence_inventory.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_timezone_candidate.schema.json",
@@ -195,13 +199,16 @@ V51_REQUIRED_FILES = tuple(
 
 TASK7D_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "71d7cd18b44ec75d1be6a10518434c7691efcde804dfe6938fb830cd33519e8a"
+        "14c2c6d324f427be2c04fc9979cffae5e7f1d90a4b4f923fa0439f6958d96d28"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
         "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
     ),
     "schemas/v5_2_split_receipt.schema.json": (
         "b9de7114410e036cd43a2530a8440dcdbc1b85d78699281e1c623d234102aeea"
+    ),
+    "schemas/v5_2_game_evidence_inventory.schema.json": (
+        "9460307dccfc65f82f5a0f837c0139eb4be7dc0337483a6337264c104f85bd70"
     ),
     "schemas/v5_2_schedule_anchor_inventory.schema.json": (
         "66698b643ad186434d0930a7f369b3b292f664e1152ddaaa727e6d0003a13c31"

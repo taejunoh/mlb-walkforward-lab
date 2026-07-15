@@ -3794,8 +3794,10 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def test_task7c_bound_runtime_rejects_dirty_initialize_and_load(self) -> None:
         required = (
+            Path("mlb_backtest/v52_game_evidence_inventory.py"),
             Path("mlb_backtest/v52_query_plan.py"),
             Path("mlb_backtest/v52_schedule_inventory.py"),
+            Path("schemas/v5_2_game_evidence_inventory.schema.json"),
             Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
             Path("schemas/v5_2_split_receipt.schema.json"),
         )
