@@ -107,14 +107,14 @@ def _planned_statcast_sidecars(
     omit_ranges: set[tuple[str, str]] | None = None,
     omit_years: set[int] | None = None,
 ) -> list[dict[str, object]]:
-    from mlb_backtest.v52_query_plan import build_statcast_root_batch
+    from mlb_backtest.v52_query_plan import _build_statcast_root_batch
 
     cutoff_date = date.fromisoformat(cutoff)
     omitted_ranges = omit_ranges or set()
     omitted_years = omit_years or set()
     queries = [
         query
-        for query in build_statcast_root_batch(RUN_SPEC, CONTRACT).queries
+        for query in _build_statcast_root_batch(RUN_SPEC, CONTRACT).queries
         if query.source == "baseball_savant_statcast"
         and start_year <= int(query.requested_range["year"]) <= cutoff_date.year
         and date.fromisoformat(str(query.requested_range["start_date"]))
@@ -139,9 +139,9 @@ def _planned_statcast_sidecars(
 
 
 def _planned_statcast_query(start: str, end: str) -> LogicalQuery:
-    from mlb_backtest.v52_query_plan import build_statcast_root_batch
+    from mlb_backtest.v52_query_plan import _build_statcast_root_batch
 
-    for query in build_statcast_root_batch(RUN_SPEC, CONTRACT).queries:
+    for query in _build_statcast_root_batch(RUN_SPEC, CONTRACT).queries:
         if (
             query.source == "baseball_savant_statcast"
             and query.requested_range.get("start_date") == start

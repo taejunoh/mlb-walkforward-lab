@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -28,6 +31,48 @@ RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
 CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
+
+_STATCAST_AUTHORITY_FILES = (
+    Path("protocols/v5_2_qd/historical_walkforward_500.json"),
+    Path("protocols/v5_2_qd/historical_source_acquisition.json"),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
+    ),
+    Path(
+        "docs/superpowers/plans/"
+        "2026-07-13-mlb-v5-2-hybrid-acquisition.md"
+    ),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+    ),
+    Path("schemas/v5_2_acquisition_contract.schema.json"),
+)
+
+
+def _statcast_authority_fixture(parent: Path, *, in_place: bool = False) -> Path:
+    root = (parent if in_place else parent / "repo").resolve()
+    for relative in _STATCAST_AUTHORITY_FILES:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "query-plan@example.test"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Query Plan Test"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture authority"], cwd=root, check=True
+    )
+    return root
 
 
 def _inventory_anchor(**changes: object) -> dict[str, object]:
@@ -309,7 +354,8 @@ def _split_evidence_root(repository_root: Path) -> Path:
 def _split_batches(root: Path):
     import mlb_backtest.v52_query_plan as query_plan
 
-    parent_batch = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+    _statcast_authority_fixture(root, in_place=True)
+    parent_batch = query_plan.build_statcast_root_batch(root)
     parent = next(
         query
         for query in parent_batch.queries
@@ -330,6 +376,25 @@ def _split_batches(root: Path):
 
 
 class V52QueryPlanTest(unittest.TestCase):
+    def test_statcast_root_builder_exposes_private_transform_and_public_authority_api(
+        self,
+    ):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        private = getattr(query_plan, "_build_statcast_root_batch", None)
+        self.assertIsNotNone(
+            private,
+            "missing pure _build_statcast_root_batch(path, path) seam",
+        )
+        self.assertEqual(
+            tuple(inspect.signature(private).parameters),
+            ("run_spec_path", "acquisition_contract_path"),
+        )
+        self.assertEqual(
+            tuple(inspect.signature(query_plan.build_statcast_root_batch).parameters),
+            ("repository_root",),
+        )
+
     def test_static_batch_covers_2018_through_2024_only_and_excludes_2025(self):
         from mlb_backtest.v52_query_plan import build_static_batch
 
@@ -349,9 +414,9 @@ class V52QueryPlanTest(unittest.TestCase):
         self.assertEqual(batch.stage, "STATIC_SCHEDULES")
 
     def test_statcast_root_batch_uses_monthly_official_parents_only(self):
-        from mlb_backtest.v52_query_plan import build_statcast_root_batch
+        from mlb_backtest.v52_query_plan import _build_statcast_root_batch
 
-        batch = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        batch = _build_statcast_root_batch(RUN_SPEC, CONTRACT)
         self.assertEqual(batch.stage, "REMAINING")
         self.assertIsNone(batch.derived_from_sha256)
         self.assertEqual(len(batch.queries), 46)
@@ -372,15 +437,17 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_static_and_statcast_root_batches_are_a_lossless_deterministic_split(self):
         from mlb_backtest.v52_query_plan import (
-            build_statcast_root_batch,
+            _build_statcast_root_batch,
             build_static_batch,
         )
 
         static = build_static_batch(RUN_SPEC, CONTRACT)
-        statcast = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        statcast = _build_statcast_root_batch(RUN_SPEC, CONTRACT)
         self.assertNotEqual(static.batch_id, statcast.batch_id)
         self.assertEqual(static, build_static_batch(RUN_SPEC, CONTRACT))
-        self.assertEqual(statcast, build_statcast_root_batch(RUN_SPEC, CONTRACT))
+        self.assertEqual(
+            statcast, _build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        )
         self.assertEqual(static.stage, "STATIC_SCHEDULES")
         self.assertEqual(statcast.stage, "REMAINING")
 
@@ -410,18 +477,116 @@ class V52QueryPlanTest(unittest.TestCase):
             publish_query_batch,
         )
 
-        batches = (
-            build_static_batch(RUN_SPEC, CONTRACT),
-            build_statcast_root_batch(RUN_SPEC, CONTRACT),
-        )
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td).resolve()
+            root = _statcast_authority_fixture(Path(td))
+            batches = (
+                build_static_batch(RUN_SPEC, CONTRACT),
+                build_statcast_root_batch(root),
+            )
             paths = [publish_query_batch(root, batch) for batch in batches]
             self.assertEqual(len(set(paths)), 2)
             self.assertEqual(
                 [load_query_batch(root, batch.batch_id) for batch in batches],
                 list(batches),
             )
+
+    def test_statcast_public_builder_publishes_loads_and_is_idempotent(self):
+        from mlb_backtest.v52_query_plan import (
+            _build_statcast_root_batch,
+            build_statcast_root_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            batch = build_statcast_root_batch(root)
+            expected = _build_statcast_root_batch(
+                root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                root / "protocols/v5_2_qd/historical_source_acquisition.json",
+            )
+            self.assertEqual(batch, expected)
+            self.assertEqual(len(batch.queries), 46)
+            path = publish_query_batch(root, batch)
+            before = path.stat()
+            self.assertEqual(publish_query_batch(root, batch), path)
+            after = path.stat()
+            self.assertEqual(
+                (before.st_dev, before.st_ino),
+                (after.st_dev, after.st_ino),
+            )
+            self.assertEqual(load_query_batch(root, batch.batch_id), batch)
+
+    def test_statcast_root_publish_rebinds_authority_for_existing_and_new_files(
+        self,
+    ):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        for publication in ("existing", "new"):
+            with (
+                self.subTest(publication=publication),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = _statcast_authority_fixture(Path(directory))
+                batch = query_plan.build_statcast_root_batch(root)
+                final = (
+                    root
+                    / "audit/v5_2_qd/historical/acquisition/query_batches"
+                    / f"{batch.batch_id}.json"
+                )
+                expected: bytes | None = None
+                if publication == "existing":
+                    query_plan.publish_query_batch(root, batch)
+                    expected = final.read_bytes()
+
+                def mutate_authority() -> None:
+                    contract = root / (
+                        "protocols/v5_2_qd/"
+                        "historical_source_acquisition.json"
+                    )
+                    contract.write_bytes(contract.read_bytes() + b" ")
+
+                with (
+                    mock.patch.object(
+                        query_plan,
+                        "_before_query_batch_authority_rebind",
+                        side_effect=mutate_authority,
+                    ) as hook,
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    query_plan.publish_query_batch(root, batch)
+                hook.assert_called_once_with()
+                if publication == "existing":
+                    self.assertEqual(final.read_bytes(), expected)
+                else:
+                    self.assertFalse(final.exists())
+
+    def test_statcast_root_load_rebinds_authority_after_reconstruction(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            batch = query_plan.build_statcast_root_batch(root)
+            final = query_plan.publish_query_batch(root, batch)
+            expected = final.read_bytes()
+
+            def mutate_authority() -> None:
+                contract = root / (
+                    "protocols/v5_2_qd/historical_source_acquisition.json"
+                )
+                contract.write_bytes(contract.read_bytes() + b" ")
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_before_query_batch_authority_rebind",
+                    side_effect=mutate_authority,
+                ) as hook,
+                self.assertRaises((ValueError, RuntimeError)),
+            ):
+                query_plan.load_query_batch(root, batch.batch_id)
+            hook.assert_called_once_with()
+            self.assertEqual(final.read_bytes(), expected)
 
     def test_query_batch_construction_rejects_unknown_stage_with_any_population(self):
         from mlb_backtest.v52_query_plan import _make_batch, build_static_batch
@@ -507,14 +672,15 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_load_recomputation_rejects_semantically_forged_statcast_root_batches(self):
         from mlb_backtest.v52_query_plan import (
-            build_statcast_root_batch,
+            _build_statcast_root_batch,
             load_query_batch,
         )
 
-        queries = build_statcast_root_batch(RUN_SPEC, CONTRACT).queries
+        queries = _build_statcast_root_batch(RUN_SPEC, CONTRACT).queries
         attacks = {
             "empty": (),
-            "coverage": queries[:-1],
+            "omission": queries[:-1],
+            "extra": (*queries, queries[-1]),
             "order": (queries[1], queries[0], *queries[2:]),
             "parent": (
                 dataclasses.replace(queries[0], parent_query_id="d" * 64),
@@ -534,32 +700,41 @@ class V52QueryPlanTest(unittest.TestCase):
                 ),
                 *queries[1:],
             ),
-            "binding": (
-                dataclasses.replace(queries[0], acquisition_contract_sha256="e" * 64),
-                *queries[1:],
+            "run-hash": tuple(
+                dataclasses.replace(query, run_spec_sha256="e" * 64)
+                for query in queries
+            ),
+            "contract-hash": tuple(
+                dataclasses.replace(
+                    query, acquisition_contract_sha256="e" * 64
+                )
+                for query in queries
             ),
         }
         for attack, forged_queries in attacks.items():
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
-                root = Path(td).resolve()
+                root = _statcast_authority_fixture(Path(td))
                 batch_id = _write_forged_canonical_batch(
                     root,
                     stage="REMAINING",
                     derived_from_sha256=None,
                     queries=tuple(forged_queries),
                 )
-                with self.assertRaisesRegex(ValueError, "REMAINING|Statcast|root"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "REMAINING|Statcast|root|RunSpec|acquisition|authority|replay",
+                ):
                     load_query_batch(root, batch_id)
 
     def test_remaining_derived_batches_require_valid_parented_statcast_queries(self):
         from mlb_backtest.v52_query_plan import (
             _make_batch,
+            _build_statcast_root_batch,
             bisect_statcast_query,
-            build_statcast_root_batch,
             load_query_batch,
         )
 
-        root_query = build_statcast_root_batch(RUN_SPEC, CONTRACT).queries[0]
+        root_query = _build_statcast_root_batch(RUN_SPEC, CONTRACT).queries[0]
         left, right = bisect_statcast_query(root_query)
         left_left, left_right = bisect_statcast_query(left)
         valid = _make_batch("REMAINING", "c" * 64, [left_left, left_right, right])
@@ -592,13 +767,13 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_load_recomputation_rejects_static_remaining_source_mixing(self):
         from mlb_backtest.v52_query_plan import (
-            build_statcast_root_batch,
+            _build_statcast_root_batch,
             build_static_batch,
             load_query_batch,
         )
 
         static = build_static_batch(RUN_SPEC, CONTRACT)
-        statcast = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+        statcast = _build_statcast_root_batch(RUN_SPEC, CONTRACT)
         attacks = (
             ("REMAINING", static.queries),
             ("STATIC_SCHEDULES", (*static.queries[:-1], statcast.queries[0])),
@@ -2598,8 +2773,9 @@ class V52QueryPlanTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve()
+            _statcast_authority_fixture(root, in_place=True)
             evidence_root = _split_evidence_root(root)
-            legitimate = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            legitimate = query_plan._build_statcast_root_batch(RUN_SPEC, CONTRACT)
             forged_queries = tuple(
                 dataclasses.replace(
                     query,
@@ -2624,11 +2800,21 @@ class V52QueryPlanTest(unittest.TestCase):
                 parent_batch.batch_id,
                 query_plan.bisect_statcast_query(parent),
             )
-            query_plan.publish_query_batch(root, parent_batch)
+            forged_id = _write_forged_canonical_batch(
+                root,
+                stage="REMAINING",
+                derived_from_sha256=None,
+                queries=parent_batch.queries,
+            )
+            self.assertEqual(forged_id, parent_batch.batch_id)
             query_plan.publish_query_batch(root, child_batch)
             attempt_number = _record_split_attempt(root, parent, "TIMEOUT")
 
-            with self.assertRaisesRegex(ValueError, "acquisition contract"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "acquisition contract|fixed contract replay|"
+                "fixed Statcast authority replay",
+            ):
                 query_plan.publish_split_receipt(
                     root,
                     evidence_root=evidence_root,
@@ -2697,12 +2883,19 @@ class V52QueryPlanTest(unittest.TestCase):
                         contract["minimum_free_space_reserve_bytes"] += 1
                     contract_path.write_bytes(_canonical_json_bytes(contract))
 
+                expected_error = (
+                    (FileNotFoundError, ValueError)
+                    if mutation == "missing"
+                    else ValueError
+                )
                 with self.assertRaisesRegex(
-                    ValueError, "acquisition contract|RunSpec"
+                    expected_error,
+                    "acquisition contract|historical_source_acquisition|RunSpec",
                 ):
                     query_plan.publish_split_receipt(root, **kwargs)
                 with self.assertRaisesRegex(
-                    ValueError, "acquisition contract|RunSpec"
+                    expected_error,
+                    "acquisition contract|historical_source_acquisition|RunSpec",
                 ):
                     query_plan.load_split_receipt(
                         root,
@@ -2954,7 +3147,8 @@ class V52QueryPlanTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve()
-            root_batch = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            _statcast_authority_fixture(root, in_place=True)
+            root_batch = query_plan.build_statcast_root_batch(root)
             parent = next(
                 query
                 for query in root_batch.queries

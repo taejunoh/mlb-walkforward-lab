@@ -576,7 +576,7 @@ def _batch_payload(
     query_records = [_query_record(query) for query in queries]
     query_ids = [logical_query_id(query) for query in queries]
     if len(query_ids) != len(set(query_ids)):
-        raise ValueError("query batch contains duplicate logical queries")
+        raise ValueError(f"{stage} query batch contains duplicate logical queries")
     _validate_stage_batch(stage, derived_from_sha256, queries)
     return {
         "stage": stage,
@@ -1070,7 +1070,7 @@ def build_static_batch(
     return _make_batch("STATIC_SCHEDULES", None, queries)
 
 
-def build_statcast_root_batch(
+def _build_statcast_root_batch(
     run_spec_path: Path,
     acquisition_contract_path: Path,
 ) -> QueryBatch:
@@ -1099,6 +1099,14 @@ def build_statcast_root_batch(
                 )
             )
     return _make_batch("REMAINING", None, queries)
+
+
+def build_statcast_root_batch(repository_root: Path) -> QueryBatch:
+    root = Path(repository_root)
+    return _build_statcast_root_batch(
+        root / _RUN_SPEC_RELATIVE,
+        root / _ACQUISITION_CONTRACT_RELATIVE,
+    )
 
 
 def _canonical_mapping_sha256(value: Mapping[str, object], label: str) -> str:
@@ -1785,9 +1793,29 @@ def _validate_participant_batch_authority(
         raise ValueError("PARTICIPANT_DERIVED differs from fixed game inventory replay")
 
 
+def _is_statcast_root_batch(batch: QueryBatch) -> bool:
+    return (
+        batch.stage == "REMAINING"
+        and batch.derived_from_sha256 is None
+        and len(batch.queries) == 46
+        and all(query.parent_query_id is None for query in batch.queries)
+    )
+
+
+def _validate_statcast_root_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if not _is_statcast_root_batch(batch):
+        return
+    expected = build_statcast_root_batch(repository_root)
+    if batch != expected:
+        raise ValueError("REMAINING root differs from fixed Statcast authority replay")
+
+
 def _validate_query_batch_authority(repository_root: Path, batch: QueryBatch) -> None:
     _validate_reference_batch_authority(repository_root, batch)
     _validate_participant_batch_authority(repository_root, batch)
+    _validate_statcast_root_batch_authority(repository_root, batch)
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
@@ -2310,7 +2338,7 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         ) != _batch_file_identity(metadata):
             raise ValueError("query batch identity or bytes changed during load")
         _verify_opened_batch_chain(root, descriptors)
-        if batch.stage == "PARTICIPANT_DERIVED":
+        if batch.stage == "PARTICIPANT_DERIVED" or _is_statcast_root_batch(batch):
             _rebind_query_batch_authority(root, batch)
         return batch
     finally:
@@ -2419,7 +2447,10 @@ def _before_query_batch_authority_rebind() -> None:
 
 
 def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
-    if batch.stage not in {"REFERENCE_INPUTS", "PARTICIPANT_DERIVED"}:
+    if batch.stage not in {
+        "REFERENCE_INPUTS",
+        "PARTICIPANT_DERIVED",
+    } and not _is_statcast_root_batch(batch):
         return
     _before_query_batch_authority_rebind()
     _validate_query_batch_authority(root, batch)

@@ -1075,9 +1075,9 @@ class V52TimezoneReviewTest(unittest.TestCase):
 
     def test_candidate_cli_ignores_duplicate_unrelated_query_across_batches(self):
         from mlb_backtest.v52_query_plan import (
+            _build_statcast_root_batch,
             _make_batch,
             bisect_statcast_query,
-            build_statcast_root_batch,
             publish_query_batch,
         )
         from mlb_backtest.v52_timezone_review import main
@@ -1087,7 +1087,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             evidence_root = root / "evidence"
             evidence_root.mkdir()
             base, _, venue = _sealed_candidate_fixture(root, evidence_root)
-            statcast_root = build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            statcast_root = _build_statcast_root_batch(RUN_SPEC, CONTRACT)
             unrelated = bisect_statcast_query(statcast_root.queries[0])[0]
             schedule_batch = base[0]
             venue_batch = base[1]

@@ -1964,9 +1964,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 if attack == "omitted":
                     batch_ids = (static_batch.batch_id,)
                 elif attack == "extra":
-                    extra = build_statcast_root_batch(
-                        root / RUN_SPEC_RELATIVE, root / CONTRACT_RELATIVE
-                    )
+                    extra = build_statcast_root_batch(root)
                     publish_query_batch(root, extra)
                     batch_ids = (*batch_ids, extra.batch_id)
                 elif attack == "missing-evidence":
