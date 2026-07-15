@@ -28,6 +28,14 @@ SEAL_SCHEMA = ROOT / "schemas/v5_2_timezone_seal_receipt.schema.json"
 PRODUCTION_MAPPING = ROOT / "config/v5_2_qd/venue_timezones.json"
 FORBIDDEN_MAPPING = ROOT / "config/v5_2_qd_venue_timezones.json"
 AUDIT_NAMESPACE = Path("audit/v5_2_qd/historical/acquisition")
+FIXED_CANDIDATE = AUDIT_NAMESPACE / "venue_timezone_candidate.json"
+FIXED_COVERAGE_REVIEW = (
+    AUDIT_NAMESPACE / "timezone_reviews/coverage.json"
+)
+FIXED_SEMANTIC_REVIEW = (
+    AUDIT_NAMESPACE / "timezone_reviews/semantic.json"
+)
+FIXED_SEAL = AUDIT_NAMESPACE / "venue_timezone_seal.json"
 PROVENANCE = {
     "query_batch_ids": ["c" * 64, "d" * 64],
     "run_spec_sha256": "a" * 64,
@@ -133,7 +141,12 @@ def _resolve_candidate(candidate: dict[str, object]):
     return candidate
 
 
-def _sealed_candidate_fixture(root: Path, evidence_root: Path):
+def _sealed_candidate_fixture(
+    root: Path,
+    evidence_root: Path,
+    *,
+    tamper_venue_semantics: bool = False,
+):
     from mlb_backtest.protocols import load_run_spec
     from mlb_backtest.v52_evidence import (
         AttemptCapture,
@@ -223,47 +236,72 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
         raise AssertionError("production reference fixture must contain two venues")
     publish_query_batch(root, reference_batch)
     store = V52EvidenceStore(evidence_root)
-    capture = AttemptCapture(
-        started_at_utc="2026-07-14T00:00:00.000000Z",
-        ended_at_utc="2026-07-14T00:00:01.000000Z",
-        final_url="https://fixture.invalid",
-        http_status=200,
-        response_headers=(("Content-Type", "application/json"),),
-        body=b"{}",
-        error_classification=None,
-    )
     schedule_semantics = _inputs()[0][0]["semantics"]
     venue_records = {
         row["venue_id"]: row
         for row in _inputs()[1][0]["semantics"]["venues"]
     }
-    evidence = [
-        (
-            query,
-            schedule_semantics
-            if query is schedule
-            else {
-                "anchors": [
+    evidence = []
+    if evidence_root != inventory_evidence_root:
+        evidence.extend(
+            (
+                query,
+                b"{}",
+                schedule_semantics
+                if query is schedule
+                else {
+                    "anchors": [
+                        {
+                            "alternate_site": False,
+                            "game_pk": int(query.requested_range["year"]) * 10 + 1,
+                            "neutral_site": False,
+                            "official_date": (
+                                f'{int(query.requested_range["year"]):04d}-04-02'
+                            ),
+                            "played": True,
+                            "venue_id": 31,
+                        }
+                    ]
+                },
+            )
+            for query in schedule_queries
+        )
+    for index, query in enumerate(venues):
+        venue = venue_records[query.requested_range["venue_id"]]
+        raw = _canonical(
+            {
+                "venues": [
                     {
-                        "alternate_site": False,
-                        "game_pk": int(query.requested_range["year"]) * 10 + 1,
-                        "neutral_site": False,
-                        "official_date": (
-                            f'{int(query.requested_range["year"]):04d}-04-02'
-                        ),
-                        "played": True,
-                        "venue_id": 31,
+                        "id": venue["venue_id"],
+                        "location": {
+                            "city": venue["city"],
+                            "defaultCoordinates": {
+                                "latitude": venue["latitude"],
+                                "longitude": venue["longitude"],
+                            },
+                        },
+                        "name": venue["venue_name"],
                     }
                 ]
-            },
+            }
         )
-        for query in schedule_queries
-    ]
-    evidence.extend(
-        (query, {"venues": [venue_records[query.requested_range["venue_id"]]]})
-        for query in venues
-    )
-    for query, semantics in evidence:
+        semantic_venue = dict(venue)
+        if tamper_venue_semantics and index == 0:
+            semantic_venue["venue_name"] = "Sidecar-only tamper"
+        evidence.append((query, raw, {"venues": [semantic_venue]}))
+    for query, raw, semantics in evidence:
+        capture = AttemptCapture(
+            started_at_utc="2026-07-14T00:00:00.000000Z",
+            ended_at_utc="2026-07-14T00:00:01.000000Z",
+            final_url=query.endpoint,
+            http_status=200,
+            response_headers=(
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(raw))),
+            ),
+            body=raw,
+            error_classification=None,
+        )
         with store.acquire_query(query) as lease:
             store.publish_fetched(
                 query,
@@ -340,6 +378,64 @@ def _reviewed_candidate_fixture(
             ).relative_to(root)
         )
     return candidate, reviews
+
+
+def _fixed_verified_gate_fixture(
+    root: Path, *, tamper_venue_semantics: bool = False
+):
+    from mlb_backtest.v52_timezone_review import (
+        build_timezone_candidate,
+        seal_timezone_mapping,
+        write_timezone_review_receipt,
+    )
+
+    evidence_root = root / "data/v5_2_qd/historical/raw"
+    batches, _, _ = _sealed_candidate_fixture(
+        root,
+        evidence_root,
+        tamper_venue_semantics=tamper_venue_semantics,
+    )
+    candidate = _resolve_candidate(
+        dict(
+            build_timezone_candidate(
+                root=root,
+                evidence_root=evidence_root,
+                batch_ids=[batch.batch_id for batch in batches],
+            )
+        )
+    )
+    _write(root, FIXED_CANDIDATE, candidate)
+    reviews = []
+    for path, identity, role in (
+        (
+            FIXED_COVERAGE_REVIEW,
+            "reviewer-coverage",
+            "TIMEZONE_COVERAGE_REVIEW",
+        ),
+        (
+            FIXED_SEMANTIC_REVIEW,
+            "reviewer-semantic",
+            "TIMEZONE_SEMANTIC_REVIEW",
+        ),
+    ):
+        reviews.append(
+            write_timezone_review_receipt(
+                root,
+                candidate_path=FIXED_CANDIDATE,
+                output=path,
+                reviewer_identity=identity,
+                reviewer_role=role,
+                decision="APPROVED",
+            ).relative_to(root)
+        )
+    seal_timezone_mapping(
+        root,
+        candidate_path=FIXED_CANDIDATE,
+        review_receipt_paths=reviews,
+        output=Path("config/v5_2_qd/venue_timezones.json"),
+        receipt_output=FIXED_SEAL,
+    )
+    return batches, evidence_root
 
 
 class V52TimezoneReviewTest(unittest.TestCase):
@@ -1432,6 +1528,128 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         receipt_output=seal_output,
                     )
                 self.assertFalse((root / seal_output).exists())
+
+    def test_verified_gate_loads_only_fixed_current_authority_and_deep_freezes(self):
+        from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            batches, evidence_root = _fixed_verified_gate_fixture(root)
+            gate = load_verified_timezone_gate(root)
+
+            self.assertEqual(
+                gate.query_batch_ids,
+                tuple(batch.batch_id for batch in batches),
+            )
+            self.assertEqual(
+                gate.schedule_inventory_sha256,
+                batches[1].derived_from_sha256,
+            )
+            self.assertEqual(gate.run_spec_sha256, RUN_SHA)
+            self.assertEqual(gate.acquisition_contract_sha256, CONTRACT_SHA)
+            self.assertEqual(
+                gate.mapping_sha256,
+                hashlib.sha256(
+                    (root / "config/v5_2_qd/venue_timezones.json").read_bytes()
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                [review["reviewer_role"] for review in gate.reviews],
+                ["TIMEZONE_COVERAGE_REVIEW", "TIMEZONE_SEMANTIC_REVIEW"],
+            )
+            self.assertTrue(
+                all(
+                    row["review_status"] == "UNREVIEWED"
+                    and isinstance(row["time_zone"], str)
+                    for row in gate.candidate["timezone_rows"]
+                )
+            )
+            with self.assertRaises(TypeError):
+                gate.mapping["schema_version"] = 2
+            with self.assertRaises(TypeError):
+                gate.candidate["timezone_rows"][0]["time_zone"] = "UTC"
+            with self.assertRaises(TypeError):
+                load_verified_timezone_gate(root, evidence_root=evidence_root)
+
+    def test_verified_gate_replays_venue_raw_instead_of_trusting_sidecar(self):
+        from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _fixed_verified_gate_fixture(
+                root,
+                tamper_venue_semantics=True,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "venue|sidecar|raw|semantic"
+            ):
+                load_verified_timezone_gate(root)
+
+    def test_verified_gate_rebinds_every_fixed_artifact_before_return(self):
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _fixed_verified_gate_fixture(root)
+            candidate = root / FIXED_CANDIDATE
+
+            def replace_candidate() -> None:
+                replacement = candidate.with_suffix(".replacement")
+                replacement.write_bytes(candidate.read_bytes())
+                os.replace(replacement, candidate)
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_before_timezone_gate_final_rebind",
+                    side_effect=replace_candidate,
+                    create=True,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "candidate|identity|changed|rebind"
+                ),
+            ):
+                timezone_review.load_verified_timezone_gate(root)
+
+    def test_verified_gate_rebinds_after_second_authority_replay(self):
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        for label, relative in (
+            ("candidate", FIXED_CANDIDATE),
+            (
+                "authority",
+                Path("protocols/v5_2_qd/historical_walkforward_500.json"),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _fixed_verified_gate_fixture(root)
+                target = root / relative
+                original = timezone_review._current_timezone_authority
+                calls = 0
+
+                def replay_then_replace(replay_root: Path):
+                    nonlocal calls
+                    authority = original(replay_root)
+                    calls += 1
+                    if calls == 2:
+                        replacement = target.with_suffix(".replacement")
+                        replacement.write_bytes(target.read_bytes())
+                        os.replace(replacement, target)
+                    return authority
+
+                with (
+                    patch.object(
+                        timezone_review,
+                        "_current_timezone_authority",
+                        side_effect=replay_then_replace,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "candidate|authority|identity|changed|rebind",
+                    ),
+                ):
+                    timezone_review.load_verified_timezone_gate(root)
 
     def test_cli_help_lists_all_offline_subcommands(self) -> None:
         from mlb_backtest.v52_timezone_review import main

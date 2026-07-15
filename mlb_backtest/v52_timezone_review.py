@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .v52_evidence import V52EvidenceStore, logical_query_id
@@ -31,8 +32,27 @@ _ROLES = frozenset(
 _DECISIONS = frozenset({"APPROVED", "REJECTED"})
 _PRODUCTION_MAPPING = Path("config/v5_2_qd/venue_timezones.json")
 _ACQUISITION_AUDIT = Path("audit/v5_2_qd/historical/acquisition")
+_CANDIDATE_PATH = _ACQUISITION_AUDIT / "venue_timezone_candidate.json"
+_COVERAGE_REVIEW_PATH = (
+    _ACQUISITION_AUDIT / "timezone_reviews/coverage.json"
+)
+_SEMANTIC_REVIEW_PATH = (
+    _ACQUISITION_AUDIT / "timezone_reviews/semantic.json"
+)
+_SEAL_PATH = _ACQUISITION_AUDIT / "venue_timezone_seal.json"
+_SCHEDULE_INVENTORY_PATH = (
+    _ACQUISITION_AUDIT / "schedule_anchor_inventory.json"
+)
+_RUN_SPEC_PATH = Path("protocols/v5_2_qd/historical_walkforward_500.json")
+_ACQUISITION_CONTRACT_PATH = Path(
+    "protocols/v5_2_qd/historical_source_acquisition.json"
+)
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _VENUE_ENDPOINT_PREFIX = "https://statsapi.mlb.com/api/v1/venues/"
+_MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
+_MAX_MAPPING_BYTES = 8 * 1024 * 1024
+_MAX_RECEIPT_BYTES = 1024 * 1024
+_MAX_AUTHORITY_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,34 @@ class _SafeSnapshot:
     relative: Path
     contents: bytes
     identity: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedTimezoneGate:
+    candidate: Mapping[str, object]
+    mapping: Mapping[str, object]
+    reviews: tuple[Mapping[str, object], ...]
+    seal: Mapping[str, object]
+    candidate_sha256: str
+    mapping_sha256: str
+    review_sha256s: tuple[str, ...]
+    seal_sha256: str
+    run_spec_sha256: str
+    acquisition_contract_sha256: str
+    schedule_inventory_sha256: str
+    query_batch_ids: tuple[str, str]
+    query_batch_sha256s: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class _CurrentTimezoneAuthority:
+    source_projection: Mapping[str, object]
+    run_spec_sha256: str
+    acquisition_contract_sha256: str
+    schedule_inventory_sha256: str
+    query_batch_ids: tuple[str, str]
+    query_batch_sha256s: tuple[str, str]
+    snapshots: tuple[_SafeSnapshot, ...]
 
 
 def _before_review_final_rebind() -> None:
@@ -54,12 +102,26 @@ def _before_seal_final_rebind() -> None:
     """Deterministic seal publication race-test hook."""
 
 
+def _before_timezone_gate_final_rebind() -> None:
+    """Deterministic verified-gate race-test hook."""
+
+
 def _canonical_file_bytes(value: object) -> bytes:
     return canonical_json_bytes(value) + b"\n"
 
 
 def _sha256(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
+
+
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
 
 
 def _sha256_text(value: object, label: str) -> str:
@@ -673,7 +735,12 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 
 def _read_safe_snapshot(
-    root: Path, path: Path, label: str, *, missing_ok: bool = False
+    root: Path,
+    path: Path,
+    label: str,
+    *,
+    missing_ok: bool = False,
+    max_bytes: int | None = None,
 ) -> _SafeSnapshot | None:
     relative = _relative(root, path, label)
     try:
@@ -706,8 +773,14 @@ def _read_safe_snapshot(
             or _file_identity(before) != _file_identity(linked)
         ):
             raise ValueError(f"{label} must be an unaliased regular file")
+        if max_bytes is not None and before.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds its bounded read limit")
         chunks = []
+        total = 0
         while chunk := os.read(descriptor, 64 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError(f"{label} exceeds its bounded read limit")
             chunks.append(chunk)
         after = os.fstat(descriptor)
         rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
@@ -733,9 +806,18 @@ def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
 
 
 def _rebind_safe_snapshot(
-    root: Path, expected: _SafeSnapshot, label: str
+    root: Path,
+    expected: _SafeSnapshot,
+    label: str,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
-    current = _read_safe_snapshot(root, expected.relative, label)
+    current = _read_safe_snapshot(
+        root,
+        expected.relative,
+        label,
+        max_bytes=max_bytes,
+    )
     if current != expected:
         raise ValueError(f"{label} identity or bytes changed")
 
@@ -1230,6 +1312,464 @@ def build_timezone_candidate(
     )
 
 
+def _required_snapshot(
+    root: Path,
+    relative: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> _SafeSnapshot:
+    snapshot = _read_safe_snapshot(
+        root,
+        relative,
+        label,
+        max_bytes=max_bytes,
+    )
+    if snapshot is None:
+        raise ValueError(f"{label} is missing")
+    return snapshot
+
+
+def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
+    from .protocols import parse_run_spec
+    from .v52_query_plan import (
+        build_schedule_reference_batch,
+        load_query_batch,
+    )
+    from .v52_schedule_inventory import (
+        _read_inventory_contents,
+        load_verified_schedule_anchor_inventory,
+    )
+    from .v52_sources.references import recompute_venue_query_sidecar
+
+    run_snapshot = _required_snapshot(
+        root,
+        _RUN_SPEC_PATH,
+        "timezone gate RunSpec",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    contract_snapshot = _required_snapshot(
+        root,
+        _ACQUISITION_CONTRACT_PATH,
+        "timezone gate acquisition contract",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    run_spec = parse_run_spec(
+        _json_object(
+            run_snapshot.contents,
+            "timezone gate RunSpec",
+            canonical=True,
+        )
+    )
+    namespaces = run_spec.raw.get("namespaces")
+    raw_namespace = (
+        namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    )
+    if not isinstance(raw_namespace, str):
+        raise ValueError("timezone gate RunSpec raw namespace differs")
+    raw_relative = Path(raw_namespace)
+    if (
+        raw_relative.is_absolute()
+        or not raw_relative.parts
+        or raw_relative.as_posix() != raw_namespace
+        or any(part in {"", ".", ".."} for part in raw_relative.parts)
+    ):
+        raise ValueError("timezone gate RunSpec raw namespace differs")
+
+    inventory_contents = _read_inventory_contents(root)
+    inventory_record = _json_object(
+        inventory_contents,
+        "schedule anchor inventory",
+        canonical=True,
+    )
+    static_binding = inventory_record.get("static_batch")
+    if not isinstance(static_binding, Mapping):
+        raise ValueError("timezone gate static batch binding differs")
+    static_batch_id = _sha256_text(
+        static_binding.get("batch_id"), "timezone gate static batch ID"
+    )
+    evidence_root = root / raw_relative
+    verified_inventory = load_verified_schedule_anchor_inventory(
+        root,
+        run_spec,
+        acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
+        static_batch_id=static_batch_id,
+        evidence_root=evidence_root,
+    )
+    inventory_snapshot = _required_snapshot(
+        root,
+        _SCHEDULE_INVENTORY_PATH,
+        "timezone gate schedule inventory",
+        max_bytes=_MAX_AUTHORITY_BYTES,
+    )
+    if _sha256(inventory_snapshot.contents) != verified_inventory.sha256:
+        raise ValueError("timezone gate schedule inventory hash differs")
+    static_batch_snapshot = _required_snapshot(
+        root,
+        _ACQUISITION_AUDIT
+        / "query_batches"
+        / f"{static_batch_id}.json",
+        "timezone gate STATIC_SCHEDULES batch",
+        max_bytes=_MAX_AUTHORITY_BYTES,
+    )
+    static_batch = load_query_batch(root, static_batch_id)
+    reference_expected = build_schedule_reference_batch(
+        root,
+        root / _RUN_SPEC_PATH,
+        acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
+        static_batch_id=static_batch_id,
+        evidence_root=evidence_root,
+    )
+    reference_batch_snapshot = _required_snapshot(
+        root,
+        _ACQUISITION_AUDIT
+        / "query_batches"
+        / f"{reference_expected.batch_id}.json",
+        "timezone gate REFERENCE_INPUTS batch",
+        max_bytes=_MAX_AUTHORITY_BYTES,
+    )
+    reference_batch = load_query_batch(root, reference_expected.batch_id)
+    if reference_batch != reference_expected:
+        raise ValueError("timezone gate REFERENCE_INPUTS authority differs")
+    if (
+        static_batch.stage != "STATIC_SCHEDULES"
+        or reference_batch.stage != "REFERENCE_INPUTS"
+        or reference_batch.derived_from_sha256 != verified_inventory.sha256
+    ):
+        raise ValueError("timezone gate batch/inventory authority differs")
+
+    batch_snapshots = (
+        static_batch_snapshot,
+        reference_batch_snapshot,
+    )
+
+    payload = verified_inventory.payload
+    raw_anchors = payload.get("anchors")
+    if not isinstance(raw_anchors, Sequence) or not raw_anchors:
+        raise ValueError("timezone gate schedule inventory anchors differ")
+    observed: dict[tuple[int, str], tuple[bool, bool]] = {}
+    for anchor in raw_anchors:
+        if not isinstance(anchor, Mapping):
+            raise ValueError("timezone gate schedule inventory anchor differs")
+        venue_id = _positive(anchor.get("venue_id"), "timezone gate venue ID")
+        official = _day(
+            anchor.get("official_date"), "timezone gate official date"
+        ).isoformat()
+        neutral = anchor.get("neutral_site")
+        alternate = anchor.get("alternate_site")
+        if type(neutral) is not bool or type(alternate) is not bool:
+            raise ValueError("timezone gate observed venue flags differ")
+        key = (venue_id, official)
+        disposition = (neutral, alternate)
+        if key in observed and observed[key] != disposition:
+            raise ValueError("timezone gate observed venue disposition conflicts")
+        observed[key] = disposition
+
+    season_sources = payload.get("season_sources")
+    if not isinstance(season_sources, Sequence) or not season_sources:
+        raise ValueError("timezone gate schedule source bindings differ")
+    schedule_sidecar_sha256s = []
+    for source in season_sources:
+        if not isinstance(source, Mapping) or not isinstance(
+            source.get("query_sidecar"), Mapping
+        ):
+            raise ValueError("timezone gate schedule source binding differs")
+        schedule_sidecar_sha256s.append(
+            _sha256_text(
+                source["query_sidecar"].get("sha256"),
+                "timezone gate schedule sidecar SHA-256",
+            )
+        )
+    if len(schedule_sidecar_sha256s) != len(set(schedule_sidecar_sha256s)):
+        raise ValueError("timezone gate schedule sidecar population differs")
+    schedule_sidecar_sha256s.sort()
+
+    store = V52EvidenceStore(evidence_root)
+    venue_sidecars: list[Mapping[str, object]] = []
+    for query in reference_batch.queries:
+        if not (
+            query.source == "venue_team_timezone_table"
+            and query.grain == "effective_dated_venue_team_reference"
+            and query.endpoint.startswith(_VENUE_ENDPOINT_PREFIX)
+        ):
+            continue
+        verified = store.read_verified_success(query)
+        if verified.registered_query != query or verified.raw_bytes is None:
+            raise ValueError("timezone gate venue verified SUCCESS differs")
+        recomputed = recompute_venue_query_sidecar(verified.raw_bytes, query)
+        if recomputed != verified.query_sidecar:
+            raise ValueError("timezone gate venue raw/sidecar semantics differ")
+        venue_sidecars.append(recomputed)
+    venues, venue_sidecar_sha256s = _venues_from_sidecars(venue_sidecars)
+    observed_scope = {venue_id for venue_id, _ in observed}
+    if set(venues) != observed_scope:
+        raise ValueError("timezone gate venue evidence scope differs")
+    observed_rows = [
+        {
+            "alternate_site": disposition[1],
+            "neutral_site": disposition[0],
+            "official_date": official,
+            "venue_id": venue_id,
+        }
+        for (venue_id, official), disposition in sorted(observed.items())
+    ]
+    run_sha = _sha256(run_snapshot.contents)
+    contract_sha = _sha256(contract_snapshot.contents)
+    source_projection = {
+        "acquisition_contract_sha256": contract_sha,
+        "artifact_kind": "VENUE_TIMEZONE_CANDIDATE",
+        "observed_venue_dates": observed_rows,
+        "query_batch_ids": sorted(
+            (static_batch.batch_id, reference_batch.batch_id)
+        ),
+        "run_spec_sha256": run_sha,
+        "schedule_sidecar_sha256s": schedule_sidecar_sha256s,
+        "schema_version": 1,
+        "venue_scope": sorted(observed_scope),
+        "venue_sidecar_sha256s": venue_sidecar_sha256s,
+        "venues": [venues[venue_id] for venue_id in sorted(venues)],
+    }
+    return _CurrentTimezoneAuthority(
+        source_projection=source_projection,
+        run_spec_sha256=run_sha,
+        acquisition_contract_sha256=contract_sha,
+        schedule_inventory_sha256=verified_inventory.sha256,
+        query_batch_ids=(static_batch.batch_id, reference_batch.batch_id),
+        query_batch_sha256s=tuple(
+            _sha256(snapshot.contents) for snapshot in batch_snapshots
+        ),  # type: ignore[arg-type]
+        snapshots=(
+            run_snapshot,
+            contract_snapshot,
+            inventory_snapshot,
+            *batch_snapshots,
+        ),
+    )
+
+
+def _seal_object(contents: bytes) -> dict[str, object]:
+    value = _json_object(
+        contents,
+        "timezone mapping seal receipt",
+        canonical=True,
+    )
+    if set(value) != {
+        "candidate",
+        "mapping",
+        "occurred_at_utc",
+        "receipt_kind",
+        "reviews",
+        "schema_version",
+        "venue_scope",
+    }:
+        raise ValueError("timezone mapping seal receipt keys differ")
+    if (
+        value.get("schema_version") != 1
+        or value.get("receipt_kind") != "TIMEZONE_MAPPING_SEAL"
+        or not isinstance(value.get("occurred_at_utc"), str)
+        or _UTC.fullmatch(str(value.get("occurred_at_utc"))) is None
+        or not isinstance(value.get("candidate"), Mapping)
+        or not isinstance(value.get("mapping"), Mapping)
+        or not isinstance(value.get("reviews"), list)
+        or len(value["reviews"]) != 2
+        or not isinstance(value.get("venue_scope"), list)
+    ):
+        raise ValueError("timezone mapping seal receipt identity differs")
+    return value
+
+
+def load_verified_timezone_gate(root: Path) -> VerifiedTimezoneGate:
+    root = _trusted_root(root)
+    fixed_snapshots = (
+        _required_snapshot(
+            root,
+            _CANDIDATE_PATH,
+            "timezone candidate",
+            max_bytes=_MAX_CANDIDATE_BYTES,
+        ),
+        _required_snapshot(
+            root,
+            _COVERAGE_REVIEW_PATH,
+            "timezone coverage review",
+            max_bytes=_MAX_RECEIPT_BYTES,
+        ),
+        _required_snapshot(
+            root,
+            _SEMANTIC_REVIEW_PATH,
+            "timezone semantic review",
+            max_bytes=_MAX_RECEIPT_BYTES,
+        ),
+        _required_snapshot(
+            root,
+            _PRODUCTION_MAPPING,
+            "timezone mapping",
+            max_bytes=_MAX_MAPPING_BYTES,
+        ),
+        _required_snapshot(
+            root,
+            _SEAL_PATH,
+            "timezone mapping seal receipt",
+            max_bytes=_MAX_RECEIPT_BYTES,
+        ),
+    )
+    candidate_snapshot, *review_and_seal = fixed_snapshots
+    coverage_snapshot = review_and_seal[0]
+    semantic_snapshot = review_and_seal[1]
+    mapping_snapshot = review_and_seal[2]
+    seal_snapshot = review_and_seal[3]
+    candidate = _candidate_object(
+        _json_object(
+            candidate_snapshot.contents,
+            "timezone candidate",
+            canonical=True,
+        )
+    )
+    authority = _current_timezone_authority(root)
+    candidate_projection = {
+        key: value for key, value in candidate.items() if key != "timezone_rows"
+    }
+    if candidate_projection != authority.source_projection:
+        raise ValueError("timezone candidate differs from current source authority")
+    mapping = _mapping_from_candidate(candidate, require_resolved=True)
+    stored_mapping = _mapping_object(
+        _json_object(
+            mapping_snapshot.contents,
+            "timezone mapping",
+            canonical=True,
+        )
+    )
+    if stored_mapping != mapping:
+        raise ValueError("timezone mapping differs from resolved candidate")
+
+    candidate_binding = {
+        "path": _CANDIDATE_PATH.as_posix(),
+        "sha256": _sha256(candidate_snapshot.contents),
+    }
+    roles_and_reviews = (
+        (
+            "TIMEZONE_COVERAGE_REVIEW",
+            _COVERAGE_REVIEW_PATH,
+            coverage_snapshot,
+        ),
+        (
+            "TIMEZONE_SEMANTIC_REVIEW",
+            _SEMANTIC_REVIEW_PATH,
+            semantic_snapshot,
+        ),
+    )
+    reviews: list[dict[str, object]] = []
+    identities: set[str] = set()
+    review_bindings = []
+    for expected_role, expected_path, snapshot in roles_and_reviews:
+        review = _review_object(snapshot.contents)
+        if (
+            review["decision"] != "APPROVED"
+            or review["reviewer_role"] != expected_role
+            or review["candidate"] != candidate_binding
+            or review["reviewed_venue_ids"] != candidate["venue_scope"]
+        ):
+            raise ValueError("timezone review approval authority differs")
+        identity = str(review["reviewer_identity"])
+        identities.add(identity)
+        reviews.append(review)
+        review_bindings.append(
+            {
+                "path": expected_path.as_posix(),
+                "reviewer_identity": identity,
+                "reviewer_role": expected_role,
+                "sha256": _sha256(snapshot.contents),
+            }
+        )
+    if len(identities) != 2:
+        raise ValueError("timezone reviewer identity values must be distinct")
+
+    mapping_binding = {
+        "path": _PRODUCTION_MAPPING.as_posix(),
+        "sha256": _sha256(mapping_snapshot.contents),
+    }
+    seal = _seal_object(seal_snapshot.contents)
+    if (
+        seal["candidate"] != candidate_binding
+        or seal["mapping"] != mapping_binding
+        or seal["reviews"] != review_bindings
+        or seal["venue_scope"] != candidate["venue_scope"]
+    ):
+        raise ValueError("timezone mapping seal authority differs")
+
+    _before_timezone_gate_final_rebind()
+    rebound_authority = _current_timezone_authority(root)
+    if (
+        rebound_authority.source_projection != authority.source_projection
+        or rebound_authority.run_spec_sha256 != authority.run_spec_sha256
+        or rebound_authority.acquisition_contract_sha256
+        != authority.acquisition_contract_sha256
+        or rebound_authority.schedule_inventory_sha256
+        != authority.schedule_inventory_sha256
+        or rebound_authority.query_batch_ids != authority.query_batch_ids
+        or rebound_authority.query_batch_sha256s
+        != authority.query_batch_sha256s
+    ):
+        raise ValueError("timezone source authority changed during verified load")
+    for snapshot, label, max_bytes in (
+        (candidate_snapshot, "timezone candidate", _MAX_CANDIDATE_BYTES),
+        (
+            coverage_snapshot,
+            "timezone coverage review",
+            _MAX_RECEIPT_BYTES,
+        ),
+        (
+            semantic_snapshot,
+            "timezone semantic review",
+            _MAX_RECEIPT_BYTES,
+        ),
+        (mapping_snapshot, "timezone mapping", _MAX_MAPPING_BYTES),
+        (
+            seal_snapshot,
+            "timezone mapping seal receipt",
+            _MAX_RECEIPT_BYTES,
+        ),
+        *(
+            (snapshot, "timezone source authority", _MAX_AUTHORITY_BYTES)
+            for snapshot in rebound_authority.snapshots
+        ),
+    ):
+        _rebind_safe_snapshot(
+            root,
+            snapshot,
+            label,
+            max_bytes=max_bytes,
+        )
+
+    frozen_candidate = _deep_freeze(candidate)
+    frozen_mapping = _deep_freeze(mapping)
+    frozen_reviews = tuple(_deep_freeze(review) for review in reviews)
+    frozen_seal = _deep_freeze(seal)
+    if (
+        not isinstance(frozen_candidate, Mapping)
+        or not isinstance(frozen_mapping, Mapping)
+        or not all(isinstance(review, Mapping) for review in frozen_reviews)
+        or not isinstance(frozen_seal, Mapping)
+    ):
+        raise AssertionError("verified timezone gate must deep-freeze to mappings")
+    return VerifiedTimezoneGate(
+        candidate=frozen_candidate,
+        mapping=frozen_mapping,
+        reviews=frozen_reviews,  # type: ignore[arg-type]
+        seal=frozen_seal,
+        candidate_sha256=candidate_binding["sha256"],
+        mapping_sha256=mapping_binding["sha256"],
+        review_sha256s=tuple(
+            binding["sha256"] for binding in review_bindings
+        ),  # type: ignore[arg-type]
+        seal_sha256=_sha256(seal_snapshot.contents),
+        run_spec_sha256=authority.run_spec_sha256,
+        acquisition_contract_sha256=authority.acquisition_contract_sha256,
+        schedule_inventory_sha256=authority.schedule_inventory_sha256,
+        query_batch_ids=authority.query_batch_ids,
+        query_batch_sha256s=authority.query_batch_sha256s,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1303,7 +1843,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "VerifiedTimezoneGate",
     "build_timezone_candidate",
+    "load_verified_timezone_gate",
     "main",
     "seal_timezone_mapping",
     "validate_timezone_mapping",
