@@ -4,15 +4,18 @@ import dataclasses
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
 from mlb_backtest.v52_evidence import (
+    AttemptCapture,
     LogicalQuery,
+    V52EvidenceStore,
     canonical_query_bytes,
     logical_query_id,
 )
@@ -105,6 +108,73 @@ def _legacy(start: str, end: str, **extra: object) -> dict[str, object]:
         },
         **extra,
     }
+
+
+def _split_capture(reason: str) -> AttemptCapture:
+    return AttemptCapture(
+        started_at_utc="2026-07-14T12:00:00.000000Z",
+        ended_at_utc="2026-07-14T12:01:00.000000Z",
+        final_url=None,
+        http_status=None,
+        response_headers=(),
+        body=None,
+        error_classification=reason,
+    )
+
+
+def _record_split_attempt(root: Path, query: LogicalQuery, reason: str) -> int:
+    store = V52EvidenceStore(_split_evidence_root(root))
+    with store.acquire_query(query) as lease:
+        attempt_number = store.next_attempt_number(lease)
+        store.record_attempt(
+            query,
+            attempt_number,
+            _split_capture(reason),
+            outcome="SPLIT_REQUIRED",
+        )
+    return attempt_number
+
+
+def _split_evidence_root(repository_root: Path) -> Path:
+    run_spec_path = (
+        repository_root / "protocols/v5_2_qd/historical_walkforward_500.json"
+    )
+    run_spec_path.parent.mkdir(parents=True, exist_ok=True)
+    if not run_spec_path.exists():
+        run_spec_path.write_bytes(RUN_SPEC.read_bytes())
+    contract_path = (
+        repository_root / "protocols/v5_2_qd/historical_source_acquisition.json"
+    )
+    if not contract_path.exists():
+        contract_path.write_bytes(CONTRACT.read_bytes())
+    raw = repository_root / str(
+        json.loads(run_spec_path.read_bytes())["namespaces"]["raw"]
+    )
+    raw.mkdir(parents=True, exist_ok=True)
+    return raw
+
+
+def _split_batches(root: Path):
+    import mlb_backtest.v52_query_plan as query_plan
+
+    parent_batch = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+    parent = next(
+        query
+        for query in parent_batch.queries
+        if (
+            date.fromisoformat(str(query.requested_range["end_date"]))
+            - date.fromisoformat(str(query.requested_range["start_date"]))
+        ).days
+        >= 6
+    )
+    children = query_plan.bisect_statcast_query(parent)
+    child_batch = query_plan._make_batch(
+        "REMAINING", parent_batch.batch_id, children
+    )
+    query_plan.publish_query_batch(root, parent_batch)
+    query_plan.publish_query_batch(root, child_batch)
+    attempt_number = _record_split_attempt(root, parent, "TIMEOUT")
+    return parent_batch, parent, child_batch, attempt_number
 
 
 class V52QueryPlanTest(unittest.TestCase):
@@ -1715,6 +1785,837 @@ class V52QueryPlanTest(unittest.TestCase):
                 self.assertTrue(os.path.lexists(candidate))
                 final = batch_dir / f"{batch.batch_id}.json"
                 self.assertFalse(final.exists())
+
+    def test_split_receipt_publishes_closed_canonical_parent_bound_record(self):
+        import jsonschema
+
+        from mlb_backtest.v52_query_plan import (
+            SplitReceipt,
+            load_split_receipt,
+            publish_split_receipt,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            receipt = publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+
+            self.assertIsInstance(receipt, SplitReceipt)
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                receipt.depth = 99  # type: ignore[misc]
+            expected_path = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                / f"{logical_query_id(parent)}.json"
+            )
+            contents = expected_path.read_bytes()
+            record = json.loads(contents)
+            schema_path = ROOT / "schemas/v5_2_split_receipt.schema.json"
+            schema_contents = schema_path.read_bytes()
+            schema = json.loads(schema_contents)
+            jsonschema.Draft202012Validator(schema).validate(record)
+            self.assertEqual(
+                schema_contents,
+                _canonical_json_bytes(schema),
+                "the closed schema itself must be canonical",
+            )
+            self.assertFalse(schema["additionalProperties"])
+            self.assertEqual(receipt.receipt_sha256, hashlib.sha256(contents).hexdigest())
+            self.assertEqual(receipt.stage, "REMAINING")
+            self.assertEqual(receipt.parent_batch_id, parent_batch.batch_id)
+            self.assertEqual(receipt.parent_query_id, logical_query_id(parent))
+            self.assertEqual(receipt.reason, "TIMEOUT")
+            self.assertEqual(receipt.exhausted_attempt_number, attempt_number)
+            self.assertEqual(receipt.depth, 1)
+            self.assertEqual(receipt.child_batch_id, child_batch.batch_id)
+            self.assertEqual(
+                receipt.recorded_at_utc,
+                "2026-07-14T12:01:00.000000Z",
+                "recorded_at_utc is the deterministic split decision timestamp",
+            )
+            self.assertEqual(
+                receipt.child_query_ids,
+                tuple(logical_query_id(query) for query in child_batch.queries),
+            )
+            self.assertEqual(
+                load_split_receipt(
+                    root,
+                    logical_query_id(parent),
+                    evidence_root=_split_evidence_root(root),
+                ),
+                receipt,
+            )
+            self.assertIsNone(
+                load_split_receipt(
+                    root,
+                    "f" * 64,
+                    evidence_root=_split_evidence_root(root),
+                )
+            )
+
+    def test_split_receipt_requires_authenticated_run_spec_raw_evidence_root(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            repository_root = Path(td).resolve()
+            evidence_root = _split_evidence_root(repository_root)
+            parent_batch, parent, child_batch, attempt_number = _split_batches(
+                repository_root
+            )
+            kwargs = {
+                "parent_batch_id": parent_batch.batch_id,
+                "parent_query_id": logical_query_id(parent),
+                "reason": "TIMEOUT",
+                "exhausted_attempt_number": attempt_number,
+                "child_batch_id": child_batch.batch_id,
+            }
+            wrong_evidence_root = repository_root / "wrong-raw"
+            wrong_evidence_root.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "evidence root|RunSpec|raw"):
+                query_plan.publish_split_receipt(
+                    repository_root,
+                    evidence_root=wrong_evidence_root,
+                    **kwargs,
+                )
+            run_spec_path = repository_root / query_plan._RUN_SPEC_RELATIVE
+            authenticated_run_spec = run_spec_path.read_bytes()
+            forged_run_spec = json.loads(authenticated_run_spec)
+            forged_run_spec["label"] = "forged split RunSpec"
+            run_spec_path.write_bytes(_canonical_json_bytes(forged_run_spec))
+            with self.assertRaisesRegex(ValueError, "RunSpec hash binding"):
+                query_plan.publish_split_receipt(
+                    repository_root,
+                    evidence_root=evidence_root,
+                    **kwargs,
+                )
+            run_spec_path.write_bytes(authenticated_run_spec)
+            receipt = query_plan.publish_split_receipt(
+                repository_root,
+                evidence_root=evidence_root,
+                **kwargs,
+            )
+            self.assertEqual(
+                query_plan.load_split_receipt(
+                    repository_root,
+                    receipt.parent_query_id,
+                    evidence_root=evidence_root,
+                ),
+                receipt,
+            )
+            with self.assertRaisesRegex(ValueError, "evidence root|RunSpec|raw"):
+                query_plan.load_split_receipt(
+                    repository_root,
+                    receipt.parent_query_id,
+                    evidence_root=wrong_evidence_root,
+                )
+
+    def test_split_receipt_rejects_consistent_forged_contract_binding(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            evidence_root = _split_evidence_root(root)
+            legitimate = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            forged_queries = tuple(
+                dataclasses.replace(
+                    query,
+                    acquisition_contract_sha256="f" * 64,
+                )
+                for query in legitimate.queries
+            )
+            parent_batch = query_plan._make_batch(
+                "REMAINING", None, forged_queries
+            )
+            parent = next(
+                query
+                for query in parent_batch.queries
+                if (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 6
+            )
+            child_batch = query_plan._make_batch(
+                "REMAINING",
+                parent_batch.batch_id,
+                query_plan.bisect_statcast_query(parent),
+            )
+            query_plan.publish_query_batch(root, parent_batch)
+            query_plan.publish_query_batch(root, child_batch)
+            attempt_number = _record_split_attempt(root, parent, "TIMEOUT")
+
+            with self.assertRaisesRegex(ValueError, "acquisition contract"):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=evidence_root,
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=logical_query_id(parent),
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+
+    def test_split_receipt_reauthenticates_repository_contract_on_publish_and_load(
+        self,
+    ):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        mutations = (
+            "missing",
+            "symlink",
+            "noncanonical",
+            "run_path_traversal",
+            "run_path_absolute",
+            "bytes_hash_mismatch",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                evidence_root = _split_evidence_root(root)
+                parent_batch, parent, child_batch, attempt_number = _split_batches(
+                    root
+                )
+                kwargs = {
+                    "evidence_root": evidence_root,
+                    "parent_batch_id": parent_batch.batch_id,
+                    "parent_query_id": logical_query_id(parent),
+                    "reason": "TIMEOUT",
+                    "exhausted_attempt_number": attempt_number,
+                    "child_batch_id": child_batch.batch_id,
+                }
+                receipt = query_plan.publish_split_receipt(root, **kwargs)
+                contract_path = (
+                    root
+                    / "protocols/v5_2_qd/historical_source_acquisition.json"
+                )
+                if mutation == "missing":
+                    contract_path.unlink()
+                elif mutation == "symlink":
+                    target = root / "contract-target.json"
+                    target.write_bytes(contract_path.read_bytes())
+                    contract_path.unlink()
+                    contract_path.symlink_to(target)
+                elif mutation == "noncanonical":
+                    contract_path.write_text(
+                        json.dumps(json.loads(contract_path.read_bytes()), indent=2)
+                    )
+                else:
+                    contract = json.loads(contract_path.read_bytes())
+                    if mutation == "run_path_traversal":
+                        contract["bindings"]["run_spec"]["path"] = (
+                            "../historical_walkforward_500.json"
+                        )
+                    elif mutation == "run_path_absolute":
+                        contract["bindings"]["run_spec"]["path"] = str(
+                            root / query_plan._RUN_SPEC_RELATIVE
+                        )
+                    else:
+                        contract["minimum_free_space_reserve_bytes"] += 1
+                    contract_path.write_bytes(_canonical_json_bytes(contract))
+
+                with self.assertRaisesRegex(
+                    ValueError, "acquisition contract|RunSpec"
+                ):
+                    query_plan.publish_split_receipt(root, **kwargs)
+                with self.assertRaisesRegex(
+                    ValueError, "acquisition contract|RunSpec"
+                ):
+                    query_plan.load_split_receipt(
+                        root,
+                        receipt.parent_query_id,
+                        evidence_root=evidence_root,
+                    )
+
+    def test_split_receipt_attempt_append_race_cleans_owned_final(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            evidence_root = _split_evidence_root(root)
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            parent_query_id = logical_query_id(parent)
+            original_publish = query_plan._publish_split_bytes_locked
+            appended = False
+
+            def append_attempt_after_final(*args, **kwargs):
+                nonlocal appended
+                result = original_publish(*args, **kwargs)
+                if not appended:
+                    appended = True
+                    _record_split_attempt(root, parent, "TIMEOUT")
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_publish_split_bytes_locked",
+                    side_effect=append_attempt_after_final,
+                ),
+                self.assertRaisesRegex(ValueError, "latest attempt|membership"),
+            ):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=evidence_root,
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=parent_query_id,
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+            final = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                / f"{parent_query_id}.json"
+            )
+            self.assertFalse(final.exists(), "a stale immutable final poisons retries")
+
+    def test_split_receipt_rejects_child_acquisition_metadata_injection(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            forged_children = list(child_batch.queries)
+            requested = dict(forged_children[0].requested_range)
+            requested.update(
+                {
+                    "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                    "protected_inventory_sha256": "a" * 64,
+                }
+            )
+            forged_children[0] = dataclasses.replace(
+                forged_children[0], requested_range=requested
+            )
+            forged = query_plan._make_batch(
+                "REMAINING", parent_batch.batch_id, forged_children
+            )
+            query_plan.publish_query_batch(root, forged)
+
+            with self.assertRaisesRegex(ValueError, "canonical|child query"):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=logical_query_id(parent),
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=forged.batch_id,
+                )
+
+    def test_split_receipt_schema_rejects_duplicate_children_and_cycle_guard(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_split_receipt.schema.json").read_bytes()
+        )
+        self.assertTrue(
+            schema["properties"]["children"].get("uniqueItems"),
+            "duplicate child entries must fail the schema",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            descriptors = query_plan._open_split_namespace(root, create=False)
+            self.assertIsNotNone(descriptors)
+            assert descriptors is not None
+            try:
+                with self.assertRaisesRegex(ValueError, "cycle"):
+                    query_plan._load_split_receipt_locked(
+                        root,
+                        _split_evidence_root(root),
+                        descriptors[-1],
+                        logical_query_id(parent),
+                        active_parent_ids={logical_query_id(parent)},
+                    )
+            finally:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+
+    def test_split_receipt_requires_child_first_latest_attempt_and_exact_lineage(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        mutations = (
+            "missing_child",
+            "reason",
+            "attempt",
+            "derived_from",
+            "coverage",
+            "run_binding",
+            "parent_binding",
+            "stage",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+                child_batch_id = child_batch.batch_id
+                reason = "TIMEOUT"
+                exhausted_attempt_number = attempt_number
+                if mutation == "missing_child":
+                    child_batch_id = "f" * 64
+                elif mutation == "reason":
+                    reason = "SIZE_LIMIT"
+                elif mutation == "attempt":
+                    exhausted_attempt_number += 1
+                else:
+                    children = child_batch.queries
+                    stage = "REMAINING"
+                    derived_from = parent_batch.batch_id
+                    if mutation == "derived_from":
+                        derived_from = "e" * 64
+                    elif mutation == "coverage":
+                        children = children[:1]
+                    elif mutation == "run_binding":
+                        children = tuple(
+                            dataclasses.replace(query, run_spec_sha256="d" * 64)
+                            for query in children
+                        )
+                    elif mutation == "parent_binding":
+                        children = tuple(
+                            dataclasses.replace(query, parent_query_id="c" * 64)
+                            for query in children
+                        )
+                    elif mutation == "stage":
+                        stage = "REFERENCE_INPUTS"
+                    forged = query_plan._make_batch(stage, derived_from, children)
+                    query_plan.publish_query_batch(root, forged)
+                    child_batch_id = forged.batch_id
+
+                with self.assertRaises((ValueError, RuntimeError)):
+                    query_plan.publish_split_receipt(
+                        root,
+                        evidence_root=_split_evidence_root(root),
+                        parent_batch_id=parent_batch.batch_id,
+                        parent_query_id=logical_query_id(parent),
+                        reason=reason,
+                        exhausted_attempt_number=exhausted_attempt_number,
+                        child_batch_id=child_batch_id,
+                    )
+                receipt_path = (
+                    root
+                    / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                    / f"{logical_query_id(parent)}.json"
+                )
+                self.assertFalse(receipt_path.exists())
+
+    def test_split_receipt_proves_recursive_depth_without_misclassifying_legacy(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            root_receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            recursive_parent = next(
+                query
+                for query in child_batch.queries
+                if (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 1
+            )
+            recursive_children = query_plan.bisect_statcast_query(recursive_parent)
+            recursive_batch = query_plan._make_batch(
+                "REMAINING", child_batch.batch_id, recursive_children
+            )
+            query_plan.publish_query_batch(root, recursive_batch)
+            recursive_attempt = _record_split_attempt(root, recursive_parent, "ROW_CAP")
+            recursive_receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=child_batch.batch_id,
+                parent_query_id=logical_query_id(recursive_parent),
+                reason="ROW_CAP",
+                exhausted_attempt_number=recursive_attempt,
+                child_batch_id=recursive_batch.batch_id,
+            )
+            self.assertEqual(root_receipt.depth, 1)
+            self.assertEqual(recursive_receipt.depth, 2)
+            self.assertEqual(
+                query_plan.load_split_receipt(
+                    root,
+                    logical_query_id(recursive_parent),
+                    evidence_root=_split_evidence_root(root),
+                ),
+                recursive_receipt,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            root_batch = query_plan.build_statcast_root_batch(RUN_SPEC, CONTRACT)
+            parent = next(
+                query
+                for query in root_batch.queries
+                if query.requested_range["year"] >= 2022
+                and (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 6
+            )
+            first = str(parent.requested_range["start_date"])
+            last = str(parent.requested_range["end_date"])
+            legacy_batch = query_plan.build_legacy_partition_batch(
+                [parent],
+                [_legacy(first, last)],
+                protected_inventory_sha256="a" * 64,
+            )
+            legacy_parent = legacy_batch.queries[0]
+            children = query_plan.bisect_statcast_query(legacy_parent)
+            child_batch = query_plan._make_batch(
+                "REMAINING", legacy_batch.batch_id, children
+            )
+            for batch in (root_batch, legacy_batch, child_batch):
+                query_plan.publish_query_batch(root, batch)
+            attempt_number = _record_split_attempt(root, legacy_parent, "SIZE_LIMIT")
+            with self.assertRaisesRegex(ValueError, "ancestor receipt"):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=legacy_batch.batch_id,
+                    parent_query_id=logical_query_id(legacy_parent),
+                    reason="SIZE_LIMIT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+
+    def test_split_receipt_publication_is_idempotent_and_race_safe(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            kwargs = {
+                "evidence_root": _split_evidence_root(root),
+                "parent_batch_id": parent_batch.batch_id,
+                "parent_query_id": logical_query_id(parent),
+                "reason": "TIMEOUT",
+                "exhausted_attempt_number": attempt_number,
+                "child_batch_id": child_batch.batch_id,
+            }
+            first = query_plan.publish_split_receipt(root, **kwargs)
+            self.assertEqual(query_plan.publish_split_receipt(root, **kwargs), first)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            barrier = threading.Barrier(3)
+            results = []
+            errors = []
+
+            def publish() -> None:
+                try:
+                    barrier.wait(timeout=10)
+                    results.append(
+                        query_plan.publish_split_receipt(
+                            root,
+                            evidence_root=_split_evidence_root(root),
+                            parent_batch_id=parent_batch.batch_id,
+                            parent_query_id=logical_query_id(parent),
+                            reason="TIMEOUT",
+                            exhausted_attempt_number=attempt_number,
+                            child_batch_id=child_batch.batch_id,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=publish) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=10)
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0], results[1])
+
+    def test_split_receipt_rejects_a_different_valid_child_partition(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            first, last = query_plan.validate_statcast_query(parent)
+            daily_children = []
+            cursor = first
+            while cursor <= last:
+                daily_children.append(query_plan._statcast_child(parent, cursor, cursor))
+                cursor += timedelta(days=1)
+            competing = query_plan._make_batch(
+                "REMAINING", parent_batch.batch_id, daily_children
+            )
+            query_plan.publish_query_batch(root, competing)
+            query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            with self.assertRaisesRegex(RuntimeError, "immutable|differs"):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=logical_query_id(parent),
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=competing.batch_id,
+                )
+
+    def test_split_receipt_fsync_failure_leaves_no_final_or_private_temp(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            receipt_dir = (
+                root / "audit/v5_2_qd/historical/acquisition/split_receipts"
+            )
+            parent_query_id = logical_query_id(parent)
+            original_fsync = query_plan.os.fsync
+
+            def fail_receipt_file_fsync(descriptor: int) -> None:
+                metadata = os.fstat(descriptor)
+                if stat.S_ISREG(metadata.st_mode):
+                    raise OSError("injected split receipt fsync failure")
+                original_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    query_plan.os,
+                    "fsync",
+                    side_effect=fail_receipt_file_fsync,
+                ),
+                self.assertRaisesRegex(OSError, "injected split receipt"),
+            ):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=parent_query_id,
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+            self.assertFalse((receipt_dir / f"{parent_query_id}.json").exists())
+            self.assertEqual(list(receipt_dir.glob("*.tmp")), [])
+            self.assertEqual(
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=parent_query_id,
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                ).parent_query_id,
+                parent_query_id,
+            )
+
+    def test_split_receipt_retry_recovers_lost_ack_after_final_link(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            parent_query_id = logical_query_id(parent)
+            receipt_dir = (
+                root / "audit/v5_2_qd/historical/acquisition/split_receipts"
+            )
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_unlink_owned_temp",
+                    side_effect=OSError("injected lost acknowledgement"),
+                ),
+                self.assertRaisesRegex(OSError, "lost acknowledgement"),
+            ):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=parent_query_id,
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+            final = receipt_dir / f"{parent_query_id}.json"
+            stale = list(receipt_dir.glob("*.tmp"))
+            self.assertTrue(final.is_file())
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(os.stat(final).st_ino, os.stat(stale[0]).st_ino)
+
+            recovered = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=parent_query_id,
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            self.assertEqual(recovered.parent_query_id, parent_query_id)
+            self.assertEqual(recovered.recorded_at_utc, "2026-07-14T12:01:00.000000Z")
+            self.assertEqual(os.stat(final).st_nlink, 1)
+            self.assertEqual(list(receipt_dir.glob("*.tmp")), [])
+
+    def test_recursive_split_load_rejects_corrupted_ancestor_receipt(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            root_receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            recursive_parent = next(
+                query
+                for query in child_batch.queries
+                if (
+                    date.fromisoformat(str(query.requested_range["end_date"]))
+                    - date.fromisoformat(str(query.requested_range["start_date"]))
+                ).days
+                >= 1
+            )
+            recursive_batch = query_plan._make_batch(
+                "REMAINING",
+                child_batch.batch_id,
+                query_plan.bisect_statcast_query(recursive_parent),
+            )
+            query_plan.publish_query_batch(root, recursive_batch)
+            recursive_attempt = _record_split_attempt(root, recursive_parent, "ROW_CAP")
+            query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=child_batch.batch_id,
+                parent_query_id=logical_query_id(recursive_parent),
+                reason="ROW_CAP",
+                exhausted_attempt_number=recursive_attempt,
+                child_batch_id=recursive_batch.batch_id,
+            )
+            ancestor_path = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                / f"{root_receipt.parent_query_id}.json"
+            )
+            forged = json.loads(ancestor_path.read_bytes())
+            forged["depth"] = 99
+            identity = dict(forged)
+            identity.pop("split_receipt_id")
+            forged["split_receipt_id"] = hashlib.sha256(
+                _canonical_json_bytes(identity).removesuffix(b"\n")
+            ).hexdigest()
+            ancestor_path.write_bytes(_canonical_json_bytes(forged))
+            with self.assertRaisesRegex(ValueError, "reconstruction|ancestor|depth"):
+                query_plan.load_split_receipt(
+                    root,
+                    logical_query_id(recursive_parent),
+                    evidence_root=_split_evidence_root(root),
+                )
+
+    def test_split_receipt_rejects_unsafe_namespace_and_rebind(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            acquisition = root / "audit/v5_2_qd/historical/acquisition"
+            external = root / "external"
+            external.mkdir()
+            (acquisition / "split_receipts").symlink_to(
+                external, target_is_directory=True
+            )
+            with self.assertRaisesRegex(ValueError, "no-follow|ancestor|directory"):
+                query_plan.publish_split_receipt(
+                    root,
+                    evidence_root=_split_evidence_root(root),
+                    parent_batch_id=parent_batch.batch_id,
+                    parent_query_id=logical_query_id(parent),
+                    reason="TIMEOUT",
+                    exhausted_attempt_number=attempt_number,
+                    child_batch_id=child_batch.batch_id,
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_batch, parent, child_batch, attempt_number = _split_batches(root)
+            receipt = query_plan.publish_split_receipt(
+                root,
+                evidence_root=_split_evidence_root(root),
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=logical_query_id(parent),
+                reason="TIMEOUT",
+                exhausted_attempt_number=attempt_number,
+                child_batch_id=child_batch.batch_id,
+            )
+            receipt_path = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                / f"{receipt.parent_query_id}.json"
+            )
+            replacement = receipt_path.with_name("replacement.json")
+            replacement.write_bytes(receipt_path.read_bytes())
+            original = query_plan._read_linked_regular
+            replaced = False
+
+            def replace_after_read(parent_fd: int, name: str, label: str):
+                nonlocal replaced
+                result = original(parent_fd, name, label)
+                if label == "split receipt" and result is not None and not replaced:
+                    replaced = True
+                    os.replace(replacement, receipt_path)
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_read_linked_regular",
+                    side_effect=replace_after_read,
+                ),
+                self.assertRaisesRegex(ValueError, "identity|changed"),
+            ):
+                query_plan.load_split_receipt(
+                    root,
+                    receipt.parent_query_id,
+                    evidence_root=_split_evidence_root(root),
+                )
 
 
 if __name__ == "__main__":

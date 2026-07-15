@@ -10,12 +10,17 @@ import secrets
 import stat
 import subprocess
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import urlencode
 
-from .v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
+from .v52_evidence import (
+    LogicalQuery,
+    V52EvidenceStore,
+    canonical_query_bytes,
+    logical_query_id,
+)
 from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 
 
@@ -27,6 +32,9 @@ _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
 _TEAMS_ENDPOINT = "https://statsapi.mlb.com/api/v1/teams"
 _MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
+_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition.json"
+)
 _APPROVED_DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -38,7 +46,14 @@ _PLAN_A_AMENDMENT_RELATIVE = Path(
 )
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
+_SPLIT_RECEIPT_ROOT = Path(
+    "audit/v5_2_qd/historical/acquisition/split_receipts"
+)
 _PRESEASON_DISPOSITION_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+_SPLIT_REASONS = frozenset({"ROW_CAP", "SIZE_LIMIT", "TIMEOUT"})
+_SPLIT_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$"
+)
 _ALLOWED_STAGES = frozenset(
     {
         "STATIC_SCHEDULES",
@@ -56,6 +71,21 @@ class QueryBatch:
     stage: str
     derived_from_sha256: str | None
     queries: tuple[LogicalQuery, ...]
+
+
+@dataclass(frozen=True)
+class SplitReceipt:
+    split_receipt_id: str
+    receipt_sha256: str
+    stage: str
+    parent_batch_id: str
+    parent_query_id: str
+    reason: str
+    exhausted_attempt_number: int
+    depth: int
+    child_batch_id: str
+    child_query_ids: tuple[str, ...]
+    recorded_at_utc: str
 
 
 @dataclass(frozen=True)
@@ -474,29 +504,51 @@ def _verify_frozen_acquisition_schema(root: Path, contract: dict[str, object]) -
     )
 
 
-def _load_static_contracts(
-    run_spec_path: Path, acquisition_contract_path: Path
+def _validate_run_bound_acquisition_contract(
+    root: Path,
+    run_spec_contents: bytes,
+    contract_contents: bytes,
 ) -> tuple[dict[str, object], str, dict[str, object], str]:
-    run_spec, run_sha = _load_json_object(run_spec_path, "RunSpec")
-    contract, contract_sha = _load_json_object(
-        acquisition_contract_path,
+    run_spec = _parse_json_object(run_spec_contents, "RunSpec")
+    run_sha = _sha256_bytes(run_spec_contents)
+    contract = _parse_json_object(
+        contract_contents,
         "acquisition contract",
         canonical=True,
     )
+    contract_sha = _sha256_bytes(contract_contents)
     if contract.get("schema_version") != 2:
         raise ValueError("acquisition contract must use schema version 2")
     bindings = contract.get("bindings")
     if not isinstance(bindings, dict):
         raise ValueError("acquisition contract bindings must be an object")
-    root = _repository_root(run_spec_path)
-    _verify_repository_binding(
+    verified_run_spec = _verify_repository_binding(
         root,
         bindings.get("run_spec"),
         expected_path=_RUN_SPEC_RELATIVE,
         label="RunSpec",
     )
-    if bindings["run_spec"]["sha256"] != run_sha:
+    if verified_run_spec != run_spec_contents:
         raise ValueError("acquisition contract RunSpec binding differs")
+    return run_spec, run_sha, contract, contract_sha
+
+
+def _load_static_contracts(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> tuple[dict[str, object], str, dict[str, object], str]:
+    run_spec_path = Path(run_spec_path)
+    acquisition_contract_path = Path(acquisition_contract_path)
+    root = _repository_root(run_spec_path)
+    run_spec, run_sha, contract, contract_sha = (
+        _validate_run_bound_acquisition_contract(
+            root,
+            run_spec_path.read_bytes(),
+            acquisition_contract_path.read_bytes(),
+        )
+    )
+    bindings = contract["bindings"]
+    if not isinstance(bindings, dict):
+        raise AssertionError("validated acquisition contract bindings must be an object")
     _verify_repository_binding(
         root,
         bindings.get("approved_design"),
@@ -1716,6 +1768,682 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
                         os.fsync(current)
                 finally:
                     os.close(descriptor)
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _split_range(query: LogicalQuery) -> dict[str, object]:
+    first, last = validate_statcast_query(query)
+    return {
+        "end_date": last.isoformat(),
+        "start_date": first.isoformat(),
+        "year": first.year,
+    }
+
+
+def _validate_split_timestamp(value: object) -> str:
+    if not isinstance(value, str) or _SPLIT_TIMESTAMP.fullmatch(value) is None:
+        raise ValueError("split receipt timestamp differs")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("split receipt timestamp differs") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError("split receipt timestamp differs")
+    return value
+
+
+def _verify_split_evidence_root(
+    repository_root: Path,
+    evidence_root: Path,
+    parent: LogicalQuery | None = None,
+) -> None:
+    contents = _read_repository_file(
+        repository_root,
+        _RUN_SPEC_RELATIVE,
+        "split RunSpec",
+    )
+    contract_contents = _read_repository_file(
+        repository_root,
+        _ACQUISITION_CONTRACT_RELATIVE,
+        "split acquisition contract",
+    )
+    _, run_spec_sha256, _, contract_sha256 = (
+        _validate_run_bound_acquisition_contract(
+            repository_root,
+            contents,
+            contract_contents,
+        )
+    )
+    if parent is not None:
+        if run_spec_sha256 != parent.run_spec_sha256:
+            raise ValueError("split parent RunSpec hash binding differs")
+        if contract_sha256 != parent.acquisition_contract_sha256:
+            raise ValueError("split parent acquisition contract hash binding differs")
+    run_spec = _parse_json_object(contents, "split RunSpec")
+    namespaces = run_spec.get("namespaces")
+    raw = namespaces.get("raw") if isinstance(namespaces, dict) else None
+    if not isinstance(raw, str):
+        raise ValueError("split RunSpec raw namespace binding differs")
+    raw_path = Path(raw)
+    if (
+        raw_path.is_absolute()
+        or not raw_path.parts
+        or any(component in {"", ".", ".."} for component in raw_path.parts)
+    ):
+        raise ValueError("split RunSpec raw namespace binding differs")
+    expected = Path(os.path.abspath(os.fspath(Path(repository_root) / raw_path)))
+    supplied = Path(os.path.abspath(os.fspath(evidence_root)))
+    if supplied != expected:
+        raise ValueError("split evidence root differs from the RunSpec raw namespace")
+
+
+def _verified_split_attempt(
+    evidence_root: Path,
+    parent: LogicalQuery,
+    reason: str,
+    attempt_number: int,
+) -> tuple[dict[str, object], str, str]:
+    if reason not in _SPLIT_REASONS:
+        raise ValueError("split reason is not approved")
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or not 1 <= attempt_number <= 999999
+    ):
+        raise ValueError("exhausted_attempt_number must be a positive integer")
+    progress = V52EvidenceStore(evidence_root).read_verified_query_progress(parent)
+    if not progress.attempt_receipts:
+        raise ValueError("split parent has no exhausted attempt receipt")
+    if progress.pending_attempt_numbers:
+        raise ValueError("split attempt membership changed")
+    latest = max(
+        progress.attempt_receipts,
+        key=lambda record: int(record["attempt_number"]),
+    )
+    if latest.get("attempt_number") != attempt_number:
+        raise ValueError("split receipt must bind the latest attempt receipt")
+    if latest.get("outcome") != "SPLIT_REQUIRED":
+        raise ValueError("latest attempt is not SPLIT_REQUIRED")
+    if latest.get("error_classification") != reason:
+        raise ValueError("split reason differs from the latest attempt receipt")
+    parent_query_id = logical_query_id(parent)
+    relative = Path(
+        "queries",
+        parent.source,
+        parent_query_id,
+        "attempts",
+        f"{attempt_number:06d}.json",
+    )
+    contents = _read_repository_file(
+        evidence_root, relative, "split attempt receipt"
+    )
+    if contents != _canonical_json_bytes(dict(latest)) + b"\n":
+        raise ValueError("split attempt receipt bytes differ")
+    return dict(latest), relative.as_posix(), _sha256_bytes(contents)
+
+
+def _verified_split_lineage(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int,
+    *,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    active_parent_ids: set[str],
+) -> tuple[
+    QueryBatch,
+    LogicalQuery,
+    QueryBatch,
+    dict[str, object],
+    str,
+    str,
+    int,
+]:
+    requested_parent_batch_id = _validate_sha256(
+        parent_batch_id, "parent_batch_id"
+    )
+    requested_parent_query_id = _validate_sha256(
+        parent_query_id, "parent_query_id"
+    )
+    requested_child_batch_id = _validate_sha256(child_batch_id, "child_batch_id")
+    parent_batch = load_query_batch(repository_root, requested_parent_batch_id)
+    child_batch = load_query_batch(repository_root, requested_child_batch_id)
+    matches = [
+        query
+        for query in parent_batch.queries
+        if logical_query_id(query) == requested_parent_query_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("split parent query must occur exactly once in its batch")
+    parent = matches[0]
+    _verify_split_evidence_root(repository_root, evidence_root, parent)
+    parent_first, parent_last = validate_statcast_query(parent)
+    if parent_batch.stage != "REMAINING" or child_batch.stage != parent_batch.stage:
+        raise ValueError("split parent and child batches must use REMAINING stage")
+    if child_batch.derived_from_sha256 != parent_batch.batch_id:
+        raise ValueError("split child batch must derive from the parent batch")
+    if len(child_batch.queries) < 2:
+        raise ValueError("split child batch must contain at least two queries")
+    cursor = parent_first
+    for child in child_batch.queries:
+        child_first, child_last = validate_statcast_query(child)
+        if (
+            child.parent_query_id != requested_parent_query_id
+            or child.run_spec_sha256 != parent.run_spec_sha256
+            or child.acquisition_contract_sha256
+            != parent.acquisition_contract_sha256
+        ):
+            raise ValueError("split child query lineage bindings differ")
+        if child != _statcast_child(parent, child_first, child_last):
+            raise ValueError("split child query differs from its canonical parent slice")
+        if child_first != cursor or child_first > child_last or child_last > parent_last:
+            raise ValueError("split child ranges are unordered, overlapping, or gapped")
+        cursor = child_last + timedelta(days=1)
+    if cursor != parent_last + timedelta(days=1):
+        raise ValueError("split child ranges do not cover the parent exactly")
+
+    if parent.parent_query_id is None:
+        if parent_batch.derived_from_sha256 is not None:
+            raise ValueError("split root parent batch must not be derived")
+        depth = 1
+    else:
+        ancestor = _load_split_receipt_locked(
+            repository_root,
+            evidence_root,
+            split_fd,
+            parent.parent_query_id,
+            active_parent_ids=active_parent_ids,
+        )
+        if ancestor is None:
+            raise ValueError("recursive split ancestor receipt is missing")
+        else:
+            if (
+                ancestor.child_batch_id != parent_batch.batch_id
+                or requested_parent_query_id not in ancestor.child_query_ids
+            ):
+                raise ValueError("recursive split ancestor binding differs")
+            depth = ancestor.depth + 1
+
+    attempt, attempt_path, attempt_sha256 = _verified_split_attempt(
+        evidence_root,
+        parent,
+        reason,
+        exhausted_attempt_number,
+    )
+    return (
+        parent_batch,
+        parent,
+        child_batch,
+        attempt,
+        attempt_path,
+        attempt_sha256,
+        depth,
+    )
+
+
+def _split_record(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int,
+    *,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    active_parent_ids: set[str],
+) -> dict[str, object]:
+    (
+        parent_batch,
+        parent,
+        child_batch,
+        attempt,
+        attempt_path,
+        attempt_sha256,
+        depth,
+    ) = _verified_split_lineage(
+        repository_root,
+        evidence_root,
+        split_fd,
+        parent_batch_id=parent_batch_id,
+        parent_query_id=parent_query_id,
+        reason=reason,
+        exhausted_attempt_number=exhausted_attempt_number,
+        child_batch_id=child_batch_id,
+        active_parent_ids=active_parent_ids,
+    )
+    record = {
+        "attempt_receipt": {
+            "attempt_number": exhausted_attempt_number,
+            "path": attempt_path,
+            "sha256": attempt_sha256,
+        },
+        "child_batch_id": child_batch.batch_id,
+        "children": [
+            {
+                "query_id": logical_query_id(query),
+                "range": _split_range(query),
+            }
+            for query in child_batch.queries
+        ],
+        "depth": depth,
+        "parent_batch_id": parent_batch.batch_id,
+        "parent_query_id": logical_query_id(parent),
+        "parent_range": _split_range(parent),
+        "reason": reason,
+        "receipt_kind": "QUERY_SPLIT",
+        "recorded_at_utc": _validate_split_timestamp(attempt["ended_at_utc"]),
+        "schema_version": 1,
+        "stage": parent_batch.stage,
+    }
+    return {
+        **record,
+        "split_receipt_id": _sha256_bytes(_canonical_json_bytes(record)),
+    }
+
+
+_SPLIT_RECORD_KEYS = frozenset(
+    {
+        "attempt_receipt",
+        "child_batch_id",
+        "children",
+        "depth",
+        "parent_batch_id",
+        "parent_query_id",
+        "parent_range",
+        "reason",
+        "receipt_kind",
+        "recorded_at_utc",
+        "schema_version",
+        "split_receipt_id",
+        "stage",
+    }
+)
+
+
+def _split_receipt_value(record: dict[str, object], contents: bytes) -> SplitReceipt:
+    children = record["children"]
+    attempt = record["attempt_receipt"]
+    if not isinstance(children, list) or not isinstance(attempt, dict):
+        raise ValueError("split receipt nested records differ")
+    child_query_ids = tuple(
+        _validate_sha256(child.get("query_id"), "split child query_id")
+        if isinstance(child, dict)
+        else _validate_sha256(None, "split child query_id")
+        for child in children
+    )
+    attempt_number = attempt.get("attempt_number")
+    depth = record["depth"]
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or isinstance(depth, bool)
+        or not isinstance(depth, int)
+    ):
+        raise ValueError("split receipt numeric fields differ")
+    return SplitReceipt(
+        split_receipt_id=_validate_sha256(
+            record["split_receipt_id"], "split_receipt_id"
+        ),
+        receipt_sha256=_sha256_bytes(contents),
+        stage=str(record["stage"]),
+        parent_batch_id=_validate_sha256(
+            record["parent_batch_id"], "parent_batch_id"
+        ),
+        parent_query_id=_validate_sha256(
+            record["parent_query_id"], "parent_query_id"
+        ),
+        reason=str(record["reason"]),
+        exhausted_attempt_number=attempt_number,
+        depth=depth,
+        child_batch_id=_validate_sha256(record["child_batch_id"], "child_batch_id"),
+        child_query_ids=child_query_ids,
+        recorded_at_utc=_validate_split_timestamp(record["recorded_at_utc"]),
+    )
+
+
+def _load_split_receipt_locked(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int,
+    parent_query_id: str,
+    *,
+    active_parent_ids: set[str],
+) -> SplitReceipt | None:
+    requested_id = _validate_sha256(parent_query_id, "parent_query_id")
+    if requested_id in active_parent_ids:
+        raise ValueError("split receipt ancestry contains a cycle")
+    name = f"{requested_id}.json"
+    loaded = _read_linked_regular(split_fd, name, "split receipt")
+    if loaded is None:
+        return None
+    contents, metadata = loaded
+    if metadata.st_nlink != 1:
+        raise ValueError("split receipt must be an unaliased regular file")
+    record = _parse_json_object(contents, "split receipt", canonical=True)
+    if set(record) != _SPLIT_RECORD_KEYS:
+        raise ValueError("split receipt keys differ")
+    if (
+        record.get("schema_version") != 1
+        or record.get("receipt_kind") != "QUERY_SPLIT"
+        or record.get("stage") != "REMAINING"
+        or record.get("reason") not in _SPLIT_REASONS
+        or record.get("parent_query_id") != requested_id
+    ):
+        raise ValueError("split receipt closed fields differ")
+    embedded_id = record.get("split_receipt_id")
+    identity = dict(record)
+    identity.pop("split_receipt_id", None)
+    if embedded_id != _sha256_bytes(_canonical_json_bytes(identity)):
+        raise ValueError("split receipt canonical ID binding differs")
+    attempt = record.get("attempt_receipt")
+    if not isinstance(attempt, dict) or set(attempt) != {
+        "attempt_number",
+        "path",
+        "sha256",
+    }:
+        raise ValueError("split attempt receipt binding differs")
+    attempt_number = attempt.get("attempt_number")
+    if isinstance(attempt_number, bool) or not isinstance(attempt_number, int):
+        raise ValueError("split attempt receipt number differs")
+
+    active_parent_ids.add(requested_id)
+    try:
+        expected = _split_record(
+            repository_root,
+            evidence_root,
+            split_fd,
+            parent_batch_id=_validate_sha256(
+                record.get("parent_batch_id"), "parent_batch_id"
+            ),
+            parent_query_id=requested_id,
+            reason=str(record["reason"]),
+            exhausted_attempt_number=attempt_number,
+            child_batch_id=_validate_sha256(
+                record.get("child_batch_id"), "child_batch_id"
+            ),
+            active_parent_ids=active_parent_ids,
+        )
+    finally:
+        active_parent_ids.remove(requested_id)
+    if record != expected:
+        raise ValueError("split receipt verified reconstruction differs")
+    rebound = _read_linked_regular(split_fd, name, "split receipt")
+    if rebound is None:
+        raise ValueError("split receipt disappeared during load")
+    rebound_contents, rebound_metadata = rebound
+    if rebound_contents != contents or _batch_file_identity(
+        rebound_metadata
+    ) != _batch_file_identity(metadata):
+        raise ValueError("split receipt identity or bytes changed during load")
+    return _split_receipt_value(record, contents)
+
+
+def _open_optional_directory(parent_fd: int, name: str) -> int | None:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(
+            "split receipt ancestors must be existing no-follow directories"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("split receipt ancestor identity differs")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_split_namespace(root: Path, *, create: bool) -> list[int] | None:
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in _SPLIT_RECEIPT_ROOT.parts:
+            child = (
+                _open_or_create_directory(current, component)
+                if create
+                else _open_optional_directory(current, component)
+            )
+            if child is None:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+                return None
+            descriptors.append(child)
+            current = child
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _verify_split_namespace_chain(root: Path, descriptors: Sequence[int]) -> None:
+    if len(descriptors) != len(_SPLIT_RECEIPT_ROOT.parts) + 1:
+        raise ValueError("split receipt ancestor chain differs")
+    fresh_root = _open_root(root)
+    try:
+        opened = os.fstat(descriptors[0])
+        fresh = os.fstat(fresh_root)
+        if (opened.st_dev, opened.st_ino) != (fresh.st_dev, fresh.st_ino):
+            raise ValueError("split receipt root identity changed")
+    finally:
+        os.close(fresh_root)
+    for index, component in enumerate(_SPLIT_RECEIPT_ROOT.parts):
+        try:
+            opened = os.fstat(descriptors[index + 1])
+            linked = os.stat(
+                component,
+                dir_fd=descriptors[index],
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("split receipt ancestor identity changed") from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("split receipt ancestor identity changed")
+
+
+def load_split_receipt(
+    repository_root: Path,
+    parent_query_id: str,
+    *,
+    evidence_root: Path,
+) -> SplitReceipt | None:
+    requested_id = _validate_sha256(parent_query_id, "parent_query_id")
+    repository_root = Path(repository_root)
+    evidence_root = Path(evidence_root)
+    _verify_split_evidence_root(repository_root, evidence_root)
+    descriptors = _open_split_namespace(repository_root, create=False)
+    if descriptors is None:
+        return None
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_SH)
+        try:
+            receipt = _load_split_receipt_locked(
+                repository_root,
+                evidence_root,
+                current,
+                requested_id,
+                active_parent_ids=set(),
+            )
+            _verify_split_namespace_chain(repository_root, descriptors)
+            return receipt
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _publish_split_bytes_locked(
+    parent_fd: int,
+    parent_query_id: str,
+    contents: bytes,
+) -> tuple[int, ...] | None:
+    temp_name = f".{parent_query_id}.{secrets.token_hex(16)}.tmp"
+    final_name = f"{parent_query_id}.json"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+    temp_exists = True
+    try:
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("split receipt publication made no progress")
+            view = view[written:]
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("split receipt temp publication was aliased")
+        os.fsync(descriptor)
+        if _read_existing(parent_fd, temp_name) != contents:
+            raise ValueError("split receipt temp bytes differ")
+        try:
+            os.link(
+                temp_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _unlink_owned_temp(parent_fd, temp_name, descriptor)
+            temp_exists = False
+            os.fsync(parent_fd)
+            concurrent = _reconcile_batch_final(
+                parent_fd, parent_query_id, contents
+            )
+            if concurrent is None:
+                raise ValueError("concurrent split receipt disappeared")
+            return None
+        _unlink_owned_temp(parent_fd, temp_name, descriptor)
+        temp_exists = False
+        os.fsync(parent_fd)
+        if _reconcile_batch_final(parent_fd, parent_query_id, contents) != contents:
+            raise ValueError("split receipt bytes changed after publication")
+        return _batch_file_identity(os.fstat(descriptor))
+    finally:
+        try:
+            if temp_exists:
+                _unlink_owned_temp(parent_fd, temp_name, descriptor)
+                os.fsync(parent_fd)
+        finally:
+            os.close(descriptor)
+
+
+def _cleanup_owned_split_final(
+    parent_fd: int,
+    parent_query_id: str,
+    contents: bytes,
+    identity: tuple[int, ...],
+) -> None:
+    name = f"{parent_query_id}.json"
+    loaded = _read_linked_regular(parent_fd, name, "owned split receipt final")
+    if loaded is None:
+        return
+    final_contents, metadata = loaded
+    if final_contents != contents or _batch_file_identity(metadata) != identity:
+        raise ValueError("split receipt final ownership changed before cleanup")
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _batch_file_identity(rebound) != identity:
+        raise ValueError("split receipt final ownership changed before cleanup")
+    os.unlink(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def publish_split_receipt(
+    repository_root: Path,
+    *,
+    evidence_root: Path,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+) -> SplitReceipt:
+    requested_parent_query_id = _validate_sha256(
+        parent_query_id, "parent_query_id"
+    )
+    repository_root = Path(repository_root)
+    evidence_root = Path(evidence_root)
+    descriptors = _open_split_namespace(repository_root, create=True)
+    if descriptors is None:
+        raise AssertionError("created split receipt namespace must exist")
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_EX)
+        try:
+            _verify_split_namespace_chain(repository_root, descriptors)
+            record = _split_record(
+                repository_root,
+                evidence_root,
+                current,
+                parent_batch_id=parent_batch_id,
+                parent_query_id=requested_parent_query_id,
+                reason=reason,
+                exhausted_attempt_number=exhausted_attempt_number,
+                child_batch_id=child_batch_id,
+                active_parent_ids={requested_parent_query_id},
+            )
+            contents = _canonical_json_bytes(record) + b"\n"
+            existing = _reconcile_batch_final(
+                current, requested_parent_query_id, contents
+            )
+            _cleanup_prelink_batch_temps(current, requested_parent_query_id)
+            created_identity = None
+            if existing is None:
+                created_identity = _publish_split_bytes_locked(
+                    current,
+                    requested_parent_query_id,
+                    contents,
+                )
+            try:
+                receipt = _load_split_receipt_locked(
+                    repository_root,
+                    evidence_root,
+                    current,
+                    requested_parent_query_id,
+                    active_parent_ids=set(),
+                )
+                if receipt is None:
+                    raise ValueError("split receipt is missing after publication")
+                _verify_split_namespace_chain(repository_root, descriptors)
+                return receipt
+            except BaseException:
+                if created_identity is not None:
+                    _cleanup_owned_split_final(
+                        current,
+                        requested_parent_query_id,
+                        contents,
+                        created_identity,
+                    )
+                raise
         finally:
             fcntl.flock(current, fcntl.LOCK_UN)
     finally:
