@@ -1812,10 +1812,44 @@ def _validate_statcast_root_batch_authority(
         raise ValueError("REMAINING root differs from fixed Statcast authority replay")
 
 
+def _is_legacy_partition_batch_candidate(
+    repository_root: Path, batch: QueryBatch
+) -> bool:
+    if batch.stage != "REMAINING" or not batch.queries:
+        return False
+    if any(
+        query.requested_range.get("acquisition")
+        not in {"FETCH_REQUIRED", "PROTECTED_LEGACY_REFERENCE"}
+        for query in batch.queries
+    ):
+        return False
+    root_ids = {
+        logical_query_id(parent)
+        for parent in build_statcast_root_batch(repository_root).queries
+    }
+    direct_root_ids = {
+        query.parent_query_id
+        for query in batch.queries
+        if query.parent_query_id in root_ids
+    }
+    return len(direct_root_ids) >= 1
+
+
+def _validate_legacy_partition_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if not _is_legacy_partition_batch_candidate(repository_root, batch):
+        return
+    expected = build_legacy_partition_batch(repository_root)
+    if batch != expected:
+        raise ValueError("REMAINING legacy partition differs from decision replay")
+
+
 def _validate_query_batch_authority(repository_root: Path, batch: QueryBatch) -> None:
     _validate_reference_batch_authority(repository_root, batch)
     _validate_participant_batch_authority(repository_root, batch)
     _validate_statcast_root_batch_authority(repository_root, batch)
+    _validate_legacy_partition_batch_authority(repository_root, batch)
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
@@ -1962,7 +1996,7 @@ def _legacy_ranges(
     return result
 
 
-def build_legacy_partition_batch(
+def _build_legacy_partition_batch_from_catalog(
     parents: Sequence[LogicalQuery],
     protected_catalog: Sequence[Mapping[str, object]],
     *,
@@ -2049,6 +2083,99 @@ def build_legacy_partition_batch(
                 )
             )
     return _make_batch("REMAINING", protected_inventory_sha256, queries)
+
+
+def build_legacy_partition_batch(repository_root: Path) -> QueryBatch:
+    """Replay the sealed legacy decisions into the fixed first-level partition."""
+    from .v52_legacy_decision_inventory import (
+        _load_legacy_partition_decision_replay,
+    )
+
+    root = Path(repository_root)
+    decision_sha256, protected_sha256, decisions = (
+        _load_legacy_partition_decision_replay(root)
+    )
+    expected_root = build_statcast_root_batch(root)
+    root_batch = _load_query_batch(
+        root, expected_root.batch_id, invoke_authority_hook=False
+    )
+    if root_batch != expected_root or len(root_batch.queries) != 46:
+        raise ValueError("legacy partition Statcast root authority differs")
+    if len(decisions) != 48:
+        raise ValueError("legacy partition requires exactly 48 sealed decisions")
+
+    parents = {
+        logical_query_id(parent): (parent, *_canonical_statcast_parent_range(parent))
+        for parent in root_batch.queries
+    }
+    if len(parents) != 46:
+        raise ValueError("legacy partition root query IDs are not unique")
+    by_parent: dict[str, list[tuple[date, date]]] = {
+        parent_id: [] for parent_id in parents
+    }
+    queries: list[LogicalQuery] = []
+    disposition_counts = {"PROMOTED": 0, "FETCH_REQUIRED": 0}
+    for decision in decisions:
+        parent_id = decision.get("parent_query_id")
+        candidate_id = decision.get("candidate_query_id")
+        decision_range = decision.get("range")
+        disposition = decision.get("disposition")
+        if (
+            not isinstance(parent_id, str)
+            or parent_id not in parents
+            or not isinstance(candidate_id, str)
+            or not isinstance(decision_range, Mapping)
+            or disposition not in disposition_counts
+        ):
+            raise ValueError("legacy partition decision binding differs")
+        year = decision_range.get("year")
+        first = _iso_date(decision_range.get("start_date"), "decision start")
+        last = _iso_date(decision_range.get("end_date"), "decision end")
+        parent, parent_first, parent_last = parents[parent_id]
+        if (
+            isinstance(year, bool)
+            or not isinstance(year, int)
+            or year != first.year
+            or first > last
+            or not parent_first <= first <= last <= parent_last
+        ):
+            raise ValueError("legacy partition decision range differs")
+        acquisition = (
+            "PROTECTED_LEGACY_REFERENCE"
+            if disposition == "PROMOTED"
+            else "FETCH_REQUIRED"
+        )
+        query = _statcast_child(parent, first, last, acquisition=acquisition)
+        if disposition == "PROMOTED":
+            requested = dict(query.requested_range)
+            requested["protected_inventory_sha256"] = protected_sha256
+            query = replace(query, requested_range=requested)
+        if logical_query_id(query) != candidate_id:
+            raise ValueError("legacy partition candidate query ID differs")
+        queries.append(query)
+        by_parent[parent_id].append((first, last))
+        disposition_counts[disposition] += 1
+
+    if disposition_counts != {"PROMOTED": 1, "FETCH_REQUIRED": 47}:
+        raise ValueError("legacy partition dispositions differ")
+    for parent_id, (parent, parent_first, parent_last) in parents.items():
+        ranges = by_parent[parent_id]
+        if not ranges or ranges[0][0] != parent_first or ranges[-1][1] != parent_last:
+            raise ValueError("legacy partition does not cover every root parent")
+        if any(
+            current[0] != previous[1] + timedelta(days=1)
+            for previous, current in zip(ranges, ranges[1:])
+        ):
+            raise ValueError("legacy partition root coverage is not contiguous")
+        if logical_query_id(parent) != parent_id:
+            raise ValueError("legacy partition root parent identity differs")
+
+    batch = _make_batch("REMAINING", decision_sha256, queries)
+    if tuple(logical_query_id(query) for query in batch.queries) != tuple(
+        decision["candidate_query_id"] for decision in decisions
+    ):
+        raise ValueError("legacy partition decision replay order differs")
+    return batch
 
 
 def _directory_flags() -> int:
@@ -2271,7 +2398,11 @@ def _verify_opened_batch_chain(root: Path, descriptors: Sequence[int]) -> None:
             raise ValueError("query batch ancestor identity changed")
 
 
-def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
+def _load_query_batch(
+    root: Path, batch_id: str, *, invoke_authority_hook: bool
+) -> QueryBatch:
+    if type(invoke_authority_hook) is not bool:
+        raise TypeError("invoke_authority_hook must be a bool")
     root = Path(root)
     requested_id = _validate_sha256(batch_id, "batch_id")
     descriptors = [_open_root(root)]
@@ -2338,12 +2469,22 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         ) != _batch_file_identity(metadata):
             raise ValueError("query batch identity or bytes changed during load")
         _verify_opened_batch_chain(root, descriptors)
-        if batch.stage == "PARTICIPANT_DERIVED" or _is_statcast_root_batch(batch):
+        if invoke_authority_hook and (
+            batch.stage == "PARTICIPANT_DERIVED"
+            or _is_statcast_root_batch(batch)
+            or _is_legacy_partition_batch_candidate(root, batch)
+        ):
             _rebind_query_batch_authority(root, batch)
         return batch
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+def load_query_batch(repository_root: Path, batch_id: str) -> QueryBatch:
+    return _load_query_batch(
+        repository_root, batch_id, invoke_authority_hook=True
+    )
 
 
 def _reconcile_batch_final(
@@ -2447,10 +2588,15 @@ def _before_query_batch_authority_rebind() -> None:
 
 
 def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
-    if batch.stage not in {
-        "REFERENCE_INPUTS",
-        "PARTICIPANT_DERIVED",
-    } and not _is_statcast_root_batch(batch):
+    if (
+        batch.stage
+        not in {
+            "REFERENCE_INPUTS",
+            "PARTICIPANT_DERIVED",
+        }
+        and not _is_statcast_root_batch(batch)
+        and not _is_legacy_partition_batch_candidate(root, batch)
+    ):
         return
     _before_query_batch_authority_rebind()
     _validate_query_batch_authority(root, batch)

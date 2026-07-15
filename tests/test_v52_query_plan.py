@@ -1916,8 +1916,8 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_bisect_and_legacy_share_strict_canonical_monthly_parent_validation(self):
         from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
             bisect_statcast_query,
-            build_legacy_partition_batch,
         )
 
         valid = _parent("2024-06-01", "2024-06-30")
@@ -1940,7 +1940,7 @@ class V52QueryPlanTest(unittest.TestCase):
             with self.subTest(parent=parent), self.assertRaises(ValueError):
                 bisect_statcast_query(parent)
             with self.subTest(parent=parent), self.assertRaises(ValueError):
-                build_legacy_partition_batch(
+                _build_legacy_partition_batch_from_catalog(
                     [parent], [], protected_inventory_sha256="a" * 64
                 )
 
@@ -1969,12 +1969,12 @@ class V52QueryPlanTest(unittest.TestCase):
         self,
     ):
         from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
             bisect_statcast_query,
-            build_legacy_partition_batch,
         )
 
         parent = _parent("2024-06-01", "2024-06-30")
-        promoted = build_legacy_partition_batch(
+        promoted = _build_legacy_partition_batch_from_catalog(
             [parent],
             [_legacy("2024-06-01", "2024-06-30")],
             protected_inventory_sha256="a" * 64,
@@ -2031,14 +2031,16 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_legacy_partition_maps_verified_children_and_fetches_only_uncovered_gaps(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
+        )
 
         parent = _parent("2024-06-01", "2024-06-30")
         catalog = [
             _legacy("2024-06-01", "2024-06-10"),
             _legacy("2024-06-21", "2024-06-30"),
         ]
-        batch = build_legacy_partition_batch(
+        batch = _build_legacy_partition_batch_from_catalog(
             [parent], catalog, protected_inventory_sha256="a" * 64
         )
         self.assertEqual(batch.derived_from_sha256, "a" * 64)
@@ -2074,7 +2076,9 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_legacy_partition_rejects_gap_overlap_and_mixed_parent_child_ambiguity(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
+        )
 
         parent = _parent("2024-06-01", "2024-06-30")
         overlap = [
@@ -2082,7 +2086,7 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2024-06-20", "2024-06-30"),
         ]
         with self.assertRaisesRegex(ValueError, "overlap"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [parent], overlap, protected_inventory_sha256="a" * 64
             )
 
@@ -2091,7 +2095,7 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2024-06-01", "2024-06-10"),
         ]
         with self.assertRaisesRegex(ValueError, "mixed parent/child"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [parent], mixed, protected_inventory_sha256="a" * 64
             )
 
@@ -2104,14 +2108,16 @@ class V52QueryPlanTest(unittest.TestCase):
             },
         )
         with self.assertRaisesRegex(ValueError, "parameters"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [bad_parent], [], protected_inventory_sha256="a" * 64
             )
 
     def test_legacy_partition_requires_exact_canonical_url_and_no_duplicate_mapping(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
+        )
 
         parent = _parent("2024-06-01", "2024-06-30")
         malformed = _legacy("2024-06-01", "2024-06-10")
@@ -2120,7 +2126,7 @@ class V52QueryPlanTest(unittest.TestCase):
             "url": "https://baseballsavant.mlb.com/statcast_search/csv?wrong=true",
         }
         with self.assertRaisesRegex(ValueError, "canonical URL"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [parent], [malformed], protected_inventory_sha256="a" * 64
             )
 
@@ -2129,12 +2135,14 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2024-06-01", "2024-06-10", raw={"sha256": "2" * 64}),
         ]
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [parent], duplicate, protected_inventory_sha256="a" * 64
             )
 
     def test_legacy_partition_rejects_unsorted_unmapped_and_incompatible_children(self):
-        from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_legacy_partition_batch_from_catalog,
+        )
 
         june = _parent("2024-06-01", "2024-06-30")
         july = _parent("2024-07-01", "2024-07-31")
@@ -2143,7 +2151,7 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2024-06-01", "2024-06-10"),
         ]
         with self.assertRaisesRegex(ValueError, "ordered"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [june], unsorted, protected_inventory_sha256="a" * 64
             )
 
@@ -2153,7 +2161,7 @@ class V52QueryPlanTest(unittest.TestCase):
             _legacy("2025-06-01", "2025-06-30"),
         ):
             with self.subTest(unmapped=unmapped), self.assertRaises(ValueError):
-                build_legacy_partition_batch(
+                _build_legacy_partition_batch_from_catalog(
                     [june, july], [unmapped], protected_inventory_sha256="a" * 64
                 )
 
@@ -2165,8 +2173,330 @@ class V52QueryPlanTest(unittest.TestCase):
             ),
         }
         with self.assertRaisesRegex(ValueError, "canonical URL"):
-            build_legacy_partition_batch(
+            _build_legacy_partition_batch_from_catalog(
                 [june], [incompatible], protected_inventory_sha256="a" * 64
+            )
+
+    def test_legacy_partition_public_builder_replays_verified_decisions_exactly(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with self.subTest(public_load_contract="signature"):
+            self.assertEqual(
+                tuple(inspect.signature(query_plan.load_query_batch).parameters),
+                ("repository_root", "batch_id"),
+            )
+        with self.subTest(public_load_contract="private_kwarg_rejected"):
+            with self.assertRaises(TypeError):
+                query_plan.load_query_batch(
+                    Path("."), "a" * 64, _invoke_authority_hook=False
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, protected_sha256 = _legacy_decision_repository(
+                Path(directory)
+            )
+            verified = publish_legacy_decision_inventory(root)
+            root_batch = query_plan.build_statcast_root_batch(root)
+            batch = query_plan.build_legacy_partition_batch(root)
+            decisions = verified.payload["decisions"]
+
+            self.assertEqual(batch.stage, "REMAINING")
+            self.assertEqual(batch.derived_from_sha256, verified.sha256)
+            self.assertEqual(len(batch.queries), len(decisions), 48)
+            self.assertEqual(
+                [logical_query_id(query) for query in batch.queries],
+                [decision["candidate_query_id"] for decision in decisions],
+            )
+            self.assertEqual(
+                [
+                    (
+                        decision["range"]["year"],
+                        decision["range"]["start_date"],
+                        decision["range"]["end_date"],
+                        decision["candidate_query_id"],
+                    )
+                    for decision in decisions
+                ],
+                sorted(
+                    (
+                        decision["range"]["year"],
+                        decision["range"]["start_date"],
+                        decision["range"]["end_date"],
+                        decision["candidate_query_id"],
+                    )
+                    for decision in decisions
+                ),
+            )
+
+            disposition_counts = {"PROMOTED": 0, "FETCH_REQUIRED": 0}
+            children_by_parent: dict[str, list[tuple[date, date]]] = {}
+            parents_by_id = {
+                logical_query_id(parent): parent for parent in root_batch.queries
+            }
+            for query, decision in zip(batch.queries, decisions):
+                query_range = decision["range"]
+                start = str(query_range["start_date"])
+                end = str(query_range["end_date"])
+                disposition = str(decision["disposition"])
+                disposition_counts[disposition] += 1
+                self.assertEqual(query.parent_query_id, decision["parent_query_id"])
+                self.assertEqual(
+                    (query.source, query.grain, query.endpoint),
+                    (
+                        "baseball_savant_statcast",
+                        "pitch",
+                        "https://baseballsavant.mlb.com/statcast_search/csv",
+                    ),
+                )
+                self.assertEqual(
+                    (
+                        query.expected_media_type,
+                        query.parser_version,
+                        query.run_spec_sha256,
+                        query.acquisition_contract_sha256,
+                    ),
+                    (
+                        "text/csv",
+                        "v5.2.1",
+                        parents_by_id[query.parent_query_id or ""].run_spec_sha256,
+                        parents_by_id[
+                            query.parent_query_id or ""
+                        ].acquisition_contract_sha256,
+                    ),
+                )
+                self.assertEqual(query.parameters, _parent(start, end).parameters)
+                expected_range: dict[str, object] = {
+                    "year": query_range["year"],
+                    "start_date": start,
+                    "end_date": end,
+                    "acquisition": (
+                        "PROTECTED_LEGACY_REFERENCE"
+                        if disposition == "PROMOTED"
+                        else "FETCH_REQUIRED"
+                    ),
+                }
+                if disposition == "PROMOTED":
+                    expected_range["protected_inventory_sha256"] = protected_sha256
+                self.assertEqual(query.requested_range, expected_range)
+                children_by_parent.setdefault(query.parent_query_id or "", []).append(
+                    (date.fromisoformat(start), date.fromisoformat(end))
+                )
+
+            self.assertEqual(disposition_counts, {"PROMOTED": 1, "FETCH_REQUIRED": 47})
+            self.assertEqual(
+                set(children_by_parent),
+                {logical_query_id(parent) for parent in root_batch.queries},
+            )
+            for parent in root_batch.queries:
+                ranges = children_by_parent[logical_query_id(parent)]
+                parent_start = date.fromisoformat(
+                    str(parent.requested_range["start_date"])
+                )
+                parent_end = date.fromisoformat(str(parent.requested_range["end_date"]))
+                self.assertEqual(ranges[0][0], parent_start)
+                self.assertEqual(ranges[-1][1], parent_end)
+                self.assertTrue(
+                    all(
+                        current[0] == previous[1] + timedelta(days=1)
+                        for previous, current in zip(ranges, ranges[1:])
+                    )
+                )
+
+            with self.assertRaises(TypeError):
+                query_plan.build_legacy_partition_batch(
+                    root_batch.queries,
+                    [],
+                    protected_inventory_sha256=protected_sha256,
+                )
+
+    def test_legacy_partition_public_batch_is_idempotent_and_forgery_closed(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _protected_sha256 = _legacy_decision_repository(
+                Path(directory)
+            )
+            verified = publish_legacy_decision_inventory(root)
+            batch = query_plan.build_legacy_partition_batch(root)
+            path = query_plan.publish_query_batch(root, batch)
+            before = path.stat()
+            self.assertEqual(query_plan.publish_query_batch(root, batch), path)
+            after = path.stat()
+            self.assertEqual(
+                (before.st_dev, before.st_ino), (after.st_dev, after.st_ino)
+            )
+            self.assertEqual(query_plan.load_query_batch(root, batch.batch_id), batch)
+
+            promoted_index = next(
+                index
+                for index, query in enumerate(batch.queries)
+                if query.requested_range["acquisition"] == "PROTECTED_LEGACY_REFERENCE"
+            )
+            promoted = batch.queries[promoted_index]
+            downgraded_range = dict(promoted.requested_range)
+            downgraded_range["acquisition"] = "FETCH_REQUIRED"
+            downgraded_range.pop("protected_inventory_sha256")
+            downgraded = dataclasses.replace(promoted, requested_range=downgraded_range)
+            candidate_index = next(
+                index
+                for index, query in enumerate(batch.queries)
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                and date.fromisoformat(str(query.requested_range["end_date"]))
+                > date.fromisoformat(str(query.requested_range["start_date"]))
+            )
+            changed_candidate = query_plan.bisect_statcast_query(
+                batch.queries[candidate_index]
+            )[0]
+            subset_parent = batch.queries[0].parent_query_id
+            single_parent_subset = tuple(
+                query
+                for query in batch.queries
+                if query.parent_query_id == subset_parent
+            )
+            self.assertTrue(0 < len(single_parent_subset) < len(batch.queries))
+
+            def replaced(index: int, query: LogicalQuery) -> tuple[LogicalQuery, ...]:
+                values = list(batch.queries)
+                values[index] = query
+                return tuple(values)
+
+            for label, derived, queries in (
+                ("omit", verified.sha256, batch.queries[1:]),
+                ("extra", verified.sha256, (*batch.queries, changed_candidate)),
+                (
+                    "reorder",
+                    verified.sha256,
+                    (batch.queries[1], batch.queries[0], *batch.queries[2:]),
+                ),
+                (
+                    "disposition",
+                    verified.sha256,
+                    replaced(promoted_index, downgraded),
+                ),
+                (
+                    "parent",
+                    verified.sha256,
+                    replaced(
+                        0,
+                        dataclasses.replace(batch.queries[0], parent_query_id="f" * 64),
+                    ),
+                ),
+                (
+                    "candidate",
+                    verified.sha256,
+                    replaced(candidate_index, changed_candidate),
+                ),
+                ("single_parent_subset", verified.sha256, single_parent_subset),
+                ("derived", "f" * 64, batch.queries),
+            ):
+                with self.subTest(label=label):
+                    forged = query_plan._make_batch("REMAINING", derived, queries)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        query_plan.publish_query_batch(root, forged)
+                    forged_id = _write_forged_canonical_batch(
+                        root,
+                        stage="REMAINING",
+                        derived_from_sha256=derived,
+                        queries=queries,
+                    )
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        query_plan.load_query_batch(root, forged_id)
+
+    def test_legacy_partition_authority_races_clean_up_and_recursive_children_pass(
+        self,
+    ):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            DECISION_PATH,
+            _legacy_decision_repository,
+            _statcast_root_batch_path,
+        )
+
+        for authority in ("decision", "root"):
+            for publication in ("new", "existing"):
+                with self.subTest(authority=authority, publication=publication):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root, _inventory_path, _protected_sha256 = (
+                            _legacy_decision_repository(Path(directory))
+                        )
+                        publish_legacy_decision_inventory(root)
+                        batch = query_plan.build_legacy_partition_batch(root)
+                        final = (
+                            root
+                            / "audit/v5_2_qd/historical/acquisition/query_batches"
+                            / f"{batch.batch_id}.json"
+                        )
+                        expected: bytes | None = None
+                        if publication == "existing":
+                            query_plan.publish_query_batch(root, batch)
+                            expected = final.read_bytes()
+
+                        target = (
+                            root / DECISION_PATH
+                            if authority == "decision"
+                            else _statcast_root_batch_path(root)
+                        )
+
+                        def mutate_authority() -> None:
+                            payload = json.loads(target.read_bytes())
+                            if authority == "decision":
+                                payload["counts"]["fetch_required_count"] += 1
+                            else:
+                                payload["queries"] = payload["queries"][:-1]
+                            target.write_bytes(_canonical_json_bytes(payload))
+
+                        with (
+                            mock.patch.object(
+                                query_plan,
+                                "_before_query_batch_authority_rebind",
+                                side_effect=mutate_authority,
+                            ) as hook,
+                            self.assertRaises((ValueError, RuntimeError)),
+                        ):
+                            query_plan.publish_query_batch(root, batch)
+                        hook.assert_called_once_with()
+                        if publication == "existing":
+                            self.assertEqual(final.read_bytes(), expected)
+                        else:
+                            self.assertFalse(final.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _protected_sha256 = _legacy_decision_repository(
+                Path(directory)
+            )
+            publish_legacy_decision_inventory(root)
+            batch = query_plan.build_legacy_partition_batch(root)
+            query_plan.publish_query_batch(root, batch)
+            parent = next(
+                query
+                for query in batch.queries
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                and date.fromisoformat(str(query.requested_range["end_date"]))
+                > date.fromisoformat(str(query.requested_range["start_date"]))
+            )
+            children = query_plan.bisect_statcast_query(parent)
+            child_batch = query_plan._make_batch("REMAINING", batch.batch_id, children)
+            query_plan.publish_query_batch(root, child_batch)
+            self.assertEqual(
+                query_plan.load_query_batch(root, child_batch.batch_id), child_batch
             )
 
     def test_batches_and_published_bytes_are_stable_closed_and_immutable(self):
@@ -3146,32 +3476,33 @@ class V52QueryPlanTest(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td).resolve()
-            _statcast_authority_fixture(root, in_place=True)
-            root_batch = query_plan.build_statcast_root_batch(root)
-            parent = next(
+            from mlb_backtest.v52_legacy_decision_inventory import (
+                publish_legacy_decision_inventory,
+            )
+            from tests.test_v52_legacy_decision_inventory import (
+                _legacy_decision_repository,
+            )
+
+            root, _inventory_path, _protected_sha256 = (
+                _legacy_decision_repository(Path(td))
+            )
+            publish_legacy_decision_inventory(root)
+            legacy_batch = query_plan.build_legacy_partition_batch(root)
+            legacy_parent = next(
                 query
-                for query in root_batch.queries
-                if query.requested_range["year"] >= 2022
+                for query in legacy_batch.queries
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
                 and (
                     date.fromisoformat(str(query.requested_range["end_date"]))
                     - date.fromisoformat(str(query.requested_range["start_date"]))
                 ).days
                 >= 6
             )
-            first = str(parent.requested_range["start_date"])
-            last = str(parent.requested_range["end_date"])
-            legacy_batch = query_plan.build_legacy_partition_batch(
-                [parent],
-                [_legacy(first, last)],
-                protected_inventory_sha256="a" * 64,
-            )
-            legacy_parent = legacy_batch.queries[0]
             children = query_plan.bisect_statcast_query(legacy_parent)
             child_batch = query_plan._make_batch(
                 "REMAINING", legacy_batch.batch_id, children
             )
-            for batch in (root_batch, legacy_batch, child_batch):
+            for batch in (legacy_batch, child_batch):
                 query_plan.publish_query_batch(root, batch)
             attempt_number = _record_split_attempt(root, legacy_parent, "SIZE_LIMIT")
             with self.assertRaisesRegex(ValueError, "ancestor receipt"):

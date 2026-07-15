@@ -230,7 +230,9 @@ def _legacy_catalog_record(
 
 
 def _task3_legacy_queries(*, protected: bool) -> tuple[LogicalQuery, ...]:
-    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+    from mlb_backtest.v52_query_plan import (
+        _build_legacy_partition_batch_from_catalog,
+    )
 
     parent = _planned_statcast_query("2024-04-01", "2024-04-30")
     catalog = (
@@ -238,7 +240,7 @@ def _task3_legacy_queries(*, protected: bool) -> tuple[LogicalQuery, ...]:
         if protected
         else []
     )
-    return build_legacy_partition_batch(
+    return _build_legacy_partition_batch_from_catalog(
         [parent], catalog, protected_inventory_sha256="c" * 64
     ).queries
 
@@ -251,10 +253,12 @@ def _task3_legacy_partition_queries(
     parent_start: str = "2024-04-01",
     parent_end: str = "2024-04-30",
 ) -> tuple[LogicalQuery, ...]:
-    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+    from mlb_backtest.v52_query_plan import (
+        _build_legacy_partition_batch_from_catalog,
+    )
 
     parent = _planned_statcast_query(parent_start, parent_end)
-    return build_legacy_partition_batch(
+    return _build_legacy_partition_batch_from_catalog(
         [parent],
         [_legacy_catalog_record(parent, protected_start, protected_end)],
         protected_inventory_sha256=protected_inventory_sha256,
@@ -264,10 +268,12 @@ def _task3_legacy_partition_queries(
 def _task3_fetch_month_queries(
     start: str, end: str, *, protected_inventory_sha256: str
 ) -> tuple[LogicalQuery, ...]:
-    from mlb_backtest.v52_query_plan import build_legacy_partition_batch
+    from mlb_backtest.v52_query_plan import (
+        _build_legacy_partition_batch_from_catalog,
+    )
 
     parent = _planned_statcast_query(start, end)
-    return build_legacy_partition_batch(
+    return _build_legacy_partition_batch_from_catalog(
         [parent], [], protected_inventory_sha256=protected_inventory_sha256
     ).queries
 

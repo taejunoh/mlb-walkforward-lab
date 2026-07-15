@@ -28,9 +28,9 @@ from .v52_legacy import (
     load_protected_legacy_catalog,
 )
 from .v52_query_plan import (
-    build_legacy_partition_batch,
+    _build_legacy_partition_batch_from_catalog,
+    _load_query_batch,
     build_statcast_root_batch,
-    load_query_batch,
 )
 from .v52_source_contracts import canonical_json_bytes
 
@@ -290,14 +290,16 @@ def _assemble(repository_root: Path) -> _Authority:
         protected_inventory_sha256=protected_sha256,
     )
     root_expected = build_statcast_root_batch(root)
-    root_batch = load_query_batch(root, root_expected.batch_id)
+    root_batch = _load_query_batch(
+        root, root_expected.batch_id, invoke_authority_hook=False
+    )
     if root_batch != root_expected or len(root_batch.queries) != 46:
         raise ValueError("Statcast root batch authority differs")
     root_batch_relative = _QUERY_BATCH_ROOT / f"{root_batch.batch_id}.json"
     root_batch_snapshot = _snapshot(root, root / root_batch_relative)
 
     in_scope = _in_scope_records(catalog)
-    partition = build_legacy_partition_batch(
+    partition = _build_legacy_partition_batch_from_catalog(
         root_batch.queries,
         in_scope,
         protected_inventory_sha256=protected_sha256,
@@ -733,6 +735,30 @@ def load_verified_legacy_decision_inventory(
     _rebind(initial.root, final, snapshot)
     authority = _Authority(rebound.root, rebound_payload, rebound.identities)
     return _verified(authority, final, contents)
+
+
+def _load_legacy_partition_decision_replay(
+    repository_root: Path,
+) -> tuple[str, str, tuple[Mapping[str, object], ...]]:
+    """Return the sealed decision-file hash, protected hash, and frozen decisions."""
+    verified = load_verified_legacy_decision_inventory(repository_root)
+    protected = verified.payload.get("protected_inventory")
+    decisions = verified.payload.get("decisions")
+    counts = verified.payload.get("counts")
+    if (
+        not isinstance(protected, Mapping)
+        or not isinstance(protected.get("sha256"), str)
+        or not isinstance(decisions, tuple)
+        or not all(isinstance(decision, Mapping) for decision in decisions)
+        or not isinstance(counts, Mapping)
+        or counts.get("fatal_integrity_count") != 0
+    ):
+        raise ValueError("legacy decision replay authority differs")
+    return (
+        verified.sha256,
+        protected["sha256"],
+        tuple(decisions),
+    )
 
 
 __all__ = [
