@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -66,7 +66,9 @@ BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/execution_registry.py"),
     Path("mlb_backtest/verify_v52_design.py"),
     Path("mlb_backtest/v52_query_plan.py"),
+    Path("mlb_backtest/v52_schedule_inventory.py"),
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
+    Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_split_receipt.schema.json"),
 )
@@ -312,6 +314,141 @@ class ExecutionRegistryTest(unittest.TestCase):
             pending_query_ids=query_ids,
             quarantined_query_ids=(),
             split_query_ids=(),
+        )
+
+    def reference_checkpoint_fixture(self, root: Path, run_spec: object):
+        from mlb_backtest.v52_evidence import (
+            AttemptCapture,
+            V52EvidenceStore,
+            logical_query_id,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_schedule_reference_batch,
+            publish_query_batch,
+        )
+        from mlb_backtest.v52_schedule_inventory import (
+            publish_schedule_anchor_inventory,
+        )
+        from mlb_backtest.v52_sources.schedule import (
+            recompute_schedule_anchor_sidecar,
+        )
+        from tests.test_v52_schedule_inventory import _schedule_raw
+
+        static_batch, static_ids = self.checkpoint_fixture(root, run_spec)
+        raw_root = root / run_spec.raw["namespaces"]["raw"]
+        raw_root.mkdir(parents=True)
+        store = V52EvidenceStore(raw_root)
+        for query in static_batch.queries:
+            payload = json.loads(_schedule_raw(query, 0))
+            official = date.fromisoformat(
+                str(query.requested_range["start_date"])
+            ) + timedelta(days=1)
+            official_text = official.isoformat()
+            payload["dates"][0]["date"] = official_text
+            game = payload["dates"][0]["games"][0]
+            game["gamePk"] = int(query.requested_range["year"]) * 10 + 1
+            game["officialDate"] = official_text
+            game["gameDate"] = f"{official_text}T17:05:00Z"
+            game["venue"] = {"id": 31, "name": "Primary Park"}
+            raw = canonical_json_bytes(payload) + b"\n"
+            sidecar = recompute_schedule_anchor_sidecar(raw, query)
+            capture = AttemptCapture(
+                started_at_utc="2026-07-14T00:00:00.000000Z",
+                ended_at_utc="2026-07-14T00:00:01.000000Z",
+                final_url=query.endpoint,
+                http_status=200,
+                response_headers=(
+                    ("content-type", "application/json"),
+                    ("content-length", str(len(raw))),
+                ),
+                body=raw,
+                error_classification=None,
+            )
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    sidecar["semantics"],
+                )
+        inventory = publish_schedule_anchor_inventory(
+            root,
+            run_spec,
+            acquisition_contract_path=root / CONTRACT_RELATIVE,
+            static_batch_id=static_batch.batch_id,
+            evidence_root=raw_root,
+        )
+        reference_batch = build_schedule_reference_batch(
+            root,
+            root / RUN_SPEC_RELATIVE,
+            acquisition_contract_path=root / CONTRACT_RELATIVE,
+            static_batch_id=static_batch.batch_id,
+            evidence_root=raw_root,
+        )
+        publish_query_batch(root, reference_batch)
+        reference_ids = tuple(
+            sorted(logical_query_id(query) for query in reference_batch.queries)
+        )
+        static_checkpoint = self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=None,
+            stage="STATIC_SCHEDULES",
+            query_batch_ids=(static_batch.batch_id,),
+            completed_query_ids=static_ids,
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        return (
+            static_batch,
+            reference_batch,
+            static_ids,
+            reference_ids,
+            inventory,
+            static_checkpoint,
+            store,
+        )
+
+    def publish_reference_checkpoint(
+        self,
+        root: Path,
+        run_spec: object,
+        fixture: tuple[object, ...],
+        *,
+        expected_prior: str,
+        completed_reference_ids: tuple[str, ...] = (),
+        quarantined_reference_ids: tuple[str, ...] = (),
+    ):
+        (
+            static_batch,
+            reference_batch,
+            static_ids,
+            reference_ids,
+            inventory,
+            _,
+            _,
+        ) = fixture
+        completed_reference = set(completed_reference_ids)
+        quarantined_reference = set(quarantined_reference_ids)
+        return self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=expected_prior,
+            stage="REFERENCE_INPUTS",
+            query_batch_ids=(static_batch.batch_id, reference_batch.batch_id),
+            completed_query_ids=tuple(
+                sorted((*static_ids, *completed_reference_ids))
+            ),
+            pending_query_ids=tuple(
+                query_id
+                for query_id in reference_ids
+                if query_id not in completed_reference
+                and query_id not in quarantined_reference
+            ),
+            quarantined_query_ids=tuple(sorted(quarantined_reference_ids)),
+            split_query_ids=(),
+            stage_evidence_receipts=(inventory.path,),
         )
 
     def test_acquisition_checkpoint_schema_and_public_api_are_closed(self) -> None:
@@ -857,7 +994,6 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
             for stage in (
-                "REFERENCE_INPUTS",
                 "TIMEZONE_REVIEW",
                 "PARTICIPANT_DERIVED",
                 "REMAINING",
@@ -876,6 +1012,360 @@ class ExecutionRegistryTest(unittest.TestCase):
                         quarantined_query_ids=(),
                         split_query_ids=(),
                     )
+
+    def test_reference_checkpoint_opens_with_exact_fixed_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            fixture = self.reference_checkpoint_fixture(root, run_spec)
+            static_batch, reference_batch, static_ids, reference_ids, inventory, static_checkpoint, _ = fixture
+            checkpoint = self.publish_reference_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=static_checkpoint.receipt_sha256,
+            )
+            self.assertEqual(checkpoint.stage, "REFERENCE_INPUTS")
+            self.assertEqual(
+                checkpoint.query_batch_ids,
+                (static_batch.batch_id, reference_batch.batch_id),
+            )
+            self.assertEqual(checkpoint.completed_query_ids, static_ids)
+            self.assertEqual(checkpoint.pending_query_ids, reference_ids)
+            self.assertEqual(
+                checkpoint.stage_evidence_receipt_sha256s,
+                (inventory.sha256,),
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                checkpoint,
+            )
+
+    def test_reference_checkpoint_rejects_noncanonical_batches_and_stage_evidence(self):
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch, publish_query_batch
+
+        for attack in ("omitted", "extra", "missing-evidence", "extra-evidence"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                fixture = self.reference_checkpoint_fixture(root, run_spec)
+                static_batch, reference_batch, static_ids, reference_ids, inventory, static_checkpoint, _ = fixture
+                batch_ids = (static_batch.batch_id, reference_batch.batch_id)
+                stage_evidence = (inventory.path,)
+                if attack == "omitted":
+                    batch_ids = (static_batch.batch_id,)
+                elif attack == "extra":
+                    extra = build_statcast_root_batch(
+                        root / RUN_SPEC_RELATIVE, root / CONTRACT_RELATIVE
+                    )
+                    publish_query_batch(root, extra)
+                    batch_ids = (*batch_ids, extra.batch_id)
+                elif attack == "missing-evidence":
+                    stage_evidence = ()
+                else:
+                    extra_evidence = self.write_artifact(
+                        root,
+                        "audit/v5_2_qd/historical/acquisition/extra.json",
+                        {"extra": True},
+                    )
+                    stage_evidence = (inventory.path, extra_evidence)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "REFERENCE_INPUTS|reference|inventory|batch|stage evidence|order",
+                ):
+                    self.registry.publish_acquisition_checkpoint(
+                        root,
+                        run_spec,
+                        expected_prior_checkpoint_sha256=static_checkpoint.receipt_sha256,
+                        stage="REFERENCE_INPUTS",
+                        query_batch_ids=batch_ids,
+                        completed_query_ids=static_ids,
+                        pending_query_ids=reference_ids,
+                        quarantined_query_ids=(),
+                        split_query_ids=(),
+                        stage_evidence_receipts=stage_evidence,
+                    )
+
+    def test_reference_checkpoint_authority_mutation_cleans_new_receipt_and_load_fails(self):
+        for operation in ("publish-pre", "publish-post", "load"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                fixture = self.reference_checkpoint_fixture(root, run_spec)
+                *_, inventory, static_checkpoint, _ = fixture
+                checkpoint_dir = root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+
+                def mutate_inventory() -> None:
+                    payload = json.loads(inventory.path.read_bytes())
+                    payload["counts"]["game_count"] += 1
+                    inventory.path.write_bytes(canonical_json_bytes(payload) + b"\n")
+
+                if operation == "load":
+                    checkpoint = self.publish_reference_checkpoint(
+                        root,
+                        run_spec,
+                        fixture,
+                        expected_prior=static_checkpoint.receipt_sha256,
+                    )
+                    mutate_inventory()
+                    with self.assertRaisesRegex(
+                        (ValueError, RuntimeError), "inventory|reference|checkpoint"
+                    ):
+                        self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+                    self.assertTrue(
+                        any(checkpoint.receipt_sha256 in path.name for path in checkpoint_dir.iterdir())
+                    )
+                    continue
+                hook = (
+                    "_before_registry_publish"
+                    if operation == "publish-pre"
+                    else "_after_registry_publish"
+                )
+                with (
+                    patch.object(self.registry, hook, side_effect=mutate_inventory),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "inventory|artifact|evidence|checkpoint|reference",
+                    ),
+                ):
+                    self.publish_reference_checkpoint(
+                        root,
+                        run_spec,
+                        fixture,
+                        expected_prior=static_checkpoint.receipt_sha256,
+                    )
+                self.assertEqual(
+                    sorted(path.name for path in checkpoint_dir.iterdir()),
+                    [
+                        f"00000000-{static_checkpoint.receipt_sha256}.json"
+                    ],
+                )
+
+    def test_reference_terminal_progress_is_repeatable_stop_after_authority(self):
+        from mlb_backtest.v52_evidence import AttemptCapture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            fixture = self.reference_checkpoint_fixture(root, run_spec)
+            _, reference_batch, _, reference_ids, _, static_checkpoint, store = fixture
+            pending = self.publish_reference_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=static_checkpoint.receipt_sha256,
+            )
+            for query in reference_batch.queries:
+                raw = b"{}"
+                capture = AttemptCapture(
+                    started_at_utc="2026-07-14T00:00:00.000000Z",
+                    ended_at_utc="2026-07-14T00:00:01.000000Z",
+                    final_url=query.endpoint,
+                    http_status=200,
+                    response_headers=(
+                        ("content-type", "application/json"),
+                        ("content-length", str(len(raw))),
+                    ),
+                    body=raw,
+                    error_classification=None,
+                )
+                with store.acquire_query(query) as lease:
+                    store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        capture,
+                        {},
+                    )
+            terminal = self.publish_reference_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=pending.receipt_sha256,
+                completed_reference_ids=reference_ids,
+            )
+            self.assertFalse(terminal.pending_query_ids)
+            self.assertFalse(terminal.quarantined_query_ids)
+            self.assertFalse(terminal.split_query_ids)
+            self.assertEqual(
+                self.publish_reference_checkpoint(
+                    root,
+                    run_spec,
+                    fixture,
+                    expected_prior=terminal.receipt_sha256,
+                    completed_reference_ids=reference_ids,
+                ),
+                terminal,
+            )
+
+    def test_reference_stored_checkpoint_rejects_forged_evidence_labels(self):
+        from mlb_backtest.v52_evidence import AttemptCapture
+
+        for attack in ("success-path", "quarantine-path", "wrong-query"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                fixture = self.reference_checkpoint_fixture(root, run_spec)
+                _, reference_batch, _, reference_ids, inventory, static_checkpoint, store = fixture
+                completed_reference_ids: tuple[str, ...] = ()
+                if attack == "wrong-query":
+                    query = reference_batch.queries[0]
+                    raw = b"{}"
+                    capture = AttemptCapture(
+                        started_at_utc="2026-07-14T00:00:00.000000Z",
+                        ended_at_utc="2026-07-14T00:00:01.000000Z",
+                        final_url=query.endpoint,
+                        http_status=200,
+                        response_headers=(
+                            ("content-type", "application/json"),
+                            ("content-length", str(len(raw))),
+                        ),
+                        body=raw,
+                        error_classification=None,
+                    )
+                    with store.acquire_query(query) as lease:
+                        store.publish_fetched(
+                            query,
+                            store.next_attempt_number(lease),
+                            capture,
+                            {},
+                        )
+                    from mlb_backtest.v52_evidence import logical_query_id
+
+                    completed_reference_ids = (logical_query_id(query),)
+                checkpoint = self.publish_reference_checkpoint(
+                    root,
+                    run_spec,
+                    fixture,
+                    expected_prior=static_checkpoint.receipt_sha256,
+                    completed_reference_ids=completed_reference_ids,
+                )
+                checkpoint_dir = root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                receipt = next(
+                    path
+                    for path in checkpoint_dir.iterdir()
+                    if checkpoint.receipt_sha256 in path.name
+                )
+                payload = json.loads(receipt.read_bytes())
+                target = next(
+                    query_id
+                    for query_id in reference_ids
+                    if query_id not in completed_reference_ids
+                )
+                payload["pending_query_ids"].remove(target)
+                if attack == "quarantine-path":
+                    payload["quarantined_query_ids"].append(target)
+                    kind = "QUARANTINE"
+                    forged_binding = {
+                        "path": inventory.path.relative_to(root).as_posix(),
+                        "query_id": target,
+                        "receipt_kind": kind,
+                        "sha256": inventory.sha256,
+                    }
+                elif attack == "wrong-query":
+                    payload["completed_query_ids"].append(target)
+                    kind = "SUCCESS"
+                    source = next(
+                        item
+                        for item in payload["query_evidence_receipts"]
+                        if item["receipt_kind"] == "SUCCESS"
+                        and item["query_id"] in completed_reference_ids
+                    )
+                    forged_binding = {**source, "query_id": target}
+                else:
+                    payload["completed_query_ids"].append(target)
+                    kind = "SUCCESS"
+                    forged_binding = {
+                        "path": inventory.path.relative_to(root).as_posix(),
+                        "query_id": target,
+                        "receipt_kind": kind,
+                        "sha256": inventory.sha256,
+                    }
+                payload["completed_query_ids"].sort()
+                payload["quarantined_query_ids"].sort()
+                payload["query_evidence_receipts"].append(forged_binding)
+                payload["query_evidence_receipts"].sort(
+                    key=lambda item: (
+                        item["query_id"],
+                        item["receipt_kind"],
+                        item["path"],
+                    )
+                )
+                self.replace_receipt_payload(receipt, payload)
+                with self.assertRaisesRegex(
+                    ValueError, "status|evidence|query|path|checkpoint"
+                ):
+                    self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+
+    def test_reference_stored_status_supports_current_quarantine_and_recovery(self):
+        from mlb_backtest.v52_evidence import AttemptCapture, logical_query_id
+
+        for status in ("QUARANTINED", "SUCCESS"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                fixture = self.reference_checkpoint_fixture(root, run_spec)
+                _, reference_batch, _, _, _, static_checkpoint, store = fixture
+                query = reference_batch.queries[0]
+                query_id = logical_query_id(query)
+                quarantined_raw = b"invalid-but-owned"
+                quarantined_capture = AttemptCapture(
+                    started_at_utc="2026-07-14T00:00:00.000000Z",
+                    ended_at_utc="2026-07-14T00:00:01.000000Z",
+                    final_url=query.endpoint,
+                    http_status=200,
+                    response_headers=(
+                        ("content-type", "application/json"),
+                        ("content-length", str(len(quarantined_raw))),
+                    ),
+                    body=quarantined_raw,
+                    error_classification=None,
+                )
+                with store.acquire_query(query) as lease:
+                    store.quarantine_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        quarantined_capture,
+                        error_classification="SEMANTIC_INVALID",
+                    )
+                completed: tuple[str, ...] = ()
+                quarantined = (query_id,)
+                if status == "SUCCESS":
+                    raw = b"{}"
+                    success_capture = AttemptCapture(
+                        started_at_utc="2026-07-14T00:00:02.000000Z",
+                        ended_at_utc="2026-07-14T00:00:03.000000Z",
+                        final_url=query.endpoint,
+                        http_status=200,
+                        response_headers=(
+                            ("content-type", "application/json"),
+                            ("content-length", str(len(raw))),
+                        ),
+                        body=raw,
+                        error_classification=None,
+                    )
+                    with store.acquire_query(query) as lease:
+                        store.publish_fetched(
+                            query,
+                            store.next_attempt_number(lease),
+                            success_capture,
+                            {},
+                        )
+                    completed = (query_id,)
+                    quarantined = ()
+                checkpoint = self.publish_reference_checkpoint(
+                    root,
+                    run_spec,
+                    fixture,
+                    expected_prior=static_checkpoint.receipt_sha256,
+                    completed_reference_ids=completed,
+                    quarantined_reference_ids=quarantined,
+                )
+                self.assertEqual(
+                    query_id in checkpoint.completed_query_ids,
+                    status == "SUCCESS",
+                )
+                self.assertEqual(
+                    query_id in checkpoint.quarantined_query_ids,
+                    status == "QUARANTINED",
+                )
+                self.assertEqual(
+                    self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                    checkpoint,
+                )
 
     def test_static_checkpoint_replays_canonical_builder_authority(self) -> None:
         from dataclasses import replace
