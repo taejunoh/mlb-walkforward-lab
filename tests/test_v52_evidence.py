@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import hashlib
 import inspect
 import json
 import os
 import shutil
+import socket
+import stat
 import tempfile
 import threading
 import time
 import unittest
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -641,6 +645,7 @@ class V52EvidenceTest(unittest.TestCase):
                 "response_headers",
                 "body",
                 "error_classification",
+                "timed_out",
             ),
             PublishedEvidence: (
                 "query_id",
@@ -665,12 +670,72 @@ class V52EvidenceTest(unittest.TestCase):
                 )
                 self.assertTrue(record.__dataclass_params__.frozen)
 
+    def test_timed_out_capture_invariant_is_closed(self) -> None:
+        capture = dataclasses.replace(
+            _capture(None, status=None, error="TRANSIENT_NETWORK"),
+            final_url=None,
+            response_headers=(),
+            timed_out=True,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.record_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    outcome="TRANSIENT_NETWORK",
+                )
+                partial = dataclasses.replace(
+                    _capture(b"partial", error="TRANSIENT_NETWORK"),
+                    timed_out=True,
+                )
+                store.record_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    partial,
+                    outcome="TRANSIENT_NETWORK",
+                )
+                for invalid in (
+                    dataclasses.replace(capture, body=b"partial"),
+                    dataclasses.replace(capture, http_status=503),
+                    dataclasses.replace(capture, final_url=query.endpoint),
+                    dataclasses.replace(capture, response_headers=(("ETag", "x"),)),
+                    dataclasses.replace(capture, error_classification="TIMEOUT"),
+                    dataclasses.replace(partial, final_url=None),
+                    dataclasses.replace(partial, http_status=None),
+                ):
+                    with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                        ValueError, "timed_out|bodyless transient"
+                    ):
+                        store.record_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            invalid,
+                            outcome="TRANSIENT_NETWORK",
+                        )
+
     def test_verified_query_progress_records_are_frozen_exported_and_exact(self) -> None:
         self.assertTrue(hasattr(v52_evidence, "VerifiedQuarantineRead"))
         self.assertTrue(hasattr(v52_evidence, "VerifiedQueryProgress"))
+        self.assertTrue(hasattr(v52_evidence, "PersistedAttemptEvidence"))
         quarantine_record = v52_evidence.VerifiedQuarantineRead
         progress_record = v52_evidence.VerifiedQueryProgress
         expected = {
+            v52_evidence.PersistedAttemptEvidence: (
+                "query_id",
+                "attempt_number",
+                "outcome",
+                "attempt_receipt_path",
+                "attempt_receipt_sha256",
+                "evidence_receipt_path",
+                "evidence_receipt_sha256",
+                "body_path",
+                "body_sha256",
+                "byte_count",
+                "error_classification",
+            ),
             quarantine_record: (
                 "attempt_number",
                 "receipt_path",
@@ -870,15 +935,25 @@ class V52EvidenceTest(unittest.TestCase):
                 store.record_attempt(
                     query,
                     transient,
-                    _capture(None, status=None, error="TIMEOUT"),
+                    dataclasses.replace(
+                        _capture(None, status=None, error="TRANSIENT_NETWORK"),
+                        final_url=None,
+                        response_headers=(),
+                        timed_out=True,
+                    ),
                     outcome="TRANSIENT_NETWORK",
                 )
                 split = store.next_attempt_number(lease)
-                store.record_attempt(
+                store.persist_split_attempt(
                     query,
                     split,
-                    _capture(None, status=None, error="TOO_WIDE"),
-                    outcome="SPLIT_REQUIRED",
+                    dataclasses.replace(
+                        _capture(None, status=None, error="TRANSIENT_NETWORK"),
+                        final_url=None,
+                        response_headers=(),
+                        timed_out=True,
+                    ),
+                    reason="TIMEOUT",
                 )
                 permanent = store.next_attempt_number(lease)
                 store.record_attempt(
@@ -1862,8 +1937,9 @@ class V52EvidenceTest(unittest.TestCase):
             query = _derived_query()
             with self.assertRaisesRegex(RuntimeError, "interruption"):
                 with store.acquire_query(query):
-                    with patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
+                    with patch.object(
+                        store,
+                        "_verify_query_chain",
                         side_effect=RuntimeError("derived interruption"),
                     ):
                         store.publish_derived_disposition(
@@ -1901,17 +1977,22 @@ class V52EvidenceTest(unittest.TestCase):
             query = _derived_query()
             query_id = logical_query_id(query)
             sidecars = root / "queries" / query.source / query_id / "sidecars"
+            original_verify = store._verify_query_chain
 
-            def corrupt_sidecar() -> None:
+            def corrupt_sidecar_then_verify(
+                *args: object, **kwargs: object
+            ) -> None:
                 paths = list(sidecars.iterdir())
                 self.assertEqual(len(paths), 1)
                 paths[0].write_bytes(paths[0].read_bytes() + b" ")
+                original_verify(*args, **kwargs)  # type: ignore[arg-type]
 
             with store.acquire_query(query):
                 with (
-                    patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
-                        side_effect=corrupt_sidecar,
+                    patch.object(
+                        store,
+                        "_verify_query_chain",
+                        side_effect=corrupt_sidecar_then_verify,
                     ),
                     self.assertRaisesRegex(
                         (ValueError, RuntimeError),
@@ -2103,6 +2184,80 @@ class V52EvidenceTest(unittest.TestCase):
             ):
                 store.register_query(query)
 
+    def test_register_query_rebinds_registration_and_query_generation_before_return(
+        self,
+    ) -> None:
+        for attack in ("replace", "symlink", "generation"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                query_id = store.register_query(query)
+                query_root = root / "queries" / query.source / query_id
+                registration = query_root / "query.json"
+                original = registration.read_bytes()
+                original_validate = store._validated_registered_query
+                attacked = False
+
+                def validate_then_attack(*args: object, **kwargs: object):
+                    nonlocal attacked
+                    result = original_validate(*args, **kwargs)
+                    if attacked:
+                        return result
+                    attacked = True
+                    if attack == "replace":
+                        replacement = query_root / ".replacement.json"
+                        replacement.write_bytes(original)
+                        os.replace(replacement, registration)
+                    elif attack == "symlink":
+                        target = _tmp(td) / "same-registration.json"
+                        target.write_bytes(original)
+                        registration.unlink()
+                        registration.symlink_to(target)
+                    else:
+                        detached = query_root.with_name(query_root.name + ".detached")
+                        query_root.rename(detached)
+                        shutil.copytree(detached, query_root)
+                    return result
+
+                with (
+                    patch.object(
+                        store,
+                        "_validated_registered_query",
+                        side_effect=validate_then_attack,
+                    ),
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    store.register_query(query)
+
+    def test_register_query_registration_snapshot_rebind_is_last_locked_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            query_id = store.register_query(query)
+            query_path = root / "queries" / query.source / query_id / "query.json"
+            original = query_path.read_bytes()
+            original_chain = store._verify_query_chain
+            attacked = False
+
+            def chain_then_replace(*args: object, **kwargs: object) -> None:
+                nonlocal attacked
+                original_chain(*args, **kwargs)
+                if not attacked:
+                    attacked = True
+                    replacement = query_path.with_name(".same-query.json")
+                    replacement.write_bytes(original)
+                    os.replace(replacement, query_path)
+
+            with (
+                patch.object(store, "_verify_query_chain", side_effect=chain_then_replace),
+                self.assertRaises((ValueError, RuntimeError)),
+            ):
+                store.register_query(query)
+
     def test_query_registration_immutably_binds_lock_device_and_inode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = _tmp(td) / "raw"
@@ -2134,10 +2289,22 @@ class V52EvidenceTest(unittest.TestCase):
             allow_completion = threading.Event()
             results: list[str] = []
             errors: list[BaseException] = []
+            original_write = os.write
+            paused = False
+            pause_lock = threading.Lock()
 
-            def pause_first_registration() -> None:
-                partial_created.set()
-                self.assertTrue(allow_completion.wait(timeout=5))
+            def pause_first_registration(
+                descriptor: int, contents: bytes | bytearray | memoryview
+            ) -> int:
+                nonlocal paused
+                with pause_lock:
+                    should_pause = not paused
+                    if should_pause:
+                        paused = True
+                if should_pause:
+                    partial_created.set()
+                    self.assertTrue(allow_completion.wait(timeout=5))
+                return original_write(descriptor, contents)
 
             def worker() -> None:
                 try:
@@ -2146,7 +2313,7 @@ class V52EvidenceTest(unittest.TestCase):
                     errors.append(exc)
 
             with patch(
-                "mlb_backtest.v52_evidence._during_query_registration_publish",
+                "mlb_backtest.v52_evidence.os.write",
                 side_effect=pause_first_registration,
             ):
                 first = threading.Thread(target=worker)
@@ -2515,6 +2682,1983 @@ class V52EvidenceTest(unittest.TestCase):
             self.assertEqual(attempt["outcome"], "QUARANTINED")
             self.assertEqual(attempt["error_classification"], "SEMANTIC_INVALID")
 
+    def test_bodyless_terminal_failure_is_canonical_checkpoint_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            capture = dataclasses.replace(
+                _capture(None, status=None, error="PERMANENT_NETWORK"),
+                final_url=None,
+                response_headers=(),
+            )
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                evidence = store.quarantine_bodyless_attempt(
+                    query,
+                    number,
+                    capture,
+                    error_classification="PERMANENT_NETWORK",
+                )
+                before = evidence.attempt_receipt_path.stat()
+                repeated = store.quarantine_bodyless_attempt(
+                    query,
+                    number,
+                    capture,
+                    error_classification="PERMANENT_NETWORK",
+                )
+                after = evidence.attempt_receipt_path.stat()
+
+            self.assertEqual(repeated, evidence)
+            self.assertEqual((after.st_dev, after.st_ino, after.st_mtime_ns),
+                             (before.st_dev, before.st_ino, before.st_mtime_ns))
+            attempt_bytes = evidence.attempt_receipt_path.read_bytes()
+            self.assertEqual(
+                evidence.attempt_receipt_sha256,
+                hashlib.sha256(attempt_bytes).hexdigest(),
+            )
+            attempt = json.loads(attempt_bytes)
+            self.assertEqual(attempt["outcome"], "QUARANTINED")
+            self.assertIsNone(attempt["body_sha256"])
+            self.assertEqual(attempt["byte_count"], 0)
+            receipt = json.loads(evidence.evidence_receipt_path.read_bytes())
+            self.assertEqual(receipt["evidence_kind"], "TERMINAL_BODYLESS_FAILURE")
+            self.assertIsNone(receipt["quarantined_body_path"])
+            self.assertIsNone(receipt["raw_sha256"])
+            jsonschema.validate(receipt, json.loads(MANIFEST_SCHEMA.read_bytes()))
+            progress = store.read_verified_query_progress(query)
+            self.assertEqual(progress.status, "QUARANTINED")
+            self.assertEqual(progress.pending_attempt_numbers, ())
+            self.assertEqual(progress.quarantines, ())
+
+    def test_bodyless_terminal_failure_rejects_tampered_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            capture = dataclasses.replace(
+                _capture(None, status=None, error="PERMANENT_NETWORK"),
+                final_url=None,
+                response_headers=(),
+            )
+            with store.acquire_query(query) as lease:
+                evidence = store.quarantine_bodyless_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    error_classification="PERMANENT_NETWORK",
+                )
+            receipt = json.loads(evidence.evidence_receipt_path.read_bytes())
+            receipt["evidence_kind"] = "PARTIAL_SPLIT_RESPONSE"
+            evidence.evidence_receipt_path.write_bytes(_canonical_file(receipt))
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "evidence|bodyless|binding|path"
+            ):
+                store.read_verified_query_progress(query)
+
+    def test_partial_split_persists_bytes_and_latest_split_receipt_binding(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            requested_range={
+                "year": 2021,
+                "start_date": "2021-06-01",
+                "end_date": "2021-06-30",
+            },
+            expected_media_type="text/csv",
+        )
+        for reason in ("SIZE_LIMIT", "ROW_CAP", "TIMEOUT"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                partial = b"game_pk,pitch_type\n1,FF\n"
+                capture = dataclasses.replace(
+                    _capture(
+                        partial,
+                        error=(
+                            "TRANSIENT_NETWORK" if reason == "TIMEOUT" else reason
+                        ),
+                    ),
+                    response_headers=(("Content-Type", "text/csv"),),
+                    timed_out=reason == "TIMEOUT",
+                )
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    evidence = store.persist_split_attempt(
+                        query, number, capture, reason=reason
+                    )
+                    body_before = evidence.body_path.stat()
+                    repeated = store.persist_split_attempt(
+                        query, number, capture, reason=reason
+                    )
+                    body_after = evidence.body_path.stat()
+
+                self.assertEqual(repeated, evidence)
+                self.assertEqual(
+                    (body_after.st_dev, body_after.st_ino, body_after.st_mtime_ns),
+                    (body_before.st_dev, body_before.st_ino, body_before.st_mtime_ns),
+                )
+                self.assertEqual(evidence.body_path.read_bytes(), partial)
+                self.assertEqual(
+                    evidence.body_sha256, hashlib.sha256(partial).hexdigest()
+                )
+                receipt = json.loads(evidence.evidence_receipt_path.read_bytes())
+                self.assertEqual(receipt["evidence_kind"], "PARTIAL_SPLIT_RESPONSE")
+                self.assertEqual(receipt["raw_sha256"], evidence.body_sha256)
+                self.assertEqual(root / receipt["quarantined_body_path"], evidence.body_path)
+                manifest_schema = json.loads(MANIFEST_SCHEMA.read_bytes())
+                jsonschema.validate(receipt, manifest_schema)
+                empty_declared_body = {**receipt, "byte_count": 0}
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(empty_declared_body, manifest_schema)
+                progress = store.read_verified_query_progress(query)
+                latest = progress.attempt_receipts[-1]
+                self.assertEqual(latest["outcome"], "SPLIT_REQUIRED")
+                self.assertEqual(latest["error_classification"], reason)
+                self.assertEqual(latest["body_sha256"], evidence.body_sha256)
+                self.assertEqual(progress.pending_attempt_numbers, ())
+
+    def test_partial_split_rejects_reason_and_detects_tampered_bytes(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            capture = _capture(b"partial", error="SIZE_LIMIT")
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                with self.assertRaisesRegex(ValueError, "split reason"):
+                    store.persist_split_attempt(
+                        query, number, capture, reason="TRANSIENT_NETWORK"
+                    )
+                evidence = store.persist_split_attempt(
+                    query, number, capture, reason="SIZE_LIMIT"
+                )
+            evidence.body_path.write_bytes(b"tampered")
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "body|hash|binding|byte"
+            ):
+                store.read_verified_query_progress(query)
+
+    def test_interrupted_partial_split_publication_resumes_same_reservation(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            capture = _capture(b"partial", error="SIZE_LIMIT")
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                with (
+                    patch.object(
+                        store,
+                        "_finish_failure_transaction",
+                        side_effect=RuntimeError("injected interruption"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "injected interruption"),
+                ):
+                    store.persist_split_attempt(
+                        query, number, capture, reason="SIZE_LIMIT"
+                    )
+
+            with store.acquire_query(query) as lease:
+                evidence = store.persist_split_attempt(
+                    query, number, capture, reason="SIZE_LIMIT"
+                )
+            progress = store.read_verified_query_progress(query)
+            self.assertEqual(progress.pending_attempt_numbers, ())
+            self.assertEqual(progress.attempt_receipts[-1]["attempt_number"], number)
+            self.assertEqual(progress.attempt_receipts[-1]["outcome"], "SPLIT_REQUIRED")
+            self.assertEqual(evidence.body_path.read_bytes(), b"partial")
+
+    def test_failure_transactions_recover_every_durable_boundary_without_number(self) -> None:
+        statcast = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        cases = (
+            (statcast, _capture(b"partial", error="SIZE_LIMIT"), "split", "SIZE_LIMIT"),
+            (
+                _query(),
+                dataclasses.replace(
+                    _capture(None, status=None, error="PERMANENT_NETWORK"),
+                    final_url=None,
+                    response_headers=(),
+                ),
+                "bodyless",
+                "PERMANENT_NETWORK",
+            ),
+        )
+        for query, capture, kind, classification in cases:
+            for boundary in ("INTENT", "TRANSACTION", "BODY", "EVIDENCE", "ATTEMPT"):
+                with (
+                    self.subTest(kind=kind, boundary=boundary),
+                    tempfile.TemporaryDirectory() as td,
+                ):
+                    root = _tmp(td) / "raw"
+                    store = V52EvidenceStore(root)
+
+                    original_write = v52_evidence._write_once_at
+                    original_unlink = v52_evidence._unlink_exact_regular_at
+
+                    def interrupt_write(
+                        parent_fd: int,
+                        name: str,
+                        contents: bytes,
+                        label: str,
+                        **kwargs: object,
+                    ) -> None:
+                        if (
+                            boundary == "INTENT"
+                            and label == "failure transaction marker"
+                        ):
+                            raise RuntimeError("interrupted at INTENT")
+                        if (
+                            boundary == "BODY"
+                            and label == "failure evidence receipt"
+                        ) or (
+                            boundary == "EVIDENCE"
+                            and label == "attempt receipt"
+                        ):
+                            raise RuntimeError(f"interrupted at {boundary}")
+                        original_write(
+                            parent_fd, name, contents, label, **kwargs
+                        )
+
+                    def interrupt_unlink(
+                        parent_fd: int,
+                        name: str,
+                        expected: bytes,
+                        label: str,
+                    ) -> None:
+                        if (
+                            boundary == "ATTEMPT"
+                            and label == "failure transaction cleanup marker"
+                        ):
+                            raise RuntimeError("interrupted at ATTEMPT")
+                        original_unlink(parent_fd, name, expected, label)
+
+                    if boundary == "TRANSACTION":
+                        interruption = patch.object(
+                            store,
+                            "_finish_failure_transaction",
+                            side_effect=RuntimeError(
+                                "interrupted at TRANSACTION"
+                            ),
+                        )
+                    elif boundary in {"INTENT", "BODY", "EVIDENCE"}:
+                        interruption = patch(
+                            "mlb_backtest.v52_evidence._write_once_at",
+                            side_effect=interrupt_write,
+                        )
+                    else:
+                        interruption = patch(
+                            "mlb_backtest.v52_evidence._unlink_exact_regular_at",
+                            side_effect=interrupt_unlink,
+                        )
+
+                    with store.acquire_query(query) as lease:
+                        number = store.next_attempt_number(lease)
+                        with (
+                            interruption,
+                            self.assertRaisesRegex(RuntimeError, "interrupted"),
+                        ):
+                            if kind == "split":
+                                store.persist_split_attempt(
+                                    query, number, capture, reason=classification
+                                )
+                            else:
+                                store.quarantine_bodyless_attempt(
+                                    query,
+                                    number,
+                                    capture,
+                                    error_classification=classification,
+                                )
+
+                    restarted = V52EvidenceStore(root)
+                    restarted.read_verified_query_progress(query)
+                    with restarted.acquire_query(query):
+                        recovered = restarted.recover_failure_attempt(query)
+                    if boundary == "ATTEMPT":
+                        self.assertIsNone(recovered)
+                    else:
+                        self.assertIsNotNone(recovered)
+                        self.assertEqual(recovered.attempt_number, 1)
+                    progress = restarted.read_verified_query_progress(query)
+                    self.assertEqual(progress.pending_attempt_numbers, ())
+                    self.assertFalse(
+                        (
+                            root
+                            / "queries"
+                            / query.source
+                            / logical_query_id(query)
+                            / "failure-transaction"
+                        ).exists()
+                    )
+                    self.assertFalse(
+                        (
+                            root
+                            / "queries"
+                            / query.source
+                            / logical_query_id(query)
+                            / "failure-intent"
+                        ).exists()
+                    )
+
+    def test_failure_marker_cannot_self_authenticate_against_external_intent(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query) as lease:
+                with (
+                    patch.object(
+                        store,
+                        "_finish_failure_transaction",
+                        side_effect=RuntimeError("interrupted"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "interrupted"),
+                ):
+                    store.persist_split_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+
+            query_root = root / "queries" / query.source / logical_query_id(query)
+            self.assertTrue((query_root / "failure-intent/intent.json").is_file())
+            marker_path = query_root / "failure-transaction/marker.json"
+            marker = json.loads(marker_path.read_bytes())
+            marker["evidence_receipt"]["error_classification"] = "ROW_CAP"
+            base = {key: marker[key] for key in marker if key != "transaction_id"}
+            marker["transaction_id"] = hashlib.sha256(
+                v52_evidence._canonical_json_bytes(base)
+            ).hexdigest()
+            marker_path.write_bytes(_canonical_file(marker))
+
+            restarted = V52EvidenceStore(root)
+            with restarted.acquire_query(query), self.assertRaisesRegex(
+                (ValueError, RuntimeError), "intent|transaction|marker|binding"
+            ):
+                restarted.recover_failure_attempt(query)
+
+    def test_failure_recovery_rejects_intent_tamper_and_marker_without_intent(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for attack in ("intent", "intent-symlink", "marker-only"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch.object(
+                            store,
+                            "_finish_failure_transaction",
+                            side_effect=RuntimeError("interrupted"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "interrupted"),
+                    ):
+                        store.persist_split_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            _capture(b"partial", error="SIZE_LIMIT"),
+                            reason="SIZE_LIMIT",
+                        )
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                intent_root = query_root / "failure-intent"
+                if attack == "intent":
+                    intent_path = intent_root / "intent.json"
+                    intent = json.loads(intent_path.read_bytes())
+                    intent["exact_reason"] = "ROW_CAP"
+                    intent_path.write_bytes(_canonical_file(intent))
+                elif attack == "intent-symlink":
+                    intent_path = intent_root / "intent.json"
+                    outside = root / "outside-intent.json"
+                    outside.write_bytes(intent_path.read_bytes())
+                    intent_path.unlink()
+                    intent_path.symlink_to(outside)
+                else:
+                    (intent_root / "body.raw").unlink()
+                    (intent_root / "intent.json").unlink()
+                    intent_root.rmdir()
+
+                restarted = V52EvidenceStore(root)
+                with restarted.acquire_query(query), self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "intent|marker|binding|semantic"
+                ):
+                    restarted.recover_failure_attempt(query)
+
+    def test_failure_intent_conflicting_retry_commits_only_original_reason(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                with (
+                    patch.object(
+                        store,
+                        "_finish_failure_transaction",
+                        side_effect=RuntimeError("interrupted"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "interrupted"),
+                ):
+                    store.persist_split_attempt(
+                        query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+
+            restarted = V52EvidenceStore(root)
+            with restarted.acquire_query(query), self.assertRaisesRegex(
+                RuntimeError, "conflicting failure mutation"
+            ):
+                restarted.persist_split_attempt(
+                    query, number, _capture(b"partial", error="ROW_CAP"),
+                    reason="ROW_CAP",
+                )
+            progress = restarted.read_verified_query_progress(query)
+            self.assertEqual(
+                progress.attempt_receipts[-1]["error_classification"],
+                "SIZE_LIMIT",
+            )
+            self.assertFalse(
+                (
+                    root / "queries" / query.source / logical_query_id(query)
+                    / "failure-intent"
+                ).exists()
+            )
+
+    def test_failure_recovery_rejects_last_boundary_root_and_query_swaps(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for generation in ("root", "query"):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch.object(
+                            store,
+                            "_finish_failure_transaction",
+                            side_effect=RuntimeError("interrupted"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "interrupted"),
+                    ):
+                        store.persist_split_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            _capture(b"partial", error="SIZE_LIMIT"),
+                            reason="SIZE_LIMIT",
+                        )
+                query_dir = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                restarted = V52EvidenceStore(root)
+                original = v52_evidence._read_regular_at
+                swapped = False
+
+                def swap_after_marker_read(*args: object, **kwargs: object):
+                    nonlocal swapped
+                    result = original(*args, **kwargs)  # type: ignore[arg-type]
+                    label = args[2] if len(args) > 2 else kwargs.get("label")
+                    if not swapped and label == "failure transaction marker":
+                        swapped = True
+                        target = root if generation == "root" else query_dir
+                        displaced = target.with_name(target.name + "-displaced")
+                        target.rename(displaced)
+                        target.mkdir()
+                    return result
+
+                lease_context = restarted.acquire_query(query)
+                lease_context.__enter__()
+                try:
+                    with (
+                        patch.object(
+                            v52_evidence,
+                            "_read_regular_at",
+                            side_effect=swap_after_marker_read,
+                        ),
+                        self.assertRaisesRegex(
+                            (ValueError, RuntimeError),
+                            "root|query|identity|generation|chain",
+                        ),
+                    ):
+                        restarted.recover_failure_attempt(query)
+                finally:
+                    with contextlib.suppress(ValueError):
+                        lease_context.__exit__(None, None, None)
+                self.assertTrue(swapped)
+                displaced_attempt = (
+                    root.with_name(root.name + "-displaced")
+                    / "queries"
+                    / query.source
+                    / logical_query_id(query)
+                    / "attempts/000001.json"
+                    if generation == "root"
+                    else query_dir.with_name(query_dir.name + "-displaced")
+                    / "attempts/000001.json"
+                )
+                self.assertFalse(displaced_attempt.exists())
+
+    def test_failure_finish_rebinds_immutable_intent_identity(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            original = store._verified_quarantine_bundle
+            swapped = False
+
+            def swap_intent_after_deep_verify(*args: object, **kwargs: object):
+                nonlocal swapped
+                result = original(*args, **kwargs)  # type: ignore[arg-type]
+                if not swapped:
+                    swapped = True
+                    intent = (
+                        root / "queries" / query.source / logical_query_id(query)
+                        / "failure-intent/intent.json"
+                    )
+                    contents = intent.read_bytes()
+                    intent.unlink()
+                    intent.write_bytes(contents)
+                return result
+
+            with store.acquire_query(query) as lease:
+                with (
+                    patch.object(
+                        store,
+                        "_verified_quarantine_bundle",
+                        side_effect=swap_intent_after_deep_verify,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "intent|identity|changed|immutable",
+                    ),
+                ):
+                    store.persist_split_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+            self.assertTrue(swapped)
+
+    def test_generic_attempt_writer_rejects_split_required(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                with self.assertRaisesRegex(ValueError, "dedicated"):
+                    store.record_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(None, status=None, error="TIMEOUT"),
+                        outcome="SPLIT_REQUIRED",
+                    )
+
+    def test_generic_attempt_writer_rejects_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _query()
+            with store.acquire_query(query) as lease:
+                with self.assertRaisesRegex(ValueError, "dedicated"):
+                    store.record_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"invalid"),
+                        outcome="QUARANTINED",
+                    )
+
+    def test_pending_failure_transaction_is_closed_before_every_mutation(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for mutation in (
+            "next", "record", "publish", "quarantine", "bodyless", "split"
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                split_capture = _capture(b"partial", error="SIZE_LIMIT")
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    with (
+                        patch.object(
+                            store,
+                            "_finish_failure_transaction",
+                            side_effect=RuntimeError("interrupted after transaction rename"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "interrupted"),
+                    ):
+                        store.persist_split_attempt(
+                            query, number, split_capture, reason="SIZE_LIMIT"
+                        )
+
+                restarted = V52EvidenceStore(root)
+                with restarted.acquire_query(query) as lease:
+                    if mutation == "next":
+                        with self.assertRaisesRegex(RuntimeError, "recovered"):
+                            restarted.next_attempt_number(lease)
+                    elif mutation == "record":
+                        with self.assertRaisesRegex(RuntimeError, "recovered"):
+                            restarted.record_attempt(
+                                query, number,
+                                _capture(None, status=None, error="TRANSIENT_NETWORK"),
+                                outcome="TRANSIENT_NETWORK",
+                            )
+                    elif mutation == "publish":
+                        with self.assertRaisesRegex(RuntimeError, "recovered"):
+                            restarted.publish_fetched(
+                                query, number, _capture(b'{"dates":[]}'), _sidecar()
+                            )
+                    elif mutation == "quarantine":
+                        with self.assertRaisesRegex(RuntimeError, "recovered"):
+                            restarted.quarantine_attempt(
+                                query, number, _capture(b"invalid"),
+                                error_classification="SEMANTIC_INVALID",
+                            )
+                    elif mutation == "bodyless":
+                        bodyless = dataclasses.replace(
+                            _capture(None, status=None, error="PERMANENT_NETWORK"),
+                            final_url=None,
+                            response_headers=(),
+                        )
+                        with self.assertRaisesRegex(RuntimeError, "recovered"):
+                            restarted.quarantine_bodyless_attempt(
+                                query, number, bodyless,
+                                error_classification="PERMANENT_NETWORK",
+                            )
+                    else:
+                        recovered = restarted.persist_split_attempt(
+                            query, number, split_capture, reason="SIZE_LIMIT"
+                        )
+                        self.assertEqual(recovered.outcome, "SPLIT_REQUIRED")
+
+                progress = restarted.read_verified_query_progress(query)
+                self.assertEqual(
+                    tuple(item["outcome"] for item in progress.attempt_receipts),
+                    ("SPLIT_REQUIRED",),
+                )
+                self.assertEqual(progress.pending_attempt_numbers, ())
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                self.assertFalse((query_root / "failure-transaction").exists())
+                self.assertFalse((query_root / "success.json").exists())
+                self.assertFalse((query_root / "attempts/000002.reservation.json").exists())
+
+    def test_split_partial_body_must_be_nonempty_and_empty_timeout_normalizes(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for reason in ("SIZE_LIMIT", "ROW_CAP"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as td:
+                store = V52EvidenceStore(_tmp(td) / "raw")
+                with store.acquire_query(query) as lease:
+                    with self.assertRaisesRegex(ValueError, "nonempty"):
+                        store.persist_split_attempt(
+                            query, store.next_attempt_number(lease),
+                            _capture(b"", error=reason), reason=reason,
+                        )
+
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            timeout = dataclasses.replace(
+                _capture(b"", status=None, error="TRANSIENT_NETWORK"),
+                final_url=None,
+                response_headers=(),
+                timed_out=True,
+            )
+            with store.acquire_query(query) as lease:
+                evidence = store.persist_split_attempt(
+                    query, store.next_attempt_number(lease), timeout, reason="TIMEOUT"
+                )
+            receipt = json.loads(evidence.evidence_receipt_path.read_bytes())
+            self.assertEqual(receipt["byte_count"], 0)
+            self.assertIsNone(receipt["body_sha256"])
+            self.assertIsNone(receipt["raw_sha256"])
+            self.assertIsNone(evidence.body_path)
+            jsonschema.validate(receipt, json.loads(MANIFEST_SCHEMA.read_bytes()))
+
+    def test_pre_rename_failure_transaction_failures_leave_no_membership(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for failure in ("marker-write", "body-write", "rename", "fsync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                original_write = v52_evidence._write_once_at
+                original_rename = os.rename
+                original_fsync = os.fsync
+                directory_fsyncs = 0
+
+                def fail_write(
+                    parent_fd: int, name: str, contents: bytes, label: str, **kwargs: object
+                ) -> None:
+                    if failure == "marker-write" and label == "failure intent marker":
+                        raise OSError("injected marker write failure")
+                    if failure == "body-write" and label == "failure intent body":
+                        raise OSError("injected body write failure")
+                    original_write(parent_fd, name, contents, label, **kwargs)
+
+                def fail_rename(src: object, dst: object, *args: object, **kwargs: object) -> None:
+                    if failure == "rename" and dst == "failure-intent":
+                        raise OSError("injected rename failure")
+                    original_rename(src, dst, *args, **kwargs)
+
+                def fail_fsync(descriptor: int) -> None:
+                    nonlocal directory_fsyncs
+                    if failure == "fsync" and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                        directory_fsyncs += 1
+                        if directory_fsyncs == 3:
+                            raise OSError("injected fsync failure")
+                    original_fsync(descriptor)
+
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    with (
+                        patch("mlb_backtest.v52_evidence._write_once_at", side_effect=fail_write),
+                        patch("mlb_backtest.v52_evidence.os.rename", side_effect=fail_rename),
+                        patch("mlb_backtest.v52_evidence.os.fsync", side_effect=fail_fsync),
+                        self.assertRaisesRegex(OSError, "injected"),
+                    ):
+                        store.persist_split_attempt(
+                            query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                            reason="SIZE_LIMIT",
+                        )
+
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                self.assertFalse((query_root / "failure-transaction").exists())
+                self.assertEqual(
+                    tuple(path.name for path in query_root.iterdir()
+                          if path.name.startswith(".failure-transaction")),
+                    (),
+                )
+                progress = store.read_verified_query_progress(query)
+                self.assertEqual(progress.pending_attempt_numbers, (1,))
+
+    def test_committed_failure_cleanup_crashes_resume_from_owned_tombstones(
+        self,
+    ) -> None:
+        failure_points = (
+            "after-transaction-claim",
+            "after-transaction-container",
+            "after-transaction-rename",
+            "after-intent-rename",
+            "after-transaction-unlink",
+            "before-transaction-rmdir",
+            "after-intent-unlink",
+            "before-intent-rmdir",
+            "after-intent-claim-unlink",
+            "after-transaction-claim-unlink",
+        )
+        for failure_point in failure_points:
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                capture = dataclasses.replace(
+                    _capture(None, status=None, error="PERMANENT_NETWORK"),
+                    final_url=None,
+                    response_headers=(),
+                )
+                original_rename = v52_evidence._rename_directory_exclusive_at
+                original_claim = v52_evidence._publish_cleanup_claim_at
+                original_mkdir = os.mkdir
+                original_unlink = v52_evidence._unlink_exact_regular_at
+                original_rmdir = os.rmdir
+
+                def crash_after_claim(
+                    parent_fd: int, name: str, contents: bytes
+                ) -> None:
+                    original_claim(parent_fd, name, contents)
+                    if (
+                        failure_point == "after-transaction-claim"
+                        and "claim-transaction" in name
+                    ):
+                        raise OSError("injected cleanup claim crash")
+
+                def crash_after_container(
+                    name: object,
+                    mode: int = 0o777,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    original_mkdir(name, mode, *args, **kwargs)
+                    if (
+                        failure_point == "after-transaction-container"
+                        and isinstance(name, str)
+                        and name.startswith(".failure-cleanup-transaction-")
+                    ):
+                        raise OSError("injected cleanup container crash")
+
+                def crash_after_rename(
+                    src: object, dst: object, *args: object, **kwargs: object
+                ) -> None:
+                    original_rename(src, dst, *args, **kwargs)
+                    if (
+                        failure_point == "after-transaction-rename"
+                        and src == "failure-transaction"
+                        and dst == "payload"
+                    ) or (
+                        failure_point == "after-intent-rename"
+                        and src == "failure-intent"
+                        and dst == "payload"
+                    ):
+                        raise OSError("injected cleanup rename crash")
+
+                def crash_after_unlink(
+                    parent_fd: int,
+                    name: str,
+                    expected: bytes,
+                    label: str,
+                ) -> None:
+                    original_unlink(parent_fd, name, expected, label)
+                    if (
+                        failure_point == "after-transaction-unlink"
+                        and label == "failure transaction cleanup marker"
+                    ) or (
+                        failure_point == "after-intent-unlink"
+                        and label == "failure intent cleanup marker"
+                    ) or (
+                        failure_point == "after-intent-claim-unlink"
+                        and label == "failure intent cleanup claim"
+                    ) or (
+                        failure_point == "after-transaction-claim-unlink"
+                        and label == "failure transaction cleanup claim"
+                    ):
+                        raise OSError("injected cleanup unlink crash")
+
+                def crash_before_rmdir(
+                    name: object, *args: object, **kwargs: object
+                ) -> None:
+                    if (
+                        failure_point == "before-transaction-rmdir"
+                        and isinstance(name, str)
+                        and name.startswith(".failure-cleanup-transaction-")
+                    ) or (
+                        failure_point == "before-intent-rmdir"
+                        and isinstance(name, str)
+                        and name.startswith(".failure-cleanup-intent-")
+                    ):
+                        raise OSError("injected cleanup rmdir crash")
+                    original_rmdir(name, *args, **kwargs)
+
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch(
+                            "mlb_backtest.v52_evidence._publish_cleanup_claim_at",
+                            side_effect=crash_after_claim,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence.os.mkdir",
+                            side_effect=crash_after_container,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence._rename_directory_exclusive_at",
+                            side_effect=crash_after_rename,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence._unlink_exact_regular_at",
+                            side_effect=crash_after_unlink,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence.os.rmdir",
+                            side_effect=crash_before_rmdir,
+                        ),
+                        self.assertRaisesRegex(OSError, "injected cleanup"),
+                    ):
+                        store.quarantine_bodyless_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            capture,
+                            error_classification="PERMANENT_NETWORK",
+                        )
+
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                if failure_point == "after-intent-claim-unlink":
+                    claim_names = {
+                        path.name
+                        for path in query_root.iterdir()
+                        if "failure-cleanup-claim" in path.name
+                    }
+                    self.assertTrue(
+                        any("claim-transaction" in name for name in claim_names)
+                    )
+                    self.assertFalse(
+                        any("claim-intent" in name for name in claim_names)
+                    )
+                restarted = V52EvidenceStore(root)
+                progress = restarted.read_verified_query_progress(query)
+                self.assertEqual(progress.status, "QUARANTINED")
+                self.assertEqual(progress.pending_attempt_numbers, ())
+                self.assertEqual(
+                    tuple(record["outcome"] for record in progress.attempt_receipts),
+                    ("QUARANTINED",),
+                )
+                self.assertEqual(
+                    tuple(
+                        name
+                        for name in os.listdir(query_root)
+                        if name.startswith(".failure-cleanup-")
+                    ),
+                    (),
+                )
+
+    def test_failure_cleanup_tombstones_reject_forgery_symlink_and_conflict(
+        self,
+    ) -> None:
+        for attack in ("forgery", "claim-forgery", "symlink", "conflict"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                capture = dataclasses.replace(
+                    _capture(None, status=None, error="PERMANENT_NETWORK"),
+                    final_url=None,
+                    response_headers=(),
+                )
+                original_rename = v52_evidence._rename_directory_exclusive_at
+
+                def interrupt_after_transaction_rename(
+                    src: object, dst: object, *args: object, **kwargs: object
+                ) -> None:
+                    original_rename(src, dst, *args, **kwargs)
+                    if src == "failure-transaction" and dst == "payload":
+                        raise OSError("interrupted after transaction tombstone")
+
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch(
+                            "mlb_backtest.v52_evidence._rename_directory_exclusive_at",
+                            side_effect=interrupt_after_transaction_rename,
+                        ),
+                        self.assertRaisesRegex(OSError, "transaction tombstone"),
+                    ):
+                        store.quarantine_bodyless_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            capture,
+                            error_classification="PERMANENT_NETWORK",
+                        )
+
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                transaction_tombstone = next(
+                    path
+                    for path in query_root.iterdir()
+                    if path.name.startswith(".failure-cleanup-transaction-")
+                    and path.is_dir()
+                )
+                victim = _tmp(td) / "victim"
+                victim.mkdir()
+                (victim / "not-owned").write_bytes(b"preserve")
+                if attack == "forgery":
+                    forged = query_root / (
+                        ".failure-cleanup-intent-000001-" + "0" * 64
+                    )
+                    forged.mkdir()
+                    (forged / "not-owned").write_bytes(b"foreign")
+                elif attack == "claim-forgery":
+                    forged_claim = query_root / (
+                        ".failure-cleanup-claim-transaction-000001-"
+                        + "0" * 32
+                        + ".json"
+                    )
+                    forged_claim.write_bytes(b"{}\n")
+                elif attack == "symlink":
+                    shutil.rmtree(transaction_tombstone)
+                    transaction_tombstone.symlink_to(
+                        victim, target_is_directory=True
+                    )
+                else:
+                    conflicting = query_root / (
+                        ".failure-cleanup-transaction-000001-" + "0" * 64
+                    )
+                    conflicting.mkdir()
+
+                with self.assertRaises((ValueError, RuntimeError, OSError)):
+                    V52EvidenceStore(root).read_verified_query_progress(query)
+                self.assertEqual((victim / "not-owned").read_bytes(), b"preserve")
+                if attack == "forgery":
+                    self.assertEqual((forged / "not-owned").read_bytes(), b"foreign")
+                elif attack == "claim-forgery":
+                    self.assertEqual(forged_claim.read_bytes(), b"{}\n")
+                elif attack == "symlink":
+                    self.assertTrue(transaction_tombstone.is_symlink())
+                else:
+                    self.assertTrue(conflicting.is_dir())
+
+    def test_failure_cleanup_container_claim_is_exclusive_and_payload_rename_never_replaces(
+        self,
+    ) -> None:
+        for attack in ("old-exact-name", "nonce-collision", "payload-race"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                query_id = store.register_query(query)
+                query_root = root / "queries" / query.source / query_id
+                capture = dataclasses.replace(
+                    _capture(None, status=None, error="PERMANENT_NETWORK"),
+                    final_url=None,
+                    response_headers=(),
+                )
+                original_name = v52_evidence._failure_cleanup_tombstone_name
+                original_mkdir = os.mkdir
+                original_rename = v52_evidence._rename_directory_exclusive_at
+                planted: Path | None = None
+                planted_identity: tuple[int, int] | None = None
+
+                def plant_old_exact_name(
+                    kind: str,
+                    attempt_number: int,
+                    marker_contents: bytes,
+                    **kwargs: object,
+                ) -> str:
+                    nonlocal planted
+                    name = original_name(
+                        kind, attempt_number, marker_contents, **kwargs
+                    )
+                    if attack == "old-exact-name" and kind == "transaction":
+                        planted = query_root / name
+                        planted.mkdir()
+                    return name
+
+                def collide_container(
+                    name: object,
+                    mode: int = 0o777,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal planted
+                    if (
+                        attack == "nonce-collision"
+                        and isinstance(name, str)
+                        and name.startswith(".failure-cleanup-")
+                    ):
+                        original_mkdir(name, mode, *args, **kwargs)
+                        planted = query_root / name
+                        (planted / "foreign").write_bytes(b"preserve")
+                    original_mkdir(name, mode, *args, **kwargs)
+
+                def race_payload(
+                    src: object, dst: object, *args: object, **kwargs: object
+                ) -> None:
+                    nonlocal planted, planted_identity
+                    if attack == "payload-race" and dst == "payload":
+                        container_fd = kwargs["dst_dir_fd"]
+                        original_mkdir("payload", 0o700, dir_fd=container_fd)
+                        planted = next(
+                            path
+                            for path in query_root.iterdir()
+                            if path.name.startswith(".failure-cleanup-")
+                            and path.is_dir()
+                        ) / "payload"
+                        metadata = planted.lstat()
+                        planted_identity = (metadata.st_dev, metadata.st_ino)
+                    original_rename(src, dst, *args, **kwargs)
+
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch(
+                            "mlb_backtest.v52_evidence._failure_cleanup_tombstone_name",
+                            side_effect=plant_old_exact_name,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence.os.mkdir",
+                            side_effect=collide_container,
+                        ),
+                        patch(
+                            "mlb_backtest.v52_evidence._rename_directory_exclusive_at",
+                            side_effect=race_payload,
+                        ),
+                        self.assertRaises((FileExistsError, ValueError, RuntimeError)),
+                    ):
+                        store.quarantine_bodyless_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            capture,
+                            error_classification="PERMANENT_NETWORK",
+                        )
+
+                self.assertIsNotNone(planted)
+                assert planted is not None
+                self.assertTrue(planted.exists())
+                if attack == "nonce-collision":
+                    self.assertEqual((planted / "foreign").read_bytes(), b"preserve")
+                elif attack == "payload-race":
+                    metadata = planted.lstat()
+                    self.assertEqual(
+                        (metadata.st_dev, metadata.st_ino), planted_identity
+                    )
+
+    def test_failure_cleanup_recovery_errors_close_provisional_descriptors(
+        self,
+    ) -> None:
+        descriptor_directory = Path("/dev/fd")
+        if not descriptor_directory.is_dir():
+            self.skipTest("descriptor inventory is unavailable")
+        query = _query()
+        capture = dataclasses.replace(
+            _capture(None, status=None, error="PERMANENT_NETWORK"),
+            final_url=None,
+            response_headers=(),
+        )
+        for failure in ("rename", "list", "rebind"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                original_rename = v52_evidence._rename_directory_exclusive_at
+
+                def interrupt_after_transaction_claim(
+                    source: str,
+                    destination: str,
+                    **kwargs: int,
+                ) -> None:
+                    original_rename(
+                        source,
+                        destination,
+                        **kwargs,
+                    )
+                    if source == "failure-transaction" and destination == "payload":
+                        raise OSError("leave claimed transaction tombstone")
+
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch.object(
+                            v52_evidence,
+                            "_rename_directory_exclusive_at",
+                            side_effect=interrupt_after_transaction_claim,
+                        ),
+                        self.assertRaisesRegex(OSError, "claimed transaction"),
+                    ):
+                        store.quarantine_bodyless_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            capture,
+                            error_classification="PERMANENT_NETWORK",
+                        )
+
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                tombstone = next(
+                    path
+                    for path in query_root.iterdir()
+                    if path.name.startswith(".failure-cleanup-transaction-")
+                    and path.is_dir()
+                )
+                (tombstone / "payload").rename(
+                    query_root / "failure-transaction"
+                )
+                tombstone_metadata = tombstone.lstat()
+                tombstone_identity = (
+                    tombstone_metadata.st_dev,
+                    tombstone_metadata.st_ino,
+                )
+                original_listdir = os.listdir
+                original_rebind = v52_evidence._rebind_directory_at
+
+                def fail_listdir(path: object):
+                    if isinstance(path, int):
+                        metadata = os.fstat(path)
+                        if (metadata.st_dev, metadata.st_ino) == tombstone_identity:
+                            raise OSError("injected tombstone list failure")
+                    return original_listdir(path)  # type: ignore[arg-type]
+
+                def fail_rename(
+                    source: str,
+                    destination: str,
+                    **kwargs: int,
+                ) -> None:
+                    if source == "failure-transaction" and destination == "payload":
+                        raise OSError("injected payload rename failure")
+                    original_rename(source, destination, **kwargs)
+
+                def fail_rebind(*args: object, **kwargs: object) -> None:
+                    label = args[3] if len(args) > 3 else kwargs.get("label")
+                    if label == "failure transaction cleanup payload":
+                        raise ValueError("injected payload rebind failure")
+                    original_rebind(*args, **kwargs)  # type: ignore[arg-type]
+
+                injected = {
+                    "rename": patch.object(
+                        v52_evidence,
+                        "_rename_directory_exclusive_at",
+                        side_effect=fail_rename,
+                    ),
+                    "list": patch.object(
+                        v52_evidence.os, "listdir", side_effect=fail_listdir
+                    ),
+                    "rebind": patch.object(
+                        v52_evidence,
+                        "_rebind_directory_at",
+                        side_effect=fail_rebind,
+                    ),
+                }[failure]
+                before = len(original_listdir(descriptor_directory))
+                with injected, self.assertRaises((OSError, ValueError, RuntimeError)):
+                    V52EvidenceStore(root).read_verified_query_progress(query)
+                after = len(original_listdir(descriptor_directory))
+                self.assertEqual(after, before)
+
+    def test_failure_transaction_rejects_tampered_staged_body(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query) as lease:
+                with (
+                    patch.object(
+                        store,
+                        "_finish_failure_transaction",
+                        side_effect=RuntimeError("interrupted"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "interrupted"),
+                ):
+                    store.persist_split_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+            transaction = (
+                root / "queries" / query.source / logical_query_id(query)
+                / "failure-intent" / "body.raw"
+            )
+            transaction.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "intent body|hash|byte"):
+                store.read_verified_query_progress(query)
+            with store.acquire_query(query), self.assertRaisesRegex(
+                ValueError, "intent body|hash|byte"
+            ):
+                store.recover_failure_attempt(query)
+
+    def test_failure_body_publication_never_replaces_a_racing_destination(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        body = b"authenticated-partial"
+        body_name = f"{hashlib.sha256(body).hexdigest()}.raw"
+        for race in ("identical", "foreign", "symlink"):
+            with self.subTest(race=race), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                original_read = v52_evidence._read_regular_snapshot_at
+                planted_identity: tuple[int, int] | None = None
+                planted = False
+                outside = root / "outside-body"
+                outside.parent.mkdir(parents=True, exist_ok=True)
+                outside.write_bytes(b"outside-preserved")
+
+                def plant_after_missing_read(
+                    parent_fd: int,
+                    name: str,
+                    label: str,
+                    *,
+                    missing_ok: bool = False,
+                ):
+                    nonlocal planted, planted_identity
+                    snapshot = original_read(
+                        parent_fd, name, label, missing_ok=missing_ok
+                    )
+                    if (
+                        not planted
+                        and snapshot is None
+                        and missing_ok
+                        and label == "persisted failure response body"
+                    ):
+                        planted = True
+                        if race == "symlink":
+                            os.symlink(outside, name, dir_fd=parent_fd)
+                        else:
+                            descriptor = os.open(
+                                name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                0o600,
+                                dir_fd=parent_fd,
+                            )
+                            try:
+                                os.write(
+                                    descriptor,
+                                    body if race == "identical" else b"foreign",
+                                )
+                            finally:
+                                os.close(descriptor)
+                        metadata = os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                        planted_identity = (metadata.st_dev, metadata.st_ino)
+                    return snapshot
+
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    publication = contextlib.nullcontext()
+                    if race != "identical":
+                        publication = self.assertRaises(
+                            (ValueError, RuntimeError, OSError)
+                        )
+                    with (
+                        patch.object(
+                            v52_evidence,
+                            "_read_regular_snapshot_at",
+                            side_effect=plant_after_missing_read,
+                        ),
+                        publication,
+                    ):
+                        store.persist_split_attempt(
+                            query,
+                            number,
+                            _capture(body, error="SIZE_LIMIT"),
+                            reason="SIZE_LIMIT",
+                        )
+
+                self.assertTrue(planted)
+                final_body = (
+                    root / "quarantine" / query.source
+                    / logical_query_id(query) / body_name
+                )
+                metadata = final_body.lstat()
+                self.assertEqual(
+                    (metadata.st_dev, metadata.st_ino), planted_identity
+                )
+                if race == "identical":
+                    self.assertEqual(final_body.read_bytes(), body)
+                elif race == "foreign":
+                    self.assertEqual(final_body.read_bytes(), b"foreign")
+                else:
+                    self.assertTrue(final_body.is_symlink())
+                    self.assertEqual(outside.read_bytes(), b"outside-preserved")
+
+    def test_failure_body_link_intermediate_recovers_only_exact_owned_pair(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        body = b"authenticated-partial"
+        body_name = f"{hashlib.sha256(body).hexdigest()}.raw"
+        for attack in (None, "different-inode", "extra-link", "symlink", "wrong-bytes"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                final_body = (
+                    root / "quarantine" / query.source
+                    / logical_query_id(query) / body_name
+                )
+                original_unlink = os.unlink
+                interrupted = False
+
+                def interrupt_before_source_unlink(
+                    name: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal interrupted
+                    if (
+                        not interrupted
+                        and name == "body.raw"
+                        and final_body.exists()
+                    ):
+                        interrupted = True
+                        source_metadata = os.stat(
+                            name,
+                            dir_fd=kwargs.get("dir_fd"),
+                            follow_symlinks=False,
+                        )
+                        destination_metadata = final_body.lstat()
+                        self.assertEqual(source_metadata.st_nlink, 2)
+                        self.assertEqual(
+                            (source_metadata.st_dev, source_metadata.st_ino),
+                            (destination_metadata.st_dev, destination_metadata.st_ino),
+                        )
+                        raise OSError("interrupted after destination link")
+                    original_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
+
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch.object(
+                            v52_evidence.os,
+                            "unlink",
+                            side_effect=interrupt_before_source_unlink,
+                        ),
+                        self.assertRaisesRegex(OSError, "destination link"),
+                    ):
+                        store.persist_split_attempt(
+                            query,
+                            store.next_attempt_number(lease),
+                            _capture(body, error="SIZE_LIMIT"),
+                            reason="SIZE_LIMIT",
+                        )
+                self.assertTrue(interrupted)
+                staged_body = query_root / "failure-intent/body.raw"
+                self.assertEqual(staged_body.stat().st_nlink, 2)
+                self.assertEqual(final_body.stat().st_nlink, 2)
+
+                extra = root / "not-owned-extra-link"
+                outside = root / "outside-body"
+                if attack == "different-inode":
+                    final_body.unlink()
+                    os.link(staged_body, extra)
+                    final_body.write_bytes(body)
+                elif attack == "extra-link":
+                    os.link(staged_body, extra)
+                elif attack == "symlink":
+                    final_body.unlink()
+                    os.link(staged_body, extra)
+                    outside.write_bytes(body)
+                    final_body.symlink_to(outside)
+                elif attack == "wrong-bytes":
+                    final_body.write_bytes(b"tampered")
+
+                restarted = V52EvidenceStore(root)
+                if attack is None:
+                    progress = restarted.read_verified_query_progress(query)
+                    self.assertEqual(progress.pending_attempt_numbers, (1,))
+                    with restarted.acquire_query(query):
+                        recovered = restarted.recover_failure_attempt(query)
+                    self.assertIsNotNone(recovered)
+                    assert recovered is not None
+                    self.assertEqual(recovered.outcome, "SPLIT_REQUIRED")
+                    self.assertEqual(final_body.read_bytes(), body)
+                    self.assertEqual(final_body.stat().st_nlink, 1)
+                    self.assertFalse(staged_body.exists())
+                else:
+                    with self.assertRaises((ValueError, RuntimeError, OSError)):
+                        restarted.read_verified_query_progress(query)
+                    with restarted.acquire_query(query), self.assertRaises(
+                        (ValueError, RuntimeError, OSError)
+                    ):
+                        restarted.recover_failure_attempt(query)
+                    if attack == "wrong-bytes":
+                        self.assertEqual(final_body.read_bytes(), b"tampered")
+                    elif attack == "symlink":
+                        self.assertTrue(final_body.is_symlink())
+                    else:
+                        self.assertTrue(final_body.exists())
+
+    def test_partial_transaction_requires_its_staged_body_until_atomic_move(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for mutation in ("missing", "symlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    with (
+                        patch.object(
+                            store,
+                            "_finish_failure_transaction",
+                            side_effect=RuntimeError("interrupted"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "interrupted"),
+                    ):
+                        store.persist_split_attempt(
+                            query, store.next_attempt_number(lease),
+                            _capture(b"partial", error="SIZE_LIMIT"), reason="SIZE_LIMIT"
+                        )
+                body = root / "queries" / query.source / logical_query_id(query) / "failure-intent/body.raw"
+                body.unlink()
+                if mutation == "symlink":
+                    body.symlink_to(root / "outside")
+                with self.assertRaisesRegex((ValueError, RuntimeError), "intent body|missing|regular"):
+                    store.read_verified_query_progress(query)
+                with store.acquire_query(query), self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "intent body|missing|regular"
+                ):
+                    store.recover_failure_attempt(query)
+
+    def test_preexisting_failure_transaction_temp_directory_is_never_adopted(
+        self,
+    ) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            original_mkdir = os.mkdir
+            collision: Path | None = None
+
+            def collide_with_temporary(
+                name: str | bytes,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                nonlocal collision
+                if (
+                    isinstance(name, str)
+                    and name.startswith(".failure-transaction.")
+                    and dir_fd is not None
+                ):
+                    original_mkdir(name, mode, dir_fd=dir_fd)
+                    descriptor = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd
+                    )
+                    try:
+                        rogue_descriptor = os.open(
+                            "not-owned",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=descriptor,
+                        )
+                        try:
+                            os.write(rogue_descriptor, b"foreign")
+                        finally:
+                            os.close(rogue_descriptor)
+                    finally:
+                        os.close(descriptor)
+                    query_root = (
+                        root
+                        / "queries"
+                        / query.source
+                        / logical_query_id(query)
+                    )
+                    collision = query_root / name
+                    raise FileExistsError("injected temporary collision")
+                original_mkdir(name, mode, dir_fd=dir_fd)
+
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                with (
+                    patch(
+                        "mlb_backtest.v52_evidence.os.mkdir",
+                        side_effect=collide_with_temporary,
+                    ),
+                    self.assertRaisesRegex(FileExistsError, "collision"),
+                ):
+                    store.persist_split_attempt(
+                        query,
+                        number,
+                        _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+
+            self.assertIsNotNone(collision)
+            assert collision is not None
+            self.assertEqual(
+                (collision / "not-owned").read_bytes(), b"foreign"
+            )
+            self.assertFalse((query_root / "failure-transaction").exists())
+            self.assertTrue(
+                (query_root / "attempts/000001.reservation.json").is_file()
+            )
+
+    def test_pending_failure_transaction_blocks_legacy_success_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            capture = dataclasses.replace(
+                _capture(None, status=None, error="PERMANENT_NETWORK"),
+                final_url=None,
+                response_headers=(),
+            )
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                with (
+                    patch.object(
+                        store,
+                        "_finish_failure_transaction",
+                        side_effect=RuntimeError("interrupted"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "interrupted"),
+                ):
+                    store.quarantine_bodyless_attempt(
+                        query,
+                        number,
+                        capture,
+                        error_classification="PERMANENT_NETWORK",
+                    )
+
+            restarted = V52EvidenceStore(store.root)
+            with restarted.acquire_query(query), self.assertRaisesRegex(
+                RuntimeError, "pending failure transaction recovered"
+            ):
+                restarted.publish_legacy_reference(
+                    query, reference, _sidecar()
+                )
+            progress = restarted.read_verified_query_progress(query)
+            self.assertEqual(progress.status, "QUARANTINED")
+            self.assertEqual(progress.pending_attempt_numbers, ())
+            self.assertFalse(
+                (
+                    store.root
+                    / "queries"
+                    / query.source
+                    / logical_query_id(query)
+                    / "success.json"
+                ).exists()
+            )
+
+    def test_verified_split_read_never_reopens_paths_after_locked_snapshots(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                expected = store.persist_split_attempt(
+                    query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                    reason="SIZE_LIMIT",
+                )
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("path reopen")):
+                self.assertEqual(store.read_verified_split_attempt(query, number), expected)
+
+    def test_verified_split_read_final_snapshots_follow_all_chain_checks(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for attack in ("attempt", "evidence", "body", "query"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    expected = store.persist_split_attempt(
+                        query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+                query_root = root / "queries" / query.source / logical_query_id(query)
+                receipt = json.loads(expected.evidence_receipt_path.read_bytes())
+                targets = {
+                    "attempt": expected.attempt_receipt_path,
+                    "evidence": expected.evidence_receipt_path,
+                    "body": root / receipt["quarantined_body_path"],
+                    "query": query_root / "query.json",
+                }
+                target = targets[attack]
+                original_contents = target.read_bytes()
+                original_chain = store._verify_query_chain
+                attacked = False
+
+                def chain_then_replace(*args: object, **kwargs: object) -> None:
+                    nonlocal attacked
+                    original_chain(*args, **kwargs)
+                    if not attacked:
+                        attacked = True
+                        replacement = query_root / f".replace-{attack}"
+                        replacement.write_bytes(original_contents)
+                        os.replace(replacement, target)
+
+                with (
+                    patch.object(store, "_verify_query_chain", side_effect=chain_then_replace),
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    store.read_verified_split_attempt(query, number)
+
+    def test_verified_split_read_rejects_last_boundary_generation_swaps(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for generation in ("root", "query", "quarantine"):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    store.persist_split_attempt(
+                        query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+                query_id = logical_query_id(query)
+                query_dir = root / "queries" / query.source / query_id
+                quarantine_dir = root / "quarantine" / query.source / query_id
+                original = v52_evidence._rebind_regular_snapshot_at
+                swapped = False
+
+                def swap_after_last_rebind(*args: object, **kwargs: object):
+                    nonlocal swapped
+                    result = original(*args, **kwargs)  # type: ignore[arg-type]
+                    label = args[3] if len(args) > 3 else kwargs.get("label")
+                    if not swapped and label == "split evidence receipt":
+                        swapped = True
+                        target = {"root": root, "query": query_dir,
+                                  "quarantine": quarantine_dir}[generation]
+                        displaced = target.with_name(target.name + "-displaced")
+                        target.rename(displaced)
+                        target.mkdir()
+                    return result
+
+                with (
+                    patch.object(
+                        v52_evidence, "_rebind_regular_snapshot_at",
+                        side_effect=swap_after_last_rebind,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "root|query|quarantine|chain|identity|generation",
+                    ),
+                ):
+                    store.read_verified_split_attempt(query, number)
+                self.assertTrue(swapped)
+
+    def test_verified_split_read_rebinds_registration_at_last_boundary(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for attack in ("changed", "symlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    store.persist_split_attempt(
+                        query, number, _capture(b"partial", error="SIZE_LIMIT"),
+                        reason="SIZE_LIMIT",
+                    )
+                query_file = (
+                    root / "queries" / query.source / logical_query_id(query)
+                    / "query.json"
+                )
+                original = v52_evidence._rebind_regular_snapshot_at
+                attacked = False
+
+                def attack_after_last_evidence_rebind(
+                    *args: object, **kwargs: object
+                ) -> None:
+                    nonlocal attacked
+                    original(*args, **kwargs)  # type: ignore[arg-type]
+                    label = args[3] if len(args) > 3 else kwargs.get("label")
+                    if not attacked and label == "split evidence receipt":
+                        attacked = True
+                        if attack == "changed":
+                            registration = json.loads(query_file.read_bytes())
+                            registration["parser_version"] = "tampered"
+                            query_file.write_bytes(_canonical_file(registration))
+                        else:
+                            outside = root / "outside-query.json"
+                            outside.write_bytes(query_file.read_bytes())
+                            query_file.unlink()
+                            query_file.symlink_to(outside)
+
+                with (
+                    patch.object(
+                        v52_evidence,
+                        "_rebind_regular_snapshot_at",
+                        side_effect=attack_after_last_evidence_rebind,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "logical query|registration|regular|identity|changed",
+                    ),
+                ):
+                    store.read_verified_split_attempt(query, number)
+                self.assertTrue(attacked)
+
+    def test_bodyless_timeout_split_requires_transport_timeout_capture(self) -> None:
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        invalid = (
+            dataclasses.replace(_capture(None, status=None, error="TRANSIENT_NETWORK"), final_url=None, response_headers=()),
+            dataclasses.replace(_capture(None, status=None, error="PERMANENT_NETWORK"), final_url=None, response_headers=()),
+            _capture(b"partial", error="TRANSIENT_NETWORK"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                for capture in invalid:
+                    with self.subTest(capture=capture), self.assertRaisesRegex(
+                        ValueError, "timed_out|timeout"
+                    ):
+                        store.persist_split_attempt(query, number, capture, reason="TIMEOUT")
+
+    def test_fetch_partial_timeout_persists_once_as_timeout_split(self) -> None:
+        from mlb_backtest.v52_http import fetch_attempt
+
+        query = dataclasses.replace(
+            _query(), source="baseball_savant_statcast", grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+
+        class PartialTimeoutResponse:
+            status = 200
+            headers = {"Content-Type": "text/csv", "ETag": '"partial"'}
+
+            def __init__(self) -> None:
+                self.read_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def getcode(self) -> int:
+                return self.status
+
+            def geturl(self) -> str:
+                return query.endpoint
+
+            def read(self, _size: int = -1) -> bytes:
+                self.read_count += 1
+                if self.read_count == 1:
+                    return b"authenticated-partial"
+                raise socket.timeout("late response body")
+
+        clock_values = iter(
+            (
+                datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 14, 12, 1, tzinfo=timezone.utc),
+            )
+        )
+        capture = fetch_attempt(
+            query,
+            timeout=90,
+            max_bytes=1024,
+            opener=lambda *_args, **_kwargs: PartialTimeoutResponse(),
+            clock=lambda: next(clock_values),
+        )
+        self.assertTrue(capture.timed_out)
+        self.assertEqual(capture.error_classification, "TRANSIENT_NETWORK")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query) as lease:
+                persisted = store.persist_split_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    reason="TIMEOUT",
+                )
+            progress = store.read_verified_query_progress(query)
+
+            self.assertEqual(persisted.outcome, "SPLIT_REQUIRED")
+            self.assertEqual(persisted.error_classification, "TIMEOUT")
+            self.assertEqual(persisted.body_path.read_bytes(), capture.body)
+            self.assertEqual(
+                list(persisted.body_path.parent.glob("*.raw")),
+                [persisted.body_path],
+            )
+            self.assertEqual(progress.attempt_receipts[-1]["outcome"], "SPLIT_REQUIRED")
+            self.assertEqual(progress.attempt_receipts[-1]["error_classification"], "TIMEOUT")
+
+    def test_split_writer_body_requirements_and_authoritative_read(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            bodyless = dataclasses.replace(
+                _capture(None, status=None, error="TRANSIENT_NETWORK"),
+                final_url=None,
+                response_headers=(),
+                timed_out=True,
+            )
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                for reason in ("SIZE_LIMIT", "ROW_CAP"):
+                    with self.subTest(reason=reason), self.assertRaisesRegex(
+                        ValueError, "body|bytes"
+                    ):
+                        store.persist_split_attempt(
+                            query,
+                            number,
+                            bodyless,
+                            reason=reason,
+                        )
+                written = store.persist_split_attempt(
+                    query, number, bodyless, reason="TIMEOUT"
+                )
+            verified = store.read_verified_split_attempt(query, number)
+            self.assertEqual(verified, written)
+            self.assertIsNone(verified.body_path)
+            self.assertIsNone(verified.body_sha256)
+            self.assertEqual(verified.byte_count, 0)
+
     def test_quarantine_requires_a_reservation_before_writing_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = _tmp(td) / "raw"
@@ -2771,11 +4915,20 @@ class V52EvidenceTest(unittest.TestCase):
             def corrupt_payload() -> None:
                 payload_path.write_bytes(original_payload + b"corrupt")
 
+            original_rebind = store._rebind_legacy_lineage
+
+            def corrupt_payload_then_rebind(
+                *args: object, **kwargs: object
+            ) -> None:
+                corrupt_payload()
+                original_rebind(*args, **kwargs)  # type: ignore[arg-type]
+
             with store.acquire_query(query):
                 with (
-                    patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
-                        side_effect=corrupt_payload,
+                    patch.object(
+                        store,
+                        "_rebind_legacy_lineage",
+                        side_effect=corrupt_payload_then_rebind,
                     ),
                     self.assertRaisesRegex(
                         (ValueError, RuntimeError),
@@ -2918,8 +5071,9 @@ class V52EvidenceTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected interruption"):
                 with store.acquire_query(query) as lease:
                     number = store.next_attempt_number(lease)
-                    with patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
+                    with patch.object(
+                        store,
+                        "_verify_query_chain",
                         side_effect=RuntimeError("injected interruption"),
                     ):
                         store.publish_fetched(query, number, _capture(), _sidecar())
@@ -2945,8 +5099,9 @@ class V52EvidenceTest(unittest.TestCase):
             first_capture = _capture(b"orphan-a")
             with self.assertRaisesRegex(RuntimeError, "injected interruption"):
                 with store.acquire_query(query) as lease:
-                    with patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
+                    with patch.object(
+                        store,
+                        "_verify_query_chain",
                         side_effect=RuntimeError("injected interruption"),
                     ):
                         store.publish_fetched(
@@ -3122,19 +5277,24 @@ class V52EvidenceTest(unittest.TestCase):
             query_id = logical_query_id(query)
             folder = root / "queries" / query.source / query_id
             moved = folder.with_name(f"{query_id}.moved")
+            original_verify = store._verify_query_chain
 
-            def replace_query_directory() -> None:
+            def replace_query_directory_then_verify(
+                *args: object, **kwargs: object
+            ) -> None:
                 folder.rename(moved)
                 folder.mkdir()
+                original_verify(*args, **kwargs)  # type: ignore[arg-type]
 
             with self.assertRaisesRegex(
                 (ValueError, RuntimeError), "query|identity|binding"
             ):
                 with store.acquire_query(query) as lease:
                     number = store.next_attempt_number(lease)
-                    with patch(
-                        "mlb_backtest.v52_evidence._before_success_publish",
-                        side_effect=replace_query_directory,
+                    with patch.object(
+                        store,
+                        "_verify_query_chain",
+                        side_effect=replace_query_directory_then_verify,
                     ):
                         store.publish_fetched(query, number, _capture(), _sidecar())
             self.assertFalse((moved / "success.json").exists())

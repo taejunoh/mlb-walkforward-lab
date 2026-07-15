@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import dataclasses
 import unittest
 from datetime import datetime, timezone
 from email.message import Message
@@ -94,11 +95,85 @@ class V52HttpTest(unittest.TestCase):
         return lambda: next(values)
 
     def test_retry_policy_and_transient_http_contract_are_frozen(self):
-        from mlb_backtest.v52_http import RetryPolicy, TRANSIENT_HTTP
+        import json
+        from pathlib import Path
+
+        from mlb_backtest.v52_http import RetryPolicy, TRANSIENT_HTTP, fetch_limits
 
         self.assertEqual(TRANSIENT_HTTP, frozenset({429, 500, 502, 503, 504}))
         self.assertEqual(RetryPolicy().base_delays, (1, 2, 4, 8, 16))
         self.assertEqual(RetryPolicy().jitter_fraction, 0.25)
+        self.assertEqual(RetryPolicy().timeout, 90.0)
+        contract = json.loads(
+            (Path(__file__).resolve().parents[1]
+             / "protocols/v5_2_qd/historical_source_acquisition.json").read_bytes()
+        )
+        self.assertEqual(RetryPolicy().timeout, contract["request_timeout_seconds"])
+        self.assertEqual(
+            RetryPolicy.from_acquisition_contract(contract), RetryPolicy()
+        )
+        self.assertEqual(fetch_limits(_query()).timeout, 90.0)
+        self.assertEqual(fetch_limits(_query()).max_bytes, 134_217_728)
+        for invalid in ({}, {"request_timeout_seconds": True},
+                        {"request_timeout_seconds": 91}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "request timeout"
+            ):
+                RetryPolicy.from_acquisition_contract(invalid)
+
+    def test_retry_policy_rejects_invalid_request_timeouts(self):
+        from mlb_backtest.v52_http import FetchLimits, RetryPolicy
+
+        self.assertTrue(FetchLimits.__dataclass_params__.frozen)
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(FetchLimits)),
+            ("timeout", "max_bytes"),
+        )
+        for timeout in (0, -1, float("inf"), float("nan"), True, "90"):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(
+                ValueError, "timeout"
+            ):
+                RetryPolicy(timeout=timeout)  # type: ignore[arg-type]
+
+    def test_timeout_is_identified_without_changing_transient_classification(self):
+        from mlb_backtest.v52_http import fetch_attempt
+
+        timeout = fetch_attempt(
+            _query(), timeout=5, max_bytes=100,
+            opener=mock.Mock(side_effect=URLError(socket.timeout("late"))),
+            clock=self._clock(),
+        )
+        disconnected = fetch_attempt(
+            _query(), timeout=5, max_bytes=100,
+            opener=mock.Mock(side_effect=URLError(ConnectionResetError("reset"))),
+            clock=self._clock(),
+        )
+
+        self.assertEqual(timeout.error_classification, "TRANSIENT_NETWORK")
+        self.assertTrue(timeout.timed_out)
+        self.assertEqual(disconnected.error_classification, "TRANSIENT_NETWORK")
+        self.assertFalse(disconnected.timed_out)
+
+    def test_partial_body_timeout_preserves_transport_timeout_provenance(self):
+        from mlb_backtest.v52_http import fetch_attempt
+
+        body = _FailingBody(socket.timeout("late body"))
+        response = _Response()
+        response._stream = body
+        capture = fetch_attempt(
+            _query(), timeout=5, max_bytes=100,
+            opener=lambda *_a, **_k: response, clock=self._clock(),
+        )
+
+        self.assertEqual(capture.body, b"part")
+        self.assertEqual(capture.error_classification, "TRANSIENT_NETWORK")
+        self.assertTrue(capture.timed_out)
+        self.assertEqual(capture.final_url, response.geturl())
+        self.assertEqual(capture.http_status, 200)
+        self.assertEqual(
+            capture.response_headers,
+            (("Content-Type", "application/json"),),
+        )
 
     def test_fetch_attempt_captures_final_url_status_and_selected_headers(self):
         from mlb_backtest.v52_http import fetch_attempt
@@ -216,6 +291,7 @@ class V52HttpTest(unittest.TestCase):
                 self.assertEqual(
                     capture.error_classification, "TRANSIENT_NETWORK"
                 )
+                self.assertEqual(capture.timed_out, isinstance(failure, socket.timeout))
 
     def test_retry_after_supports_delta_and_http_date(self):
         from mlb_backtest.v52_http import parse_retry_after

@@ -223,6 +223,7 @@ class V52AcquisitionContractTest(unittest.TestCase):
 
     def test_contract_v2_freezes_timezone_path_transport_caps_and_completeness(self) -> None:
         self.assertEqual(self.contract["schema_version"], 2)
+        self.assertEqual(self.contract["request_timeout_seconds"], 90)
         self.assertEqual(
             self.contract["timezone_mapping_path"],
             "config/v5_2_qd/venue_timezones.json",

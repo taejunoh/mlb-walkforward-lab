@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -10,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from .v52_evidence import AttemptCapture, LogicalQuery
+from .v52_evidence import AttemptCapture, LogicalQuery, response_byte_limit
 
 
 TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
@@ -24,12 +25,52 @@ _SELECTED_HEADERS = (
 )
 _READ_CHUNK_BYTES = 64 * 1024
 _USER_AGENT = "mlb-v5.2-acquisition/1.0"
+DEFAULT_TIMEOUT_SECONDS = 90.0
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
     base_delays: tuple[float, ...] = (1, 2, 4, 8, 16)
     jitter_fraction: float = 0.25
+    timeout: float = DEFAULT_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.timeout, bool)
+            or not isinstance(self.timeout, (int, float))
+            or not math.isfinite(self.timeout)
+            or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite")
+
+    @classmethod
+    def from_acquisition_contract(
+        cls, contract: Mapping[str, object]
+    ) -> RetryPolicy:
+        if not isinstance(contract, Mapping):
+            raise ValueError("acquisition contract request timeout is missing")
+        timeout = contract.get("request_timeout_seconds")
+        if type(timeout) is not int or timeout != int(DEFAULT_TIMEOUT_SECONDS):
+            raise ValueError("acquisition contract request timeout differs")
+        return cls(timeout=float(timeout))
+
+
+@dataclass(frozen=True)
+class FetchLimits:
+    timeout: float
+    max_bytes: int
+
+
+def fetch_limits(
+    query: LogicalQuery, *, policy: RetryPolicy | None = None
+) -> FetchLimits:
+    selected = RetryPolicy() if policy is None else policy
+    if not isinstance(selected, RetryPolicy):
+        raise TypeError("policy must be a RetryPolicy")
+    return FetchLimits(
+        timeout=selected.timeout,
+        max_bytes=response_byte_limit(query),
+    )
 
 
 def _utc_now() -> datetime:
@@ -178,11 +219,13 @@ def _read_bounded(
     return b"".join(chunks), exceeded, None
 
 
-def _network_classification(exc: BaseException) -> str:
+def _network_classification(exc: BaseException) -> tuple[str, bool]:
     reason = exc.reason if isinstance(exc, URLError) else exc
-    if isinstance(reason, (socket.timeout, TimeoutError, ConnectionError, OSError)):
-        return "TRANSIENT_NETWORK"
-    return "PERMANENT_NETWORK"
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return "TRANSIENT_NETWORK", True
+    if isinstance(reason, (ConnectionError, OSError)):
+        return "TRANSIENT_NETWORK", False
+    return "PERMANENT_NETWORK", False
 
 
 def _capture_response(
@@ -191,7 +234,14 @@ def _capture_response(
     expected_host: str,
     expected_media_type: str,
     max_bytes: int,
-) -> tuple[str | None, int | None, tuple[tuple[str, str], ...], bytes | None, str | None]:
+) -> tuple[
+    str | None,
+    int | None,
+    tuple[tuple[str, str], ...],
+    bytes | None,
+    str | None,
+    bool,
+]:
     final_url = response.geturl()  # type: ignore[attr-defined]
     status = getattr(response, "status", None)
     if status is None:
@@ -199,27 +249,28 @@ def _capture_response(
     selected = _headers(response)
     parsed_final = urlsplit(final_url)
     if parsed_final.scheme != "https" or parsed_final.hostname != expected_host:
-        return final_url, status, selected, None, "REDIRECT_HOST_NOT_ALLOWED"
+        return final_url, status, selected, None, "REDIRECT_HOST_NOT_ALLOWED", False
 
     body, exceeded, read_error = _read_bounded(response, max_bytes)
     if read_error is not None:
-        return final_url, status, selected, body, "TRANSIENT_NETWORK"
+        classification, timed_out = _network_classification(read_error)
+        return final_url, status, selected, body, classification, timed_out
     if isinstance(status, int) and not 200 <= status <= 299:
         classification = "TRANSIENT_HTTP" if status in TRANSIENT_HTTP else "PERMANENT_HTTP"
-        return final_url, status, selected, body, classification
+        return final_url, status, selected, body, classification, False
     if exceeded:
-        return final_url, status, selected, body, "MAX_BYTES_EXCEEDED"
+        return final_url, status, selected, body, "MAX_BYTES_EXCEEDED", False
 
     content_type = _header_value(selected, "Content-Type")
     actual_media_type = content_type.split(";", 1)[0].strip().lower() if content_type else None
     if actual_media_type != expected_media_type.strip().lower():
-        return final_url, status, selected, body, "CONTENT_TYPE_MISMATCH"
+        return final_url, status, selected, body, "CONTENT_TYPE_MISMATCH", False
 
     declared = _header_value(selected, "Content-Length")
     if declared is not None:
         if not declared.isascii() or not declared.isdecimal() or int(declared) != len(body):
-            return final_url, status, selected, body, "CONTENT_LENGTH_MISMATCH"
-    return final_url, status, selected, body, None
+            return final_url, status, selected, body, "CONTENT_LENGTH_MISMATCH", False
+    return final_url, status, selected, body, None, False
 
 
 def fetch_attempt(
@@ -243,9 +294,10 @@ def fetch_attempt(
     request = Request(request_url, headers={"User-Agent": _USER_AGENT})
     started = _canonical_utc(clock())
     try:
+        timed_out = False
         response = opener(request, timeout=timeout)
         with response:
-            final_url, status, headers, body, classification = _capture_response(
+            final_url, status, headers, body, classification, timed_out = _capture_response(
                 response,
                 expected_host=expected_host,
                 expected_media_type=query.expected_media_type,
@@ -253,7 +305,7 @@ def fetch_attempt(
             )
     except HTTPError as exc:
         with exc:
-            final_url, status, headers, body, classification = _capture_response(
+            final_url, status, headers, body, classification, timed_out = _capture_response(
                 exc,
                 expected_host=expected_host,
                 expected_media_type=query.expected_media_type,
@@ -264,7 +316,7 @@ def fetch_attempt(
         status = None
         headers = ()
         body = None
-        classification = _network_classification(exc)
+        classification, timed_out = _network_classification(exc)
     ended = _canonical_utc(clock())
     return AttemptCapture(
         started_at_utc=started,
@@ -274,4 +326,5 @@ def fetch_attempt(
         response_headers=headers,
         body=body,
         error_classification=classification,
+        timed_out=timed_out,
     )

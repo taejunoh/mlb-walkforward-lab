@@ -1957,6 +1957,75 @@ def bisect_statcast_query(
     return left, right
 
 
+def _validate_statcast_split_parent_batch(
+    repository_root: Path, parent_batch: QueryBatch
+) -> None:
+    if _is_statcast_root_batch(parent_batch) or _is_legacy_partition_batch_candidate(
+        repository_root, parent_batch
+    ):
+        return
+    ancestor_batch_id = _validate_sha256(
+        parent_batch.derived_from_sha256,
+        "Statcast split parent batch derived_from_sha256",
+    )
+    parent_query_ids = {query.parent_query_id for query in parent_batch.queries}
+    if len(parent_query_ids) != 1 or None in parent_query_ids:
+        raise ValueError("Statcast split parent batch has noncanonical parent lineage")
+    ancestor = load_query_batch(repository_root, ancestor_batch_id)
+    parent_query_id = next(iter(parent_query_ids))
+    matches = [
+        query
+        for query in ancestor.queries
+        if logical_query_id(query) == parent_query_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("Statcast split parent batch has noncanonical parent lineage")
+    if parent_batch != build_statcast_split_batch(
+        repository_root, ancestor, matches[0]
+    ):
+        raise ValueError("Statcast split parent batch differs from canonical bisection")
+
+
+def build_statcast_split_batch(
+    repository_root: Path,
+    parent_batch: QueryBatch,
+    parent_query: LogicalQuery,
+) -> QueryBatch:
+    """Build the canonical sealed child batch for one Statcast parent query."""
+    if not isinstance(parent_batch, QueryBatch):
+        raise TypeError("parent_batch must be a QueryBatch")
+    if not isinstance(parent_query, LogicalQuery):
+        raise TypeError("parent_query must be a LogicalQuery")
+    if parent_batch.stage != "REMAINING":
+        raise ValueError("Statcast split parent batch must use REMAINING stage")
+
+    payload = _batch_payload(
+        parent_batch.stage,
+        parent_batch.derived_from_sha256,
+        parent_batch.queries,
+    )
+    if parent_batch.batch_id != _sha256_bytes(_canonical_json_bytes(payload)):
+        raise ValueError("parent batch_id differs from its canonical sealed payload")
+    root = Path(repository_root)
+    _validate_query_batch_authority(root, parent_batch)
+    _validate_statcast_split_parent_batch(root, parent_batch)
+
+    requested_parent_id = logical_query_id(parent_query)
+    matches = [
+        query
+        for query in parent_batch.queries
+        if logical_query_id(query) == requested_parent_id
+    ]
+    if len(matches) != 1 or matches[0] != parent_query:
+        raise ValueError("Statcast split parent query must occur exactly once in its batch")
+
+    return _make_batch(
+        "REMAINING",
+        parent_batch.batch_id,
+        bisect_statcast_query(parent_query),
+    )
+
+
 def _legacy_ranges(
     protected_catalog: Sequence[Mapping[str, object]],
 ) -> list[tuple[date, date]]:
@@ -2803,7 +2872,8 @@ def _verified_split_attempt(
         or not 1 <= attempt_number <= 999999
     ):
         raise ValueError("exhausted_attempt_number must be a positive integer")
-    progress = V52EvidenceStore(evidence_root).read_verified_query_progress(parent)
+    store = V52EvidenceStore(evidence_root)
+    progress = store.read_verified_query_progress(parent)
     if not progress.attempt_receipts:
         raise ValueError("split parent has no exhausted attempt receipt")
     if progress.pending_attempt_numbers:
@@ -2818,6 +2888,24 @@ def _verified_split_attempt(
         raise ValueError("latest attempt is not SPLIT_REQUIRED")
     if latest.get("error_classification") != reason:
         raise ValueError("split reason differs from the latest attempt receipt")
+    split_evidence = store.read_verified_split_attempt(parent, attempt_number)
+    if (
+        split_evidence.query_id != logical_query_id(parent)
+        or split_evidence.attempt_number != attempt_number
+        or split_evidence.outcome != "SPLIT_REQUIRED"
+        or split_evidence.error_classification != reason
+    ):
+        raise ValueError("dedicated split evidence binding differs")
+    if reason in {"SIZE_LIMIT", "ROW_CAP"} and (
+        split_evidence.body_path is None
+        or split_evidence.body_sha256 is None
+        or split_evidence.byte_count <= 0
+    ):
+        raise ValueError(f"{reason} requires authenticated partial-body split evidence")
+    if (split_evidence.body_path is None) != (
+        split_evidence.body_sha256 is None
+    ) or (split_evidence.body_path is None) != (split_evidence.byte_count == 0):
+        raise ValueError("dedicated split evidence body binding differs")
     parent_query_id = logical_query_id(parent)
     relative = Path(
         "queries",
@@ -2826,10 +2914,15 @@ def _verified_split_attempt(
         "attempts",
         f"{attempt_number:06d}.json",
     )
+    if split_evidence.attempt_receipt_path != evidence_root / relative:
+        raise ValueError("dedicated split attempt receipt path differs")
     contents = _read_repository_file(
         evidence_root, relative, "split attempt receipt"
     )
-    if contents != _canonical_json_bytes(dict(latest)) + b"\n":
+    if (
+        contents != _canonical_json_bytes(dict(latest)) + b"\n"
+        or split_evidence.attempt_receipt_sha256 != _sha256_bytes(contents)
+    ):
         raise ValueError("split attempt receipt bytes differ")
     return dict(latest), relative.as_posix(), _sha256_bytes(contents)
 
@@ -2877,6 +2970,10 @@ def _verified_split_lineage(
         raise ValueError("split parent and child batches must use REMAINING stage")
     if child_batch.derived_from_sha256 != parent_batch.batch_id:
         raise ValueError("split child batch must derive from the parent batch")
+    if child_batch != build_statcast_split_batch(
+        repository_root, parent_batch, parent
+    ):
+        raise ValueError("split child batch differs from the canonical bisection")
     if len(child_batch.queries) < 2:
         raise ValueError("split child batch must contain at least two queries")
     cursor = parent_first

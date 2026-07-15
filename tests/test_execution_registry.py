@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -43,6 +44,70 @@ FORMAT_CHECKER.checkers = {
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repository_module_path(root: Path, module: str) -> Path | None:
+    if module != "mlb_backtest" and not module.startswith("mlb_backtest."):
+        return None
+    parts = module.split(".")
+    source = root.joinpath(*parts).with_suffix(".py")
+    if source.is_file():
+        return source
+    package = root.joinpath(*parts, "__init__.py")
+    return package if package.is_file() else None
+
+
+def _repository_local_imports(
+    root: Path, module: str, source: Path
+) -> frozenset[str]:
+    tree = ast.parse(source.read_bytes(), filename=os.fspath(source))
+    package = module if source.name == "__init__.py" else module.rpartition(".")[0]
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        candidates: list[str] = []
+        if isinstance(node, ast.Import):
+            candidates.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                relative = "." * node.level + (node.module or "")
+                target = importlib.util.resolve_name(relative, package)
+            else:
+                target = node.module or ""
+            candidates.append(target)
+            candidates.extend(
+                f"{target}.{alias.name}" for alias in node.names
+            )
+        for candidate in candidates:
+            if _repository_module_path(root, candidate) is not None:
+                imports.add(candidate)
+    return frozenset(imports)
+
+
+def _repository_local_import_closure(
+    root: Path, root_modules: tuple[str, ...]
+) -> frozenset[Path]:
+    root = Path(root).resolve()
+    pending = list(root_modules)
+    seen: set[str] = set()
+    paths: set[Path] = set()
+    while pending:
+        module = pending.pop()
+        if module in seen:
+            continue
+        source = _repository_module_path(root, module)
+        if source is None:
+            raise ValueError(f"repository-local import root is missing: {module}")
+        seen.add(module)
+        paths.add(source.relative_to(root))
+        parts = module.split(".")
+        for index in range(1, len(parts)):
+            package = ".".join(parts[:index])
+            if package not in seen and _repository_module_path(root, package):
+                pending.append(package)
+        pending.extend(_repository_local_imports(root, module, source) - seen)
+    return frozenset(paths)
+
+
 RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
@@ -69,15 +134,30 @@ SOURCE_INVENTORY_RELATIVE = Path(
 RECEIPTS_RELATIVE = Path(
     "audit/v5_2_qd/historical/execution/phase_receipts"
 )
-BOUND_EXECUTION_CODE = (
-    Path("mlb_backtest/execution_registry.py"),
-    Path("mlb_backtest/verify_v52_design.py"),
-    Path("mlb_backtest/v52_query_plan.py"),
-    Path("mlb_backtest/v52_game_evidence_inventory.py"),
-    Path("mlb_backtest/v52_legacy.py"),
-    Path("mlb_backtest/v52_legacy_decision_inventory.py"),
-    Path("mlb_backtest/v52_schedule_inventory.py"),
-    Path("mlb_backtest/v52_timezone_review.py"),
+ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
+    "mlb_backtest.execution_registry",
+    "mlb_backtest.v52_game_evidence_inventory",
+    "mlb_backtest.v52_http",
+    "mlb_backtest.v52_legacy",
+    "mlb_backtest.v52_legacy_decision_inventory",
+    "mlb_backtest.v52_query_plan",
+    "mlb_backtest.v52_schedule_inventory",
+    "mlb_backtest.v52_source_contracts",
+    "mlb_backtest.v52_timezone_review",
+)
+PASSIVE_IMPORT_CLOSURE_EXCLUSIONS = frozenset(
+    {Path("mlb_backtest/__init__.py")}
+)
+ACQUISITION_EXECUTION_IMPORT_CLOSURE = tuple(
+    sorted(
+        _repository_local_import_closure(
+            ROOT, ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES
+        )
+        - PASSIVE_IMPORT_CLOSURE_EXCLUSIONS
+    )
+)
+BOUND_PYTHON_EXTRAS = (Path("mlb_backtest/verify_v52_design.py"),)
+BOUND_SCHEMA_PATHS = (
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
@@ -88,6 +168,11 @@ BOUND_EXECUTION_CODE = (
     Path("schemas/v5_2_timezone_review_receipt.schema.json"),
     Path("schemas/v5_2_timezone_seal_receipt.schema.json"),
     Path("schemas/v5_2_venue_timezones.schema.json"),
+)
+BOUND_EXECUTION_CODE = (
+    *ACQUISITION_EXECUTION_IMPORT_CLOSURE,
+    *BOUND_PYTHON_EXTRAS,
+    *BOUND_SCHEMA_PATHS,
 )
 TIMEZONE_STAGE_EVIDENCE = (
     Path("audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"),
@@ -4712,27 +4797,95 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(self.initialize(root, run_spec).phase, "DESIGN_ACCEPTED")
 
     def test_task7d_runtime_authority_is_exactly_in_production_bound_code(self) -> None:
-        required = {
-            "mlb_backtest/execution_registry.py",
-            "mlb_backtest/verify_v52_design.py",
-            "mlb_backtest/v52_game_evidence_inventory.py",
-            "mlb_backtest/v52_legacy.py",
-            "mlb_backtest/v52_legacy_decision_inventory.py",
-            "mlb_backtest/v52_query_plan.py",
-            "mlb_backtest/v52_schedule_inventory.py",
-            "mlb_backtest/v52_timezone_review.py",
-            "schemas/v5_2_acquisition_checkpoint.schema.json",
-            "schemas/v5_2_execution_receipt.schema.json",
-            "schemas/v5_2_game_evidence_inventory.schema.json",
-            "schemas/v5_2_legacy_decision_inventory.schema.json",
-            "schemas/v5_2_schedule_anchor_inventory.schema.json",
-            "schemas/v5_2_split_receipt.schema.json",
-            "schemas/v5_2_timezone_candidate.schema.json",
-            "schemas/v5_2_timezone_review_receipt.schema.json",
-            "schemas/v5_2_timezone_seal_receipt.schema.json",
-            "schemas/v5_2_venue_timezones.schema.json",
-        }
+        required = {path.as_posix() for path in BOUND_EXECUTION_CODE}
         self.assertEqual(set(self.registry._BOUND_EXECUTION_CODE), required)
+
+    def test_bound_acquisition_import_closure_is_computed_and_exact(self) -> None:
+        computed = _repository_local_import_closure(
+            ROOT, ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES
+        )
+        self.assertEqual(
+            computed & PASSIVE_IMPORT_CLOSURE_EXCLUSIONS,
+            PASSIVE_IMPORT_CLOSURE_EXCLUSIONS,
+        )
+        for relative in PASSIVE_IMPORT_CLOSURE_EXCLUSIONS:
+            with self.subTest(passive_exclusion=relative):
+                self.assertEqual((ROOT / relative).read_bytes(), b"\n")
+        reachable = computed - PASSIVE_IMPORT_CLOSURE_EXCLUSIONS
+        bound = {Path(path) for path in self.registry._BOUND_EXECUTION_CODE}
+        bound_python = {path for path in bound if path.suffix == ".py"}
+        self.assertLessEqual(reachable, bound_python)
+        self.assertEqual(
+            bound_python - reachable,
+            set(BOUND_PYTHON_EXTRAS),
+        )
+        self.assertEqual(
+            {path for path in bound if path.parent == Path("schemas")},
+            set(BOUND_SCHEMA_PATHS),
+        )
+        self.assertEqual(
+            bound,
+            reachable | set(BOUND_PYTHON_EXTRAS) | set(BOUND_SCHEMA_PATHS),
+        )
+        for relative in self.registry._BOUND_EXECUTION_CODE:
+            with self.subTest(relative=relative):
+                self.assertTrue((ROOT / relative).is_file())
+
+    def test_import_graph_detects_a_new_repository_local_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "mlb_backtest"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            acquisition = package / "acquisition.py"
+            acquisition.write_text("VALUE = 1\n", encoding="utf-8")
+            before = _repository_local_import_closure(
+                root, ("mlb_backtest.acquisition",)
+            )
+
+            (package / "new_dependency.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            acquisition.write_text(
+                "from . import new_dependency\n", encoding="utf-8"
+            )
+            after = _repository_local_import_closure(
+                root, ("mlb_backtest.acquisition",)
+            )
+
+            self.assertNotIn(Path("mlb_backtest/new_dependency.py"), before)
+            self.assertIn(Path("mlb_backtest/new_dependency.py"), after)
+            simulated_bound = {
+                Path("mlb_backtest/__init__.py"),
+                Path("mlb_backtest/acquisition.py"),
+            }
+            self.assertEqual(
+                after - simulated_bound,
+                {Path("mlb_backtest/new_dependency.py")},
+            )
+
+    def test_import_graph_detects_function_local_relative_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "mlb_backtest"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "new_dependency.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            (package / "acquisition.py").write_text(
+                "def acquire():\n"
+                "    if True:\n"
+                "        from . import new_dependency\n"
+                "    return new_dependency.VALUE\n",
+                encoding="utf-8",
+            )
+
+            closure = _repository_local_import_closure(
+                root, ("mlb_backtest.acquisition",)
+            )
+
+            self.assertIn(Path("mlb_backtest/new_dependency.py"), closure)
 
     def test_task7c_bound_runtime_rejects_dirty_initialize_and_load(self) -> None:
         required = (
