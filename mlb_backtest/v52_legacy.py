@@ -10,6 +10,7 @@ import stat
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 from .v52_evidence import (
@@ -89,6 +90,13 @@ class PromotionDecision:
     disposition: PromotionDisposition
     reason_codes: tuple[PromotionReasonCode, ...]
     candidate: LegacyCandidate | None
+
+
+@dataclass(frozen=True)
+class LegacyDecisionEvidence:
+    decision: PromotionDecision
+    candidate_lineage: Mapping[str, object] | None
+    semantic_sha256: str | None
 
 
 class ProtectedLegacyIntegrityError(RuntimeError):
@@ -814,6 +822,60 @@ def audit_legacy_candidate(
     return _audit_with_record(query, catalog)[0]
 
 
+def audit_legacy_candidate_evidence(
+    query: LogicalQuery, catalog: ProtectedLegacyCatalog
+) -> LegacyDecisionEvidence:
+    """Audit one query and return its immutable legacy decision evidence."""
+    if not isinstance(query, LogicalQuery):
+        raise TypeError("query must be a LogicalQuery")
+    if not isinstance(catalog, ProtectedLegacyCatalog):
+        raise TypeError("catalog must be a ProtectedLegacyCatalog")
+    decision, record, semantics = _audit_with_record(query, catalog)
+    if (
+        decision.disposition is not PromotionDisposition.PROMOTED
+        or record is None
+        or semantics is None
+    ):
+        return LegacyDecisionEvidence(decision, None, None)
+
+    inventory_record = record.inventory_record
+    manifest = inventory_record.get("manifest")
+    seal = inventory_record.get("seal")
+    raw = inventory_record.get("raw")
+    if not all(isinstance(item, Mapping) for item in (manifest, seal, raw)):
+        raise ProtectedLegacyIntegrityError(
+            PromotionReasonCode.PROTECTED_INVENTORY_INVALID
+        )
+    assert isinstance(manifest, Mapping)
+    assert isinstance(seal, Mapping)
+    assert isinstance(raw, Mapping)
+    lineage = MappingProxyType(
+        {
+            "source": record.candidate.source,
+            "manifest": MappingProxyType(
+                {"path": manifest["path"], "sha256": manifest["sha256"]}
+            ),
+            "seal": MappingProxyType({"path": seal["path"], "sha256": seal["sha256"]}),
+            "raw": MappingProxyType(
+                {
+                    "path": raw["path"],
+                    "sha256": raw["sha256"],
+                    "byte_size": raw["byte_size"],
+                    "row_count": record.manifest["row_count"],
+                }
+            ),
+            "protected_inventory": MappingProxyType(
+                {
+                    "path": catalog.protected_inventory_path.as_posix(),
+                    "sha256": catalog.protected_inventory_sha256,
+                }
+            ),
+        }
+    )
+    semantic_sha256 = hashlib.sha256(canonical_json_bytes(semantics)).hexdigest()
+    return LegacyDecisionEvidence(decision, lineage, semantic_sha256)
+
+
 def promote_legacy_candidate(
     store: V52EvidenceStore,
     query: LogicalQuery,
@@ -887,6 +949,7 @@ def promote_legacy_candidate(
 
 __all__ = [
     "LegacyCandidate",
+    "LegacyDecisionEvidence",
     "LegacyPromotionNotEligibleError",
     "PromotionDecision",
     "PromotionDisposition",
@@ -894,6 +957,7 @@ __all__ = [
     "ProtectedLegacyCatalog",
     "ProtectedLegacyIntegrityError",
     "audit_legacy_candidate",
+    "audit_legacy_candidate_evidence",
     "load_protected_legacy_catalog",
     "promote_legacy_candidate",
 ]
