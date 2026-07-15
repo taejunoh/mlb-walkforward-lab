@@ -96,11 +96,13 @@ _TIMESTAMP = re.compile(
 _BOUND_EXECUTION_CODE = (
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/verify_v52_design.py",
+    "mlb_backtest/v52_game_evidence_inventory.py",
     "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/v52_schedule_inventory.py",
     "mlb_backtest/v52_timezone_review.py",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
+    "schemas/v5_2_game_evidence_inventory.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_timezone_candidate.schema.json",
@@ -152,7 +154,12 @@ _SCHEDULE_INVENTORY_PATH = (
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
 )
 _OPEN_CHECKPOINT_STAGES = frozenset(
-    {"STATIC_SCHEDULES", "REFERENCE_INPUTS", "TIMEZONE_REVIEW"}
+    {
+        "STATIC_SCHEDULES",
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+    }
 )
 _TIMEZONE_STAGE_EVIDENCE_PATHS = (
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json",
@@ -161,6 +168,12 @@ _TIMEZONE_STAGE_EVIDENCE_PATHS = (
     "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
     "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
     "config/v5_2_qd/venue_timezones.json",
+)
+_GAME_EVIDENCE_INVENTORY_PATH = (
+    "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
+)
+_PARTICIPANT_STAGE_EVIDENCE_PATHS = tuple(
+    sorted((*_TIMEZONE_STAGE_EVIDENCE_PATHS, _GAME_EVIDENCE_INVENTORY_PATH))
 )
 
 
@@ -2079,6 +2092,7 @@ def _checkpoint_stage_authority(
     contract_binding: Mapping[str, object],
 ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
     from mlb_backtest.v52_query_plan import (
+        build_participant_derived_batch,
         build_schedule_reference_batch,
         build_static_batch,
     )
@@ -2088,7 +2102,11 @@ def _checkpoint_stage_authority(
     static_batch = build_static_batch(run_path, contract_path)
     if stage == "STATIC_SCHEDULES":
         return (static_batch,), ()
-    if stage not in {"REFERENCE_INPUTS", "TIMEZONE_REVIEW"}:
+    if stage not in {
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+    }:
         raise ValueError(
             "non-static checkpoint stage authority is unavailable until implemented"
         )
@@ -2153,7 +2171,40 @@ def _checkpoint_stage_authority(
             "sha256": gate.mapping_sha256,
         },
     )
-    return (static_batch, reference_batch), stage_evidence
+    if stage == "TIMEZONE_REVIEW":
+        return (static_batch, reference_batch), stage_evidence
+
+    from mlb_backtest.v52_game_evidence_inventory import (
+        load_verified_game_evidence_inventory,
+    )
+
+    inventory = load_verified_game_evidence_inventory(paths.root)
+    participant_batch = build_participant_derived_batch(paths.root)
+    if (
+        participant_batch.derived_from_sha256 != inventory.sha256
+        or any(
+            query.run_spec_sha256 != run_binding["sha256"]
+            or query.acquisition_contract_sha256 != contract_binding["sha256"]
+            for query in participant_batch.queries
+        )
+    ):
+        raise ValueError("PARTICIPANT_DERIVED game inventory authority differs")
+    participant_stage_evidence = tuple(
+        sorted(
+            (
+                *stage_evidence,
+                {
+                    "path": _GAME_EVIDENCE_INVENTORY_PATH,
+                    "sha256": inventory.sha256,
+                },
+            ),
+            key=lambda item: item["path"],
+        )
+    )
+    return (
+        (static_batch, reference_batch, participant_batch),
+        participant_stage_evidence,
+    )
 
 
 def _checkpoint_semantic_snapshots(
@@ -2306,6 +2357,18 @@ def _checkpoint_current_semantic(
         raise ValueError(
             "TIMEZONE_REVIEW requires terminal completed STATIC and REFERENCE queries"
         )
+    if stage == "PARTICIPANT_DERIVED":
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:2])
+        )
+        if (
+            not prefix_ids <= set(completed)
+            or split
+            or split_receipt_paths
+        ):
+            raise ValueError(
+                "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
+            )
 
     expected_split_paths = {
         Path("audit/v5_2_qd/historical/acquisition/split_receipts")
@@ -2538,6 +2601,18 @@ def _checkpoint_artifacts_and_population(
         raise ValueError(
             "TIMEZONE_REVIEW requires terminal completed STATIC and REFERENCE queries"
         )
+    if stage == "PARTICIPANT_DERIVED":
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:2])
+        )
+        if (
+            not prefix_ids <= set(payload["completed_query_ids"])
+            or payload["split_query_ids"]
+            or payload["split_receipts"]
+        ):
+            raise ValueError(
+                "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
+            )
     evidence = payload["query_evidence_receipts"]
     assert isinstance(evidence, list)
     verified_evidence: set[tuple[str, str, str, str]] = set()
@@ -2714,6 +2789,11 @@ def _validate_checkpoint_progression(
             raise ValueError(
                 "TIMEZONE_REVIEW checkpoint lacks its sealed semantic gate evidence"
             )
+    if current_stage == "PARTICIPANT_DERIVED":
+        if evidence_paths != set(_PARTICIPANT_STAGE_EVIDENCE_PATHS):
+            raise ValueError(
+                "PARTICIPANT_DERIVED checkpoint lacks exact game inventory evidence"
+            )
     if previous is None:
         if current_stage != "STATIC_SCHEDULES":
             raise ValueError("first acquisition checkpoint stage differs")
@@ -2723,6 +2803,13 @@ def _validate_checkpoint_progression(
     if current_stage == "TIMEZONE_REVIEW" and previous["stage"] != "REFERENCE_INPUTS":
         raise ValueError(
             "TIMEZONE_REVIEW requires the terminal REFERENCE_INPUTS checkpoint"
+        )
+    if current_stage == "PARTICIPANT_DERIVED" and previous["stage"] not in {
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+    }:
+        raise ValueError(
+            "PARTICIPANT_DERIVED requires the terminal TIMEZONE_REVIEW checkpoint"
         )
     if current_stage_index not in {previous_stage, previous_stage + 1}:
         raise ValueError("acquisition checkpoint stage regressed or skipped")

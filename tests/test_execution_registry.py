@@ -66,11 +66,13 @@ BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/execution_registry.py"),
     Path("mlb_backtest/verify_v52_design.py"),
     Path("mlb_backtest/v52_query_plan.py"),
+    Path("mlb_backtest/v52_game_evidence_inventory.py"),
     Path("mlb_backtest/v52_schedule_inventory.py"),
     Path("mlb_backtest/v52_timezone_review.py"),
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
+    Path("schemas/v5_2_game_evidence_inventory.schema.json"),
     Path("schemas/v5_2_split_receipt.schema.json"),
     Path("schemas/v5_2_timezone_candidate.schema.json"),
     Path("schemas/v5_2_timezone_review_receipt.schema.json"),
@@ -85,6 +87,17 @@ TIMEZONE_STAGE_EVIDENCE = (
     Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
     Path("config/v5_2_qd/venue_timezones.json"),
 )
+PARTICIPANT_STAGE_EVIDENCE = tuple(
+    sorted(
+        (
+            *TIMEZONE_STAGE_EVIDENCE,
+            Path(
+                "audit/v5_2_qd/historical/acquisition/"
+                "game_evidence_inventory.json"
+            ),
+        )
+    )
+)
 
 
 def _sha256(path: Path) -> str:
@@ -95,6 +108,37 @@ def _git(root: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+def _checkpoint_schema_payload(
+    *,
+    stage: str,
+    query_batches: list[dict[str, object]],
+    stage_evidence: list[dict[str, str]],
+) -> dict[str, object]:
+    binding = {"path": "audit/base.json", "sha256": "a" * 64}
+    return {
+        "acquisition_contract": binding,
+        "completed_query_ids": [],
+        "execution_phase": "ACQUIRING",
+        "execution_phase_receipt": binding,
+        "git_head": "b" * 40,
+        "pending_query_ids": [],
+        "prior_checkpoint_sha256": "c" * 64,
+        "quarantined_query_ids": [],
+        "query_batches": query_batches,
+        "query_evidence_receipts": [],
+        "receipt_kind": "ACQUISITION_CHECKPOINT",
+        "recorded_at_utc": "2026-07-14T00:00:00.000000Z",
+        "run_id": "historical_walkforward_500",
+        "run_spec": binding,
+        "schema_version": 1,
+        "sequence": 2,
+        "split_query_ids": [],
+        "split_receipts": [],
+        "stage": stage,
+        "stage_evidence_receipts": stage_evidence,
+    }
 
 
 class ExecutionRegistryTest(unittest.TestCase):
@@ -470,10 +514,16 @@ class ExecutionRegistryTest(unittest.TestCase):
         fixture: tuple[object, ...],
     ) -> tuple[Path, ...]:
         from mlb_backtest.v52_evidence import AttemptCapture
+        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
         from mlb_backtest.v52_timezone_review import (
             build_timezone_candidate,
             seal_timezone_mapping,
             write_timezone_review_receipt,
+        )
+        from tests.test_v52_game_evidence_inventory import (
+            _boxscore_raw,
+            _pitching_raw,
+            _team_raw,
         )
 
         (
@@ -485,6 +535,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             _,
             store,
         ) = fixture
+        schedule_inventory = json.loads(inventory.path.read_bytes())
+        anchors = {
+            int(row["game_pk"]): row for row in schedule_inventory["anchors"]
+        }
         for query in reference_batch.queries:
             if query.endpoint.startswith("https://statsapi.mlb.com/api/v1/venues/"):
                 venue_id = int(query.requested_range["venue_id"])
@@ -505,20 +559,19 @@ class ExecutionRegistryTest(unittest.TestCase):
                         ]
                     }
                 ) + b"\n"
-                semantics = {
-                    "venues": [
-                        {
-                            "city": "Fixture City",
-                            "latitude": 40.0,
-                            "longitude": -75.0,
-                            "venue_id": venue_id,
-                            "venue_name": "Fixture Park",
-                        }
-                    ]
-                }
+            elif query.endpoint.endswith("/boxscore"):
+                raw = _boxscore_raw(
+                    anchors[int(query.requested_range["game_pk"])]
+                )
+            elif query.endpoint == "https://statsapi.mlb.com/api/v1/stats":
+                raw = _pitching_raw()
+            elif query.endpoint == "https://statsapi.mlb.com/api/v1/teams":
+                raw = _team_raw()
             else:
-                raw = b"{}"
-                semantics = {}
+                raise AssertionError(
+                    f"unexpected reference fixture query: {query.endpoint}"
+                )
+            semantics = recompute_query_sidecar(query, raw)
             capture = AttemptCapture(
                 started_at_utc="2026-07-14T00:00:00.000000Z",
                 ended_at_utc="2026-07-14T00:00:01.000000Z",
@@ -626,6 +679,145 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         return fixture, stage_evidence, reference
 
+    def participant_checkpoint_fixture(
+        self,
+        root: Path,
+        run_spec: object,
+        *,
+        terminal_timezone_checkpoint: bool = True,
+    ):
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_game_evidence_inventory import (
+            publish_game_evidence_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_participant_derived_batch,
+            publish_query_batch,
+        )
+
+        fixture, timezone_evidence, reference = self.terminal_timezone_fixture(
+            root, run_spec
+        )
+        prior = reference
+        if terminal_timezone_checkpoint:
+            prior = self.publish_timezone_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=reference.receipt_sha256,
+                stage_evidence=timezone_evidence,
+            )
+        inventory = publish_game_evidence_inventory(root)
+        participant_batch = build_participant_derived_batch(root)
+        publish_query_batch(root, participant_batch)
+        participant_ids = tuple(
+            sorted(logical_query_id(query) for query in participant_batch.queries)
+        )
+        return (
+            fixture,
+            prior,
+            inventory,
+            participant_batch,
+            participant_ids,
+            tuple(root / path for path in PARTICIPANT_STAGE_EVIDENCE),
+        )
+
+    def complete_participant_queries(
+        self,
+        root: Path,
+        run_spec: object,
+        participant_batch: object,
+    ) -> None:
+        from mlb_backtest.v52_evidence import V52EvidenceStore
+        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+        from tests.test_v52_game_evidence_inventory import (
+            _capture,
+            _pitching_raw,
+        )
+
+        store = V52EvidenceStore(root / run_spec.raw["namespaces"]["raw"])
+        career_payload = json.loads(_pitching_raw())
+        career_split = career_payload["stats"][0]["splits"][0]
+        career_split["sport"] = {"id": 1}
+        career_split["team"] = {"id": 10}
+        career_payload["stats"][0]["splits"].append(
+            {
+                "sport": {"id": 0},
+                "stat": {"battersFaced": career_split["stat"]["battersFaced"]},
+            }
+        )
+        career_raw = canonical_json_bytes(career_payload) + b"\n"
+        for query in participant_batch.queries:
+            if store.read_verified_query_progress(query).status == "SUCCESS":
+                continue
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(query, career_raw),
+                    recompute_query_sidecar(query, career_raw),
+                )
+
+    def publish_participant_checkpoint(
+        self,
+        root: Path,
+        run_spec: object,
+        participant_fixture: tuple[object, ...],
+        *,
+        expected_prior: str,
+        completed_participant_ids: tuple[str, ...] = (),
+        quarantined_participant_ids: tuple[str, ...] = (),
+        split_participant_ids: tuple[str, ...] = (),
+        query_batch_ids: tuple[str, ...] | None = None,
+        stage_evidence: tuple[Path, ...] | None = None,
+    ):
+        (
+            fixture,
+            _,
+            _,
+            participant_batch,
+            participant_ids,
+            participant_evidence,
+        ) = participant_fixture
+        static_batch, reference_batch, static_ids, reference_ids, *_ = fixture
+        terminal = set(completed_participant_ids)
+        terminal.update(quarantined_participant_ids)
+        terminal.update(split_participant_ids)
+        return self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=expected_prior,
+            stage="PARTICIPANT_DERIVED",
+            query_batch_ids=(
+                (
+                    static_batch.batch_id,
+                    reference_batch.batch_id,
+                    participant_batch.batch_id,
+                )
+                if query_batch_ids is None
+                else query_batch_ids
+            ),
+            completed_query_ids=tuple(
+                sorted(
+                    (
+                        *static_ids,
+                        *reference_ids,
+                        *completed_participant_ids,
+                    )
+                )
+            ),
+            pending_query_ids=tuple(
+                query_id for query_id in participant_ids if query_id not in terminal
+            ),
+            quarantined_query_ids=tuple(sorted(quarantined_participant_ids)),
+            split_query_ids=tuple(sorted(split_participant_ids)),
+            stage_evidence_receipts=(
+                participant_evidence
+                if stage_evidence is None
+                else stage_evidence
+            ),
+        )
+
     def test_acquisition_checkpoint_schema_and_public_api_are_closed(self) -> None:
         self.assertTrue(hasattr(self.registry, "AcquisitionCheckpoint"))
         self.assertTrue(hasattr(self.registry, "publish_acquisition_checkpoint"))
@@ -645,33 +837,15 @@ class ExecutionRegistryTest(unittest.TestCase):
         schema = json.loads(
             (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
         )
-        binding = {"path": "audit/base.json", "sha256": "a" * 64}
         evidence = [
             {"path": path.as_posix(), "sha256": f"{index:x}" * 64}
             for index, path in enumerate(TIMEZONE_STAGE_EVIDENCE, start=1)
         ]
-        payload = {
-            "acquisition_contract": binding,
-            "completed_query_ids": [],
-            "execution_phase": "ACQUIRING",
-            "execution_phase_receipt": binding,
-            "git_head": "b" * 40,
-            "pending_query_ids": [],
-            "prior_checkpoint_sha256": "c" * 64,
-            "quarantined_query_ids": [],
-            "query_batches": [],
-            "query_evidence_receipts": [],
-            "receipt_kind": "ACQUISITION_CHECKPOINT",
-            "recorded_at_utc": "2026-07-14T00:00:00.000000Z",
-            "run_id": "historical_walkforward_500",
-            "run_spec": binding,
-            "schema_version": 1,
-            "sequence": 2,
-            "split_query_ids": [],
-            "split_receipts": [],
-            "stage": "TIMEZONE_REVIEW",
-            "stage_evidence_receipts": evidence,
-        }
+        payload = _checkpoint_schema_payload(
+            stage="TIMEZONE_REVIEW",
+            query_batches=[],
+            stage_evidence=evidence,
+        )
         jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
         for mutation in ("missing", "extra", "reordered"):
             with self.subTest(mutation=mutation):
@@ -695,6 +869,71 @@ class ExecutionRegistryTest(unittest.TestCase):
                         schema,
                         format_checker=FORMAT_CHECKER,
                     )
+
+    def test_participant_checkpoint_schema_requires_exact_three_batches_and_seven_evidence_paths(
+        self,
+    ) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        batches = [
+            {
+                "batch_id": f"{index}" * 64,
+                "path": (
+                    "audit/v5_2_qd/historical/acquisition/query_batches/"
+                    f"{str(index) * 64}.json"
+                ),
+                "sha256": f"{index + 3}" * 64,
+                "stage": stage,
+            }
+            for index, stage in enumerate(
+                ("STATIC_SCHEDULES", "REFERENCE_INPUTS", "PARTICIPANT_DERIVED"),
+                start=1,
+            )
+        ]
+        evidence = [
+            {"path": path.as_posix(), "sha256": f"{index:x}" * 64}
+            for index, path in enumerate(PARTICIPANT_STAGE_EVIDENCE, start=7)
+        ]
+        payload = _checkpoint_schema_payload(
+            stage="PARTICIPANT_DERIVED",
+            query_batches=batches,
+            stage_evidence=evidence,
+        )
+        jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
+
+        for collection, mutation in (
+            ("query_batches", "missing"),
+            ("query_batches", "extra"),
+            ("query_batches", "reordered"),
+            ("stage_evidence_receipts", "missing"),
+            ("stage_evidence_receipts", "extra"),
+            ("stage_evidence_receipts", "reordered"),
+        ):
+            with self.subTest(collection=collection, mutation=mutation):
+                forged = json.loads(json.dumps(payload))
+                values = forged[collection]
+                if mutation == "missing":
+                    values.pop()
+                elif mutation == "extra":
+                    values.append(values[-1])
+                else:
+                    values[:2] = reversed(values[:2])
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
+
+        remaining = json.loads(json.dumps(payload))
+        remaining["stage"] = "REMAINING"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                remaining,
+                schema,
+                format_checker=FORMAT_CHECKER,
+            )
 
     def test_acquisition_checkpoint_genesis_chain_latest_and_idempotent_retry(
         self,
@@ -1401,6 +1640,288 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(
                 self.registry.load_latest_acquisition_checkpoint(root, run_spec),
                 reference,
+            )
+
+    def test_terminal_timezone_opens_partial_participant_with_exact_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            participant_fixture = self.participant_checkpoint_fixture(
+                root, run_spec
+            )
+            (
+                fixture,
+                timezone,
+                inventory,
+                participant_batch,
+                participant_ids,
+                stage_evidence,
+            ) = participant_fixture
+            static_batch, reference_batch, static_ids, reference_ids, *_ = fixture
+
+            checkpoint = self.publish_participant_checkpoint(
+                root,
+                run_spec,
+                participant_fixture,
+                expected_prior=timezone.receipt_sha256,
+            )
+            self.assertEqual(timezone.stage, "TIMEZONE_REVIEW")
+            self.assertEqual(checkpoint.stage, "PARTICIPANT_DERIVED")
+            self.assertEqual(
+                checkpoint.query_batch_ids,
+                (
+                    static_batch.batch_id,
+                    reference_batch.batch_id,
+                    participant_batch.batch_id,
+                ),
+            )
+            self.assertEqual(
+                checkpoint.stage_evidence_receipt_sha256s,
+                tuple(_sha256(path) for path in stage_evidence),
+            )
+            self.assertEqual(len(checkpoint.query_batch_ids), 3)
+            self.assertEqual(len(checkpoint.stage_evidence_receipt_sha256s), 7)
+            self.assertEqual(
+                checkpoint.completed_query_ids,
+                tuple(sorted((*static_ids, *reference_ids))),
+            )
+            self.assertEqual(checkpoint.pending_query_ids, participant_ids)
+            self.assertFalse(checkpoint.quarantined_query_ids)
+            self.assertFalse(checkpoint.split_query_ids)
+            self.assertEqual(
+                participant_batch.derived_from_sha256,
+                inventory.sha256,
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                checkpoint,
+            )
+
+    def test_partial_participant_advances_terminal_and_retries_idempotently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            participant_fixture = self.participant_checkpoint_fixture(
+                root, run_spec
+            )
+            _, timezone, _, participant_batch, participant_ids, _ = (
+                participant_fixture
+            )
+            partial = self.publish_participant_checkpoint(
+                root,
+                run_spec,
+                participant_fixture,
+                expected_prior=timezone.receipt_sha256,
+            )
+            self.complete_participant_queries(root, run_spec, participant_batch)
+            terminal = self.publish_participant_checkpoint(
+                root,
+                run_spec,
+                participant_fixture,
+                expected_prior=partial.receipt_sha256,
+                completed_participant_ids=participant_ids,
+            )
+            self.assertFalse(terminal.pending_query_ids)
+            self.assertFalse(terminal.quarantined_query_ids)
+            self.assertFalse(terminal.split_query_ids)
+            self.assertEqual(
+                self.publish_participant_checkpoint(
+                    root,
+                    run_spec,
+                    participant_fixture,
+                    expected_prior=terminal.receipt_sha256,
+                    completed_participant_ids=participant_ids,
+                ),
+                terminal,
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                terminal,
+            )
+
+    def test_participant_checkpoint_rejects_nonterminal_prior_wrong_evidence_and_split(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            participant_fixture = self.participant_checkpoint_fixture(
+                root,
+                run_spec,
+                terminal_timezone_checkpoint=False,
+            )
+            (
+                fixture,
+                reference,
+                _,
+                participant_batch,
+                participant_ids,
+                participant_evidence,
+            ) = participant_fixture
+            with self.assertRaisesRegex(
+                ValueError,
+                "PARTICIPANT_DERIVED|stage|TIMEZONE|prior|fully verified|authority",
+            ):
+                self.publish_participant_checkpoint(
+                    root,
+                    run_spec,
+                    participant_fixture,
+                    expected_prior=reference.receipt_sha256,
+                )
+
+            timezone = self.publish_timezone_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=reference.receipt_sha256,
+                stage_evidence=tuple(root / path for path in TIMEZONE_STAGE_EVIDENCE),
+            )
+            participant_fixture = (
+                fixture,
+                timezone,
+                *participant_fixture[2:],
+            )
+            static_batch, reference_batch, *_ = fixture
+            wrong_evidence = tuple(
+                path
+                for path in participant_evidence
+                if path.name != "game_evidence_inventory.json"
+            )
+            for attack, kwargs in (
+                (
+                    "wrong-batch",
+                    {
+                        "query_batch_ids": (
+                            static_batch.batch_id,
+                            participant_batch.batch_id,
+                            reference_batch.batch_id,
+                        )
+                    },
+                ),
+                ("wrong-evidence", {"stage_evidence": wrong_evidence}),
+                (
+                    "split",
+                    {"split_participant_ids": (participant_ids[0],)},
+                ),
+                (
+                    "wrong-status",
+                    {"completed_participant_ids": (participant_ids[0],)},
+                ),
+            ):
+                with (
+                    self.subTest(attack=attack),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "PARTICIPANT_DERIVED|batch|order|evidence|split|status|authority|checkpoint",
+                    ),
+                ):
+                    self.publish_participant_checkpoint(
+                        root,
+                        run_spec,
+                        participant_fixture,
+                        expected_prior=timezone.receipt_sha256,
+                        **kwargs,
+                    )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                timezone,
+            )
+
+    def test_participant_historical_inventory_or_batch_mutation_is_rejected(
+        self,
+    ) -> None:
+        for authority in ("inventory", "batch"):
+            with (
+                self.subTest(authority=authority),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root, run_spec = self.make_repo(Path(directory))
+                participant_fixture = self.participant_checkpoint_fixture(
+                    root, run_spec
+                )
+                _, timezone, inventory, participant_batch, *_ = (
+                    participant_fixture
+                )
+                checkpoint = self.publish_participant_checkpoint(
+                    root,
+                    run_spec,
+                    participant_fixture,
+                    expected_prior=timezone.receipt_sha256,
+                )
+                if authority == "inventory":
+                    payload = json.loads(inventory.path.read_bytes())
+                    payload["counts"]["game_count"] += 1
+                    inventory.path.write_bytes(
+                        canonical_json_bytes(payload) + b"\n"
+                    )
+                else:
+                    batch_path = (
+                        root
+                        / "audit/v5_2_qd/historical/acquisition/query_batches"
+                        / f"{participant_batch.batch_id}.json"
+                    )
+                    batch_path.write_bytes(batch_path.read_bytes() + b" ")
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "PARTICIPANT_DERIVED|inventory|batch|hash|checkpoint|authority",
+                ):
+                    self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+                checkpoint_dir = (
+                    root
+                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                )
+                self.assertTrue(
+                    any(
+                        checkpoint.receipt_sha256 in path.name
+                        for path in checkpoint_dir.iterdir()
+                    )
+                )
+
+    def test_participant_post_link_inventory_race_cleans_owned_new_head(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            participant_fixture = self.participant_checkpoint_fixture(
+                root, run_spec
+            )
+            _, timezone, inventory, *_ = participant_fixture
+            original = inventory.path.read_bytes()
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            before = sorted(path.name for path in checkpoint_dir.iterdir())
+
+            def mutate_inventory() -> None:
+                inventory.path.write_bytes(original + b" ")
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_after_registry_publish",
+                    side_effect=mutate_inventory,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "PARTICIPANT_DERIVED|inventory|artifact|evidence|snapshot|authority",
+                ),
+            ):
+                self.publish_participant_checkpoint(
+                    root,
+                    run_spec,
+                    participant_fixture,
+                    expected_prior=timezone.receipt_sha256,
+                )
+            inventory.path.write_bytes(original)
+            self.assertEqual(
+                sorted(path.name for path in checkpoint_dir.iterdir()),
+                before,
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                timezone,
             )
 
     def test_reference_checkpoint_opens_with_exact_fixed_authority(self) -> None:
@@ -3255,11 +3776,13 @@ class ExecutionRegistryTest(unittest.TestCase):
         required = {
             "mlb_backtest/execution_registry.py",
             "mlb_backtest/verify_v52_design.py",
+            "mlb_backtest/v52_game_evidence_inventory.py",
             "mlb_backtest/v52_query_plan.py",
             "mlb_backtest/v52_schedule_inventory.py",
             "mlb_backtest/v52_timezone_review.py",
             "schemas/v5_2_acquisition_checkpoint.schema.json",
             "schemas/v5_2_execution_receipt.schema.json",
+            "schemas/v5_2_game_evidence_inventory.schema.json",
             "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
             "schemas/v5_2_timezone_candidate.schema.json",
