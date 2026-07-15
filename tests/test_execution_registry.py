@@ -72,6 +72,14 @@ BOUND_EXECUTION_CODE = (
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_split_receipt.schema.json"),
 )
+TIMEZONE_STAGE_EVIDENCE = (
+    Path("audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"),
+    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),
+    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json"),
+    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json"),
+    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
+    Path("config/v5_2_qd/venue_timezones.json"),
+)
 
 
 def _sha256(path: Path) -> str:
@@ -451,6 +459,168 @@ class ExecutionRegistryTest(unittest.TestCase):
             stage_evidence_receipts=(inventory.path,),
         )
 
+    def complete_reference_and_timezone_gate(
+        self,
+        root: Path,
+        fixture: tuple[object, ...],
+    ) -> tuple[Path, ...]:
+        from mlb_backtest.v52_evidence import AttemptCapture
+        from mlb_backtest.v52_timezone_review import (
+            build_timezone_candidate,
+            seal_timezone_mapping,
+            write_timezone_review_receipt,
+        )
+
+        (
+            static_batch,
+            reference_batch,
+            _,
+            _,
+            inventory,
+            _,
+            store,
+        ) = fixture
+        for query in reference_batch.queries:
+            if query.endpoint.startswith("https://statsapi.mlb.com/api/v1/venues/"):
+                venue_id = int(query.requested_range["venue_id"])
+                raw = canonical_json_bytes(
+                    {
+                        "venues": [
+                            {
+                                "id": venue_id,
+                                "location": {
+                                    "city": "Fixture City",
+                                    "defaultCoordinates": {
+                                        "latitude": 40.0,
+                                        "longitude": -75.0,
+                                    },
+                                },
+                                "name": "Fixture Park",
+                            }
+                        ]
+                    }
+                ) + b"\n"
+                semantics = {
+                    "venues": [
+                        {
+                            "city": "Fixture City",
+                            "latitude": 40.0,
+                            "longitude": -75.0,
+                            "venue_id": venue_id,
+                            "venue_name": "Fixture Park",
+                        }
+                    ]
+                }
+            else:
+                raw = b"{}"
+                semantics = {}
+            capture = AttemptCapture(
+                started_at_utc="2026-07-14T00:00:00.000000Z",
+                ended_at_utc="2026-07-14T00:00:01.000000Z",
+                final_url=query.endpoint,
+                http_status=200,
+                response_headers=(
+                    ("content-type", "application/json"),
+                    ("content-length", str(len(raw))),
+                ),
+                body=raw,
+                error_classification=None,
+            )
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    semantics,
+                )
+
+        candidate = dict(
+            build_timezone_candidate(
+                root=root,
+                evidence_root=store.root,
+                batch_ids=(static_batch.batch_id, reference_batch.batch_id),
+            )
+        )
+        for row in candidate["timezone_rows"]:
+            row["time_zone"] = "America/New_York"
+        candidate_path = self.write_artifact(
+            root,
+            TIMEZONE_STAGE_EVIDENCE[3].as_posix(),
+            candidate,
+        )
+        reviews = []
+        for path, identity, role in (
+            (
+                TIMEZONE_STAGE_EVIDENCE[1],
+                "coverage-reviewer",
+                "TIMEZONE_COVERAGE_REVIEW",
+            ),
+            (
+                TIMEZONE_STAGE_EVIDENCE[2],
+                "semantic-reviewer",
+                "TIMEZONE_SEMANTIC_REVIEW",
+            ),
+        ):
+            reviews.append(
+                write_timezone_review_receipt(
+                    root,
+                    candidate_path=candidate_path.relative_to(root),
+                    output=path,
+                    reviewer_identity=identity,
+                    reviewer_role=role,
+                    decision="APPROVED",
+                ).relative_to(root)
+            )
+        seal_timezone_mapping(
+            root,
+            candidate_path=candidate_path.relative_to(root),
+            review_receipt_paths=reviews,
+            output=TIMEZONE_STAGE_EVIDENCE[5],
+            receipt_output=TIMEZONE_STAGE_EVIDENCE[4],
+        )
+        self.assertEqual(inventory.path.relative_to(root), TIMEZONE_STAGE_EVIDENCE[0])
+        return tuple(root / path for path in TIMEZONE_STAGE_EVIDENCE)
+
+    def publish_timezone_checkpoint(
+        self,
+        root: Path,
+        run_spec: object,
+        fixture: tuple[object, ...],
+        *,
+        expected_prior: str,
+        stage_evidence: tuple[Path, ...],
+        query_batch_ids: tuple[str, ...] | None = None,
+    ):
+        static_batch, reference_batch, static_ids, reference_ids, *_ = fixture
+        return self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=expected_prior,
+            stage="TIMEZONE_REVIEW",
+            query_batch_ids=(
+                (static_batch.batch_id, reference_batch.batch_id)
+                if query_batch_ids is None
+                else query_batch_ids
+            ),
+            completed_query_ids=tuple(sorted((*static_ids, *reference_ids))),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+            stage_evidence_receipts=stage_evidence,
+        )
+
+    def terminal_timezone_fixture(self, root: Path, run_spec: object):
+        fixture = self.reference_checkpoint_fixture(root, run_spec)
+        stage_evidence = self.complete_reference_and_timezone_gate(root, fixture)
+        reference = self.publish_reference_checkpoint(
+            root,
+            run_spec,
+            fixture,
+            expected_prior=fixture[5].receipt_sha256,
+            completed_reference_ids=fixture[3],
+        )
+        return fixture, stage_evidence, reference
+
     def test_acquisition_checkpoint_schema_and_public_api_are_closed(self) -> None:
         self.assertTrue(hasattr(self.registry, "AcquisitionCheckpoint"))
         self.assertTrue(hasattr(self.registry, "publish_acquisition_checkpoint"))
@@ -463,6 +633,63 @@ class ExecutionRegistryTest(unittest.TestCase):
         self.assertEqual(
             schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
         )
+
+    def test_timezone_checkpoint_schema_requires_exact_six_fixed_evidence_paths(
+        self,
+    ) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        binding = {"path": "audit/base.json", "sha256": "a" * 64}
+        evidence = [
+            {"path": path.as_posix(), "sha256": f"{index:x}" * 64}
+            for index, path in enumerate(TIMEZONE_STAGE_EVIDENCE, start=1)
+        ]
+        payload = {
+            "acquisition_contract": binding,
+            "completed_query_ids": [],
+            "execution_phase": "ACQUIRING",
+            "execution_phase_receipt": binding,
+            "git_head": "b" * 40,
+            "pending_query_ids": [],
+            "prior_checkpoint_sha256": "c" * 64,
+            "quarantined_query_ids": [],
+            "query_batches": [],
+            "query_evidence_receipts": [],
+            "receipt_kind": "ACQUISITION_CHECKPOINT",
+            "recorded_at_utc": "2026-07-14T00:00:00.000000Z",
+            "run_id": "historical_walkforward_500",
+            "run_spec": binding,
+            "schema_version": 1,
+            "sequence": 2,
+            "split_query_ids": [],
+            "split_receipts": [],
+            "stage": "TIMEZONE_REVIEW",
+            "stage_evidence_receipts": evidence,
+        }
+        jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
+        for mutation in ("missing", "extra", "reordered"):
+            with self.subTest(mutation=mutation):
+                forged = json.loads(json.dumps(payload))
+                if mutation == "missing":
+                    forged["stage_evidence_receipts"].pop()
+                elif mutation == "extra":
+                    forged["stage_evidence_receipts"].append(
+                        {
+                            "path": "audit/timezone-extra.json",
+                            "sha256": "f" * 64,
+                        }
+                    )
+                else:
+                    forged["stage_evidence_receipts"][1:3] = reversed(
+                        forged["stage_evidence_receipts"][1:3]
+                    )
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
 
     def test_acquisition_checkpoint_genesis_chain_latest_and_idempotent_retry(
         self,
@@ -551,7 +778,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     root,
                     run_spec,
                     expected_prior_checkpoint_sha256=None,
-                    stage="TIMEZONE_REVIEW",
+                    stage="PARTICIPANT_DERIVED",
                     query_batch_ids=(batch.batch_id,),
                     completed_query_ids=(),
                     pending_query_ids=query_ids,
@@ -994,7 +1221,6 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
             for stage in (
-                "TIMEZONE_REVIEW",
                 "PARTICIPANT_DERIVED",
                 "REMAINING",
             ):
@@ -1012,6 +1238,165 @@ class ExecutionRegistryTest(unittest.TestCase):
                         quarantined_query_ids=(),
                         split_query_ids=(),
                     )
+
+    def test_timezone_checkpoint_is_terminal_no_batch_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            fixture, stage_evidence, reference = self.terminal_timezone_fixture(
+                root, run_spec
+            )
+            checkpoint = self.publish_timezone_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=reference.receipt_sha256,
+                stage_evidence=stage_evidence,
+            )
+            self.assertEqual(checkpoint.stage, "TIMEZONE_REVIEW")
+            self.assertEqual(
+                checkpoint.query_batch_ids,
+                (fixture[0].batch_id, fixture[1].batch_id),
+            )
+            self.assertFalse(checkpoint.pending_query_ids)
+            self.assertFalse(checkpoint.quarantined_query_ids)
+            self.assertFalse(checkpoint.split_query_ids)
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                checkpoint,
+            )
+            self.assertEqual(
+                self.publish_timezone_checkpoint(
+                    root,
+                    run_spec,
+                    fixture,
+                    expected_prior=checkpoint.receipt_sha256,
+                    stage_evidence=stage_evidence,
+                ),
+                checkpoint,
+            )
+
+    def test_timezone_checkpoint_rejects_nonterminal_and_extra_evidence(self):
+        from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
+
+        for attack in ("nonterminal", "extra-evidence", "new-batch"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                fixture = self.reference_checkpoint_fixture(root, run_spec)
+                *_, static_checkpoint, _ = fixture
+                query_batch_ids = None
+                if attack == "nonterminal":
+                    reference = self.publish_reference_checkpoint(
+                        root,
+                        run_spec,
+                        fixture,
+                        expected_prior=static_checkpoint.receipt_sha256,
+                    )
+                stage_evidence = self.complete_reference_and_timezone_gate(
+                    root, fixture
+                )
+                if attack != "nonterminal":
+                    reference = self.publish_reference_checkpoint(
+                        root,
+                        run_spec,
+                        fixture,
+                        expected_prior=static_checkpoint.receipt_sha256,
+                        completed_reference_ids=fixture[3],
+                    )
+                if attack == "extra-evidence":
+                    extra = self.write_artifact(
+                        root,
+                        "audit/v5_2_qd/historical/acquisition/timezone-extra.json",
+                        {"extra": True},
+                    )
+                    stage_evidence = (*stage_evidence, extra)
+                elif attack == "new-batch":
+                    timezone_batch = _make_batch("TIMEZONE_REVIEW", None, ())
+                    publish_query_batch(root, timezone_batch)
+                    query_batch_ids = (
+                        fixture[0].batch_id,
+                        fixture[1].batch_id,
+                        timezone_batch.batch_id,
+                    )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "TIMEZONE_REVIEW|terminal|pending|stage evidence|authority|fully verified",
+                ):
+                    self.publish_timezone_checkpoint(
+                        root,
+                        run_spec,
+                        fixture,
+                        expected_prior=reference.receipt_sha256,
+                        stage_evidence=stage_evidence,
+                        query_batch_ids=query_batch_ids,
+                    )
+
+    def test_timezone_checkpoint_historical_load_rechecks_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            fixture, stage_evidence, reference = self.terminal_timezone_fixture(
+                root, run_spec
+            )
+            self.publish_timezone_checkpoint(
+                root,
+                run_spec,
+                fixture,
+                expected_prior=reference.receipt_sha256,
+                stage_evidence=stage_evidence,
+            )
+            candidate = root / TIMEZONE_STAGE_EVIDENCE[3]
+            candidate.write_bytes(candidate.read_bytes() + b" ")
+            with self.assertRaisesRegex(
+                ValueError, "timezone|candidate|gate|checkpoint|evidence"
+            ):
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+
+    def test_timezone_checkpoint_post_link_gate_race_cleans_new_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            fixture, stage_evidence, reference = self.terminal_timezone_fixture(
+                root, run_spec
+            )
+            static_checkpoint = fixture[5]
+            candidate = root / TIMEZONE_STAGE_EVIDENCE[3]
+            original = candidate.read_bytes()
+
+            def mutate_candidate() -> None:
+                candidate.write_bytes(original + b" ")
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_after_registry_publish",
+                    side_effect=mutate_candidate,
+                ),
+                self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "timezone|candidate|gate|artifact|evidence|snapshot",
+                ),
+            ):
+                self.publish_timezone_checkpoint(
+                    root,
+                    run_spec,
+                    fixture,
+                    expected_prior=reference.receipt_sha256,
+                    stage_evidence=stage_evidence,
+                )
+            candidate.write_bytes(original)
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            self.assertEqual(
+                sorted(path.name for path in checkpoint_dir.iterdir()),
+                [
+                    f"00000000-{static_checkpoint.receipt_sha256}.json",
+                    f"00000001-{reference.receipt_sha256}.json",
+                ],
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                reference,
+            )
 
     def test_reference_checkpoint_opens_with_exact_fixed_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

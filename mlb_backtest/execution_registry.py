@@ -146,7 +146,17 @@ _SOURCE_REPLAY_PREFIX = (
 _SCHEDULE_INVENTORY_PATH = (
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
 )
-_OPEN_CHECKPOINT_STAGES = frozenset({"STATIC_SCHEDULES", "REFERENCE_INPUTS"})
+_OPEN_CHECKPOINT_STAGES = frozenset(
+    {"STATIC_SCHEDULES", "REFERENCE_INPUTS", "TIMEZONE_REVIEW"}
+)
+_TIMEZONE_STAGE_EVIDENCE_PATHS = (
+    "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json",
+    "audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json",
+    "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
+    "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
+    "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+    "config/v5_2_qd/venue_timezones.json",
+)
 
 
 class _ReceiptMembershipError(ValueError):
@@ -2073,7 +2083,7 @@ def _checkpoint_stage_authority(
     static_batch = build_static_batch(run_path, contract_path)
     if stage == "STATIC_SCHEDULES":
         return (static_batch,), ()
-    if stage != "REFERENCE_INPUTS":
+    if stage not in {"REFERENCE_INPUTS", "TIMEZONE_REVIEW"}:
         raise ValueError(
             "non-static checkpoint stage authority is unavailable until implemented"
         )
@@ -2098,10 +2108,47 @@ def _checkpoint_stage_authority(
     )
     if reference_batch.derived_from_sha256 != verified.sha256:
         raise ValueError("REFERENCE_INPUTS inventory-derived batch binding differs")
-    return (
-        (static_batch, reference_batch),
-        ({"path": _SCHEDULE_INVENTORY_PATH, "sha256": verified.sha256},),
+    if stage == "REFERENCE_INPUTS":
+        return (
+            (static_batch, reference_batch),
+            ({"path": _SCHEDULE_INVENTORY_PATH, "sha256": verified.sha256},),
+        )
+
+    from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
+
+    gate = load_verified_timezone_gate(paths.root)
+    if (
+        gate.run_spec_sha256 != run_binding["sha256"]
+        or gate.acquisition_contract_sha256 != contract_binding["sha256"]
+        or gate.schedule_inventory_sha256 != verified.sha256
+        or gate.query_batch_ids
+        != (static_batch.batch_id, reference_batch.batch_id)
+    ):
+        raise ValueError("TIMEZONE_REVIEW gate authority binding differs")
+    stage_evidence = (
+        {"path": _TIMEZONE_STAGE_EVIDENCE_PATHS[0], "sha256": verified.sha256},
+        {
+            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[1],
+            "sha256": gate.review_sha256s[0],
+        },
+        {
+            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[2],
+            "sha256": gate.review_sha256s[1],
+        },
+        {
+            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[3],
+            "sha256": gate.candidate_sha256,
+        },
+        {
+            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[4],
+            "sha256": gate.seal_sha256,
+        },
+        {
+            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[5],
+            "sha256": gate.mapping_sha256,
+        },
     )
+    return (static_batch, reference_batch), stage_evidence
 
 
 def _checkpoint_semantic_snapshots(
@@ -2244,6 +2291,16 @@ def _checkpoint_current_semantic(
             raise ValueError(
                 "REFERENCE_INPUTS requires a complete canonical STATIC prefix"
             )
+    if stage == "TIMEZONE_REVIEW" and (
+        set(completed) != set(queries)
+        or pending
+        or quarantined
+        or split
+        or split_receipt_paths
+    ):
+        raise ValueError(
+            "TIMEZONE_REVIEW requires terminal completed STATIC and REFERENCE queries"
+        )
 
     expected_split_paths = {
         Path("audit/v5_2_qd/historical/acquisition/split_receipts")
@@ -2466,6 +2523,16 @@ def _checkpoint_artifacts_and_population(
             raise ValueError(
                 "REFERENCE_INPUTS requires a complete canonical STATIC prefix"
             )
+    if stage == "TIMEZONE_REVIEW" and (
+        set(payload["completed_query_ids"]) != query_ids
+        or payload["pending_query_ids"]
+        or payload["quarantined_query_ids"]
+        or payload["split_query_ids"]
+        or payload["split_receipts"]
+    ):
+        raise ValueError(
+            "TIMEZONE_REVIEW requires terminal completed STATIC and REFERENCE queries"
+        )
     evidence = payload["query_evidence_receipts"]
     assert isinstance(evidence, list)
     verified_evidence: set[tuple[str, str, str, str]] = set()
@@ -2638,16 +2705,7 @@ def _validate_checkpoint_progression(
             "REFERENCE_INPUTS checkpoint lacks schedule anchor evidence"
         )
     if current_stage == "TIMEZONE_REVIEW":
-        required = {
-            "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
-            "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
-            "config/v5_2_qd/venue_timezones.json",
-        }
-        review_prefix = (
-            "audit/v5_2_qd/historical/acquisition/timezone_reviews/"
-        )
-        reviews = {path for path in evidence_paths if path.startswith(review_prefix)}
-        if not required <= evidence_paths or len(reviews) != 2:
+        if evidence_paths != set(_TIMEZONE_STAGE_EVIDENCE_PATHS):
             raise ValueError(
                 "TIMEZONE_REVIEW checkpoint lacks its sealed semantic gate evidence"
             )
@@ -2657,6 +2715,10 @@ def _validate_checkpoint_progression(
         return
     previous_stage = ACQUISITION_STAGES.index(str(previous["stage"]))
     current_stage_index = ACQUISITION_STAGES.index(current_stage)
+    if current_stage == "TIMEZONE_REVIEW" and previous["stage"] != "REFERENCE_INPUTS":
+        raise ValueError(
+            "TIMEZONE_REVIEW requires the terminal REFERENCE_INPUTS checkpoint"
+        )
     if current_stage_index not in {previous_stage, previous_stage + 1}:
         raise ValueError("acquisition checkpoint stage regressed or skipped")
     if current_stage_index > previous_stage and (
