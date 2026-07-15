@@ -20,6 +20,7 @@ from mlb_backtest.v52_evidence import (
     logical_query_id,
 )
 from mlb_backtest.statcast import statcast_url
+from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,115 @@ RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
 CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
+
+
+def _inventory_anchor(**changes: object) -> dict[str, object]:
+    season = int(changes.get("season", 2024))
+    first, _ = SEASON_BOUNDARIES[season]
+    index = season - 2018
+    played = changes.get("played", False)
+    anchor: dict[str, object] = {
+        "alternate_site": False,
+        "away_score": 2 if played is True else None,
+        "away_team_id": 10 + index,
+        "completed_innings": 9 if played is True else None,
+        "doubleheader_order": 1,
+        "game_pk": season * 100 + index + 1,
+        "home_score": 4 if played is True else None,
+        "home_team_id": 20 + index,
+        "neutral_site": False,
+        "official_date": first.isoformat(),
+        "played": played,
+        "scheduled_innings": 9,
+        "scheduled_start_utc": f"{first.isoformat()}T17:05:00Z",
+        "season": season,
+        "season_start_date": first.isoformat(),
+        "terminal_status": "Final" if played is True else "Postponed",
+        "venue_id": 100 + index,
+        "winner_team_id": 20 + index if played is True else None,
+    }
+    anchor.update(changes)
+    return anchor
+
+
+def _verified_schedule_inventory(
+    custom_anchors: list[dict[str, object]] | None = None,
+) -> tuple[dict[str, object], str]:
+    by_season: dict[int, list[dict[str, object]]] = {}
+    for raw in custom_anchors or []:
+        anchor = _inventory_anchor(**raw)
+        by_season.setdefault(int(anchor["season"]), []).append(anchor)
+    anchors = [
+        anchor
+        for season in range(2018, 2025)
+        for anchor in by_season.get(season, [_inventory_anchor(season=season)])
+    ]
+    anchors.sort(key=lambda row: (int(row["season"]), int(row["game_pk"])))
+    season_sources = []
+    for season in range(2018, 2025):
+        rows = [row for row in anchors if row["season"] == season]
+        played = sum(row["played"] is True for row in rows)
+        first, last = SEASON_BOUNDARIES[season]
+        digest = hashlib.sha256(str(season).encode()).hexdigest()
+        season_sources.append(
+            {
+                "game_count": len(rows),
+                "inclusive_end": last.isoformat(),
+                "inclusive_start": first.isoformat(),
+                "played_game_count": played,
+                "query_id": digest,
+                "query_sidecar": {
+                    "path": f"data/v5_2_qd/historical/raw/{season}.sidecar.json",
+                    "sha256": digest,
+                },
+                "raw_sha256": digest,
+                "season": season,
+                "storage_mode": "FETCHED_RAW",
+                "success_receipt": {
+                    "path": f"data/v5_2_qd/historical/raw/{season}.success.json",
+                    "sha256": digest,
+                },
+                "unplayed_game_count": len(rows) - played,
+            }
+        )
+    played_count = sum(row["played"] is True for row in anchors)
+    payload: dict[str, object] = {
+        "acquisition_contract": {
+            "path": "protocols/v5_2_qd/historical_source_acquisition.json",
+            "sha256": CONTRACT_SHA,
+        },
+        "anchors": anchors,
+        "artifact_kind": "SCHEDULE_ANCHOR_INVENTORY",
+        "counts": {
+            "game_count": len(anchors),
+            "played_game_count": played_count,
+            "season_count": 7,
+            "unplayed_game_count": len(anchors) - played_count,
+        },
+        "run_id": "historical_walkforward_500",
+        "run_spec": {
+            "path": "protocols/v5_2_qd/historical_walkforward_500.json",
+            "sha256": RUN_SHA,
+        },
+        "schema_version": 1,
+        "season_sources": season_sources,
+        "static_batch": {
+            "batch_id": "d" * 64,
+            "path": "audit/v5_2_qd/historical/acquisition/query_batches/"
+            + "d" * 64
+            + ".json",
+            "sha256": "e" * 64,
+        },
+        "team_ids": sorted(
+            {
+                int(row[field])
+                for row in anchors
+                for field in ("away_team_id", "home_team_id")
+            }
+        ),
+        "venue_ids": sorted({int(row["venue_id"]) for row in anchors}),
+    }
+    return payload, hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -59,7 +169,7 @@ def _write_forged_canonical_batch(
     ).hexdigest()
     record = {"schema_version": 1, "batch_id": batch_id, **payload}
     batch_dir = root / "audit/v5_2_qd/historical/acquisition/query_batches"
-    batch_dir.mkdir(parents=True)
+    batch_dir.mkdir(parents=True, exist_ok=True)
     (batch_dir / f"{batch_id}.json").write_bytes(_canonical_json_bytes(record))
     return batch_id
 
@@ -645,21 +755,15 @@ class V52QueryPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single-day"):
             bisect_statcast_query(_parent("2024-06-01", "2024-06-01"))
 
-    def test_schedule_reference_batch_deduplicates_boxscore_pitching_team_and_venue_queries(
+    def test_schedule_reference_batch_projects_exact_boxscore_pitching_team_and_venue_queries(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
 
-        inventory = {
-            "anchors": [
-                {
-                    "season": 2024,
-                    "season_start_date": "2024-03-20",
-                    "game_pk": 7,
-                    "official_date": "2024-04-02",
-                    "venue_id": 31,
-                    "played": True,
-                },
+        inventory, inventory_sha256 = _verified_schedule_inventory(
+            [
                 {
                     "season": 2024,
                     "season_start_date": "2024-03-20",
@@ -677,9 +781,10 @@ class V52QueryPlanTest(unittest.TestCase):
                     "played": False,
                 },
             ]
-        }
-        batch = build_schedule_reference_batch(
+        )
+        batch = _build_schedule_reference_batch_from_inventory(
             inventory,
+            inventory_sha256=inventory_sha256,
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -701,14 +806,17 @@ class V52QueryPlanTest(unittest.TestCase):
             pitching.requested_range["response_completeness"],
             {"limit": 5000, "reject_total_splits_at_or_above_limit": True},
         )
-        self.assertEqual(sum(q.endpoint.endswith("/teams") for q in batch.queries), 1)
+        self.assertEqual(sum(q.endpoint.endswith("/teams") for q in batch.queries), 7)
         self.assertEqual(sum("/venues/31" in q.endpoint for q in batch.queries), 1)
         self.assertEqual(batch.stage, "REFERENCE_INPUTS")
+        self.assertEqual(batch.derived_from_sha256, inventory_sha256)
 
     def test_schedule_reference_rejects_wrong_start_offseason_and_conflicting_season_rows(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
 
         base = {
             "season": 2024,
@@ -718,33 +826,35 @@ class V52QueryPlanTest(unittest.TestCase):
             "venue_id": 31,
             "played": True,
         }
-        invalid_inventories = [
-            {"anchors": [{**base, "season_start_date": "2024-03-21"}]},
-            {"anchors": [{**base, "official_date": "2024-10-01"}]},
-            {
-                "anchors": [
+        invalid_anchor_sets = [
+            [{**base, "season_start_date": "2024-03-21"}],
+            [{**base, "official_date": "2024-10-01"}],
+            [
                     base,
                     {
                         **base,
                         "game_pk": 8,
                         "season_start_date": "2024-03-19",
                     },
-                ]
-            },
+            ],
         ]
-        for inventory in invalid_inventories:
-            with self.subTest(inventory=inventory), self.assertRaises(ValueError):
-                build_schedule_reference_batch(
+        for anchors in invalid_anchor_sets:
+            inventory, inventory_sha256 = _verified_schedule_inventory(anchors)
+            with self.subTest(anchors=anchors), self.assertRaises(ValueError):
+                _build_schedule_reference_batch_from_inventory(
                     inventory,
+                    inventory_sha256=inventory_sha256,
                     run_spec_sha256=RUN_SHA,
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
 
     def test_opening_day_d1_emits_preseason_disposition_not_invalid_stats_query(self):
-        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
 
-        inventory = {
-            "anchors": [
+        inventory, inventory_sha256 = _verified_schedule_inventory(
+            [
                 {
                     "season": 2024,
                     "season_start_date": "2024-03-20",
@@ -754,9 +864,10 @@ class V52QueryPlanTest(unittest.TestCase):
                     "played": True,
                 }
             ]
-        }
-        batch = build_schedule_reference_batch(
+        )
+        batch = _build_schedule_reference_batch_from_inventory(
             inventory,
+            inventory_sha256=inventory_sha256,
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -777,28 +888,23 @@ class V52QueryPlanTest(unittest.TestCase):
         self.assertNotIn("startDate", pitching[0].parameters)
 
     def test_all_unplayed_schedule_population_emits_no_d1_query_or_disposition(self):
-        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
 
-        batch = build_schedule_reference_batch(
-            {
-                "anchors": [
-                    {
-                        "season": 2024,
-                        "season_start_date": "2024-03-20",
-                        "game_pk": 1,
-                        "official_date": "2024-03-20",
-                        "venue_id": 31,
-                        "played": False,
-                    }
-                ]
-            },
+        inventory, inventory_sha256 = _verified_schedule_inventory()
+        batch = _build_schedule_reference_batch_from_inventory(
+            inventory,
+            inventory_sha256=inventory_sha256,
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
         self.assertFalse(any(q.source == "mlb_stats_pitching" for q in batch.queries))
 
-    def test_schedule_reference_requires_played_and_rejects_conflicting_duplicate(self):
-        from mlb_backtest.v52_query_plan import build_schedule_reference_batch
+    def test_schedule_reference_requires_complete_inventory_and_rejects_any_duplicate(self):
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
 
         base = {
             "season": 2024,
@@ -807,17 +913,330 @@ class V52QueryPlanTest(unittest.TestCase):
             "official_date": "2024-04-02",
             "venue_id": 31,
         }
-        invalid_anchors = [
-            [base],
-            [{**base, "played": True}, {**base, "played": False}],
-        ]
-        for anchors in invalid_anchors:
-            with self.subTest(anchors=anchors), self.assertRaises(ValueError):
-                build_schedule_reference_batch(
-                    {"anchors": anchors},
+        missing, _ = _verified_schedule_inventory([{**base, "played": True}])
+        del missing["anchors"][-1]["played"]
+        duplicate, duplicate_sha = _verified_schedule_inventory(
+            [{**base, "played": True}, {**base, "played": True}]
+        )
+        valid, _ = _verified_schedule_inventory(
+            [{**base, "played": True}]
+        )
+        forged_run = json.loads(_canonical_json_bytes(valid))
+        forged_run["run_spec"]["sha256"] = "9" * 64
+        forged_contract = json.loads(_canonical_json_bytes(valid))
+        forged_contract["acquisition_contract"]["sha256"] = "8" * 64
+        attacks = (
+            (missing, hashlib.sha256(_canonical_json_bytes(missing)).hexdigest()),
+            (duplicate, duplicate_sha),
+            ({"anchors": [_inventory_anchor()]}, "f" * 64),
+            (valid, "0" * 64),
+            (
+                forged_run,
+                hashlib.sha256(_canonical_json_bytes(forged_run)).hexdigest(),
+            ),
+            (
+                forged_contract,
+                hashlib.sha256(
+                    _canonical_json_bytes(forged_contract)
+                ).hexdigest(),
+            ),
+        )
+        for inventory, inventory_sha256 in attacks:
+            with self.subTest(inventory=inventory), self.assertRaises(ValueError):
+                _build_schedule_reference_batch_from_inventory(
+                    inventory,
+                    inventory_sha256=inventory_sha256,
                     run_spec_sha256=RUN_SHA,
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
+
+    def test_schedule_reference_public_builder_loads_fixed_verified_inventory(self):
+        from mlb_backtest.v52_schedule_inventory import (
+            publish_schedule_anchor_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_schedule_reference_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_schedule_inventory import _fixture, _kwargs
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = _fixture(Path(td).resolve())
+            verified = publish_schedule_anchor_inventory(**_kwargs(fixture))
+            batch = build_schedule_reference_batch(
+                fixture.root,
+                fixture.root
+                / "protocols/v5_2_qd/historical_walkforward_500.json",
+                acquisition_contract_path=fixture.root
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+                static_batch_id=fixture.batch_id,
+                evidence_root=fixture.evidence_root,
+            )
+            self.assertEqual(batch.derived_from_sha256, verified.sha256)
+            self.assertEqual(batch.stage, "REFERENCE_INPUTS")
+            publish_query_batch(fixture.root, batch)
+            self.assertEqual(
+                load_query_batch(fixture.root, batch.batch_id), batch
+            )
+            with self.assertRaises((TypeError, ValueError)):
+                build_schedule_reference_batch(  # type: ignore[call-arg]
+                    verified.payload,
+                    run_spec_sha256=RUN_SHA,
+                    acquisition_contract_sha256=CONTRACT_SHA,
+                )
+
+    def test_reference_stage_validator_rejects_forged_structure_on_make_and_load(self):
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+            _make_batch,
+            load_query_batch,
+        )
+
+        inventory, inventory_sha256 = _verified_schedule_inventory(
+            [
+                {
+                    "season": 2024,
+                    "game_pk": 7,
+                    "official_date": "2024-04-02",
+                    "played": True,
+                    "venue_id": 31,
+                },
+                {
+                    "season": 2024,
+                    "game_pk": 8,
+                    "official_date": "2024-04-02",
+                    "played": True,
+                    "venue_id": 32,
+                },
+            ]
+        )
+        valid = _build_schedule_reference_batch_from_inventory(
+            inventory,
+            inventory_sha256=inventory_sha256,
+            run_spec_sha256=RUN_SHA,
+            acquisition_contract_sha256=CONTRACT_SHA,
+        )
+        boxscore_index = next(
+            index
+            for index, query in enumerate(valid.queries)
+            if query.source == "mlb_schedule_game_feed"
+        )
+        team_index = next(
+            index
+            for index, query in enumerate(valid.queries)
+            if query.endpoint.endswith("/teams")
+        )
+        forged_boxscore = dataclasses.replace(
+            valid.queries[boxscore_index],
+            endpoint=valid.queries[boxscore_index].endpoint + "/forged",
+        )
+        pitching_index = next(
+            index
+            for index, query in enumerate(valid.queries)
+            if query.source == "mlb_stats_pitching"
+        )
+        pitching_query = valid.queries[pitching_index]
+        split_pitching = tuple(
+            dataclasses.replace(
+                pitching_query,
+                requested_range={
+                    **pitching_query.requested_range,
+                    "consumer_cutoff_dates": {
+                        str(game_pk): pitching_query.requested_range[
+                            "as_of_date"
+                        ]
+                    },
+                    "consuming_game_pks": [game_pk],
+                },
+            )
+            for game_pk in pitching_query.requested_range["consuming_game_pks"]
+        )
+        attacks = {
+            "missing-derived": (None, valid.queries),
+            "empty": (inventory_sha256, ()),
+            "boxscore": (
+                inventory_sha256,
+                (*valid.queries[:boxscore_index], forged_boxscore, *valid.queries[boxscore_index + 1 :]),
+            ),
+            "missing-team": (
+                inventory_sha256,
+                (*valid.queries[:team_index], *valid.queries[team_index + 1 :]),
+            ),
+            "split-pitching-group": (
+                inventory_sha256,
+                (
+                    *valid.queries[:pitching_index],
+                    *split_pitching,
+                    *valid.queries[pitching_index + 1 :],
+                ),
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "REFERENCE_INPUTS|boxscore"):
+            _make_batch(
+                "REFERENCE_INPUTS",
+                inventory_sha256,
+                attacks["boxscore"][1],
+            )
+        with self.assertRaisesRegex(ValueError, "REFERENCE_INPUTS|pitching"):
+            _make_batch(
+                "REFERENCE_INPUTS",
+                inventory_sha256,
+                attacks["split-pitching-group"][1],
+            )
+        for attack, (derived, queries) in attacks.items():
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                batch_id = _write_forged_canonical_batch(
+                    root,
+                    stage="REFERENCE_INPUTS",
+                    derived_from_sha256=derived,
+                    queries=tuple(queries),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "REFERENCE_INPUTS|reference|derived"
+                ):
+                    load_query_batch(root, batch_id)
+
+    def test_reference_publish_and_load_replay_fixed_inventory_exactly(self):
+        from mlb_backtest.v52_schedule_inventory import (
+            publish_schedule_anchor_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            _make_batch,
+            build_schedule_reference_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_schedule_inventory import _fixture, _kwargs
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = _fixture(Path(td).resolve())
+            verified = publish_schedule_anchor_inventory(**_kwargs(fixture))
+            valid = build_schedule_reference_batch(
+                fixture.root,
+                fixture.root
+                / "protocols/v5_2_qd/historical_walkforward_500.json",
+                acquisition_contract_path=fixture.root
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+                static_batch_id=fixture.batch_id,
+                evidence_root=fixture.evidence_root,
+            )
+            no_played = tuple(
+                query
+                for query in valid.queries
+                if query.source
+                not in {"mlb_schedule_game_feed", "mlb_stats_pitching"}
+            )
+            venue_indexes = [
+                index
+                for index, query in enumerate(valid.queries)
+                if "/venues/" in query.endpoint
+            ]
+            venue_subset = tuple(
+                query
+                for index, query in enumerate(valid.queries)
+                if index != venue_indexes[-1]
+            )
+            last_venue = valid.queries[venue_indexes[-1]]
+            extra_venue = dataclasses.replace(
+                last_venue,
+                endpoint="https://statsapi.mlb.com/api/v1/venues/999",
+                requested_range={"venue_id": 999},
+            )
+            venue_extra = (*valid.queries, extra_venue)
+            semantic_attacks = {
+                "played-subset": no_played,
+                "venue-subset": venue_subset,
+                "venue-extra": venue_extra,
+            }
+            for attack, queries in semantic_attacks.items():
+                forged = _make_batch(
+                    "REFERENCE_INPUTS", verified.sha256, queries
+                )
+                with self.subTest(attack=attack), self.assertRaisesRegex(
+                    ValueError, "REFERENCE_INPUTS|inventory|reference|replay"
+                ):
+                    publish_query_batch(fixture.root, forged)
+                forged_id = _write_forged_canonical_batch(
+                    fixture.root,
+                    stage="REFERENCE_INPUTS",
+                    derived_from_sha256=verified.sha256,
+                    queries=tuple(queries),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "REFERENCE_INPUTS|inventory|reference|replay"
+                ):
+                    load_query_batch(fixture.root, forged_id)
+
+            team_index = next(
+                index
+                for index, query in enumerate(valid.queries)
+                if query.endpoint.endswith("/teams")
+            )
+            team_omission = (
+                *valid.queries[:team_index],
+                *valid.queries[team_index + 1 :],
+            )
+            forged_id = _write_forged_canonical_batch(
+                fixture.root,
+                stage="REFERENCE_INPUTS",
+                derived_from_sha256=verified.sha256,
+                queries=team_omission,
+            )
+            with self.assertRaises(ValueError):
+                load_query_batch(fixture.root, forged_id)
+
+    def test_reference_publish_rebinds_authority_before_existing_and_new_returns(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        from mlb_backtest.v52_schedule_inventory import (
+            publish_schedule_anchor_inventory,
+        )
+        from tests.test_v52_schedule_inventory import _fixture, _kwargs
+
+        for publication in ("existing", "new"):
+            with self.subTest(publication=publication), tempfile.TemporaryDirectory() as td:
+                fixture = _fixture(Path(td).resolve())
+                verified = publish_schedule_anchor_inventory(**_kwargs(fixture))
+                batch = query_plan.build_schedule_reference_batch(
+                    fixture.root,
+                    fixture.root
+                    / "protocols/v5_2_qd/historical_walkforward_500.json",
+                    acquisition_contract_path=fixture.root
+                    / "protocols/v5_2_qd/historical_source_acquisition.json",
+                    static_batch_id=fixture.batch_id,
+                    evidence_root=fixture.evidence_root,
+                )
+                final = (
+                    fixture.root
+                    / "audit/v5_2_qd/historical/acquisition/query_batches"
+                    / f"{batch.batch_id}.json"
+                )
+                if publication == "existing":
+                    query_plan.publish_query_batch(fixture.root, batch)
+                    expected = final.read_bytes()
+
+                def mutate_authority() -> None:
+                    payload = json.loads(verified.path.read_bytes())
+                    payload["counts"]["game_count"] += 1
+                    verified.path.write_bytes(_canonical_json_bytes(payload))
+
+                with (
+                    mock.patch.object(
+                        query_plan,
+                        "_before_query_batch_authority_rebind",
+                        side_effect=mutate_authority,
+                        create=True,
+                    ) as hook,
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    query_plan.publish_query_batch(fixture.root, batch)
+                hook.assert_called_once_with()
+                if publication == "existing":
+                    self.assertEqual(final.read_bytes(), expected)
+                else:
+                    self.assertFalse(final.exists())
 
     def test_participant_batch_uses_only_verified_actual_starters_and_deduplicates(
         self,
@@ -2196,9 +2615,19 @@ class V52QueryPlanTest(unittest.TestCase):
                         )
                     elif mutation == "stage":
                         stage = "REFERENCE_INPUTS"
-                    forged = query_plan._make_batch(stage, derived_from, children)
-                    query_plan.publish_query_batch(root, forged)
-                    child_batch_id = forged.batch_id
+                    if mutation == "stage":
+                        child_batch_id = _write_forged_canonical_batch(
+                            root,
+                            stage=stage,
+                            derived_from_sha256=derived_from,
+                            queries=tuple(children),
+                        )
+                    else:
+                        forged = query_plan._make_batch(
+                            stage, derived_from, children
+                        )
+                        query_plan.publish_query_batch(root, forged)
+                        child_batch_id = forged.batch_id
 
                 with self.assertRaises((ValueError, RuntimeError)):
                     query_plan.publish_split_receipt(

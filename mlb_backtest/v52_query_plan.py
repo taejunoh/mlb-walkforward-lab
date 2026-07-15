@@ -107,9 +107,18 @@ class _StaticQueryInputs:
 
 
 def _canonical_json_bytes(value: object) -> bytes:
+    def normalized(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {key: normalized(child) for key, child in item.items()}
+        if isinstance(item, tuple):
+            return [normalized(child) for child in item]
+        if isinstance(item, list):
+            return [normalized(child) for child in item]
+        return item
+
     try:
         return json.dumps(
-            value,
+            normalized(value),
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -235,6 +244,214 @@ def _validate_remaining_stage(
             )
 
 
+def _reference_common(query: LogicalQuery, label: str) -> None:
+    if (
+        query.parent_query_id is not None
+        or query.expected_media_type != "application/json"
+        or query.parser_version != "v5.2.1"
+    ):
+        raise ValueError(f"REFERENCE_INPUTS {label} query contract differs")
+
+
+def _validate_reference_inputs_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    derived = _validate_sha256(
+        derived_from_sha256, "REFERENCE_INPUTS derived_from_sha256"
+    )
+    if not derived or not queries:
+        raise ValueError("REFERENCE_INPUTS requires a nonempty derived batch")
+    _validate_shared_query_bindings(queries, "REFERENCE_INPUTS")
+
+    categories: list[int] = []
+    boxscores: list[tuple[int, int, date]] = []
+    pitching: list[tuple[int, date, tuple[int, ...]]] = []
+    teams: list[int] = []
+    venues: list[int] = []
+    boxscore_endpoint = re.compile(rf"^{re.escape(_MLB_BASE)}/game/([1-9][0-9]*)/boxscore$")
+    venue_endpoint = re.compile(rf"^{re.escape(_MLB_BASE)}/venues/([1-9][0-9]*)$")
+
+    for query in queries:
+        _reference_common(query, "source")
+        boxscore_match = boxscore_endpoint.fullmatch(query.endpoint)
+        venue_match = venue_endpoint.fullmatch(query.endpoint)
+        if query.source == "mlb_schedule_game_feed" and boxscore_match is not None:
+            categories.append(0)
+            game_pk = int(boxscore_match.group(1))
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            requested_game_pk = requested.get("game_pk")
+            if (
+                query.grain != "season_schedule_and_game"
+                or dict(query.parameters)
+                or set(requested) != {"season", "game_pk", "official_date"}
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or season not in SEASON_BOUNDARIES
+                or requested_game_pk != game_pk
+            ):
+                raise ValueError("REFERENCE_INPUTS boxscore query differs")
+            official = _iso_date(
+                requested.get("official_date"), "REFERENCE_INPUTS boxscore date"
+            )
+            first, last = SEASON_BOUNDARIES[season]
+            if not first <= official <= last:
+                raise ValueError("REFERENCE_INPUTS boxscore date differs from season")
+            boxscores.append((game_pk, season, official))
+            continue
+
+        if query.source == "mlb_stats_pitching":
+            categories.append(1)
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            if (
+                query.grain != "season_d1_league_pitching_reference"
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or season not in SEASON_BOUNDARIES
+            ):
+                raise ValueError("REFERENCE_INPUTS pitching query differs")
+            as_of = _iso_date(
+                requested.get("as_of_date"), "REFERENCE_INPUTS pitching as_of_date"
+            )
+            consumers = requested.get("consuming_game_pks")
+            cutoffs = requested.get("consumer_cutoff_dates")
+            if (
+                not isinstance(consumers, list)
+                or not consumers
+                or any(
+                    isinstance(game_pk, bool)
+                    or not isinstance(game_pk, int)
+                    or game_pk <= 0
+                    for game_pk in consumers
+                )
+                or consumers != sorted(set(consumers))
+                or not isinstance(cutoffs, dict)
+                or set(cutoffs) != {str(game_pk) for game_pk in consumers}
+                or any(value != as_of.isoformat() for value in cutoffs.values())
+            ):
+                raise ValueError("REFERENCE_INPUTS pitching consumers differ")
+            first, _ = SEASON_BOUNDARIES[season]
+            if as_of < first:
+                expected_requested = {
+                    "season": season,
+                    "as_of_date": as_of.isoformat(),
+                    "consumer_cutoff_dates": cutoffs,
+                    "consuming_game_pks": consumers,
+                    "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                    "reason": _PRESEASON_DISPOSITION_REASON,
+                }
+                if (
+                    as_of != first - timedelta(days=1)
+                    or query.endpoint
+                    != "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+                    or dict(query.parameters)
+                    or requested != expected_requested
+                ):
+                    raise ValueError(
+                        "REFERENCE_INPUTS preseason disposition differs"
+                    )
+            else:
+                expected_parameters = {
+                    "stats": "byDateRange",
+                    "group": "pitching",
+                    "sportIds": 1,
+                    "gameType": "R",
+                    "playerPool": "ALL",
+                    "limit": 5000,
+                    "startDate": first.isoformat(),
+                    "endDate": as_of.isoformat(),
+                }
+                expected_requested = {
+                    "season": season,
+                    "start_date": first.isoformat(),
+                    "as_of_date": as_of.isoformat(),
+                    "consumer_cutoff_dates": cutoffs,
+                    "consuming_game_pks": consumers,
+                    "response_completeness": {
+                        "limit": 5000,
+                        "reject_total_splits_at_or_above_limit": True,
+                    },
+                }
+                if (
+                    query.endpoint != _STATS_ENDPOINT
+                    or dict(query.parameters) != expected_parameters
+                    or requested != expected_requested
+                ):
+                    raise ValueError("REFERENCE_INPUTS pitching query differs")
+            pitching.append((season, as_of, tuple(consumers)))
+            continue
+
+        if query.source == "venue_team_timezone_table" and query.endpoint == _TEAMS_ENDPOINT:
+            categories.append(2)
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            if (
+                query.grain != "effective_dated_venue_team_reference"
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or dict(query.parameters)
+                != {
+                    "sportId": 1,
+                    "season": season,
+                    "hydrate": "venue(location)",
+                }
+                or requested != {"season": season, "entity": "teams"}
+            ):
+                raise ValueError("REFERENCE_INPUTS team query differs")
+            teams.append(season)
+            continue
+
+        if (
+            query.source == "venue_team_timezone_table"
+            and venue_match is not None
+        ):
+            categories.append(3)
+            venue_id = int(venue_match.group(1))
+            if (
+                query.grain != "effective_dated_venue_team_reference"
+                or dict(query.parameters) != {"hydrate": "location"}
+                or dict(query.requested_range) != {"venue_id": venue_id}
+            ):
+                raise ValueError("REFERENCE_INPUTS venue query differs")
+            venues.append(venue_id)
+            continue
+        raise ValueError("REFERENCE_INPUTS contains an unapproved source query")
+
+    if categories != sorted(categories):
+        raise ValueError("REFERENCE_INPUTS query partitions are out of order")
+    game_pks = [row[0] for row in boxscores]
+    if game_pks != sorted(set(game_pks)):
+        raise ValueError("REFERENCE_INPUTS boxscores are not uniquely ordered")
+    pitching_keys = [(season, as_of) for season, as_of, _ in pitching]
+    if pitching_keys != sorted(set(pitching_keys)):
+        raise ValueError(
+            "REFERENCE_INPUTS pitching groups are not uniquely ordered"
+        )
+    if teams != list(range(2018, 2025)):
+        raise ValueError("REFERENCE_INPUTS requires the seven canonical team queries")
+    if not venues or venues != sorted(set(venues)):
+        raise ValueError("REFERENCE_INPUTS venues are not uniquely ordered")
+
+    boxscore_by_pk = {
+        game_pk: (season, official) for game_pk, season, official in boxscores
+    }
+    pitching_consumers: set[int] = set()
+    for season, as_of, consumers in pitching:
+        for game_pk in consumers:
+            if game_pk in pitching_consumers:
+                raise ValueError("REFERENCE_INPUTS pitching consumer is duplicated")
+            expected = boxscore_by_pk.get(game_pk)
+            if expected != (season, as_of + timedelta(days=1)):
+                raise ValueError(
+                    "REFERENCE_INPUTS pitching consumer differs from boxscore"
+                )
+            pitching_consumers.add(game_pk)
+    if pitching_consumers != set(boxscore_by_pk):
+        raise ValueError("REFERENCE_INPUTS pitching coverage differs from boxscores")
+
+
 def _validate_stage_batch(
     stage: str,
     derived_from_sha256: str | None,
@@ -242,6 +459,8 @@ def _validate_stage_batch(
 ) -> None:
     if stage == "STATIC_SCHEDULES":
         _validate_static_schedule_stage(derived_from_sha256, queries)
+    elif stage == "REFERENCE_INPUTS":
+        _validate_reference_inputs_stage(derived_from_sha256, queries)
     elif stage == "REMAINING":
         _validate_remaining_stage(derived_from_sha256, queries)
 
@@ -802,24 +1021,270 @@ def _validate_binding_hashes(
     _validate_sha256(acquisition_contract_sha256, "acquisition_contract_sha256")
 
 
-def build_schedule_reference_batch(
+_SCHEDULE_INVENTORY_KEYS = frozenset(
+    {
+        "acquisition_contract",
+        "anchors",
+        "artifact_kind",
+        "counts",
+        "run_id",
+        "run_spec",
+        "schema_version",
+        "season_sources",
+        "static_batch",
+        "team_ids",
+        "venue_ids",
+    }
+)
+_SCHEDULE_ANCHOR_KEYS = frozenset(
+    {
+        "alternate_site",
+        "away_score",
+        "away_team_id",
+        "completed_innings",
+        "doubleheader_order",
+        "game_pk",
+        "home_score",
+        "home_team_id",
+        "neutral_site",
+        "official_date",
+        "played",
+        "scheduled_innings",
+        "scheduled_start_utc",
+        "season",
+        "season_start_date",
+        "terminal_status",
+        "venue_id",
+        "winner_team_id",
+    }
+)
+_SCHEDULE_SOURCE_KEYS = frozenset(
+    {
+        "game_count",
+        "inclusive_end",
+        "inclusive_start",
+        "played_game_count",
+        "query_id",
+        "query_sidecar",
+        "raw_sha256",
+        "season",
+        "storage_mode",
+        "success_receipt",
+        "unplayed_game_count",
+    }
+)
+
+
+def _inventory_binding(
+    raw: object,
+    label: str,
+    *,
+    expected_path: str | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[str, str]:
+    if not isinstance(raw, Mapping) or set(raw) != {"path", "sha256"}:
+        raise ValueError(f"schedule inventory {label} binding differs")
+    path = raw.get("path")
+    digest = raw.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or any(part in {"", ".", ".."} for part in Path(path).parts)
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or (expected_path is not None and path != expected_path)
+        or (expected_sha256 is not None and digest != expected_sha256)
+    ):
+        raise ValueError(f"schedule inventory {label} binding differs")
+    return path, digest
+
+
+def _validated_schedule_inventory_anchors(
     anchor_inventory: Mapping[str, object],
     *,
+    inventory_sha256: str,
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+) -> list[Mapping[str, object]]:
+    _validate_sha256(inventory_sha256, "schedule inventory SHA-256")
+    if (
+        _sha256_bytes(_canonical_json_bytes(anchor_inventory) + b"\n")
+        != inventory_sha256
+    ):
+        raise ValueError("schedule inventory SHA-256 differs from canonical bytes")
+    if set(anchor_inventory) != _SCHEDULE_INVENTORY_KEYS:
+        raise ValueError("schedule inventory top-level keys differ")
+    if (
+        anchor_inventory.get("artifact_kind") != "SCHEDULE_ANCHOR_INVENTORY"
+        or anchor_inventory.get("schema_version") != 1
+        or anchor_inventory.get("run_id") != "historical_walkforward_500"
+    ):
+        raise ValueError("schedule inventory identity differs")
+    _inventory_binding(
+        anchor_inventory.get("run_spec"),
+        "RunSpec",
+        expected_path=_RUN_SPEC_RELATIVE.as_posix(),
+        expected_sha256=run_spec_sha256,
+    )
+    _inventory_binding(
+        anchor_inventory.get("acquisition_contract"),
+        "acquisition contract",
+        expected_path=_ACQUISITION_CONTRACT_RELATIVE.as_posix(),
+        expected_sha256=acquisition_contract_sha256,
+    )
+    static_batch = anchor_inventory.get("static_batch")
+    if not isinstance(static_batch, Mapping) or set(static_batch) != {
+        "batch_id",
+        "path",
+        "sha256",
+    }:
+        raise ValueError("schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_batch.get("batch_id"), "schedule inventory static batch ID"
+    )
+    _inventory_binding(
+        {"path": static_batch.get("path"), "sha256": static_batch.get("sha256")},
+        "static batch",
+        expected_path=(
+            _ACQUISITION_BATCH_ROOT / f"{static_batch_id}.json"
+        ).as_posix(),
+    )
+
+    raw_anchors = anchor_inventory.get("anchors")
+    if (
+        not isinstance(raw_anchors, Sequence)
+        or isinstance(raw_anchors, (str, bytes))
+        or not raw_anchors
+    ):
+        raise ValueError("schedule inventory anchors must be nonempty")
+    anchors: list[Mapping[str, object]] = []
+    prior: tuple[int, int] | None = None
+    game_pks: set[int] = set()
+    teams: set[int] = set()
+    venues: set[int] = set()
+    by_season: dict[int, list[Mapping[str, object]]] = {
+        season: [] for season in range(2018, 2025)
+    }
+    for raw in raw_anchors:
+        if not isinstance(raw, Mapping) or set(raw) != _SCHEDULE_ANCHOR_KEYS:
+            raise ValueError("schedule inventory anchor keys differ")
+        season = raw.get("season")
+        game_pk = raw.get("game_pk")
+        venue_id = raw.get("venue_id")
+        away_team_id = raw.get("away_team_id")
+        home_team_id = raw.get("home_team_id")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                season,
+                game_pk,
+                venue_id,
+                away_team_id,
+                home_team_id,
+            )
+        ):
+            raise ValueError("schedule inventory anchor IDs differ")
+        if season not in SEASON_BOUNDARIES:
+            raise ValueError("schedule inventory anchor season differs")
+        if type(raw.get("played")) is not bool:
+            raise ValueError("schedule inventory anchor played differs")
+        official = _iso_date(
+            raw.get("official_date"), "schedule inventory official_date"
+        )
+        season_start = _iso_date(
+            raw.get("season_start_date"), "schedule inventory season_start_date"
+        )
+        first, last = SEASON_BOUNDARIES[season]
+        if season_start != first or not first <= official <= last:
+            raise ValueError("schedule inventory anchor dates differ from season")
+        identity = (season, game_pk)
+        if prior is not None and identity <= prior:
+            raise ValueError("schedule inventory anchors are not strictly ordered")
+        if game_pk in game_pks:
+            raise ValueError("schedule inventory contains duplicate game_pk")
+        prior = identity
+        game_pks.add(game_pk)
+        teams.update((away_team_id, home_team_id))
+        venues.add(venue_id)
+        anchors.append(raw)
+        by_season[season].append(raw)
+
+    inventory_team_ids = anchor_inventory.get("team_ids")
+    inventory_venue_ids = anchor_inventory.get("venue_ids")
+    if (
+        not isinstance(inventory_team_ids, Sequence)
+        or isinstance(inventory_team_ids, (str, bytes))
+        or list(inventory_team_ids) != sorted(teams)
+    ):
+        raise ValueError("schedule inventory team IDs differ from anchors")
+    if (
+        not isinstance(inventory_venue_ids, Sequence)
+        or isinstance(inventory_venue_ids, (str, bytes))
+        or list(inventory_venue_ids) != sorted(venues)
+    ):
+        raise ValueError("schedule inventory venue IDs differ from anchors")
+    played_count = sum(anchor.get("played") is True for anchor in anchors)
+    if anchor_inventory.get("counts") != {
+        "game_count": len(anchors),
+        "played_game_count": played_count,
+        "season_count": 7,
+        "unplayed_game_count": len(anchors) - played_count,
+    }:
+        raise ValueError("schedule inventory counts differ from anchors")
+    sources = anchor_inventory.get("season_sources")
+    if (
+        not isinstance(sources, Sequence)
+        or isinstance(sources, (str, bytes))
+        or len(sources) != 7
+    ):
+        raise ValueError("schedule inventory season sources differ")
+    for season, source in zip(range(2018, 2025), sources, strict=True):
+        if not isinstance(source, Mapping) or set(source) != _SCHEDULE_SOURCE_KEYS:
+            raise ValueError("schedule inventory season source keys differ")
+        rows = by_season[season]
+        played = sum(row.get("played") is True for row in rows)
+        first, last = SEASON_BOUNDARIES[season]
+        if (
+            not rows
+            or source.get("season") != season
+            or source.get("inclusive_start") != first.isoformat()
+            or source.get("inclusive_end") != last.isoformat()
+            or source.get("game_count") != len(rows)
+            or source.get("played_game_count") != played
+            or source.get("unplayed_game_count") != len(rows) - played
+            or source.get("storage_mode")
+            not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
+        ):
+            raise ValueError("schedule inventory season source differs")
+        _validate_sha256(source.get("query_id"), "schedule source query ID")
+        _validate_sha256(source.get("raw_sha256"), "schedule source raw SHA-256")
+        _inventory_binding(source.get("query_sidecar"), "query sidecar")
+        _inventory_binding(source.get("success_receipt"), "success receipt")
+    return anchors
+
+
+def _build_schedule_reference_batch_from_inventory(
+    anchor_inventory: Mapping[str, object],
+    *,
+    inventory_sha256: str,
     run_spec_sha256: str,
     acquisition_contract_sha256: str,
 ) -> QueryBatch:
     _validate_binding_hashes(run_spec_sha256, acquisition_contract_sha256)
-    derived = _canonical_mapping_sha256(anchor_inventory, "anchor_inventory")
-    anchors = anchor_inventory.get("anchors")
-    if not isinstance(anchors, list):
-        raise ValueError("anchor_inventory.anchors must be a list")
+    anchors = _validated_schedule_inventory_anchors(
+        anchor_inventory,
+        inventory_sha256=inventory_sha256,
+        run_spec_sha256=run_spec_sha256,
+        acquisition_contract_sha256=acquisition_contract_sha256,
+    )
 
     unique_games: dict[int, tuple[int, date, date, int, bool]] = {}
     seasons: set[int] = set()
     venues: set[int] = set()
     pitching_consumers: dict[tuple[int, date, date], set[int]] = {}
     for raw in anchors:
-        if not isinstance(raw, dict):
+        if not isinstance(raw, Mapping):
             raise ValueError("schedule anchor must be an object")
         season = raw.get("season")
         game_pk = raw.get("game_pk")
@@ -842,8 +1307,8 @@ def build_schedule_reference_batch(
         if season_start != frozen_start or not frozen_start <= official <= frozen_end:
             raise ValueError("schedule anchor dates differ from season")
         identity = (season, season_start, official, venue_id, played)
-        if game_pk in unique_games and unique_games[game_pk] != identity:
-            raise ValueError("conflicting duplicate schedule game_pk")
+        if game_pk in unique_games:
+            raise ValueError("schedule inventory contains duplicate game_pk")
         unique_games[game_pk] = identity
         seasons.add(season)
         venues.add(venue_id)
@@ -957,7 +1422,121 @@ def build_schedule_reference_batch(
                 acquisition_contract_sha256=acquisition_contract_sha256,
             )
         )
-    return _make_batch("REFERENCE_INPUTS", derived, queries)
+    return _make_batch("REFERENCE_INPUTS", inventory_sha256, queries)
+
+
+def build_schedule_reference_batch(
+    repository_root: Path,
+    run_spec_path: Path,
+    *,
+    acquisition_contract_path: Path,
+    static_batch_id: str,
+    evidence_root: Path,
+) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    run_spec_path = Path(os.path.abspath(os.fspath(run_spec_path)))
+    if _repository_root(run_spec_path) != repository_root:
+        raise ValueError("reference RunSpec path differs from repository root")
+    from .protocols import load_run_spec
+    from .v52_schedule_inventory import load_verified_schedule_anchor_inventory
+
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        load_run_spec(run_spec_path),
+        acquisition_contract_path=acquisition_contract_path,
+        static_batch_id=static_batch_id,
+        evidence_root=evidence_root,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified schedule inventory authority bindings differ")
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified schedule acquisition contract SHA-256",
+        ),
+    )
+
+
+def _load_fixed_reference_batch_authority(repository_root: Path) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    from .protocols import parse_run_spec
+    from .v52_schedule_inventory import (
+        _read_inventory_contents,
+        load_verified_schedule_anchor_inventory,
+    )
+
+    run_contents = _read_repository_file(
+        repository_root, _RUN_SPEC_RELATIVE, "reference RunSpec"
+    )
+    run_spec = parse_run_spec(_parse_json_object(run_contents, "reference RunSpec"))
+    namespaces = run_spec.raw.get("namespaces")
+    raw_namespace = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(raw_namespace, str):
+        raise ValueError("reference RunSpec raw namespace differs")
+    raw_relative = Path(raw_namespace)
+    if (
+        raw_relative.is_absolute()
+        or not raw_relative.parts
+        or any(part in {"", ".", ".."} for part in raw_relative.parts)
+    ):
+        raise ValueError("reference RunSpec raw namespace differs")
+    inventory_record = _parse_json_object(
+        _read_inventory_contents(repository_root),
+        "schedule anchor inventory",
+        canonical=True,
+    )
+    static_binding = inventory_record.get("static_batch")
+    if not isinstance(static_binding, dict):
+        raise ValueError("schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_binding.get("batch_id"), "schedule inventory static batch ID"
+    )
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        run_spec,
+        acquisition_contract_path=repository_root
+        / _ACQUISITION_CONTRACT_RELATIVE,
+        static_batch_id=static_batch_id,
+        evidence_root=repository_root / raw_relative,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified schedule inventory authority bindings differ")
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified schedule acquisition contract SHA-256",
+        ),
+    )
+
+
+def _validate_reference_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if batch.stage != "REFERENCE_INPUTS":
+        return
+    expected = _load_fixed_reference_batch_authority(repository_root)
+    if batch != expected:
+        raise ValueError(
+            "REFERENCE_INPUTS differs from fixed schedule inventory replay"
+        )
 
 
 def build_participant_derived_batch(
@@ -1576,6 +2155,7 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
+        _validate_reference_batch_authority(root, batch)
         rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if rebound is None:
             raise ValueError("query batch is missing after reconstruction")
@@ -1687,16 +2267,47 @@ def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
         os.fsync(parent_fd)
 
 
+def _before_query_batch_authority_rebind() -> None:
+    """Deterministic authority-mutation test hook; production does nothing."""
+
+
+def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
+    if batch.stage != "REFERENCE_INPUTS":
+        return
+    _before_query_batch_authority_rebind()
+    _validate_reference_batch_authority(root, batch)
+
+
+def _cleanup_owned_query_batch_final(
+    parent_fd: int,
+    name: str,
+    contents: bytes,
+    identity: tuple[int, ...],
+) -> None:
+    loaded = _read_linked_regular(parent_fd, name, "owned query batch final")
+    if loaded is None:
+        return
+    final_contents, metadata = loaded
+    if final_contents != contents or _batch_file_identity(metadata) != identity:
+        raise ValueError("query batch final ownership changed before cleanup")
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _batch_file_identity(rebound) != identity:
+        raise ValueError("query batch final ownership changed before cleanup")
+    os.unlink(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
 def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     if not isinstance(batch, QueryBatch):
         raise TypeError("batch must be a QueryBatch")
+    root = Path(root)
+    _validate_reference_batch_authority(root, batch)
     payload = _batch_payload(batch.stage, batch.derived_from_sha256, batch.queries)
     expected_id = _sha256_bytes(_canonical_json_bytes(payload))
     if batch.batch_id != expected_id:
         raise ValueError("batch_id differs from canonical batch payload")
     record = {"schema_version": 1, "batch_id": batch.batch_id, **payload}
     contents = _canonical_json_bytes(record) + b"\n"
-    root = Path(root)
     root_fd = _open_root(root)
     descriptors = [root_fd]
     try:
@@ -1710,6 +2321,7 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
             existing = _reconcile_batch_final(current, batch.batch_id, contents)
             _cleanup_prelink_batch_temps(current, batch.batch_id)
             if existing is not None:
+                _rebind_query_batch_authority(root, batch)
                 return root / _ACQUISITION_BATCH_ROOT / name
             temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
             flags = (
@@ -1751,16 +2363,28 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
                     )
                     if concurrent is None:
                         raise ValueError("concurrent query batch final disappeared")
+                    _rebind_query_batch_authority(root, batch)
                     return root / _ACQUISITION_BATCH_ROOT / name
                 _unlink_owned_temp(current, temp_name, descriptor)
                 temp_exists = False
+                created_identity = _batch_file_identity(os.fstat(descriptor))
                 os.fsync(current)
-                if (
-                    _reconcile_batch_final(current, batch.batch_id, contents)
-                    != contents
-                ):
-                    raise ValueError("query batch bytes changed after publication")
-                return root / _ACQUISITION_BATCH_ROOT / name
+                try:
+                    if (
+                        _reconcile_batch_final(current, batch.batch_id, contents)
+                        != contents
+                    ):
+                        raise ValueError("query batch bytes changed after publication")
+                    _rebind_query_batch_authority(root, batch)
+                    return root / _ACQUISITION_BATCH_ROOT / name
+                except BaseException:
+                    _cleanup_owned_query_batch_final(
+                        current,
+                        name,
+                        contents,
+                        created_identity,
+                    )
+                    raise
             finally:
                 try:
                     if temp_exists:

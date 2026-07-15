@@ -134,6 +134,7 @@ def _resolve_candidate(candidate: dict[str, object]):
 
 
 def _sealed_candidate_fixture(root: Path, evidence_root: Path):
+    from mlb_backtest.protocols import load_run_spec
     from mlb_backtest.v52_evidence import (
         AttemptCapture,
         V52EvidenceStore,
@@ -143,34 +144,75 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
         build_static_batch,
         publish_query_batch,
     )
+    from mlb_backtest.v52_schedule_inventory import (
+        publish_schedule_anchor_inventory,
+    )
+    from mlb_backtest.v52_sources.schedule import (
+        recompute_schedule_anchor_sidecar,
+    )
+    from tests.test_v52_schedule_inventory import (
+        _schedule_raw as one_game_schedule_raw,
+    )
+    from tests.test_v52_source_schedule import (
+        _schedule_raw as two_game_schedule_raw,
+    )
 
+    protocol_dir = root / "protocols/v5_2_qd"
+    protocol_dir.mkdir(parents=True)
+    run_spec_path = protocol_dir / RUN_SPEC.name
+    contract_path = protocol_dir / CONTRACT.name
+    run_spec_path.write_bytes(RUN_SPEC.read_bytes())
+    contract_path.write_bytes(CONTRACT.read_bytes())
+    run_spec = load_run_spec(run_spec_path)
     schedule_batch = build_static_batch(RUN_SPEC, CONTRACT)
     schedule_queries = schedule_batch.queries
     schedule = schedule_queries[-1]
-    anchor_inventory = {
-        "anchors": [
-            {
-                "game_pk": 9001,
-                "official_date": "2024-04-02",
-                "played": True,
-                "season": 2024,
-                "season_start_date": "2024-03-20",
-                "venue_id": 31,
-            },
-            {
-                "game_pk": 9002,
-                "official_date": "2024-04-02",
-                "played": False,
-                "season": 2024,
-                "season_start_date": "2024-03-20",
-                "venue_id": 99,
-            },
-        ]
-    }
+    publish_query_batch(root, schedule_batch)
+    inventory_evidence_root = root / str(run_spec.raw["namespaces"]["raw"])
+    inventory_evidence_root.mkdir(parents=True)
+    inventory_store = V52EvidenceStore(inventory_evidence_root)
+    for query in schedule_queries:
+        if int(query.requested_range["year"]) == 2024:
+            raw = two_game_schedule_raw()
+        else:
+            payload = json.loads(one_game_schedule_raw(query, 0))
+            game = payload["dates"][0]["games"][0]
+            game["gamePk"] = int(query.requested_range["year"]) * 10 + 1
+            game["venue"] = {"id": 31, "name": "Primary Park"}
+            raw = _canonical(payload)
+        sidecar = recompute_schedule_anchor_sidecar(raw, query)
+        inventory_capture = AttemptCapture(
+            started_at_utc="2026-07-14T00:00:00.000000Z",
+            ended_at_utc="2026-07-14T00:00:01.000000Z",
+            final_url=query.endpoint,
+            http_status=200,
+            response_headers=(
+                ("content-type", "application/json"),
+                ("content-length", str(len(raw))),
+            ),
+            body=raw,
+            error_classification=None,
+        )
+        with inventory_store.acquire_query(query) as lease:
+            inventory_store.publish_fetched(
+                query,
+                inventory_store.next_attempt_number(lease),
+                inventory_capture,
+                sidecar["semantics"],
+            )
+    publish_schedule_anchor_inventory(
+        root,
+        run_spec,
+        acquisition_contract_path=contract_path,
+        static_batch_id=schedule_batch.batch_id,
+        evidence_root=inventory_evidence_root,
+    )
     reference_batch = build_schedule_reference_batch(
-        anchor_inventory,
-        run_spec_sha256=RUN_SHA,
-        acquisition_contract_sha256=CONTRACT_SHA,
+        root,
+        run_spec_path,
+        acquisition_contract_path=contract_path,
+        static_batch_id=schedule_batch.batch_id,
+        evidence_root=inventory_evidence_root,
     )
     venues = tuple(
         query
@@ -179,7 +221,6 @@ def _sealed_candidate_fixture(root: Path, evidence_root: Path):
     )
     if len(venues) != 2:
         raise AssertionError("production reference fixture must contain two venues")
-    publish_query_batch(root, schedule_batch)
     publish_query_batch(root, reference_batch)
     store = V52EvidenceStore(evidence_root)
     capture = AttemptCapture(
@@ -898,9 +939,14 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 for query in batches[1].queries
                 if query.source == "mlb_stats_pitching"
             ]
-            self.assertEqual(len(d1_queries), 1)
+            self.assertEqual(len(d1_queries), 7)
+            d1_2024 = next(
+                query
+                for query in d1_queries
+                if query.requested_range["season"] == 2024
+            )
             self.assertEqual(
-                d1_queries[0].parameters,
+                d1_2024.parameters,
                 {
                     "stats": "byDateRange",
                     "group": "pitching",
@@ -978,75 +1024,40 @@ class V52TimezoneReviewTest(unittest.TestCase):
             duplicate_relevant = _make_batch(
                 "REFERENCE_INPUTS",
                 "1" * 64,
-                [venue],
+                venue_batch.queries,
             )
-            publish_query_batch(root, duplicate_relevant)
-            with self.assertRaisesRegex(ValueError, "query.*duplicate|duplicate.*query"):
-                main(
-                    [
-                        "candidate",
-                        "--root",
-                        str(root),
-                        "--evidence-root",
-                        str(evidence_root),
-                        "--batch-id",
-                        schedule_batch.batch_id,
-                        "--batch-id",
-                        duplicate_relevant.batch_id,
-                        "--batch-id",
-                        venue_batch.batch_id,
-                        "--output",
-                        (AUDIT_NAMESPACE / "duplicate-relevant.json").as_posix(),
-                    ]
-                )
+            with self.assertRaisesRegex(
+                ValueError, "REFERENCE_INPUTS|fixed schedule inventory"
+            ):
+                publish_query_batch(root, duplicate_relevant)
 
     def test_candidate_cli_rejects_wrong_stage_and_mixed_relevant_binding(self):
         from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
-        from mlb_backtest.v52_timezone_review import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             evidence_root = root / "evidence"
             evidence_root.mkdir()
             batches, schedule, venue = _sealed_candidate_fixture(root, evidence_root)
-            wrong_stage = _make_batch("REFERENCE_INPUTS", "2" * 64, [schedule])
-            publish_query_batch(root, wrong_stage)
-            with self.assertRaisesRegex(ValueError, "STATIC_SCHEDULES|stage"):
-                main(
-                    [
-                        "candidate",
-                        "--root",
-                        str(root),
-                        "--evidence-root",
-                        str(evidence_root),
-                        "--batch-id",
-                        wrong_stage.batch_id,
-                        "--batch-id",
-                        batches[1].batch_id,
-                        "--output",
-                        (AUDIT_NAMESPACE / "wrong-stage.json").as_posix(),
-                    ]
-                )
+            wrong_stage = _make_batch(
+                "REFERENCE_INPUTS", "2" * 64, batches[1].queries
+            )
+            with self.assertRaisesRegex(
+                ValueError, "REFERENCE_INPUTS|fixed schedule inventory"
+            ):
+                publish_query_batch(root, wrong_stage)
 
-            mismatched_venue = replace(venue, run_spec_sha256="9" * 64)
-            mixed = _make_batch("REFERENCE_INPUTS", "3" * 64, [mismatched_venue])
-            publish_query_batch(root, mixed)
-            with self.assertRaisesRegex(ValueError, "binding|run|contract"):
-                main(
-                    [
-                        "candidate",
-                        "--root",
-                        str(root),
-                        "--evidence-root",
-                        str(evidence_root),
-                        "--batch-id",
-                        batches[0].batch_id,
-                        "--batch-id",
-                        mixed.batch_id,
-                        "--output",
-                        (AUDIT_NAMESPACE / "mixed-binding.json").as_posix(),
-                    ]
-                )
+            mismatched_reference = tuple(
+                replace(query, run_spec_sha256="9" * 64)
+                for query in batches[1].queries
+            )
+            mixed = _make_batch(
+                "REFERENCE_INPUTS", "3" * 64, mismatched_reference
+            )
+            with self.assertRaisesRegex(
+                ValueError, "binding|run|contract|REFERENCE_INPUTS"
+            ):
+                publish_query_batch(root, mixed)
 
     def test_review_and_seal_cli_use_exact_namespaces_and_candidate_scope(self):
         from mlb_backtest.v52_timezone_review import main
