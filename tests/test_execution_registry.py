@@ -136,6 +136,7 @@ RECEIPTS_RELATIVE = Path(
 )
 ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.execution_registry",
+    "mlb_backtest.v52_acquire",
     "mlb_backtest.v52_game_evidence_inventory",
     "mlb_backtest.v52_http",
     "mlb_backtest.v52_legacy",

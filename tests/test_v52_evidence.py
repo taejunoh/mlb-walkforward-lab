@@ -401,6 +401,132 @@ def _career_reference_fixture(
 
 
 class V52EvidenceTest(unittest.TestCase):
+    def test_leased_attempt_budget_snapshot_is_frozen_exact_and_lease_bound(self) -> None:
+        from mlb_backtest.v52_evidence import (
+            AttemptBudgetSnapshot,
+            AttemptRetryState,
+        )
+
+        self.assertTrue(AttemptBudgetSnapshot.__dataclass_params__.frozen)
+        self.assertTrue(AttemptRetryState.__dataclass_params__.frozen)
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(AttemptBudgetSnapshot)),
+            ("reservation_numbers", "receipt_bindings", "latest_receipt"),
+        )
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(AttemptRetryState)),
+            (
+                "attempt_number",
+                "retry_ordinal",
+                "outcome",
+                "error_classification",
+                "ended_at_utc",
+                "retry_after",
+            ),
+        )
+        query = _query()
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            with store.acquire_query(query) as lease:
+                first = store.next_attempt_number(lease)
+                receipt_path = store.record_attempt(
+                    query,
+                    first,
+                    _capture(b"busy", status=503, error="TRANSIENT_HTTP"),
+                    outcome="TRANSIENT_HTTP",
+                )
+                second = store.next_attempt_number(lease)
+                snapshot = store.read_leased_attempt_budget(lease)
+
+            self.assertEqual(snapshot.reservation_numbers, (1, 2))
+            self.assertEqual(second, 2)
+            self.assertEqual(
+                snapshot.receipt_bindings,
+                (
+                    (
+                        1,
+                        receipt_path.relative_to(store.root).as_posix(),
+                        hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                snapshot.latest_receipt,
+                AttemptRetryState(
+                    attempt_number=1,
+                    retry_ordinal=1,
+                    outcome="TRANSIENT_HTTP",
+                    error_classification="TRANSIENT_HTTP",
+                    ended_at_utc="2026-07-14T12:00:01.000001Z",
+                    retry_after="3",
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "active query lease"):
+                store.read_leased_attempt_budget(lease)
+
+    def test_leased_attempt_budget_final_replay_rejects_namespace_mutation(self) -> None:
+        query = _query()
+        for attack in ("add", "remove", "replace"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                store = V52EvidenceStore(_tmp(td) / "raw")
+                query_id = logical_query_id(query)
+                attempts = store.root / "queries" / query.source / query_id / "attempts"
+                original_rebind = v52_evidence._rebind_regular_snapshot_at
+                attacked = False
+
+                def mutate_after_initial_rebind(
+                    parent_fd: int,
+                    name: str,
+                    expected: object,
+                    label: str,
+                ) -> None:
+                    nonlocal attacked
+                    original_rebind(parent_fd, name, expected, label)  # type: ignore[arg-type]
+                    if (
+                        attacked
+                        or label != "attempt budget artifact"
+                        or name != "000001.json"
+                    ):
+                        return
+                    attacked = True
+                    receipt = attempts / "000001.json"
+                    if attack == "add":
+                        (attempts / "000002.reservation.json").write_bytes(
+                            _canonical_file(
+                                {
+                                    "attempt_number": 2,
+                                    "query_id": query_id,
+                                    "schema_version": 1,
+                                }
+                            )
+                        )
+                    elif attack == "remove":
+                        receipt.unlink()
+                    else:
+                        replacement = attempts / "replacement.json"
+                        replacement.write_bytes(receipt.read_bytes())
+                        os.replace(replacement, receipt)
+
+                with store.acquire_query(query) as lease:
+                    number = store.next_attempt_number(lease)
+                    store.record_attempt(
+                        query,
+                        number,
+                        _capture(b"busy", status=503, error="TRANSIENT_HTTP"),
+                        outcome="TRANSIENT_HTTP",
+                    )
+                    with (
+                        patch(
+                            "mlb_backtest.v52_evidence._rebind_regular_snapshot_at",
+                            side_effect=mutate_after_initial_rebind,
+                        ),
+                        self.assertRaisesRegex(
+                            (ValueError, RuntimeError),
+                            "attempt budget|membership|missing|changed",
+                        ),
+                    ):
+                        store.read_leased_attempt_budget(lease)
+
     def _read_progress(
         self, store: V52EvidenceStore, query: LogicalQuery
     ) -> object:

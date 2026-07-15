@@ -206,6 +206,23 @@ class VerifiedQueryProgress:
     quarantines: tuple[VerifiedQuarantineRead, ...]
 
 
+@dataclass(frozen=True)
+class AttemptRetryState:
+    attempt_number: int
+    retry_ordinal: int | None
+    outcome: str
+    error_classification: str | None
+    ended_at_utc: str
+    retry_after: str | None
+
+
+@dataclass(frozen=True)
+class AttemptBudgetSnapshot:
+    reservation_numbers: tuple[int, ...]
+    receipt_bindings: tuple[tuple[int, str, str], ...]
+    latest_receipt: AttemptRetryState | None
+
+
 class ProtectedLegacyPublishReverifyError(ValueError):
     """Final protected-lineage revalidation failed during publication."""
 
@@ -2832,6 +2849,106 @@ class V52EvidenceStore:
         finally:
             os.close(attempts_fd)
             self._close_fds(descriptors)
+
+    def read_leased_attempt_budget(
+        self, lease: QueryLease
+    ) -> AttemptBudgetSnapshot:
+        if not isinstance(lease, QueryLease):
+            raise TypeError("lease must be a QueryLease")
+        active = self._active_leases().get(lease.query_id)
+        if active is not lease or lease._owner_thread != threading.get_ident():
+            raise RuntimeError("attempt budget read requires the active query lease")
+        self._verify_lease_binding(lease)
+        query = self._query_from_registered_lease(lease)
+        attempts_fd, descriptors = self._attempts_fd(query)
+        snapshot: AttemptBudgetSnapshot
+        try:
+            reservations, history, records, artifact_snapshots = (
+                self._verified_attempt_bundle(query, attempts_fd)
+            )
+            expected_members = tuple(
+                sorted(
+                    (
+                        *(f"{number:06d}.reservation.json" for number in reservations),
+                        *(f"{int(item['attempt_number']):06d}.json" for item in history),
+                    )
+                )
+            )
+            if tuple(sorted(os.listdir(attempts_fd))) != expected_members:
+                raise ValueError("attempt budget membership changed while reading")
+            for name, artifact_snapshot in artifact_snapshots:
+                _rebind_regular_snapshot_at(
+                    attempts_fd,
+                    name,
+                    artifact_snapshot,
+                    "attempt budget artifact",
+                )
+            (
+                final_reservations,
+                final_history,
+                final_records,
+                final_artifact_snapshots,
+            ) = self._verified_attempt_bundle(query, attempts_fd)
+            final_members = tuple(sorted(os.listdir(attempts_fd)))
+            if (
+                final_reservations != reservations
+                or final_history != history
+                or final_records != records
+                or final_artifact_snapshots != artifact_snapshots
+                or final_members != expected_members
+            ):
+                raise ValueError("attempt budget changed during final replay")
+            transient_ordinal = sum(
+                record.get("outcome") in {"TRANSIENT_HTTP", "TRANSIENT_NETWORK"}
+                for record in records
+            )
+            latest = records[-1] if records else None
+            latest_receipt = None
+            if latest is not None:
+                headers = latest.get("response_headers")
+                if not isinstance(headers, Mapping):
+                    raise ValueError("attempt budget latest headers differ")
+                outcome = latest.get("outcome")
+                classification = latest.get("error_classification")
+                ended_at_utc = latest.get("ended_at_utc")
+                attempt_number = latest.get("attempt_number")
+                if (
+                    not isinstance(outcome, str)
+                    or classification is not None
+                    and not isinstance(classification, str)
+                    or not isinstance(ended_at_utc, str)
+                    or type(attempt_number) is not int
+                ):
+                    raise ValueError("attempt budget latest receipt differs")
+                retryable = outcome in {"TRANSIENT_HTTP", "TRANSIENT_NETWORK"}
+                retry_after = headers.get("Retry-After")
+                if retry_after is not None and not isinstance(retry_after, str):
+                    raise ValueError("attempt budget Retry-After differs")
+                latest_receipt = AttemptRetryState(
+                    attempt_number=attempt_number,
+                    retry_ordinal=transient_ordinal if retryable else None,
+                    outcome=outcome,
+                    error_classification=classification,
+                    ended_at_utc=ended_at_utc,
+                    retry_after=retry_after,
+                )
+            snapshot = AttemptBudgetSnapshot(
+                reservation_numbers=tuple(sorted(reservations)),
+                receipt_bindings=tuple(
+                    (
+                        int(item["attempt_number"]),
+                        str(item["path"]),
+                        str(item["sha256"]),
+                    )
+                    for item in history
+                ),
+                latest_receipt=latest_receipt,
+            )
+        finally:
+            os.close(attempts_fd)
+            self._close_fds(descriptors)
+        self._require_lease(query)
+        return snapshot
 
     def _query_from_registered_lease(self, lease: QueryLease) -> LogicalQuery:
         root_fd = self._root_fd()
@@ -5837,6 +5954,8 @@ class V52EvidenceStore:
 
 
 __all__ = [
+    "AttemptBudgetSnapshot",
+    "AttemptRetryState",
     "AttemptCapture",
     "LogicalQuery",
     "PersistedAttemptEvidence",

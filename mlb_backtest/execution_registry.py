@@ -121,6 +121,7 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/sources.py",
     "mlb_backtest/statcast.py",
     "mlb_backtest/verify_v52_design.py",
+    "mlb_backtest/v52_acquire.py",
     "mlb_backtest/v52_evidence.py",
     "mlb_backtest/v52_game_evidence_inventory.py",
     "mlb_backtest/v52_http.py",
