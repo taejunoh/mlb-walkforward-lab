@@ -53,6 +53,7 @@ AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
 CONTRACT_RELATIVE = Path("protocols/v5_2_qd/historical_source_acquisition.json")
+ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
 SOURCE_INVENTORY_RELATIVE = Path(
@@ -64,6 +65,7 @@ RECEIPTS_RELATIVE = Path(
 BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/execution_registry.py"),
     Path("mlb_backtest/verify_v52_design.py"),
+    Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
 )
 
@@ -94,6 +96,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             PLAN_RELATIVE,
             AMENDMENT_RELATIVE,
             CONTRACT_RELATIVE,
+            ACQUISITION_SCHEMA_RELATIVE,
             BASELINE_RELATIVE,
             PROTECTED_RELATIVE,
             *BOUND_EXECUTION_CODE,
@@ -103,6 +106,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         shutil.copy2(ROOT / DESIGN_RELATIVE, root / DESIGN_RELATIVE)
         shutil.copy2(ROOT / PLAN_RELATIVE, root / PLAN_RELATIVE)
         shutil.copy2(ROOT / AMENDMENT_RELATIVE, root / AMENDMENT_RELATIVE)
+        shutil.copy2(
+            ROOT / ACQUISITION_SCHEMA_RELATIVE,
+            root / ACQUISITION_SCHEMA_RELATIVE,
+        )
         shutil.copy2(ROOT / BASELINE_RELATIVE, root / BASELINE_RELATIVE)
         shutil.copy2(ROOT / PROTECTED_RELATIVE, root / PROTECTED_RELATIVE)
         for relative in BOUND_EXECUTION_CODE:
@@ -162,7 +169,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         return path
 
     def write_real_source_evidence(
-        self, root: Path
+        self,
+        root: Path,
+        *,
+        terminal_checkpoint: bool = True,
     ) -> tuple[Path, tuple[Path, Path, Path]]:
         snapshots = ["a" * 64, "b" * 64]
         reviewed_query_ids = ["query-001", "query-002"]
@@ -212,7 +222,49 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             for index in (1, 2)
         )
+        if terminal_checkpoint:
+            self.install_terminal_checkpoint_stub(root)
         return inventory, (review, *replays)
+
+    def install_terminal_checkpoint_stub(self, root: Path) -> None:
+        checkpoint_dir = (
+            root
+            / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+        )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        contents = canonical_json_bytes({"fixture": "terminal-checkpoint"}) + b"\n"
+        digest = hashlib.sha256(contents).hexdigest()
+        name = f"00000000-{digest}.json"
+        (checkpoint_dir / name).write_bytes(contents)
+        checkpoint = self.registry.AcquisitionCheckpoint(
+            sequence=0,
+            receipt_sha256=digest,
+            prior_checkpoint_sha256=None,
+            stage="REMAINING",
+            recorded_at_utc="2026-07-14T00:00:00.000000Z",
+            git_head="a" * 40,
+            execution_receipt_sha256="b" * 64,
+            query_batch_ids=(),
+            query_batch_sha256s=(),
+            query_evidence_receipt_sha256s=(),
+            stage_evidence_receipt_sha256s=(),
+            split_receipt_sha256s=(),
+            completed_query_ids=(),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        payload = {
+            "pending_query_ids": [],
+            "quarantined_query_ids": [],
+        }
+        patcher = patch.object(
+            self.registry,
+            "_load_checkpoints_locked",
+            return_value=((checkpoint,), (payload,), (name,)),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def replace_receipt_payload(self, receipt: Path, payload: object) -> Path:
         contents = canonical_json_bytes(payload) + b"\n"
@@ -222,6 +274,723 @@ class ExecutionRegistryTest(unittest.TestCase):
         receipt.unlink()
         replacement.write_bytes(contents)
         return replacement
+
+    def checkpoint_fixture(self, root: Path, run_spec: object):
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_query_plan import (
+            build_static_batch,
+            publish_query_batch,
+        )
+
+        self.initialize(root, run_spec)
+        self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+        batch = build_static_batch(root / RUN_SPEC_RELATIVE, root / CONTRACT_RELATIVE)
+        publish_query_batch(root, batch)
+        query_ids = tuple(
+            sorted(logical_query_id(query) for query in batch.queries)
+        )
+        return batch, query_ids
+
+    def publish_pending_checkpoint(
+        self,
+        root: Path,
+        run_spec: object,
+        batch: object,
+        query_ids: tuple[str, ...],
+        *,
+        expected_prior: str | None,
+    ):
+        return self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=expected_prior,
+            stage="STATIC_SCHEDULES",
+            query_batch_ids=(batch.batch_id,),
+            completed_query_ids=(),
+            pending_query_ids=query_ids,
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+
+    def test_acquisition_checkpoint_schema_and_public_api_are_closed(self) -> None:
+        self.assertTrue(hasattr(self.registry, "AcquisitionCheckpoint"))
+        self.assertTrue(hasattr(self.registry, "publish_acquisition_checkpoint"))
+        self.assertTrue(hasattr(self.registry, "load_latest_acquisition_checkpoint"))
+        schema_path = ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json"
+        schema = json.loads(schema_path.read_bytes())
+        jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        self.assertEqual(
+            schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
+        )
+
+    def test_acquisition_checkpoint_genesis_chain_latest_and_idempotent_retry(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_evidence import AttemptCapture, V52EvidenceStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            first = self.publish_pending_checkpoint(
+                root, run_spec, batch, query_ids, expected_prior=None
+            )
+            self.assertEqual(first.sequence, 0)
+            self.assertIsNone(first.prior_checkpoint_sha256)
+            self.assertEqual(first.stage, "STATIC_SCHEDULES")
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                first,
+            )
+            self.assertEqual(
+                self.publish_pending_checkpoint(
+                    root, run_spec, batch, query_ids, expected_prior=None
+                ),
+                first,
+            )
+
+            raw_root = root / run_spec.raw["namespaces"]["raw"]
+            raw_root.parent.mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(raw_root)
+            query = batch.queries[0]
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                store.record_attempt(
+                    query,
+                    number,
+                    AttemptCapture(
+                        started_at_utc="2026-07-14T00:00:00.000000Z",
+                        ended_at_utc="2026-07-14T00:00:01.000000Z",
+                        final_url=None,
+                        http_status=None,
+                        response_headers=(),
+                        body=None,
+                        error_classification="TIMEOUT",
+                    ),
+                    outcome="TRANSIENT_NETWORK",
+                )
+            second = self.publish_pending_checkpoint(
+                root,
+                run_spec,
+                batch,
+                query_ids,
+                expected_prior=first.receipt_sha256,
+            )
+            self.assertEqual(second.sequence, 1)
+            self.assertEqual(second.prior_checkpoint_sha256, first.receipt_sha256)
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                second,
+            )
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            self.assertEqual(len(list(checkpoint_dir.iterdir())), 2)
+
+    def test_acquisition_checkpoint_rejects_partition_stage_and_stale_fork(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            with self.assertRaisesRegex(ValueError, "partition|status|query"):
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    expected_prior_checkpoint_sha256=None,
+                    stage="STATIC_SCHEDULES",
+                    query_batch_ids=(batch.batch_id,),
+                    completed_query_ids=(query_ids[0],),
+                    pending_query_ids=query_ids[1:],
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+            with self.assertRaisesRegex(ValueError, "stage"):
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    expected_prior_checkpoint_sha256=None,
+                    stage="TIMEZONE_REVIEW",
+                    query_batch_ids=(batch.batch_id,),
+                    completed_query_ids=(),
+                    pending_query_ids=query_ids,
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+
+            first = self.publish_pending_checkpoint(
+                root, run_spec, batch, query_ids, expected_prior=None
+            )
+            with self.assertRaisesRegex(ValueError, "stale|fork|prior|replay"):
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    expected_prior_checkpoint_sha256="f" * 64,
+                    stage="STATIC_SCHEDULES",
+                    query_batch_ids=(batch.batch_id,),
+                    completed_query_ids=(),
+                    pending_query_ids=query_ids,
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                first,
+            )
+
+    def test_acquisition_checkpoint_rejects_gap_tamper_and_unknown_membership(
+        self,
+    ) -> None:
+        for attack in ("gap", "tamper", "unknown"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                batch, query_ids = self.checkpoint_fixture(root, run_spec)
+                self.publish_pending_checkpoint(
+                    root, run_spec, batch, query_ids, expected_prior=None
+                )
+                checkpoint_dir = (
+                    root
+                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                )
+                receipt = next(checkpoint_dir.iterdir())
+                if attack == "gap":
+                    receipt.rename(receipt.with_name("00000002-" + receipt.name[9:]))
+                elif attack == "tamper":
+                    receipt.write_bytes(receipt.read_bytes() + b" ")
+                else:
+                    (checkpoint_dir / "unknown.tmp").write_bytes(b"keep")
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "checkpoint|gap|fork|unknown|hash"
+                ):
+                    self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+
+    def test_acquisition_checkpoint_partial_write_cleans_and_retry_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            original_write = self.registry.os.write
+            writes = 0
+
+            def interrupted_write(descriptor: int, data: object) -> int:
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return original_write(descriptor, bytes(data)[:11])
+                raise OSError("injected checkpoint interruption")
+
+            with (
+                patch.object(
+                    self.registry.os, "write", side_effect=interrupted_write
+                ),
+                self.assertRaisesRegex(ValueError, "published|publication|receipt"),
+            ):
+                self.publish_pending_checkpoint(
+                    root, run_spec, batch, query_ids, expected_prior=None
+                )
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            self.assertEqual(list(checkpoint_dir.iterdir()), [])
+            self.assertEqual(
+                self.publish_pending_checkpoint(
+                    root, run_spec, batch, query_ids, expected_prior=None
+                ).sequence,
+                0,
+            )
+
+    def test_acquisition_checkpoint_concurrent_identical_publish_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            barrier = threading.Barrier(2)
+            results = []
+            errors = []
+
+            def publish() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results.append(
+                        self.publish_pending_checkpoint(
+                            root,
+                            run_spec,
+                            batch,
+                            query_ids,
+                            expected_prior=None,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=publish) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0], results[1])
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            self.assertEqual(len(list(checkpoint_dir.iterdir())), 1)
+
+    def test_acquisition_checkpoint_requires_acquiring_and_documents_tail_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            with self.assertRaisesRegex(ValueError, "ACQUIRING"):
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    expected_prior_checkpoint_sha256=None,
+                    stage="STATIC_SCHEDULES",
+                    query_batch_ids=(),
+                    completed_query_ids=(),
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            self.publish_pending_checkpoint(
+                root, run_spec, batch, query_ids, expected_prior=None
+            )
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            next(checkpoint_dir.iterdir()).unlink()
+            self.assertIsNone(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                "a tail deleted before read is outside local detection until a later "
+                "immutable checkpoint, phase receipt, or completion receipt binds it",
+            )
+
+    def test_acquisition_checkpoint_stage_advance_requires_stage_work(self) -> None:
+        batch = {
+            "batch_id": "a" * 64,
+            "path": "audit/static.json",
+            "sha256": "b" * 64,
+            "stage": "STATIC_SCHEDULES",
+        }
+        previous = {
+            "stage": "STATIC_SCHEDULES",
+            "pending_query_ids": [],
+            "quarantined_query_ids": [],
+            "query_batches": [batch],
+            "query_evidence_receipts": [],
+            "stage_evidence_receipts": [],
+            "split_receipts": [],
+            "completed_query_ids": ["c" * 64],
+            "split_query_ids": [],
+            "recorded_at_utc": "2026-07-14T00:00:00.000000Z",
+        }
+        reference = {
+            **previous,
+            "stage": "REFERENCE_INPUTS",
+            "recorded_at_utc": "2026-07-14T00:00:01.000000Z",
+        }
+        with self.assertRaisesRegex(ValueError, "REFERENCE_INPUTS|batch|stage"):
+            self.registry._validate_checkpoint_progression(previous, reference)
+
+        reference_batch = {**batch, "batch_id": "d" * 64, "stage": "REFERENCE_INPUTS"}
+        reference = {**reference, "query_batches": [batch, reference_batch]}
+        timezone = {
+            **reference,
+            "stage": "TIMEZONE_REVIEW",
+            "recorded_at_utc": "2026-07-14T00:00:02.000000Z",
+        }
+        with self.assertRaisesRegex(ValueError, "TIMEZONE_REVIEW|evidence|gate"):
+            self.registry._validate_checkpoint_progression(reference, timezone)
+
+    def test_checkpoint_runtime_rejects_duplicate_binding_arrays(self) -> None:
+        binding = {"path": "audit/evidence.json", "sha256": "a" * 64}
+        payload = {
+            "acquisition_contract": binding,
+            "completed_query_ids": [],
+            "execution_phase": "ACQUIRING",
+            "execution_phase_receipt": binding,
+            "git_head": "b" * 40,
+            "pending_query_ids": ["c" * 64],
+            "prior_checkpoint_sha256": None,
+            "quarantined_query_ids": [],
+            "query_batches": [
+                {
+                    "batch_id": "d" * 64,
+                    "path": "audit/batch.json",
+                    "sha256": "e" * 64,
+                    "stage": "STATIC_SCHEDULES",
+                }
+            ],
+            "query_evidence_receipts": [],
+            "receipt_kind": "ACQUISITION_CHECKPOINT",
+            "recorded_at_utc": "2026-07-14T00:00:00.000000Z",
+            "run_id": "historical_walkforward_500",
+            "run_spec": binding,
+            "schema_version": 1,
+            "sequence": 0,
+            "split_query_ids": [],
+            "split_receipts": [],
+            "stage": "STATIC_SCHEDULES",
+            "stage_evidence_receipts": [],
+        }
+        duplicates = {
+            "query_batches": payload["query_batches"][0],
+            "query_evidence_receipts": {
+                "path": "audit/attempt.json",
+                "query_id": "c" * 64,
+                "receipt_kind": "ATTEMPT",
+                "sha256": "f" * 64,
+            },
+            "stage_evidence_receipts": binding,
+            "split_receipts": {
+                "parent_query_id": "c" * 64,
+                "path": "audit/split.json",
+                "sha256": "1" * 64,
+                "split_receipt_id": "2" * 64,
+            },
+        }
+        for key, item in duplicates.items():
+            with self.subTest(key=key):
+                forged = json.loads(json.dumps(payload))
+                forged[key] = [item, item]
+                with self.assertRaisesRegex(ValueError, "duplicate|unique|order"):
+                    self.registry._validate_checkpoint_payload(forged)
+
+    def test_checkpoint_split_requires_canonical_verified_split_graph(self) -> None:
+        from mlb_backtest import v52_query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            checkpoint = self.publish_pending_checkpoint(
+                root, run_spec, batch, query_ids, expected_prior=None
+            )
+            checkpoint_path = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+            )
+            payload = json.loads(checkpoint_path.read_bytes())
+            parent = query_ids[0]
+            payload["pending_query_ids"].remove(parent)
+            payload["split_query_ids"] = [parent]
+            fake_split = self.write_artifact(
+                root,
+                f"audit/v5_2_qd/historical/acquisition/split_receipts/{parent}.json",
+                {"parent_query_id": parent, "split_receipt_id": "f" * 64},
+            )
+            payload["split_receipts"] = [
+                {
+                    "parent_query_id": parent,
+                    "path": fake_split.relative_to(root).as_posix(),
+                    "sha256": _sha256(fake_split),
+                    "split_receipt_id": "f" * 64,
+                }
+            ]
+            paths = self.registry._paths(root, run_spec)
+            with (
+                patch.object(
+                    v52_query_plan,
+                    "load_split_receipt",
+                    return_value=None,
+                ) as load_split,
+                self.assertRaisesRegex(ValueError, "split|child|receipt"),
+            ):
+                self.registry._checkpoint_artifacts_and_population(
+                    paths,
+                    run_spec,
+                    payload,
+                )
+            load_split.assert_called_once_with(
+                root,
+                parent,
+                evidence_root=(
+                    root / run_spec.raw["namespaces"]["raw"]
+                ),
+            )
+
+    def test_checkpoint_publish_evidence_race_leaves_no_poisoned_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            stage_evidence = self.write_artifact(
+                root, "audit/checkpoint-stage-evidence.json", {"version": 1}
+            )
+
+            def mutate_evidence() -> None:
+                stage_evidence.write_bytes(
+                    canonical_json_bytes({"version": 2}) + b"\n"
+                )
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_before_registry_publish",
+                    side_effect=mutate_evidence,
+                ),
+                self.assertRaisesRegex(ValueError, "artifact|evidence|snapshot"),
+            ):
+                self.registry.publish_acquisition_checkpoint(
+                    root,
+                    run_spec,
+                    expected_prior_checkpoint_sha256=None,
+                    stage="STATIC_SCHEDULES",
+                    query_batch_ids=(batch.batch_id,),
+                    completed_query_ids=(),
+                    pending_query_ids=query_ids,
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                    stage_evidence_receipts=(stage_evidence,),
+                )
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            self.assertEqual(list(checkpoint_dir.iterdir()), [])
+            self.assertIsNone(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+            )
+
+    def test_checkpoint_post_link_membership_failure_cleans_owned_final(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            unknown = checkpoint_dir / "unknown.json"
+
+            def add_unknown_after_final_read() -> None:
+                unknown.write_bytes(b"{}\n")
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_after_registry_receipt_read",
+                    side_effect=add_unknown_after_final_read,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "checkpoint|membership|gap|fork|unknown"
+                ),
+            ):
+                self.publish_pending_checkpoint(
+                    root,
+                    run_spec,
+                    batch,
+                    query_ids,
+                    expected_prior=None,
+                )
+            self.assertEqual(list(checkpoint_dir.iterdir()), [unknown])
+            unknown.unlink()
+            self.assertIsNone(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec)
+            )
+
+    def test_checkpoint_membership_cleanup_failure_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            unknown = checkpoint_dir / "unknown.json"
+
+            def add_unknown_after_final_read() -> None:
+                unknown.write_bytes(b"{}\n")
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_after_registry_receipt_read",
+                    side_effect=add_unknown_after_final_read,
+                ),
+                patch.object(
+                    self.registry,
+                    "_cleanup_created_receipt",
+                    side_effect=OSError("injected cleanup failure"),
+                ),
+                self.assertRaisesRegex(ValueError, "cleanup ownership verification"),
+            ):
+                self.publish_pending_checkpoint(
+                    root,
+                    run_spec,
+                    batch,
+                    query_ids,
+                    expected_prior=None,
+                )
+
+    def test_sources_ready_requires_terminal_checkpoint_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(
+                root, terminal_checkpoint=False
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint|artifact evidence"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+
+    def test_non_static_checkpoint_stages_fail_closed_until_authority_exists(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            for stage in (
+                "REFERENCE_INPUTS",
+                "TIMEZONE_REVIEW",
+                "PARTICIPANT_DERIVED",
+                "REMAINING",
+            ):
+                with self.subTest(stage=stage), self.assertRaisesRegex(
+                    ValueError, "authority|implemented|unavailable"
+                ):
+                    self.registry.publish_acquisition_checkpoint(
+                        root,
+                        run_spec,
+                        expected_prior_checkpoint_sha256=None,
+                        stage=stage,
+                        query_batch_ids=(batch.batch_id,),
+                        completed_query_ids=(),
+                        pending_query_ids=query_ids,
+                        quarantined_query_ids=(),
+                        split_query_ids=(),
+                    )
+
+    def test_static_checkpoint_replays_canonical_builder_authority(self) -> None:
+        from dataclasses import replace
+
+        from mlb_backtest import v52_query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            different = replace(batch, batch_id="f" * 64)
+            with (
+                patch.object(
+                    v52_query_plan,
+                    "build_static_batch",
+                    return_value=different,
+                ),
+                self.assertRaisesRegex(ValueError, "STATIC_SCHEDULES|authority"),
+            ):
+                self.publish_pending_checkpoint(
+                    root,
+                    run_spec,
+                    batch,
+                    query_ids,
+                    expected_prior=None,
+                )
+
+    def test_sources_ready_publication_rechecks_full_checkpoint_membership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(
+                root, terminal_checkpoint=False
+            )
+            checkpoint_dir = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            )
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            first_contents = canonical_json_bytes({"fixture": "interior"}) + b"\n"
+            head_contents = canonical_json_bytes({"fixture": "head"}) + b"\n"
+            first_sha = hashlib.sha256(first_contents).hexdigest()
+            head_sha = hashlib.sha256(head_contents).hexdigest()
+            names = (
+                f"00000000-{first_sha}.json",
+                f"00000001-{head_sha}.json",
+            )
+            first_path = checkpoint_dir / names[0]
+            first_path.write_bytes(first_contents)
+            (checkpoint_dir / names[1]).write_bytes(head_contents)
+
+            def checkpoint(sequence: int, digest: str):
+                return self.registry.AcquisitionCheckpoint(
+                    sequence=sequence,
+                    receipt_sha256=digest,
+                    prior_checkpoint_sha256=first_sha if sequence else None,
+                    stage="REMAINING",
+                    recorded_at_utc="2026-07-14T00:00:00.000000Z",
+                    git_head="a" * 40,
+                    execution_receipt_sha256="b" * 64,
+                    query_batch_ids=(),
+                    query_batch_sha256s=(),
+                    query_evidence_receipt_sha256s=(),
+                    stage_evidence_receipt_sha256s=(),
+                    split_receipt_sha256s=(),
+                    completed_query_ids=(),
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+
+            checkpoints = (checkpoint(0, first_sha), checkpoint(1, head_sha))
+            payloads = (
+                {"pending_query_ids": [], "quarantined_query_ids": []},
+                {"pending_query_ids": [], "quarantined_query_ids": []},
+            )
+
+            def load_chain(*args: object, **kwargs: object):
+                del args, kwargs
+                if tuple(sorted(path.name for path in checkpoint_dir.iterdir())) != names:
+                    raise self.registry._ReceiptMembershipError(
+                        "checkpoint membership changed"
+                    )
+                return checkpoints, payloads, names
+
+            def delete_interior() -> None:
+                first_path.unlink(missing_ok=True)
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_load_checkpoints_locked",
+                    side_effect=load_chain,
+                ),
+                patch.object(
+                    self.registry,
+                    "_after_registry_publish",
+                    side_effect=delete_interior,
+                ),
+                self.assertRaisesRegex(ValueError, "checkpoint|membership"),
+            ):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+            self.assertFalse(
+                any(
+                    path.name.startswith("000002-SOURCES_READY-")
+                    for path in (root / RECEIPTS_RELATIVE).iterdir()
+                )
+            )
 
     def test_sources_ready_rejects_consistent_review_ids_unrelated_to_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -518,17 +1287,14 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertIsNotNone(fork_path)
             self.assertTrue(fork_path.is_file())
             self.assertEqual(
-                len(
-                    [
-                        path
-                        for path in receipts.iterdir()
-                        if path.name.startswith("000001-")
-                    ]
-                ),
-                2,
+                [
+                    path
+                    for path in receipts.iterdir()
+                    if path.name.startswith("000001-")
+                ],
+                [fork_path],
+                "the caller-created final is cleaned without deleting the fork",
             )
-            with self.assertRaisesRegex(ValueError, "fork|gap|chain"):
-                self.registry.load_execution_registry(root, run_spec)
 
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
         for failure in ("partial_write", "fsync"):

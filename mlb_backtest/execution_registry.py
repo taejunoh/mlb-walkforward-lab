@@ -44,6 +44,7 @@ _SUCCESS_KEYS = frozenset(
         "approved_design",
         "implementation_plan",
         "acquisition_contract",
+        "acquisition_checkpoint_head",
         "task0_lineage",
         "inventory",
         "validation_receipts",
@@ -78,10 +79,14 @@ _AUTOMATIC_QUARANTINE_CLASSIFICATION_BY_PHASE = {
     "SOURCES_READY": "SOURCE_GATE_EVIDENCE_INVALID",
 }
 _BINDING_KEYS = frozenset({"path", "sha256"})
+_CHECKPOINT_HEAD_KEYS = frozenset({"count", "path", "sequence", "sha256", "stage"})
 _PLAN_BINDING_KEYS = frozenset({"path", "sha256", "git_blob_id"})
 _LINEAGE_KEYS = frozenset({"baseline_inventory", "protected_inventory"})
 _SUCCESS_NAME = re.compile(
     r"^(?P<sequence>[0-9]{6})-(?P<phase>[A-Z0-9_]+)-(?P<sha>[0-9a-f]{64})\.json$"
+)
+_CHECKPOINT_NAME = re.compile(
+    r"^(?P<sequence>[0-9]{8})-(?P<sha>[0-9a-f]{64})\.json$"
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_HEAD = re.compile(r"^[0-9a-f]{40}$")
@@ -91,7 +96,39 @@ _TIMESTAMP = re.compile(
 _BOUND_EXECUTION_CODE = (
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/verify_v52_design.py",
+    "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
+)
+ACQUISITION_STAGES: tuple[str, ...] = (
+    "STATIC_SCHEDULES",
+    "REFERENCE_INPUTS",
+    "TIMEZONE_REVIEW",
+    "PARTICIPANT_DERIVED",
+    "REMAINING",
+)
+_CHECKPOINT_KEYS = frozenset(
+    {
+        "acquisition_contract",
+        "completed_query_ids",
+        "execution_phase",
+        "execution_phase_receipt",
+        "git_head",
+        "pending_query_ids",
+        "prior_checkpoint_sha256",
+        "quarantined_query_ids",
+        "query_batches",
+        "query_evidence_receipts",
+        "receipt_kind",
+        "recorded_at_utc",
+        "run_id",
+        "run_spec",
+        "schema_version",
+        "sequence",
+        "split_query_ids",
+        "split_receipts",
+        "stage",
+        "stage_evidence_receipts",
+    }
 )
 _SOURCE_INVENTORY_PATH = (
     "data/v5_2_qd/historical/sources/source_inventory.json"
@@ -117,11 +154,32 @@ class ExecutionRegistryState:
 
 
 @dataclass(frozen=True)
+class AcquisitionCheckpoint:
+    sequence: int
+    receipt_sha256: str
+    prior_checkpoint_sha256: str | None
+    stage: str
+    recorded_at_utc: str
+    git_head: str
+    execution_receipt_sha256: str
+    query_batch_ids: tuple[str, ...]
+    query_batch_sha256s: tuple[str, ...]
+    query_evidence_receipt_sha256s: tuple[str, ...]
+    stage_evidence_receipt_sha256s: tuple[str, ...]
+    split_receipt_sha256s: tuple[str, ...]
+    completed_query_ids: tuple[str, ...]
+    pending_query_ids: tuple[str, ...]
+    quarantined_query_ids: tuple[str, ...]
+    split_query_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _RegistryPaths:
     root: Path
     execution_relative: Path
     receipts_relative: Path
     quarantine_relative: Path
+    checkpoints_relative: Path
     lock_relative: Path
 
 
@@ -236,6 +294,7 @@ def _paths(root: Path, run_spec: RunSpec) -> _RegistryPaths:
         execution_relative=execution,
         receipts_relative=execution / "phase_receipts",
         quarantine_relative=execution / "quarantine",
+        checkpoints_relative=execution / "acquisition_checkpoints",
         lock_relative=execution / ".registry.lock",
     )
 
@@ -856,6 +915,7 @@ def _verify_published_receipt(
     contents: bytes,
     label: str,
     expected_receipt_names: Sequence[str] | None,
+    membership_validator: Callable[[Sequence[str]], None] | None,
 ) -> None:
     """Use the final no-follow read as the operation's return snapshot.
 
@@ -893,7 +953,10 @@ def _verify_published_receipt(
                 raise _ReceiptMembershipError(
                     "execution registry receipt membership is unreadable"
                 ) from exc
-            _validate_receipt_name_chain(visible_names)
+            if membership_validator is None:
+                _validate_receipt_name_chain(visible_names)
+            else:
+                membership_validator(visible_names)
             if tuple(visible_names) != tuple(expected_receipt_names):
                 raise _ReceiptMembershipError(
                     "execution registry receipt membership has a gap, fork, or unknown entry"
@@ -925,6 +988,7 @@ def _write_exclusive(
     label: str,
     verify_after_publish: Callable[[], None],
     expected_receipt_names: Sequence[str] | None = None,
+    membership_validator: Callable[[Sequence[str]], None] | None = None,
 ) -> None:
     parent_fd, descriptors = _open_directory_at(
         execution_descriptor, relative.parent
@@ -962,10 +1026,9 @@ def _write_exclusive(
             contents,
             label,
             expected_receipt_names,
+            membership_validator,
         )
     except FileExistsError:
-        raise
-    except _ReceiptMembershipError:
         raise
     except BaseException as exc:
         if created:
@@ -987,7 +1050,11 @@ def _write_exclusive(
 
 
 def _ensure_registry_directories(paths: _RegistryPaths) -> None:
-    for relative in (paths.receipts_relative, paths.quarantine_relative):
+    for relative in (
+        paths.receipts_relative,
+        paths.quarantine_relative,
+        paths.checkpoints_relative,
+    ):
         _, descriptors = _open_directory(paths.root, relative, create=True)
         _close_directories(descriptors)
 
@@ -1353,6 +1420,32 @@ def _validate_success_receipt(payload: object) -> Mapping[str, object]:
         lineage.get("protected_inventory"), "protected inventory"
     )
     _validate_binding_value(receipt.get("inventory"), "phase inventory")
+    checkpoint_head = receipt.get("acquisition_checkpoint_head")
+    if sequence < 2:
+        if checkpoint_head is not None:
+            raise ValueError("early execution receipt checkpoint head must be null")
+    else:
+        head = _exact_object(
+            checkpoint_head,
+            _CHECKPOINT_HEAD_KEYS,
+            "acquisition checkpoint head",
+        )
+        head_sequence = head.get("sequence")
+        head_sha = head.get("sha256")
+        expected_path = (
+            "audit/v5_2_qd/historical/execution/acquisition_checkpoints/"
+            f"{head_sequence:08d}-{head_sha}.json"
+        ) if type(head_sequence) is int else ""
+        if (
+            type(head_sequence) is not int
+            or head_sequence < 0
+            or head.get("count") != head_sequence + 1
+            or not isinstance(head_sha, str)
+            or not _SHA256.fullmatch(head_sha)
+            or head.get("path") != expected_path
+            or head.get("stage") != "REMAINING"
+        ):
+            raise ValueError("acquisition checkpoint head binding differs")
     validations = receipt.get("validation_receipts")
     if not isinstance(validations, list):
         raise ValueError("validation receipts violate the receipt schema")
@@ -1561,6 +1654,26 @@ def _load_locked(
     if trusted_git is None:
         raise ValueError("execution registry trusted Git snapshot is missing")
     _verify_git_snapshot(paths.root, trusted_git)
+    checkpoint_head = last["acquisition_checkpoint_head"]
+    if checkpoint_head is not None:
+        checkpoints, checkpoint_payloads, checkpoint_names = (
+            _load_checkpoints_locked(
+                paths,
+                run_spec,
+                payloads,
+                trusted_git,
+                lock_binding,
+                verify_latest_progress=True,
+            )
+        )
+        authenticated_head = _terminal_checkpoint_head(
+            paths,
+            checkpoints,
+            checkpoint_payloads,
+            checkpoint_names,
+        )
+        if checkpoint_head != authenticated_head:
+            raise ValueError("execution receipt checkpoint head binding differs")
     _verify_lock_binding(paths, lock_binding)
     return (
         ExecutionRegistryState(
@@ -1631,6 +1744,8 @@ def _publish_locked(
     evidence_snapshots: Sequence[_ArtifactSnapshot] = (),
     *,
     expected_receipt_names: Sequence[str] | None = None,
+    membership_validator: Callable[[Sequence[str]], None] | None = None,
+    state_verifier: Callable[[], None] | None = None,
 ) -> None:
     child = _execution_child(paths, relative)
     _before_registry_publish()
@@ -1639,6 +1754,8 @@ def _publish_locked(
     _verify_artifact_snapshots(
         paths.root, evidence_snapshots, "dynamic phase evidence"
     )
+    if state_verifier is not None:
+        state_verifier()
 
     def verify_after_publish() -> None:
         _verify_git_snapshot(paths.root, snapshot)
@@ -1646,6 +1763,8 @@ def _publish_locked(
         _verify_artifact_snapshots(
             paths.root, evidence_snapshots, "dynamic phase evidence"
         )
+        if state_verifier is not None:
+            state_verifier()
 
     _write_exclusive(
         lock_binding.execution_descriptor,
@@ -1654,6 +1773,7 @@ def _publish_locked(
         label,
         verify_after_publish,
         expected_receipt_names,
+        membership_validator,
     )
 
 
@@ -1707,6 +1827,831 @@ def _publish_quarantine_locked(
     return paths.root / relative
 
 
+def _checkpoint_sorted_sha_list(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a SHA-256 array")
+    values = tuple(value)
+    if any(
+        not isinstance(item, str) or not _SHA256.fullmatch(item)
+        for item in values
+    ):
+        raise ValueError(f"{label} must be a SHA-256 array")
+    if values != tuple(sorted(values)) or len(values) != len(set(values)):
+        raise ValueError(f"{label} must be sorted and unique")
+    return values
+
+
+def _checkpoint_binding_list(
+    value: object,
+    keys: frozenset[str],
+    label: str,
+) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    result: list[Mapping[str, object]] = []
+    for item in value:
+        result.append(_exact_object(item, keys, label))
+    identities = [canonical_json_bytes(dict(item)) for item in result]
+    if len(identities) != len(set(identities)):
+        raise ValueError(f"{label} must contain unique bindings")
+    return tuple(result)
+
+
+def _validate_checkpoint_payload(payload: object) -> Mapping[str, object]:
+    receipt = _exact_object(payload, _CHECKPOINT_KEYS, "acquisition checkpoint")
+    sequence = receipt.get("sequence")
+    prior = receipt.get("prior_checkpoint_sha256")
+    stage = receipt.get("stage")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("receipt_kind") != "ACQUISITION_CHECKPOINT"
+        or receipt.get("run_id") != "historical_walkforward_500"
+        or receipt.get("execution_phase") != "ACQUIRING"
+        or type(sequence) is not int
+        or sequence < 0
+        or stage not in ACQUISITION_STAGES
+        or (sequence == 0 and prior is not None)
+        or (
+            sequence > 0
+            and (not isinstance(prior, str) or not _SHA256.fullmatch(prior))
+        )
+        or not isinstance(receipt.get("git_head"), str)
+        or not _GIT_HEAD.fullmatch(str(receipt.get("git_head")))
+    ):
+        raise ValueError("acquisition checkpoint identity differs")
+    _validate_timestamp(receipt.get("recorded_at_utc"), "acquisition checkpoint")
+    _validate_binding_value(receipt.get("run_spec"), "checkpoint RunSpec")
+    _validate_binding_value(
+        receipt.get("acquisition_contract"), "checkpoint acquisition contract"
+    )
+    _validate_binding_value(
+        receipt.get("execution_phase_receipt"), "checkpoint execution receipt"
+    )
+    batches = _checkpoint_binding_list(
+        receipt.get("query_batches"),
+        frozenset({"batch_id", "path", "sha256", "stage"}),
+        "checkpoint query batches",
+    )
+    for batch in batches:
+        _validate_sha = batch.get("batch_id")
+        if not isinstance(_validate_sha, str) or not _SHA256.fullmatch(_validate_sha):
+            raise ValueError("checkpoint batch ID differs")
+        _validate_binding_value(
+            {"path": batch.get("path"), "sha256": batch.get("sha256")},
+            "checkpoint query batch",
+        )
+        if batch.get("stage") not in ACQUISITION_STAGES:
+            raise ValueError("checkpoint batch stage differs")
+    evidence = _checkpoint_binding_list(
+        receipt.get("query_evidence_receipts"),
+        frozenset({"path", "query_id", "receipt_kind", "sha256"}),
+        "checkpoint query evidence",
+    )
+    for item in evidence:
+        query_id = item.get("query_id")
+        if not isinstance(query_id, str) or not _SHA256.fullmatch(query_id):
+            raise ValueError("checkpoint evidence query ID differs")
+        if item.get("receipt_kind") not in {"ATTEMPT", "QUARANTINE", "SUCCESS"}:
+            raise ValueError("checkpoint evidence kind differs")
+        _validate_binding_value(
+            {"path": item.get("path"), "sha256": item.get("sha256")},
+            "checkpoint query evidence",
+        )
+    if tuple(
+        (str(item["query_id"]), str(item["receipt_kind"]), str(item["path"]))
+        for item in evidence
+    ) != tuple(
+        sorted(
+            (
+                str(item["query_id"]),
+                str(item["receipt_kind"]),
+                str(item["path"]),
+            )
+            for item in evidence
+        )
+    ):
+        raise ValueError("checkpoint query evidence order differs")
+    stage_evidence = _checkpoint_binding_list(
+        receipt.get("stage_evidence_receipts"),
+        _BINDING_KEYS,
+        "checkpoint stage evidence",
+    )
+    for item in stage_evidence:
+        _validate_binding_value(item, "checkpoint stage evidence")
+    if tuple(str(item["path"]) for item in stage_evidence) != tuple(
+        sorted(str(item["path"]) for item in stage_evidence)
+    ):
+        raise ValueError("checkpoint stage evidence order differs")
+    splits = _checkpoint_binding_list(
+        receipt.get("split_receipts"),
+        frozenset({"parent_query_id", "path", "sha256", "split_receipt_id"}),
+        "checkpoint split receipts",
+    )
+    for item in splits:
+        for key in ("parent_query_id", "split_receipt_id"):
+            digest = item.get(key)
+            if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+                raise ValueError("checkpoint split binding differs")
+        _validate_binding_value(
+            {"path": item.get("path"), "sha256": item.get("sha256")},
+            "checkpoint split receipt",
+        )
+    if tuple(str(item["parent_query_id"]) for item in splits) != tuple(
+        sorted(str(item["parent_query_id"]) for item in splits)
+    ):
+        raise ValueError("checkpoint split receipt order differs")
+    populations = tuple(
+        _checkpoint_sorted_sha_list(receipt.get(key), f"checkpoint {key}")
+        for key in (
+            "completed_query_ids",
+            "pending_query_ids",
+            "quarantined_query_ids",
+            "split_query_ids",
+        )
+    )
+    if sum(len(values) for values in populations) != len(
+        set().union(*(set(values) for values in populations))
+    ):
+        raise ValueError("checkpoint query status populations overlap")
+    return receipt
+
+
+def _checkpoint_from_payload(
+    payload: Mapping[str, object], receipt_sha256: str
+) -> AcquisitionCheckpoint:
+    batches = payload["query_batches"]
+    evidence = payload["query_evidence_receipts"]
+    stage_evidence = payload["stage_evidence_receipts"]
+    splits = payload["split_receipts"]
+    assert isinstance(batches, list)
+    assert isinstance(evidence, list)
+    assert isinstance(stage_evidence, list)
+    assert isinstance(splits, list)
+    return AcquisitionCheckpoint(
+        sequence=int(payload["sequence"]),
+        receipt_sha256=receipt_sha256,
+        prior_checkpoint_sha256=payload["prior_checkpoint_sha256"],  # type: ignore[arg-type]
+        stage=str(payload["stage"]),
+        recorded_at_utc=str(payload["recorded_at_utc"]),
+        git_head=str(payload["git_head"]),
+        execution_receipt_sha256=str(
+            payload["execution_phase_receipt"]["sha256"]  # type: ignore[index]
+        ),
+        query_batch_ids=tuple(str(item["batch_id"]) for item in batches),
+        query_batch_sha256s=tuple(str(item["sha256"]) for item in batches),
+        query_evidence_receipt_sha256s=tuple(
+            str(item["sha256"]) for item in evidence
+        ),
+        stage_evidence_receipt_sha256s=tuple(
+            str(item["sha256"]) for item in stage_evidence
+        ),
+        split_receipt_sha256s=tuple(str(item["sha256"]) for item in splits),
+        completed_query_ids=tuple(payload["completed_query_ids"]),  # type: ignore[arg-type]
+        pending_query_ids=tuple(payload["pending_query_ids"]),  # type: ignore[arg-type]
+        quarantined_query_ids=tuple(payload["quarantined_query_ids"]),  # type: ignore[arg-type]
+        split_query_ids=tuple(payload["split_query_ids"]),  # type: ignore[arg-type]
+    )
+
+
+def _checkpoint_semantic_projection(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        key: payload[key]
+        for key in _CHECKPOINT_KEYS
+        if key not in {"sequence", "prior_checkpoint_sha256", "recorded_at_utc"}
+    }
+
+
+def _checkpoint_artifact_binding(root: Path, relative: Path, label: str) -> dict[str, str]:
+    artifact = _capture_artifact(root, root / relative, label)
+    return artifact.binding
+
+
+def _checkpoint_evidence_root(paths: _RegistryPaths, run_spec: RunSpec) -> Path:
+    namespaces = run_spec.raw.get("namespaces")
+    raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("checkpoint RunSpec raw namespace differs")
+    relative = Path(raw)
+    if (
+        relative.is_absolute()
+        or "\\" in raw
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.as_posix() != raw
+    ):
+        raise ValueError("checkpoint RunSpec raw namespace differs")
+    return paths.root / relative
+
+
+def _checkpoint_semantic_snapshots(
+    paths: _RegistryPaths,
+    semantic: Mapping[str, object],
+) -> tuple[_ArtifactSnapshot, ...]:
+    bindings: list[Mapping[str, object]] = []
+    for key in ("run_spec", "acquisition_contract", "execution_phase_receipt"):
+        value = semantic[key]
+        assert isinstance(value, Mapping)
+        bindings.append(value)
+    for key in (
+        "query_batches",
+        "query_evidence_receipts",
+        "stage_evidence_receipts",
+        "split_receipts",
+    ):
+        values = semantic[key]
+        assert isinstance(values, list)
+        for value in values:
+            assert isinstance(value, Mapping)
+            bindings.append(value)
+    snapshots: list[_ArtifactSnapshot] = []
+    seen: set[str] = set()
+    for binding in bindings:
+        relative = str(binding["path"])
+        if relative in seen:
+            continue
+        seen.add(relative)
+        snapshot = _capture_artifact(
+            paths.root,
+            paths.root / relative,
+            "checkpoint bound artifact",
+        )
+        if snapshot.binding != {
+            "path": binding["path"],
+            "sha256": binding["sha256"],
+        }:
+            raise ValueError("checkpoint bound artifact snapshot differs")
+        snapshots.append(snapshot)
+    return tuple(snapshots)
+
+
+def _checkpoint_current_semantic(
+    paths: _RegistryPaths,
+    run_spec: RunSpec,
+    registry_payloads: Sequence[Mapping[str, object]],
+    git_snapshot: _GitSnapshot,
+    *,
+    stage: str,
+    query_batch_ids: Sequence[str],
+    completed_query_ids: Sequence[str],
+    pending_query_ids: Sequence[str],
+    quarantined_query_ids: Sequence[str],
+    split_query_ids: Sequence[str],
+    stage_evidence_receipts: Sequence[Path],
+    split_receipt_paths: Sequence[Path],
+) -> dict[str, object]:
+    from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
+    from mlb_backtest.v52_query_plan import (
+        build_static_batch,
+        load_query_batch,
+        load_split_receipt,
+    )
+
+    if stage not in ACQUISITION_STAGES:
+        raise ValueError("acquisition checkpoint stage differs")
+    base = registry_payloads[0]
+    run_binding = dict(
+        _validate_binding_value(base["run_spec"], "checkpoint RunSpec")
+    )
+    contract_binding = dict(
+        _validate_binding_value(
+            base["acquisition_contract"], "checkpoint acquisition contract"
+        )
+    )
+    batches: list[dict[str, object]] = []
+    loaded_batches: dict[str, object] = {}
+    batch_query_ids: dict[str, set[str]] = {}
+    queries: dict[str, object] = {}
+    prior_stage_index = -1
+    for raw_batch_id in query_batch_ids:
+        if not isinstance(raw_batch_id, str) or not _SHA256.fullmatch(raw_batch_id):
+            raise ValueError("checkpoint batch ID differs")
+        batch = load_query_batch(paths.root, raw_batch_id)
+        batch_index = ACQUISITION_STAGES.index(batch.stage)
+        if batch_index < prior_stage_index or batch_index > ACQUISITION_STAGES.index(stage):
+            raise ValueError("checkpoint batch stage order differs")
+        prior_stage_index = batch_index
+        relative = Path(
+            "audit/v5_2_qd/historical/acquisition/query_batches"
+        ) / f"{batch.batch_id}.json"
+        binding = _checkpoint_artifact_binding(
+            paths.root, relative, "checkpoint query batch"
+        )
+        batches.append(
+            {"batch_id": batch.batch_id, "stage": batch.stage, **binding}
+        )
+        loaded_batches[batch.batch_id] = batch
+        batch_query_ids[batch.batch_id] = set()
+        for query in batch.queries:
+            query_id = logical_query_id(query)
+            if query_id in queries:
+                raise ValueError("checkpoint query appears in multiple batches")
+            if (
+                query.run_spec_sha256 != run_binding["sha256"]
+                or query.acquisition_contract_sha256 != contract_binding["sha256"]
+            ):
+                raise ValueError("checkpoint query run or contract binding differs")
+            queries[query_id] = query
+            batch_query_ids[batch.batch_id].add(query_id)
+    if not batches or batches[0]["stage"] != "STATIC_SCHEDULES":
+        raise ValueError("checkpoint must bind the STATIC_SCHEDULES root batch")
+    canonical_static = build_static_batch(
+        paths.root / str(run_binding["path"]),
+        paths.root / str(contract_binding["path"]),
+    )
+    if (
+        batches[0]["batch_id"] != canonical_static.batch_id
+        or batch_query_ids[str(batches[0]["batch_id"])]
+        != {logical_query_id(query) for query in canonical_static.queries}
+    ):
+        raise ValueError("checkpoint STATIC_SCHEDULES authority differs")
+    if stage == "STATIC_SCHEDULES" and len(batches) != 1:
+        raise ValueError("STATIC_SCHEDULES checkpoint contains unauthorized batches")
+
+    completed = tuple(sorted(completed_query_ids))
+    pending = tuple(sorted(pending_query_ids))
+    quarantined = tuple(sorted(quarantined_query_ids))
+    split = tuple(sorted(split_query_ids))
+    populations = (completed, pending, quarantined, split)
+    if any(len(values) != len(set(values)) for values in populations):
+        raise ValueError("checkpoint query status contains duplicates")
+    union = set().union(*(set(values) for values in populations))
+    if sum(len(values) for values in populations) != len(union) or union != set(queries):
+        raise ValueError("checkpoint query status partition differs from batches")
+
+    expected_split_paths = {
+        Path("audit/v5_2_qd/historical/acquisition/split_receipts")
+        / f"{parent_id}.json"
+        for parent_id in split
+    }
+    supplied_split_paths = {
+        _relative_path(paths.root, supplied, "checkpoint split receipt")
+        for supplied in split_receipt_paths
+    }
+    if supplied_split_paths != expected_split_paths:
+        raise ValueError("checkpoint split receipt namespace differs")
+    evidence_root = _checkpoint_evidence_root(paths, run_spec)
+    split_bindings: list[dict[str, object]] = []
+    for parent_id in split:
+        relative = (
+            Path("audit/v5_2_qd/historical/acquisition/split_receipts")
+            / f"{parent_id}.json"
+        )
+        receipt = load_split_receipt(
+            paths.root,
+            parent_id,
+            evidence_root=evidence_root,
+        )
+        if receipt is None:
+            raise ValueError("checkpoint split receipt is missing")
+        if (
+            receipt.parent_query_id != parent_id
+            or receipt.parent_batch_id not in loaded_batches
+            or receipt.child_batch_id not in loaded_batches
+            or parent_id not in batch_query_ids[receipt.parent_batch_id]
+            or set(receipt.child_query_ids)
+            != batch_query_ids[receipt.child_batch_id]
+        ):
+            raise ValueError("checkpoint split child graph differs")
+        artifact = _capture_artifact(
+            paths.root, paths.root / relative, "checkpoint split receipt"
+        )
+        if receipt.receipt_sha256 != artifact.sha256:
+            raise ValueError("checkpoint split receipt hash differs")
+        split_bindings.append(
+            {
+                "parent_query_id": parent_id,
+                "path": artifact.path,
+                "sha256": artifact.sha256,
+                "split_receipt_id": receipt.split_receipt_id,
+            }
+        )
+    split_bindings.sort(key=lambda item: str(item["parent_query_id"]))
+    if {str(item["parent_query_id"]) for item in split_bindings} != set(split):
+        raise ValueError("checkpoint split population differs from receipts")
+
+    namespaces = run_spec.raw["namespaces"]
+    assert isinstance(namespaces, Mapping)
+    raw_root = evidence_root
+    store = V52EvidenceStore(raw_root) if raw_root.is_dir() else None
+    evidence: list[dict[str, object]] = []
+    for query_id, query in sorted(queries.items()):
+        if store is None:
+            actual_status = "PENDING"
+            attempt_receipts: tuple[Mapping[str, object], ...] = ()
+            published = None
+            quarantines = ()
+        else:
+            progress = store.read_verified_query_progress(query)  # type: ignore[arg-type]
+            actual_status = progress.status
+            attempt_receipts = progress.attempt_receipts
+            published = progress.published_evidence
+            quarantines = progress.quarantines
+        if query_id in completed:
+            expected_status = "SUCCESS"
+        elif query_id in quarantined:
+            expected_status = "QUARANTINED"
+        else:
+            expected_status = "PENDING"
+        if actual_status != expected_status:
+            raise ValueError("checkpoint query status differs from verified evidence")
+        if query_id in split and (
+            not attempt_receipts
+            or attempt_receipts[-1].get("outcome") != "SPLIT_REQUIRED"
+        ):
+            raise ValueError("checkpoint split status lacks a split-required attempt")
+        source = query.source  # type: ignore[attr-defined]
+        for attempt in attempt_receipts:
+            number = int(attempt["attempt_number"])
+            relative = Path(str(namespaces["raw"])) / "queries" / source / query_id / "attempts" / f"{number:06d}.json"
+            binding = _checkpoint_artifact_binding(paths.root, relative, "checkpoint attempt receipt")
+            evidence.append({"query_id": query_id, "receipt_kind": "ATTEMPT", **binding})
+        if published is not None:
+            relative = _relative_path(paths.root, published.success_receipt_path, "checkpoint success receipt")
+            binding = _checkpoint_artifact_binding(paths.root, relative, "checkpoint success receipt")
+            evidence.append({"query_id": query_id, "receipt_kind": "SUCCESS", **binding})
+        for item in quarantines:
+            relative = _relative_path(paths.root, item.receipt_path, "checkpoint quarantine receipt")
+            binding = _checkpoint_artifact_binding(paths.root, relative, "checkpoint quarantine receipt")
+            evidence.append({"query_id": query_id, "receipt_kind": "QUARANTINE", **binding})
+    evidence.sort(key=lambda item: (str(item["query_id"]), str(item["receipt_kind"]), str(item["path"])))
+
+    stage_evidence = [
+        _capture_artifact(paths.root, supplied, "checkpoint stage evidence").binding
+        for supplied in stage_evidence_receipts
+    ]
+    stage_evidence.sort(key=lambda item: item["path"])
+    if len({item["path"] for item in stage_evidence}) != len(stage_evidence):
+        raise ValueError("checkpoint stage evidence is duplicated")
+
+    acquiring_payload = registry_payloads[1] if len(registry_payloads) > 1 else None
+    if acquiring_payload is None or acquiring_payload.get("phase") != "ACQUIRING":
+        raise ValueError("checkpoint requires the authenticated ACQUIRING receipt")
+    acquiring_contents = canonical_json_bytes(acquiring_payload) + b"\n"
+    acquiring_sha = _sha256_bytes(acquiring_contents)
+    acquiring_relative = paths.receipts_relative / f"000001-ACQUIRING-{acquiring_sha}.json"
+    execution_receipt = _checkpoint_artifact_binding(
+        paths.root, acquiring_relative, "checkpoint ACQUIRING receipt"
+    )
+    return {
+        "acquisition_contract": contract_binding,
+        "completed_query_ids": list(completed),
+        "execution_phase": "ACQUIRING",
+        "execution_phase_receipt": execution_receipt,
+        "git_head": git_snapshot.head,
+        "pending_query_ids": list(pending),
+        "quarantined_query_ids": list(quarantined),
+        "query_batches": batches,
+        "query_evidence_receipts": evidence,
+        "receipt_kind": "ACQUISITION_CHECKPOINT",
+        "run_id": run_spec.run_id,
+        "run_spec": run_binding,
+        "schema_version": 1,
+        "split_query_ids": list(split),
+        "split_receipts": split_bindings,
+        "stage": stage,
+        "stage_evidence_receipts": stage_evidence,
+    }
+
+
+def _validate_checkpoint_name_chain(names: Sequence[str]) -> None:
+    for expected_sequence, name in enumerate(names):
+        match = _CHECKPOINT_NAME.fullmatch(name)
+        if match is None or int(match.group("sequence")) != expected_sequence:
+            raise _ReceiptMembershipError(
+                "acquisition checkpoint chain has a gap, fork, or unknown entry"
+            )
+
+
+def _checkpoint_artifacts_and_population(
+    paths: _RegistryPaths,
+    run_spec: RunSpec,
+    payload: Mapping[str, object],
+) -> set[str]:
+    from mlb_backtest.v52_evidence import logical_query_id
+    from mlb_backtest.v52_query_plan import load_query_batch, load_split_receipt
+
+    if payload["stage"] != "STATIC_SCHEDULES":
+        raise ValueError(
+            "non-static checkpoint stage authority is unavailable until Task7D"
+        )
+    query_ids: set[str] = set()
+    evidence_root = _checkpoint_evidence_root(paths, run_spec)
+    batch_query_ids: dict[str, set[str]] = {}
+    batches = payload["query_batches"]
+    assert isinstance(batches, list)
+    for item in batches:
+        assert isinstance(item, Mapping)
+        batch_id = str(item["batch_id"])
+        batch = load_query_batch(paths.root, batch_id)
+        if batch.stage != item["stage"]:
+            raise ValueError("checkpoint batch stage binding differs")
+        relative = Path(str(item["path"]))
+        actual = _checkpoint_artifact_binding(
+            paths.root, relative, "checkpoint query batch"
+        )
+        if actual != {"path": item["path"], "sha256": item["sha256"]}:
+            raise ValueError("checkpoint query batch hash binding differs")
+        batch_query_ids[batch_id] = set()
+        for query in batch.queries:
+            query_id = logical_query_id(query)
+            if query_id in query_ids:
+                raise ValueError("checkpoint query appears in multiple batches")
+            query_ids.add(query_id)
+            batch_query_ids[batch_id].add(query_id)
+    populations = set().union(
+        set(payload["completed_query_ids"]),
+        set(payload["pending_query_ids"]),
+        set(payload["quarantined_query_ids"]),
+        set(payload["split_query_ids"]),
+    )
+    if populations != query_ids:
+        raise ValueError("checkpoint query status partition differs from batches")
+    evidence = payload["query_evidence_receipts"]
+    assert isinstance(evidence, list)
+    for item in evidence:
+        assert isinstance(item, Mapping)
+        if item["query_id"] not in query_ids:
+            raise ValueError("checkpoint evidence query is outside its batches")
+        actual = _checkpoint_artifact_binding(
+            paths.root, Path(str(item["path"])), "checkpoint query evidence"
+        )
+        if actual != {"path": item["path"], "sha256": item["sha256"]}:
+            raise ValueError("checkpoint query evidence hash binding differs")
+    for key, label in (
+        ("stage_evidence_receipts", "checkpoint stage evidence"),
+        ("split_receipts", "checkpoint split receipt"),
+    ):
+        values = payload[key]
+        assert isinstance(values, list)
+        for item in values:
+            assert isinstance(item, Mapping)
+            actual = _checkpoint_artifact_binding(
+                paths.root, Path(str(item["path"])), label
+            )
+            if actual != {"path": item["path"], "sha256": item["sha256"]}:
+                raise ValueError(f"{label} hash binding differs")
+            if key == "split_receipts":
+                parent_id = str(item["parent_query_id"])
+                expected_path = (
+                    "audit/v5_2_qd/historical/acquisition/split_receipts/"
+                    f"{parent_id}.json"
+                )
+                receipt = load_split_receipt(
+                    paths.root,
+                    parent_id,
+                    evidence_root=evidence_root,
+                )
+                if (
+                    str(item["path"]) != expected_path
+                    or receipt is None
+                    or receipt.receipt_sha256 != item["sha256"]
+                    or receipt.split_receipt_id != item["split_receipt_id"]
+                    or receipt.parent_query_id != parent_id
+                    or parent_id not in payload["split_query_ids"]
+                    or receipt.parent_batch_id not in batch_query_ids
+                    or receipt.child_batch_id not in batch_query_ids
+                    or parent_id not in batch_query_ids[receipt.parent_batch_id]
+                    or set(receipt.child_query_ids)
+                    != batch_query_ids[receipt.child_batch_id]
+                ):
+                    raise ValueError("checkpoint split receipt child graph differs")
+    for key, label in (
+        ("run_spec", "checkpoint RunSpec"),
+        ("acquisition_contract", "checkpoint acquisition contract"),
+        ("execution_phase_receipt", "checkpoint execution receipt"),
+    ):
+        item = payload[key]
+        assert isinstance(item, Mapping)
+        actual = _checkpoint_artifact_binding(
+            paths.root, Path(str(item["path"])), label
+        )
+        if actual != dict(item):
+            raise ValueError(f"{label} hash binding differs")
+    return query_ids
+
+
+def _validate_checkpoint_progression(
+    previous: Mapping[str, object] | None,
+    current: Mapping[str, object],
+) -> None:
+    current_stage = str(current["stage"])
+    current_batches = current["query_batches"]
+    assert isinstance(current_batches, list)
+    if current_stage != "TIMEZONE_REVIEW" and not any(
+        isinstance(item, Mapping) and item.get("stage") == current_stage
+        for item in current_batches
+    ):
+        raise ValueError(
+            f"acquisition checkpoint {current_stage} stage lacks its batch"
+        )
+    evidence_paths = {
+        str(item["path"])
+        for item in current["stage_evidence_receipts"]  # type: ignore[union-attr]
+    }
+    if current_stage == "REFERENCE_INPUTS" and (
+        "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
+        not in evidence_paths
+    ):
+        raise ValueError(
+            "REFERENCE_INPUTS checkpoint lacks schedule anchor evidence"
+        )
+    if current_stage == "TIMEZONE_REVIEW":
+        required = {
+            "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
+            "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+            "config/v5_2_qd/venue_timezones.json",
+        }
+        review_prefix = (
+            "audit/v5_2_qd/historical/acquisition/timezone_reviews/"
+        )
+        reviews = {path for path in evidence_paths if path.startswith(review_prefix)}
+        if not required <= evidence_paths or len(reviews) != 2:
+            raise ValueError(
+                "TIMEZONE_REVIEW checkpoint lacks its sealed semantic gate evidence"
+            )
+    if previous is None:
+        if current_stage != "STATIC_SCHEDULES":
+            raise ValueError("first acquisition checkpoint stage differs")
+        return
+    previous_stage = ACQUISITION_STAGES.index(str(previous["stage"]))
+    current_stage_index = ACQUISITION_STAGES.index(current_stage)
+    if current_stage_index not in {previous_stage, previous_stage + 1}:
+        raise ValueError("acquisition checkpoint stage regressed or skipped")
+    if current_stage_index > previous_stage and (
+        previous["pending_query_ids"] or previous["quarantined_query_ids"]
+    ):
+        raise ValueError("acquisition checkpoint stage is not fully verified")
+    prior_batches = previous["query_batches"]
+    assert isinstance(prior_batches, list) and isinstance(current_batches, list)
+    if current_batches[: len(prior_batches)] != prior_batches:
+        raise ValueError("acquisition checkpoint batch history is not cumulative")
+    if current_stage_index > previous_stage and current_stage != "TIMEZONE_REVIEW":
+        new_batches = current_batches[len(prior_batches) :]
+        if not any(
+            isinstance(item, Mapping) and item.get("stage") == current_stage
+            for item in new_batches
+        ):
+            raise ValueError(
+                f"acquisition checkpoint {current_stage} stage lacks a new batch"
+            )
+    for key in (
+        "query_evidence_receipts",
+        "stage_evidence_receipts",
+        "split_receipts",
+    ):
+        old = {canonical_json_bytes(item) for item in previous[key]}  # type: ignore[union-attr]
+        new = {canonical_json_bytes(item) for item in current[key]}  # type: ignore[union-attr]
+        if not old <= new:
+            raise ValueError("acquisition checkpoint evidence history regressed")
+    for key in (
+        "completed_query_ids",
+        "quarantined_query_ids",
+        "split_query_ids",
+    ):
+        if not set(previous[key]) <= set(current[key]):  # type: ignore[arg-type]
+            raise ValueError("acquisition checkpoint terminal status regressed")
+    if str(current["recorded_at_utc"]) < str(previous["recorded_at_utc"]):
+        raise ValueError("acquisition checkpoint trusted UTC regressed")
+
+
+def _load_checkpoints_locked(
+    paths: _RegistryPaths,
+    run_spec: RunSpec,
+    registry_payloads: Sequence[Mapping[str, object]],
+    git_snapshot: _GitSnapshot,
+    lock_binding: _RegistryLockBinding,
+    *,
+    verify_latest_progress: bool,
+) -> tuple[
+    tuple[AcquisitionCheckpoint, ...],
+    tuple[Mapping[str, object], ...],
+    tuple[str, ...],
+]:
+    checkpoint_child = _execution_child(paths, paths.checkpoints_relative)
+    try:
+        checkpoint_fd, descriptors = _open_directory_at(
+            lock_binding.execution_descriptor, checkpoint_child
+        )
+    except FileNotFoundError:
+        return (), (), ()
+    try:
+        names = tuple(sorted(os.listdir(checkpoint_fd)))
+    finally:
+        _close_directories(descriptors)
+    _validate_checkpoint_name_chain(names)
+    checkpoints: list[AcquisitionCheckpoint] = []
+    payloads: list[Mapping[str, object]] = []
+    prior_sha: str | None = None
+    previous: Mapping[str, object] | None = None
+    base = registry_payloads[0]
+    for expected_sequence, name in enumerate(names):
+        match = _CHECKPOINT_NAME.fullmatch(name)
+        assert match is not None
+        receipt_sha = match.group("sha")
+        contents = _read_relative_at(
+            lock_binding.execution_descriptor,
+            checkpoint_child / name,
+            "acquisition checkpoint",
+        )
+        if _sha256_bytes(contents) != receipt_sha:
+            raise ValueError("acquisition checkpoint filename hash differs")
+        payload = _validate_checkpoint_payload(
+            _canonical_object(contents, "acquisition checkpoint")
+        )
+        if (
+            payload["sequence"] != expected_sequence
+            or payload["prior_checkpoint_sha256"] != prior_sha
+            or payload["run_id"] != run_spec.run_id
+            or payload["run_spec"] != base["run_spec"]
+            or payload["acquisition_contract"] != base["acquisition_contract"]
+            or payload["git_head"] != git_snapshot.head
+        ):
+            raise ValueError("acquisition checkpoint chain or binding differs")
+        _checkpoint_artifacts_and_population(paths, run_spec, payload)
+        _validate_checkpoint_progression(previous, payload)
+        checkpoints.append(_checkpoint_from_payload(payload, receipt_sha))
+        payloads.append(payload)
+        prior_sha = receipt_sha
+        previous = payload
+    if names:
+        checkpoint_fd, descriptors = _open_directory_at(
+            lock_binding.execution_descriptor, checkpoint_child
+        )
+        try:
+            if tuple(sorted(os.listdir(checkpoint_fd))) != names:
+                raise _ReceiptMembershipError(
+                    "acquisition checkpoint membership changed during load"
+                )
+        finally:
+            _close_directories(descriptors)
+    if payloads and verify_latest_progress:
+        latest = payloads[-1]
+        current_semantic = _checkpoint_current_semantic(
+            paths,
+            run_spec,
+            registry_payloads,
+            git_snapshot,
+            stage=str(latest["stage"]),
+            query_batch_ids=[
+                str(item["batch_id"]) for item in latest["query_batches"]  # type: ignore[index]
+            ],
+            completed_query_ids=latest["completed_query_ids"],  # type: ignore[arg-type]
+            pending_query_ids=latest["pending_query_ids"],  # type: ignore[arg-type]
+            quarantined_query_ids=latest["quarantined_query_ids"],  # type: ignore[arg-type]
+            split_query_ids=latest["split_query_ids"],  # type: ignore[arg-type]
+            stage_evidence_receipts=[
+                paths.root / str(item["path"])
+                for item in latest["stage_evidence_receipts"]  # type: ignore[union-attr]
+            ],
+            split_receipt_paths=[
+                paths.root / str(item["path"])
+                for item in latest["split_receipts"]  # type: ignore[union-attr]
+            ],
+        )
+        if _checkpoint_semantic_projection(latest) != current_semantic:
+            raise ValueError("latest acquisition checkpoint differs from verified progress")
+    return tuple(checkpoints), tuple(payloads), names
+
+
+def _terminal_checkpoint_head(
+    paths: _RegistryPaths,
+    checkpoints: Sequence[AcquisitionCheckpoint],
+    payloads: Sequence[Mapping[str, object]],
+    names: Sequence[str],
+) -> dict[str, object]:
+    if not checkpoints or not payloads or len(checkpoints) != len(names):
+        raise ValueError("SOURCES_READY requires an acquisition checkpoint chain")
+    checkpoint = checkpoints[-1]
+    payload = payloads[-1]
+    if (
+        checkpoint.stage != "REMAINING"
+        or payload["pending_query_ids"]
+        or payload["quarantined_query_ids"]
+    ):
+        raise ValueError(
+            "SOURCES_READY requires a terminal REMAINING acquisition checkpoint"
+        )
+    expected_name = f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+    if names[-1] != expected_name or len(names) != checkpoint.sequence + 1:
+        raise ValueError("terminal acquisition checkpoint membership differs")
+    relative = paths.checkpoints_relative / expected_name
+    binding = _checkpoint_artifact_binding(
+        paths.root,
+        relative,
+        "terminal acquisition checkpoint",
+    )
+    if binding["sha256"] != checkpoint.receipt_sha256:
+        raise ValueError("terminal acquisition checkpoint hash differs")
+    return {
+        "count": len(names),
+        "path": binding["path"],
+        "sequence": checkpoint.sequence,
+        "sha256": checkpoint.receipt_sha256,
+        "stage": checkpoint.stage,
+    }
+
+
 def initialize_execution_registry(
     root: Path,
     run_spec: RunSpec,
@@ -1753,6 +2698,7 @@ def initialize_execution_registry(
             "recorded_at_utc": _utc_now(),
             "git_head": snapshot.head,
             **evidence,
+            "acquisition_checkpoint_head": None,
             "inventory": protected,
             "validation_receipts": [],
         }
@@ -1776,6 +2722,145 @@ def load_execution_registry(root: Path, run_spec: RunSpec) -> ExecutionRegistryS
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, _ = _load_locked(paths, run_spec, lock_binding)
         return state
+
+
+def load_latest_acquisition_checkpoint(
+    root: Path,
+    run_spec: RunSpec,
+) -> AcquisitionCheckpoint | None:
+    """Load the fully verified append-only restart authority.
+
+    A tail deleted before this read cannot be distinguished from a tail that was
+    never published until a later immutable checkpoint, phase receipt, or
+    completion receipt binds it. Gaps, forks, and deletion during this read fail
+    closed.
+    """
+    paths = _paths(root, run_spec)
+    with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
+        _, registry_payloads = _load_locked(paths, run_spec, lock_binding)
+        snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
+        checkpoints, _, _ = _load_checkpoints_locked(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            lock_binding,
+            verify_latest_progress=False,
+        )
+        return checkpoints[-1] if checkpoints else None
+
+
+def publish_acquisition_checkpoint(
+    root: Path,
+    run_spec: RunSpec,
+    *,
+    expected_prior_checkpoint_sha256: str | None,
+    stage: str,
+    query_batch_ids: Sequence[str],
+    completed_query_ids: Sequence[str],
+    pending_query_ids: Sequence[str],
+    quarantined_query_ids: Sequence[str],
+    split_query_ids: Sequence[str],
+    stage_evidence_receipts: Sequence[Path] = (),
+    split_receipt_paths: Sequence[Path] = (),
+) -> AcquisitionCheckpoint:
+    paths = _paths(root, run_spec)
+    if expected_prior_checkpoint_sha256 is not None and (
+        not isinstance(expected_prior_checkpoint_sha256, str)
+        or not _SHA256.fullmatch(expected_prior_checkpoint_sha256)
+    ):
+        raise ValueError("expected prior checkpoint SHA-256 differs")
+    _ensure_registry_directories(paths)
+    with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
+        state, registry_payloads = _load_locked(paths, run_spec, lock_binding)
+        if state.phase != "ACQUIRING":
+            raise ValueError(
+                "acquisition checkpoints require the authenticated ACQUIRING phase"
+            )
+        if stage != "STATIC_SCHEDULES":
+            raise ValueError(
+                "non-static checkpoint stage authority is unavailable until Task7D"
+            )
+        snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
+        checkpoints, checkpoint_payloads, names = _load_checkpoints_locked(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            lock_binding,
+            verify_latest_progress=False,
+        )
+        semantic = _checkpoint_current_semantic(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            stage=stage,
+            query_batch_ids=query_batch_ids,
+            completed_query_ids=completed_query_ids,
+            pending_query_ids=pending_query_ids,
+            quarantined_query_ids=quarantined_query_ids,
+            split_query_ids=split_query_ids,
+            stage_evidence_receipts=stage_evidence_receipts,
+            split_receipt_paths=split_receipt_paths,
+        )
+        semantic_snapshots = _checkpoint_semantic_snapshots(paths, semantic)
+        previous_checkpoint = checkpoints[-1] if checkpoints else None
+        previous_payload = checkpoint_payloads[-1] if checkpoint_payloads else None
+        if previous_payload is not None and (
+            _checkpoint_semantic_projection(previous_payload) == semantic
+        ):
+            if expected_prior_checkpoint_sha256 not in {
+                previous_checkpoint.receipt_sha256,  # type: ignore[union-attr]
+                previous_checkpoint.prior_checkpoint_sha256,  # type: ignore[union-attr]
+            }:
+                raise ValueError("acquisition checkpoint stale replay or prior differs")
+            return previous_checkpoint  # type: ignore[return-value]
+        authenticated_prior = (
+            previous_checkpoint.receipt_sha256
+            if previous_checkpoint is not None
+            else None
+        )
+        if expected_prior_checkpoint_sha256 != authenticated_prior:
+            raise ValueError("acquisition checkpoint stale prior or fork differs")
+        sequence = len(checkpoints)
+        payload = {
+            **semantic,
+            "sequence": sequence,
+            "prior_checkpoint_sha256": authenticated_prior,
+            "recorded_at_utc": _utc_now(),
+        }
+        _validate_checkpoint_payload(payload)
+        _validate_checkpoint_progression(previous_payload, payload)
+        contents = canonical_json_bytes(payload) + b"\n"
+        digest = _sha256_bytes(contents)
+        relative = paths.checkpoints_relative / f"{sequence:08d}-{digest}.json"
+        _publish_locked(
+            paths,
+            snapshot,
+            lock_binding,
+            relative,
+            contents,
+            "acquisition checkpoint",
+            semantic_snapshots,
+            expected_receipt_names=(*names, relative.name),
+            membership_validator=_validate_checkpoint_name_chain,
+        )
+        final_checkpoints, _, final_names = _load_checkpoints_locked(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            lock_binding,
+            verify_latest_progress=True,
+        )
+        if (
+            not final_checkpoints
+            or final_checkpoints[-1].receipt_sha256 != digest
+            or final_names != (*names, relative.name)
+        ):
+            raise ValueError("acquisition checkpoint publication did not seal its head")
+        return final_checkpoints[-1]
 
 
 def advance_execution_phase(
@@ -1812,6 +2897,8 @@ def advance_execution_phase(
         )
         inventory = inventory_snapshot.binding
         validations = [artifact.binding for artifact in validation_snapshots]
+        checkpoint_snapshot: _ArtifactSnapshot | None = None
+        checkpoint_verifier: Callable[[], None] | None = None
         try:
             _validate_phase_evidence(
                 next_phase,
@@ -1820,6 +2907,62 @@ def advance_execution_phase(
                 validation_snapshots,
                 run_id=run_spec.run_id,
             )
+            checkpoint_head: Mapping[str, object] | None = None
+            if next_phase == "SOURCES_READY":
+                checkpoints, checkpoint_payloads, checkpoint_names = (
+                    _load_checkpoints_locked(
+                        paths,
+                        run_spec,
+                        payloads,
+                        snapshot,
+                        lock_binding,
+                        verify_latest_progress=True,
+                    )
+                )
+                checkpoint_head = _terminal_checkpoint_head(
+                    paths,
+                    checkpoints,
+                    checkpoint_payloads,
+                    checkpoint_names,
+                )
+                checkpoint_snapshot = _capture_artifact(
+                    paths.root,
+                    paths.root / str(checkpoint_head["path"]),
+                    "terminal acquisition checkpoint",
+                )
+                if checkpoint_snapshot.binding != {
+                    "path": checkpoint_head["path"],
+                    "sha256": checkpoint_head["sha256"],
+                }:
+                    raise ValueError(
+                        "terminal acquisition checkpoint snapshot differs"
+                    )
+
+                def verify_checkpoint_state() -> None:
+                    verified, verified_payloads, verified_names = (
+                        _load_checkpoints_locked(
+                            paths,
+                            run_spec,
+                            payloads,
+                            snapshot,
+                            lock_binding,
+                            verify_latest_progress=True,
+                        )
+                    )
+                    if (
+                        _terminal_checkpoint_head(
+                            paths,
+                            verified,
+                            verified_payloads,
+                            verified_names,
+                        )
+                        != checkpoint_head
+                    ):
+                        raise ValueError(
+                            "terminal acquisition checkpoint state changed"
+                        )
+
+                checkpoint_verifier = verify_checkpoint_state
             payload = {
                 "schema_version": 1,
                 "receipt_kind": "PHASE_TRANSITION",
@@ -1829,6 +2972,7 @@ def advance_execution_phase(
                 "prior_receipt_sha256": state.receipt_sha256,
                 "recorded_at_utc": _utc_now(),
                 "git_head": snapshot.head,
+                "acquisition_checkpoint_head": checkpoint_head,
                 **{
                     key: base[key]
                     for key in (
@@ -1871,11 +3015,16 @@ def advance_execution_phase(
             relative,
             contents,
             "execution receipt",
-            (inventory_snapshot, *validation_snapshots),
+            (
+                inventory_snapshot,
+                *validation_snapshots,
+                *((checkpoint_snapshot,) if checkpoint_snapshot else ()),
+            ),
             expected_receipt_names=(
                 *(_success_receipt_name(item) for item in payloads),
                 relative.name,
             ),
+            state_verifier=checkpoint_verifier,
         )
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 
