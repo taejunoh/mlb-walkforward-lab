@@ -46,6 +46,9 @@ _PLAN_A_AMENDMENT_RELATIVE = Path(
 )
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
+_GAME_EVIDENCE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
+)
 _SPLIT_RECEIPT_ROOT = Path(
     "audit/v5_2_qd/historical/acquisition/split_receipts"
 )
@@ -452,6 +455,94 @@ def _validate_reference_inputs_stage(
         raise ValueError("REFERENCE_INPUTS pitching coverage differs from boxscores")
 
 
+def _validate_participant_derived_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    _validate_sha256(derived_from_sha256, "PARTICIPANT_DERIVED derived_from_sha256")
+    if not queries:
+        raise ValueError("PARTICIPANT_DERIVED requires a nonempty derived batch")
+    _validate_shared_query_bindings(queries, "PARTICIPANT_DERIVED")
+
+    baselines = ("2017-12-31", "2021-12-31")
+    keys: list[tuple[int, int]] = []
+    consumers_by_pitcher: dict[int, set[int]] = {}
+    for query in queries:
+        requested = dict(query.requested_range)
+        parameters = dict(query.parameters)
+        pitcher_id = requested.get("pitcher_id")
+        inclusive_end = requested.get("inclusive_end")
+        consumers = requested.get("consuming_game_pks")
+        cutoffs = requested.get("consumer_cutoff_dates")
+        if (
+            isinstance(pitcher_id, bool)
+            or not isinstance(pitcher_id, int)
+            or pitcher_id <= 0
+            or inclusive_end not in baselines
+            or query.source != "mlb_stats_pitcher_bf"
+            or query.grain != "player_career_batters_faced_reference"
+            or query.endpoint != f"{_MLB_BASE}/people/{pitcher_id}/stats"
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or query.parent_query_id is not None
+            or set(requested)
+            != {
+                "consumer_cutoff_dates",
+                "consuming_game_pks",
+                "pitcher_id",
+                "inclusive_end",
+            }
+            or parameters
+            != {
+                "stats": "byDateRange",
+                "group": "pitching",
+                "gameType": "R",
+                "sportIds": 1,
+                "startDate": "1876-01-01",
+                "endDate": inclusive_end,
+            }
+            or not isinstance(consumers, list)
+            or not consumers
+            or any(
+                isinstance(game_pk, bool)
+                or not isinstance(game_pk, int)
+                or game_pk <= 0
+                for game_pk in consumers
+            )
+            or consumers != sorted(set(consumers))
+            or not isinstance(cutoffs, dict)
+            or set(cutoffs) != {str(game_pk) for game_pk in consumers}
+        ):
+            raise ValueError("PARTICIPANT_DERIVED query contract differs")
+
+        expected_baseline = None
+        for game_pk in consumers:
+            cutoff = _iso_date(
+                cutoffs[str(game_pk)], "PARTICIPANT_DERIVED consumer cutoff"
+            )
+            if not date(2017, 12, 31) <= cutoff <= date(2024, 12, 30):
+                raise ValueError(
+                    "PARTICIPANT_DERIVED consumer cutoff is outside the historical run"
+                )
+            baseline = "2017-12-31" if cutoff <= date(2021, 12, 31) else "2021-12-31"
+            if expected_baseline is None:
+                expected_baseline = baseline
+            elif expected_baseline != baseline:
+                raise ValueError("PARTICIPANT_DERIVED query mixes baseline partitions")
+        if inclusive_end != expected_baseline:
+            raise ValueError("PARTICIPANT_DERIVED baseline differs from cutoffs")
+
+        key = (pitcher_id, baselines.index(inclusive_end))
+        keys.append(key)
+        seen = consumers_by_pitcher.setdefault(pitcher_id, set())
+        if seen.intersection(consumers):
+            raise ValueError("PARTICIPANT_DERIVED consumer is duplicated")
+        seen.update(consumers)
+
+    if keys != sorted(set(keys)):
+        raise ValueError("PARTICIPANT_DERIVED queries are not uniquely ordered")
+
+
 def _validate_stage_batch(
     stage: str,
     derived_from_sha256: str | None,
@@ -461,6 +552,8 @@ def _validate_stage_batch(
         _validate_static_schedule_stage(derived_from_sha256, queries)
     elif stage == "REFERENCE_INPUTS":
         _validate_reference_inputs_stage(derived_from_sha256, queries)
+    elif stage == "PARTICIPANT_DERIVED":
+        _validate_participant_derived_stage(derived_from_sha256, queries)
     elif stage == "REMAINING":
         _validate_remaining_stage(derived_from_sha256, queries)
 
@@ -1539,23 +1632,22 @@ def _validate_reference_batch_authority(
         )
 
 
-def build_participant_derived_batch(
+def _build_participant_derived_batch_from_inventory(
     game_evidence_inventory: Mapping[str, object],
     *,
+    inventory_sha256: str,
     run_spec_sha256: str,
     acquisition_contract_sha256: str,
 ) -> QueryBatch:
     _validate_binding_hashes(run_spec_sha256, acquisition_contract_sha256)
-    derived = _canonical_mapping_sha256(
-        game_evidence_inventory, "game_evidence_inventory"
-    )
+    derived = _validate_sha256(inventory_sha256, "game evidence inventory SHA-256")
     games = game_evidence_inventory.get("games")
-    if not isinstance(games, list):
-        raise ValueError("game_evidence_inventory.games must be a list")
+    if not isinstance(games, Sequence) or isinstance(games, (str, bytes)):
+        raise ValueError("game_evidence_inventory.games must be an array")
     pitcher_consumers: dict[int, dict[int, date]] = {}
     seen_game_pks: set[int] = set()
     for game in games:
-        if not isinstance(game, dict):
+        if not isinstance(game, Mapping):
             raise ValueError("game evidence must be an object")
         game_pk = game.get("game_pk")
         season = game.get("season")
@@ -1587,7 +1679,11 @@ def build_participant_derived_batch(
         ):
             continue
         starters = game.get("actual_starter_ids")
-        if not isinstance(starters, list) or len(starters) != 2:
+        if (
+            not isinstance(starters, Sequence)
+            or isinstance(starters, (str, bytes))
+            or len(starters) != 2
+        ):
             raise ValueError("verified game must contain two actual starter IDs")
         for pitcher_id in starters:
             if (
@@ -1643,6 +1739,55 @@ def build_participant_derived_batch(
                 )
             )
     return _make_batch("PARTICIPANT_DERIVED", derived, queries)
+
+
+def build_participant_derived_batch(repository_root: Path) -> QueryBatch:
+    from .v52_game_evidence_inventory import (
+        load_verified_game_evidence_inventory,
+    )
+
+    root = Path(repository_root)
+    verified = load_verified_game_evidence_inventory(root)
+    inventory_contents = _read_repository_file(
+        root,
+        _GAME_EVIDENCE_INVENTORY_RELATIVE,
+        "game evidence inventory",
+    )
+    inventory_sha256 = _sha256_bytes(inventory_contents)
+    if inventory_sha256 != verified.sha256:
+        raise ValueError("game evidence inventory changed after verified load")
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified game inventory authority bindings differ")
+    return _build_participant_derived_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=inventory_sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified game inventory RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified game inventory acquisition contract SHA-256",
+        ),
+    )
+
+
+def _validate_participant_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if batch.stage != "PARTICIPANT_DERIVED":
+        return
+    expected = build_participant_derived_batch(repository_root)
+    if batch != expected:
+        raise ValueError("PARTICIPANT_DERIVED differs from fixed game inventory replay")
+
+
+def _validate_query_batch_authority(repository_root: Path, batch: QueryBatch) -> None:
+    _validate_reference_batch_authority(repository_root, batch)
+    _validate_participant_batch_authority(repository_root, batch)
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
@@ -2155,7 +2300,7 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
-        _validate_reference_batch_authority(root, batch)
+        _validate_query_batch_authority(root, batch)
         rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if rebound is None:
             raise ValueError("query batch is missing after reconstruction")
@@ -2165,6 +2310,8 @@ def load_query_batch(root: Path, batch_id: str) -> QueryBatch:
         ) != _batch_file_identity(metadata):
             raise ValueError("query batch identity or bytes changed during load")
         _verify_opened_batch_chain(root, descriptors)
+        if batch.stage == "PARTICIPANT_DERIVED":
+            _rebind_query_batch_authority(root, batch)
         return batch
     finally:
         for descriptor in reversed(descriptors):
@@ -2272,10 +2419,10 @@ def _before_query_batch_authority_rebind() -> None:
 
 
 def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
-    if batch.stage != "REFERENCE_INPUTS":
+    if batch.stage not in {"REFERENCE_INPUTS", "PARTICIPANT_DERIVED"}:
         return
     _before_query_batch_authority_rebind()
-    _validate_reference_batch_authority(root, batch)
+    _validate_query_batch_authority(root, batch)
 
 
 def _cleanup_owned_query_batch_final(
@@ -2301,7 +2448,7 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     if not isinstance(batch, QueryBatch):
         raise TypeError("batch must be a QueryBatch")
     root = Path(root)
-    _validate_reference_batch_authority(root, batch)
+    _validate_query_batch_authority(root, batch)
     payload = _batch_payload(batch.stage, batch.derived_from_sha256, batch.queries)
     expected_id = _sha256_bytes(_canonical_json_bytes(payload))
     if batch.batch_id != expected_id:

@@ -174,6 +174,48 @@ def _write_forged_canonical_batch(
     return batch_id
 
 
+def _participant_authority_fixture(root: Path):
+    from mlb_backtest.v52_game_evidence_inventory import (
+        publish_game_evidence_inventory,
+    )
+    from tests.test_v52_game_evidence_inventory import _fixture
+
+    _fixture(root)
+    return publish_game_evidence_inventory(root)
+
+
+def _forged_participant_batch(
+    valid,
+    *,
+    derived_from_sha256: str | None = None,
+    queries: tuple[LogicalQuery, ...] | None = None,
+):
+    from mlb_backtest.v52_query_plan import QueryBatch
+
+    forged_queries = valid.queries if queries is None else queries
+    derived = (
+        valid.derived_from_sha256
+        if derived_from_sha256 is None
+        else derived_from_sha256
+    )
+    payload = {
+        "derived_from_sha256": derived,
+        "queries": [
+            json.loads(canonical_query_bytes(query)) for query in forged_queries
+        ],
+        "stage": "PARTICIPANT_DERIVED",
+    }
+    batch_id = hashlib.sha256(
+        _canonical_json_bytes(payload).removesuffix(b"\n")
+    ).hexdigest()
+    return QueryBatch(
+        batch_id=batch_id,
+        stage="PARTICIPANT_DERIVED",
+        derived_from_sha256=derived,
+        queries=forged_queries,
+    )
+
+
 def _parent(start: str, end: str) -> LogicalQuery:
     query = LogicalQuery(
         source="baseball_savant_statcast",
@@ -1241,7 +1283,9 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_participant_batch_uses_only_verified_actual_starters_and_deduplicates(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_participant_derived_batch_from_inventory,
+        )
 
         inventory = {
             "games": [
@@ -1274,8 +1318,11 @@ class V52QueryPlanTest(unittest.TestCase):
                 },
             ]
         }
-        batch = build_participant_derived_batch(
+        batch = _build_participant_derived_batch_from_inventory(
             inventory,
+            inventory_sha256=hashlib.sha256(
+                _canonical_json_bytes(inventory)
+            ).hexdigest(),
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -1308,7 +1355,9 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_participant_batch_splits_each_pitcher_by_cutoff_baseline_without_loss(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_participant_derived_batch_from_inventory,
+        )
 
         inventory = {
             "games": [
@@ -1332,8 +1381,11 @@ class V52QueryPlanTest(unittest.TestCase):
                 },
             ]
         }
-        batch = build_participant_derived_batch(
+        batch = _build_participant_derived_batch_from_inventory(
             inventory,
+            inventory_sha256=hashlib.sha256(
+                _canonical_json_bytes(inventory)
+            ).hexdigest(),
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -1409,7 +1461,9 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_participant_batch_validates_2018_2024_season_and_game_date_boundaries(
         self,
     ):
-        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_participant_derived_batch_from_inventory,
+        )
 
         valid = {
             "games": [
@@ -1433,8 +1487,11 @@ class V52QueryPlanTest(unittest.TestCase):
                 },
             ]
         }
-        batch = build_participant_derived_batch(
+        batch = _build_participant_derived_batch_from_inventory(
             valid,
+            inventory_sha256=hashlib.sha256(
+                _canonical_json_bytes(valid)
+            ).hexdigest(),
             run_spec_sha256=RUN_SHA,
             acquisition_contract_sha256=CONTRACT_SHA,
         )
@@ -1451,14 +1508,20 @@ class V52QueryPlanTest(unittest.TestCase):
         ]
         for game in invalid_games:
             with self.subTest(game=game), self.assertRaises(ValueError):
-                build_participant_derived_batch(
-                    {"games": [game]},
+                inventory = {"games": [game]}
+                _build_participant_derived_batch_from_inventory(
+                    inventory,
+                    inventory_sha256=hashlib.sha256(
+                        _canonical_json_bytes(inventory)
+                    ).hexdigest(),
                     run_spec_sha256=RUN_SHA,
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
 
     def test_participant_batch_rejects_duplicate_games_and_identical_starters(self):
-        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_participant_derived_batch_from_inventory,
+        )
 
         base = {
             "game_pk": 1,
@@ -1477,11 +1540,204 @@ class V52QueryPlanTest(unittest.TestCase):
         ]
         for games in invalid_games:
             with self.subTest(games=games), self.assertRaises(ValueError):
-                build_participant_derived_batch(
-                    {"games": games},
+                inventory = {"games": games}
+                _build_participant_derived_batch_from_inventory(
+                    inventory,
+                    inventory_sha256=hashlib.sha256(
+                        _canonical_json_bytes(inventory)
+                    ).hexdigest(),
                     run_spec_sha256=RUN_SHA,
                     acquisition_contract_sha256=CONTRACT_SHA,
                 )
+
+    def test_participant_public_builder_uses_fixed_verified_inventory_file_hash(self):
+        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inventory = _participant_authority_fixture(root)
+            contents = inventory.path.read_bytes()
+            expected = hashlib.sha256(contents).hexdigest()
+            self.assertTrue(contents.endswith(b"\n"))
+            self.assertNotEqual(
+                expected,
+                hashlib.sha256(contents.removesuffix(b"\n")).hexdigest(),
+            )
+            batch = build_participant_derived_batch(root)
+            self.assertEqual(batch.stage, "PARTICIPANT_DERIVED")
+            self.assertEqual(batch.derived_from_sha256, expected)
+            self.assertEqual(inventory.sha256, expected)
+            self.assertTrue(batch.queries)
+
+    def test_participant_public_builder_rejects_legacy_mapping_signature(self):
+        from mlb_backtest.v52_query_plan import build_participant_derived_batch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inventory = _participant_authority_fixture(root)
+            payload = json.loads(inventory.path.read_bytes())
+            with self.assertRaises(TypeError):
+                build_participant_derived_batch(  # type: ignore[call-arg]
+                    payload,
+                    run_spec_sha256=RUN_SHA,
+                    acquisition_contract_sha256=CONTRACT_SHA,
+                )
+
+    def test_participant_stage_semantic_validator_rejects_closed_attacks(self):
+        from mlb_backtest import v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _participant_authority_fixture(root)
+            valid = query_plan.build_participant_derived_batch(root)
+            first = valid.queries[0]
+            first_consumer = str(first.requested_range["consuming_game_pks"][0])
+            out_of_run_cutoffs = dict(
+                first.requested_range["consumer_cutoff_dates"]
+            )
+            out_of_run_cutoffs[first_consumer] = "9999-01-01"
+            attacks = {
+                "closed-field": (
+                    dataclasses.replace(
+                        first,
+                        parameters={**first.parameters, "unexpected": "field"},
+                    ),
+                    *valid.queries[1:],
+                ),
+                "order": tuple(reversed(valid.queries)),
+                "baseline": (
+                    dataclasses.replace(
+                        first,
+                        parameters={**first.parameters, "endDate": "2020-12-31"},
+                    ),
+                    *valid.queries[1:],
+                ),
+                "consumer-cutoff-out-of-run": (
+                    dataclasses.replace(
+                        first,
+                        requested_range={
+                            **first.requested_range,
+                            "consumer_cutoff_dates": out_of_run_cutoffs,
+                        },
+                    ),
+                    *valid.queries[1:],
+                ),
+            }
+            for attack, queries in attacks.items():
+                with self.subTest(attack=attack), self.assertRaises(ValueError):
+                    query_plan._make_batch(
+                        "PARTICIPANT_DERIVED",
+                        valid.derived_from_sha256,
+                        queries,
+                    )
+
+    def test_participant_fixed_replay_rejects_omitted_extra_and_wrong_derived(self):
+        from mlb_backtest.v52_query_plan import (
+            build_participant_derived_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+
+        for attack in ("omitted", "extra", "wrong-derived"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _participant_authority_fixture(root)
+                valid = build_participant_derived_batch(root)
+                if attack == "omitted":
+                    forged = _forged_participant_batch(
+                        valid, queries=valid.queries[:-1]
+                    )
+                elif attack == "extra":
+                    source = valid.queries[-1]
+                    pitcher_id = int(source.requested_range["pitcher_id"]) + 999_999
+                    extra = dataclasses.replace(
+                        source,
+                        endpoint=(
+                            "https://statsapi.mlb.com/api/v1/people/"
+                            f"{pitcher_id}/stats"
+                        ),
+                        requested_range={
+                            **source.requested_range,
+                            "pitcher_id": pitcher_id,
+                        },
+                    )
+                    forged = _forged_participant_batch(
+                        valid, queries=(*valid.queries, extra)
+                    )
+                else:
+                    forged = _forged_participant_batch(
+                        valid, derived_from_sha256="0" * 64
+                    )
+                with self.assertRaises((ValueError, RuntimeError)):
+                    publish_query_batch(root, forged)
+                forged_id = _write_forged_canonical_batch(
+                    root,
+                    stage=forged.stage,
+                    derived_from_sha256=forged.derived_from_sha256,
+                    queries=forged.queries,
+                )
+                self.assertEqual(forged_id, forged.batch_id)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    load_query_batch(root, forged_id)
+
+    def test_participant_batch_final_authority_rebind_rejects_inventory_race(self):
+        from mlb_backtest import v52_query_plan as query_plan
+
+        for publication in ("new", "existing"):
+            with self.subTest(publication=publication), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inventory = _participant_authority_fixture(root)
+                batch = query_plan.build_participant_derived_batch(root)
+                final = (
+                    root
+                    / "audit/v5_2_qd/historical/acquisition/query_batches"
+                    / f"{batch.batch_id}.json"
+                )
+                expected: bytes | None = None
+                if publication == "existing":
+                    query_plan.publish_query_batch(root, batch)
+                    expected = final.read_bytes()
+
+                def mutate_inventory() -> None:
+                    payload = json.loads(inventory.path.read_bytes())
+                    payload["counts"]["game_count"] += 1
+                    inventory.path.write_bytes(_canonical_json_bytes(payload))
+
+                with (
+                    mock.patch.object(
+                        query_plan,
+                        "_before_query_batch_authority_rebind",
+                        side_effect=mutate_inventory,
+                    ) as hook,
+                    self.assertRaises((ValueError, RuntimeError)),
+                ):
+                    query_plan.publish_query_batch(root, batch)
+                hook.assert_called_once_with()
+                if publication == "existing":
+                    self.assertEqual(final.read_bytes(), expected)
+                else:
+                    self.assertFalse(final.exists())
+
+    def test_participant_batch_publish_load_are_exactly_idempotent(self):
+        from mlb_backtest.v52_query_plan import (
+            build_participant_derived_batch,
+            load_query_batch,
+            publish_query_batch,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _participant_authority_fixture(root)
+            batch = build_participant_derived_batch(root)
+            path = publish_query_batch(root, batch)
+            before = path.stat()
+            self.assertEqual(publish_query_batch(root, batch), path)
+            after = path.stat()
+            self.assertEqual(
+                (before.st_dev, before.st_ino),
+                (after.st_dev, after.st_ino),
+            )
+            self.assertEqual(load_query_batch(root, batch.batch_id), batch)
 
     def test_bisect_and_legacy_share_strict_canonical_monthly_parent_validation(self):
         from mlb_backtest.v52_query_plan import (
