@@ -67,10 +67,15 @@ BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/verify_v52_design.py"),
     Path("mlb_backtest/v52_query_plan.py"),
     Path("mlb_backtest/v52_schedule_inventory.py"),
+    Path("mlb_backtest/v52_timezone_review.py"),
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_split_receipt.schema.json"),
+    Path("schemas/v5_2_timezone_candidate.schema.json"),
+    Path("schemas/v5_2_timezone_review_receipt.schema.json"),
+    Path("schemas/v5_2_timezone_seal_receipt.schema.json"),
+    Path("schemas/v5_2_venue_timezones.schema.json"),
 )
 TIMEZONE_STAGE_EVIDENCE = (
     Path("audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"),
@@ -3252,10 +3257,15 @@ class ExecutionRegistryTest(unittest.TestCase):
             "mlb_backtest/verify_v52_design.py",
             "mlb_backtest/v52_query_plan.py",
             "mlb_backtest/v52_schedule_inventory.py",
+            "mlb_backtest/v52_timezone_review.py",
             "schemas/v5_2_acquisition_checkpoint.schema.json",
             "schemas/v5_2_execution_receipt.schema.json",
             "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
+            "schemas/v5_2_timezone_candidate.schema.json",
+            "schemas/v5_2_timezone_review_receipt.schema.json",
+            "schemas/v5_2_timezone_seal_receipt.schema.json",
+            "schemas/v5_2_venue_timezones.schema.json",
         }
         self.assertEqual(set(self.registry._BOUND_EXECUTION_CODE), required)
 
@@ -3282,6 +3292,31 @@ class ExecutionRegistryTest(unittest.TestCase):
                     if operation == "load":
                         self.initialize(root, run_spec)
                     with target.open("ab") as handle:
+                        handle.write(b"\n")
+                    with self.assertRaisesRegex(ValueError, "execution code|dirty"):
+                        if operation == "initialize":
+                            self.initialize(root, run_spec)
+                        else:
+                            self.registry.load_execution_registry(root, run_spec)
+
+    def test_task7d_timezone_runtime_rejects_dirty_initialize_and_load(self) -> None:
+        required = (
+            Path("mlb_backtest/v52_timezone_review.py"),
+            Path("schemas/v5_2_timezone_candidate.schema.json"),
+            Path("schemas/v5_2_timezone_review_receipt.schema.json"),
+            Path("schemas/v5_2_timezone_seal_receipt.schema.json"),
+            Path("schemas/v5_2_venue_timezones.schema.json"),
+        )
+        for relative in required:
+            for operation in ("initialize", "load"):
+                with (
+                    self.subTest(relative=relative, operation=operation),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root, run_spec = self.make_repo(Path(directory))
+                    if operation == "load":
+                        self.initialize(root, run_spec)
+                    with (root / relative).open("ab") as handle:
                         handle.write(b"\n")
                     with self.assertRaisesRegex(ValueError, "execution code|dirty"):
                         if operation == "initialize":

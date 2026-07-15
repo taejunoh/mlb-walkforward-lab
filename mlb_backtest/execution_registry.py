@@ -98,10 +98,15 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/verify_v52_design.py",
     "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/v52_schedule_inventory.py",
+    "mlb_backtest/v52_timezone_review.py",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
+    "schemas/v5_2_timezone_candidate.schema.json",
+    "schemas/v5_2_timezone_review_receipt.schema.json",
+    "schemas/v5_2_timezone_seal_receipt.schema.json",
+    "schemas/v5_2_venue_timezones.schema.json",
 )
 ACQUISITION_STAGES: tuple[str, ...] = (
     "STATIC_SCHEDULES",

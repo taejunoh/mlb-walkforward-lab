@@ -170,27 +170,47 @@ class DesignVerificationTest(unittest.TestCase):
         scope = verifier_module.capture_current_scope(ROOT)
         self.assertTrue(required_docs.issubset(set(scope["single_files"])))
 
-    def test_task7d_schedule_inventory_is_required_canonical_and_current_scope_bound(self) -> None:
+    def test_task7d_timezone_authority_is_required_canonical_pinned_and_current_scope_bound(self) -> None:
         required_schemas = {
             "schemas/v5_2_acquisition_checkpoint.schema.json",
             "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
+            "schemas/v5_2_timezone_candidate.schema.json",
+            "schemas/v5_2_timezone_review_receipt.schema.json",
+            "schemas/v5_2_timezone_seal_receipt.schema.json",
+            "schemas/v5_2_venue_timezones.schema.json",
         }
         required_code = {
             "mlb_backtest/v52_query_plan.py",
             "mlb_backtest/v52_schedule_inventory.py",
+            "mlb_backtest/v52_timezone_review.py",
             "tests/test_v52_query_plan.py",
             "tests/test_v52_schedule_inventory.py",
+            "tests/test_v52_timezone_review.py",
+        }
+        required_docs = {
+            "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md",
+            "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md",
+            "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md",
         }
         self.assertTrue(
             required_schemas.issubset(set(verifier_module.EXPECTED_CURRENT_FILES))
         )
         self.assertTrue(required_schemas.issubset(set(CANONICAL_JSON_FILES)))
         self.assertTrue(
-            required_code.issubset(set(verifier_module.CURRENT_SCOPE_SINGLE_FILES))
+            (required_code | required_docs).issubset(
+                set(verifier_module.CURRENT_SCOPE_SINGLE_FILES)
+            )
+        )
+        self.assertTrue(
+            required_schemas.issubset(
+                set(getattr(verifier_module, "TASK7D_SCHEMA_DOCUMENT_SHA256", {}))
+            )
         )
         scope = verifier_module.capture_current_scope(ROOT)
-        self.assertTrue(required_code.issubset(set(scope["single_files"])))
+        self.assertTrue(
+            (required_code | required_docs).issubset(set(scope["single_files"]))
+        )
         schema_nodes = scope["trees"]["schemas"]["nodes"]
         self.assertTrue(required_schemas.issubset(set(schema_nodes)))
 
@@ -733,6 +753,9 @@ class DesignVerificationTest(unittest.TestCase):
                 ".gitignore",
                 "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
                 "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+                "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md",
+                "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md",
+                "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md",
             ):
                 source = ROOT / relative
                 target = root / relative
@@ -1263,6 +1286,10 @@ class DesignVerificationTest(unittest.TestCase):
                 "v5_2_acquisition_checkpoint.schema.json",
                 "v5_2_execution_receipt.schema.json",
                 "v5_2_schedule_anchor_inventory.schema.json",
+                "v5_2_timezone_candidate.schema.json",
+                "v5_2_timezone_review_receipt.schema.json",
+                "v5_2_timezone_seal_receipt.schema.json",
+                "v5_2_venue_timezones.schema.json",
             ):
                 shutil.copy2(ROOT / "schemas" / name, root / "schemas" / name)
             for mutation in ("const", "additionalProperties", "properties"):
@@ -1304,6 +1331,10 @@ class DesignVerificationTest(unittest.TestCase):
             "v5_2_acquisition_checkpoint.schema.json",
             "v5_2_execution_receipt.schema.json",
             "v5_2_schedule_anchor_inventory.schema.json",
+            "v5_2_timezone_candidate.schema.json",
+            "v5_2_timezone_review_receipt.schema.json",
+            "v5_2_timezone_seal_receipt.schema.json",
+            "v5_2_venue_timezones.schema.json",
         )
         malformed = {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1364,13 +1395,13 @@ class DesignVerificationTest(unittest.TestCase):
                     ] = "unknown-date-format"
                 path.write_bytes(canonical_json_bytes(schema) + b"\n")
                 pins = {
-                    **verifier_module.TASK7C_SCHEMA_DOCUMENT_SHA256,
+                    **verifier_module.TASK7D_SCHEMA_DOCUMENT_SHA256,
                     relative: sha256_file(path),
                 }
                 with (
                     patch.object(
                         verifier_module,
-                        "TASK7C_SCHEMA_DOCUMENT_SHA256",
+                        "TASK7D_SCHEMA_DOCUMENT_SHA256",
                         pins,
                     ),
                     self.assertRaisesRegex(

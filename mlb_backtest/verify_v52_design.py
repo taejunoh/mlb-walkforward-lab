@@ -91,6 +91,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/v52_schedule_inventory.py",
+    "mlb_backtest/v52_timezone_review.py",
     "mlb_backtest/notebook_artifact.py",
     "mlb_backtest/report_artifact.py",
     "mlb_backtest/protocols.py",
@@ -102,6 +103,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_execution_registry.py",
     "tests/test_v52_query_plan.py",
     "tests/test_v52_schedule_inventory.py",
+    "tests/test_v52_timezone_review.py",
     "tests/test_notebook_artifact.py",
     "tests/test_report_artifact.py",
     "tests/test_protocols.py",
@@ -109,6 +111,9 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_verify_v52_design.py",
     "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md",
     "docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md",
+    "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md",
+    "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md",
+    "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md",
 )
 FORBIDDEN_NAMESPACE_ROOTS = (
     *HISTORICAL_NAMESPACE_ROOTS,
@@ -135,6 +140,10 @@ EXPECTED_CURRENT_FILES = (
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
+    "schemas/v5_2_timezone_candidate.schema.json",
+    "schemas/v5_2_timezone_review_receipt.schema.json",
+    "schemas/v5_2_timezone_seal_receipt.schema.json",
+    "schemas/v5_2_venue_timezones.schema.json",
     "protocols/v5_2_qd/change_contract.json",
     "protocols/v5_2_qd/historical_walkforward_500.json",
     "protocols/v5_2_qd/prospective_2026.json",
@@ -157,6 +166,10 @@ CANONICAL_JSON_FILES = (
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
+    "schemas/v5_2_timezone_candidate.schema.json",
+    "schemas/v5_2_timezone_review_receipt.schema.json",
+    "schemas/v5_2_timezone_seal_receipt.schema.json",
+    "schemas/v5_2_venue_timezones.schema.json",
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_qd.schema.json",
     "schemas/v5_2_run_spec.schema.json",
@@ -180,9 +193,9 @@ V51_REQUIRED_FILES = tuple(
     )
 )
 
-TASK7C_SCHEMA_DOCUMENT_SHA256 = {
+TASK7D_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "aec8db7e39598b9d9a96aaa48bbc63135a6e88b8ec693550536104d347ffaadd"
+        "71d7cd18b44ec75d1be6a10518434c7691efcde804dfe6938fb830cd33519e8a"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
         "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
@@ -192,6 +205,18 @@ TASK7C_SCHEMA_DOCUMENT_SHA256 = {
     ),
     "schemas/v5_2_schedule_anchor_inventory.schema.json": (
         "66698b643ad186434d0930a7f369b3b292f664e1152ddaaa727e6d0003a13c31"
+    ),
+    "schemas/v5_2_timezone_candidate.schema.json": (
+        "9cc9d49ec18a7e538d37e6b00bf8acb1185aaeeba4ad97e836e12f200ab5f91b"
+    ),
+    "schemas/v5_2_timezone_review_receipt.schema.json": (
+        "f809ef68ed1ececb70fd33ddad15e4728eab0ad821243303aa317e69c2d11727"
+    ),
+    "schemas/v5_2_timezone_seal_receipt.schema.json": (
+        "4f63caad4371e39aa41fea81dc2825cd71b3a9de4087d14f2e590963cd763126"
+    ),
+    "schemas/v5_2_venue_timezones.schema.json": (
+        "beb1469e4e6860b1670cbb05e0a3f4b59d82b3e753025701eb04ef25d6a026a0"
     ),
 }
 
@@ -921,7 +946,7 @@ def verify_contract_schemas(
     for relative, expected in documents.items():
         if (root / relative).read_bytes() != canonical_json_bytes(expected) + b"\n":
             raise ValueError(f"schema/parser disagreement: {relative}")
-    for relative, expected_sha256 in TASK7C_SCHEMA_DOCUMENT_SHA256.items():
+    for relative, expected_sha256 in TASK7D_SCHEMA_DOCUMENT_SHA256.items():
         path = require_regular_file(root, relative)
         try:
             contents = path.read_bytes()
