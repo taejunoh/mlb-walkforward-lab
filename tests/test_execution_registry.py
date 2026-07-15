@@ -56,6 +56,12 @@ CONTRACT_RELATIVE = Path("protocols/v5_2_qd/historical_source_acquisition.json")
 ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
+LEGACY_DECISION_RELATIVE = Path(
+    "audit/v5_2_qd/historical/acquisition/legacy_decision_inventory.json"
+)
+LEGACY_DECISION_SCHEMA_RELATIVE = Path(
+    "schemas/v5_2_legacy_decision_inventory.schema.json"
+)
 SOURCE_INVENTORY_RELATIVE = Path(
     "data/v5_2_qd/historical/sources/source_inventory.json"
 )
@@ -67,12 +73,15 @@ BOUND_EXECUTION_CODE = (
     Path("mlb_backtest/verify_v52_design.py"),
     Path("mlb_backtest/v52_query_plan.py"),
     Path("mlb_backtest/v52_game_evidence_inventory.py"),
+    Path("mlb_backtest/v52_legacy.py"),
+    Path("mlb_backtest/v52_legacy_decision_inventory.py"),
     Path("mlb_backtest/v52_schedule_inventory.py"),
     Path("mlb_backtest/v52_timezone_review.py"),
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_game_evidence_inventory.schema.json"),
+    LEGACY_DECISION_SCHEMA_RELATIVE,
     Path("schemas/v5_2_split_receipt.schema.json"),
     Path("schemas/v5_2_timezone_candidate.schema.json"),
     Path("schemas/v5_2_timezone_review_receipt.schema.json"),
@@ -149,7 +158,9 @@ class ExecutionRegistryTest(unittest.TestCase):
 
         self.registry = execution_registry
 
-    def make_repo(self, parent: Path) -> tuple[Path, object]:
+    def make_repo(
+        self, parent: Path, *, remaining_authority: bool = False
+    ) -> tuple[Path, object]:
         root = (parent / "repo").resolve()
         for relative in (
             RUN_SPEC_RELATIVE,
@@ -175,6 +186,29 @@ class ExecutionRegistryTest(unittest.TestCase):
         shutil.copy2(ROOT / PROTECTED_RELATIVE, root / PROTECTED_RELATIVE)
         for relative in BOUND_EXECUTION_CODE:
             shutil.copy2(ROOT / relative, root / relative)
+        if remaining_authority:
+            from mlb_backtest.manifest import RawStore
+            from mlb_backtest.statcast import statcast_url
+            from mlb_backtest.v52_protected_inventory import (
+                build_protected_raw_inventory,
+            )
+            from tests.test_v52_legacy import _canonical_file
+
+            legacy_root = root / "data/v5_1_bt/raw"
+            RawStore(legacy_root).put(
+                "baseball_savant_statcast",
+                {
+                    "end": "2024-04-02",
+                    "game_type": "R",
+                    "start": "2024-04-02",
+                    "url": statcast_url("2024-04-02", "2024-04-02"),
+                },
+                (
+                    ROOT / "tests/fixtures/v5_2_qd/sources/statcast_mini.csv"
+                ).read_bytes(),
+            )
+            inventory = build_protected_raw_inventory(root, legacy_root)
+            (root / PROTECTED_RELATIVE).write_bytes(_canonical_file(inventory))
         (root / "unrelated.txt").write_text("clean\n", encoding="utf-8")
         _git(root, "init", "-q")
         _git(root, "config", "user.email", "registry@example.test")
@@ -210,7 +244,17 @@ class ExecutionRegistryTest(unittest.TestCase):
             }
         )
         (root / CONTRACT_RELATIVE).write_bytes(canonical_json_bytes(template) + b"\n")
-        _git(root, "add", CONTRACT_RELATIVE.as_posix())
+        contract_paths = [CONTRACT_RELATIVE.as_posix()]
+        if remaining_authority:
+            acquisition_schema = json.loads(
+                (root / ACQUISITION_SCHEMA_RELATIVE).read_bytes()
+            )
+            acquisition_schema["const"] = template
+            (root / ACQUISITION_SCHEMA_RELATIVE).write_bytes(
+                canonical_json_bytes(acquisition_schema) + b"\n"
+            )
+            contract_paths.append(ACQUISITION_SCHEMA_RELATIVE.as_posix())
+        _git(root, "add", *contract_paths)
         _git(root, "commit", "-qm", "fixture contract")
         return root, load_run_spec(root / RUN_SPEC_RELATIVE)
 
@@ -818,6 +862,189 @@ class ExecutionRegistryTest(unittest.TestCase):
             ),
         )
 
+    def remaining_checkpoint_fixture(
+        self, parent: Path, *, terminal_participant: bool = True
+    ):
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+
+        root, run_spec = self.make_repo(parent, remaining_authority=True)
+        participant_fixture = self.participant_checkpoint_fixture(root, run_spec)
+        fixture, timezone, _, participant_batch, participant_ids, evidence = (
+            participant_fixture
+        )
+        if terminal_participant:
+            self.complete_participant_queries(root, run_spec, participant_batch)
+        participant_checkpoint = self.publish_participant_checkpoint(
+            root,
+            run_spec,
+            participant_fixture,
+            expected_prior=timezone.receipt_sha256,
+            completed_participant_ids=(
+                participant_ids if terminal_participant else ()
+            ),
+        )
+        root_batch = build_statcast_root_batch(root)
+        publish_query_batch(root, root_batch)
+        decision = publish_legacy_decision_inventory(root)
+        partition_batch = build_legacy_partition_batch(root)
+        publish_query_batch(root, partition_batch)
+        root_batch_path = (
+            root
+            / "audit/v5_2_qd/historical/acquisition/query_batches"
+            / f"{root_batch.batch_id}.json"
+        )
+        remaining_evidence = tuple(
+            sorted(
+                (
+                    *evidence,
+                    root / PROTECTED_RELATIVE,
+                    decision.path,
+                    root_batch_path,
+                )
+            )
+        )
+        partition_ids = tuple(
+            sorted(logical_query_id(query) for query in partition_batch.queries)
+        )
+        root_ids = tuple(
+            sorted(logical_query_id(query) for query in root_batch.queries)
+        )
+        return (
+            root,
+            run_spec,
+            fixture,
+            participant_batch,
+            participant_checkpoint,
+            root_batch,
+            partition_batch,
+            partition_ids,
+            root_ids,
+            remaining_evidence,
+        )
+
+    def publish_remaining_checkpoint(
+        self,
+        remaining_fixture: tuple[object, ...],
+        *,
+        expected_prior: str,
+        completed_partition_ids: tuple[str, ...] = (),
+        quarantined_partition_ids: tuple[str, ...] = (),
+        split_partition_ids: tuple[str, ...] = (),
+        extra_pending_ids: tuple[str, ...] = (),
+        query_batch_ids: tuple[str, ...] | None = None,
+        stage_evidence: tuple[Path, ...] | None = None,
+    ):
+        from mlb_backtest.v52_evidence import logical_query_id
+
+        (
+            root,
+            run_spec,
+            fixture,
+            participant_batch,
+            _,
+            _,
+            partition_batch,
+            partition_ids,
+            _,
+            remaining_evidence,
+        ) = remaining_fixture
+        static_batch, reference_batch, static_ids, reference_ids, *_ = fixture
+        terminal = {
+            *completed_partition_ids,
+            *quarantined_partition_ids,
+            *split_partition_ids,
+        }
+        return self.registry.publish_acquisition_checkpoint(
+            root,
+            run_spec,
+            expected_prior_checkpoint_sha256=expected_prior,
+            stage="REMAINING",
+            query_batch_ids=(
+                (
+                    static_batch.batch_id,
+                    reference_batch.batch_id,
+                    participant_batch.batch_id,
+                    partition_batch.batch_id,
+                )
+                if query_batch_ids is None
+                else query_batch_ids
+            ),
+            completed_query_ids=tuple(
+                sorted(
+                    (
+                        *static_ids,
+                        *reference_ids,
+                        *(
+                            logical_query_id(query)
+                            for query in participant_batch.queries
+                        ),
+                        *completed_partition_ids,
+                    )
+                )
+            ),
+            pending_query_ids=tuple(
+                (
+                    *(
+                        query_id
+                        for query_id in partition_ids
+                        if query_id not in terminal
+                    ),
+                    *extra_pending_ids,
+                )
+            ),
+            quarantined_query_ids=tuple(sorted(quarantined_partition_ids)),
+            split_query_ids=tuple(sorted(split_partition_ids)),
+            stage_evidence_receipts=(
+                remaining_evidence if stage_evidence is None else stage_evidence
+            ),
+        )
+
+    def complete_remaining_queries(
+        self,
+        root: Path,
+        run_spec: object,
+        partition_batch: object,
+    ) -> None:
+        from mlb_backtest.v52_evidence import AttemptCapture, V52EvidenceStore
+        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+
+        store = V52EvidenceStore(root / run_spec.raw["namespaces"]["raw"])
+        fixture = (
+            ROOT / "tests/fixtures/v5_2_qd/sources/statcast_mini.csv"
+        ).read_bytes()
+        for query in partition_batch.queries:
+            if store.read_verified_query_progress(query).status == "SUCCESS":
+                continue
+            start = str(query.requested_range["start_date"])
+            raw = fixture.replace(b"2024-04-02", start.encode("ascii"))
+            capture = AttemptCapture(
+                started_at_utc="2026-07-14T00:00:00.000000Z",
+                ended_at_utc="2026-07-14T00:00:01.000000Z",
+                final_url=query.endpoint,
+                http_status=200,
+                response_headers=(
+                    ("content-type", "text/csv"),
+                    ("content-length", str(len(raw))),
+                ),
+                body=raw,
+                error_classification=None,
+            )
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    recompute_query_sidecar(query, raw),
+                )
+
     def test_acquisition_checkpoint_schema_and_public_api_are_closed(self) -> None:
         self.assertTrue(hasattr(self.registry, "AcquisitionCheckpoint"))
         self.assertTrue(hasattr(self.registry, "publish_acquisition_checkpoint"))
@@ -830,6 +1057,320 @@ class ExecutionRegistryTest(unittest.TestCase):
         self.assertEqual(
             schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
         )
+        self.assertTrue(
+            {
+                "mlb_backtest/v52_legacy_decision_inventory.py",
+                "schemas/v5_2_legacy_decision_inventory.schema.json",
+            }
+            <= set(self.registry._BOUND_EXECUTION_CODE)
+        )
+
+    def test_remaining_checkpoint_schema_requires_exact_four_batch_prefix_and_ten_evidence_paths(
+        self,
+    ) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        batch_ids = tuple(str(index) * 64 for index in range(1, 5))
+        batches = [
+            {
+                "batch_id": batch_id,
+                "path": (
+                    "audit/v5_2_qd/historical/acquisition/query_batches/"
+                    f"{batch_id}.json"
+                ),
+                "sha256": str(index + 4) * 64,
+                "stage": stage,
+            }
+            for index, (batch_id, stage) in enumerate(
+                zip(
+                    batch_ids,
+                    (
+                        "STATIC_SCHEDULES",
+                        "REFERENCE_INPUTS",
+                        "PARTICIPANT_DERIVED",
+                        "REMAINING",
+                    ),
+                ),
+                start=1,
+            )
+        ]
+        evidence_paths = tuple(
+            sorted(
+                (
+                    PROTECTED_RELATIVE.as_posix(),
+                    *(
+                        path.as_posix() for path in PARTICIPANT_STAGE_EVIDENCE
+                    ),
+                    LEGACY_DECISION_RELATIVE.as_posix(),
+                    (
+                        "audit/v5_2_qd/historical/acquisition/query_batches/"
+                        f"{'9' * 64}.json"
+                    ),
+                )
+            )
+        )
+        self.assertEqual(len(evidence_paths), 10)
+        evidence = [
+            {"path": path, "sha256": f"{index:x}" * 64}
+            for index, path in enumerate(evidence_paths, start=6)
+        ]
+        payload = _checkpoint_schema_payload(
+            stage="REMAINING",
+            query_batches=batches,
+            stage_evidence=evidence,
+        )
+        jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
+
+        for collection, mutation in (
+            ("query_batches", "missing"),
+            ("query_batches", "extra"),
+            ("query_batches", "reordered"),
+            ("stage_evidence_receipts", "missing"),
+            ("stage_evidence_receipts", "extra"),
+            ("stage_evidence_receipts", "reordered"),
+        ):
+            with self.subTest(collection=collection, mutation=mutation):
+                forged = json.loads(json.dumps(payload))
+                values = forged[collection]
+                if mutation == "missing":
+                    values.pop()
+                elif mutation == "extra":
+                    values.append(values[-1])
+                else:
+                    values[-2:] = reversed(values[-2:])
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        forged,
+                        schema,
+                        format_checker=FORMAT_CHECKER,
+                    )
+
+    def test_first_remaining_checkpoint_uses_partition_population_and_fixed_authority(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_evidence import logical_query_id
+
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(Path(directory))
+            (
+                root,
+                run_spec,
+                fixture,
+                participant_batch,
+                participant_checkpoint,
+                _root_batch,
+                partition_batch,
+                partition_ids,
+                root_ids,
+                remaining_evidence,
+            ) = remaining_fixture
+            checkpoint = self.publish_remaining_checkpoint(
+                remaining_fixture,
+                expected_prior=participant_checkpoint.receipt_sha256,
+            )
+            static_batch, reference_batch, *_ = fixture
+            self.assertEqual(
+                checkpoint.query_batch_ids,
+                (
+                    static_batch.batch_id,
+                    reference_batch.batch_id,
+                    participant_batch.batch_id,
+                    partition_batch.batch_id,
+                ),
+            )
+            self.assertEqual(
+                checkpoint.stage_evidence_receipt_sha256s,
+                tuple(_sha256(path) for path in remaining_evidence),
+            )
+            self.assertEqual(len(checkpoint.stage_evidence_receipt_sha256s), 10)
+            status_union = {
+                *checkpoint.completed_query_ids,
+                *checkpoint.pending_query_ids,
+                *checkpoint.quarantined_query_ids,
+                *checkpoint.split_query_ids,
+            }
+            prefix_ids = {
+                logical_query_id(query)
+                for batch in (static_batch, reference_batch, participant_batch)
+                for query in batch.queries
+            }
+            self.assertEqual(set(checkpoint.completed_query_ids), prefix_ids)
+            self.assertEqual(set(checkpoint.pending_query_ids), set(partition_ids))
+            self.assertEqual(status_union, prefix_ids | set(partition_ids))
+            self.assertTrue(set(root_ids).isdisjoint(status_union))
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                checkpoint,
+            )
+
+    def test_remaining_checkpoint_advances_partial_to_terminal_and_retries_idempotently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(Path(directory))
+            (
+                root,
+                run_spec,
+                _,
+                _,
+                participant_checkpoint,
+                _,
+                partition_batch,
+                partition_ids,
+                _,
+                _,
+            ) = remaining_fixture
+            partial = self.publish_remaining_checkpoint(
+                remaining_fixture,
+                expected_prior=participant_checkpoint.receipt_sha256,
+            )
+            self.complete_remaining_queries(root, run_spec, partition_batch)
+            terminal = self.publish_remaining_checkpoint(
+                remaining_fixture,
+                expected_prior=partial.receipt_sha256,
+                completed_partition_ids=partition_ids,
+            )
+            self.assertFalse(terminal.pending_query_ids)
+            self.assertFalse(terminal.quarantined_query_ids)
+            self.assertFalse(terminal.split_query_ids)
+            self.assertTrue(set(partition_ids) <= set(terminal.completed_query_ids))
+            self.assertEqual(
+                self.publish_remaining_checkpoint(
+                    remaining_fixture,
+                    expected_prior=terminal.receipt_sha256,
+                    completed_partition_ids=partition_ids,
+                ),
+                terminal,
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
+                terminal,
+            )
+
+    def test_remaining_checkpoint_rejects_fixed_authority_status_and_evidence_attacks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(Path(directory))
+            (
+                root,
+                _,
+                fixture,
+                participant_batch,
+                participant_checkpoint,
+                root_batch,
+                partition_batch,
+                partition_ids,
+                root_ids,
+                remaining_evidence,
+            ) = remaining_fixture
+            static_batch, reference_batch, *_ = fixture
+            fixed = (
+                static_batch.batch_id,
+                reference_batch.batch_id,
+                participant_batch.batch_id,
+                partition_batch.batch_id,
+            )
+            extra_evidence = self.write_artifact(
+                root,
+                "audit/v5_2_qd/historical/acquisition/remaining-extra.json",
+                {"unexpected": True},
+            )
+            wrong_evidence = tuple(
+                extra_evidence if path == remaining_evidence[2] else path
+                for path in remaining_evidence
+            )
+            attacks = (
+                (
+                    "fixed5",
+                    {
+                        "query_batch_ids": (
+                            *fixed[:3],
+                            root_batch.batch_id,
+                            partition_batch.batch_id,
+                        )
+                    },
+                ),
+                ("batch_missing", {"query_batch_ids": fixed[:-1]}),
+                ("batch_extra", {"query_batch_ids": (*fixed, fixed[-1])}),
+                (
+                    "batch_reordered",
+                    {"query_batch_ids": (fixed[0], fixed[2], fixed[1], fixed[3])},
+                ),
+                ("batch_wrong", {"query_batch_ids": (*fixed[:3], root_batch.batch_id)}),
+                ("evidence_missing", {"stage_evidence": remaining_evidence[:-1]}),
+                (
+                    "evidence_extra",
+                    {"stage_evidence": (*remaining_evidence, extra_evidence)},
+                ),
+                ("evidence_wrong", {"stage_evidence": wrong_evidence}),
+                (
+                    "root_population",
+                    {"extra_pending_ids": (root_ids[0],)},
+                ),
+                (
+                    "false_success",
+                    {"completed_partition_ids": (partition_ids[0],)},
+                ),
+                (
+                    "false_quarantine",
+                    {"quarantined_partition_ids": (partition_ids[0],)},
+                ),
+                (
+                    "false_split",
+                    {"split_partition_ids": (partition_ids[0],)},
+                ),
+            )
+            for attack, kwargs in attacks:
+                with (
+                    self.subTest(attack=attack),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "REMAINING|authority|batch|evidence|status|split|partition|checkpoint",
+                    ),
+                ):
+                    self.publish_remaining_checkpoint(
+                        remaining_fixture,
+                        expected_prior=participant_checkpoint.receipt_sha256,
+                        **kwargs,
+                    )
+
+    def test_remaining_checkpoint_rejects_reordered_evidence_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(Path(directory))
+            participant_checkpoint = remaining_fixture[4]
+            remaining_evidence = remaining_fixture[9]
+            reordered = (
+                remaining_evidence[1],
+                remaining_evidence[0],
+                *remaining_evidence[2:],
+            )
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError),
+                "REMAINING|evidence|order|canonical|checkpoint",
+            ):
+                self.publish_remaining_checkpoint(
+                    remaining_fixture,
+                    expected_prior=participant_checkpoint.receipt_sha256,
+                    stage_evidence=reordered,
+                )
+
+    def test_remaining_checkpoint_requires_terminal_participant_prior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            remaining_fixture = self.remaining_checkpoint_fixture(
+                Path(directory), terminal_participant=False
+            )
+            participant_checkpoint = remaining_fixture[4]
+            self.assertTrue(participant_checkpoint.pending_query_ids)
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError),
+                "REMAINING|participant|fully verified|pending|prior|stage|status|checkpoint",
+            ):
+                self.publish_remaining_checkpoint(
+                    remaining_fixture,
+                    expected_prior=participant_checkpoint.receipt_sha256,
+                )
 
     def test_timezone_checkpoint_schema_requires_exact_six_fixed_evidence_paths(
         self,
@@ -3775,12 +4316,15 @@ class ExecutionRegistryTest(unittest.TestCase):
             "mlb_backtest/execution_registry.py",
             "mlb_backtest/verify_v52_design.py",
             "mlb_backtest/v52_game_evidence_inventory.py",
+            "mlb_backtest/v52_legacy.py",
+            "mlb_backtest/v52_legacy_decision_inventory.py",
             "mlb_backtest/v52_query_plan.py",
             "mlb_backtest/v52_schedule_inventory.py",
             "mlb_backtest/v52_timezone_review.py",
             "schemas/v5_2_acquisition_checkpoint.schema.json",
             "schemas/v5_2_execution_receipt.schema.json",
             "schemas/v5_2_game_evidence_inventory.schema.json",
+            "schemas/v5_2_legacy_decision_inventory.schema.json",
             "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
             "schemas/v5_2_timezone_candidate.schema.json",

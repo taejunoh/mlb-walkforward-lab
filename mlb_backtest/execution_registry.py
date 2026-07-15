@@ -97,12 +97,15 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/verify_v52_design.py",
     "mlb_backtest/v52_game_evidence_inventory.py",
+    "mlb_backtest/v52_legacy.py",
+    "mlb_backtest/v52_legacy_decision_inventory.py",
     "mlb_backtest/v52_query_plan.py",
     "mlb_backtest/v52_schedule_inventory.py",
     "mlb_backtest/v52_timezone_review.py",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_game_evidence_inventory.schema.json",
+    "schemas/v5_2_legacy_decision_inventory.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_timezone_candidate.schema.json",
@@ -159,6 +162,7 @@ _OPEN_CHECKPOINT_STAGES = frozenset(
         "REFERENCE_INPUTS",
         "TIMEZONE_REVIEW",
         "PARTICIPANT_DERIVED",
+        "REMAINING",
     }
 )
 _TIMEZONE_STAGE_EVIDENCE_PATHS = (
@@ -171,6 +175,10 @@ _TIMEZONE_STAGE_EVIDENCE_PATHS = (
 )
 _GAME_EVIDENCE_INVENTORY_PATH = (
     "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
+)
+_PROTECTED_RAW_INVENTORY_PATH = "audit/v5_1_bt/protected_raw_inventory.json"
+_LEGACY_DECISION_INVENTORY_PATH = (
+    "audit/v5_2_qd/historical/acquisition/legacy_decision_inventory.json"
 )
 _PARTICIPANT_STAGE_EVIDENCE_PATHS = tuple(
     sorted((*_TIMEZONE_STAGE_EVIDENCE_PATHS, _GAME_EVIDENCE_INVENTORY_PATH))
@@ -2092,9 +2100,12 @@ def _checkpoint_stage_authority(
     contract_binding: Mapping[str, object],
 ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
     from mlb_backtest.v52_query_plan import (
+        build_legacy_partition_batch,
         build_participant_derived_batch,
         build_schedule_reference_batch,
+        build_statcast_root_batch,
         build_static_batch,
+        load_query_batch,
     )
 
     run_path = paths.root / str(run_binding["path"])
@@ -2106,6 +2117,7 @@ def _checkpoint_stage_authority(
         "REFERENCE_INPUTS",
         "TIMEZONE_REVIEW",
         "PARTICIPANT_DERIVED",
+        "REMAINING",
     }:
         raise ValueError(
             "non-static checkpoint stage authority is unavailable until implemented"
@@ -2201,9 +2213,68 @@ def _checkpoint_stage_authority(
             key=lambda item: item["path"],
         )
     )
+    if stage == "PARTICIPANT_DERIVED":
+        return (
+            (static_batch, reference_batch, participant_batch),
+            participant_stage_evidence,
+        )
+
+    from mlb_backtest.v52_legacy_decision_inventory import (
+        load_verified_legacy_decision_inventory,
+    )
+
+    root_expected = build_statcast_root_batch(paths.root)
+    root_batch = load_query_batch(paths.root, root_expected.batch_id)
+    if root_batch != root_expected or len(root_batch.queries) != 46:
+        raise ValueError("REMAINING Statcast root authority differs")
+    decision = load_verified_legacy_decision_inventory(paths.root)
+    partition_batch = build_legacy_partition_batch(paths.root)
+    if (
+        partition_batch.derived_from_sha256 != decision.sha256
+        or len(partition_batch.queries) != 48
+    ):
+        raise ValueError("REMAINING partition decision authority differs")
+    protected = decision.payload.get("protected_inventory")
+    if not isinstance(protected, Mapping):
+        raise ValueError("REMAINING protected inventory authority differs")
+    protected_binding = _checkpoint_artifact_binding(
+        paths.root,
+        Path(_PROTECTED_RAW_INVENTORY_PATH),
+        "REMAINING protected raw inventory",
+    )
+    decision_binding = _checkpoint_artifact_binding(
+        paths.root,
+        Path(_LEGACY_DECISION_INVENTORY_PATH),
+        "REMAINING legacy decision inventory",
+    )
+    root_relative = (
+        Path("audit/v5_2_qd/historical/acquisition/query_batches")
+        / f"{root_batch.batch_id}.json"
+    )
+    root_binding = _checkpoint_artifact_binding(
+        paths.root, root_relative, "REMAINING Statcast root batch"
+    )
+    if (
+        protected_binding["sha256"] != protected.get("sha256")
+        or decision_binding["sha256"] != decision.sha256
+    ):
+        raise ValueError("REMAINING stage evidence lineage differs")
+    remaining_stage_evidence = tuple(
+        sorted(
+            (
+                *participant_stage_evidence,
+                protected_binding,
+                decision_binding,
+                root_binding,
+            ),
+            key=lambda item: item["path"],
+        )
+    )
+    if len(remaining_stage_evidence) != 10:
+        raise ValueError("REMAINING requires exactly ten stage evidence bindings")
     return (
-        (static_batch, reference_batch, participant_batch),
-        participant_stage_evidence,
+        (static_batch, reference_batch, participant_batch, partition_batch),
+        remaining_stage_evidence,
     )
 
 
@@ -2372,6 +2443,23 @@ def _checkpoint_current_semantic(
         ):
             raise ValueError(
                 "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
+            )
+    if stage == "REMAINING":
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
+        )
+        partition_ids = batch_query_ids[str(batches[3]["batch_id"])]
+        if (
+            len(batches) != 4
+            or not prefix_ids <= set(completed)
+            or set(pending) - partition_ids
+            or set(quarantined) - partition_ids
+            or split
+            or split_receipt_paths
+            or (not pending and quarantined)
+        ):
+            raise ValueError(
+                "REMAINING requires a terminal prefix and exact unsplit partition state"
             )
 
     expected_split_paths = {
@@ -2617,6 +2705,25 @@ def _checkpoint_artifacts_and_population(
             raise ValueError(
                 "PARTICIPANT_DERIVED requires a terminal prefix and forbids splits"
             )
+    if stage == "REMAINING":
+        prefix_ids = set().union(
+            *(batch_query_ids[str(batch["batch_id"])] for batch in batches[:3])
+        )
+        partition_ids = batch_query_ids[str(batches[3]["batch_id"])]
+        pending_ids = set(payload["pending_query_ids"])
+        quarantined_ids = set(payload["quarantined_query_ids"])
+        if (
+            len(batches) != 4
+            or not prefix_ids <= set(payload["completed_query_ids"])
+            or pending_ids - partition_ids
+            or quarantined_ids - partition_ids
+            or payload["split_query_ids"]
+            or payload["split_receipts"]
+            or (not pending_ids and quarantined_ids)
+        ):
+            raise ValueError(
+                "REMAINING requires a terminal prefix and exact unsplit partition state"
+            )
     evidence = payload["query_evidence_receipts"]
     assert isinstance(evidence, list)
     verified_evidence: set[tuple[str, str, str, str]] = set()
@@ -2798,6 +2905,16 @@ def _validate_checkpoint_progression(
             raise ValueError(
                 "PARTICIPANT_DERIVED checkpoint lacks exact game inventory evidence"
             )
+    if current_stage == "REMAINING" and (
+        len(evidence_paths) != 10
+        or not {
+            *_PARTICIPANT_STAGE_EVIDENCE_PATHS,
+            _PROTECTED_RAW_INVENTORY_PATH,
+            _LEGACY_DECISION_INVENTORY_PATH,
+        }
+        <= evidence_paths
+    ):
+        raise ValueError("REMAINING checkpoint lacks exact planning lineage evidence")
     if previous is None:
         if current_stage != "STATIC_SCHEDULES":
             raise ValueError("first acquisition checkpoint stage differs")
@@ -2814,6 +2931,13 @@ def _validate_checkpoint_progression(
     }:
         raise ValueError(
             "PARTICIPANT_DERIVED requires the terminal TIMEZONE_REVIEW checkpoint"
+        )
+    if current_stage == "REMAINING" and previous["stage"] not in {
+        "PARTICIPANT_DERIVED",
+        "REMAINING",
+    }:
+        raise ValueError(
+            "REMAINING requires the terminal PARTICIPANT_DERIVED checkpoint"
         )
     if current_stage_index not in {previous_stage, previous_stage + 1}:
         raise ValueError("acquisition checkpoint stage regressed or skipped")
@@ -3105,6 +3229,30 @@ def publish_acquisition_checkpoint(
     stage_evidence_receipts: Sequence[Path] = (),
     split_receipt_paths: Sequence[Path] = (),
 ) -> AcquisitionCheckpoint:
+    for values, label in (
+        (completed_query_ids, "completed query IDs"),
+        (pending_query_ids, "pending query IDs"),
+        (quarantined_query_ids, "quarantined query IDs"),
+        (split_query_ids, "split query IDs"),
+    ):
+        supplied = tuple(values)
+        try:
+            canonical = tuple(sorted(supplied))
+        except TypeError as exc:
+            raise ValueError(f"checkpoint {label} order differs") from exc
+        if supplied != canonical:
+            raise ValueError(f"checkpoint {label} order differs")
+    for values, label in (
+        (stage_evidence_receipts, "stage evidence"),
+        (split_receipt_paths, "split receipt paths"),
+    ):
+        supplied = tuple(values)
+        try:
+            canonical = tuple(sorted(supplied, key=os.fspath))
+        except TypeError as exc:
+            raise ValueError(f"checkpoint {label} order differs") from exc
+        if supplied != canonical:
+            raise ValueError(f"checkpoint {label} order differs")
     paths = _paths(root, run_spec)
     if expected_prior_checkpoint_sha256 is not None and (
         not isinstance(expected_prior_checkpoint_sha256, str)
