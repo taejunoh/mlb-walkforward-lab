@@ -10,7 +10,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 from mlb_backtest.diagnostic_report import render_markdown
 from mlb_backtest.diagnostics import (
@@ -90,6 +90,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "mlb_backtest/diagnostic_report.py",
     "mlb_backtest/execution_registry.py",
     "mlb_backtest/v52_query_plan.py",
+    "mlb_backtest/v52_schedule_inventory.py",
     "mlb_backtest/notebook_artifact.py",
     "mlb_backtest/report_artifact.py",
     "mlb_backtest/protocols.py",
@@ -100,6 +101,7 @@ CURRENT_SCOPE_SINGLE_FILES = (
     "tests/test_diagnostic_report.py",
     "tests/test_execution_registry.py",
     "tests/test_v52_query_plan.py",
+    "tests/test_v52_schedule_inventory.py",
     "tests/test_notebook_artifact.py",
     "tests/test_report_artifact.py",
     "tests/test_protocols.py",
@@ -131,6 +133,7 @@ EXPECTED_CURRENT_FILES = (
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "protocols/v5_2_qd/change_contract.json",
     "protocols/v5_2_qd/historical_walkforward_500.json",
@@ -152,6 +155,7 @@ CANONICAL_JSON_FILES = (
     "schemas/v5_2_preflight.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
+    "schemas/v5_2_schedule_anchor_inventory.schema.json",
     "schemas/v5_2_split_receipt.schema.json",
     "schemas/v5_2_prospective.schema.json",
     "schemas/v5_2_qd.schema.json",
@@ -178,13 +182,16 @@ V51_REQUIRED_FILES = tuple(
 
 TASK7C_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "eb4b810b420cb2454de00b0f0157bc3aa82e41872f8186c3c51da76bdd7c8c15"
+        "aec8db7e39598b9d9a96aaa48bbc63135a6e88b8ec693550536104d347ffaadd"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
         "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
     ),
     "schemas/v5_2_split_receipt.schema.json": (
         "b9de7114410e036cd43a2530a8440dcdbc1b85d78699281e1c623d234102aeea"
+    ),
+    "schemas/v5_2_schedule_anchor_inventory.schema.json": (
+        "66698b643ad186434d0930a7f369b3b292f664e1152ddaaa727e6d0003a13c31"
     ),
 }
 
@@ -940,7 +947,62 @@ def verify_contract_schemas(
             )
         else:
             closed = schema.get("additionalProperties") is False
-        if not closed:
+        known_formats = {
+            *FormatChecker().checkers,
+            "date",
+            "date-time",
+        }
+        object_closure_exemptions = {
+            "schemas/v5_2_acquisition_checkpoint.schema.json": {
+                (
+                    "allOf",
+                    0,
+                    "then",
+                    "properties",
+                    "stage_evidence_receipts",
+                    "contains",
+                )
+            }
+        }.get(relative, set())
+
+        def semantic_nodes_are_closed_and_formatted(
+            value: object, *, path: tuple[object, ...] = ()
+        ) -> bool:
+            if isinstance(value, Mapping):
+                if (
+                    value.get("type") == "object"
+                    and value.get("additionalProperties") is not False
+                    and path not in object_closure_exemptions
+                ):
+                    return False
+                format_name = value.get("format")
+                if (
+                    format_name is not None
+                    and (
+                        not isinstance(format_name, str)
+                        or format_name not in known_formats
+                    )
+                ):
+                    return False
+                return all(
+                    semantic_nodes_are_closed_and_formatted(
+                        child, path=(*path, key)
+                    )
+                    for key, child in value.items()
+                )
+            if isinstance(value, list):
+                return all(
+                    semantic_nodes_are_closed_and_formatted(
+                        child, path=(*path, index)
+                    )
+                    for index, child in enumerate(value)
+                )
+            return True
+
+        if (
+            not closed
+            or not semantic_nodes_are_closed_and_formatted(schema)
+        ):
             raise ValueError(f"schema/parser disagreement: {relative}")
 
 

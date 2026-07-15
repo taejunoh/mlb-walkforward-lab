@@ -2861,20 +2861,24 @@ class ExecutionRegistryTest(unittest.TestCase):
             (root / "unrelated.txt").write_text("dirty\n", encoding="utf-8")
             self.assertEqual(self.initialize(root, run_spec).phase, "DESIGN_ACCEPTED")
 
-    def test_task7c_runtime_authority_is_in_production_bound_code(self) -> None:
+    def test_task7d_runtime_authority_is_exactly_in_production_bound_code(self) -> None:
         required = {
             "mlb_backtest/execution_registry.py",
             "mlb_backtest/verify_v52_design.py",
             "mlb_backtest/v52_query_plan.py",
+            "mlb_backtest/v52_schedule_inventory.py",
             "schemas/v5_2_acquisition_checkpoint.schema.json",
             "schemas/v5_2_execution_receipt.schema.json",
+            "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
         }
-        self.assertTrue(required.issubset(set(self.registry._BOUND_EXECUTION_CODE)))
+        self.assertEqual(set(self.registry._BOUND_EXECUTION_CODE), required)
 
     def test_task7c_bound_runtime_rejects_dirty_initialize_and_load(self) -> None:
         required = (
             Path("mlb_backtest/v52_query_plan.py"),
+            Path("mlb_backtest/v52_schedule_inventory.py"),
+            Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
             Path("schemas/v5_2_split_receipt.schema.json"),
         )
         for relative in required:

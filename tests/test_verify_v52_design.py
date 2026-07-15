@@ -170,14 +170,17 @@ class DesignVerificationTest(unittest.TestCase):
         scope = verifier_module.capture_current_scope(ROOT)
         self.assertTrue(required_docs.issubset(set(scope["single_files"])))
 
-    def test_task7c_files_are_required_canonical_and_current_scope_bound(self) -> None:
+    def test_task7d_schedule_inventory_is_required_canonical_and_current_scope_bound(self) -> None:
         required_schemas = {
             "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_schedule_anchor_inventory.schema.json",
             "schemas/v5_2_split_receipt.schema.json",
         }
         required_code = {
             "mlb_backtest/v52_query_plan.py",
+            "mlb_backtest/v52_schedule_inventory.py",
             "tests/test_v52_query_plan.py",
+            "tests/test_v52_schedule_inventory.py",
         }
         self.assertTrue(
             required_schemas.issubset(set(verifier_module.EXPECTED_CURRENT_FILES))
@@ -1259,6 +1262,7 @@ class DesignVerificationTest(unittest.TestCase):
                 "v5_2_split_receipt.schema.json",
                 "v5_2_acquisition_checkpoint.schema.json",
                 "v5_2_execution_receipt.schema.json",
+                "v5_2_schedule_anchor_inventory.schema.json",
             ):
                 shutil.copy2(ROOT / "schemas" / name, root / "schemas" / name)
             for mutation in ("const", "additionalProperties", "properties"):
@@ -1280,7 +1284,7 @@ class DesignVerificationTest(unittest.TestCase):
                             root, config, historical, prospective, preflight
                         )
 
-    def test_task7c_closed_schema_semantic_tampering_fails(self) -> None:
+    def test_task7d_closed_schema_semantic_tampering_fails(self) -> None:
         config = load_v52_config(ROOT / "config/v5_2_qd.json")
         historical = load_run_spec(
             ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
@@ -1299,6 +1303,7 @@ class DesignVerificationTest(unittest.TestCase):
             "v5_2_split_receipt.schema.json",
             "v5_2_acquisition_checkpoint.schema.json",
             "v5_2_execution_receipt.schema.json",
+            "v5_2_schedule_anchor_inventory.schema.json",
         )
         malformed = {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1315,6 +1320,62 @@ class DesignVerificationTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     ValueError, "schema/parser disagreement"
+                ):
+                    verify_contract_schemas(
+                        root, config, historical, prospective, preflight
+                    )
+
+    def test_schedule_inventory_schema_requires_nested_closure_and_known_formats(self):
+        config = load_v52_config(ROOT / "config/v5_2_qd.json")
+        historical = load_run_spec(
+            ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+        )
+        prospective = load_prospective_spec(
+            ROOT / "protocols/v5_2_qd/prospective_2026.json"
+        )
+        preflight = parse_preflight(
+            json.loads(
+                (ROOT / "reports/v5_2_qd/walkforward_500_preflight.json").read_bytes()
+            )
+        )
+        relative = "schemas/v5_2_schedule_anchor_inventory.schema.json"
+        for mutation in (
+            "definition-closure",
+            "inline-counts-closure",
+            "inline-static-batch-closure",
+            "unknown-format",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                shutil.copytree(ROOT / "schemas", root / "schemas")
+                path = root / relative
+                schema = json.loads(path.read_bytes())
+                if mutation == "definition-closure":
+                    schema["$defs"]["anchor"]["additionalProperties"] = True
+                elif mutation == "inline-counts-closure":
+                    schema["properties"]["counts"]["additionalProperties"] = True
+                elif mutation == "inline-static-batch-closure":
+                    schema["properties"]["static_batch"][
+                        "additionalProperties"
+                    ] = True
+                else:
+                    schema["$defs"]["anchor"]["properties"]["official_date"][
+                        "format"
+                    ] = "unknown-date-format"
+                path.write_bytes(canonical_json_bytes(schema) + b"\n")
+                pins = {
+                    **verifier_module.TASK7C_SCHEMA_DOCUMENT_SHA256,
+                    relative: sha256_file(path),
+                }
+                with (
+                    patch.object(
+                        verifier_module,
+                        "TASK7C_SCHEMA_DOCUMENT_SHA256",
+                        pins,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "schema/parser disagreement"
+                    ),
                 ):
                     verify_contract_schemas(
                         root, config, historical, prospective, preflight
