@@ -2154,6 +2154,24 @@ def _build_legacy_partition_batch_from_catalog(
     return _make_batch("REMAINING", protected_inventory_sha256, queries)
 
 
+def build_legacy_partition_batch_from_catalog(
+    root_batch: QueryBatch,
+    protected_catalog: Sequence[Mapping[str, object]],
+    *,
+    protected_inventory_sha256: str,
+) -> QueryBatch:
+    """Build the pure first-level legacy partition without publishing files."""
+    if not isinstance(root_batch, QueryBatch) or not _is_statcast_root_batch(
+        root_batch
+    ):
+        raise ValueError("root_batch must be the canonical Statcast root batch")
+    return _build_legacy_partition_batch_from_catalog(
+        root_batch.queries,
+        protected_catalog,
+        protected_inventory_sha256=protected_inventory_sha256,
+    )
+
+
 def build_legacy_partition_batch(repository_root: Path) -> QueryBatch:
     """Replay the sealed legacy decisions into the fixed first-level partition."""
     from .v52_legacy_decision_inventory import (

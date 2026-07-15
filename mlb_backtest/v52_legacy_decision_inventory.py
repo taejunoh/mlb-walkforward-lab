@@ -15,8 +15,9 @@ from typing import Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from .v52_evidence import logical_query_id
+from .v52_evidence import LogicalQuery, logical_query_id
 from .v52_legacy import (
+    LegacyDecisionEvidence,
     PromotionDisposition,
     ProtectedLegacyCatalog,
     _Snapshot,
@@ -24,12 +25,13 @@ from .v52_legacy import (
     _rebind,
     _snapshot,
     _trusted_root,
-    audit_legacy_candidate_evidence,
+    audit_legacy_candidates_evidence,
     load_protected_legacy_catalog,
 )
 from .v52_query_plan import (
-    _build_legacy_partition_batch_from_catalog,
     _load_query_batch,
+    QueryBatch,
+    build_legacy_partition_batch_from_catalog,
     build_statcast_root_batch,
 )
 from .v52_source_contracts import canonical_json_bytes
@@ -85,6 +87,13 @@ class VerifiedLegacyDecisionInventory:
     path: Path
     sha256: str
     payload: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class LegacyDecisionPreview:
+    partition_batch: QueryBatch
+    decisions: tuple[Mapping[str, object], ...]
+    counts: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -236,6 +245,129 @@ def _in_scope_records(catalog: ProtectedLegacyCatalog) -> list[Mapping[str, obje
     return records
 
 
+def _candidate_order(record: Mapping[str, object]) -> tuple[str, str, bytes]:
+    query = record.get("canonical_query")
+    if not isinstance(query, Mapping):
+        raise ValueError("legacy candidate canonical query differs")
+    first = query.get("start")
+    last = query.get("end")
+    if not isinstance(first, str) or not isinstance(last, str):
+        raise ValueError("legacy candidate range differs")
+    return first, last, canonical_json_bytes(_plain(record))
+
+
+def _decision_record(
+    query: LogicalQuery,
+    evidence: LegacyDecisionEvidence,
+) -> dict[str, object]:
+    if evidence.decision.query_id != logical_query_id(query):
+        raise RuntimeError("legacy decision query binding differs")
+    requested = query.requested_range
+    return {
+        "parent_query_id": query.parent_query_id,
+        "candidate_query_id": evidence.decision.query_id,
+        "range": {
+            "year": requested["year"],
+            "start_date": requested["start_date"],
+            "end_date": requested["end_date"],
+        },
+        "disposition": evidence.decision.disposition.value,
+        "reason_codes": [item.value for item in evidence.decision.reason_codes],
+        "candidate_lineage": _plain(evidence.candidate_lineage),
+        "semantic_sha256": evidence.semantic_sha256,
+    }
+
+
+def preview_legacy_decisions(
+    root_batch: QueryBatch,
+    catalog: ProtectedLegacyCatalog,
+    *,
+    protected_inventory_sha256: str,
+) -> LegacyDecisionPreview:
+    """Compute the exact legacy partition and closed decisions without writes."""
+    if not isinstance(root_batch, QueryBatch) or len(root_batch.queries) != 46:
+        raise ValueError("preview requires the fixed 46-query Statcast root batch")
+    if not isinstance(catalog, ProtectedLegacyCatalog):
+        raise TypeError("catalog must be a ProtectedLegacyCatalog")
+    if protected_inventory_sha256 != catalog.protected_inventory_sha256:
+        raise ValueError("preview protected inventory binding differs")
+
+    expected_partition_size = len(root_batch.queries) + 2
+    in_scope = sorted(_in_scope_records(catalog), key=_candidate_order)
+    selected: list[Mapping[str, object]] = []
+    for candidate in in_scope:
+        candidate_partition = build_legacy_partition_batch_from_catalog(
+            root_batch,
+            (candidate,),
+            protected_inventory_sha256=protected_inventory_sha256,
+        )
+        candidate_queries = tuple(
+            query
+            for query in candidate_partition.queries
+            if query.requested_range.get("acquisition") == "PROTECTED_LEGACY_REFERENCE"
+        )
+        if len(candidate_queries) != 1:
+            raise ValueError("legacy candidate does not map to one preview query")
+        if len(candidate_partition.queries) != expected_partition_size:
+            continue
+        query = candidate_queries[0]
+        evidence = audit_legacy_candidates_evidence((query,), catalog)[0]
+        if evidence.decision.query_id != logical_query_id(query):
+            raise RuntimeError("legacy preview candidate query binding differs")
+        if evidence.decision.disposition is not PromotionDisposition.FETCH_REQUIRED:
+            selected.append(candidate)
+            break
+    if len(selected) != 1:
+        raise ValueError("legacy preview has no eligible three-way partition")
+
+    partition = build_legacy_partition_batch_from_catalog(
+        root_batch,
+        selected,
+        protected_inventory_sha256=protected_inventory_sha256,
+    )
+    if len(partition.queries) != expected_partition_size:
+        raise ValueError(
+            "legacy preview must split one root into exactly three leaves"
+        )
+    final_evidence = audit_legacy_candidates_evidence(partition.queries, catalog)
+    decisions = [
+        _decision_record(query, evidence)
+        for query, evidence in zip(partition.queries, final_evidence)
+    ]
+    decisions.sort(
+        key=lambda item: (
+            item["range"]["year"],
+            item["range"]["start_date"],
+            item["range"]["end_date"],
+            item["candidate_query_id"],
+        )
+    )
+    disposition_counts = {item.value: 0 for item in PromotionDisposition}
+    for decision in decisions:
+        disposition = decision["disposition"]
+        if not isinstance(disposition, str) or disposition not in disposition_counts:
+            raise ValueError("legacy preview disposition differs")
+        disposition_counts[disposition] += 1
+    unique_ranges = {
+        (item["canonical_query"]["start"], item["canonical_query"]["end"])
+        for item in in_scope
+    }
+    counts = {
+        "protected_catalog_record_count": len(catalog.records),
+        "in_scope_statcast_record_count": len(in_scope),
+        "out_of_scope_record_count": len(catalog.records) - len(in_scope),
+        "unique_candidate_range_count": len(unique_ranges),
+        "promoted_count": disposition_counts["PROMOTED"],
+        "fetch_required_count": disposition_counts["FETCH_REQUIRED"],
+        "fatal_integrity_count": disposition_counts["FATAL_INTEGRITY"],
+    }
+    return LegacyDecisionPreview(
+        partition_batch=partition,
+        decisions=tuple(_deep_freeze(item) for item in decisions),
+        counts=_deep_freeze(counts),  # type: ignore[arg-type]
+    )
+
+
 def _authority_identities(
     root: Path,
     catalog: ProtectedLegacyCatalog,
@@ -298,46 +430,11 @@ def _assemble(repository_root: Path) -> _Authority:
     root_batch_relative = _QUERY_BATCH_ROOT / f"{root_batch.batch_id}.json"
     root_batch_snapshot = _snapshot(root, root / root_batch_relative)
 
-    in_scope = _in_scope_records(catalog)
-    partition = _build_legacy_partition_batch_from_catalog(
-        root_batch.queries,
-        in_scope,
+    preview = preview_legacy_decisions(
+        root_batch,
+        catalog,
         protected_inventory_sha256=protected_sha256,
     )
-    decisions: list[dict[str, object]] = []
-    disposition_counts = {item.value: 0 for item in PromotionDisposition}
-    for query in partition.queries:
-        evidence = audit_legacy_candidate_evidence(query, catalog)
-        if evidence.decision.query_id != logical_query_id(query):
-            raise RuntimeError("legacy decision query binding differs")
-        requested = query.requested_range
-        record = {
-            "parent_query_id": query.parent_query_id,
-            "candidate_query_id": evidence.decision.query_id,
-            "range": {
-                "year": requested["year"],
-                "start_date": requested["start_date"],
-                "end_date": requested["end_date"],
-            },
-            "disposition": evidence.decision.disposition.value,
-            "reason_codes": [item.value for item in evidence.decision.reason_codes],
-            "candidate_lineage": _plain(evidence.candidate_lineage),
-            "semantic_sha256": evidence.semantic_sha256,
-        }
-        decisions.append(record)
-        disposition_counts[evidence.decision.disposition.value] += 1
-    decisions.sort(
-        key=lambda item: (
-            item["range"]["year"],
-            item["range"]["start_date"],
-            item["range"]["end_date"],
-            item["candidate_query_id"],
-        )
-    )
-    unique_ranges = {
-        (item["canonical_query"]["start"], item["canonical_query"]["end"])
-        for item in in_scope
-    }
     payload = {
         "schema_version": 1,
         "receipt_kind": "LEGACY_DECISION_INVENTORY",
@@ -361,16 +458,8 @@ def _assemble(repository_root: Path) -> _Authority:
         },
         "permitted_legacy_years": list(_PERMITTED_YEARS),
         "root_query_count": len(root_batch.queries),
-        "counts": {
-            "protected_catalog_record_count": len(catalog.records),
-            "in_scope_statcast_record_count": len(in_scope),
-            "out_of_scope_record_count": len(catalog.records) - len(in_scope),
-            "unique_candidate_range_count": len(unique_ranges),
-            "promoted_count": disposition_counts["PROMOTED"],
-            "fetch_required_count": disposition_counts["FETCH_REQUIRED"],
-            "fatal_integrity_count": disposition_counts["FATAL_INTEGRITY"],
-        },
-        "decisions": decisions,
+        "counts": _plain(preview.counts),
+        "decisions": _plain(preview.decisions),
     }
     identities = _authority_identities(
         root,
@@ -762,8 +851,10 @@ def _load_legacy_partition_decision_replay(
 
 
 __all__ = [
+    "LegacyDecisionPreview",
     "VerifiedLegacyDecisionInventory",
     "build_legacy_decision_inventory",
     "load_verified_legacy_decision_inventory",
+    "preview_legacy_decisions",
     "publish_legacy_decision_inventory",
 ]

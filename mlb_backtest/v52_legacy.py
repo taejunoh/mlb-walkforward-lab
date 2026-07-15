@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .v52_evidence import (
     LogicalQuery,
@@ -181,6 +181,11 @@ def _trusted_root(root: Path) -> Path:
     if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
         raise ProtectedLegacyIntegrityError(PromotionReasonCode.PROTECTED_PATH_INVALID)
     return supplied.resolve(strict=True)
+
+
+def trusted_legacy_repository_root(root: Path) -> Path:
+    """Return the authenticated canonical repository root for legacy reads."""
+    return _trusted_root(root)
 
 
 def _exact_path(root: Path, supplied: Path, expected: Path) -> Path:
@@ -473,10 +478,12 @@ def _assert_object_binding(
         raise ProtectedLegacyIntegrityError(reason)
 
 
-def _verify_selected(
-    catalog: ProtectedLegacyCatalog, record: _CatalogRecord
+def _verify_selected_revalidated(
+    catalog: ProtectedLegacyCatalog,
+    record: _CatalogRecord,
+    root: Path,
+    inventory_snapshot: _Snapshot,
 ) -> _VerifiedRecord:
-    root, inventory_snapshot = _revalidate_catalog(catalog)
     manifest_snapshot = _snapshot(root, record.candidate.manifest_path)
     seal_snapshot = _snapshot(root, record.candidate.seal_path)
     payload_snapshot = _snapshot(root, record.candidate.payload_path)
@@ -545,6 +552,18 @@ def _verify_selected(
         manifest=dict(manifest),
         inventory_record=_catalog_inventory_record(record),
         payload=payload_snapshot.contents,
+    )
+
+
+def _verify_selected(
+    catalog: ProtectedLegacyCatalog, record: _CatalogRecord
+) -> _VerifiedRecord:
+    root, inventory_snapshot = _revalidate_catalog(catalog)
+    return _verify_selected_revalidated(
+        catalog,
+        record,
+        root,
+        inventory_snapshot,
     )
 
 
@@ -689,22 +708,12 @@ def _current_query_fields_valid(query: LogicalQuery) -> bool:
     return True
 
 
-def _audit_with_record(
-    query: LogicalQuery, catalog: ProtectedLegacyCatalog
+def _audit_revalidated(
+    query: LogicalQuery,
+    catalog: ProtectedLegacyCatalog,
+    root: Path,
+    inventory_snapshot: _Snapshot,
 ) -> tuple[PromotionDecision, _VerifiedRecord | None, Mapping[str, object] | None]:
-    try:
-        _revalidate_catalog(catalog)
-    except ProtectedLegacyIntegrityError as exc:
-        return (
-            PromotionDecision(
-                query_id="0" * 64,
-                disposition=PromotionDisposition.FATAL_INTEGRITY,
-                reason_codes=(exc.reason_code,),
-                candidate=None,
-            ),
-            None,
-            None,
-        )
     try:
         query_id = logical_query_id(query)
     except (TypeError, ValueError):
@@ -779,7 +788,12 @@ def _audit_with_record(
         )
     catalog_record = matches[0]
     try:
-        record = _verify_selected(catalog, catalog_record)
+        record = _verify_selected_revalidated(
+            catalog,
+            catalog_record,
+            root,
+            inventory_snapshot,
+        )
     except ProtectedLegacyIntegrityError as exc:
         return (
             _decision(query, PromotionDisposition.FATAL_INTEGRITY, exc.reason_code),
@@ -812,6 +826,31 @@ def _audit_with_record(
     )
 
 
+def _fatal_audit(
+    reason: PromotionReasonCode,
+) -> tuple[PromotionDecision, None, None]:
+    return (
+        PromotionDecision(
+            query_id="0" * 64,
+            disposition=PromotionDisposition.FATAL_INTEGRITY,
+            reason_codes=(reason,),
+            candidate=None,
+        ),
+        None,
+        None,
+    )
+
+
+def _audit_with_record(
+    query: LogicalQuery, catalog: ProtectedLegacyCatalog
+) -> tuple[PromotionDecision, _VerifiedRecord | None, Mapping[str, object] | None]:
+    try:
+        root, inventory_snapshot = _revalidate_catalog(catalog)
+    except ProtectedLegacyIntegrityError as exc:
+        return _fatal_audit(exc.reason_code)
+    return _audit_revalidated(query, catalog, root, inventory_snapshot)
+
+
 def audit_legacy_candidate(
     query: LogicalQuery, catalog: ProtectedLegacyCatalog
 ) -> PromotionDecision:
@@ -822,15 +861,15 @@ def audit_legacy_candidate(
     return _audit_with_record(query, catalog)[0]
 
 
-def audit_legacy_candidate_evidence(
-    query: LogicalQuery, catalog: ProtectedLegacyCatalog
+def _decision_evidence(
+    audited: tuple[
+        PromotionDecision,
+        _VerifiedRecord | None,
+        Mapping[str, object] | None,
+    ],
+    catalog: ProtectedLegacyCatalog,
 ) -> LegacyDecisionEvidence:
-    """Audit one query and return its immutable legacy decision evidence."""
-    if not isinstance(query, LogicalQuery):
-        raise TypeError("query must be a LogicalQuery")
-    if not isinstance(catalog, ProtectedLegacyCatalog):
-        raise TypeError("catalog must be a ProtectedLegacyCatalog")
-    decision, record, semantics = _audit_with_record(query, catalog)
+    decision, record, semantics = audited
     if (
         decision.disposition is not PromotionDisposition.PROMOTED
         or record is None
@@ -874,6 +913,53 @@ def audit_legacy_candidate_evidence(
     )
     semantic_sha256 = hashlib.sha256(canonical_json_bytes(semantics)).hexdigest()
     return LegacyDecisionEvidence(decision, lineage, semantic_sha256)
+
+
+def audit_legacy_candidate_evidence(
+    query: LogicalQuery, catalog: ProtectedLegacyCatalog
+) -> LegacyDecisionEvidence:
+    """Audit one query and return its immutable legacy decision evidence."""
+    if not isinstance(query, LogicalQuery):
+        raise TypeError("query must be a LogicalQuery")
+    if not isinstance(catalog, ProtectedLegacyCatalog):
+        raise TypeError("catalog must be a ProtectedLegacyCatalog")
+    return _decision_evidence(_audit_with_record(query, catalog), catalog)
+
+
+def audit_legacy_candidates_evidence(
+    queries: Sequence[LogicalQuery],
+    catalog: ProtectedLegacyCatalog,
+) -> tuple[LegacyDecisionEvidence, ...]:
+    """Audit an immutable query set under one start/end catalog authentication."""
+    if not isinstance(queries, Sequence) or not all(
+        isinstance(query, LogicalQuery) for query in queries
+    ):
+        raise TypeError("queries must contain LogicalQuery values")
+    if not queries:
+        raise ValueError("queries must be nonempty")
+    if not isinstance(catalog, ProtectedLegacyCatalog):
+        raise TypeError("catalog must be a ProtectedLegacyCatalog")
+    try:
+        root, inventory_snapshot = _revalidate_catalog(catalog)
+    except ProtectedLegacyIntegrityError as exc:
+        fatal = _decision_evidence(_fatal_audit(exc.reason_code), catalog)
+        return tuple(fatal for _query in queries)
+    audited = tuple(
+        _audit_revalidated(query, catalog, root, inventory_snapshot)
+        for query in queries
+    )
+    try:
+        rebound_root, rebound_inventory = _revalidate_catalog(catalog)
+    except ProtectedLegacyIntegrityError as exc:
+        fatal = _decision_evidence(_fatal_audit(exc.reason_code), catalog)
+        return tuple(fatal for _query in queries)
+    if rebound_root != root or rebound_inventory != inventory_snapshot:
+        fatal = _decision_evidence(
+            _fatal_audit(PromotionReasonCode.LEGACY_PATH_IDENTITY_CHANGED),
+            catalog,
+        )
+        return tuple(fatal for _query in queries)
+    return tuple(_decision_evidence(item, catalog) for item in audited)
 
 
 def promote_legacy_candidate(
@@ -958,6 +1044,8 @@ __all__ = [
     "ProtectedLegacyIntegrityError",
     "audit_legacy_candidate",
     "audit_legacy_candidate_evidence",
+    "audit_legacy_candidates_evidence",
     "load_protected_legacy_catalog",
     "promote_legacy_candidate",
+    "trusted_legacy_repository_root",
 ]

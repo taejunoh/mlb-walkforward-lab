@@ -70,19 +70,27 @@ def _git(root: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
 
 
-def _legacy_decision_repository(parent: Path) -> tuple[Path, Path, str]:
+def _legacy_decision_repository(
+    parent: Path, *, production_shaped: bool = False
+) -> tuple[Path, Path, str]:
     root = _statcast_authority_fixture(parent)
     legacy_root = root / LEGACY_ROOT
-    RawStore(legacy_root).put(
-        "baseball_savant_statcast",
-        {
-            "end": "2024-04-02",
-            "game_type": "R",
-            "start": "2024-04-02",
-            "url": statcast_url("2024-04-02", "2024-04-02"),
-        },
-        STATCAST_RAW,
+    candidate_ranges = (
+        (("2024-04-01", "2024-04-02"), ("2024-04-05", "2024-04-08"))
+        if production_shaped
+        else (("2024-04-02", "2024-04-02"),)
     )
+    for start, end in candidate_ranges:
+        RawStore(legacy_root).put(
+            "baseball_savant_statcast",
+            {
+                "end": end,
+                "game_type": "R",
+                "start": start,
+                "url": statcast_url(start, end),
+            },
+            STATCAST_RAW.replace(b"2024-04-02", start.encode()),
+        )
     RawStore(legacy_root).put(
         "baseball_savant_statcast",
         {
@@ -171,6 +179,26 @@ class V52LegacyDecisionInventoryTest(unittest.TestCase):
             inventory_module._LEGACY_DECISION_INVENTORY_RELATIVE,
             DECISION_PATH,
         )
+        self.assertTrue(
+            {
+                "LegacyDecisionPreview",
+                "preview_legacy_decisions",
+            }.issubset(inventory_module.__all__)
+        )
+
+        import mlb_backtest.v52_legacy as legacy_module
+
+        self.assertTrue(
+            {
+                "audit_legacy_candidates_evidence",
+                "trusted_legacy_repository_root",
+            }.issubset(legacy_module.__all__)
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch_from_catalog,
+        )
+
+        self.assertTrue(callable(build_legacy_partition_batch_from_catalog))
 
     def test_candidate_evidence_is_stable_closed_and_repository_relative(self) -> None:
         from mlb_backtest.v52_legacy import (
@@ -298,6 +326,119 @@ class V52LegacyDecisionInventoryTest(unittest.TestCase):
             )
             self.assertTrue(all(item["semantic_sha256"] is None for item in fetched))
 
+    def test_read_only_preview_is_exact_and_builder_uses_identical_decisions(
+        self,
+    ) -> None:
+        import mlb_backtest.v52_legacy as legacy_module
+
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            LegacyDecisionPreview,
+            build_legacy_decision_inventory,
+            preview_legacy_decisions,
+        )
+        from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch
+
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(LegacyDecisionPreview)),
+            ("partition_batch", "decisions", "counts"),
+        )
+        self.assertTrue(LegacyDecisionPreview.__dataclass_params__.frozen)
+        with tempfile.TemporaryDirectory() as directory:
+            root, inventory_path, digest = _legacy_decision_repository(Path(directory))
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=inventory_path,
+                protected_inventory_sha256=digest,
+            )
+            root_batch = build_statcast_root_batch(root)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with (
+                mock.patch.object(
+                    socket,
+                    "socket",
+                    side_effect=AssertionError("network access is forbidden"),
+                ) as network,
+                mock.patch.object(
+                    legacy_module,
+                    "_revalidate_catalog",
+                    wraps=legacy_module._revalidate_catalog,
+                ) as revalidate,
+            ):
+                first = preview_legacy_decisions(
+                    root_batch,
+                    catalog,
+                    protected_inventory_sha256=digest,
+                )
+                self.assertLessEqual(revalidate.call_count, 4)
+                second = preview_legacy_decisions(
+                    root_batch,
+                    catalog,
+                    protected_inventory_sha256=digest,
+                )
+            network.assert_not_called()
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(first, second)
+            self.assertEqual(after, before)
+            self.assertEqual(len(first.partition_batch.queries), 48)
+            self.assertEqual(first.counts["promoted_count"], 1)
+            self.assertEqual(first.counts["fetch_required_count"], 47)
+            self.assertEqual(first.counts["fatal_integrity_count"], 0)
+            with self.assertRaises(TypeError):
+                first.counts["promoted_count"] = 2
+
+            built = build_legacy_decision_inventory(root)
+            self.assertEqual(built["decisions"], _plain(first.decisions))
+            self.assertEqual(built["counts"], _plain(first.counts))
+
+    def test_preview_selects_first_eligible_three_way_partition(self) -> None:
+        from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            preview_legacy_decisions,
+        )
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, inventory_path, digest = _legacy_decision_repository(
+                Path(directory), production_shaped=True
+            )
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=inventory_path,
+                protected_inventory_sha256=digest,
+            )
+            preview = preview_legacy_decisions(
+                build_statcast_root_batch(root),
+                catalog,
+                protected_inventory_sha256=digest,
+            )
+            self.assertEqual(len(preview.partition_batch.queries), 48)
+            self.assertEqual(preview.counts["promoted_count"], 1)
+            self.assertEqual(preview.counts["fetch_required_count"], 47)
+            promoted = next(
+                decision
+                for decision in preview.decisions
+                if decision["disposition"] == "PROMOTED"
+            )
+            self.assertEqual(
+                dict(promoted["range"]),
+                {
+                    "year": 2024,
+                    "start_date": "2024-04-05",
+                    "end_date": "2024-04-08",
+                },
+            )
+
     def test_publish_load_schema_idempotence_and_fatal_refusal_are_closed(self) -> None:
         import mlb_backtest.v52_legacy_decision_inventory as inventory_module
 
@@ -363,8 +504,10 @@ class V52LegacyDecisionInventoryTest(unittest.TestCase):
             with (
                 mock.patch.object(
                     inventory_module,
-                    "audit_legacy_candidate_evidence",
-                    return_value=fatal,
+                    "audit_legacy_candidates_evidence",
+                    side_effect=lambda queries, _catalog: tuple(
+                        fatal for _query in queries
+                    ),
                 ),
                 mock.patch.object(
                     socket,

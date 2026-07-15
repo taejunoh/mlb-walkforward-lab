@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import os
 import tempfile
 import threading
 import unittest
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +26,8 @@ from mlb_backtest.v52_http import (
 
 
 T0 = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+ROOT = Path(__file__).resolve().parents[1]
+RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 
 
 def _query(*, statcast: bool = False, single_day: bool = False) -> LogicalQuery:
@@ -865,6 +870,517 @@ class V52AcquireRetryEngineTest(unittest.TestCase):
             self.assertEqual(progress.status, "PENDING")
             self.assertEqual(progress.pending_attempt_numbers, (1,))
             self.assertEqual(progress.attempt_receipts, ())
+
+
+class AcquisitionOrchestrationTests(unittest.TestCase):
+    def _request(self, *, plan_only: bool, resume: bool = False):
+        from mlb_backtest.protocols import load_run_spec
+        from mlb_backtest.v52_acquire import _AcquisitionRequest
+
+        return _AcquisitionRequest(
+            root=ROOT,
+            run_spec=load_run_spec(RUN_SPEC),
+            years=range(2018, 2025),
+            mode="hybrid",
+            resume=resume,
+            stop_after=None,
+            legacy_root=ROOT / "data/v5_1_bt/raw",
+            protected_inventory_path=(
+                ROOT / "audit/v5_1_bt/protected_raw_inventory.json"
+            ),
+            reserve_bytes=20 * 1024**3,
+            plan_only=plan_only,
+        )
+
+    def _ops(
+        self,
+        calls: list[str],
+        *,
+        phase: str | None = None,
+        progress: bool = False,
+    ):
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _AcquireOps,
+            _RuntimeState,
+        )
+
+        def authenticate(_request):
+            calls.append("authenticate")
+            return _AcquisitionPlan(
+                contract_sha256="a" * 64,
+                query_batch_ids=("b" * 64, "c" * 64, "d" * 64),
+                legacy_dispositions=(
+                    "PROMOTED",
+                    "FETCH_REQUIRED",
+                    "FETCH_REQUIRED",
+                ),
+            )
+
+        @contextmanager
+        def runner_lock(_request):
+            calls.append("lock")
+            yield
+
+        def inspect(_request, _plan):
+            calls.append("inspect")
+            return _RuntimeState(phase=phase, has_progress=progress)
+
+        def begin(_request, _plan, _state):
+            calls.append("begin")
+
+        return _AcquireOps(
+            authenticate=authenticate,
+            runner_lock=runner_lock,
+            inspect_runtime=inspect,
+            begin_runtime=begin,
+        )
+
+    def test_plan_only_is_strictly_read_only_and_reports_exact_plan(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _run_acquisition,
+        )
+
+        calls: list[str] = []
+        summary = _run_acquisition(
+            self._request(plan_only=True), self._ops(calls, progress=True)
+        )
+
+        self.assertEqual(calls, ["authenticate"])
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            summary.pending = 1  # type: ignore[misc]
+        self.assertEqual(summary.contract_sha256, "a" * 64)
+        self.assertEqual(
+            summary.query_batch_sha256s,
+            ("b" * 64, "c" * 64, "d" * 64),
+        )
+        self.assertEqual(summary.promoted, 0)
+        self.assertEqual(summary.fetched, 0)
+        self.assertEqual(summary.planned_promoted, 1)
+        self.assertEqual(summary.planned_fetch_required, 2)
+        self.assertEqual(summary.resumed, 0)
+        self.assertEqual(summary.quarantined, 0)
+        self.assertEqual(summary.pending, 0)
+        self.assertEqual(summary.network_attempts, 0)
+
+        invalid = dataclasses.replace(
+            self._ops([]),
+            authenticate=lambda _request: _AcquisitionPlan(
+                contract_sha256="invalid",
+                query_batch_ids=("b" * 64,),
+                legacy_dispositions=("FETCH_REQUIRED",),
+            ),
+        )
+        with self.assertRaisesRegex(TrustIntegrityError, "SHA-256"):
+            _run_acquisition(self._request(plan_only=True), invalid)
+
+    def test_authentication_failure_precedes_runtime_operations(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquireOps,
+            _run_acquisition,
+        )
+
+        calls: list[str] = []
+
+        def fail(_request):
+            calls.append("authenticate")
+            raise TrustIntegrityError("wrong authority")
+
+        def forbidden(*_args):
+            calls.append("forbidden")
+            raise AssertionError("runtime operation reached")
+
+        ops = _AcquireOps(
+            authenticate=fail,
+            runner_lock=forbidden,
+            inspect_runtime=forbidden,
+            begin_runtime=forbidden,
+        )
+        with self.assertRaises(TrustIntegrityError):
+            _run_acquisition(self._request(plan_only=False), ops)
+        self.assertEqual(calls, ["authenticate"])
+
+    def test_real_plan_preview_matches_closed_48_decision_authority(self) -> None:
+        from mlb_backtest.protocols import load_run_spec
+        from mlb_backtest.v52_acquire import acquire_sources
+        from tests.test_v52_legacy_decision_inventory import (
+            INVENTORY_PATH,
+            LEGACY_ROOT,
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            before_directories = {
+                path.relative_to(root)
+                for path in root.rglob("*")
+                if path.is_dir()
+            }
+            summary = acquire_sources(
+                root,
+                load_run_spec(
+                    root / "protocols/v5_2_qd/historical_walkforward_500.json"
+                ),
+                years=range(2018, 2025),
+                mode="hybrid",
+                resume=False,
+                stop_after=None,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=inventory_path,
+                plan_only=True,
+            )
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            after_directories = {
+                path.relative_to(root)
+                for path in root.rglob("*")
+                if path.is_dir()
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(after_directories, before_directories)
+            self.assertEqual(summary.promoted, 0)
+            self.assertEqual(summary.fetched, 0)
+            self.assertEqual(summary.planned_promoted, 1)
+            self.assertEqual(summary.planned_fetch_required, 47)
+            self.assertEqual(summary.pending, 0)
+            self.assertEqual(summary.network_attempts, 0)
+            self.assertEqual(len(summary.query_batch_sha256s), 3)
+            self.assertFalse((root / INVENTORY_PATH).is_symlink())
+
+    def test_lock_conflict_and_existing_progress_are_operational_blocks(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _run_acquisition,
+        )
+
+        calls: list[str] = []
+        base = self._ops(calls)
+
+        @contextmanager
+        def conflict(_request):
+            calls.append("lock")
+            raise OperationalBlock("another acquisition runner is active")
+            yield
+
+        with self.assertRaisesRegex(OperationalBlock, "another"):
+            _run_acquisition(
+                self._request(plan_only=False),
+                dataclasses.replace(base, runner_lock=conflict),
+            )
+        self.assertEqual(calls, ["authenticate", "lock"])
+
+        calls.clear()
+        with self.assertRaisesRegex(OperationalBlock, "--resume"):
+            _run_acquisition(
+                self._request(plan_only=False),
+                self._ops(calls, phase="ACQUIRING", progress=True),
+            )
+        self.assertEqual(calls, ["authenticate", "lock", "inspect"])
+
+    def test_real_runner_lock_rejects_symlinks_and_hardlinks(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _real_runner_lock,
+        )
+
+        lock_relative = Path(
+            "audit/v5_2_qd/historical/execution/.acquisition-runner.lock"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            parent = root / lock_relative.parent
+            parent.mkdir(parents=True)
+            target = root / "lock-target"
+            target.write_bytes(b"target")
+            (root / lock_relative).symlink_to(target)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            with self.assertRaises(TrustIntegrityError):
+                with _real_runner_lock(request):
+                    self.fail("symlink lock was acquired")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "audit").symlink_to(outside, target_is_directory=True)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            with self.assertRaises(TrustIntegrityError):
+                with _real_runner_lock(request):
+                    self.fail("symlink parent was traversed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            parent = root / lock_relative.parent
+            parent.mkdir(parents=True)
+            peer = parent / "peer.lock"
+            peer.write_bytes(b"")
+            os.link(peer, root / lock_relative)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            with self.assertRaisesRegex(TrustIntegrityError, "identity"):
+                with _real_runner_lock(request):
+                    self.fail("hardlinked lock was acquired")
+
+    def test_real_runner_lock_is_nonblocking_and_releases_every_fd(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _real_runner_lock,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            with _real_runner_lock(request):
+                with self.assertRaisesRegex(OperationalBlock, "another"):
+                    with _real_runner_lock(request):
+                        self.fail("second runner acquired the lock")
+            with self.assertRaisesRegex(RuntimeError, "body failed"):
+                with _real_runner_lock(request):
+                    raise RuntimeError("body failed")
+            with _real_runner_lock(request):
+                pass
+
+    def test_real_runner_lock_detects_path_replacement_and_blocks_double_acquire(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _real_runner_lock,
+        )
+
+        lock_relative = Path(
+            "audit/v5_2_qd/historical/execution/.acquisition-runner.lock"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            with self.assertRaisesRegex(TrustIntegrityError, "identity"):
+                with _real_runner_lock(request):
+                    lock_path = root / lock_relative
+                    lock_path.unlink()
+                    lock_path.write_bytes(b"replacement")
+                    with self.assertRaisesRegex(OperationalBlock, "another"):
+                        with _real_runner_lock(request):
+                            self.fail("replacement enabled a second runner")
+            with _real_runner_lock(request):
+                pass
+            with self.assertRaisesRegex(TrustIntegrityError, "identity"):
+                with _real_runner_lock(request):
+                    lock_path = root / lock_relative
+                    lock_path.unlink()
+                    lock_path.write_bytes(b"second replacement")
+                    raise RuntimeError("body failure must not hide lock tampering")
+
+    def test_real_runner_lock_blocks_leaf_directory_rename_recreate(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _real_runner_lock,
+        )
+
+        execution_relative = Path("audit/v5_2_qd/historical/execution")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = dataclasses.replace(self._request(plan_only=False), root=root)
+            second_acquired = False
+            second_blocked = False
+            with self.assertRaisesRegex(TrustIntegrityError, "directory identity"):
+                with _real_runner_lock(request):
+                    execution = root / execution_relative
+                    moved = execution.with_name("execution-moved")
+                    execution.rename(moved)
+                    execution.mkdir()
+                    try:
+                        with _real_runner_lock(request):
+                            second_acquired = True
+                    except OperationalBlock:
+                        second_blocked = True
+            self.assertFalse(second_acquired)
+            self.assertTrue(second_blocked)
+            with _real_runner_lock(request):
+                pass
+
+    def test_real_adapters_translate_expected_oserrors(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _RuntimeState,
+            _real_begin_runtime,
+            _real_runner_lock,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = dataclasses.replace(
+                self._request(plan_only=False), root=Path(directory)
+            )
+            with (
+                patch("mlb_backtest.v52_acquire.os.mkdir", side_effect=PermissionError),
+                self.assertRaisesRegex(TrustIntegrityError, "directory"),
+            ):
+                with _real_runner_lock(request):
+                    self.fail("mkdir failure was not translated")
+            with (
+                patch("mlb_backtest.v52_acquire.os.open", side_effect=PermissionError),
+                self.assertRaisesRegex(TrustIntegrityError, "directory"),
+            ):
+                with _real_runner_lock(request):
+                    self.fail("directory open failure was not translated")
+
+            plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+            runtime = _RuntimeState("ACQUIRING", True)
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire.shutil.disk_usage",
+                    side_effect=OSError("unavailable"),
+                ),
+                self.assertRaisesRegex(OperationalBlock, "free-space"),
+            ):
+                _real_begin_runtime(request, plan, runtime)
+
+    def test_resume_authenticates_phase_then_stops_at_c2a_boundary(self) -> None:
+        from mlb_backtest.v52_acquire import OperationalBlock, _run_acquisition
+
+        for phase in (None, "DESIGN_ACCEPTED", "ACQUIRING"):
+            calls: list[str] = []
+            with (
+                self.subTest(phase=phase),
+                self.assertRaisesRegex(OperationalBlock, "stage orchestration pending"),
+            ):
+                _run_acquisition(
+                    self._request(plan_only=False, resume=phase is not None),
+                    self._ops(
+                        calls,
+                        phase=phase,
+                        progress=phase is not None,
+                    ),
+                )
+            self.assertEqual(
+                calls,
+                ["authenticate", "lock", "inspect", "begin"],
+            )
+
+    def test_cli_exit_taxonomy_and_canonical_plan_json(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            AcquisitionSummary,
+            OperationalBlock,
+            TrustIntegrityError,
+            main,
+        )
+
+        argv = self._cli_argv()
+        value = AcquisitionSummary(
+            contract_sha256="a" * 64,
+            query_batch_sha256s=("b" * 64,),
+            promoted=1,
+            fetched=2,
+            planned_promoted=3,
+            planned_fetch_required=4,
+            resumed=0,
+            quarantined=0,
+            pending=0,
+            network_attempts=0,
+        )
+        output = io.StringIO()
+        with (
+            patch("mlb_backtest.v52_acquire.acquire_sources", return_value=value),
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(main(argv), 0)
+        expected = (
+            '{"contract_sha256":"'
+            + "a" * 64
+            + '","fetched":2,"network_attempts":0,"pending":0,'
+            '"planned_fetch_required":4,"planned_promoted":3,"promoted":1,'
+            '"quarantined":0,"query_batch_sha256s":["'
+            + "b" * 64
+            + '"],"resumed":0}\n'
+        )
+        self.assertEqual(output.getvalue(), expected)
+
+        for error, code in (
+            (OperationalBlock("busy"), 1),
+            (TrustIntegrityError("bad trust"), 2),
+        ):
+            stderr = io.StringIO()
+            with (
+                self.subTest(error=type(error).__name__),
+                patch("mlb_backtest.v52_acquire.acquire_sources", side_effect=error),
+                patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(main(argv), code)
+            self.assertEqual(stderr.getvalue(), f"{error}\n")
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+        with (
+            patch(
+                "mlb_backtest.v52_acquire.acquire_sources",
+                side_effect=ValueError("programmer error"),
+            ),
+            self.assertRaisesRegex(ValueError, "programmer error"),
+        ):
+            main(argv)
+
+        with self.assertRaises(SystemExit) as misuse:
+            main(["--root", str(ROOT)])
+        self.assertEqual(misuse.exception.code, 2)
+
+    def _cli_argv(self) -> list[str]:
+        return [
+            "--root",
+            str(ROOT),
+            "--run-spec",
+            str(RUN_SPEC),
+            "--years",
+            "2018:2024",
+            "--mode",
+            "hybrid",
+            "--legacy-root",
+            str(ROOT / "data/v5_1_bt/raw"),
+            "--protected-inventory",
+            str(ROOT / "audit/v5_1_bt/protected_raw_inventory.json"),
+            "--plan-only",
+        ]
+
+    def test_cli_parses_closed_arguments(self) -> None:
+        from mlb_backtest.v52_acquire import main
+
+        base = self._cli_argv()
+        with patch(
+            "mlb_backtest.v52_acquire.acquire_sources",
+            side_effect=KeyboardInterrupt,
+        ):
+            self.assertEqual(main(base), 130)
+        for extra in (
+            ["--years", "2019:2024"],
+            ["--mode", "fetch"],
+            ["--stop-after", "static-schedules"],
+            ["--unknown"],
+        ):
+            args = base.copy()
+            option = extra[0]
+            if option in args:
+                index = args.index(option)
+                args[index : index + 2] = extra
+            else:
+                args.extend(extra)
+            with self.subTest(extra=extra), self.assertRaises(SystemExit) as raised:
+                main(args)
+            self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
