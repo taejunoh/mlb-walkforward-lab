@@ -10,7 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
-from ..statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
+from ..source_parsers.statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
 from ..v52_evidence import LogicalQuery, canonical_query_bytes
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,

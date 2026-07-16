@@ -25,7 +25,18 @@ from tests.test_v52_source_schedule import _query, _schedule_raw
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "mlb_backtest/v52_verify_sources.py"
-PARSER_IMPORT_GUARD_CASES = ("schedule",)
+SOURCE_FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
+_VENUE_GUARD_PAYLOAD = json.loads(
+    (SOURCE_FIXTURES / "venues_mini.json").read_bytes()
+)
+_VENUE_GUARD_PAYLOAD["venues"] = _VENUE_GUARD_PAYLOAD["venues"][:1]
+PARSER_IMPORT_GUARD_CASES = (
+    "schedule",
+    "statcast",
+    "d1_pitching",
+    "career_bf",
+    "team_venue_reference",
+)
 PARSER_IMPORT_GUARD_SCRIPT = r"""
 import importlib.abc
 import sys
@@ -102,6 +113,133 @@ if case == "schedule":
     semantics = recompute_query_sidecar(query, raw)
     if semantics["game_pks"] != [9001, 9002]:
         raise AssertionError("schedule parser dispatch differs")
+elif case == "statcast":
+    query = LogicalQuery(
+        source="baseball_savant_statcast",
+        grain="pitch",
+        endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+        parameters={
+            "all": "true",
+            "type": "details",
+            "player_type": "batter",
+            "game_date_gt": "2024-04-01",
+            "game_date_lt": "2024-04-30",
+            "hfGT": "R|",
+            "group_by": "name-year",
+            "sort_col": "pitches",
+            "player_event_sort": "api_p_release_speed",
+            "sort_order": "desc",
+            "min_pitches": "0",
+        },
+        requested_range={
+            "year": 2024,
+            "start_date": "2024-04-01",
+            "end_date": "2024-04-30",
+        },
+        expected_media_type="text/csv",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    semantics = recompute_query_sidecar(query, __STATCAST_RAW__)
+    if semantics["game_pks"] != [9001]:
+        raise AssertionError("Statcast parser dispatch differs")
+elif case == "d1_pitching":
+    query = LogicalQuery(
+        source="mlb_stats_pitching",
+        grain="season_d1_league_pitching_reference",
+        endpoint="https://statsapi.mlb.com/api/v1/stats",
+        parameters={
+            "stats": "byDateRange",
+            "group": "pitching",
+            "sportIds": 1,
+            "gameType": "R",
+            "playerPool": "ALL",
+            "limit": 5000,
+            "startDate": "2024-03-20",
+            "endDate": "2024-04-01",
+        },
+        requested_range={
+            "season": 2024,
+            "start_date": "2024-03-20",
+            "as_of_date": "2024-04-01",
+            "consuming_game_pks": [9001],
+            "consumer_cutoff_dates": {"9001": "2024-04-01"},
+            "response_completeness": {
+                "limit": 5000,
+                "reject_total_splits_at_or_above_limit": True,
+            },
+        },
+        expected_media_type="application/json",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    semantics = recompute_query_sidecar(query, __PITCHING_RAW__)
+    if semantics["batters_faced"] != 75:
+        raise AssertionError("D-1 pitching parser dispatch differs")
+elif case == "career_bf":
+    query = LogicalQuery(
+        source="mlb_stats_pitcher_bf",
+        grain="player_career_batters_faced_reference",
+        endpoint="https://statsapi.mlb.com/api/v1/people/101/stats",
+        parameters={
+            "stats": "byDateRange",
+            "group": "pitching",
+            "gameType": "R",
+            "sportIds": 1,
+            "startDate": "1876-01-01",
+            "endDate": "2017-12-31",
+        },
+        requested_range={
+            "pitcher_id": 101,
+            "inclusive_end": "2017-12-31",
+            "consuming_game_pks": [9001],
+            "consumer_cutoff_dates": {"9001": "2024-04-30"},
+        },
+        expected_media_type="application/json",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    semantics = recompute_query_sidecar(query, b'{"stats":[]}')
+    if semantics["baseline_batters_faced"] != 0:
+        raise AssertionError("career BF parser dispatch differs")
+elif case == "team_venue_reference":
+    common = {
+        "source": "venue_team_timezone_table",
+        "grain": "effective_dated_venue_team_reference",
+        "expected_media_type": "application/json",
+        "parser_version": "v5.2.1",
+        "parent_query_id": None,
+        "run_spec_sha256": "a" * 64,
+        "acquisition_contract_sha256": "b" * 64,
+    }
+    team_query = LogicalQuery(
+        **common,
+        endpoint="https://statsapi.mlb.com/api/v1/teams",
+        parameters={
+            "sportId": 1,
+            "season": 2024,
+            "hydrate": "venue(location)",
+        },
+        requested_range={"season": 2024, "entity": "teams"},
+    )
+    venue_query = LogicalQuery(
+        **common,
+        endpoint="https://statsapi.mlb.com/api/v1/venues/31",
+        parameters={"hydrate": "location"},
+        requested_range={"venue_id": 31},
+    )
+    team_semantics = recompute_query_sidecar(team_query, __TEAM_RAW__)
+    venue_semantics = recompute_query_sidecar(venue_query, __VENUE_RAW__)
+    if [row["team_id"] for row in team_semantics["teams"]] != [10, 20]:
+        raise AssertionError("team reference parser dispatch differs")
+    if [row["venue_id"] for row in venue_semantics["venues"]] != [31]:
+        raise AssertionError("venue reference parser dispatch differs")
 else:
     raise AssertionError("unknown parser guard case: " + case)
 
@@ -121,7 +259,20 @@ for module_name, module in tuple(sys.modules.items()):
             + ":"
             + ",".join(sorted(exposed))
         )
-""".replace("__SCHEDULE_RAW__", repr(_schedule_raw()))
+"""
+for _placeholder, _raw in (
+    ("__SCHEDULE_RAW__", _schedule_raw()),
+    ("__STATCAST_RAW__", (SOURCE_FIXTURES / "statcast_mini.csv").read_bytes()),
+    ("__PITCHING_RAW__", (SOURCE_FIXTURES / "pitching_mini.json").read_bytes()),
+    ("__TEAM_RAW__", (SOURCE_FIXTURES / "team_mini.json").read_bytes()),
+    (
+        "__VENUE_RAW__",
+        json.dumps(_VENUE_GUARD_PAYLOAD, separators=(",", ":")).encode(),
+    ),
+):
+    PARSER_IMPORT_GUARD_SCRIPT = PARSER_IMPORT_GUARD_SCRIPT.replace(
+        _placeholder, repr(_raw)
+    )
 
 
 def _snapshot_tree(

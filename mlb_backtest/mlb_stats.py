@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 
 from .manifest import RawStore, _safe_leaf_bytes
+from .source_parsers.pitching import parse_league_era as parse_league_era
 from .sources import MLB_BASE, fetch_bytes
 
 
@@ -50,59 +51,6 @@ def league_era_url(season_open: str, as_of: str) -> str:
         }
     )
     return f"{MLB_BASE}/stats?{query}"
-
-
-def _payload_bytes(source: str | Path | bytes) -> bytes:
-    return source if isinstance(source, bytes) else Path(source).read_bytes()
-
-
-def parse_league_era(source: str | Path | bytes) -> dict[str, int | float]:
-    """Validate one complete pitching group and derive ERA from integer outs."""
-    try:
-        payload = json.loads(_payload_bytes(source).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("MLB pitching stats must be UTF-8 JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("MLB pitching stats root must be an object")
-    stats = payload.get("stats")
-    if not isinstance(stats, list) or len(stats) != 1:
-        raise ValueError("MLB pitching stats must contain exactly one stats group")
-    group = stats[0]
-    if not isinstance(group, dict):
-        raise ValueError("MLB pitching stats group must be an object")
-    group_meta = group.get("group")
-    if (
-        not isinstance(group_meta, dict)
-        or group_meta.get("displayName") != "pitching"
-    ):
-        raise ValueError("MLB pitching stats group must be pitching")
-    total_splits = group.get("totalSplits")
-    splits = group.get("splits")
-    if type(total_splits) is not int or total_splits < 0:
-        raise ValueError("MLB pitching totalSplits must be a nonnegative integer")
-    if not isinstance(splits, list) or total_splits != len(splits):
-        raise ValueError("MLB pitching stats are truncated or paged")
-    earned_runs = 0
-    outs = 0
-    for index, split in enumerate(splits):
-        if not isinstance(split, dict) or not isinstance(split.get("stat"), dict):
-            raise ValueError(f"MLB pitching split {index} must contain a stat object")
-        stat = split["stat"]
-        er = stat.get("earnedRuns")
-        split_outs = stat.get("outs")
-        if type(er) is not int or er < 0:
-            raise ValueError("earnedRuns must be a nonnegative integer")
-        if type(split_outs) is not int or split_outs < 0:
-            raise ValueError("outs must be a nonnegative integer")
-        earned_runs += er
-        outs += split_outs
-    if outs <= 0:
-        raise ValueError("MLB pitching stats must contain positive total outs")
-    return {
-        "earned_runs": earned_runs,
-        "outs": outs,
-        "value": 27.0 * earned_runs / outs,
-    }
 
 
 def _query(season_open: str, as_of: str) -> dict[str, object]:

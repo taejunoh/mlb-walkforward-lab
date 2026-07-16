@@ -9,8 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 
-from ..career_bf import parse_prior_career_bf
-from ..mlb_stats import parse_league_era
+from ..source_parsers.pitching import parse_league_era, parse_prior_career_bf
 from ..v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
 from ..v52_query_plan import validate_statcast_query
 from ..v52_seasons import SEASON_BOUNDARIES, monthly_ranges
