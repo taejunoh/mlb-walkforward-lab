@@ -191,6 +191,19 @@ def _query_directory(evidence_root: Path, query) -> Path:
 
 
 class V52GameEvidenceInventoryTest(unittest.TestCase):
+    @staticmethod
+    def _tree_byte_inode_snapshot(
+        root: Path,
+    ) -> dict[Path, tuple[int, int, bytes | None]]:
+        return {
+            path.relative_to(root): (
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in (root, *sorted(root.rglob("*")))
+        }
+
     def test_publish_load_are_closed_schema_valid_frozen_and_idempotent(self) -> None:
         from mlb_backtest.v52_game_evidence_inventory import (
             VerifiedGameEvidenceInventory,
@@ -261,6 +274,64 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             after = published.path.stat()
             self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
             self.assertEqual(load_verified_game_evidence_inventory(root), published)
+
+    def test_read_only_rebound_fails_closed_on_recovery_race_without_cleanup(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_game_evidence_inventory
+        from mlb_backtest.v52_game_evidence_inventory import (
+            load_verified_game_evidence_inventory,
+            publish_game_evidence_inventory,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            static_batch, _, evidence_root = _fixture(root)
+            publish_game_evidence_inventory(root)
+            target = _query_directory(evidence_root, static_batch.queries[0])
+            attacker_snapshot: dict[
+                Path, tuple[int, int, bytes | None]
+            ] | None = None
+
+            def inject_recovery() -> None:
+                nonlocal attacker_snapshot
+                recovery = target / "failure-transaction"
+                recovery.mkdir()
+                (recovery / "canary").write_bytes(b"must-not-change")
+                attacker_snapshot = self._tree_byte_inode_snapshot(root)
+
+            with (
+                patch.object(
+                    v52_game_evidence_inventory,
+                    "_before_game_inventory_final_rebind",
+                    side_effect=inject_recovery,
+                ),
+                patch.object(
+                    V52EvidenceStore,
+                    "_finish_failure_cleanup_before_read",
+                    side_effect=AssertionError("read-only cleanup reached"),
+                ) as before_cleanup,
+                patch.object(
+                    V52EvidenceStore,
+                    "_finish_failure_cleanup_tombstones",
+                    side_effect=AssertionError("read-only cleanup reached"),
+                ) as tombstone_cleanup,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "read-only evidence requires failure recovery",
+                ),
+            ):
+                load_verified_game_evidence_inventory(
+                    root,
+                    read_only_progress=True,
+                )
+
+            self.assertIsNotNone(attacker_snapshot)
+            self.assertEqual(
+                self._tree_byte_inode_snapshot(root), attacker_snapshot
+            )
+            before_cleanup.assert_not_called()
+            tombstone_cleanup.assert_not_called()
 
     def test_load_rejects_raw_sidecar_and_saved_artifact_tamper(self) -> None:
         from mlb_backtest.v52_game_evidence_inventory import (

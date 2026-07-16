@@ -356,6 +356,7 @@ def build_schedule_anchor_inventory(
     acquisition_contract_path: Path,
     static_batch_id: str,
     evidence_root: Path,
+    read_only_progress: bool = False,
 ) -> Mapping[str, object]:
     root = _absolute(root)
     run_sha, contract_sha, evidence_relative = _authenticate(
@@ -363,7 +364,11 @@ def build_schedule_anchor_inventory(
     )
     if not isinstance(static_batch_id, str) or _SHA256.fullmatch(static_batch_id) is None:
         raise ValueError("static_batch_id must be a SHA-256")
-    batch = load_query_batch(root, static_batch_id)
+    batch = load_query_batch(
+        root,
+        static_batch_id,
+        read_only_progress=read_only_progress,
+    )
     if batch.stage != "STATIC_SCHEDULES" or batch.derived_from_sha256 is not None or len(batch.queries) != 7:
         raise ValueError("static batch is not the exact seven-season replay")
     years = tuple(query.requested_range.get("year") for query in batch.queries)
@@ -376,7 +381,11 @@ def build_schedule_anchor_inventory(
     ):
         raise ValueError("static batch authority binding differs")
 
-    store = V52EvidenceStore(_absolute(evidence_root))
+    store = (
+        V52EvidenceStore.open_read_only(_absolute(evidence_root))
+        if read_only_progress
+        else V52EvidenceStore(_absolute(evidence_root))
+    )
     all_anchors: list[dict[str, object]] = []
     season_sources: list[dict[str, object]] = []
     for query in batch.queries:
@@ -666,6 +675,7 @@ def load_verified_schedule_anchor_inventory(
     acquisition_contract_path: Path,
     static_batch_id: str,
     evidence_root: Path,
+    read_only_progress: bool = False,
 ) -> VerifiedScheduleAnchorInventory:
     root = _absolute(root)
     contents = _read_inventory_contents(root)
@@ -682,6 +692,7 @@ def load_verified_schedule_anchor_inventory(
         acquisition_contract_path=acquisition_contract_path,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     if validated != current:
         raise ValueError("schedule inventory differs from current verified evidence")

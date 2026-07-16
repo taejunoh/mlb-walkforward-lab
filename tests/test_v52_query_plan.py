@@ -2359,7 +2359,7 @@ class V52QueryPlanTest(unittest.TestCase):
         with self.subTest(public_load_contract="signature"):
             self.assertEqual(
                 tuple(inspect.signature(query_plan.load_query_batch).parameters),
-                ("repository_root", "batch_id"),
+                ("repository_root", "batch_id", "read_only_progress"),
             )
         with self.subTest(public_load_contract="private_kwarg_rejected"):
             with self.assertRaises(TypeError):

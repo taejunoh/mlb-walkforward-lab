@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import jsonschema
@@ -1424,6 +1426,331 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(
                 self.registry.load_latest_acquisition_checkpoint(root, run_spec),
                 terminal,
+            )
+
+    def test_terminal_loader_accepts_split_history_and_rejects_wrong_phase_head(
+        self,
+    ) -> None:
+        checkpoints = tuple(
+            SimpleNamespace(
+                sequence=index,
+                receipt_sha256=f"{index + 1:064x}",
+                stage="REMAINING",
+            )
+            for index in range(11)
+        )
+
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        def loaded(count: int):
+            return (
+                checkpoints[:count],
+                tuple({} for _ in range(count)),
+                tuple(f"checkpoint-{index}" for index in range(count)),
+            )
+
+        with (
+            patch.object(
+                self.registry,
+                "_paths",
+                return_value=SimpleNamespace(root=Path("/sealed")),
+            ),
+            patch.object(self.registry, "_registry_lock", shared_lock),
+            patch.object(
+                self.registry,
+                "_load_locked",
+                return_value=(SimpleNamespace(phase="SOURCES_READY"), ({},)),
+            ) as registry_loader,
+            patch.object(
+                self.registry,
+                "_capture_git_snapshot",
+                return_value=SimpleNamespace(head="a" * 40),
+            ),
+            patch.object(
+                self.registry,
+                "_terminal_checkpoint_head",
+                return_value={},
+            ),
+            patch.object(
+                self.registry,
+                "_load_checkpoints_locked",
+                return_value=loaded(11),
+            ) as loader,
+        ):
+            self.assertEqual(
+                self.registry.load_terminal_acquisition_checkpoint(
+                    Path("/sealed"),
+                    SimpleNamespace(),
+                ),
+                checkpoints[-1],
+            )
+            self.assertTrue(loader.call_args.kwargs["verify_latest_progress"])
+            self.assertTrue(loader.call_args.kwargs["read_only_progress"])
+            self.assertTrue(
+                registry_loader.call_args.kwargs["read_only_progress"]
+            )
+
+        with (
+            patch.object(
+                self.registry,
+                "_paths",
+                return_value=SimpleNamespace(root=Path("/sealed")),
+            ),
+            patch.object(self.registry, "_registry_lock", shared_lock),
+            patch.object(
+                self.registry,
+                "_load_locked",
+                return_value=(SimpleNamespace(phase="ACQUIRING"), ({},)),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "requires SOURCES_READY"):
+                self.registry.load_terminal_acquisition_checkpoint(
+                    Path("/sealed"),
+                    SimpleNamespace(),
+                )
+
+    def test_active_public_loaders_preserve_recovery_capable_progress_mode(
+        self,
+    ) -> None:
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        state = SimpleNamespace(phase="ACQUIRING")
+        with (
+            patch.object(
+                self.registry,
+                "_paths",
+                return_value=SimpleNamespace(root=Path("/active")),
+            ),
+            patch.object(self.registry, "_registry_lock", shared_lock),
+            patch.object(
+                self.registry,
+                "_load_locked",
+                return_value=(state, ({},)),
+            ) as loader,
+        ):
+            self.assertIs(
+                self.registry.load_execution_registry(
+                    Path("/active"), SimpleNamespace()
+                ),
+                state,
+            )
+            self.assertFalse(
+                loader.call_args.kwargs.get("read_only_progress", False)
+            )
+
+        with (
+            patch.object(
+                self.registry,
+                "_paths",
+                return_value=SimpleNamespace(root=Path("/active")),
+            ),
+            patch.object(self.registry, "_registry_lock", shared_lock),
+            patch.object(
+                self.registry,
+                "_load_locked",
+                return_value=(state, ({},)),
+            ) as registry_loader,
+            patch.object(
+                self.registry,
+                "_capture_git_snapshot",
+                return_value=SimpleNamespace(head="a" * 40),
+            ),
+            patch.object(
+                self.registry,
+                "_load_checkpoints_locked",
+                return_value=((), (), ()),
+            ) as checkpoint_loader,
+        ):
+            self.assertIsNone(
+                self.registry.load_latest_acquisition_checkpoint(
+                    Path("/active"), SimpleNamespace()
+                )
+            )
+            self.assertFalse(
+                registry_loader.call_args.kwargs.get(
+                    "read_only_progress", False
+                )
+            )
+            self.assertFalse(
+                checkpoint_loader.call_args.kwargs.get(
+                    "read_only_progress", False
+                )
+            )
+
+    def test_checkpoint_progress_read_only_phase_table(self) -> None:
+        cases = (
+            ("DESIGN_ACCEPTED", None, False),
+            ("ACQUIRING", None, False),
+            ("SOURCES_READY", None, True),
+            ("OOF_SEALED", None, True),
+            ("CARDS_SEALED", None, True),
+            ("TARGET_LOCKED", None, True),
+            ("OUTCOMES_JOINED", None, True),
+            ("SAMPLE_500_SEALED", None, True),
+            ("VERIFIED", None, True),
+            ("ACQUIRING", {"receipt_sha256": "a" * 64}, True),
+        )
+        for phase, checkpoint_head, expected in cases:
+            with self.subTest(phase=phase, checkpoint_head=checkpoint_head):
+                self.assertEqual(
+                    self.registry._checkpoint_progress_is_read_only(
+                        phase,
+                        checkpoint_head,
+                    ),
+                    expected,
+                )
+
+    def test_later_phase_latest_checkpoint_load_cannot_clean_progress(
+        self,
+    ) -> None:
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        for phase in ("OOF_SEALED", "VERIFIED"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory) / "frozen-progress"
+                marker.write_bytes(b"must-not-change")
+                before = (marker.read_bytes(), marker.stat().st_ino)
+
+                def load_checkpoints(*_args, read_only_progress=False, **_kwargs):
+                    if not read_only_progress:
+                        marker.unlink()
+                    return (), (), ()
+
+                state = SimpleNamespace(phase=phase)
+                payload = {"acquisition_checkpoint_head": None}
+                with (
+                    patch.object(
+                        self.registry,
+                        "_paths",
+                        return_value=SimpleNamespace(root=Path("/sealed")),
+                    ),
+                    patch.object(self.registry, "_registry_lock", shared_lock),
+                    patch.object(
+                        self.registry,
+                        "_load_locked",
+                        return_value=(state, (payload,)),
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_capture_git_snapshot",
+                        return_value=SimpleNamespace(head="a" * 40),
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_load_checkpoints_locked",
+                        side_effect=load_checkpoints,
+                    ) as checkpoint_loader,
+                ):
+                    self.assertIsNone(
+                        self.registry.load_latest_acquisition_checkpoint(
+                            Path("/sealed"), SimpleNamespace()
+                        )
+                    )
+
+                self.assertTrue(
+                    checkpoint_loader.call_args.kwargs["read_only_progress"]
+                )
+                self.assertEqual(
+                    (marker.read_bytes(), marker.stat().st_ino),
+                    before,
+                )
+
+    def test_active_pending_checkpoint_finishes_owned_failure_cleanup(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_evidence
+        from mlb_backtest.v52_evidence import (
+            AttemptCapture,
+            V52EvidenceStore,
+            logical_query_id,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            checkpoint = self.publish_pending_checkpoint(
+                root,
+                run_spec,
+                batch,
+                query_ids,
+                expected_prior=None,
+            )
+            evidence_root = root / run_spec.raw["namespaces"]["raw"]
+            evidence_root.mkdir(parents=True)
+            store = V52EvidenceStore(evidence_root)
+            query = batch.queries[0]
+            capture = AttemptCapture(
+                started_at_utc="2026-07-14T00:00:00.000000Z",
+                ended_at_utc="2026-07-14T00:00:01.000000Z",
+                final_url=None,
+                http_status=None,
+                response_headers=(),
+                body=None,
+                error_classification="PERMANENT_NETWORK",
+            )
+            original_rename = v52_evidence._rename_directory_exclusive_at
+
+            def interrupt_after_transaction_rename(
+                src: object,
+                dst: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                original_rename(src, dst, *args, **kwargs)
+                if src == "failure-transaction" and dst == "payload":
+                    raise OSError("interrupted owned cleanup")
+
+            with store.acquire_query(query) as lease:
+                with (
+                    patch(
+                        "mlb_backtest.v52_evidence._rename_directory_exclusive_at",
+                        side_effect=interrupt_after_transaction_rename,
+                    ),
+                    self.assertRaisesRegex(OSError, "owned cleanup"),
+                ):
+                    store.quarantine_bodyless_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        capture,
+                        error_classification="PERMANENT_NETWORK",
+                    )
+
+            query_root = (
+                evidence_root
+                / "queries"
+                / query.source
+                / logical_query_id(query)
+            )
+            self.assertTrue(
+                any(
+                    name.startswith(".failure-cleanup-")
+                    for name in os.listdir(query_root)
+                )
+            )
+            self.assertEqual(
+                self.registry.load_latest_acquisition_checkpoint(
+                    root, run_spec
+                ),
+                checkpoint,
+            )
+            self.assertFalse(
+                any(
+                    name.startswith(".failure-cleanup-")
+                    or name in {"failure-intent", "failure-transaction"}
+                    for name in os.listdir(query_root)
+                )
+            )
+            self.assertEqual(
+                V52EvidenceStore(evidence_root)
+                .read_verified_query_progress(query)
+                .status,
+                "QUARANTINED",
             )
 
     def test_remaining_checkpoint_replays_split_history_to_idempotent_terminal(

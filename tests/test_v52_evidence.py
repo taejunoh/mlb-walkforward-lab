@@ -401,6 +401,254 @@ def _career_reference_fixture(
 
 
 class V52EvidenceTest(unittest.TestCase):
+    @staticmethod
+    def _tree_byte_inode_snapshot(root: Path) -> dict[Path, tuple[object, ...]]:
+        snapshot: dict[Path, tuple[object, ...]] = {}
+        for path in (root, *sorted(root.rglob("*"))):
+            metadata = path.lstat()
+            relative = path.relative_to(root)
+            if stat.S_ISREG(metadata.st_mode):
+                payload: object = path.read_bytes()
+            elif stat.S_ISLNK(metadata.st_mode):
+                payload = os.readlink(path)
+            else:
+                payload = None
+            snapshot[relative] = (
+                stat.S_IFMT(metadata.st_mode),
+                metadata.st_dev,
+                metadata.st_ino,
+                payload,
+            )
+        return snapshot
+
+    def test_read_only_store_requires_existing_root_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "raw"
+            with self.assertRaises(FileNotFoundError):
+                V52EvidenceStore.open_read_only(root)
+            self.assertFalse(root.exists())
+
+            root.mkdir()
+            marker = root / "marker"
+            marker.write_bytes(b"sealed")
+            before = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            store = V52EvidenceStore.open_read_only(root)
+            self.assertEqual(store.root, root.resolve())
+            after = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+    def test_read_only_progress_verifies_success_without_tree_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                published = store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            before = self._tree_byte_inode_snapshot(root)
+
+            progress = V52EvidenceStore.open_read_only(
+                root
+            ).read_verified_query_progress(query)
+
+            self.assertEqual(progress.status, "SUCCESS")
+            self.assertEqual(progress.published_evidence, published)
+            self.assertEqual(self._tree_byte_inode_snapshot(root), before)
+
+    def test_read_only_progress_fails_closed_on_recovery_state_without_mutation(
+        self,
+    ) -> None:
+        recovery_names = (
+            "failure-intent",
+            "failure-transaction",
+            v52_evidence._failure_cleanup_tombstone_name(
+                "transaction",
+                1,
+                b"{}\n",
+                nonce="0" * 32,
+            ),
+        )
+        for recovery_name in recovery_names:
+            with self.subTest(recovery_name=recovery_name), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query):
+                    pass
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                recovery = query_root / recovery_name
+                recovery.mkdir()
+                (recovery / "canary").write_bytes(b"must-not-change")
+                before = self._tree_byte_inode_snapshot(root)
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "read-only evidence requires failure recovery",
+                ):
+                    V52EvidenceStore.open_read_only(
+                        root
+                    ).read_verified_query_progress(query)
+
+                self.assertEqual(self._tree_byte_inode_snapshot(root), before)
+
+    def test_read_only_success_uses_shared_lock_without_cleanup_or_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            before = self._tree_byte_inode_snapshot(root)
+            readonly = V52EvidenceStore.open_read_only(root)
+            operations: list[int] = []
+            original_flock = v52_evidence.fcntl.flock
+
+            def record_flock(descriptor: int, operation: int) -> None:
+                operations.append(operation)
+                original_flock(descriptor, operation)
+
+            with (
+                patch.object(
+                    readonly,
+                    "_finish_failure_cleanup_before_read",
+                    side_effect=AssertionError("read-only cleanup reached"),
+                ) as before_cleanup,
+                patch.object(
+                    readonly,
+                    "_finish_failure_cleanup_tombstones",
+                    side_effect=AssertionError("read-only cleanup reached"),
+                ) as tombstone_cleanup,
+                patch(
+                    "mlb_backtest.v52_evidence.fcntl.flock",
+                    side_effect=record_flock,
+                ),
+            ):
+                verified = readonly.read_verified_success(query)
+
+            self.assertEqual(verified.registered_query, query)
+            self.assertIn(v52_evidence.fcntl.LOCK_SH, operations)
+            self.assertNotIn(v52_evidence.fcntl.LOCK_EX, operations)
+            before_cleanup.assert_not_called()
+            tombstone_cleanup.assert_not_called()
+            self.assertEqual(self._tree_byte_inode_snapshot(root), before)
+
+    def test_read_only_success_detects_recovery_race_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+            readonly = V52EvidenceStore.open_read_only(root)
+            query_root = (
+                root / "queries" / query.source / logical_query_id(query)
+            )
+            original_canary = readonly._require_no_failure_recovery_state
+            calls = 0
+            attacker_snapshot: dict[Path, tuple[object, ...]] | None = None
+
+            def inject_after_start(query_fd: int) -> None:
+                nonlocal calls, attacker_snapshot
+                calls += 1
+                original_canary(query_fd)
+                if calls == 1:
+                    recovery = query_root / "failure-transaction"
+                    recovery.mkdir()
+                    (recovery / "canary").write_bytes(b"must-not-change")
+                    attacker_snapshot = self._tree_byte_inode_snapshot(root)
+
+            with (
+                patch.object(
+                    readonly,
+                    "_require_no_failure_recovery_state",
+                    side_effect=inject_after_start,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "read-only evidence requires failure recovery",
+                ),
+            ):
+                readonly.read_verified_success(query)
+
+            self.assertEqual(calls, 2)
+            self.assertIsNotNone(attacker_snapshot)
+            self.assertEqual(
+                self._tree_byte_inode_snapshot(root), attacker_snapshot
+            )
+
+    def test_read_only_split_read_uses_shared_lock_without_cleanup(self) -> None:
+        query = dataclasses.replace(
+            _query(),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query) as lease:
+                number = store.next_attempt_number(lease)
+                expected = store.persist_split_attempt(
+                    query,
+                    number,
+                    _capture(b"partial", error="SIZE_LIMIT"),
+                    reason="SIZE_LIMIT",
+                )
+            before = self._tree_byte_inode_snapshot(root)
+            readonly = V52EvidenceStore.open_read_only(root)
+            operations: list[int] = []
+            original_flock = v52_evidence.fcntl.flock
+
+            def record_flock(descriptor: int, operation: int) -> None:
+                operations.append(operation)
+                original_flock(descriptor, operation)
+
+            with (
+                patch.object(
+                    readonly,
+                    "_finish_failure_cleanup_tombstones",
+                    side_effect=AssertionError("read-only cleanup reached"),
+                ) as cleanup,
+                patch(
+                    "mlb_backtest.v52_evidence.fcntl.flock",
+                    side_effect=record_flock,
+                ),
+            ):
+                actual = readonly.read_verified_split_attempt(query, number)
+
+            self.assertEqual(actual, expected)
+            self.assertIn(v52_evidence.fcntl.LOCK_SH, operations)
+            self.assertNotIn(v52_evidence.fcntl.LOCK_EX, operations)
+            cleanup.assert_not_called()
+            self.assertEqual(self._tree_byte_inode_snapshot(root), before)
+
     def test_leased_attempt_budget_snapshot_is_frozen_exact_and_lease_bound(self) -> None:
         from mlb_backtest.v52_evidence import (
             AttemptBudgetSnapshot,

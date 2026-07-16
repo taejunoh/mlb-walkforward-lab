@@ -1091,7 +1091,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 self._request(plan_only=False),
                 dataclasses.replace(base, runner_lock=conflict),
             )
-        self.assertEqual(calls, ["authenticate", "lock"])
+        self.assertEqual(calls, ["authenticate", "inspect", "lock"])
 
         calls.clear()
         with self.assertRaisesRegex(OperationalBlock, "--resume"):
@@ -1099,7 +1099,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 self._request(plan_only=False),
                 self._ops(calls, phase="ACQUIRING", progress=True),
             )
-        self.assertEqual(calls, ["authenticate", "lock", "inspect"])
+        self.assertEqual(
+            calls,
+            ["authenticate", "inspect", "lock", "inspect"],
+        )
 
     def test_real_runner_lock_rejects_symlinks_and_hardlinks(self) -> None:
         from mlb_backtest.v52_acquire import (
@@ -1296,7 +1299,204 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             self.assertEqual(actual, stage_summary)
             self.assertEqual(
                 calls,
-                ["authenticate", "lock", "inspect", "begin", "stages"],
+                [
+                    "authenticate",
+                    "inspect",
+                    "lock",
+                    "inspect",
+                    "begin",
+                    "stages",
+                ],
+            )
+
+    def test_phase_flip_at_runner_lock_replays_terminal_after_unlock(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            AcquisitionSummary,
+            _AcquisitionPlan,
+            _AcquireOps,
+            _RuntimeState,
+            _run_acquisition,
+        )
+
+        calls: list[str] = []
+        locked = False
+        states = iter(
+            (
+                _RuntimeState("DESIGN_ACCEPTED", False),
+                _RuntimeState("SOURCES_READY", True),
+            )
+        )
+        plan = _AcquisitionPlan(
+            "a" * 64,
+            ("b" * 64, "c" * 64, "d" * 64),
+            ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+        )
+        summary = AcquisitionSummary(
+            contract_sha256=plan.contract_sha256,
+            query_batch_sha256s=("e" * 64,) * 4,
+            promoted=0,
+            fetched=0,
+            planned_promoted=1,
+            planned_fetch_required=47,
+            resumed=81,
+            quarantined=0,
+            pending=0,
+            network_attempts=0,
+        )
+
+        @contextmanager
+        def lock(_request):
+            nonlocal locked
+            calls.append("lock")
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+                calls.append("unlock")
+
+        def inspect(_request, _plan):
+            calls.append("inspect")
+            return next(states)
+
+        def replay(_request, _plan):
+            calls.append("replay")
+            self.assertFalse(locked)
+            return summary
+
+        actual = _run_acquisition(
+            self._request(plan_only=False, resume=False),
+            _AcquireOps(
+                authenticate=lambda _request: plan,
+                runner_lock=lock,
+                inspect_runtime=inspect,
+                begin_runtime=lambda *_args: self.fail("stale begin reached"),
+                replay_terminal=replay,
+                run_stages=lambda *_args: self.fail("stale stages reached"),
+            ),
+        )
+        self.assertEqual(actual, summary)
+        self.assertEqual(
+            calls,
+            ["inspect", "lock", "inspect", "unlock", "replay"],
+        )
+
+    def test_terminal_promotion_replay_trust_fails_without_recovery_mutation(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _validate_terminal_remaining_promotion,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "raw"
+            query = _query()
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query):
+                pass
+            recovery = (
+                root
+                / "queries"
+                / query.source
+                / logical_query_id(query)
+                / "failure-transaction"
+            )
+            recovery.mkdir()
+            (recovery / "canary").write_bytes(b"must-not-change")
+
+            def snapshot() -> dict[Path, tuple[int, int, bytes | None]]:
+                values: dict[Path, tuple[int, int, bytes | None]] = {}
+                for path in (root, *sorted(root.rglob("*"))):
+                    metadata = path.lstat()
+                    values[path.relative_to(root)] = (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        path.read_bytes() if path.is_file() else None,
+                    )
+                return values
+
+            before = snapshot()
+            with self.assertRaisesRegex(
+                TrustIntegrityError,
+                "terminal REMAINING promotion replay",
+            ):
+                _validate_terminal_remaining_promotion(
+                    V52EvidenceStore.open_read_only(root),
+                    ((query, object()),),
+                )
+            self.assertEqual(snapshot(), before)
+
+    def test_real_terminal_partition_load_is_read_only_and_nonmutating(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _real_replay_terminal,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            marker = root / "canary"
+            marker.write_bytes(b"must-not-change")
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            plan = _AcquisitionPlan(
+                "a" * 64,
+                ("b" * 64, "c" * 64, "d" * 64),
+                ("PROMOTED", *('FETCH_REQUIRED' for _ in range(47))),
+            )
+            checkpoint = SimpleNamespace(
+                stage="REMAINING",
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                stage_evidence_receipt_sha256s=("1" * 64,) * 10,
+                query_batch_ids=(
+                    plan.query_batch_ids[0],
+                    "2" * 64,
+                    "3" * 64,
+                    "4" * 64,
+                ),
+                completed_query_ids=(),
+            )
+            calls: list[bool] = []
+
+            def load_partition(
+                _root: Path,
+                _batch_id: str,
+                *,
+                read_only_progress: bool = False,
+            ) -> object:
+                calls.append(read_only_progress)
+                return object()
+
+            before = (marker.read_bytes(), marker.stat().st_ino)
+            with (
+                patch(
+                    "mlb_backtest.execution_registry.load_terminal_acquisition_checkpoint",
+                    return_value=checkpoint,
+                ),
+                patch(
+                    "mlb_backtest.v52_query_plan.load_query_batch",
+                    side_effect=load_partition,
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy_decision_inventory.load_verified_legacy_decision_inventory",
+                    return_value=SimpleNamespace(payload={}),
+                ),
+                self.assertRaisesRegex(
+                    TrustIntegrityError,
+                    "protected decision authority",
+                ),
+            ):
+                _real_replay_terminal(request, plan)
+
+            self.assertEqual(calls, [True])
+            self.assertEqual(
+                (marker.read_bytes(), marker.stat().st_ino), before
             )
 
     def test_pre_network_gate_reauthenticates_pending_authority_then_checks_disk(

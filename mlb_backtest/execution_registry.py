@@ -30,6 +30,18 @@ PHASES: tuple[str, ...] = (
     "VERIFIED",
 )
 
+
+def _checkpoint_progress_is_read_only(
+    phase: object,
+    checkpoint_head: object | None,
+) -> bool:
+    if not isinstance(phase, str) or phase not in PHASES:
+        raise ValueError("execution phase authority differs")
+    return (
+        checkpoint_head is not None
+        or PHASES.index(phase) >= PHASES.index("SOURCES_READY")
+    )
+
 _SUCCESS_KEYS = frozenset(
     {
         "schema_version",
@@ -1664,6 +1676,8 @@ def _load_locked(
     paths: _RegistryPaths,
     run_spec: RunSpec,
     lock_binding: _RegistryLockBinding,
+    *,
+    read_only_progress: bool = False,
 ) -> tuple[ExecutionRegistryState, list[Mapping[str, object]]]:
     _verify_lock_binding(paths, lock_binding)
     _require_bound_execution_code_clean(paths.root)
@@ -1749,6 +1763,13 @@ def _load_locked(
                 trusted_git,
                 lock_binding,
                 verify_latest_progress=True,
+                read_only_progress=(
+                    read_only_progress
+                    or _checkpoint_progress_is_read_only(
+                        last["phase"],
+                        checkpoint_head,
+                    )
+                ),
             )
         )
         authenticated_head = _terminal_checkpoint_head(
@@ -2236,6 +2257,7 @@ def _checkpoint_stage_authority(
     stage: str,
     run_binding: Mapping[str, object],
     contract_binding: Mapping[str, object],
+    read_only_progress: bool = False,
 ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
     from mlb_backtest.v52_query_plan import (
         build_legacy_partition_batch,
@@ -2271,6 +2293,7 @@ def _checkpoint_stage_authority(
         acquisition_contract_path=contract_path,
         static_batch_id=static_batch.batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     reference_batch = build_schedule_reference_batch(
         paths.root,
@@ -2278,6 +2301,7 @@ def _checkpoint_stage_authority(
         acquisition_contract_path=contract_path,
         static_batch_id=static_batch.batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     if reference_batch.derived_from_sha256 != verified.sha256:
         raise ValueError("REFERENCE_INPUTS inventory-derived batch binding differs")
@@ -2289,7 +2313,10 @@ def _checkpoint_stage_authority(
 
     from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
 
-    gate = load_verified_timezone_gate(paths.root)
+    gate = load_verified_timezone_gate(
+        paths.root,
+        read_only_progress=read_only_progress,
+    )
     if (
         gate.run_spec_sha256 != run_binding["sha256"]
         or gate.acquisition_contract_sha256 != contract_binding["sha256"]
@@ -2328,8 +2355,14 @@ def _checkpoint_stage_authority(
         load_verified_game_evidence_inventory,
     )
 
-    inventory = load_verified_game_evidence_inventory(paths.root)
-    participant_batch = build_participant_derived_batch(paths.root)
+    inventory = load_verified_game_evidence_inventory(
+        paths.root,
+        read_only_progress=read_only_progress,
+    )
+    participant_batch = build_participant_derived_batch(
+        paths.root,
+        read_only_progress=read_only_progress,
+    )
     if (
         participant_batch.derived_from_sha256 != inventory.sha256
         or any(
@@ -2362,11 +2395,18 @@ def _checkpoint_stage_authority(
     )
 
     root_expected = build_statcast_root_batch(paths.root)
-    root_batch = load_query_batch(paths.root, root_expected.batch_id)
+    root_batch = load_query_batch(
+        paths.root,
+        root_expected.batch_id,
+        read_only_progress=read_only_progress,
+    )
     if root_batch != root_expected or len(root_batch.queries) != 46:
         raise ValueError("REMAINING Statcast root authority differs")
     decision = load_verified_legacy_decision_inventory(paths.root)
-    partition_batch = build_legacy_partition_batch(paths.root)
+    partition_batch = build_legacy_partition_batch(
+        paths.root,
+        read_only_progress=read_only_progress,
+    )
     if (
         partition_batch.derived_from_sha256 != decision.sha256
         or len(partition_batch.queries) != 48
@@ -2471,6 +2511,7 @@ def _checkpoint_current_semantic(
     split_query_ids: Sequence[str],
     stage_evidence_receipts: Sequence[Path],
     split_receipt_paths: Sequence[Path],
+    read_only_progress: bool = False,
 ) -> dict[str, object]:
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
     from mlb_backtest.v52_query_plan import (
@@ -2498,7 +2539,11 @@ def _checkpoint_current_semantic(
     for raw_batch_id in query_batch_ids:
         if not isinstance(raw_batch_id, str) or not _SHA256.fullmatch(raw_batch_id):
             raise ValueError("checkpoint batch ID differs")
-        batch = load_query_batch(paths.root, raw_batch_id)
+        batch = load_query_batch(
+            paths.root,
+            raw_batch_id,
+            read_only_progress=read_only_progress,
+        )
         batch_index = ACQUISITION_STAGES.index(batch.stage)
         if batch_index < prior_stage_index or batch_index > ACQUISITION_STAGES.index(stage):
             raise ValueError("checkpoint batch stage order differs")
@@ -2539,6 +2584,7 @@ def _checkpoint_current_semantic(
             stage=stage,
             run_binding=run_binding,
             contract_binding=contract_binding,
+            read_only_progress=read_only_progress,
         )
     )
     if stage == "REMAINING":
@@ -2612,6 +2658,7 @@ def _checkpoint_current_semantic(
             paths.root,
             parent_id,
             evidence_root=evidence_root,
+            read_only_progress=read_only_progress,
         )
         if receipt is None:
             raise ValueError("checkpoint split receipt is missing")
@@ -2672,7 +2719,15 @@ def _checkpoint_current_semantic(
     namespaces = run_spec.raw["namespaces"]
     assert isinstance(namespaces, Mapping)
     raw_root = evidence_root
-    store = V52EvidenceStore(raw_root) if raw_root.is_dir() else None
+    store = (
+        (
+            V52EvidenceStore.open_read_only(raw_root)
+            if read_only_progress
+            else V52EvidenceStore(raw_root)
+        )
+        if raw_root.is_dir()
+        else None
+    )
     evidence: list[dict[str, object]] = []
     for query_id, query in sorted(queries.items()):
         if store is None:
@@ -2768,6 +2823,8 @@ def _checkpoint_artifacts_and_population(
     paths: _RegistryPaths,
     run_spec: RunSpec,
     payload: Mapping[str, object],
+    *,
+    read_only_progress: bool = False,
 ) -> set[str]:
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
     from mlb_backtest.v52_query_plan import load_query_batch, load_split_receipt
@@ -2787,7 +2844,11 @@ def _checkpoint_artifacts_and_population(
     for item in batches:
         assert isinstance(item, Mapping)
         batch_id = str(item["batch_id"])
-        batch = load_query_batch(paths.root, batch_id)
+        batch = load_query_batch(
+            paths.root,
+            batch_id,
+            read_only_progress=read_only_progress,
+        )
         if batch.stage != item["stage"]:
             raise ValueError("checkpoint batch stage binding differs")
         loaded_batch_sequence.append(batch)
@@ -2821,6 +2882,7 @@ def _checkpoint_artifacts_and_population(
             stage=stage,
             run_binding=run_binding,
             contract_binding=contract_binding,
+            read_only_progress=read_only_progress,
         )
     )
     if stage == "REMAINING":
@@ -2878,7 +2940,11 @@ def _checkpoint_artifacts_and_population(
     verified_evidence: set[tuple[str, str, str, str]] = set()
     raw_root = _checkpoint_evidence_root(paths, run_spec)
     if raw_root.is_dir():
-        store = V52EvidenceStore(raw_root)
+        store = (
+            V52EvidenceStore.open_read_only(raw_root)
+            if read_only_progress
+            else V52EvidenceStore(raw_root)
+        )
         namespaces = run_spec.raw["namespaces"]
         assert isinstance(namespaces, Mapping)
         for query_id, query in sorted(queries_by_id.items()):
@@ -2986,6 +3052,7 @@ def _checkpoint_artifacts_and_population(
                     paths.root,
                     parent_id,
                     evidence_root=evidence_root,
+                    read_only_progress=read_only_progress,
                 )
                 if (
                     str(item["path"]) != expected_path
@@ -3171,6 +3238,7 @@ def _load_checkpoints_locked(
     lock_binding: _RegistryLockBinding,
     *,
     verify_latest_progress: bool,
+    read_only_progress: bool = False,
 ) -> tuple[
     tuple[AcquisitionCheckpoint, ...],
     tuple[Mapping[str, object], ...],
@@ -3216,7 +3284,12 @@ def _load_checkpoints_locked(
             or payload["git_head"] != git_snapshot.head
         ):
             raise ValueError("acquisition checkpoint chain or binding differs")
-        _checkpoint_artifacts_and_population(paths, run_spec, payload)
+        _checkpoint_artifacts_and_population(
+            paths,
+            run_spec,
+            payload,
+            read_only_progress=read_only_progress,
+        )
         _validate_checkpoint_progression(previous, payload)
         checkpoints.append(_checkpoint_from_payload(payload, receipt_sha))
         payloads.append(payload)
@@ -3256,6 +3329,7 @@ def _load_checkpoints_locked(
                 paths.root / str(item["path"])
                 for item in latest["split_receipts"]  # type: ignore[union-attr]
             ],
+            read_only_progress=read_only_progress,
         )
         if _checkpoint_semantic_projection(latest) != current_semantic:
             raise ValueError("latest acquisition checkpoint differs from verified progress")
@@ -3385,7 +3459,9 @@ def load_latest_acquisition_checkpoint(
     """
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
-        _, registry_payloads = _load_locked(paths, run_spec, lock_binding)
+        state, registry_payloads = _load_locked(
+            paths, run_spec, lock_binding
+        )
         snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
         checkpoints, _, _ = _load_checkpoints_locked(
             paths,
@@ -3394,8 +3470,43 @@ def load_latest_acquisition_checkpoint(
             snapshot,
             lock_binding,
             verify_latest_progress=False,
+            read_only_progress=_checkpoint_progress_is_read_only(
+                state.phase,
+                registry_payloads[-1].get("acquisition_checkpoint_head"),
+            ),
         )
         return checkpoints[-1] if checkpoints else None
+
+
+def load_terminal_acquisition_checkpoint(
+    root: Path,
+    run_spec: RunSpec,
+) -> AcquisitionCheckpoint:
+    """Read-only authentication of the frozen SOURCES_READY checkpoint head."""
+    paths = _paths(root, run_spec)
+    with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
+        state, registry_payloads = _load_locked(
+            paths,
+            run_spec,
+            lock_binding,
+            read_only_progress=True,
+        )
+        if state.phase != "SOURCES_READY":
+            raise ValueError(
+                "terminal acquisition replay requires SOURCES_READY"
+            )
+        snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
+        checkpoints, payloads, names = _load_checkpoints_locked(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            lock_binding,
+            verify_latest_progress=True,
+            read_only_progress=True,
+        )
+        _terminal_checkpoint_head(paths, checkpoints, payloads, names)
+        return checkpoints[-1]
 
 
 def publish_acquisition_checkpoint(

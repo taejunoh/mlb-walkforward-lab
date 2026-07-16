@@ -715,6 +715,15 @@ def _stages_unavailable(
     raise OperationalBlock("reference stages unavailable")
 
 
+def _terminal_replay_unavailable(
+    _request: _AcquisitionRequest,
+    _plan: _AcquisitionPlan,
+) -> AcquisitionSummary:
+    raise TrustIntegrityError(
+        "SOURCES_READY lacks a read-only terminal replay authority"
+    )
+
+
 @dataclass(frozen=True)
 class _AcquireOps:
     authenticate: Callable[[_AcquisitionRequest], _AcquisitionPlan]
@@ -723,6 +732,9 @@ class _AcquireOps:
     begin_runtime: Callable[
         [_AcquisitionRequest, _AcquisitionPlan, _RuntimeState], None
     ]
+    replay_terminal: Callable[
+        [_AcquisitionRequest, _AcquisitionPlan], AcquisitionSummary
+    ] = _terminal_replay_unavailable
     run_stages: Callable[
         [_AcquisitionRequest, _AcquisitionPlan], AcquisitionSummary
     ] = _stages_unavailable
@@ -775,31 +787,70 @@ def _run_acquisition(
     if request.plan_only:
         return _summary_for_plan(plan)
 
-    with ops.runner_lock(request):
-        runtime = ops.inspect_runtime(request, plan)
-        if not isinstance(runtime, _RuntimeState):
-            raise TypeError("runtime inspection must return a _RuntimeState")
-        if runtime.has_progress and not request.resume:
-            raise OperationalBlock("existing acquisition progress requires --resume")
-        if runtime.phase in {
-            "SOURCES_READY",
-            "OOF_SEALED",
-            "CARDS_SEALED",
-            "TARGET_LOCKED",
-            "OUTCOMES_JOINED",
-            "SAMPLE_500_SEALED",
-            "VERIFIED",
-        }:
-            raise OperationalBlock(
-                f"execution phase {runtime.phase} does not permit acquisition"
+    def replay_terminal() -> AcquisitionSummary:
+        if request.stop_after is not None:
+            raise TrustIntegrityError(
+                "SOURCES_READY requires terminal REMAINING replay"
             )
-        if runtime.phase not in {None, "DESIGN_ACCEPTED", "ACQUIRING"}:
-            raise TrustIntegrityError("execution phase authority differs")
-        ops.begin_runtime(request, plan, runtime)
-        summary = ops.run_stages(request, plan)
+        summary = ops.replay_terminal(request, plan)
         if not isinstance(summary, AcquisitionSummary):
-            raise TypeError("stage runner must return an AcquisitionSummary")
+            raise TypeError("terminal replay must return an AcquisitionSummary")
+        if (
+            summary.promoted
+            or summary.fetched
+            or summary.network_attempts
+            or summary.pending
+            or summary.quarantined
+        ):
+            raise TrustIntegrityError(
+                "SOURCES_READY terminal replay summary differs"
+            )
         return summary
+
+    later_phases = {
+        "OOF_SEALED",
+        "CARDS_SEALED",
+        "TARGET_LOCKED",
+        "OUTCOMES_JOINED",
+        "SAMPLE_500_SEALED",
+        "VERIFIED",
+    }
+
+    runtime = ops.inspect_runtime(request, plan)
+    if not isinstance(runtime, _RuntimeState):
+        raise TypeError("runtime inspection must return a _RuntimeState")
+    if runtime.phase == "SOURCES_READY":
+        return replay_terminal()
+    if runtime.phase in later_phases:
+        raise TrustIntegrityError(
+            f"execution phase {runtime.phase} is later than acquisition"
+        )
+    replay_after_unlock = False
+    with ops.runner_lock(request):
+        current = ops.inspect_runtime(request, plan)
+        if not isinstance(current, _RuntimeState):
+            raise TypeError("runtime inspection must return a _RuntimeState")
+        if current.phase == "SOURCES_READY":
+            replay_after_unlock = True
+        elif current.phase in later_phases:
+            raise TrustIntegrityError(
+                f"execution phase {current.phase} is later than acquisition"
+            )
+        else:
+            if current.has_progress and not request.resume:
+                raise OperationalBlock(
+                    "existing acquisition progress requires --resume"
+                )
+            if current.phase not in {None, "DESIGN_ACCEPTED", "ACQUIRING"}:
+                raise TrustIntegrityError("execution phase authority differs")
+            ops.begin_runtime(request, plan, current)
+            summary = ops.run_stages(request, plan)
+            if not isinstance(summary, AcquisitionSummary):
+                raise TypeError("stage runner must return an AcquisitionSummary")
+            return summary
+    if replay_after_unlock:
+        return replay_terminal()
+    raise AssertionError("acquisition phase routing is incomplete")
 
 
 def _absolute_supplied(path: Path, root: Path) -> Path:
@@ -1611,6 +1662,15 @@ def _run_remaining_wave(
             assert isinstance(host, str)
             by_host[host].append(query)
 
+    for query in sorted(
+        (query for queries in by_host.values() for query in queries),
+        key=logical_query_id,
+    ):
+        _integrity_boundary(
+            "remaining query registration",
+            lambda query=query: store.register_query(query),
+        )
+
     network_attempts = 0
     attempts_by_query: dict[str, int] = {}
     counter_lock = threading.Lock()
@@ -1897,6 +1957,15 @@ def _execute_stage(
                 return store.publish_derived_disposition(query, semantics)
 
         _integrity_boundary("derived disposition", publish_derived)
+
+    for query in sorted(
+        (query for queries in by_host.values() for query in queries),
+        key=logical_query_id,
+    ):
+        _integrity_boundary(
+            "stage query registration",
+            lambda query=query: store.register_query(query),
+        )
 
     def guarded_gate(item: LogicalQuery) -> None:
         check_stop()
@@ -3320,11 +3389,91 @@ def _real_begin_runtime(
         raise TrustIntegrityError("execution registry initialization failed") from exc
 
 
+def _real_replay_terminal(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+) -> AcquisitionSummary:
+    from .execution_registry import load_terminal_acquisition_checkpoint
+    from .v52_legacy import load_protected_legacy_catalog
+    from .v52_legacy_decision_inventory import (
+        load_verified_legacy_decision_inventory,
+    )
+    from .v52_query_plan import load_query_batch
+
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    try:
+        checkpoint = load_terminal_acquisition_checkpoint(root, request.run_spec)
+        batch_ids = checkpoint.query_batch_ids
+        if (
+            checkpoint.stage != "REMAINING"
+            or checkpoint.pending_query_ids
+            or checkpoint.quarantined_query_ids
+            or len(checkpoint.stage_evidence_receipt_sha256s) != 10
+            or len(batch_ids) < 4
+            or batch_ids[0] != plan.query_batch_ids[0]
+        ):
+            raise TrustIntegrityError(
+                "SOURCES_READY terminal checkpoint authority differs"
+            )
+        partition = load_query_batch(
+            root,
+            batch_ids[3],
+            read_only_progress=True,
+        )
+        inventory = load_verified_legacy_decision_inventory(root)
+        protected = inventory.payload.get("protected_inventory")
+        if not isinstance(protected, Mapping) or not isinstance(
+            protected.get("sha256"), str
+        ):
+            raise TrustIntegrityError(
+                "SOURCES_READY protected decision authority differs"
+            )
+        catalog = load_protected_legacy_catalog(
+            root,
+            legacy_root=root / _LEGACY_ROOT_RELATIVE,
+            protected_inventory_path=root / _PROTECTED_INVENTORY_RELATIVE,
+            protected_inventory_sha256=str(protected["sha256"]),
+        )
+        promoted = _validate_remaining_decisions(partition, inventory, catalog)
+        evidence_root = root / "data/v5_2_qd/historical/raw"
+        if not evidence_root.is_dir():
+            raise TrustIntegrityError(
+                "SOURCES_READY raw evidence authority is unavailable"
+            )
+        store = V52EvidenceStore.open_read_only(evidence_root)
+        _validate_terminal_remaining_promotion(store, promoted)
+        planned_promoted = plan.legacy_dispositions.count("PROMOTED")
+        planned_fetch = plan.legacy_dispositions.count("FETCH_REQUIRED")
+        if planned_promoted != 1 or planned_fetch != 47:
+            raise TrustIntegrityError(
+                "SOURCES_READY planned disposition authority differs"
+            )
+        return AcquisitionSummary(
+            contract_sha256=plan.contract_sha256,
+            query_batch_sha256s=batch_ids,
+            promoted=0,
+            fetched=0,
+            planned_promoted=planned_promoted,
+            planned_fetch_required=planned_fetch,
+            resumed=len(checkpoint.completed_query_ids),
+            quarantined=0,
+            pending=0,
+            network_attempts=0,
+        )
+    except TrustIntegrityError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise TrustIntegrityError(
+            "SOURCES_READY terminal replay authentication failed"
+        ) from exc
+
+
 _REAL_OPS = _AcquireOps(
     authenticate=_real_authenticate,
     runner_lock=_real_runner_lock,
     inspect_runtime=_real_inspect_runtime,
     begin_runtime=_real_begin_runtime,
+    replay_terminal=_real_replay_terminal,
     run_stages=_real_run_stages,
 )
 

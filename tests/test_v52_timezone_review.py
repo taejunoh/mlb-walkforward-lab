@@ -1800,9 +1800,16 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 original = timezone_review._current_timezone_authority
                 calls = 0
 
-                def replay_then_replace(replay_root: Path):
+                def replay_then_replace(
+                    replay_root: Path,
+                    *,
+                    read_only_progress: bool = False,
+                ):
                     nonlocal calls
-                    authority = original(replay_root)
+                    authority = original(
+                        replay_root,
+                        read_only_progress=read_only_progress,
+                    )
                     calls += 1
                     if calls == 2:
                         replacement = target.with_suffix(".replacement")

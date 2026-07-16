@@ -1533,6 +1533,7 @@ def build_schedule_reference_batch(
     acquisition_contract_path: Path,
     static_batch_id: str,
     evidence_root: Path,
+    read_only_progress: bool = False,
 ) -> QueryBatch:
     repository_root = Path(os.path.abspath(os.fspath(repository_root)))
     run_spec_path = Path(os.path.abspath(os.fspath(run_spec_path)))
@@ -1547,6 +1548,7 @@ def build_schedule_reference_batch(
         acquisition_contract_path=acquisition_contract_path,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     run_binding = verified.payload.get("run_spec")
     contract_binding = verified.payload.get("acquisition_contract")
@@ -1567,7 +1569,11 @@ def build_schedule_reference_batch(
     )
 
 
-def _load_fixed_reference_batch_authority(repository_root: Path) -> QueryBatch:
+def _load_fixed_reference_batch_authority(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
     repository_root = Path(os.path.abspath(os.fspath(repository_root)))
     from .protocols import parse_run_spec
     from .v52_schedule_inventory import (
@@ -1608,6 +1614,7 @@ def _load_fixed_reference_batch_authority(repository_root: Path) -> QueryBatch:
         / _ACQUISITION_CONTRACT_RELATIVE,
         static_batch_id=static_batch_id,
         evidence_root=repository_root / raw_relative,
+        read_only_progress=read_only_progress,
     )
     run_binding = verified.payload.get("run_spec")
     contract_binding = verified.payload.get("acquisition_contract")
@@ -1629,11 +1636,17 @@ def _load_fixed_reference_batch_authority(repository_root: Path) -> QueryBatch:
 
 
 def _validate_reference_batch_authority(
-    repository_root: Path, batch: QueryBatch
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
 ) -> None:
     if batch.stage != "REFERENCE_INPUTS":
         return
-    expected = _load_fixed_reference_batch_authority(repository_root)
+    expected = _load_fixed_reference_batch_authority(
+        repository_root,
+        read_only_progress=read_only_progress,
+    )
     if batch != expected:
         raise ValueError(
             "REFERENCE_INPUTS differs from fixed schedule inventory replay"
@@ -1749,13 +1762,20 @@ def _build_participant_derived_batch_from_inventory(
     return _make_batch("PARTICIPANT_DERIVED", derived, queries)
 
 
-def build_participant_derived_batch(repository_root: Path) -> QueryBatch:
+def build_participant_derived_batch(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
     from .v52_game_evidence_inventory import (
         load_verified_game_evidence_inventory,
     )
 
     root = Path(repository_root)
-    verified = load_verified_game_evidence_inventory(root)
+    verified = load_verified_game_evidence_inventory(
+        root,
+        read_only_progress=read_only_progress,
+    )
     inventory_contents = _read_repository_file(
         root,
         _GAME_EVIDENCE_INVENTORY_RELATIVE,
@@ -1784,11 +1804,17 @@ def build_participant_derived_batch(repository_root: Path) -> QueryBatch:
 
 
 def _validate_participant_batch_authority(
-    repository_root: Path, batch: QueryBatch
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
 ) -> None:
     if batch.stage != "PARTICIPANT_DERIVED":
         return
-    expected = build_participant_derived_batch(repository_root)
+    expected = build_participant_derived_batch(
+        repository_root,
+        read_only_progress=read_only_progress,
+    )
     if batch != expected:
         raise ValueError("PARTICIPANT_DERIVED differs from fixed game inventory replay")
 
@@ -1836,20 +1862,43 @@ def _is_legacy_partition_batch_candidate(
 
 
 def _validate_legacy_partition_batch_authority(
-    repository_root: Path, batch: QueryBatch
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
 ) -> None:
     if not _is_legacy_partition_batch_candidate(repository_root, batch):
         return
-    expected = build_legacy_partition_batch(repository_root)
+    expected = build_legacy_partition_batch(
+        repository_root,
+        read_only_progress=read_only_progress,
+    )
     if batch != expected:
         raise ValueError("REMAINING legacy partition differs from decision replay")
 
 
-def _validate_query_batch_authority(repository_root: Path, batch: QueryBatch) -> None:
-    _validate_reference_batch_authority(repository_root, batch)
-    _validate_participant_batch_authority(repository_root, batch)
+def _validate_query_batch_authority(
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+) -> None:
+    _validate_reference_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+    )
+    _validate_participant_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+    )
     _validate_statcast_root_batch_authority(repository_root, batch)
-    _validate_legacy_partition_batch_authority(repository_root, batch)
+    _validate_legacy_partition_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+    )
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
@@ -1958,7 +2007,10 @@ def bisect_statcast_query(
 
 
 def _validate_statcast_split_parent_batch(
-    repository_root: Path, parent_batch: QueryBatch
+    repository_root: Path,
+    parent_batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
 ) -> None:
     if _is_statcast_root_batch(parent_batch) or _is_legacy_partition_batch_candidate(
         repository_root, parent_batch
@@ -1971,7 +2023,11 @@ def _validate_statcast_split_parent_batch(
     parent_query_ids = {query.parent_query_id for query in parent_batch.queries}
     if len(parent_query_ids) != 1 or None in parent_query_ids:
         raise ValueError("Statcast split parent batch has noncanonical parent lineage")
-    ancestor = load_query_batch(repository_root, ancestor_batch_id)
+    ancestor = load_query_batch(
+        repository_root,
+        ancestor_batch_id,
+        read_only_progress=read_only_progress,
+    )
     parent_query_id = next(iter(parent_query_ids))
     matches = [
         query
@@ -1981,7 +2037,10 @@ def _validate_statcast_split_parent_batch(
     if len(matches) != 1:
         raise ValueError("Statcast split parent batch has noncanonical parent lineage")
     if parent_batch != build_statcast_split_batch(
-        repository_root, ancestor, matches[0]
+        repository_root,
+        ancestor,
+        matches[0],
+        read_only_progress=read_only_progress,
     ):
         raise ValueError("Statcast split parent batch differs from canonical bisection")
 
@@ -1990,6 +2049,8 @@ def build_statcast_split_batch(
     repository_root: Path,
     parent_batch: QueryBatch,
     parent_query: LogicalQuery,
+    *,
+    read_only_progress: bool = False,
 ) -> QueryBatch:
     """Build the canonical sealed child batch for one Statcast parent query."""
     if not isinstance(parent_batch, QueryBatch):
@@ -2007,8 +2068,16 @@ def build_statcast_split_batch(
     if parent_batch.batch_id != _sha256_bytes(_canonical_json_bytes(payload)):
         raise ValueError("parent batch_id differs from its canonical sealed payload")
     root = Path(repository_root)
-    _validate_query_batch_authority(root, parent_batch)
-    _validate_statcast_split_parent_batch(root, parent_batch)
+    _validate_query_batch_authority(
+        root,
+        parent_batch,
+        read_only_progress=read_only_progress,
+    )
+    _validate_statcast_split_parent_batch(
+        root,
+        parent_batch,
+        read_only_progress=read_only_progress,
+    )
 
     requested_parent_id = logical_query_id(parent_query)
     matches = [
@@ -2172,7 +2241,11 @@ def build_legacy_partition_batch_from_catalog(
     )
 
 
-def build_legacy_partition_batch(repository_root: Path) -> QueryBatch:
+def build_legacy_partition_batch(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
     """Replay the sealed legacy decisions into the fixed first-level partition."""
     from .v52_legacy_decision_inventory import (
         _load_legacy_partition_decision_replay,
@@ -2184,7 +2257,10 @@ def build_legacy_partition_batch(repository_root: Path) -> QueryBatch:
     )
     expected_root = build_statcast_root_batch(root)
     root_batch = _load_query_batch(
-        root, expected_root.batch_id, invoke_authority_hook=False
+        root,
+        expected_root.batch_id,
+        invoke_authority_hook=False,
+        read_only_progress=read_only_progress,
     )
     if root_batch != expected_root or len(root_batch.queries) != 46:
         raise ValueError("legacy partition Statcast root authority differs")
@@ -2486,7 +2562,11 @@ def _verify_opened_batch_chain(root: Path, descriptors: Sequence[int]) -> None:
 
 
 def _load_query_batch(
-    root: Path, batch_id: str, *, invoke_authority_hook: bool
+    root: Path,
+    batch_id: str,
+    *,
+    invoke_authority_hook: bool,
+    read_only_progress: bool = False,
 ) -> QueryBatch:
     if type(invoke_authority_hook) is not bool:
         raise TypeError("invoke_authority_hook must be a bool")
@@ -2546,7 +2626,11 @@ def _load_query_batch(
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
-        _validate_query_batch_authority(root, batch)
+        _validate_query_batch_authority(
+            root,
+            batch,
+            read_only_progress=read_only_progress,
+        )
         rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if rebound is None:
             raise ValueError("query batch is missing after reconstruction")
@@ -2561,16 +2645,28 @@ def _load_query_batch(
             or _is_statcast_root_batch(batch)
             or _is_legacy_partition_batch_candidate(root, batch)
         ):
-            _rebind_query_batch_authority(root, batch)
+            _rebind_query_batch_authority(
+                root,
+                batch,
+                read_only_progress=read_only_progress,
+            )
         return batch
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
 
 
-def load_query_batch(repository_root: Path, batch_id: str) -> QueryBatch:
+def load_query_batch(
+    repository_root: Path,
+    batch_id: str,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
     return _load_query_batch(
-        repository_root, batch_id, invoke_authority_hook=True
+        repository_root,
+        batch_id,
+        invoke_authority_hook=True,
+        read_only_progress=read_only_progress,
     )
 
 
@@ -2674,7 +2770,12 @@ def _before_query_batch_authority_rebind() -> None:
     """Deterministic authority-mutation test hook; production does nothing."""
 
 
-def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
+def _rebind_query_batch_authority(
+    root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+) -> None:
     if (
         batch.stage
         not in {
@@ -2686,7 +2787,11 @@ def _rebind_query_batch_authority(root: Path, batch: QueryBatch) -> None:
     ):
         return
     _before_query_batch_authority_rebind()
-    _validate_query_batch_authority(root, batch)
+    _validate_query_batch_authority(
+        root,
+        batch,
+        read_only_progress=read_only_progress,
+    )
 
 
 def _cleanup_owned_query_batch_final(
@@ -2881,6 +2986,8 @@ def _verified_split_attempt(
     parent: LogicalQuery,
     reason: str,
     attempt_number: int,
+    *,
+    read_only_progress: bool = False,
 ) -> tuple[dict[str, object], str, str]:
     if reason not in _SPLIT_REASONS:
         raise ValueError("split reason is not approved")
@@ -2890,7 +2997,11 @@ def _verified_split_attempt(
         or not 1 <= attempt_number <= 999999
     ):
         raise ValueError("exhausted_attempt_number must be a positive integer")
-    store = V52EvidenceStore(evidence_root)
+    store = (
+        V52EvidenceStore.open_read_only(evidence_root)
+        if read_only_progress
+        else V52EvidenceStore(evidence_root)
+    )
     progress = store.read_verified_query_progress(parent)
     if not progress.attempt_receipts:
         raise ValueError("split parent has no exhausted attempt receipt")
@@ -2956,6 +3067,7 @@ def _verified_split_lineage(
     exhausted_attempt_number: int,
     child_batch_id: str,
     active_parent_ids: set[str],
+    read_only_progress: bool = False,
 ) -> tuple[
     QueryBatch,
     LogicalQuery,
@@ -2972,8 +3084,16 @@ def _verified_split_lineage(
         parent_query_id, "parent_query_id"
     )
     requested_child_batch_id = _validate_sha256(child_batch_id, "child_batch_id")
-    parent_batch = load_query_batch(repository_root, requested_parent_batch_id)
-    child_batch = load_query_batch(repository_root, requested_child_batch_id)
+    parent_batch = load_query_batch(
+        repository_root,
+        requested_parent_batch_id,
+        read_only_progress=read_only_progress,
+    )
+    child_batch = load_query_batch(
+        repository_root,
+        requested_child_batch_id,
+        read_only_progress=read_only_progress,
+    )
     matches = [
         query
         for query in parent_batch.queries
@@ -2989,7 +3109,10 @@ def _verified_split_lineage(
     if child_batch.derived_from_sha256 != parent_batch.batch_id:
         raise ValueError("split child batch must derive from the parent batch")
     if child_batch != build_statcast_split_batch(
-        repository_root, parent_batch, parent
+        repository_root,
+        parent_batch,
+        parent,
+        read_only_progress=read_only_progress,
     ):
         raise ValueError("split child batch differs from the canonical bisection")
     if len(child_batch.queries) < 2:
@@ -3014,7 +3137,11 @@ def _verified_split_lineage(
 
     legacy_depth_one_anchor = (
         _is_legacy_partition_batch_candidate(repository_root, parent_batch)
-        and parent_batch == build_legacy_partition_batch(repository_root)
+        and parent_batch
+        == build_legacy_partition_batch(
+            repository_root,
+            read_only_progress=read_only_progress,
+        )
     )
     if parent.parent_query_id is None:
         if parent_batch.derived_from_sha256 is not None:
@@ -3029,6 +3156,7 @@ def _verified_split_lineage(
             split_fd,
             parent.parent_query_id,
             active_parent_ids=active_parent_ids,
+            read_only_progress=read_only_progress,
         )
         if ancestor is None:
             raise ValueError("recursive split ancestor receipt is missing")
@@ -3045,6 +3173,7 @@ def _verified_split_lineage(
         parent,
         reason,
         exhausted_attempt_number,
+        read_only_progress=read_only_progress,
     )
     return (
         parent_batch,
@@ -3068,6 +3197,7 @@ def _split_record(
     exhausted_attempt_number: int,
     child_batch_id: str,
     active_parent_ids: set[str],
+    read_only_progress: bool = False,
 ) -> dict[str, object]:
     (
         parent_batch,
@@ -3087,6 +3217,7 @@ def _split_record(
         exhausted_attempt_number=exhausted_attempt_number,
         child_batch_id=child_batch_id,
         active_parent_ids=active_parent_ids,
+        read_only_progress=read_only_progress,
     )
     record = {
         "attempt_receipt": {
@@ -3185,6 +3316,7 @@ def _load_split_receipt_locked(
     parent_query_id: str,
     *,
     active_parent_ids: set[str],
+    read_only_progress: bool = False,
 ) -> SplitReceipt | None:
     requested_id = _validate_sha256(parent_query_id, "parent_query_id")
     if requested_id in active_parent_ids:
@@ -3239,6 +3371,7 @@ def _load_split_receipt_locked(
                 record.get("child_batch_id"), "child_batch_id"
             ),
             active_parent_ids=active_parent_ids,
+            read_only_progress=read_only_progress,
         )
     finally:
         active_parent_ids.remove(requested_id)
@@ -3336,6 +3469,7 @@ def load_split_receipt(
     parent_query_id: str,
     *,
     evidence_root: Path,
+    read_only_progress: bool = False,
 ) -> SplitReceipt | None:
     requested_id = _validate_sha256(parent_query_id, "parent_query_id")
     repository_root = Path(repository_root)
@@ -3354,6 +3488,7 @@ def load_split_receipt(
                 current,
                 requested_id,
                 active_parent_ids=set(),
+                read_only_progress=read_only_progress,
             )
             _verify_split_namespace_chain(repository_root, descriptors)
             return receipt

@@ -725,7 +725,11 @@ def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
         raise ValueError("game participant source sidecar coverage differs")
 
 
-def _build_current_authority(root: Path) -> _Authority:
+def _build_current_authority(
+    root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> _Authority:
     run_snapshot = _required_snapshot(root, _RUN_SPEC_RELATIVE, "game evidence RunSpec")
     contract_snapshot = _required_snapshot(
         root,
@@ -762,19 +766,29 @@ def _build_current_authority(root: Path) -> _Authority:
         acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     if verified_schedule.sha256 != _sha256(schedule_snapshot.contents):
         raise ValueError("game evidence schedule inventory hash differs")
 
-    static_batch = load_query_batch(root, static_batch_id)
+    static_batch = load_query_batch(
+        root,
+        static_batch_id,
+        read_only_progress=read_only_progress,
+    )
     reference_expected = build_schedule_reference_batch(
         root,
         root / _RUN_SPEC_RELATIVE,
         acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
-    reference_batch = load_query_batch(root, reference_expected.batch_id)
+    reference_batch = load_query_batch(
+        root,
+        reference_expected.batch_id,
+        read_only_progress=read_only_progress,
+    )
     if (
         static_batch.stage != "STATIC_SCHEDULES"
         or reference_batch != reference_expected
@@ -793,7 +807,10 @@ def _build_current_authority(root: Path) -> _Authority:
         "game evidence REFERENCE_INPUTS batch",
     )
 
-    timezone_gate = load_verified_timezone_gate(root)
+    timezone_gate = load_verified_timezone_gate(
+        root,
+        read_only_progress=read_only_progress,
+    )
     timezone_snapshots = tuple(
         _required_snapshot(root, relative, label)
         for relative, label in (
@@ -826,7 +843,11 @@ def _build_current_authority(root: Path) -> _Authority:
     ):
         raise ValueError("game evidence timezone authority differs")
 
-    store = V52EvidenceStore(evidence_root)
+    store = (
+        V52EvidenceStore.open_read_only(evidence_root)
+        if read_only_progress
+        else V52EvidenceStore(evidence_root)
+    )
     schedule_sidecars: list[Mapping[str, object]] = []
     boxscores: dict[int, tuple[bytes, str]] = {}
     evidence_snapshots: list[_BoundSnapshot] = []
@@ -1211,17 +1232,25 @@ def publish_game_evidence_inventory(root: Path) -> VerifiedGameEvidenceInventory
 
 def load_verified_game_evidence_inventory(
     root: Path,
+    *,
+    read_only_progress: bool = False,
 ) -> VerifiedGameEvidenceInventory:
     root = _trusted_game_root(root)
     snapshot = _required_snapshot(root, _INVENTORY_RELATIVE, "game evidence inventory")
     stored = _json_object(snapshot.contents, "game evidence inventory")
-    authority = _build_current_authority(root)
+    authority = _build_current_authority(
+        root,
+        read_only_progress=read_only_progress,
+    )
     if stored != authority.payload:
         raise ValueError(
             "game evidence inventory differs from current verified participant authority"
         )
     _before_game_inventory_final_rebind()
-    rebound = _build_current_authority(root)
+    rebound = _build_current_authority(
+        root,
+        read_only_progress=read_only_progress,
+    )
     if rebound.payload != authority.payload:
         raise ValueError("game participant authority changed during verified load")
     _rebind_authority(root, authority)

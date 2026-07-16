@@ -1433,7 +1433,11 @@ def _required_snapshot(
     return snapshot
 
 
-def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
+def _current_timezone_authority(
+    root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> _CurrentTimezoneAuthority:
     from .protocols import parse_run_spec
     from .v52_query_plan import (
         build_schedule_reference_batch,
@@ -1498,6 +1502,7 @@ def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
         acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     inventory_snapshot = _required_snapshot(
         root,
@@ -1515,13 +1520,18 @@ def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
         "timezone gate STATIC_SCHEDULES batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
-    static_batch = load_query_batch(root, static_batch_id)
+    static_batch = load_query_batch(
+        root,
+        static_batch_id,
+        read_only_progress=read_only_progress,
+    )
     reference_expected = build_schedule_reference_batch(
         root,
         root / _RUN_SPEC_PATH,
         acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
     )
     reference_batch_snapshot = _required_snapshot(
         root,
@@ -1531,7 +1541,11 @@ def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
         "timezone gate REFERENCE_INPUTS batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
-    reference_batch = load_query_batch(root, reference_expected.batch_id)
+    reference_batch = load_query_batch(
+        root,
+        reference_expected.batch_id,
+        read_only_progress=read_only_progress,
+    )
     if reference_batch != reference_expected:
         raise ValueError("timezone gate REFERENCE_INPUTS authority differs")
     if (
@@ -1587,7 +1601,11 @@ def _current_timezone_authority(root: Path) -> _CurrentTimezoneAuthority:
         raise ValueError("timezone gate schedule sidecar population differs")
     schedule_sidecar_sha256s.sort()
 
-    store = V52EvidenceStore(evidence_root)
+    store = (
+        V52EvidenceStore.open_read_only(evidence_root)
+        if read_only_progress
+        else V52EvidenceStore(evidence_root)
+    )
     venue_sidecars: list[Mapping[str, object]] = []
     for query in reference_batch.queries:
         if not (
@@ -1681,7 +1699,11 @@ def _seal_object(contents: bytes) -> dict[str, object]:
     return value
 
 
-def load_verified_timezone_gate(root: Path) -> VerifiedTimezoneGate:
+def load_verified_timezone_gate(
+    root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> VerifiedTimezoneGate:
     root = _trusted_root(root)
     fixed_snapshots = (
         _required_snapshot(
@@ -1727,7 +1749,10 @@ def load_verified_timezone_gate(root: Path) -> VerifiedTimezoneGate:
             canonical=True,
         )
     )
-    authority = _current_timezone_authority(root)
+    authority = _current_timezone_authority(
+        root,
+        read_only_progress=read_only_progress,
+    )
     candidate_projection = {
         key: value for key, value in candidate.items() if key != "timezone_rows"
     }
@@ -1800,7 +1825,10 @@ def load_verified_timezone_gate(root: Path) -> VerifiedTimezoneGate:
         raise ValueError("timezone mapping seal authority differs")
 
     _before_timezone_gate_final_rebind()
-    rebound_authority = _current_timezone_authority(root)
+    rebound_authority = _current_timezone_authority(
+        root,
+        read_only_progress=read_only_progress,
+    )
     if (
         rebound_authority.source_projection != authority.source_projection
         or rebound_authority.run_spec_sha256 != authority.run_spec_sha256

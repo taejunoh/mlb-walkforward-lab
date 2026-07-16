@@ -1772,7 +1772,8 @@ def _attempt_record(
 
 
 class V52EvidenceStore:
-    def __init__(self, root: Path) -> None:
+    @staticmethod
+    def _validated_root(root: Path) -> Path:
         supplied = Path(os.path.abspath(os.fspath(root)))
         for node in (*reversed(supplied.parents), supplied):
             try:
@@ -1789,11 +1790,47 @@ class V52EvidenceStore:
                 raise ValueError("evidence root must be a directory")
         if not supplied.parent.is_dir():
             raise ValueError("evidence root parent is unavailable")
+        return supplied
+
+    def __init__(self, root: Path) -> None:
+        supplied = self._validated_root(root)
         self.root = supplied
         self._canonical_root = supplied
         descriptor = _open_root_path(self._canonical_root, create=True)
         os.close(descriptor)
         self._local = threading.local()
+        self._read_only = False
+
+    @classmethod
+    def open_read_only(cls, root: Path) -> V52EvidenceStore:
+        supplied = cls._validated_root(root)
+        descriptor = _open_root_path(supplied, create=False)
+        os.close(descriptor)
+        store = cls.__new__(cls)
+        store.root = supplied
+        store._canonical_root = supplied
+        store._local = threading.local()
+        store._read_only = True
+        return store
+
+    @staticmethod
+    def _require_no_failure_recovery_state(query_fd: int) -> None:
+        try:
+            membership = set(os.listdir(query_fd))
+        except OSError as exc:
+            raise RuntimeError(
+                "read-only evidence membership is unavailable"
+            ) from exc
+        recovery = {
+            name
+            for name in membership
+            if name in {_FAILURE_INTENT_NAME, _FAILURE_TRANSACTION_NAME}
+            or name.startswith(_FAILURE_CLEANUP_PREFIX)
+        }
+        if recovery:
+            raise RuntimeError(
+                "read-only evidence requires failure recovery"
+            )
 
     def _root_fd(self) -> int:
         return _open_root_path(self._canonical_root, create=False)
@@ -2026,8 +2063,19 @@ class V52EvidenceStore:
         )
 
     @staticmethod
-    def _open_query_lock(query_fd: int, *, create: bool) -> int:
-        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    def _open_query_lock(
+        query_fd: int,
+        *,
+        create: bool,
+        read_only: bool = False,
+    ) -> int:
+        if create and read_only:
+            raise ValueError("read-only query lock cannot be created")
+        flags = (
+            (os.O_RDONLY if read_only else os.O_RDWR)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         descriptor = -1
         try:
             if create:
@@ -3716,12 +3764,20 @@ class V52EvidenceStore:
         query_id = logical_query_id(query)
         _, descriptors = self._query_fds(query, create=False)
         lock_descriptor = -1
+        recovery_canary_started = False
         attempts_fd = -1
         quarantine_descriptors: list[int] | None = None
         try:
             query_fd = descriptors[-1]
-            lock_descriptor = self._open_query_lock(query_fd, create=False)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            lock_descriptor = self._open_query_lock(
+                query_fd,
+                create=False,
+                read_only=self._read_only,
+            )
+            fcntl.flock(
+                lock_descriptor,
+                fcntl.LOCK_SH if self._read_only else fcntl.LOCK_EX,
+            )
             (
                 registration_sha256,
                 registered_query,
@@ -3729,9 +3785,13 @@ class V52EvidenceStore:
             ) = self._validated_registered_query(
                 query, query_fd, lock_descriptor=lock_descriptor
             )
-            self._finish_failure_cleanup_tombstones(
-                query, query_fd, registration_sha256
-            )
+            if self._read_only:
+                self._require_no_failure_recovery_state(query_fd)
+                recovery_canary_started = True
+            else:
+                self._finish_failure_cleanup_tombstones(
+                    query, query_fd, registration_sha256
+                )
             attempts_fd = _open_directory_at(query_fd, "attempts", create=False)
             _, _, receipts, attempt_snapshots = self._verified_attempt_bundle(
                 query, attempts_fd
@@ -3850,14 +3910,18 @@ class V52EvidenceStore:
                         "split response body identity or bytes changed"
                     )
         finally:
-            if quarantine_descriptors is not None:
-                self._close_fds(quarantine_descriptors)
-            if attempts_fd >= 0:
-                os.close(attempts_fd)
-            if lock_descriptor >= 0:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-                os.close(lock_descriptor)
-            self._close_fds(descriptors)
+            try:
+                if recovery_canary_started:
+                    self._require_no_failure_recovery_state(descriptors[-1])
+            finally:
+                if quarantine_descriptors is not None:
+                    self._close_fds(quarantine_descriptors)
+                if attempts_fd >= 0:
+                    os.close(attempts_fd)
+                if lock_descriptor >= 0:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                    os.close(lock_descriptor)
+                self._close_fds(descriptors)
         attempt_path = self.root / _relative_path(
             query.source, query_id, "attempts", f"{attempt_number:06d}.json"
         )
@@ -5151,6 +5215,7 @@ class V52EvidenceStore:
         *,
         missing_ok: bool,
         cleanup_tombstones: bool = True,
+        lock_descriptor: int | None = None,
     ) -> VerifiedEvidenceRead | None:
         try:
             query_id, descriptors = self._query_fds(query, create=False)
@@ -5158,15 +5223,34 @@ class V52EvidenceStore:
             if missing_ok:
                 return None
             raise
+        owned_lock_descriptor = -1
+        recovery_canary_started = False
         try:
             query_fd = descriptors[-1]
+            active_lock_descriptor = lock_descriptor
+            if self._read_only:
+                if active_lock_descriptor is None:
+                    owned_lock_descriptor = self._open_query_lock(
+                        query_fd,
+                        create=False,
+                        read_only=True,
+                    )
+                    fcntl.flock(owned_lock_descriptor, fcntl.LOCK_SH)
+                    active_lock_descriptor = owned_lock_descriptor
+                self._require_no_failure_recovery_state(query_fd)
+                recovery_canary_started = True
             if (
                 cleanup_tombstones
+                and not self._read_only
                 and query_id not in self._active_leases()
             ):
                 self._finish_failure_cleanup_before_read(query, descriptors)
             registration_sha256, registered_query, query_snapshot = (
-                self._validated_registered_query(query, query_fd)
+                self._validated_registered_query(
+                    query,
+                    query_fd,
+                    lock_descriptor=active_lock_descriptor,
+                )
             )
             success_snapshot = _read_regular_snapshot_at(
                 query_fd,
@@ -5482,7 +5566,11 @@ class V52EvidenceStore:
                 final_registration_sha256,
                 final_registered_query,
                 final_query_snapshot,
-            ) = self._validated_registered_query(query, query_fd)
+            ) = self._validated_registered_query(
+                query,
+                query_fd,
+                lock_descriptor=active_lock_descriptor,
+            )
             if (
                 final_registration_sha256 != registration_sha256
                 or final_registered_query != registered_query
@@ -5511,7 +5599,14 @@ class V52EvidenceStore:
                 attempt_receipts=attempt_receipts,
             )
         finally:
-            self._close_fds(descriptors)
+            try:
+                if recovery_canary_started:
+                    self._require_no_failure_recovery_state(descriptors[-1])
+            finally:
+                if owned_lock_descriptor >= 0:
+                    fcntl.flock(owned_lock_descriptor, fcntl.LOCK_UN)
+                    os.close(owned_lock_descriptor)
+                self._close_fds(descriptors)
 
     def read_verified_success(self, query: LogicalQuery) -> VerifiedEvidenceRead:
         verified = self._read_verified_success(query, missing_ok=False)
@@ -5554,10 +5649,17 @@ class V52EvidenceStore:
         try:
             query_fd = descriptors[-1]
             try:
-                lock_descriptor = self._open_query_lock(query_fd, create=False)
+                lock_descriptor = self._open_query_lock(
+                    query_fd,
+                    create=False,
+                    read_only=self._read_only,
+                )
             except FileNotFoundError:
                 raise RuntimeError("query registration lock is missing") from None
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            fcntl.flock(
+                lock_descriptor,
+                fcntl.LOCK_SH if self._read_only else fcntl.LOCK_EX,
+            )
             (
                 registration_sha256,
                 registered_query,
@@ -5567,9 +5669,12 @@ class V52EvidenceStore:
                 query_fd,
                 lock_descriptor=lock_descriptor,
             )
-            self._finish_failure_cleanup_tombstones(
-                query, query_fd, registration_sha256
-            )
+            if self._read_only:
+                self._require_no_failure_recovery_state(query_fd)
+            else:
+                self._finish_failure_cleanup_tombstones(
+                    query, query_fd, registration_sha256
+                )
             attempts_fd = _open_directory_at(query_fd, "attempts", create=False)
             try:
                 (
@@ -5728,6 +5833,7 @@ class V52EvidenceStore:
                         query,
                         missing_ok=False,
                         cleanup_tombstones=False,
+                        lock_descriptor=lock_descriptor,
                     )
                     if success_snapshot is not None
                     else None
@@ -5910,6 +6016,8 @@ class V52EvidenceStore:
                         "logical query registration changed during progress read"
                     )
                 self._verify_query_chain(query, descriptors)
+                if self._read_only:
+                    self._require_no_failure_recovery_state(query_fd)
             finally:
                 os.close(attempts_fd)
 
