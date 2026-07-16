@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
-from datetime import date, timedelta
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timedelta
 
 from ..v52_source_contracts import canonical_sha256
 
@@ -32,14 +32,21 @@ def _day(value: object, label: str) -> date:
 
 def recompute_prior_history_sidecar(
     schedule_sidecar: Mapping[str, object],
+    *,
+    source_snapshot_sha256: str,
 ) -> Mapping[str, object]:
+    if (
+        not isinstance(source_snapshot_sha256, str)
+        or _SHA256.fullmatch(source_snapshot_sha256) is None
+    ):
+        raise ValueError("source snapshot SHA-256 differs")
     if not isinstance(schedule_sidecar, Mapping):
         raise ValueError("schedule_sidecar must be a mapping")
     if schedule_sidecar.get("grain") != "season_game_evidence_snapshot":
         raise ValueError("prior history requires a season game-evidence snapshot")
     raw_games = schedule_sidecar.get("games")
-    if not isinstance(raw_games, list):
-        raise ValueError("game-evidence snapshot games must be a list")
+    if isinstance(raw_games, (str, bytes)) or not isinstance(raw_games, Sequence):
+        raise ValueError("game-evidence snapshot games must be a sequence")
     if not raw_games:
         raise ValueError("prior history requires a nonempty game population")
     games = []
@@ -86,10 +93,15 @@ def recompute_prior_history_sidecar(
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
                 raise ValueError(f"history {field} must be a nonnegative integer or null")
-        if not isinstance(projection["scheduled_start_utc"], str) or not projection[
-            "scheduled_start_utc"
-        ]:
-            raise ValueError("history scheduled_start_utc must be nonempty text")
+        scheduled_start = projection["scheduled_start_utc"]
+        if not isinstance(scheduled_start, str) or not scheduled_start.endswith("Z"):
+            raise ValueError("history scheduled_start_utc must be canonical UTC")
+        try:
+            datetime.fromisoformat(scheduled_start[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError(
+                "history scheduled_start_utc must be canonical UTC"
+            ) from exc
         if not isinstance(projection["terminal_status"], str) or not projection[
             "terminal_status"
         ]:
@@ -97,13 +109,15 @@ def recompute_prior_history_sidecar(
         projection["projection_sha256"] = canonical_sha256(projection)
         games.append(projection)
         source_hashes.append(source_hash)
+    if len(source_hashes) != len(set(source_hashes)):
+        raise ValueError("prior history contains duplicate source game hashes")
     games.sort(key=lambda row: (row["official_date"], row["game_pk"]))
     return {
         "games": games,
         "grain": "verified_game_projection",
         "schema_version": 1,
         "source_game_sha256s": sorted(source_hashes),
-        "source_snapshot_sha256": canonical_sha256(dict(schedule_sidecar)),
+        "source_snapshot_sha256": source_snapshot_sha256,
     }
 
 

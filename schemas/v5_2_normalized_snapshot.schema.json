@@ -183,6 +183,38 @@
       },
       "required": ["schema_version", "grain", "records", "query_sidecar_sha256s"]
     },
+    "historyGame": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "away_team_id": {"$ref": "#/$defs/positiveId"},
+        "completed_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "doubleheader_order": {"type": "integer", "minimum": 1},
+        "game_pk": {"$ref": "#/$defs/positiveId"},
+        "history_cutoff": {"$ref": "#/$defs/date"},
+        "home_team_id": {"$ref": "#/$defs/positiveId"},
+        "official_date": {"$ref": "#/$defs/date"},
+        "projection_sha256": {"$ref": "#/$defs/sha256"},
+        "scheduled_innings": {"$ref": "#/$defs/nullableNonnegative"},
+        "scheduled_start_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+        "source_game_sha256": {"$ref": "#/$defs/sha256"},
+        "terminal_status": {"type": "string", "minLength": 1},
+        "venue_id": {"$ref": "#/$defs/positiveId"}
+      },
+      "required": ["away_team_id", "completed_innings", "doubleheader_order", "game_pk", "history_cutoff", "home_team_id", "official_date", "projection_sha256", "scheduled_innings", "scheduled_start_utc", "source_game_sha256", "terminal_status", "venue_id"]
+    },
+    "historyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "games": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/historyGame"}, "uniqueItems": true},
+        "grain": {"const": "verified_game_projection"},
+        "schema_version": {"const": 1},
+        "source_game_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "source_snapshot_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["games", "grain", "schema_version", "source_game_sha256s", "source_snapshot_sha256"]
+    },
     "referenceTeam": {
       "type": "object",
       "additionalProperties": false,
@@ -246,6 +278,23 @@
     }
   },
   "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+        "source": {"const": "prior_schedule_history"},
+        "grain": {"const": "verified_game_projection"},
+        "status": {"const": "READY"},
+        "logical_query_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "source_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "split_receipt_sha256s": {"type": "array", "maxItems": 0, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "payload": {"$ref": "#/$defs/historyPayload"}
+      },
+      "required": ["schema_version", "run_id", "season", "source", "grain", "status", "logical_query_ids", "source_query_sidecar_sha256s", "split_receipt_sha256s", "payload"]
+    },
     {
       "type": "object",
       "additionalProperties": false,

@@ -51,17 +51,48 @@ def _schedule_snapshot() -> dict[str, object]:
     }
 
 
+SOURCE_SNAPSHOT_SHA256 = "f" * 64
+
+
 class V52HistorySourceTest(unittest.TestCase):
     def test_prior_history_binds_every_source_game_hash_and_d1_cutoff(self) -> None:
         from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
 
-        snapshot = recompute_prior_history_sidecar(_schedule_snapshot())
-        jsonschema.validate(snapshot, json.loads(SCHEMA.read_text()))
+        snapshot = recompute_prior_history_sidecar(
+            _schedule_snapshot(),
+            source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+        )
+        jsonschema.validate(
+            snapshot,
+            json.loads(SCHEMA.read_text()),
+            format_checker=jsonschema.FormatChecker(),
+        )
         self.assertEqual(snapshot["grain"], "verified_game_projection")
         self.assertEqual(snapshot["source_game_sha256s"], ["c" * 64])
         self.assertEqual(snapshot["games"][0]["history_cutoff"], "2024-04-01")
         self.assertRegex(snapshot["games"][0]["projection_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(snapshot, recompute_prior_history_sidecar(_schedule_snapshot()))
+        self.assertEqual(snapshot["source_snapshot_sha256"], SOURCE_SNAPSHOT_SHA256)
+        self.assertEqual(
+            snapshot,
+            recompute_prior_history_sidecar(
+                _schedule_snapshot(),
+                source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+            ),
+        )
+
+    def test_prior_history_requires_complete_upstream_snapshot_digest(self) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        with self.assertRaises(TypeError):
+            recompute_prior_history_sidecar(_schedule_snapshot())
+        for digest in ("F" * 64, "f" * 63, None):
+            with self.subTest(digest=digest), self.assertRaisesRegex(
+                ValueError, "source snapshot"
+            ):
+                recompute_prior_history_sidecar(
+                    _schedule_snapshot(),
+                    source_snapshot_sha256=digest,  # type: ignore[arg-type]
+                )
 
     def test_prior_history_rejects_missing_hash_non_d1_and_unverified_game(self) -> None:
         from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
@@ -70,7 +101,50 @@ class V52HistorySourceTest(unittest.TestCase):
             snapshot = copy.deepcopy(_schedule_snapshot())
             snapshot["games"][0].update(mutation)
             with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, message):
-                recompute_prior_history_sidecar(snapshot)
+                recompute_prior_history_sidecar(
+                    snapshot,
+                    source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                )
+
+    def test_prior_history_rejects_noncanonical_or_non_utc_start_time(self) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        for scheduled_start in (
+            "not-a-date-time",
+            "2024-04-02T13:05:00-04:00",
+        ):
+            snapshot = copy.deepcopy(_schedule_snapshot())
+            snapshot["games"][0]["scheduled_start_utc"] = scheduled_start
+            with self.subTest(scheduled_start=scheduled_start), self.assertRaisesRegex(
+                ValueError, "scheduled_start_utc"
+            ):
+                recompute_prior_history_sidecar(
+                    snapshot,
+                    source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                )
+
+    def test_history_schema_requires_canonical_utc_start_time(self) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        schema = json.loads(SCHEMA.read_text())
+        baseline = recompute_prior_history_sidecar(
+            _schedule_snapshot(),
+            source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+        )
+        for scheduled_start in (
+            "not-a-date-time",
+            "2024-04-02T13:05:00-04:00",
+        ):
+            attack = copy.deepcopy(baseline)
+            attack["games"][0]["scheduled_start_utc"] = scheduled_start
+            with self.subTest(scheduled_start=scheduled_start), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(
+                    attack,
+                    schema,
+                    format_checker=jsonschema.FormatChecker(),
+                )
 
     def test_season_snapshot_schema_is_closed_and_grain_specific(self) -> None:
         schema = json.loads(SCHEMA.read_text())
@@ -96,7 +170,10 @@ class V52HistorySourceTest(unittest.TestCase):
             "source_query_sidecar_sha256s": [],
         }
         with self.assertRaisesRegex(ValueError, "nonempty"):
-            recompute_prior_history_sidecar(empty_schedule)
+            recompute_prior_history_sidecar(
+                empty_schedule,
+                source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+            )
         schema = json.loads(SCHEMA.read_text())
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(empty_schedule, schema)

@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
@@ -42,9 +42,11 @@ from .v52_query_plan import (
 from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 from .v52_source_contracts import (
     canonical_json_bytes,
+    canonical_sha256,
     query_sidecar,
     recompute_query_sidecar,
 )
+from .v52_sources.history import recompute_prior_history_sidecar
 from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
     validate_statcast_child_coverage,
@@ -85,6 +87,32 @@ _NORMALIZED_ENVELOPE_KEYS = frozenset(
 )
 _GAME_PAYLOAD_KEYS = frozenset(
     {"games", "grain", "schema_version", "source_query_sidecar_sha256s"}
+)
+_HISTORY_PAYLOAD_KEYS = frozenset(
+    {
+        "games",
+        "grain",
+        "schema_version",
+        "source_game_sha256s",
+        "source_snapshot_sha256",
+    }
+)
+_HISTORY_GAME_KEYS = frozenset(
+    {
+        "away_team_id",
+        "completed_innings",
+        "doubleheader_order",
+        "game_pk",
+        "history_cutoff",
+        "home_team_id",
+        "official_date",
+        "projection_sha256",
+        "scheduled_innings",
+        "scheduled_start_utc",
+        "source_game_sha256",
+        "terminal_status",
+        "venue_id",
+    }
 )
 _STATCAST_PAYLOAD_KEYS = frozenset(
     {
@@ -187,12 +215,14 @@ class NormalizedSnapshot:
         "baseball_savant_statcast",
         "mlb_schedule_game_feed",
         "mlb_stats_pitching",
+        "prior_schedule_history",
         "venue_team_timezone_table",
     ]
     grain: Literal[
         "pitch",
         "season_d1_league_pitching_reference",
         "season_game_evidence_snapshot",
+        "verified_game_projection",
         "effective_dated_venue_team_reference",
     ]
     status: Literal["READY"]
@@ -316,6 +346,116 @@ def _validate_normalized_snapshot_mapping(
             if not isinstance(game, Mapping) or game.get("season") != season:
                 raise ValueError("normalized snapshot game season differs")
         validate_game_evidence_snapshot(payload)
+        return envelope
+
+    if source == "prior_schedule_history" and grain == "verified_game_projection":
+        split_hashes = _sorted_unique_sha256s(
+            envelope.get("split_receipt_sha256s"),
+            "split receipt hashes",
+            allow_empty=True,
+        )
+        if split_hashes:
+            raise ValueError("history split receipt hashes must be empty")
+        payload_value = envelope.get("payload")
+        if (
+            not isinstance(payload_value, Mapping)
+            or set(payload_value) != _HISTORY_PAYLOAD_KEYS
+        ):
+            raise ValueError("normalized snapshot history payload keys differ")
+        payload = dict(payload_value)
+        games = payload.get("games")
+        source_snapshot_sha256 = payload.get("source_snapshot_sha256")
+        source_hashes = payload.get("source_game_sha256s")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("grain") != "verified_game_projection"
+            or not isinstance(games, list)
+            or not games
+            or not isinstance(source_snapshot_sha256, str)
+            or _SHA256.fullmatch(source_snapshot_sha256) is None
+            or not isinstance(source_hashes, list)
+            or any(
+                not isinstance(item, str) or _SHA256.fullmatch(item) is None
+                for item in source_hashes
+            )
+            or source_hashes != sorted(set(source_hashes))
+        ):
+            raise ValueError("normalized snapshot history source hashes differ")
+
+        observed: list[tuple[date, int]] = []
+        seen_game_pks: set[int] = set()
+        projected_hashes: list[str] = []
+        for row_value in games:
+            if not isinstance(row_value, Mapping) or set(row_value) != _HISTORY_GAME_KEYS:
+                raise ValueError("normalized snapshot history projection keys differ")
+            row = dict(row_value)
+            official = _canonical_day(
+                row.get("official_date"), "history official date"
+            )
+            cutoff = _canonical_day(row.get("history_cutoff"), "history cutoff")
+            game_pk = row.get("game_pk")
+            if (
+                type(game_pk) is not int
+                or game_pk <= 0
+                or game_pk in seen_game_pks
+                or not SEASON_BOUNDARIES[season][0]
+                <= official
+                <= SEASON_BOUNDARIES[season][1]
+            ):
+                raise ValueError("normalized snapshot history gamePk or season differs")
+            if cutoff != official - timedelta(days=1):
+                raise ValueError("normalized snapshot history D-1 cutoff differs")
+            if any(
+                type(row.get(field)) is not int or row[field] <= 0
+                for field in (
+                    "away_team_id",
+                    "doubleheader_order",
+                    "home_team_id",
+                    "venue_id",
+                )
+            ):
+                raise ValueError("normalized snapshot history positive identity differs")
+            if any(
+                value is not None
+                and (type(value) is not int or value < 0)
+                for value in (
+                    row.get("completed_innings"),
+                    row.get("scheduled_innings"),
+                )
+            ):
+                raise ValueError("normalized snapshot history innings differ")
+            scheduled_start = row.get("scheduled_start_utc")
+            if not isinstance(scheduled_start, str) or not scheduled_start.endswith("Z"):
+                raise ValueError("normalized snapshot history scheduled start differs")
+            try:
+                datetime.fromisoformat(scheduled_start[:-1] + "+00:00")
+            except ValueError as exc:
+                raise ValueError(
+                    "normalized snapshot history scheduled start differs"
+                ) from exc
+            if (
+                not isinstance(row.get("terminal_status"), str)
+                or not row["terminal_status"]
+            ):
+                raise ValueError("normalized snapshot history terminal status differs")
+            projection_sha256 = row.get("projection_sha256")
+            projected = dict(row)
+            projected.pop("projection_sha256")
+            if projection_sha256 != canonical_sha256(projected):
+                raise ValueError("normalized snapshot history projection hash differs")
+            source_game_sha256 = row.get("source_game_sha256")
+            if (
+                not isinstance(source_game_sha256, str)
+                or _SHA256.fullmatch(source_game_sha256) is None
+            ):
+                raise ValueError("normalized snapshot history source hashes differ")
+            observed.append((official, game_pk))
+            seen_game_pks.add(game_pk)
+            projected_hashes.append(source_game_sha256)
+        if observed != sorted(set(observed)):
+            raise ValueError("normalized snapshot history game order or gamePk differs")
+        if source_hashes != sorted(projected_hashes):
+            raise ValueError("normalized snapshot history source hashes differ")
         return envelope
 
     if source == "mlb_stats_pitching" and grain == (
@@ -1328,6 +1468,180 @@ def _build_game_normalized_snapshots(
     for season, payload in zip(_GAME_SEASONS, payloads, strict=True):
         snapshots.append(
             _normalized_snapshot(run_id, season, snapshot_inputs[season], payload)
+        )
+    return tuple(snapshots)
+
+
+def _validate_history_snapshot_lineage(
+    history_snapshot: NormalizedSnapshot,
+    game_snapshot: NormalizedSnapshot,
+) -> dict[str, object]:
+    history_mapping = (
+        history_snapshot.as_mapping()
+        if isinstance(history_snapshot, NormalizedSnapshot)
+        else None
+    )
+    game_mapping = (
+        game_snapshot.as_mapping()
+        if isinstance(game_snapshot, NormalizedSnapshot)
+        else None
+    )
+    if history_mapping is None or game_mapping is None:
+        raise ValueError("history normalized snapshot lineage differs")
+    try:
+        history_validated = _validate_normalized_snapshot_mapping(history_mapping)
+        game_validated = _validate_normalized_snapshot_mapping(game_mapping)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("history normalized snapshot lineage differs") from exc
+    if (
+        game_snapshot.source != "mlb_schedule_game_feed"
+        or game_snapshot.grain != "season_game_evidence_snapshot"
+        or game_validated != game_mapping
+        or game_snapshot.canonical_bytes
+        != canonical_json_bytes(game_mapping) + b"\n"
+        or game_snapshot.sha256
+        != hashlib.sha256(game_snapshot.canonical_bytes).hexdigest()
+        or history_snapshot.source != "prior_schedule_history"
+        or history_snapshot.grain != "verified_game_projection"
+        or history_validated != history_mapping
+        or history_snapshot.canonical_bytes
+        != canonical_json_bytes(history_mapping) + b"\n"
+        or history_snapshot.sha256
+        != hashlib.sha256(history_snapshot.canonical_bytes).hexdigest()
+        or history_snapshot.run_id != game_snapshot.run_id
+        or history_snapshot.season != game_snapshot.season
+    ):
+        raise ValueError("history normalized snapshot lineage differs")
+    payload = recompute_prior_history_sidecar(
+        game_snapshot.payload,
+        source_snapshot_sha256=game_snapshot.sha256,
+    )
+    expected = _history_normalized_snapshot(
+        game_snapshot.run_id, game_snapshot, payload
+    )
+    if (
+        history_snapshot.logical_query_ids != game_snapshot.logical_query_ids
+        or history_snapshot.source_query_sidecar_sha256s
+        != game_snapshot.source_query_sidecar_sha256s
+        or history_snapshot.split_receipt_sha256s
+        or history_snapshot.canonical_bytes != expected.canonical_bytes
+        or history_snapshot.sha256 != expected.sha256
+    ):
+        raise ValueError("history normalized snapshot lineage differs")
+    return history_mapping
+
+
+def _history_normalized_snapshot(
+    run_id: str,
+    game_snapshot: NormalizedSnapshot,
+    payload: Mapping[str, object],
+) -> NormalizedSnapshot:
+    if payload.get("source_snapshot_sha256") != game_snapshot.sha256:
+        raise ValueError("history upstream source snapshot SHA-256 differs")
+    envelope: dict[str, object] = {
+        "grain": "verified_game_projection",
+        "logical_query_ids": list(game_snapshot.logical_query_ids),
+        "payload": _plain_json(payload),
+        "run_id": run_id,
+        "schema_version": 1,
+        "season": game_snapshot.season,
+        "source": "prior_schedule_history",
+        "source_query_sidecar_sha256s": list(
+            game_snapshot.source_query_sidecar_sha256s
+        ),
+        "split_receipt_sha256s": [],
+        "status": "READY",
+    }
+    envelope = _validate_normalized_snapshot_mapping(envelope)
+    contents = canonical_json_bytes(envelope) + b"\n"
+    digest = hashlib.sha256(contents).hexdigest()
+    components = set(game_snapshot.logical_query_ids) | set(
+        game_snapshot.source_query_sidecar_sha256s
+    )
+    if digest in components or digest == game_snapshot.sha256:
+        raise ValueError("normalized snapshot hash collides with upstream lineage")
+    frozen_payload = _freeze_json(payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise AssertionError("normalized snapshot payload must freeze to a mapping")
+    return NormalizedSnapshot(
+        schema_version=1,
+        run_id=run_id,
+        season=game_snapshot.season,
+        source="prior_schedule_history",
+        grain="verified_game_projection",
+        status="READY",
+        logical_query_ids=game_snapshot.logical_query_ids,
+        source_query_sidecar_sha256s=(
+            game_snapshot.source_query_sidecar_sha256s
+        ),
+        split_receipt_sha256s=(),
+        payload=frozen_payload,
+        canonical_bytes=contents,
+        sha256=digest,
+    )
+
+
+def _build_history_normalized_snapshots(
+    run_id: str,
+    game_snapshots: Sequence[NormalizedSnapshot],
+) -> tuple[NormalizedSnapshot, ...]:
+    """Project seven authenticated game snapshots into prior history without I/O."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("history normalized snapshot run_id differs")
+    if isinstance(game_snapshots, (str, bytes)) or not isinstance(
+        game_snapshots, Sequence
+    ):
+        raise TypeError("history game snapshots must be a sequence")
+
+    game_by_season: dict[int, NormalizedSnapshot] = {}
+    seen_game_pks: set[int] = set()
+    for snapshot in game_snapshots:
+        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        if (
+            not isinstance(snapshot, NormalizedSnapshot)
+            or snapshot.run_id != run_id
+            or snapshot.source != "mlb_schedule_game_feed"
+            or snapshot.grain != "season_game_evidence_snapshot"
+            or snapshot.status != "READY"
+            or snapshot.season in game_by_season
+            or mapping is None
+            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
+            or snapshot.sha256
+            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+        ):
+            raise ValueError("history game snapshot authority differs")
+        opening, closing = SEASON_BOUNDARIES[snapshot.season]
+        games = mapping["payload"]["games"]  # type: ignore[index]
+        for game in games:
+            game_pk = game.get("game_pk")
+            official = _canonical_day(
+                game.get("official_date"), "history game official date"
+            )
+            if (
+                type(game_pk) is not int
+                or game_pk in seen_game_pks
+                or game.get("season") != snapshot.season
+                or game.get("season_start_date") != opening.isoformat()
+                or not opening <= official <= closing
+            ):
+                raise ValueError(
+                    "history gamePk or frozen season boundary differs"
+                )
+            seen_game_pks.add(game_pk)
+        game_by_season[snapshot.season] = snapshot
+    if set(game_by_season) != set(_GAME_SEASONS):
+        raise ValueError("history requires exactly seven 2018-2024 game snapshots")
+
+    snapshots: list[NormalizedSnapshot] = []
+    for season in _GAME_SEASONS:
+        game_snapshot = game_by_season[season]
+        payload = recompute_prior_history_sidecar(
+            game_snapshot.payload,
+            source_snapshot_sha256=game_snapshot.sha256,
+        )
+        snapshots.append(
+            _history_normalized_snapshot(run_id, game_snapshot, payload)
         )
     return tuple(snapshots)
 
