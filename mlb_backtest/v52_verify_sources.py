@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 from .execution_registry import (
     AcquisitionCheckpoint,
@@ -49,6 +49,21 @@ class _TerminalQueryGraph:
     completed_queries: tuple[LogicalQuery, ...]
     root_queries: tuple[LogicalQuery, ...]
     split_leaf_queries: tuple[LogicalQuery, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedQueryRecord:
+    query: LogicalQuery
+    query_id: str
+    query_sidecar_bytes: bytes
+    query_sidecar_sha256: str
+    raw_sha256: str | None
+    storage_mode: Literal[
+        "DERIVED_DISPOSITION",
+        "FETCHED_RAW",
+        "PROTECTED_LEGACY_REFERENCE",
+    ]
+    retained_raw_bytes: bytes | None
 
 
 def _enumerate_completed_query_graph(
@@ -280,16 +295,50 @@ def _recompute_completed_queries(
     )
 
 
-def _read_and_recompute_query(
+def _recompute_verified_query_records(
+    store: V52EvidenceStore,
+    queries: Sequence[LogicalQuery],
+) -> tuple[VerifiedQueryRecord, ...]:
+    return tuple(
+        _read_verified_query_record(store, query)
+        for query in sorted(queries, key=logical_query_id)
+    )
+
+
+def _retain_raw_for_aggregation(query: LogicalQuery) -> bool:
+    if (
+        query.source != "venue_team_timezone_table"
+        or query.grain != "effective_dated_venue_team_reference"
+    ):
+        return False
+    requested = dict(query.requested_range)
+    if query.endpoint == "https://statsapi.mlb.com/api/v1/teams":
+        season = requested.get("season")
+        return (
+            not isinstance(season, bool)
+            and isinstance(season, int)
+            and requested == {"season": season, "entity": "teams"}
+        )
+    venue_match = re.fullmatch(
+        r"https://statsapi\.mlb\.com/api/v1/venues/(?P<venue_id>[1-9][0-9]*)",
+        query.endpoint,
+    )
+    if venue_match is None:
+        return False
+    venue_id = int(venue_match.group("venue_id"))
+    return requested == {"venue_id": venue_id}
+
+
+def _read_verified_query_record(
     store: V52EvidenceStore,
     query: LogicalQuery,
-) -> dict[str, object]:
+) -> VerifiedQueryRecord:
     if not isinstance(store, V52EvidenceStore) or not store._read_only:
         raise ValueError("source verification requires a read-only evidence store")
     if not isinstance(query, LogicalQuery):
         raise TypeError("query must be a LogicalQuery")
 
-    result: dict[str, object] | None = None
+    result: VerifiedQueryRecord | None = None
 
     def recompute_verified_read(verified: VerifiedEvidenceRead) -> None:
         nonlocal result
@@ -299,6 +348,7 @@ def _read_and_recompute_query(
             raise ValueError("verified query identity binding differs")
         if verified.success_receipt.get("storage_mode") != published.storage_mode:
             raise ValueError("verified storage mode binding differs")
+        retained_raw: bytes | None = None
         if published.storage_mode == "DERIVED_DISPOSITION":
             if (
                 verified.raw_bytes is not None
@@ -326,39 +376,59 @@ def _read_and_recompute_query(
                 raise ValueError(
                     "derived query sidecar semantic recomputation differs"
                 )
-            result = {
-                "query_id": query_id,
-                "query_sidecar": expected_sidecar,
-                "raw_sha256": None,
-                "storage_mode": published.storage_mode,
-            }
-            return
-        if published.storage_mode not in {
-            "FETCHED_RAW",
-            "PROTECTED_LEGACY_REFERENCE",
-        }:
-            raise ValueError("verified storage mode differs")
+            raw_sha256 = None
+        else:
+            if published.storage_mode not in {
+                "FETCHED_RAW",
+                "PROTECTED_LEGACY_REFERENCE",
+            }:
+                raise ValueError("verified storage mode differs")
 
-        raw = verified.raw_bytes
-        if not isinstance(raw, bytes):
-            raise ValueError("verified raw bytes are required")
-        raw_sha256 = hashlib.sha256(raw).hexdigest()
-        if published.raw_sha256 != raw_sha256:
-            raise ValueError("verified raw hash binding differs")
+            raw = verified.raw_bytes
+            if not isinstance(raw, bytes):
+                raise ValueError("verified raw bytes are required")
+            raw_sha256 = hashlib.sha256(raw).hexdigest()
+            if published.raw_sha256 != raw_sha256:
+                raise ValueError("verified raw hash binding differs")
 
-        semantics = recompute_query_sidecar(query, raw)
-        expected_sidecar = query_sidecar(raw, query, semantics)
-        if dict(verified.query_sidecar) != expected_sidecar:
-            raise ValueError("query sidecar semantic recomputation differs")
+            semantics = recompute_query_sidecar(query, raw)
+            expected_sidecar = query_sidecar(raw, query, semantics)
+            if dict(verified.query_sidecar) != expected_sidecar:
+                raise ValueError("query sidecar semantic recomputation differs")
+            if _retain_raw_for_aggregation(query):
+                retained_raw = raw
 
-        result = {
-            "query_id": query_id,
-            "query_sidecar": expected_sidecar,
-            "raw_sha256": raw_sha256,
-            "storage_mode": published.storage_mode,
-        }
+        sidecar_bytes = canonical_json_bytes(expected_sidecar) + b"\n"
+        sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
+        if published.query_sidecar_sha256 != sidecar_sha256:
+            raise ValueError("verified query sidecar hash binding differs")
+        result = VerifiedQueryRecord(
+            query=query,
+            query_id=query_id,
+            query_sidecar_bytes=sidecar_bytes,
+            query_sidecar_sha256=sidecar_sha256,
+            raw_sha256=raw_sha256,
+            storage_mode=published.storage_mode,
+            retained_raw_bytes=retained_raw,
+        )
 
     store.inspect_verified_success(query, recompute_verified_read)
     if result is None:
         raise AssertionError("verified success inspection did not produce a result")
     return result
+
+
+def _read_and_recompute_query(
+    store: V52EvidenceStore,
+    query: LogicalQuery,
+) -> dict[str, object]:
+    record = _read_verified_query_record(store, query)
+    sidecar = json.loads(record.query_sidecar_bytes)
+    if not isinstance(sidecar, dict):
+        raise AssertionError("verified query sidecar is not an object")
+    return {
+        "query_id": record.query_id,
+        "query_sidecar": sidecar,
+        "raw_sha256": record.raw_sha256,
+        "storage_mode": record.storage_mode,
+    }

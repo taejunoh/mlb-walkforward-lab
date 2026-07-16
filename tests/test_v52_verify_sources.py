@@ -323,6 +323,35 @@ def _owned_schedule_evidence(
     return store, query, raw
 
 
+def _owned_fetched_evidence(
+    root: Path,
+    query: LogicalQuery,
+    raw: bytes,
+) -> V52EvidenceStore:
+    semantics = recompute_query_sidecar(query, raw)
+    store = V52EvidenceStore(root)
+    capture = AttemptCapture(
+        started_at_utc="2026-07-16T12:00:00.000000Z",
+        ended_at_utc="2026-07-16T12:00:01.000000Z",
+        final_url=query.endpoint,
+        http_status=200,
+        response_headers=(
+            ("content-type", query.expected_media_type),
+            ("content-length", str(len(raw))),
+        ),
+        body=raw,
+        error_classification=None,
+    )
+    with store.acquire_query(query) as lease:
+        store.publish_fetched(
+            query,
+            store.next_attempt_number(lease),
+            capture,
+            semantics,
+        )
+    return store
+
+
 def _forge_sidecar_semantics(root: Path, query: LogicalQuery) -> None:
     verified = V52EvidenceStore.open_read_only(root).read_verified_success(query)
     success_path = verified.published_evidence.success_receipt_path
@@ -737,6 +766,142 @@ class V52VerifySourcesTest(unittest.TestCase):
         self.assertEqual(
             result, tuple({"query_id": logical_query_id(query)} for query in ordered)
         )
+
+    def test_verified_query_records_are_query_id_sorted(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        queries, store = tuple(reversed(_graph_fixture().completed)), object()
+        recompute = getattr(verifier, "_recompute_verified_query_records", None)
+        self.assertIsNotNone(recompute, "missing verified-record recompute helper")
+        with patch.object(
+            verifier,
+            "_read_verified_query_record",
+            side_effect=lambda _, q: SimpleNamespace(
+                query_id=logical_query_id(q)
+            ),
+        ) as reader:
+            result = recompute(store, queries)
+        ordered = tuple(sorted(queries, key=logical_query_id))
+        self.assertEqual(
+            reader.call_args_list, [call(store, query) for query in ordered]
+        )
+        self.assertEqual(
+            tuple(record.query_id for record in result),
+            tuple(logical_query_id(query) for query in ordered),
+        )
+
+    def test_verified_query_record_binds_canonical_sidecar_and_drops_raw(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "raw"
+            _, query, raw = _owned_schedule_evidence(root)
+            read_only = V52EvidenceStore.open_read_only(root)
+            verified = read_only.read_verified_success(query)
+            expected_sidecar_bytes = (
+                canonical_json_bytes(dict(verified.query_sidecar)) + b"\n"
+            )
+            before = _snapshot_tree(root)
+
+            record = verifier._read_verified_query_record(read_only, query)
+
+            self.assertTrue(dataclasses.is_dataclass(record))
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                record.raw_sha256 = "0" * 64
+            self.assertEqual(record.query, query)
+            self.assertEqual(record.query_id, logical_query_id(query))
+            self.assertEqual(record.query_sidecar_bytes, expected_sidecar_bytes)
+            self.assertEqual(
+                record.query_sidecar_sha256,
+                hashlib.sha256(expected_sidecar_bytes).hexdigest(),
+            )
+            self.assertEqual(record.raw_sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(record.storage_mode, "FETCHED_RAW")
+            self.assertIsNone(record.retained_raw_bytes)
+            self.assertEqual(_snapshot_tree(root), before)
+
+    def test_verified_query_record_retains_only_team_and_venue_raw(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        common = {
+            "source": "venue_team_timezone_table",
+            "grain": "effective_dated_venue_team_reference",
+            "expected_media_type": "application/json",
+            "parser_version": "v5.2.1",
+            "parent_query_id": None,
+            "run_spec_sha256": "a" * 64,
+            "acquisition_contract_sha256": "b" * 64,
+        }
+        team_query = LogicalQuery(
+            **common,
+            endpoint="https://statsapi.mlb.com/api/v1/teams",
+            parameters={
+                "sportId": 1,
+                "season": 2024,
+                "hydrate": "venue(location)",
+            },
+            requested_range={"season": 2024, "entity": "teams"},
+        )
+        venue_query = LogicalQuery(
+            **common,
+            endpoint="https://statsapi.mlb.com/api/v1/venues/31",
+            parameters={"hydrate": "location"},
+            requested_range={"venue_id": 31},
+        )
+        raw_by_query = (
+            (team_query, (SOURCE_FIXTURES / "team_mini.json").read_bytes()),
+            (
+                venue_query,
+                canonical_json_bytes(_VENUE_GUARD_PAYLOAD),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            for index, (query, raw) in enumerate(raw_by_query):
+                with self.subTest(endpoint=query.endpoint):
+                    root = base / str(index)
+                    _owned_fetched_evidence(root, query, raw)
+                    record = verifier._read_verified_query_record(
+                        V52EvidenceStore.open_read_only(root), query
+                    )
+                    self.assertEqual(record.retained_raw_bytes, raw)
+
+        schedule = _query()
+        forbidden = (
+            schedule,
+            dataclasses.replace(
+                schedule,
+                source="baseball_savant_statcast",
+                grain="pitch",
+                endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            ),
+            dataclasses.replace(
+                schedule,
+                grain="season_game_evidence",
+                endpoint="https://statsapi.mlb.com/api/v1/game/9001/boxscore",
+            ),
+            dataclasses.replace(
+                schedule,
+                source="mlb_stats_pitching",
+                grain="season_d1_league_pitching_reference",
+                endpoint="https://statsapi.mlb.com/api/v1/stats",
+            ),
+            dataclasses.replace(
+                schedule,
+                source="mlb_stats_pitcher_bf",
+                grain="player_career_batters_faced_reference",
+                endpoint="https://statsapi.mlb.com/api/v1/people/101/stats",
+            ),
+            dataclasses.replace(
+                team_query,
+                endpoint="https://statsapi.mlb.com/api/v1/not-a-reference",
+            ),
+        )
+        for query in forbidden:
+            with self.subTest(source=query.source, grain=query.grain):
+                self.assertFalse(verifier._retain_raw_for_aggregation(query))
 
     def test_derived_disposition_is_independently_recomputed_without_mutation(
         self,
