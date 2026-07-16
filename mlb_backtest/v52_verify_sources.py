@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -15,6 +17,7 @@ from .v52_evidence import (
     LogicalQuery,
     V52EvidenceStore,
     VerifiedEvidenceRead,
+    canonical_query_bytes,
     logical_query_id,
 )
 from .v52_query_plan import (
@@ -23,12 +26,23 @@ from .v52_query_plan import (
     load_query_batch,
     load_split_receipt,
 )
-from .v52_source_contracts import query_sidecar, recompute_query_sidecar
+from .v52_source_contracts import (
+    canonical_json_bytes,
+    query_sidecar,
+    recompute_query_sidecar,
+)
+
+
+_STATCAST_ROOT_BATCH_PATH = re.compile(
+    r"^audit/v5_2_qd/historical/acquisition/query_batches/"
+    r"(?P<batch_id>[0-9a-f]{64})\.json$"
+)
 
 
 @dataclass(frozen=True)
 class _TerminalQueryGraph:
     checkpoint: AcquisitionCheckpoint
+    statcast_root_batch: QueryBatch
     query_batches: tuple[QueryBatch, ...]
     split_receipts: tuple[SplitReceipt, ...]
     split_parent_queries: tuple[LogicalQuery, ...]
@@ -41,6 +55,7 @@ def _enumerate_completed_query_graph(
     checkpoint: AcquisitionCheckpoint,
     batches: Sequence[QueryBatch],
     receipts: Sequence[SplitReceipt],
+    statcast_root_batch: QueryBatch,
 ) -> _TerminalQueryGraph:
     if checkpoint.stage != "REMAINING":
         raise ValueError("source verification requires a REMAINING checkpoint")
@@ -159,6 +174,7 @@ def _enumerate_completed_query_graph(
         raise ValueError("terminal completed leaf classification differs")
     return _TerminalQueryGraph(
         checkpoint=checkpoint,
+        statcast_root_batch=statcast_root_batch,
         query_batches=tuple(batches),
         split_receipts=ordered_receipts,
         split_parent_queries=tuple(query_by_id[query_id] for query_id in split_ids),
@@ -168,11 +184,61 @@ def _enumerate_completed_query_graph(
     )
 
 
+def _query_batch_artifact_sha256(batch: QueryBatch) -> str:
+    record = {
+        "batch_id": batch.batch_id,
+        "derived_from_sha256": batch.derived_from_sha256,
+        "queries": [
+            json.loads(canonical_query_bytes(query)) for query in batch.queries
+        ],
+        "schema_version": 1,
+        "stage": batch.stage,
+    }
+    return hashlib.sha256(canonical_json_bytes(record) + b"\n").hexdigest()
+
+
+def _load_statcast_root_batch(
+    root: Path,
+    checkpoint: AcquisitionCheckpoint,
+) -> QueryBatch:
+    paths = checkpoint.stage_evidence_receipt_paths
+    hashes = checkpoint.stage_evidence_receipt_sha256s
+    if len(paths) != len(hashes):
+        raise ValueError("terminal stage evidence binding differs")
+    candidates = [
+        (match.group("batch_id"), digest)
+        for path, digest in zip(paths, hashes, strict=True)
+        if (match := _STATCAST_ROOT_BATCH_PATH.fullmatch(path)) is not None
+    ]
+    if len(candidates) != 1:
+        raise ValueError("terminal Statcast root batch binding differs")
+    batch_id, expected_sha256 = candidates[0]
+    if batch_id in checkpoint.query_batch_ids:
+        raise ValueError("terminal Statcast root batch overlaps checkpoint batches")
+    batch = load_query_batch(root, batch_id, read_only_progress=True)
+    if (
+        batch.batch_id != batch_id
+        or batch.stage != "REMAINING"
+        or batch.derived_from_sha256 is not None
+        or len(batch.queries) != 46
+        or any(
+            query.source != "baseball_savant_statcast"
+            or query.grain != "pitch"
+            or query.parent_query_id is not None
+            for query in batch.queries
+        )
+        or _query_batch_artifact_sha256(batch) != expected_sha256
+    ):
+        raise ValueError("terminal Statcast root batch authority differs")
+    return batch
+
+
 def _load_terminal_query_graph(
     root: Path,
     run_spec: RunSpec,
 ) -> _TerminalQueryGraph:
     checkpoint = load_source_verification_checkpoint(root, run_spec)
+    statcast_root_batch = _load_statcast_root_batch(root, checkpoint)
     batches = tuple(
         load_query_batch(root, batch_id, read_only_progress=True)
         for batch_id in checkpoint.query_batch_ids
@@ -200,6 +266,7 @@ def _load_terminal_query_graph(
         checkpoint,
         batches,
         tuple(receipt for receipt in receipts if receipt is not None),
+        statcast_root_batch,
     )
 
 

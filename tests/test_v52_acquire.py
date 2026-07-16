@@ -4472,7 +4472,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     quarantined_query_ids=(),
                     split_query_ids=(),
                     split_receipt_sha256s=(),
-                    stage_evidence_receipt_paths=evidence,
+                    stage_evidence_receipt_paths=tuple(
+                        path.relative_to(root).as_posix() for path in evidence
+                    ),
                     stage_evidence_receipt_sha256s=tuple(
                         hashlib.sha256(path.read_bytes()).hexdigest()
                         for path in evidence
@@ -4791,6 +4793,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 _load_required_timezone_gate(root)
 
     def test_resumed_timezone_checkpoint_requires_exact_boundary_before_inventory(self) -> None:
+        from mlb_backtest.execution_registry import AcquisitionCheckpoint
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
             _validate_resumed_timezone_checkpoint,
@@ -4812,21 +4815,32 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             for index, path in enumerate(evidence):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(f"artifact-{index}\n".encode())
+            relative_evidence = tuple(
+                path.relative_to(root).as_posix() for path in evidence
+            )
             batches = ("a" * 64, "b" * 64)
             completed = ("c" * 64, "d" * 64)
-            checkpoint = SimpleNamespace(
+            checkpoint = AcquisitionCheckpoint(
+                sequence=3,
+                receipt_sha256="1" * 64,
+                prior_checkpoint_sha256="2" * 64,
                 stage="TIMEZONE_REVIEW",
+                recorded_at_utc="2026-07-16T12:00:00.000000Z",
+                git_head="3" * 40,
+                execution_receipt_sha256="4" * 64,
                 query_batch_ids=batches,
-                completed_query_ids=completed,
-                pending_query_ids=(),
-                quarantined_query_ids=(),
-                split_query_ids=(),
-                split_receipt_sha256s=(),
-                stage_evidence_receipt_paths=evidence,
+                query_batch_sha256s=("5" * 64, "6" * 64),
+                query_evidence_receipt_sha256s=(),
                 stage_evidence_receipt_sha256s=tuple(
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in evidence
                 ),
+                split_receipt_sha256s=(),
+                completed_query_ids=completed,
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+                stage_evidence_receipt_paths=relative_evidence,
             )
             _validate_resumed_timezone_checkpoint(
                 checkpoint,
@@ -4848,14 +4862,16 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 "split": {"split_query_ids": ("e" * 64,)},
                 "split receipt": {"split_receipt_sha256s": ("e" * 64,)},
                 "evidence path": {
-                    "stage_evidence_receipt_paths": tuple(reversed(evidence))
+                    "stage_evidence_receipt_paths": tuple(
+                        reversed(relative_evidence)
+                    )
                 },
                 "evidence hash": {
                     "stage_evidence_receipt_sha256s": ("f" * 64,) * 6
                 },
             }
             for label, mutation in cases.items():
-                forged = SimpleNamespace(**{**vars(checkpoint), **mutation})
+                forged = dataclasses.replace(checkpoint, **mutation)
                 with self.subTest(label=label), self.assertRaisesRegex(
                     TrustIntegrityError, "timezone checkpoint"
                 ):

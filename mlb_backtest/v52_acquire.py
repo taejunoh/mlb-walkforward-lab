@@ -2889,6 +2889,9 @@ def _validate_resumed_timezone_checkpoint(
     stage_evidence: tuple[Path, ...],
 ) -> None:
     supplied_paths = getattr(checkpoint, "stage_evidence_receipt_paths", None)
+    expected_relative_paths = tuple(
+        relative.as_posix() for relative in _TIMEZONE_STAGE_EVIDENCE_RELATIVES
+    )
     expected_evidence = tuple(
         root / relative for relative in _TIMEZONE_STAGE_EVIDENCE_RELATIVES
     )
@@ -2926,8 +2929,8 @@ def _validate_resumed_timezone_checkpoint(
         or getattr(checkpoint, "split_receipt_sha256s", None) != ()
         or getattr(checkpoint, "stage_evidence_receipt_sha256s", None)
         != evidence_hashes
-        or supplied_paths is not None
-        and supplied_paths != stage_evidence
+        or supplied_paths != expected_relative_paths
+        or tuple(root / Path(path) for path in supplied_paths) != stage_evidence
     ):
         raise TrustIntegrityError("timezone checkpoint boundary differs")
 

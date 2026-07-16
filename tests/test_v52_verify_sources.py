@@ -20,6 +20,7 @@ from mlb_backtest.v52_evidence import (
     AttemptCapture,
     LogicalQuery,
     V52EvidenceStore,
+    canonical_query_bytes,
     logical_query_id,
 )
 from mlb_backtest.v52_query_plan import QueryBatch, SplitReceipt
@@ -339,6 +340,19 @@ def _forge_sidecar_semantics(root: Path, query: LogicalQuery) -> None:
     success_path.write_bytes(canonical_json_bytes(success) + b"\n")
 
 
+def _batch_artifact_sha256(batch: QueryBatch) -> str:
+    record = {
+        "batch_id": batch.batch_id,
+        "derived_from_sha256": batch.derived_from_sha256,
+        "queries": [
+            json.loads(canonical_query_bytes(item)) for item in batch.queries
+        ],
+        "schema_version": 1,
+        "stage": batch.stage,
+    }
+    return hashlib.sha256(canonical_json_bytes(record) + b"\n").hexdigest()
+
+
 def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
     def query(label: str, parent: str | None = None) -> LogicalQuery:
         base = _query()
@@ -380,6 +394,27 @@ def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
         batches.append(QueryBatch("3" * 64, "REMAINING", "2" * 64, grand))
         receipts.append(receipt(1, batches[1], left, batches[2], 2))
         completed = [root, right, *grand]
+    statcast_root_queries = tuple(
+        dataclasses.replace(
+            query(f"sealed-statcast-root-{index:02d}"),
+            source="baseball_savant_statcast",
+            grain="pitch",
+            endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+            expected_media_type="text/csv",
+        )
+        for index in range(46)
+    )
+    statcast_root = QueryBatch(
+        "4" * 64,
+        "REMAINING",
+        None,
+        statcast_root_queries,
+    )
+    statcast_root_sha256 = _batch_artifact_sha256(statcast_root)
+    statcast_root_path = (
+        "audit/v5_2_qd/historical/acquisition/query_batches/"
+        f"{statcast_root.batch_id}.json"
+    )
     checkpoint = AcquisitionCheckpoint(
         4,
         "a" * 64,
@@ -391,7 +426,7 @@ def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
         tuple(batch.batch_id for batch in batches),
         tuple("e" * 64 for _ in batches),
         (),
-        (),
+        (statcast_root_sha256,),
         tuple(
             item.receipt_sha256
             for item in sorted(receipts, key=lambda x: x.parent_query_id)
@@ -400,6 +435,7 @@ def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
         (),
         (),
         tuple(sorted(item.parent_query_id for item in receipts)),
+        (statcast_root_path,),
     )
     return SimpleNamespace(
         checkpoint=checkpoint,
@@ -410,6 +446,9 @@ def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
         left=left,
         right=right,
         completed=tuple(completed),
+        statcast_root=statcast_root,
+        statcast_root_sha256=statcast_root_sha256,
+        statcast_root_path=statcast_root_path,
     )
 
 
@@ -420,10 +459,16 @@ class V52VerifySourcesTest(unittest.TestCase):
         fx = _graph_fixture()
         enumerate_graph = getattr(verifier, "_enumerate_completed_query_graph", None)
         self.assertIsNotNone(enumerate_graph, "missing graph enumerator")
-        graph = enumerate_graph(fx.checkpoint, fx.batches, fx.receipts)
+        graph = enumerate_graph(
+            fx.checkpoint,
+            fx.batches,
+            fx.receipts,
+            fx.statcast_root,
+        )
         self.assertIsInstance(graph, verifier._TerminalQueryGraph)
         self.assertIs(graph.checkpoint, fx.checkpoint)
         self.assertEqual(graph.query_batches, fx.batches)
+        self.assertIs(graph.statcast_root_batch, fx.statcast_root)
         self.assertEqual(
             graph.split_receipts,
             tuple(
@@ -532,7 +577,7 @@ class V52VerifySourcesTest(unittest.TestCase):
         self.assertIsNotNone(enumerate_graph, "missing graph enumerator")
         for index, arguments in enumerate(attacks):
             with self.subTest(index=index), self.assertRaises(ValueError):
-                enumerate_graph(*arguments)
+                enumerate_graph(*arguments, fx.statcast_root)
 
     def test_terminal_query_graph_loader_uses_only_sealed_read_only_artifacts(
         self,
@@ -541,7 +586,9 @@ class V52VerifySourcesTest(unittest.TestCase):
 
         fx, root = _graph_fixture(recursive=True), Path("/sealed/repository")
         run_spec = SimpleNamespace(raw={"namespaces": {"raw": "evidence/raw"}})
-        batch_index = {item.batch_id: item for item in fx.batches}
+        batch_index = {
+            item.batch_id: item for item in (*fx.batches, fx.statcast_root)
+        }
         receipt_index = {item.parent_query_id: item for item in fx.receipts}
         loader = getattr(verifier, "_load_terminal_query_graph", None)
         self.assertIsNotNone(loader, "missing terminal graph loader")
@@ -571,7 +618,13 @@ class V52VerifySourcesTest(unittest.TestCase):
         checkpoint_loader.assert_called_once_with(root, run_spec)
         self.assertEqual(
             batch_loader.call_args_list,
-            [call(root, item.batch_id, read_only_progress=True) for item in fx.batches],
+            [
+                call(root, fx.statcast_root.batch_id, read_only_progress=True),
+                *[
+                    call(root, item.batch_id, read_only_progress=True)
+                    for item in fx.batches
+                ],
+            ],
         )
         self.assertEqual(
             receipt_loader.call_args_list,
@@ -590,6 +643,7 @@ class V52VerifySourcesTest(unittest.TestCase):
         )
         self.assertIs(graph.checkpoint, fx.checkpoint)
         self.assertEqual(graph.query_batches, fx.batches)
+        self.assertIs(graph.statcast_root_batch, fx.statcast_root)
         self.assertEqual(
             graph.split_receipts,
             tuple(receipt_index[parent_id] for parent_id in fx.checkpoint.split_query_ids),
@@ -598,6 +652,71 @@ class V52VerifySourcesTest(unittest.TestCase):
             graph.split_parent_queries,
             tuple(sorted((fx.parent, fx.left), key=logical_query_id)),
         )
+
+    def test_stage_evidence_cannot_bind_a_non_statcast_root_batch(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fx, root = _graph_fixture(), Path("/sealed/repository")
+        bad = QueryBatch("9" * 64, "REMAINING", None, (fx.root,))
+        bad_path = (
+            "audit/v5_2_qd/historical/acquisition/query_batches/"
+            f"{bad.batch_id}.json"
+        )
+        checkpoint = dataclasses.replace(
+            fx.checkpoint,
+            stage_evidence_receipt_paths=(bad_path,),
+            stage_evidence_receipt_sha256s=(_batch_artifact_sha256(bad),),
+        )
+
+        with patch.object(verifier, "load_query_batch", return_value=bad) as loader:
+            with self.assertRaisesRegex(ValueError, "Statcast root batch authority"):
+                verifier._load_statcast_root_batch(root, checkpoint)
+
+        loader.assert_called_once_with(root, bad.batch_id, read_only_progress=True)
+
+    def test_statcast_root_requires_exact_stage_path_and_artifact_hash(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fx, root = _graph_fixture(), Path("/sealed/repository")
+        attacks = (
+            dataclasses.replace(
+                fx.checkpoint,
+                stage_evidence_receipt_paths=(
+                    f"audit/wrong/query_batches/{fx.statcast_root.batch_id}.json",
+                ),
+            ),
+            dataclasses.replace(
+                fx.checkpoint,
+                stage_evidence_receipt_sha256s=("f" * 64,),
+            ),
+            dataclasses.replace(
+                fx.checkpoint,
+                stage_evidence_receipt_paths=(
+                    fx.statcast_root_path,
+                    fx.statcast_root_path,
+                ),
+                stage_evidence_receipt_sha256s=(
+                    fx.statcast_root_sha256,
+                    fx.statcast_root_sha256,
+                ),
+            ),
+            dataclasses.replace(
+                fx.checkpoint,
+                query_batch_ids=(
+                    *fx.checkpoint.query_batch_ids,
+                    fx.statcast_root.batch_id,
+                ),
+            ),
+        )
+        for index, checkpoint in enumerate(attacks):
+            with (
+                self.subTest(index=index),
+                patch.object(
+                    verifier, "load_query_batch", return_value=fx.statcast_root
+                ),
+                self.assertRaises(ValueError),
+            ):
+                verifier._load_statcast_root_batch(root, checkpoint)
 
     def test_completed_query_recompute_is_query_id_sorted(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier

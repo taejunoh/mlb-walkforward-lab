@@ -240,6 +240,42 @@ def _checkpoint_schema_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_checkpoint_value_retains_stage_evidence_paths(self) -> None:
+        payload = {
+            "sequence": 9,
+            "prior_checkpoint_sha256": "a" * 64,
+            "stage": "REMAINING",
+            "recorded_at_utc": "2026-07-16T12:00:00.000000Z",
+            "git_head": "b" * 40,
+            "execution_phase_receipt": {"sha256": "c" * 64},
+            "query_batches": [],
+            "query_evidence_receipts": [],
+            "stage_evidence_receipts": [
+                {
+                    "path": "audit/v5_2_qd/historical/acquisition/query_batches/"
+                    + "d" * 64
+                    + ".json",
+                    "sha256": "e" * 64,
+                }
+            ],
+            "split_receipts": [],
+            "completed_query_ids": [],
+            "pending_query_ids": [],
+            "quarantined_query_ids": [],
+            "split_query_ids": [],
+        }
+
+        checkpoint = self.registry._checkpoint_from_payload(payload, "f" * 64)
+
+        self.assertEqual(
+            checkpoint.stage_evidence_receipt_paths,
+            (
+                "audit/v5_2_qd/historical/acquisition/query_batches/"
+                + "d" * 64
+                + ".json",
+            ),
+        )
+
     def setUp(self) -> None:
         if importlib.util.find_spec("mlb_backtest.execution_registry") is None:
             self.fail("mlb_backtest.execution_registry is not implemented")
@@ -447,6 +483,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             pending_query_ids=(),
             quarantined_query_ids=(),
             split_query_ids=(),
+            stage_evidence_receipt_paths=(),
         )
         payload = {
             "pending_query_ids": [],
@@ -1362,6 +1399,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(
                 checkpoint.stage_evidence_receipt_sha256s,
                 tuple(_sha256(path) for path in remaining_evidence),
+            )
+            self.assertEqual(
+                checkpoint.stage_evidence_receipt_paths,
+                tuple(path.relative_to(root).as_posix() for path in remaining_evidence),
             )
             self.assertEqual(len(checkpoint.stage_evidence_receipt_sha256s), 10)
             status_union = {
@@ -4084,6 +4125,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     pending_query_ids=(),
                     quarantined_query_ids=(),
                     split_query_ids=(),
+                    stage_evidence_receipt_paths=(),
                 )
 
             checkpoints = (checkpoint(0, first_sha), checkpoint(1, head_sha))

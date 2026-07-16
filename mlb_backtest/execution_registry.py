@@ -265,6 +265,7 @@ class AcquisitionCheckpoint:
     pending_query_ids: tuple[str, ...]
     quarantined_query_ids: tuple[str, ...]
     split_query_ids: tuple[str, ...]
+    stage_evidence_receipt_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -2116,6 +2117,9 @@ def _checkpoint_from_payload(
         pending_query_ids=tuple(payload["pending_query_ids"]),  # type: ignore[arg-type]
         quarantined_query_ids=tuple(payload["quarantined_query_ids"]),  # type: ignore[arg-type]
         split_query_ids=tuple(payload["split_query_ids"]),  # type: ignore[arg-type]
+        stage_evidence_receipt_paths=tuple(
+            str(item["path"]) for item in stage_evidence
+        ),
     )
 
 
