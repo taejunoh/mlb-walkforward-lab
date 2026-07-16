@@ -498,7 +498,7 @@ class V52QueryPlanTest(unittest.TestCase):
         ).hexdigest()
         self.assertEqual(
             population_digest,
-            "1b1564e1fea24924d1a434443f97f19cfbee3452d5ec1b5b1b397c63fb775b4d",
+            "80f1272b36cbd906e1ca4b8d9f6d3b473c8633a9b1de2990816e56f62ee4eb4d",
         )
         for query in (*static.queries, *statcast.queries):
             self.assertEqual(query.run_spec_sha256, RUN_SHA)
@@ -3945,7 +3945,7 @@ class V52QueryPlanTest(unittest.TestCase):
             self.assertEqual(len(results), 2)
             self.assertEqual(results[0], results[1])
 
-    def test_split_receipt_rejects_a_different_valid_child_partition(self):
+    def test_split_receipt_rejects_noncanonical_daily_partition(self):
         import mlb_backtest.v52_query_plan as query_plan
 
         with tempfile.TemporaryDirectory() as td:
@@ -3970,7 +3970,7 @@ class V52QueryPlanTest(unittest.TestCase):
                 exhausted_attempt_number=attempt_number,
                 child_batch_id=child_batch.batch_id,
             )
-            with self.assertRaisesRegex(RuntimeError, "immutable|differs"):
+            with self.assertRaisesRegex(ValueError, "canonical bisection"):
                 query_plan.publish_split_receipt(
                     root,
                     evidence_root=_split_evidence_root(root),
