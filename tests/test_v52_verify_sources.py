@@ -1474,10 +1474,17 @@ class V52VerifySourcesTest(unittest.TestCase):
         )
 
         blocked = {name: None for name in forbidden_modules}
-        with patch.dict(sys.modules, blocked):
+        package = importlib.import_module("mlb_backtest")
+        original = sys.modules["mlb_backtest.v52_verify_sources"]
+        with (
+            patch.object(package, "v52_verify_sources", original),
+            patch.dict(sys.modules, blocked),
+        ):
             sys.modules.pop("mlb_backtest.v52_verify_sources", None)
             imported = importlib.import_module("mlb_backtest.v52_verify_sources")
         self.assertTrue(hasattr(imported, "_read_and_recompute_query"))
+        self.assertIs(sys.modules["mlb_backtest.v52_verify_sources"], original)
+        self.assertIs(package.v52_verify_sources, original)
 
     def test_registered_parser_dispatch_imports_no_network_surface(self) -> None:
         for case in PARSER_IMPORT_GUARD_CASES:
