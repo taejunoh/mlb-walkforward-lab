@@ -14,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import jsonschema
+
 from mlb_backtest.diagnostics import canonical_json_bytes
 from mlb_backtest.execution_registry import AcquisitionCheckpoint
 from mlb_backtest.v52_evidence import (
@@ -25,12 +27,20 @@ from mlb_backtest.v52_evidence import (
 )
 from mlb_backtest.v52_query_plan import QueryBatch, SplitReceipt
 from mlb_backtest.v52_source_contracts import recompute_query_sidecar
-from tests.test_v52_source_schedule import _query, _schedule_raw
+from tests.test_v52_source_schedule import (
+    _box_query,
+    _boxscore_raw,
+    _query,
+    _schedule_raw,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "mlb_backtest/v52_verify_sources.py"
 SOURCE_FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
+NORMALIZED_SNAPSHOT_SCHEMA = (
+    ROOT / "schemas/v5_2_normalized_snapshot.schema.json"
+)
 _VENUE_GUARD_PAYLOAD = json.loads((SOURCE_FIXTURES / "venues_mini.json").read_bytes())
 _VENUE_GUARD_PAYLOAD["venues"] = _VENUE_GUARD_PAYLOAD["venues"][:1]
 PARSER_IMPORT_GUARD_CASES = (
@@ -481,6 +491,272 @@ def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
     )
 
 
+def _normalized_game_authority() -> SimpleNamespace:
+    from mlb_backtest.v52_game_evidence_inventory import (
+        VerifiedGameEvidenceInventory,
+    )
+    from mlb_backtest.v52_schedule_inventory import (
+        VerifiedScheduleAnchorInventory,
+    )
+    from mlb_backtest.v52_sources.schedule import (
+        recompute_boxscore_sidecar,
+        recompute_game_evidence_snapshot,
+        recompute_schedule_anchor_sidecar,
+    )
+    from mlb_backtest.v52_timezone_review import VerifiedTimezoneGate
+    from mlb_backtest.v52_verify_sources import VerifiedQueryRecord
+
+    def record(query: LogicalQuery, sidecar: dict[str, object]) -> VerifiedQueryRecord:
+        contents = canonical_json_bytes(sidecar) + b"\n"
+        return VerifiedQueryRecord(
+            query=query,
+            query_id=logical_query_id(query),
+            query_sidecar_bytes=contents,
+            query_sidecar_sha256=hashlib.sha256(contents).hexdigest(),
+            raw_sha256=str(sidecar["raw_sha256"]),
+            storage_mode="FETCHED_RAW",
+            retained_raw_bytes=None,
+        )
+
+    base_schedule = recompute_schedule_anchor_sidecar(_schedule_raw(), _query())
+    base_boxscore = recompute_boxscore_sidecar(_boxscore_raw(), _box_query())
+    records = []
+    per_season_payloads = []
+    season_sources = []
+    schedule_hashes = []
+    for season in range(2018, 2025):
+        offset = season - 2018
+        played_pk, unplayed_pk = 800_001 + offset * 10, 800_002 + offset * 10
+        official_date = f"{season}-04-02"
+        schedule_query = dataclasses.replace(
+            _query(),
+            parameters={
+                **_query().parameters,
+                "startDate": f"{season}-03-20",
+                "endDate": f"{season}-09-30",
+            },
+            requested_range={
+                "year": season,
+                "start_date": f"{season}-03-20",
+                "end_date": f"{season}-09-30",
+            },
+        )
+        schedule_sidecar = json.loads(canonical_json_bytes(base_schedule))
+        schedule_sidecar["query_id"] = logical_query_id(schedule_query)
+        schedule_sidecar["raw_sha256"] = hashlib.sha256(
+            f"schedule-{season}".encode()
+        ).hexdigest()
+        anchors = schedule_sidecar["semantics"]["anchors"]
+        for anchor, game_pk in zip(
+            anchors, (played_pk, unplayed_pk), strict=True
+        ):
+            anchor["game_pk"] = game_pk
+            anchor["official_date"] = official_date
+            anchor["scheduled_start_utc"] = f"{season}-04-02T17:05:00Z"
+            anchor["season"] = season
+            anchor["season_start_date"] = f"{season}-03-20"
+        schedule_sidecar["semantics"]["game_pks"] = [played_pk, unplayed_pk]
+        schedule_sidecar["semantics"]["played_game_pks"] = [played_pk]
+        schedule_sidecar["semantics"]["unplayed_game_pks"] = [unplayed_pk]
+        schedule_record = record(schedule_query, schedule_sidecar)
+
+        box_query = dataclasses.replace(
+            _box_query(),
+            endpoint=(
+                f"https://statsapi.mlb.com/api/v1/game/{played_pk}/boxscore"
+            ),
+            requested_range={
+                "season": season,
+                "game_pk": played_pk,
+                "official_date": official_date,
+            },
+        )
+        box_sidecar = json.loads(canonical_json_bytes(base_boxscore))
+        box_sidecar["query_id"] = logical_query_id(box_query)
+        box_sidecar["raw_sha256"] = hashlib.sha256(
+            f"boxscore-{season}".encode()
+        ).hexdigest()
+        box_sidecar["semantics"]["game_pk"] = played_pk
+        box_sidecar["semantics"]["official_date"] = official_date
+        box_record = record(box_query, box_sidecar)
+        records.extend((box_record, schedule_record))
+        schedule_hashes.append(schedule_record.query_sidecar_sha256)
+
+        payload = dict(
+            recompute_game_evidence_snapshot(
+                [schedule_sidecar],
+                {
+                    played_pk: (
+                        box_record.query_sidecar_bytes,
+                        box_record.query_sidecar_sha256,
+                    )
+                },
+            )
+        )
+        per_season_payloads.append(payload)
+        season_sources.append(
+            {
+                "season": season,
+                "query_id": schedule_record.query_id,
+                "query_sidecar": {
+                    "path": f"fixture/{season}.json",
+                    "sha256": schedule_record.query_sidecar_sha256,
+                },
+            }
+        )
+
+    schedule_sha256 = "8" * 64
+    mapping_sha256 = "7" * 64
+    candidate_sha256 = "6" * 64
+    review_sha256s = ("5" * 64, "4" * 64)
+    seal_sha256 = "3" * 64
+    schedule_inventory = VerifiedScheduleAnchorInventory(
+        payload={
+            "run_id": "historical_walkforward_500",
+            "season_sources": season_sources,
+        },
+        path=Path("/sealed/schedule.json"),
+        sha256=schedule_sha256,
+    )
+    timezone_gate = VerifiedTimezoneGate(
+        candidate={
+            "schedule_sidecar_sha256s": sorted(schedule_hashes),
+        },
+        mapping={
+            "artifact_kind": "VENUE_TIMEZONE_MAPPING",
+            "schema_version": 1,
+            "timezone_rows": [
+                {
+                    "effective_end": "2024-12-31",
+                    "effective_start": "2018-01-01",
+                    "time_zone": "America/New_York",
+                    "venue_id": venue_id,
+                }
+                for venue_id in (31, 99)
+            ],
+        },
+        reviews=({}, {}),
+        seal={},
+        candidate_sha256=candidate_sha256,
+        mapping_sha256=mapping_sha256,
+        review_sha256s=review_sha256s,
+        seal_sha256=seal_sha256,
+        run_spec_sha256="2" * 64,
+        acquisition_contract_sha256="1" * 64,
+        schedule_inventory_sha256=schedule_sha256,
+        query_batch_ids=("a" * 64, "b" * 64),
+        query_batch_sha256s=("c" * 64, "d" * 64),
+    )
+    all_games = [
+        game
+        for payload in per_season_payloads
+        for game in payload["games"]
+    ]
+    all_sidecar_hashes = sorted(
+        {
+            digest
+            for payload in per_season_payloads
+            for digest in payload["source_query_sidecar_sha256s"]
+        }
+    )
+    game_inventory = VerifiedGameEvidenceInventory(
+        payload={
+            "acquisition_contract": {
+                "path": "protocols/v5_2_qd/historical_source_acquisition.json",
+                "sha256": "1" * 64,
+            },
+            "artifact_kind": "GAME_EVIDENCE_INVENTORY",
+            "counts": {
+                "game_count": len(all_games),
+                "played_game_count": 7,
+                "unique_actual_starter_count": 2,
+                "unplayed_game_count": 7,
+                "verified_feature_consumer_game_count": 7,
+            },
+            "games": all_games,
+            "query_batches": [
+                {
+                    "batch_id": "a" * 64,
+                    "path": (
+                        "audit/v5_2_qd/historical/acquisition/query_batches/"
+                        f"{'a' * 64}.json"
+                    ),
+                    "sha256": "c" * 64,
+                    "stage": "STATIC_SCHEDULES",
+                },
+                {
+                    "batch_id": "b" * 64,
+                    "path": (
+                        "audit/v5_2_qd/historical/acquisition/query_batches/"
+                        f"{'b' * 64}.json"
+                    ),
+                    "sha256": "d" * 64,
+                    "stage": "REFERENCE_INPUTS",
+                },
+            ],
+            "run_id": "historical_walkforward_500",
+            "run_spec": {
+                "path": "protocols/v5_2_qd/historical_walkforward_500.json",
+                "sha256": "2" * 64,
+            },
+            "schedule_inventory": {
+                "path": (
+                    "audit/v5_2_qd/historical/acquisition/"
+                    "schedule_anchor_inventory.json"
+                ),
+                "sha256": schedule_sha256,
+            },
+            "schema_version": 1,
+            "source_query_sidecar_sha256s": all_sidecar_hashes,
+            "timezone_gate": {
+                "candidate": {
+                    "path": (
+                        "audit/v5_2_qd/historical/acquisition/"
+                        "venue_timezone_candidate.json"
+                    ),
+                    "sha256": candidate_sha256,
+                },
+                "mapping": {
+                    "path": "config/v5_2_qd/venue_timezones.json",
+                    "sha256": mapping_sha256,
+                },
+                "reviews": [
+                    {
+                        "path": (
+                            "audit/v5_2_qd/historical/acquisition/"
+                            "timezone_reviews/coverage.json"
+                        ),
+                        "sha256": review_sha256s[0],
+                    },
+                    {
+                        "path": (
+                            "audit/v5_2_qd/historical/acquisition/"
+                            "timezone_reviews/semantic.json"
+                        ),
+                        "sha256": review_sha256s[1],
+                    },
+                ],
+                "seal": {
+                    "path": (
+                        "audit/v5_2_qd/historical/acquisition/"
+                        "venue_timezone_seal.json"
+                    ),
+                    "sha256": seal_sha256,
+                },
+            },
+        },
+        path=Path("/sealed/games.json"),
+        sha256="9" * 64,
+    )
+    return SimpleNamespace(
+        records=tuple(reversed(records)),
+        schedule_inventory=schedule_inventory,
+        timezone_gate=timezone_gate,
+        game_inventory=game_inventory,
+        per_season_payloads=tuple(per_season_payloads),
+    )
+
+
 class V52VerifySourcesTest(unittest.TestCase):
     def test_completed_query_graph_classifies_root_and_split_leaves(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
@@ -902,6 +1178,232 @@ class V52VerifySourcesTest(unittest.TestCase):
         for query in forbidden:
             with self.subTest(source=query.source, grain=query.grain):
                 self.assertFalse(verifier._retain_raw_for_aggregation(query))
+
+    def test_builds_seven_closed_game_normalized_snapshots_in_memory(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        with patch.object(
+            verifier,
+            "recompute_game_evidence_snapshot",
+            wraps=verifier.recompute_game_evidence_snapshot,
+        ) as recompute:
+            snapshots = verifier._build_game_normalized_snapshots(
+                "historical_walkforward_500",
+                authority.records,
+                authority.game_inventory,
+                authority.timezone_gate,
+                authority.schedule_inventory,
+            )
+
+        self.assertEqual(recompute.call_count, 7)
+        self.assertEqual(tuple(item.season for item in snapshots), tuple(range(2018, 2025)))
+        schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
+        jsonschema.Draft202012Validator.check_schema(schema)
+        for snapshot, expected_payload in zip(
+            snapshots, authority.per_season_payloads, strict=True
+        ):
+            envelope = snapshot.as_mapping()
+            jsonschema.validate(envelope, schema)
+            self.assertEqual(envelope["payload"], expected_payload)
+            self.assertEqual(envelope["schema_version"], 1)
+            self.assertEqual(envelope["run_id"], "historical_walkforward_500")
+            self.assertEqual(envelope["source"], "mlb_schedule_game_feed")
+            self.assertEqual(envelope["grain"], "season_game_evidence_snapshot")
+            self.assertEqual(envelope["status"], "READY")
+            self.assertEqual(envelope["split_receipt_sha256s"], [])
+            self.assertEqual(
+                envelope["logical_query_ids"],
+                sorted(set(envelope["logical_query_ids"])),
+            )
+            self.assertEqual(
+                envelope["source_query_sidecar_sha256s"],
+                sorted(set(envelope["source_query_sidecar_sha256s"])),
+            )
+            self.assertEqual(
+                snapshot.canonical_bytes,
+                canonical_json_bytes(envelope) + b"\n",
+            )
+            self.assertEqual(
+                snapshot.sha256,
+                hashlib.sha256(snapshot.canonical_bytes).hexdigest(),
+            )
+            self.assertNotIn(
+                snapshot.sha256,
+                envelope["source_query_sidecar_sha256s"],
+            )
+            self.assertNotEqual(snapshot.sha256, authority.game_inventory.sha256)
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                snapshot.season = 2025
+
+        forged = snapshots[0].as_mapping()
+        forged["unexpected"] = True
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(forged, schema)
+        forged = snapshots[0].as_mapping()
+        forged["logical_query_ids"].append(forged["logical_query_ids"][0])
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(forged, schema)
+        forged = snapshots[0].as_mapping()
+        unplayed = next(game for game in forged["payload"]["games"] if not game["played"])
+        unplayed["boxscore_query_sidecar_sha256"] = "0" * 64
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(forged, schema)
+
+        runtime_attacks = []
+        forged = snapshots[0].as_mapping()
+        forged["season"] = 2019
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["payload"]["source_query_sidecar_sha256s"] = ["0" * 64]
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["logical_query_ids"] = list(reversed(forged["logical_query_ids"]))
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["logical_query_ids"][0] = "not-a-sha256"
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["unexpected"] = True
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        unplayed = next(game for game in forged["payload"]["games"] if not game["played"])
+        unplayed["boxscore_query_sidecar_sha256"] = "0" * 64
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        played = next(game for game in forged["payload"]["games"] if game["played"])
+        played["away_score"] = played["home_score"]
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        played = next(game for game in forged["payload"]["games"] if game["played"])
+        played["winner_team_id"] = played["away_team_id"]
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["payload"]["games"][0]["source_game_sha256"] = "0" * 64
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["payload"]["games"][0]["scheduled_start_utc"] = "not-utc"
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["payload"]["games"][0]["scheduled_start_utc"] = (
+            "2018-04-10T17:05:00Z"
+        )
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        forged["logical_query_ids"].pop()
+        runtime_attacks.append(forged)
+        forged = snapshots[0].as_mapping()
+        played = next(game for game in forged["payload"]["games"] if game["played"])
+        played["home_starting_hitter_ids"][0] = played[
+            "away_starting_hitter_ids"
+        ][0]
+        source_game = dict(played)
+        source_game.pop("source_game_sha256")
+        played["source_game_sha256"] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "anchor_sidecar_sha256": played[
+                        "schedule_query_sidecar_sha256"
+                    ],
+                    "boxscore_query_sidecar_sha256": played[
+                        "boxscore_query_sidecar_sha256"
+                    ],
+                    "game": source_game,
+                }
+            )
+        ).hexdigest()
+        runtime_attacks.append(forged)
+        for index, attack in enumerate(runtime_attacks):
+            with self.subTest(runtime_attack=index), self.assertRaises(ValueError):
+                verifier._validate_normalized_snapshot_mapping(attack)
+
+    def test_game_normalized_snapshot_authority_mismatches_fail_closed(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        def build(authority: SimpleNamespace) -> object:
+            return verifier._build_game_normalized_snapshots(
+                "historical_walkforward_500",
+                authority.records,
+                authority.game_inventory,
+                authority.timezone_gate,
+                authority.schedule_inventory,
+            )
+
+        authority = _normalized_game_authority()
+        attacks = []
+        attacks.append(dataclasses.replace(authority.game_inventory, payload={
+            **authority.game_inventory.payload,
+            "games": list(reversed(authority.game_inventory.payload["games"])),
+        }))
+        attacks.append(dataclasses.replace(authority.game_inventory, payload={
+            **authority.game_inventory.payload,
+            "source_query_sidecar_sha256s": ["0" * 64],
+        }))
+        incomplete = dict(authority.game_inventory.payload)
+        incomplete.pop("run_spec")
+        attacks.append(dataclasses.replace(
+            authority.game_inventory,
+            payload=incomplete,
+        ))
+        attacks.append(dataclasses.replace(authority.game_inventory, payload={
+            **authority.game_inventory.payload,
+            "counts": {
+                **authority.game_inventory.payload["counts"],
+                "game_count": 999,
+            },
+        }))
+        attacks.append(dataclasses.replace(
+            authority.timezone_gate,
+            schedule_inventory_sha256="0" * 64,
+        ))
+        attacks.append(dataclasses.replace(
+            authority.timezone_gate,
+            mapping={
+                "artifact_kind": "VENUE_TIMEZONE_MAPPING",
+                "schema_version": 1,
+                "timezone_rows": [],
+            },
+        ))
+        attacks.append(dataclasses.replace(authority.schedule_inventory, payload={
+            **authority.schedule_inventory.payload,
+            "season_sources": [
+                {**row, "query_id": "0" * 64}
+                if row["season"] == 2018
+                else row
+                for row in authority.schedule_inventory.payload["season_sources"]
+            ],
+        }))
+        bad_timezone = json.loads(
+            canonical_json_bytes(authority.game_inventory.payload)
+        )
+        bad_timezone["timezone_gate"]["mapping"]["sha256"] = "0" * 64
+        attacks.append(dataclasses.replace(
+            authority.game_inventory,
+            payload=bad_timezone,
+        ))
+        for index, replacement in enumerate(attacks):
+            current = _normalized_game_authority()
+            if index in {0, 1, 2, 3, 7}:
+                current.game_inventory = replacement
+            elif index in {4, 5}:
+                current.timezone_gate = replacement
+            else:
+                current.schedule_inventory = replacement
+            with self.subTest(index=index), self.assertRaisesRegex(
+                ValueError,
+                "game|schedule|timezone|mapping|sidecar|inventory|authority|differ|coverage",
+            ):
+                build(current)
+
+        authority = _normalized_game_authority()
+        with self.assertRaisesRegex(ValueError, "seven|season|2018|2024"):
+            verifier._build_game_normalized_snapshots(
+                "historical_walkforward_500",
+                authority.records[1:],
+                authority.game_inventory,
+                authority.timezone_gate,
+                authority.schedule_inventory,
+            )
 
     def test_derived_disposition_is_independently_recomputed_without_mutation(
         self,

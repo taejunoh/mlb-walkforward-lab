@@ -5,12 +5,20 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
 
 from .execution_registry import (
     AcquisitionCheckpoint,
     load_source_verification_checkpoint,
 )
+from .v52_game_evidence_inventory import (
+    VerifiedGameEvidenceInventory,
+    validate_game_evidence_snapshot,
+)
+from .v52_schedule_inventory import VerifiedScheduleAnchorInventory
+from .v52_sources.schedule import recompute_game_evidence_snapshot
+from .v52_timezone_review import VerifiedTimezoneGate, validate_timezone_mapping
 from .protocols import RunSpec
 
 from .v52_evidence import (
@@ -36,6 +44,53 @@ from .v52_source_contracts import (
 _STATCAST_ROOT_BATCH_PATH = re.compile(
     r"^audit/v5_2_qd/historical/acquisition/query_batches/"
     r"(?P<batch_id>[0-9a-f]{64})\.json$"
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
+_BOXSCORE_ENDPOINT = re.compile(
+    r"^https://statsapi\.mlb\.com/api/v1/game/(?P<game_pk>[1-9][0-9]*)/boxscore$"
+)
+_GAME_SEASONS = tuple(range(2018, 2025))
+_NORMALIZED_ENVELOPE_KEYS = frozenset(
+    {
+        "grain",
+        "logical_query_ids",
+        "payload",
+        "run_id",
+        "schema_version",
+        "season",
+        "source",
+        "source_query_sidecar_sha256s",
+        "split_receipt_sha256s",
+        "status",
+    }
+)
+_GAME_PAYLOAD_KEYS = frozenset(
+    {"games", "grain", "schema_version", "source_query_sidecar_sha256s"}
+)
+_GAME_INVENTORY_KEYS = frozenset(
+    {
+        "acquisition_contract",
+        "artifact_kind",
+        "counts",
+        "games",
+        "query_batches",
+        "run_id",
+        "run_spec",
+        "schedule_inventory",
+        "schema_version",
+        "source_query_sidecar_sha256s",
+        "timezone_gate",
+    }
+)
+_GAME_COUNT_KEYS = frozenset(
+    {
+        "game_count",
+        "played_game_count",
+        "unique_actual_starter_count",
+        "unplayed_game_count",
+        "verified_feature_consumer_game_count",
+    }
 )
 
 
@@ -64,6 +119,135 @@ class VerifiedQueryRecord:
         "PROTECTED_LEGACY_REFERENCE",
     ]
     retained_raw_bytes: bytes | None
+
+
+@dataclass(frozen=True)
+class NormalizedSnapshot:
+    schema_version: Literal[1]
+    run_id: str
+    season: int
+    source: Literal["mlb_schedule_game_feed"]
+    grain: Literal["season_game_evidence_snapshot"]
+    status: Literal["READY"]
+    logical_query_ids: tuple[str, ...]
+    source_query_sidecar_sha256s: tuple[str, ...]
+    split_receipt_sha256s: tuple[str, ...]
+    payload: Mapping[str, object]
+    canonical_bytes: bytes
+    sha256: str
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            "grain": self.grain,
+            "logical_query_ids": list(self.logical_query_ids),
+            "payload": _plain_json(self.payload),
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "season": self.season,
+            "source": self.source,
+            "source_query_sidecar_sha256s": list(
+                self.source_query_sidecar_sha256s
+            ),
+            "split_receipt_sha256s": list(self.split_receipt_sha256s),
+            "status": self.status,
+        }
+
+
+def _plain_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _sorted_unique_sha256s(
+    value: object,
+    label: str,
+    *,
+    allow_empty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ValueError(f"normalized snapshot {label} differ")
+    if any(
+        not isinstance(item, str) or _SHA256.fullmatch(item) is None
+        for item in value
+    ) or value != sorted(set(value)):
+        raise ValueError(f"normalized snapshot {label} differ")
+    return value
+
+
+def _validate_normalized_snapshot_mapping(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _NORMALIZED_ENVELOPE_KEYS:
+        raise ValueError("normalized snapshot envelope keys differ")
+    envelope = dict(value)
+    season = envelope.get("season")
+    if (
+        envelope.get("schema_version") != 1
+        or not isinstance(envelope.get("run_id"), str)
+        or not envelope["run_id"]
+        or isinstance(season, bool)
+        or not isinstance(season, int)
+        or season not in _GAME_SEASONS
+        or envelope.get("source") != "mlb_schedule_game_feed"
+        or envelope.get("grain") != "season_game_evidence_snapshot"
+        or envelope.get("status") != "READY"
+    ):
+        raise ValueError("normalized snapshot envelope identity differs")
+    query_ids = _sorted_unique_sha256s(
+        envelope.get("logical_query_ids"), "query IDs"
+    )
+    top_sidecars = _sorted_unique_sha256s(
+        envelope.get("source_query_sidecar_sha256s"), "sidecar hashes"
+    )
+    if len(query_ids) != len(top_sidecars):
+        raise ValueError("normalized snapshot query/sidecar counts differ")
+    split_hashes = _sorted_unique_sha256s(
+        envelope.get("split_receipt_sha256s"),
+        "split receipt hashes",
+        allow_empty=True,
+    )
+    if split_hashes:
+        raise ValueError("game normalized snapshot cannot own split receipts")
+
+    payload_value = envelope.get("payload")
+    if not isinstance(payload_value, Mapping) or set(payload_value) != _GAME_PAYLOAD_KEYS:
+        raise ValueError("normalized snapshot game payload keys differ")
+    payload = dict(payload_value)
+    payload_sidecars = _sorted_unique_sha256s(
+        payload.get("source_query_sidecar_sha256s"),
+        "payload sidecar hashes",
+    )
+    games = payload.get("games")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("grain") != "season_game_evidence_snapshot"
+        or top_sidecars != payload_sidecars
+        or not isinstance(games, list)
+        or not games
+    ):
+        raise ValueError("normalized snapshot game payload identity differs")
+
+    for game in games:
+        if (
+            not isinstance(game, Mapping)
+            or game.get("season") != season
+        ):
+            raise ValueError("normalized snapshot game season differs")
+    validate_game_evidence_snapshot(payload)
+    return envelope
 
 
 def _enumerate_completed_query_graph(
@@ -327,6 +511,338 @@ def _retain_raw_for_aggregation(query: LogicalQuery) -> bool:
         return False
     venue_id = int(venue_match.group("venue_id"))
     return requested == {"venue_id": venue_id}
+
+
+def _verified_sidecar(record: VerifiedQueryRecord) -> dict[str, object]:
+    if not isinstance(record, VerifiedQueryRecord):
+        raise TypeError("normalized snapshot records must be VerifiedQueryRecord")
+    query_id = logical_query_id(record.query)
+    if (
+        record.query_id != query_id
+        or record.storage_mode
+        not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
+        or record.retained_raw_bytes is not None
+        or not isinstance(record.query_sidecar_bytes, bytes)
+        or not record.query_sidecar_bytes.endswith(b"\n")
+        or hashlib.sha256(record.query_sidecar_bytes).hexdigest()
+        != record.query_sidecar_sha256
+    ):
+        raise ValueError("normalized snapshot verified query binding differs")
+    try:
+        sidecar = json.loads(record.query_sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("normalized snapshot sidecar is not canonical JSON") from exc
+    if (
+        not isinstance(sidecar, dict)
+        or canonical_json_bytes(sidecar) + b"\n" != record.query_sidecar_bytes
+        or sidecar.get("query_id") != query_id
+        or sidecar.get("source") != record.query.source
+        or sidecar.get("grain") != record.query.grain
+        or sidecar.get("raw_sha256") != record.raw_sha256
+    ):
+        raise ValueError("normalized snapshot query sidecar binding differs")
+    return sidecar
+
+
+def _binding_sha256(value: object, label: str) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} binding differs")
+    digest = value.get("sha256")
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise ValueError(f"{label} SHA-256 differs")
+    return digest
+
+
+def _normalized_snapshot(
+    run_id: str,
+    season: int,
+    records: Sequence[VerifiedQueryRecord],
+    payload: Mapping[str, object],
+) -> NormalizedSnapshot:
+    query_ids = tuple(sorted({record.query_id for record in records}))
+    hashes_value = payload.get("source_query_sidecar_sha256s")
+    if not isinstance(hashes_value, list):
+        raise ValueError("game snapshot source sidecar hashes differ")
+    sidecar_hashes = tuple(hashes_value)
+    if (
+        not query_ids
+        or sidecar_hashes != tuple(sorted(set(sidecar_hashes)))
+        or any(
+            not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+            for digest in sidecar_hashes
+        )
+        or {record.query_sidecar_sha256 for record in records}
+        != set(sidecar_hashes)
+    ):
+        raise ValueError("game snapshot logical query or sidecar population differs")
+    envelope: dict[str, object] = {
+        "grain": "season_game_evidence_snapshot",
+        "logical_query_ids": list(query_ids),
+        "payload": _plain_json(payload),
+        "run_id": run_id,
+        "schema_version": 1,
+        "season": season,
+        "source": "mlb_schedule_game_feed",
+        "source_query_sidecar_sha256s": list(sidecar_hashes),
+        "split_receipt_sha256s": [],
+        "status": "READY",
+    }
+    envelope = _validate_normalized_snapshot_mapping(envelope)
+    contents = canonical_json_bytes(envelope) + b"\n"
+    digest = hashlib.sha256(contents).hexdigest()
+    if digest in set(query_ids) | set(sidecar_hashes):
+        raise ValueError("normalized snapshot hash collides with a component hash")
+    frozen_payload = _freeze_json(payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise AssertionError("normalized snapshot payload must freeze to a mapping")
+    return NormalizedSnapshot(
+        schema_version=1,
+        run_id=run_id,
+        season=season,
+        source="mlb_schedule_game_feed",
+        grain="season_game_evidence_snapshot",
+        status="READY",
+        logical_query_ids=query_ids,
+        source_query_sidecar_sha256s=sidecar_hashes,
+        split_receipt_sha256s=(),
+        payload=frozen_payload,
+        canonical_bytes=contents,
+        sha256=digest,
+    )
+
+
+def _build_game_normalized_snapshots(
+    run_id: str,
+    records: Sequence[VerifiedQueryRecord],
+    game_inventory: VerifiedGameEvidenceInventory,
+    timezone_gate: VerifiedTimezoneGate,
+    schedule_inventory: VerifiedScheduleAnchorInventory,
+) -> tuple[NormalizedSnapshot, ...]:
+    """Reduce already loader-verified authorities without filesystem access.
+
+    The later integration wrapper owns loading and final authority rebinds. This
+    pure reducer only cross-checks the immutable values supplied by those loaders.
+    """
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("normalized snapshot run_id differs")
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise TypeError("normalized snapshot records must be a sequence")
+    if not isinstance(game_inventory, VerifiedGameEvidenceInventory):
+        raise TypeError("game inventory authority differs")
+    if not isinstance(timezone_gate, VerifiedTimezoneGate):
+        raise TypeError("timezone gate authority differs")
+    if not isinstance(schedule_inventory, VerifiedScheduleAnchorInventory):
+        raise TypeError("schedule inventory authority differs")
+
+    by_season: dict[int, list[tuple[VerifiedQueryRecord, dict[str, object]]]] = {
+        season: [] for season in _GAME_SEASONS
+    }
+    seen_query_ids: set[str] = set()
+    for record in records:
+        sidecar = _verified_sidecar(record)
+        query = record.query
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+        ):
+            raise ValueError("game snapshot query source or grain differs")
+        boxscore_match = _BOXSCORE_ENDPOINT.fullmatch(query.endpoint)
+        if query.endpoint == _SCHEDULE_ENDPOINT:
+            season = query.requested_range.get("year")
+        elif boxscore_match is not None:
+            season = query.requested_range.get("season")
+            game_pk = query.requested_range.get("game_pk")
+            if (
+                isinstance(game_pk, bool)
+                or not isinstance(game_pk, int)
+                or game_pk != int(boxscore_match.group("game_pk"))
+            ):
+                raise ValueError("game snapshot boxscore gamePk differs")
+        else:
+            raise ValueError("game snapshot query endpoint differs")
+        if isinstance(season, bool) or not isinstance(season, int) or season not in by_season:
+            raise ValueError("game snapshot requires exact 2018-2024 seasons")
+        if record.query_id in seen_query_ids:
+            raise ValueError("game snapshot query population is duplicated")
+        seen_query_ids.add(record.query_id)
+        by_season[season].append((record, sidecar))
+
+    schedule_sidecars: list[Mapping[str, object]] = []
+    schedule_records: dict[int, VerifiedQueryRecord] = {}
+    snapshot_inputs: dict[int, tuple[VerifiedQueryRecord, ...]] = {}
+    snapshots: list[NormalizedSnapshot] = []
+    payloads: list[Mapping[str, object]] = []
+    for season in _GAME_SEASONS:
+        season_records = by_season[season]
+        anchors = [
+            (record, sidecar)
+            for record, sidecar in season_records
+            if record.query.endpoint == _SCHEDULE_ENDPOINT
+        ]
+        if len(anchors) != 1:
+            raise ValueError("game snapshot requires one schedule query per season")
+        schedule_record, schedule_sidecar = anchors[0]
+        schedule_records[season] = schedule_record
+        schedule_sidecars.append(schedule_sidecar)
+        boxscores: dict[int, tuple[bytes, str]] = {}
+        for record, _sidecar in season_records:
+            if record is schedule_record:
+                continue
+            game_pk = record.query.requested_range.get("game_pk")
+            if (
+                isinstance(game_pk, bool)
+                or not isinstance(game_pk, int)
+                or game_pk in boxscores
+            ):
+                raise ValueError("game snapshot boxscore population differs")
+            boxscores[game_pk] = (
+                record.query_sidecar_bytes,
+                record.query_sidecar_sha256,
+            )
+        payload = dict(
+            recompute_game_evidence_snapshot([schedule_sidecar], boxscores)
+        )
+        inputs = tuple(record for record, _sidecar in season_records)
+        snapshot_inputs[season] = inputs
+        payloads.append(payload)
+
+    schedule_payload = schedule_inventory.payload
+    if (
+        schedule_payload.get("run_id") != run_id
+        or timezone_gate.schedule_inventory_sha256 != schedule_inventory.sha256
+    ):
+        raise ValueError("schedule and timezone authority binding differs")
+    season_sources = schedule_payload.get("season_sources")
+    if isinstance(season_sources, (str, bytes)) or not isinstance(
+        season_sources, Sequence
+    ) or len(season_sources) != len(_GAME_SEASONS):
+        raise ValueError("schedule inventory seven-season authority differs")
+    for season, value in zip(_GAME_SEASONS, season_sources, strict=True):
+        record = schedule_records[season]
+        if (
+            not isinstance(value, Mapping)
+            or value.get("season") != season
+            or value.get("query_id") != record.query_id
+            or _binding_sha256(
+                value.get("query_sidecar"),
+                "schedule inventory query sidecar",
+            )
+            != record.query_sidecar_sha256
+        ):
+            raise ValueError("schedule inventory season source differs")
+
+    expected_schedule_hashes = sorted(
+        record.query_sidecar_sha256 for record in schedule_records.values()
+    )
+    candidate_schedule_hashes = timezone_gate.candidate.get(
+        "schedule_sidecar_sha256s"
+    )
+    if list(candidate_schedule_hashes or ()) != expected_schedule_hashes:
+        raise ValueError("timezone schedule sidecar authority differs")
+    validate_timezone_mapping(timezone_gate.mapping, schedule_sidecars)
+
+    game_payload = _plain_json(game_inventory.payload)
+    if (
+        not isinstance(game_payload, dict)
+        or set(game_payload) != _GAME_INVENTORY_KEYS
+        or (
+        game_payload.get("artifact_kind") != "GAME_EVIDENCE_INVENTORY"
+        or game_payload.get("schema_version") != 1
+        or game_payload.get("run_id") != run_id
+        )
+    ):
+        raise ValueError("game inventory identity differs")
+    if (
+        _binding_sha256(game_payload.get("run_spec"), "game RunSpec")
+        != timezone_gate.run_spec_sha256
+        or _binding_sha256(
+            game_payload.get("acquisition_contract"),
+            "game acquisition contract",
+        )
+        != timezone_gate.acquisition_contract_sha256
+    ):
+        raise ValueError("game inventory protocol authority differs")
+    query_batches = game_payload.get("query_batches")
+    if (
+        not isinstance(query_batches, list)
+        or len(query_batches) != 2
+        or tuple(
+            value.get("batch_id") if isinstance(value, Mapping) else None
+            for value in query_batches
+        )
+        != timezone_gate.query_batch_ids
+        or tuple(
+            _binding_sha256(value, "game query batch")
+            for value in query_batches
+        )
+        != timezone_gate.query_batch_sha256s
+    ):
+        raise ValueError("game inventory query batch authority differs")
+    if _binding_sha256(
+        game_payload.get("schedule_inventory"), "game schedule inventory"
+    ) != schedule_inventory.sha256:
+        raise ValueError("game schedule inventory authority differs")
+    timezone_binding = game_payload.get("timezone_gate")
+    if not isinstance(timezone_binding, Mapping):
+        raise ValueError("game timezone authority differs")
+    reviews = timezone_binding.get("reviews")
+    if isinstance(reviews, (str, bytes)) or not isinstance(reviews, Sequence) or len(reviews) != 2:
+        raise ValueError("game timezone review authority differs")
+    if (
+        _binding_sha256(timezone_binding.get("candidate"), "game timezone candidate")
+        != timezone_gate.candidate_sha256
+        or _binding_sha256(timezone_binding.get("mapping"), "game timezone mapping")
+        != timezone_gate.mapping_sha256
+        or tuple(
+            _binding_sha256(value, "game timezone review") for value in reviews
+        )
+        != timezone_gate.review_sha256s
+        or _binding_sha256(timezone_binding.get("seal"), "game timezone seal")
+        != timezone_gate.seal_sha256
+    ):
+        raise ValueError("game timezone authority binding differs")
+
+    expected_games = [
+        _plain_json(game)
+        for payload in payloads
+        for game in payload["games"]  # type: ignore[index]
+    ]
+    expected_sidecar_hashes = sorted(
+        {
+            digest
+            for payload in payloads
+            for digest in payload["source_query_sidecar_sha256s"]  # type: ignore[index]
+        }
+    )
+    played_games = [game for game in expected_games if game["played"] is True]
+    starter_ids = {
+        starter_id
+        for game in played_games
+        for starter_id in game["actual_starter_ids"]
+    }
+    expected_counts = {
+        "game_count": len(expected_games),
+        "played_game_count": len(played_games),
+        "unique_actual_starter_count": len(starter_ids),
+        "unplayed_game_count": len(expected_games) - len(played_games),
+        "verified_feature_consumer_game_count": len(played_games),
+    }
+    counts = game_payload.get("counts")
+    if (
+        not isinstance(counts, Mapping)
+        or set(counts) != _GAME_COUNT_KEYS
+        or dict(counts) != expected_counts
+        or game_payload.get("games") != expected_games
+        or game_payload.get("source_query_sidecar_sha256s")
+        != expected_sidecar_hashes
+    ):
+        raise ValueError("game inventory normalized population differs")
+
+    for season, payload in zip(_GAME_SEASONS, payloads, strict=True):
+        snapshots.append(
+            _normalized_snapshot(run_id, season, snapshot_inputs[season], payload)
+        )
+    return tuple(snapshots)
 
 
 def _read_verified_query_record(

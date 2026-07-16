@@ -725,6 +725,13 @@ def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
         raise ValueError("game participant source sidecar coverage differs")
 
 
+def validate_game_evidence_snapshot(snapshot: Mapping[str, object]) -> None:
+    """Validate a normalized game snapshot with the inventory authority rules."""
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("game evidence snapshot must be a mapping")
+    _validate_game_projection(snapshot)
+
+
 def _build_current_authority(
     root: Path,
     *,
@@ -1276,4 +1283,5 @@ __all__ = [
     "VerifiedGameEvidenceInventory",
     "load_verified_game_evidence_inventory",
     "publish_game_evidence_inventory",
+    "validate_game_evidence_snapshot",
 ]
