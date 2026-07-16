@@ -5,9 +5,11 @@ import io
 import os
 import tempfile
 import threading
+import time
 import unittest
+from types import SimpleNamespace
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -898,8 +900,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         *,
         phase: str | None = None,
         progress: bool = False,
+        stage_summary=None,
     ):
         from mlb_backtest.v52_acquire import (
+            OperationalBlock,
             _AcquisitionPlan,
             _AcquireOps,
             _RuntimeState,
@@ -929,11 +933,18 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         def begin(_request, _plan, _state):
             calls.append("begin")
 
+        def run_stages(_request, _plan):
+            calls.append("stages")
+            if stage_summary is None:
+                raise OperationalBlock("reference stages unavailable")
+            return stage_summary
+
         return _AcquireOps(
             authenticate=authenticate,
             runner_lock=runner_lock,
             inspect_runtime=inspect,
             begin_runtime=begin,
+            run_stages=run_stages,
         )
 
     def test_plan_only_is_strictly_read_only_and_reports_exact_plan(self) -> None:
@@ -1252,27 +1263,1720 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             ):
                 _real_begin_runtime(request, plan, runtime)
 
-    def test_resume_authenticates_phase_then_stops_at_c2a_boundary(self) -> None:
-        from mlb_backtest.v52_acquire import OperationalBlock, _run_acquisition
+    def test_non_plan_dispatches_stage_runner_after_authenticated_runtime(self) -> None:
+        from mlb_backtest.v52_acquire import AcquisitionSummary, _run_acquisition
+
+        stage_summary = AcquisitionSummary(
+            contract_sha256="a" * 64,
+            query_batch_sha256s=("e" * 64, "f" * 64),
+            promoted=0,
+            fetched=9,
+            planned_promoted=1,
+            planned_fetch_required=47,
+            resumed=2,
+            quarantined=0,
+            pending=0,
+            network_attempts=9,
+        )
 
         for phase in (None, "DESIGN_ACCEPTED", "ACQUIRING"):
             calls: list[str] = []
-            with (
-                self.subTest(phase=phase),
-                self.assertRaisesRegex(OperationalBlock, "stage orchestration pending"),
-            ):
-                _run_acquisition(
+            with self.subTest(phase=phase):
+                actual = _run_acquisition(
                     self._request(plan_only=False, resume=phase is not None),
                     self._ops(
                         calls,
                         phase=phase,
                         progress=phase is not None,
+                        stage_summary=stage_summary,
                     ),
                 )
+            self.assertEqual(actual, stage_summary)
             self.assertEqual(
                 calls,
-                ["authenticate", "lock", "inspect", "begin"],
+                ["authenticate", "lock", "inspect", "begin", "stages"],
             )
+
+    def test_pre_network_gate_reauthenticates_pending_authority_then_checks_disk(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _real_before_network,
+        )
+
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan(
+            contract_sha256="a" * 64,
+            query_batch_ids=("b" * 64, "c" * 64, "d" * 64),
+            legacy_dispositions=("FETCH_REQUIRED",),
+        )
+        query = _query()
+        query_id = logical_query_id(query)
+        events: list[str] = []
+        checkpoint = SimpleNamespace(
+            stage="STATIC_SCHEDULES",
+            query_batch_ids=("e" * 64,),
+            pending_query_ids=(query_id,),
+        )
+
+        def authenticate(_request):
+            events.append("authenticate")
+            return plan
+
+        def registry(_root, _run_spec):
+            events.append("registry")
+            return SimpleNamespace(phase="ACQUIRING")
+
+        def latest(_root, _run_spec):
+            events.append("checkpoint")
+            return checkpoint
+
+        def load_batch(_root, _batch_id):
+            events.append("batch")
+            return SimpleNamespace(queries=(query,))
+
+        def runner(_request, _guard=None):
+            events.append("runner")
+
+        def disk(_root):
+            events.append("disk")
+            return SimpleNamespace(
+                free=request.reserve_bytes + fetch_limits(query).max_bytes
+            )
+
+        with (
+            patch("mlb_backtest.v52_acquire._real_authenticate", authenticate),
+            patch(
+                "mlb_backtest.execution_registry.load_execution_registry",
+                registry,
+            ),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                latest,
+            ),
+            patch("mlb_backtest.v52_query_plan.load_query_batch", load_batch),
+            patch("mlb_backtest.v52_acquire._validate_active_runner", runner),
+            patch("mlb_backtest.v52_acquire.shutil.disk_usage", disk),
+        ):
+            _real_before_network(
+                request,
+                plan,
+                stage="STATIC_SCHEDULES",
+                query_batch_ids=("e" * 64,),
+                query=query,
+            )
+        self.assertEqual(
+            events,
+            ["authenticate", "registry", "checkpoint", "batch", "runner", "disk"],
+        )
+
+    def test_pre_network_disk_boundary_is_exact_and_failure_never_fetches(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _AcquisitionPlan,
+            _real_before_network,
+        )
+
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        query = _query()
+        checkpoint = SimpleNamespace(
+            stage="STATIC_SCHEDULES",
+            query_batch_ids=("e" * 64,),
+            pending_query_ids=(logical_query_id(query),),
+        )
+        common = (
+            patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan),
+            patch(
+                "mlb_backtest.execution_registry.load_execution_registry",
+                return_value=SimpleNamespace(phase="ACQUIRING"),
+            ),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                return_value=checkpoint,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.load_query_batch",
+                return_value=SimpleNamespace(queries=(query,)),
+            ),
+            patch("mlb_backtest.v52_acquire._validate_active_runner"),
+        )
+        required = request.reserve_bytes + fetch_limits(query).max_bytes
+        with (
+            common[0],
+            common[1],
+            common[2],
+            common[3],
+            common[4],
+            patch(
+                "mlb_backtest.v52_acquire.shutil.disk_usage",
+                return_value=SimpleNamespace(free=required - 1),
+            ),
+            self.assertRaisesRegex(OperationalBlock, "free-space"),
+        ):
+            _real_before_network(
+                request,
+                plan,
+                stage="STATIC_SCHEDULES",
+                query_batch_ids=("e" * 64,),
+                query=query,
+            )
+
+    def test_stage_checkpoint_barriers_fetch_and_resume_without_refetch(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        query = _query()
+        query_id = logical_query_id(query)
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        events: list[str] = []
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            events.append("checkpoint")
+            checkpoint = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                **values,
+            )
+            checkpoints.append(checkpoint)
+            return checkpoint
+
+        def acquire(store, item, parser, **kwargs):
+            kwargs["before_network"](item)
+            events.append("fetch")
+            capture = kwargs["fetcher"](
+                item,
+                timeout=kwargs["limits"].timeout,
+                max_bytes=kwargs["limits"].max_bytes,
+            )
+            raw = capture.body
+            assert raw is not None
+            with store.acquire_query(item) as lease:
+                return store.publish_fetched(
+                    item,
+                    store.next_attempt_number(lease),
+                    capture,
+                    parser(raw, item),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            result = _execute_stage(
+                request,
+                plan,
+                store,
+                stage="STATIC_SCHEDULES",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior=None,
+                fetcher=lambda *_args, **_kwargs: _capture(),
+                checkpoint_publisher=publish,
+                query_acquirer=acquire,
+                parser=lambda _raw, _query: {},
+                network_gate=lambda *_args, **_kwargs: events.append("gate"),
+            )
+            self.assertEqual(events, ["checkpoint", "gate", "fetch", "checkpoint"])
+            self.assertEqual(result.fetched, 1)
+            self.assertEqual(result.resumed, 0)
+            self.assertEqual(result.network_attempts, 1)
+            self.assertEqual(result.checkpoint.pending_query_ids, ())
+            self.assertEqual(result.checkpoint.completed_query_ids, (query_id,))
+
+            events.clear()
+            rerun = _execute_stage(
+                request,
+                plan,
+                store,
+                stage="STATIC_SCHEDULES",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior=result.checkpoint.receipt_sha256,
+                fetcher=lambda *_args, **_kwargs: self.fail("verified success refetched"),
+                checkpoint_publisher=publish,
+                query_acquirer=lambda *_args, **_kwargs: self.fail(
+                    "verified success reacquired"
+                ),
+                parser=lambda _raw, _query: {},
+                network_gate=lambda *_args, **_kwargs: self.fail(
+                    "verified success gated"
+                ),
+            )
+            self.assertEqual(events, ["checkpoint"])
+            self.assertEqual((rerun.fetched, rerun.resumed, rerun.network_attempts), (0, 1, 0))
+
+    def test_stage_quarantine_publishes_nonterminal_checkpoint_and_blocks(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        published: list[Mapping[str, object]] = []
+
+        def checkpoint(**values):
+            published.append(values)
+            return SimpleNamespace(receipt_sha256="f" * 64, **values)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with store.acquire_query(query) as lease:
+                store.quarantine_bodyless_attempt(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(None, status=None, error="PERMANENT_NETWORK"),
+                    error_classification="PERMANENT_NETWORK",
+                )
+            with self.assertRaisesRegex(OperationalBlock, "quarantined"):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("quarantine fetched"),
+                    checkpoint_publisher=checkpoint,
+                    query_acquirer=lambda *_args, **_kwargs: self.fail(
+                        "quarantine acquired"
+                    ),
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: self.fail(
+                        "quarantine gated"
+                    ),
+                )
+        self.assertEqual(len(published), 1)
+        self.assertEqual(
+            published[0]["quarantined_query_ids"],
+            (logical_query_id(query),),
+        )
+
+    def test_real_stage_runner_seals_static_before_inventory_and_reference(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _RunnerGuard,
+            _StageResult,
+            _real_run_stages,
+        )
+
+        request = dataclasses.replace(
+            self._request(plan_only=False, resume=False),
+            stop_after="reference-inputs",
+        )
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        static_query = _query()
+        reference_query = dataclasses.replace(
+            _query(),
+            parameters={"season": 2023, "sportId": 1},
+            requested_range={"year": 2023},
+        )
+        static = SimpleNamespace(batch_id="c" * 64, queries=(static_query,))
+        reference = SimpleNamespace(
+            batch_id="d" * 64,
+            derived_from_sha256="1" * 64,
+            queries=(reference_query,),
+        )
+        static_checkpoint = SimpleNamespace(
+            receipt_sha256="e" * 64,
+            stage="STATIC_SCHEDULES",
+            query_batch_ids=(static.batch_id,),
+            completed_query_ids=(logical_query_id(static_query),),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        reference_checkpoint = SimpleNamespace(
+            receipt_sha256="f" * 64,
+            stage="REFERENCE_INPUTS",
+            query_batch_ids=(static.batch_id, reference.batch_id),
+            completed_query_ids=tuple(
+                sorted(
+                    (
+                        logical_query_id(static_query),
+                        logical_query_id(reference_query),
+                    )
+                )
+            ),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        inventory = SimpleNamespace(path=request.root / "schedule.json", sha256="1" * 64)
+        events: list[str] = []
+        runner_guard = _RunnerGuard(10, 11, request.root)
+
+        def execute(*_args, stage, **kwargs):
+            self.assertIs(kwargs["runner_guard"], runner_guard)
+            events.append(f"execute:{stage}")
+            if stage == "STATIC_SCHEDULES":
+                return _StageResult(static_checkpoint, 7, 0, 7)
+            return _StageResult(reference_checkpoint, 11, 2, 11)
+
+        with (
+            patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan),
+            patch(
+                "mlb_backtest.v52_acquire._current_runner_guard",
+                return_value=runner_guard,
+            ),
+            patch(
+                "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                side_effect=lambda *_args: events.append("raw-parent"),
+            ),
+            patch("mlb_backtest.v52_acquire.V52EvidenceStore", return_value=object()),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                side_effect=lambda *_args: events.append("load-checkpoint") or None,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.build_static_batch",
+                side_effect=lambda *_args: events.append("build-static") or static,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.publish_query_batch",
+                side_effect=lambda _root, batch: events.append(
+                    f"publish:{'static' if batch is static else 'reference'}"
+                ),
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_inventory.publish_schedule_anchor_inventory",
+                side_effect=lambda *_args, **_kwargs: events.append("inventory")
+                or inventory,
+            ),
+            patch(
+                "mlb_backtest.v52_acquire._validate_schedule_inventory_schema",
+                side_effect=lambda *_args: events.append("schema"),
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
+                side_effect=lambda *_args, **_kwargs: events.append("build-reference")
+                or reference,
+            ),
+            patch("mlb_backtest.v52_acquire._execute_stage", side_effect=execute),
+        ):
+            summary = _real_run_stages(request, plan)
+
+        self.assertLess(events.index("execute:STATIC_SCHEDULES"), events.index("inventory"))
+        self.assertLess(events.index("inventory"), events.index("schema"))
+        self.assertLess(events.index("schema"), events.index("build-reference"))
+        self.assertLess(events.index("publish:reference"), events.index("execute:REFERENCE_INPUTS"))
+        self.assertEqual(summary.query_batch_sha256s, (static.batch_id, reference.batch_id))
+        self.assertEqual((summary.fetched, summary.resumed, summary.network_attempts), (18, 2, 18))
+        self.assertEqual((summary.pending, summary.quarantined), (0, 0))
+
+    def test_preseason_disposition_completes_without_gate_or_network_attempt(self) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        query = LogicalQuery(
+            source="mlb_stats_pitching",
+            grain="season_d1_league_pitching_reference",
+            endpoint="disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING",
+            parameters={},
+            requested_range={
+                "as_of_date": "2024-03-19",
+                "consumer_cutoff_dates": {"9001": "2024-03-19"},
+                "consuming_game_pks": [9001],
+                "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+                "season": 2024,
+            },
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            result = SimpleNamespace(receipt_sha256=f"{len(checkpoints) + 1:064x}", **values)
+            checkpoints.append(result)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            result = _execute_stage(
+                request,
+                plan,
+                store,
+                stage="REFERENCE_INPUTS",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior=None,
+                fetcher=lambda *_args, **_kwargs: self.fail("derived query fetched"),
+                checkpoint_publisher=publish,
+                network_gate=lambda *_args, **_kwargs: self.fail("derived query gated"),
+            )
+            verified = store.read_verified_success(query)
+        self.assertEqual(result.network_attempts, 0)
+        self.assertEqual(result.fetched, 0)
+        self.assertEqual(verified.published_evidence.storage_mode, "DERIVED_DISPOSITION")
+
+    def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(self) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        stats_queries = tuple(
+            dataclasses.replace(
+                _query(),
+                parameters={"season": year, "sportId": 1},
+                requested_range={"year": year},
+            )
+            for year in range(2020, 2024)
+        )
+        savant_queries = tuple(
+            dataclasses.replace(
+                _query(statcast=True, single_day=True),
+                parameters={"day": day},
+                requested_range={
+                    "end_date": f"2024-04-0{day}",
+                    "start_date": f"2024-04-0{day}",
+                    "year": 2024,
+                },
+            )
+            for day in range(1, 4)
+        )
+        batch = SimpleNamespace(
+            batch_id="e" * 64,
+            queries=(*stats_queries, *savant_queries),
+        )
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        lock = threading.Lock()
+        active = {"statsapi.mlb.com": 0, "baseballsavant.mlb.com": 0}
+        peak = {"statsapi.mlb.com": 0, "baseballsavant.mlb.com": 0}
+        events: list[str] = []
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            with lock:
+                events.append("checkpoint")
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                **values,
+            )
+            checkpoints.append(result)
+            return result
+
+        def fetcher(query, *, timeout, max_bytes):
+            del timeout, max_bytes
+            host = "baseballsavant.mlb.com" if "savant" in query.endpoint else "statsapi.mlb.com"
+            with lock:
+                active[host] += 1
+                peak[host] = max(peak[host], active[host])
+            time.sleep(0.04)
+            with lock:
+                active[host] -= 1
+                events.append(f"done:{host}")
+            return dataclasses.replace(
+                _capture(),
+                final_url=query.endpoint,
+            )
+
+        def acquire(store, query, parser, **kwargs):
+            kwargs["before_network"](query)
+            capture = kwargs["fetcher"](
+                query,
+                timeout=kwargs["limits"].timeout,
+                max_bytes=kwargs["limits"].max_bytes,
+            )
+            assert capture.body is not None
+            with store.acquire_query(query) as lease:
+                return store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    capture,
+                    parser(capture.body, query),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            result = _execute_stage(
+                request,
+                plan,
+                store,
+                stage="REFERENCE_INPUTS",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior=None,
+                fetcher=fetcher,
+                checkpoint_publisher=publish,
+                query_acquirer=acquire,
+                parser=lambda _raw, _query: {},
+                network_gate=lambda *_args, **_kwargs: None,
+            )
+        self.assertEqual(peak["statsapi.mlb.com"], 2)
+        self.assertEqual(peak["baseballsavant.mlb.com"], 1)
+        self.assertEqual(result.network_attempts, 7)
+        self.assertEqual(result.fetched, 7)
+        self.assertEqual(events.count("checkpoint"), 2)
+        self.assertEqual(events[-1], "checkpoint")
+
+    def test_stage_unexpected_runtime_error_is_not_relabelled_or_checkpointed(self) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        query = _query()
+        slow_query = dataclasses.replace(
+            query,
+            parameters={"season": 2023, "sportId": 1},
+            requested_range={"year": 2023},
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query, slow_query))
+        checkpoints: list[SimpleNamespace] = []
+        slow_worker_joined = False
+        rendezvous = threading.Barrier(2)
+
+        def publish(**values):
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                **values,
+            )
+            checkpoints.append(result)
+            return result
+
+        def parser_bug(store, item, parser, **_kwargs):
+            nonlocal slow_worker_joined
+            rendezvous.wait(timeout=2)
+            if item == query:
+                raise RuntimeError("parser bug")
+            time.sleep(0.05)
+            raw = b"{}"
+            with store.acquire_query(item) as lease:
+                result = store.publish_fetched(
+                    item,
+                    store.next_attempt_number(lease),
+                    _capture(raw),
+                    parser(raw, item),
+                )
+            slow_worker_joined = True
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with self.assertRaisesRegex(RuntimeError, "^parser bug$"):
+                _execute_stage(
+                    self._request(plan_only=False, resume=True),
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: _capture(),
+                    checkpoint_publisher=publish,
+                    query_acquirer=parser_bug,
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: None,
+                )
+        self.assertEqual(len(checkpoints), 1)
+        self.assertTrue(slow_worker_joined)
+
+    def test_fatal_parser_cancels_queued_work_before_reservation_gate_or_fetch(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        queries = tuple(
+            dataclasses.replace(
+                _query(),
+                parameters={"season": year, "sportId": 1},
+                requested_range={"year": year},
+            )
+            for year in range(2019, 2025)
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
+
+        for fatal_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(fatal_type=fatal_type.__name__), tempfile.TemporaryDirectory() as directory:
+                rendezvous = threading.Barrier(2)
+                lock = threading.Lock()
+                reservations: list[str] = []
+                gates: list[str] = []
+                fetches: list[str] = []
+                checkpoints: list[SimpleNamespace] = []
+
+                class TrackingBudget:
+                    @contextmanager
+                    def reserve(self, item):
+                        with lock:
+                            reservations.append(logical_query_id(item))
+                        yield
+
+                def publish(**values):
+                    result = SimpleNamespace(
+                        receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+                    )
+                    checkpoints.append(result)
+                    return result
+
+                def parser(_raw, item):
+                    if item == queries[0]:
+                        raise fatal_type("fatal parser")
+                    return {}
+
+                def acquire(store, item, selected_parser, **kwargs):
+                    if item in queries[:2]:
+                        rendezvous.wait(timeout=2)
+                    if item == queries[1]:
+                        time.sleep(0.1)
+                    parsed = selected_parser(b"{}", item)
+                    kwargs["before_network"](item)
+                    capture = kwargs["fetcher"](
+                        item,
+                        timeout=kwargs["limits"].timeout,
+                        max_bytes=kwargs["limits"].max_bytes,
+                    )
+                    with store.acquire_query(item) as lease:
+                        return store.publish_fetched(
+                            item,
+                            store.next_attempt_number(lease),
+                            capture,
+                            parsed,
+                        )
+
+                with self.assertRaisesRegex(fatal_type, "^fatal parser$"):
+                    _execute_stage(
+                        self._request(plan_only=False, resume=True),
+                        _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                        V52EvidenceStore(Path(directory).resolve() / "raw"),
+                        stage="STATIC_SCHEDULES",
+                        batches=(batch,),
+                        stage_evidence=(),
+                        expected_prior=None,
+                        fetcher=lambda item, **_kwargs: fetches.append(
+                            logical_query_id(item)
+                        )
+                        or _capture(),
+                        checkpoint_publisher=publish,
+                        query_acquirer=acquire,
+                        parser=parser,
+                        network_gate=lambda _request, _plan, *, query, **_kwargs: gates.append(
+                            logical_query_id(query)
+                        ),
+                        disk_budget=TrackingBudget(),
+                    )
+                self.assertEqual(len(reservations), 2)
+                self.assertEqual(gates, [])
+                self.assertEqual(fetches, [])
+                self.assertEqual(len(checkpoints), 1)
+
+    def test_stop_signal_is_rechecked_after_gate_immediately_before_fetch(self) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        failure = dataclasses.replace(
+            _query(),
+            parameters={"season": 2023, "sportId": 1},
+            requested_range={"year": 2023},
+        )
+        gated = dataclasses.replace(
+            _query(),
+            parameters={"season": 2024, "sportId": 1},
+            requested_range={"year": 2024},
+        )
+        gate_entered = threading.Event()
+        fatal_raised = threading.Event()
+        fetches: list[str] = []
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
+            checkpoints.append(result)
+            return result
+
+        def parser(_raw, item):
+            if item == failure:
+                raise RuntimeError("fatal between gate and fetch")
+            return {}
+
+        def acquire(_store, item, selected_parser, **kwargs):
+            if item == failure:
+                self.assertTrue(gate_entered.wait(timeout=2))
+                try:
+                    selected_parser(b"{}", item)
+                finally:
+                    fatal_raised.set()
+            kwargs["before_network"](item)
+            return kwargs["fetcher"](
+                item,
+                timeout=kwargs["limits"].timeout,
+                max_bytes=kwargs["limits"].max_bytes,
+            )
+
+        def gate(_request, _plan, *, query, **_kwargs):
+            if query == gated:
+                gate_entered.set()
+                self.assertTrue(fatal_raised.wait(timeout=2))
+                time.sleep(0.1)
+
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(failure, gated))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "^fatal between gate and fetch$"):
+                _execute_stage(
+                    self._request(plan_only=False, resume=True),
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    V52EvidenceStore(Path(directory).resolve() / "raw"),
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda item, **_kwargs: fetches.append(
+                        logical_query_id(item)
+                    )
+                    or _capture(),
+                    checkpoint_publisher=publish,
+                    query_acquirer=acquire,
+                    parser=parser,
+                    network_gate=gate,
+                )
+        self.assertEqual(fetches, [])
+        self.assertEqual(len(checkpoints), 1)
+
+    def test_mixed_worker_failures_use_deterministic_precedence(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        programmer = dataclasses.replace(
+            _query(),
+            parameters={"season": 2020, "sportId": 1},
+            requested_range={"year": 2020},
+        )
+        trust = dataclasses.replace(
+            _query(),
+            parameters={"season": 2021, "sportId": 1},
+            requested_range={"year": 2021},
+        )
+        operational = _query(statcast=True, single_day=True)
+        batch = SimpleNamespace(
+            batch_id="e" * 64,
+            queries=(programmer, trust, operational),
+        )
+        selected: list[str] = []
+
+        for delays in ((0.1, 0.05, 0.0), (0.0, 0.05, 0.1)):
+            with self.subTest(delays=delays), tempfile.TemporaryDirectory() as directory:
+                rendezvous = threading.Barrier(3)
+                delay_by_id = {
+                    logical_query_id(query): delay
+                    for query, delay in zip(batch.queries, delays, strict=True)
+                }
+                checkpoints: list[SimpleNamespace] = []
+
+                def publish(**values):
+                    result = SimpleNamespace(
+                        receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+                    )
+                    checkpoints.append(result)
+                    return result
+
+                def fail(_store, item, _parser, **_kwargs):
+                    rendezvous.wait(timeout=2)
+                    time.sleep(delay_by_id[logical_query_id(item)])
+                    if item == programmer:
+                        raise RuntimeError(f"programmer:{logical_query_id(item)}")
+                    if item == trust:
+                        raise TrustIntegrityError(f"trust:{logical_query_id(item)}")
+                    raise OperationalBlock(f"operational:{logical_query_id(item)}")
+
+                with self.assertRaises(RuntimeError) as raised:
+                    _execute_stage(
+                        self._request(plan_only=False, resume=True),
+                        _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                        V52EvidenceStore(Path(directory).resolve() / "raw"),
+                        stage="REFERENCE_INPUTS",
+                        batches=(batch,),
+                        stage_evidence=(),
+                        expected_prior=None,
+                        fetcher=lambda *_args, **_kwargs: self.fail("mixed fetched"),
+                        checkpoint_publisher=publish,
+                        query_acquirer=fail,
+                        parser=lambda _raw, _query: {},
+                        network_gate=lambda *_args, **_kwargs: None,
+                    )
+                selected.append(str(raised.exception))
+                self.assertEqual(len(checkpoints), 1)
+        expected = f"programmer:{logical_query_id(programmer)}"
+        self.assertEqual(selected, [expected, expected])
+
+    def test_stage_failure_selector_freezes_full_taxonomy_and_tie_break(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            SplitRequired,
+            TerminalAcquisitionFailure,
+            TrustIntegrityError,
+            _StageFailure,
+            _select_stage_failure,
+        )
+
+        ordered_errors = (
+            KeyboardInterrupt("interrupt"),
+            RuntimeError("programmer"),
+            TrustIntegrityError("trust"),
+            SplitRequired("TIMEOUT", 6),
+            OperationalBlock("operational"),
+            TerminalAcquisitionFailure("PERMANENT_NETWORK", 6),
+        )
+        failures = tuple(
+            _StageFailure(f"{index:064x}", index, error)
+            for index, error in enumerate(ordered_errors)
+        )
+        for expected_index in range(len(failures)):
+            selected = _select_stage_failure(tuple(reversed(failures[expected_index:])))
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertIs(selected.error, ordered_errors[expected_index])
+
+        canonical = RuntimeError("canonical")
+        later = RuntimeError("later")
+        selected = _select_stage_failure(
+            (
+                _StageFailure("b" * 64, 0, later),
+                _StageFailure("a" * 64, 9, canonical),
+            )
+        )
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertIs(selected.error, canonical)
+
+    def test_coordinator_interrupt_cancels_every_host_pool_before_join(self) -> None:
+        import concurrent.futures
+
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        savant = _query(statcast=True, single_day=True)
+        stats = tuple(
+            dataclasses.replace(
+                _query(),
+                parameters={"season": year, "sportId": 1},
+                requested_range={"year": year},
+            )
+            for year in (2023, 2024)
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(savant, *stats))
+
+        for interrupt_site in ("submission", "as_completed"):
+            with self.subTest(site=interrupt_site), tempfile.TemporaryDirectory() as directory:
+                gates: list[str] = []
+                fetches: list[str] = []
+                checkpoints: list[SimpleNamespace] = []
+
+                def publish(**values):
+                    result = SimpleNamespace(
+                        receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+                    )
+                    checkpoints.append(result)
+                    return result
+
+                def acquire(_store, item, _parser, **kwargs):
+                    time.sleep(0.1)
+                    kwargs["before_network"](item)
+                    return kwargs["fetcher"](
+                        item,
+                        timeout=kwargs["limits"].timeout,
+                        max_bytes=kwargs["limits"].max_bytes,
+                    )
+
+                original_submit = concurrent.futures.ThreadPoolExecutor.submit
+                submit_count = 0
+
+                def interrupting_submit(executor, *args, **kwargs):
+                    nonlocal submit_count
+                    submit_count += 1
+                    if interrupt_site == "submission" and submit_count == 2:
+                        raise KeyboardInterrupt("coordinator submission interrupt")
+                    return original_submit(executor, *args, **kwargs)
+
+                completed_patch = (
+                    patch(
+                        "mlb_backtest.v52_acquire.concurrent.futures.as_completed",
+                        side_effect=KeyboardInterrupt(
+                            "coordinator completion interrupt"
+                        ),
+                    )
+                    if interrupt_site == "as_completed"
+                    else nullcontext()
+                )
+                expected = (
+                    "^coordinator submission interrupt$"
+                    if interrupt_site == "submission"
+                    else "^coordinator completion interrupt$"
+                )
+                with (
+                    patch.object(
+                        concurrent.futures.ThreadPoolExecutor,
+                        "submit",
+                        interrupting_submit,
+                    ),
+                    completed_patch,
+                    self.assertRaisesRegex(KeyboardInterrupt, expected),
+                ):
+                    _execute_stage(
+                        self._request(plan_only=False, resume=True),
+                        _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                        V52EvidenceStore(Path(directory).resolve() / "raw"),
+                        stage="REFERENCE_INPUTS",
+                        batches=(batch,),
+                        stage_evidence=(),
+                        expected_prior=None,
+                        fetcher=lambda item, **_kwargs: fetches.append(
+                            logical_query_id(item)
+                        )
+                        or _capture(),
+                        checkpoint_publisher=publish,
+                        query_acquirer=acquire,
+                        parser=lambda _raw, _query: {},
+                        network_gate=lambda _request, _plan, *, query, **_kwargs: gates.append(
+                            logical_query_id(query)
+                        ),
+                    )
+                self.assertEqual(gates, [])
+                self.assertEqual(fetches, [])
+                self.assertEqual(len(checkpoints), 1)
+
+    def test_retry_sleep_is_stop_aware_and_releases_reservation_promptly(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _DiskBudget,
+            _execute_stage,
+        )
+
+        sleeping = dataclasses.replace(
+            _query(),
+            parameters={"season": 2023, "sportId": 1},
+            requested_range={"year": 2023},
+        )
+        fatal = dataclasses.replace(
+            _query(),
+            parameters={"season": 2024, "sportId": 1},
+            requested_range={"year": 2024},
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(sleeping, fatal))
+        request = self._request(plan_only=False, resume=True)
+        budget = _DiskBudget(
+            request,
+            free_bytes=lambda _root: request.reserve_bytes
+            + 2 * fetch_limits(sleeping).max_bytes,
+        )
+        sleeper_entered = threading.Event()
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
+            checkpoints.append(result)
+            return result
+
+        def acquire(_store, item, _parser, **kwargs):
+            if item == sleeping:
+                sleeper_entered.set()
+                kwargs["sleeper"](3600)
+                self.fail("stop-aware sleeper returned")
+            self.assertTrue(sleeper_entered.wait(timeout=2))
+            time.sleep(0.05)
+            raise RuntimeError("fatal wakes retry sleeper")
+
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "^fatal wakes retry sleeper$"):
+                _execute_stage(
+                    request,
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    V52EvidenceStore(Path(directory).resolve() / "raw"),
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("retry fetched"),
+                    checkpoint_publisher=publish,
+                    query_acquirer=acquire,
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: None,
+                    disk_budget=budget,
+                )
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(budget.reserved_bytes, 0)
+        self.assertEqual(len(checkpoints), 1)
+
+    def test_same_host_domain_failures_admit_queued_higher_precedence_error(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        queries = tuple(
+            dataclasses.replace(
+                _query(),
+                parameters={"order": order, "season": 2024, "sportId": 1},
+                requested_range={"order": order, "year": 2024},
+            )
+            for order in (1, 2, 3, 4)
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
+        selected: list[str] = []
+
+        for trust_delay, programmer_delay in ((0.05, 0.0), (0.0, 0.05)):
+            with self.subTest(
+                trust_delay=trust_delay,
+                programmer_delay=programmer_delay,
+            ), tempfile.TemporaryDirectory() as directory:
+                admitted: list[str] = []
+                operational_completed = threading.Event()
+                trust_admitted = threading.Event()
+                queued_rendezvous = threading.Barrier(2)
+                checkpoints: list[SimpleNamespace] = []
+
+                def publish(**values):
+                    result = SimpleNamespace(
+                        receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+                    )
+                    checkpoints.append(result)
+                    return result
+
+                def fail(_store, item, _parser, **_kwargs):
+                    admitted.append(logical_query_id(item))
+                    if item == queries[0]:
+                        operational_completed.set()
+                        raise OperationalBlock("lower operational")
+                    if item == queries[1]:
+                        self.assertTrue(trust_admitted.wait(timeout=2))
+                        raise OperationalBlock("capacity blocker")
+                    self.assertTrue(operational_completed.is_set())
+                    if item == queries[2]:
+                        trust_admitted.set()
+                        queued_rendezvous.wait(timeout=2)
+                        time.sleep(trust_delay)
+                        raise TrustIntegrityError("queued trust")
+                    queued_rendezvous.wait(timeout=2)
+                    time.sleep(programmer_delay)
+                    raise RuntimeError(f"queued programmer:{logical_query_id(item)}")
+
+                with self.assertRaises(RuntimeError) as raised:
+                    _execute_stage(
+                        self._request(plan_only=False, resume=True),
+                        _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                        V52EvidenceStore(Path(directory).resolve() / "raw"),
+                        stage="REFERENCE_INPUTS",
+                        batches=(batch,),
+                        stage_evidence=(),
+                        expected_prior=None,
+                        fetcher=lambda *_args, **_kwargs: self.fail("domain fetched"),
+                        checkpoint_publisher=publish,
+                        query_acquirer=fail,
+                        parser=lambda _raw, _query: {},
+                        network_gate=lambda *_args, **_kwargs: None,
+                    )
+                selected.append(str(raised.exception))
+                self.assertEqual(
+                    sorted(admitted),
+                    sorted(logical_query_id(query) for query in queries),
+                )
+                self.assertEqual(len(checkpoints), 1)
+        expected = f"queued programmer:{logical_query_id(queries[3])}"
+        self.assertEqual(selected, [expected, expected])
+
+    def test_stage_rejects_unknown_network_host_before_checkpoint(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        query = dataclasses.replace(_query(), endpoint="https://example.com/data")
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        published = False
+
+        def publish(**_values):
+            nonlocal published
+            published = True
+            self.fail("unknown host checkpointed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with self.assertRaisesRegex(TrustIntegrityError, "host"):
+                _execute_stage(
+                    self._request(plan_only=False, resume=True),
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("unknown host fetched"),
+                    checkpoint_publisher=publish,
+                )
+        self.assertFalse(published)
+
+    def test_real_stage_integrity_failures_translate_to_trust_errors(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _RunnerGuard,
+            _real_run_stages,
+        )
+
+        request = dataclasses.replace(
+            self._request(plan_only=False, resume=True),
+            stop_after="reference-inputs",
+        )
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        guard = _RunnerGuard(10, 11, request.root)
+        with (
+            patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan),
+            patch("mlb_backtest.v52_acquire._current_runner_guard", return_value=guard),
+            patch(
+                "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                return_value=request.root / "data/v5_2_qd/historical/raw",
+            ),
+            patch("mlb_backtest.v52_acquire.V52EvidenceStore", return_value=object()),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                return_value=None,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.build_static_batch",
+                side_effect=ValueError("forged static batch"),
+            ),
+            self.assertRaisesRegex(TrustIntegrityError, "static"),
+        ):
+            _real_run_stages(request, plan)
+
+    def test_real_checkpoint_integrity_failure_translates_but_injected_bug_does_not(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with (
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=ValueError("checkpoint forged"),
+                ),
+                self.assertRaisesRegex(TrustIntegrityError, "checkpoint"),
+            ):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: _capture(),
+                )
+
+            def injected_bug(**_values):
+                raise RuntimeError("injected checkpoint bug")
+
+            with self.assertRaisesRegex(RuntimeError, "^injected checkpoint bug$"):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: _capture(),
+                    checkpoint_publisher=injected_bug,
+                )
+
+    def test_stage_terminal_and_split_outcomes_keep_exact_taxonomy(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            SplitRequired,
+            TerminalAcquisitionFailure,
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _execute_stage,
+        )
+
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "terminal")
+            checkpoints: list[SimpleNamespace] = []
+
+            def publish(**values):
+                result = SimpleNamespace(
+                    receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                    **values,
+                )
+                checkpoints.append(result)
+                return result
+
+            def terminal(store, item, _parser, **_kwargs):
+                with store.acquire_query(item) as lease:
+                    attempt = store.next_attempt_number(lease)
+                    store.quarantine_bodyless_attempt(
+                        item,
+                        attempt,
+                        _capture(None, status=None, error="PERMANENT_NETWORK"),
+                        error_classification="PERMANENT_NETWORK",
+                    )
+                raise TerminalAcquisitionFailure("PERMANENT_NETWORK", attempt)
+
+            with self.assertRaisesRegex(OperationalBlock, "quarantined"):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("terminal fetched"),
+                    checkpoint_publisher=publish,
+                    query_acquirer=terminal,
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: None,
+                )
+            self.assertEqual(len(checkpoints), 2)
+            self.assertEqual(
+                checkpoints[-1].quarantined_query_ids,
+                (logical_query_id(query),),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "split")
+            checkpoints = []
+
+            def split(*_args, **_kwargs):
+                raise SplitRequired("TIMEOUT", 6)
+
+            with self.assertRaisesRegex(TrustIntegrityError, "cannot split"):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("split fetched"),
+                    checkpoint_publisher=publish,
+                    query_acquirer=split,
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: None,
+                )
+            self.assertEqual(len(checkpoints), 1)
+
+    def test_success_before_checkpoint_recovery_never_rewrites_evidence_or_refetches(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            raw = b"{}"
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(raw),
+                    {},
+                )
+            before = {
+                path.relative_to(store.root): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in store.root.rglob("*")
+                if path.is_file()
+            }
+            checkpoints: list[SimpleNamespace] = []
+
+            def publish(**values):
+                result = SimpleNamespace(receipt_sha256="f" * 64, **values)
+                checkpoints.append(result)
+                return result
+
+            result = _execute_stage(
+                self._request(plan_only=False, resume=True),
+                _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                store,
+                stage="STATIC_SCHEDULES",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior="d" * 64,
+                fetcher=lambda *_args, **_kwargs: self.fail("success refetched"),
+                checkpoint_publisher=publish,
+                query_acquirer=lambda *_args, **_kwargs: self.fail(
+                    "success reacquired"
+                ),
+                parser=lambda _raw, _query: {},
+                network_gate=lambda *_args, **_kwargs: self.fail("success gated"),
+            )
+            after = {
+                path.relative_to(store.root): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in store.root.rglob("*")
+                if path.is_file()
+            }
+        self.assertEqual(after, before)
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual((result.fetched, result.resumed, result.network_attempts), (0, 1, 0))
+
+    def test_raw_parent_bootstrap_rejects_nofollow_ancestor_attack(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _ensure_canonical_raw_parent,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "repo"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "data").symlink_to(outside, target_is_directory=True)
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            with self.assertRaisesRegex(TrustIntegrityError, "raw evidence parent"):
+                _ensure_canonical_raw_parent(request)
+            self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_stop_after_leaves_registry_acquiring_and_creates_no_timezone_outputs(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            AcquisitionSummary,
+            _AcquisitionPlan,
+            _AcquireOps,
+            _RuntimeState,
+            _run_acquisition,
+        )
+
+        state = {"phase": "DESIGN_ACCEPTED"}
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        summary = AcquisitionSummary(
+            contract_sha256="a" * 64,
+            query_batch_sha256s=("c" * 64, "d" * 64),
+            promoted=0,
+            fetched=2,
+            planned_promoted=0,
+            planned_fetch_required=1,
+            resumed=0,
+            quarantined=0,
+            pending=0,
+            network_attempts=2,
+        )
+
+        @contextmanager
+        def lock(_request):
+            yield
+
+        def begin(_request, _plan, _runtime):
+            state["phase"] = "ACQUIRING"
+
+        def stages(request, _plan):
+            self.assertEqual(request.stop_after, "reference-inputs")
+            self.assertEqual(state["phase"], "ACQUIRING")
+            return summary
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=False),
+                root=root,
+                stop_after="reference-inputs",
+            )
+            actual = _run_acquisition(
+                request,
+                _AcquireOps(
+                    authenticate=lambda _request: plan,
+                    runner_lock=lock,
+                    inspect_runtime=lambda _request, _plan: _RuntimeState(
+                        "DESIGN_ACCEPTED", False
+                    ),
+                    begin_runtime=begin,
+                    run_stages=stages,
+                ),
+            )
+            timezone_root = root / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
+            self.assertFalse(timezone_root.exists())
+        self.assertEqual(actual, summary)
+        self.assertEqual(state["phase"], "ACQUIRING")
+
+    def test_shared_disk_budget_prevents_cross_pool_overcommit_and_releases(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _AcquisitionPlan,
+            _DiskBudget,
+            _execute_stage,
+        )
+
+        queries = tuple(
+            dataclasses.replace(
+                _query(),
+                parameters={"season": year, "sportId": 1},
+                requested_range={"year": year},
+            )
+            for year in range(2020, 2023)
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
+        request = self._request(plan_only=False, resume=True)
+        max_bytes = fetch_limits(queries[0]).max_bytes
+        budget = _DiskBudget(
+            request,
+            free_bytes=lambda _root: request.reserve_bytes + max_bytes,
+        )
+        fetch_calls = 0
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                **values,
+            )
+            checkpoints.append(result)
+            return result
+
+        def acquire(store, item, parser, **kwargs):
+            nonlocal fetch_calls
+            kwargs["before_network"](item)
+            fetch_calls += 1
+            time.sleep(0.08)
+            capture = kwargs["fetcher"](
+                item,
+                timeout=kwargs["limits"].timeout,
+                max_bytes=kwargs["limits"].max_bytes,
+            )
+            assert capture.body is not None
+            with store.acquire_query(item) as lease:
+                return store.publish_fetched(
+                    item,
+                    store.next_attempt_number(lease),
+                    capture,
+                    parser(capture.body, item),
+                )
+
+        def gate(*_args, disk_budget, **_kwargs):
+            self.assertIs(disk_budget, budget)
+            disk_budget.recheck()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with self.assertRaisesRegex(OperationalBlock, "free-space"):
+                _execute_stage(
+                    request,
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda query, **_kwargs: dataclasses.replace(
+                        _capture(), final_url=query.endpoint
+                    ),
+                    checkpoint_publisher=publish,
+                    query_acquirer=acquire,
+                    parser=lambda _raw, _query: {},
+                    network_gate=gate,
+                    disk_budget=budget,
+                )
+        self.assertEqual(fetch_calls, 1)
+        self.assertEqual(budget.peak_reserved_bytes, max_bytes)
+        self.assertEqual(budget.reserved_bytes, 0)
+        self.assertEqual(len(checkpoints), 1)
+
+    def test_disk_budget_stays_reserved_across_retries_and_releases_on_errors(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            SplitRequired,
+            TerminalAcquisitionFailure,
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _DiskBudget,
+            _execute_stage,
+        )
+
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        max_bytes = fetch_limits(query).max_bytes
+
+        error_cases = (
+            (SplitRequired("TIMEOUT", 6), TrustIntegrityError),
+            (TerminalAcquisitionFailure("PERMANENT_NETWORK", 6), OperationalBlock),
+            (RuntimeError("worker bug"), RuntimeError),
+        )
+        for error, expected in error_cases:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                budget = _DiskBudget(
+                    request,
+                    free_bytes=lambda _root: request.reserve_bytes + max_bytes,
+                )
+                store = V52EvidenceStore(Path(directory).resolve() / "raw")
+                checkpoints: list[SimpleNamespace] = []
+
+                def publish(**values):
+                    result = SimpleNamespace(
+                        receipt_sha256=f"{len(checkpoints) + 1:064x}",
+                        **values,
+                    )
+                    checkpoints.append(result)
+                    return result
+
+                def fail(*_args, **_kwargs):
+                    self.assertEqual(budget.reserved_bytes, max_bytes)
+                    raise error
+
+                with self.assertRaises(expected):
+                    _execute_stage(
+                        request,
+                        _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                        store,
+                        stage="STATIC_SCHEDULES",
+                        batches=(batch,),
+                        stage_evidence=(),
+                        expected_prior=None,
+                        fetcher=lambda *_args, **_kwargs: self.fail("error fetched"),
+                        checkpoint_publisher=publish,
+                        query_acquirer=fail,
+                        parser=lambda _raw, _query: {},
+                        network_gate=lambda *_args, **_kwargs: None,
+                        disk_budget=budget,
+                    )
+                self.assertEqual(budget.reserved_bytes, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            budget = _DiskBudget(
+                request,
+                free_bytes=lambda _root: request.reserve_bytes + max_bytes,
+            )
+            store = V52EvidenceStore(Path(directory).resolve() / "retry")
+            checkpoints = []
+
+            def publish_retry(**values):
+                result = SimpleNamespace(
+                    receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+                )
+                checkpoints.append(result)
+                return result
+
+            def retry(store, item, parser, **kwargs):
+                for _ in range(2):
+                    self.assertEqual(budget.reserved_bytes, max_bytes)
+                    kwargs["before_network"](item)
+                raw = b"{}"
+                with store.acquire_query(item) as lease:
+                    return store.publish_fetched(
+                        item,
+                        store.next_attempt_number(lease),
+                        _capture(raw),
+                        parser(raw, item),
+                    )
+
+            def retry_gate(*_args, disk_budget, **_kwargs):
+                self.assertIs(disk_budget, budget)
+                disk_budget.recheck()
+
+            result = _execute_stage(
+                request,
+                _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                store,
+                stage="STATIC_SCHEDULES",
+                batches=(batch,),
+                stage_evidence=(),
+                expected_prior=None,
+                fetcher=lambda *_args, **_kwargs: self.fail("retry fake fetched"),
+                checkpoint_publisher=publish_retry,
+                query_acquirer=retry,
+                parser=lambda _raw, _query: {},
+                network_gate=retry_gate,
+                disk_budget=budget,
+            )
+        self.assertEqual(result.network_attempts, 0)
+        self.assertEqual(budget.reserved_bytes, 0)
+
+    def test_exhausted_dangling_reservations_checkpoint_and_report_pending(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            _AcquisitionPlan,
+            _DiskBudget,
+            _execute_stage,
+        )
+
+        query = _query()
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        max_bytes = fetch_limits(query).max_bytes
+        budget = _DiskBudget(
+            request,
+            free_bytes=lambda _root: request.reserve_bytes + max_bytes,
+        )
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
+            checkpoints.append(result)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            with store.acquire_query(query) as lease:
+                self.assertEqual(
+                    tuple(store.next_attempt_number(lease) for _ in range(6)),
+                    (1, 2, 3, 4, 5, 6),
+                )
+            with self.assertRaisesRegex(
+                OperationalBlock,
+                "^STATIC_SCHEDULES contains pending query evidence$",
+            ):
+                _execute_stage(
+                    request,
+                    _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",)),
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail("exhausted fetched"),
+                    checkpoint_publisher=publish,
+                    parser=lambda _raw, _query: {},
+                    network_gate=lambda *_args, **_kwargs: self.fail(
+                        "exhausted gated"
+                    ),
+                    disk_budget=budget,
+                )
+        self.assertEqual(len(checkpoints), 2)
+        self.assertEqual(checkpoints[-1].pending_query_ids, (logical_query_id(query),))
+        self.assertEqual(checkpoints[-1].quarantined_query_ids, ())
+        self.assertEqual(budget.reserved_bytes, 0)
 
     def test_cli_exit_taxonomy_and_canonical_plan_json(self) -> None:
         from mlb_backtest.v52_acquire import (

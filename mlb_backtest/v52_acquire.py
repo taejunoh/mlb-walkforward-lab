@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import fcntl
 import hashlib
@@ -11,13 +12,16 @@ import os
 import shutil
 import stat
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import ContextManager, Literal
+from typing import ContextManager, Literal, TypeVar
+from urllib.parse import urlparse
 
 from .protocols import RunSpec, load_run_spec
 from .v52_evidence import (
@@ -52,6 +56,12 @@ _ACQUISITION_CONTRACT_RELATIVE = Path(
 )
 _LEGACY_ROOT_RELATIVE = Path("data/v5_1_bt/raw")
 _PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
+_SCHEDULE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
+)
+_SCHEDULE_INVENTORY_SCHEMA_RELATIVE = Path(
+    "schemas/v5_2_schedule_anchor_inventory.schema.json"
+)
 _DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -63,6 +73,100 @@ _RUNNER_LOCK_RELATIVE = Path(
 )
 _MINIMUM_RESERVE_BYTES = 20 * 1024**3
 _EXPECTED_YEARS = range(2018, 2025)
+_HOST_WORKERS = {
+    "baseballsavant.mlb.com": 1,
+    "statsapi.mlb.com": 2,
+}
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _RunnerGuard:
+    descriptor: int
+    parent_descriptor: int
+    root: Path
+
+
+class _DiskBudget:
+    def __init__(
+        self,
+        request: _AcquisitionRequest,
+        *,
+        free_bytes: Callable[[Path], int] | None = None,
+    ) -> None:
+        self._root = Path(os.path.abspath(os.fspath(request.root)))
+        self._reserve_bytes = request.reserve_bytes
+        self._free_bytes = (
+            (lambda root: shutil.disk_usage(root).free)
+            if free_bytes is None
+            else free_bytes
+        )
+        self._lock = threading.Lock()
+        self._reserved_bytes = 0
+        self._peak_reserved_bytes = 0
+
+    @property
+    def reserved_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes
+
+    @property
+    def peak_reserved_bytes(self) -> int:
+        with self._lock:
+            return self._peak_reserved_bytes
+
+    def _current_free_locked(self) -> int:
+        try:
+            free = self._free_bytes(self._root)
+        except OSError as exc:
+            raise OperationalBlock("free-space reserve is unavailable") from exc
+        if isinstance(free, bool) or not isinstance(free, int) or free < 0:
+            raise TrustIntegrityError("free-space measurement differs")
+        return free
+
+    @contextmanager
+    def reserve(self, query: LogicalQuery) -> Iterator[None]:
+        amount = fetch_limits(query).max_bytes
+        with self._lock:
+            free = self._current_free_locked()
+            required = self._reserve_bytes + self._reserved_bytes + amount
+            if free < required:
+                raise OperationalBlock(
+                    "free-space reserve would be violated by concurrent fetch"
+                )
+            self._reserved_bytes += amount
+            self._peak_reserved_bytes = max(
+                self._peak_reserved_bytes,
+                self._reserved_bytes,
+            )
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._reserved_bytes -= amount
+                if self._reserved_bytes < 0:
+                    raise AssertionError("disk reservation underflow")
+
+    def recheck(self) -> None:
+        with self._lock:
+            free = self._current_free_locked()
+            if free < self._reserve_bytes + self._reserved_bytes:
+                raise OperationalBlock(
+                    "free-space reserve would be violated by active fetches"
+                )
+
+
+def _integrity_boundary(label: str, operation: Callable[[], _T]) -> _T:
+    try:
+        return operation()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise TrustIntegrityError(f"{label} integrity verification failed") from exc
+
+
+_ACTIVE_RUNNER: ContextVar[_RunnerGuard | None] = ContextVar(
+    "v52_active_acquisition_runner",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -572,6 +676,7 @@ class _AcquisitionRequest:
     protected_inventory_path: Path
     reserve_bytes: int
     plan_only: bool
+    fetcher: Callable[..., AttemptCapture] = fetch_attempt
 
 
 @dataclass(frozen=True)
@@ -587,6 +692,13 @@ class _RuntimeState:
     has_progress: bool
 
 
+def _stages_unavailable(
+    _request: _AcquisitionRequest,
+    _plan: _AcquisitionPlan,
+) -> AcquisitionSummary:
+    raise OperationalBlock("reference stages unavailable")
+
+
 @dataclass(frozen=True)
 class _AcquireOps:
     authenticate: Callable[[_AcquisitionRequest], _AcquisitionPlan]
@@ -595,6 +707,9 @@ class _AcquireOps:
     begin_runtime: Callable[
         [_AcquisitionRequest, _AcquisitionPlan, _RuntimeState], None
     ]
+    run_stages: Callable[
+        [_AcquisitionRequest, _AcquisitionPlan], AcquisitionSummary
+    ] = _stages_unavailable
 
 
 def _summary_for_plan(plan: _AcquisitionPlan) -> AcquisitionSummary:
@@ -665,7 +780,10 @@ def _run_acquisition(
         if runtime.phase not in {None, "DESIGN_ACCEPTED", "ACQUIRING"}:
             raise TrustIntegrityError("execution phase authority differs")
         ops.begin_runtime(request, plan, runtime)
-        raise OperationalBlock("stage orchestration pending")
+        summary = ops.run_stages(request, plan)
+        if not isinstance(summary, AcquisitionSummary):
+            raise TypeError("stage runner must return an AcquisitionSummary")
+        return summary
 
 
 def _absolute_supplied(path: Path, root: Path) -> Path:
@@ -972,12 +1090,741 @@ def _real_runner_lock(request: _AcquisitionRequest) -> Iterator[None]:
             _validate_runner_lock(descriptor, parent_descriptor)
             _acquire_runner_flock(descriptor)
             _validate_runner_lock(descriptor, parent_descriptor)
+            token = _ACTIVE_RUNNER.set(
+                _RunnerGuard(descriptor, parent_descriptor, root)
+            )
             try:
                 yield
             finally:
-                _validate_runner_lock(descriptor, parent_descriptor)
+                try:
+                    _validate_runner_lock(descriptor, parent_descriptor)
+                finally:
+                    _ACTIVE_RUNNER.reset(token)
         finally:
             os.close(descriptor)
+
+
+def _validate_active_runner(
+    request: _AcquisitionRequest,
+    runner_guard: _RunnerGuard | None = None,
+) -> None:
+    binding = _ACTIVE_RUNNER.get() if runner_guard is None else runner_guard
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    if binding is None or binding.root != root:
+        raise TrustIntegrityError("active runner identity is unavailable")
+    _validate_runner_lock(binding.descriptor, binding.parent_descriptor)
+
+
+def _current_runner_guard(request: _AcquisitionRequest) -> _RunnerGuard:
+    guard = _ACTIVE_RUNNER.get()
+    _validate_active_runner(request, guard)
+    assert guard is not None
+    return guard
+
+
+def _real_before_network(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+    *,
+    stage: str,
+    query_batch_ids: tuple[str, ...],
+    query: LogicalQuery,
+    runner_guard: _RunnerGuard | None = None,
+    disk_budget: _DiskBudget | None = None,
+) -> None:
+    from .execution_registry import (
+        load_execution_registry,
+        load_latest_acquisition_checkpoint,
+    )
+    from .v52_query_plan import load_query_batch
+
+    if _real_authenticate(request) != plan:
+        raise TrustIntegrityError("acquisition authority changed before fetch")
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    try:
+        registry = load_execution_registry(root, request.run_spec)
+        checkpoint = load_latest_acquisition_checkpoint(root, request.run_spec)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise TrustIntegrityError("fetch checkpoint authority is unavailable") from exc
+    query_id = logical_query_id(query)
+    if (
+        registry.phase != "ACQUIRING"
+        or checkpoint is None
+        or checkpoint.stage != stage
+        or checkpoint.query_batch_ids != query_batch_ids
+        or query_id not in checkpoint.pending_query_ids
+    ):
+        raise TrustIntegrityError("query is not pending under current checkpoint authority")
+    occurrences = 0
+    try:
+        for batch_id in query_batch_ids:
+            batch = load_query_batch(root, batch_id)
+            occurrences += sum(item == query for item in batch.queries)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise TrustIntegrityError("query batch authority changed before fetch") from exc
+    if occurrences != 1:
+        raise TrustIntegrityError("pending query batch membership differs")
+    _validate_active_runner(request, runner_guard)
+    if disk_budget is not None:
+        disk_budget.recheck()
+        return
+    required = request.reserve_bytes + fetch_limits(query).max_bytes
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError as exc:
+        raise OperationalBlock("free-space reserve is unavailable") from exc
+    if free < required:
+        raise OperationalBlock("free-space reserve would be violated by fetch")
+
+
+@dataclass(frozen=True)
+class _StageResult:
+    checkpoint: object
+    fetched: int
+    resumed: int
+    network_attempts: int
+
+
+class _StageStopped(BaseException):
+    """Internal cooperative stop signal; never exposed as a stage outcome."""
+
+
+@dataclass(frozen=True)
+class _StageFailure:
+    query_id: str
+    submission_index: int
+    error: BaseException
+
+
+def _stage_failure_rank(error: BaseException) -> int:
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return 0
+    if not isinstance(
+        error,
+        (
+            TrustIntegrityError,
+            SplitRequired,
+            OperationalBlock,
+            TerminalAcquisitionFailure,
+        ),
+    ):
+        return 1
+    if isinstance(error, TrustIntegrityError):
+        return 2
+    if isinstance(error, SplitRequired):
+        return 3
+    if isinstance(error, OperationalBlock):
+        return 4
+    return 5
+
+
+def _is_fatal_stage_error(error: BaseException) -> bool:
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return True
+    return not isinstance(
+        error,
+        (
+            _StageStopped,
+            TrustIntegrityError,
+            SplitRequired,
+            OperationalBlock,
+            TerminalAcquisitionFailure,
+        ),
+    )
+
+
+def _select_stage_failure(failures: Sequence[_StageFailure]) -> _StageFailure | None:
+    if not failures:
+        return None
+    return min(
+        failures,
+        key=lambda failure: (
+            _stage_failure_rank(failure.error),
+            failure.query_id,
+            failure.submission_index,
+        ),
+    )
+
+
+def _stage_populations(
+    store: V52EvidenceStore,
+    batches: Sequence[object],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    completed: list[str] = []
+    pending: list[str] = []
+    quarantined: list[str] = []
+    seen: set[str] = set()
+    for batch in batches:
+        queries = getattr(batch, "queries", None)
+        if not isinstance(queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in queries
+        ):
+            raise TypeError("stage batch queries must be a LogicalQuery tuple")
+        for query in queries:
+            query_id = logical_query_id(query)
+            if query_id in seen:
+                raise TrustIntegrityError("stage query occurs in multiple batches")
+            seen.add(query_id)
+            progress = _integrity_boundary(
+                "query evidence replay",
+                lambda query=query: store.read_verified_query_progress(query),
+            )
+            if progress.status == "SUCCESS":
+                completed.append(query_id)
+            elif progress.status == "QUARANTINED":
+                quarantined.append(query_id)
+            else:
+                pending.append(query_id)
+    return tuple(sorted(completed)), tuple(sorted(pending)), tuple(sorted(quarantined))
+
+
+def _query_host(query: LogicalQuery) -> str | None:
+    if query.endpoint.startswith("disposition://"):
+        return None
+    parsed = urlparse(query.endpoint)
+    if parsed.scheme != "https" or parsed.hostname not in _HOST_WORKERS:
+        raise TrustIntegrityError("query host is outside the frozen acquisition pools")
+    return parsed.hostname
+
+
+def _execute_stage(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+    store: V52EvidenceStore,
+    *,
+    stage: str,
+    batches: Sequence[object],
+    active_batches: Sequence[object] | None = None,
+    stage_evidence: Sequence[Path],
+    expected_prior: str | None,
+    fetcher: Callable[..., AttemptCapture],
+    checkpoint_publisher: Callable[..., object] | None = None,
+    query_acquirer: Callable[..., PublishedEvidence] = acquire_with_retries,
+    parser: Callable[[bytes, LogicalQuery], Mapping[str, object]] | None = None,
+    network_gate: Callable[..., None] = _real_before_network,
+    runner_guard: _RunnerGuard | None = None,
+    disk_budget: _DiskBudget | None = None,
+) -> _StageResult:
+    from .execution_registry import publish_acquisition_checkpoint
+    from .v52_source_contracts import recompute_query_sidecar
+
+    if not isinstance(store, V52EvidenceStore):
+        raise TypeError("store must be a V52EvidenceStore")
+    batch_ids = tuple(getattr(batch, "batch_id", None) for batch in batches)
+    if not batch_ids or any(not isinstance(value, str) for value in batch_ids):
+        raise TypeError("stage batches must expose batch IDs")
+    selected_parser = (
+        (lambda raw, query: recompute_query_sidecar(query, raw))
+        if parser is None
+        else parser
+    )
+
+    def publish(prior: str | None) -> object:
+        completed, pending, quarantined = _stage_populations(store, batches)
+        values = {
+            "expected_prior_checkpoint_sha256": prior,
+            "stage": stage,
+            "query_batch_ids": batch_ids,
+            "completed_query_ids": completed,
+            "pending_query_ids": pending,
+            "quarantined_query_ids": quarantined,
+            "split_query_ids": (),
+            "stage_evidence_receipts": tuple(stage_evidence),
+            "split_receipt_paths": (),
+        }
+        if checkpoint_publisher is not None:
+            return checkpoint_publisher(**values)
+        return _integrity_boundary(
+            "acquisition checkpoint",
+            lambda: publish_acquisition_checkpoint(
+                request.root,
+                request.run_spec,
+                **values,
+            ),
+        )
+
+    selected_active_batches = batches if active_batches is None else active_batches
+    if any(batch not in batches for batch in selected_active_batches):
+        raise TrustIntegrityError("active stage batches differ from checkpoint batches")
+    active_queries = tuple(
+        query for batch in selected_active_batches for query in batch.queries
+    )
+    routes = {logical_query_id(query): _query_host(query) for query in active_queries}
+
+    checkpoint = publish(expected_prior)
+    prior = getattr(checkpoint, "receipt_sha256", None)
+    if not isinstance(prior, str):
+        raise TypeError("checkpoint publisher must return a receipt SHA-256")
+    if getattr(checkpoint, "quarantined_query_ids", ()):
+        raise OperationalBlock(f"{stage} contains quarantined query evidence")
+
+    resumed = 0
+    derived: list[LogicalQuery] = []
+    by_host: dict[str, list[LogicalQuery]] = {host: [] for host in _HOST_WORKERS}
+    for query in active_queries:
+        progress = _integrity_boundary(
+            "query evidence replay",
+            lambda query=query: store.read_verified_query_progress(query),
+        )
+        if progress.status == "SUCCESS":
+            resumed += 1
+        elif progress.status == "QUARANTINED":
+            raise OperationalBlock(f"{stage} contains quarantined query evidence")
+        elif routes[logical_query_id(query)] is None:
+            derived.append(query)
+        else:
+            host = routes[logical_query_id(query)]
+            assert isinstance(host, str)
+            by_host[host].append(query)
+
+    network_attempts = 0
+    attempts_by_query: dict[str, int] = {}
+    counter_lock = threading.Lock()
+    stop = threading.Event()
+
+    def check_stop() -> None:
+        if stop.is_set():
+            raise _StageStopped()
+
+    def stop_aware_sleep(seconds: float) -> None:
+        if stop.wait(seconds):
+            raise _StageStopped()
+
+    def counted_fetcher(
+        query: LogicalQuery,
+        *,
+        timeout: float,
+        max_bytes: int,
+    ) -> AttemptCapture:
+        nonlocal network_attempts
+        check_stop()
+        query_id = logical_query_id(query)
+        with counter_lock:
+            check_stop()
+            network_attempts += 1
+            attempts_by_query[query_id] = attempts_by_query.get(query_id, 0) + 1
+        try:
+            check_stop()
+        except _StageStopped:
+            with counter_lock:
+                network_attempts -= 1
+                attempts_by_query[query_id] -= 1
+            raise
+        return fetcher(query, timeout=timeout, max_bytes=max_bytes)
+
+    for query in derived:
+        semantics = dict(selected_parser(b"", query))
+        semantics["reason"] = query.requested_range.get("reason")
+
+        def publish_derived() -> PublishedEvidence:
+            with store.acquire_query(query):
+                return store.publish_derived_disposition(query, semantics)
+
+        _integrity_boundary("derived disposition", publish_derived)
+
+    def guarded_gate(item: LogicalQuery) -> None:
+        check_stop()
+        network_gate(
+            request,
+            plan,
+            stage=stage,
+            query_batch_ids=batch_ids,
+            query=item,
+            runner_guard=runner_guard,
+            disk_budget=disk_budget,
+        )
+
+    def acquire_reserved(query: LogicalQuery) -> bool:
+        query_acquirer(
+            store,
+            query,
+            selected_parser,
+            policy=RetryPolicy(),
+            limits=fetch_limits(query),
+            before_network=guarded_gate,
+            fetcher=counted_fetcher,
+            sleeper=stop_aware_sleep,
+        )
+        progress = _integrity_boundary(
+            "query evidence replay",
+            lambda: store.read_verified_query_progress(query),
+        )
+        if progress.status != "SUCCESS":
+            raise RuntimeError("query acquirer returned without verified success")
+        with counter_lock:
+            return attempts_by_query.get(logical_query_id(query), 0) > 0
+
+    def acquire_one(query: LogicalQuery) -> bool:
+        check_stop()
+        if disk_budget is None:
+            return acquire_reserved(query)
+        with disk_budget.reserve(query):
+            check_stop()
+            return acquire_reserved(query)
+
+    def run_one(query: LogicalQuery) -> bool:
+        try:
+            return acquire_one(query)
+        except BaseException as error:
+            if _is_fatal_stage_error(error):
+                stop.set()
+            raise
+
+    futures: list[concurrent.futures.Future[bool]] = []
+    submissions: dict[concurrent.futures.Future[bool], tuple[str, int]] = {}
+    executors: list[concurrent.futures.ThreadPoolExecutor] = []
+    coordinator_error: BaseException | None = None
+
+    def cancel_all() -> None:
+        for future in futures:
+            future.cancel()
+
+    try:
+        submission_index = 0
+        for host, queries in by_host.items():
+            if not queries:
+                continue
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_HOST_WORKERS[host],
+                thread_name_prefix=f"v52-{host}",
+            )
+            executors.append(executor)
+            for query in queries:
+                future = executor.submit(run_one, query)
+                futures.append(future)
+                submissions[future] = (logical_query_id(query), submission_index)
+                submission_index += 1
+        for future in concurrent.futures.as_completed(futures):
+            if future.cancelled():
+                continue
+            error = future.exception()
+            if stop.is_set() or (
+                error is not None and _is_fatal_stage_error(error)
+            ):
+                stop.set()
+                cancel_all()
+                break
+    except BaseException as error:
+        coordinator_error = error
+        stop.set()
+        cancel_all()
+    finally:
+        if stop.is_set():
+            cancel_all()
+        for executor in executors:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    if coordinator_error is not None:
+        raise coordinator_error
+
+    results: list[bool] = []
+    failures: list[_StageFailure] = []
+    for future, (query_id, index) in submissions.items():
+        if future.cancelled():
+            continue
+        error = future.exception()
+        if error is None:
+            results.append(future.result())
+        elif not isinstance(error, _StageStopped):
+            failures.append(_StageFailure(query_id, index, error))
+
+    selected_failure = _select_stage_failure(failures)
+    if selected_failure is not None and not isinstance(
+        selected_failure.error,
+        TerminalAcquisitionFailure,
+    ):
+        if isinstance(selected_failure.error, SplitRequired):
+            raise TrustIntegrityError(
+                f"{stage} cannot split a query"
+            ) from selected_failure.error
+        raise selected_failure.error
+    if selected_failure is not None:
+        terminal_checkpoint = publish(prior)
+        if getattr(terminal_checkpoint, "quarantined_query_ids", ()):
+            message = f"{stage} contains quarantined query evidence"
+        elif getattr(terminal_checkpoint, "pending_query_ids", ()):
+            message = f"{stage} contains pending query evidence"
+        else:
+            raise TrustIntegrityError(
+                f"{stage} terminal failure has no bound query status"
+            ) from selected_failure.error
+        raise OperationalBlock(message) from selected_failure.error
+
+    if not derived and not futures:
+        return _StageResult(
+            checkpoint=checkpoint,
+            fetched=0,
+            resumed=resumed,
+            network_attempts=network_attempts,
+        )
+    checkpoint = publish(prior)
+    completed, pending, quarantined = _stage_populations(store, batches)
+    if pending or quarantined:
+        raise OperationalBlock(f"{stage} is not terminal")
+    return _StageResult(
+        checkpoint=checkpoint,
+        fetched=sum(results),
+        resumed=resumed,
+        network_attempts=network_attempts,
+    )
+
+
+def _ensure_canonical_raw_parent(request: _AcquisitionRequest) -> Path:
+    namespaces = request.run_spec.raw.get("namespaces")
+    raw_value = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    relative = Path(raw_value) if isinstance(raw_value, str) else Path()
+    expected = Path("data/v5_2_qd/historical/raw")
+    if relative != expected:
+        raise TrustIntegrityError("raw evidence namespace differs")
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, flags)
+        descriptors.append(current)
+        for component in relative.parent.parts:
+            try:
+                os.mkdir(component, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            child = os.open(component, flags, dir_fd=current)
+            opened = os.fstat(child)
+            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or not _same_identity(opened, linked)
+            ):
+                os.close(child)
+                raise TrustIntegrityError("raw evidence parent identity differs")
+            descriptors.append(child)
+            current = child
+        return root / relative
+    except TrustIntegrityError:
+        raise
+    except OSError as exc:
+        raise TrustIntegrityError("raw evidence parent is unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _validate_schedule_inventory_schema(root: Path, inventory: object) -> None:
+    import jsonschema
+
+    expected_path = root / _SCHEDULE_INVENTORY_RELATIVE
+    if getattr(inventory, "path", None) != expected_path:
+        raise TrustIntegrityError("schedule inventory path differs")
+    schema_path = _require_exact_path(
+        root,
+        root / _SCHEDULE_INVENTORY_SCHEMA_RELATIVE,
+        _SCHEDULE_INVENTORY_SCHEMA_RELATIVE,
+        "schedule inventory schema",
+    )
+    schema, _ = _read_canonical_object(schema_path, "schedule inventory schema")
+    payload, contents = _read_canonical_object(expected_path, "schedule inventory")
+    if hashlib.sha256(contents).hexdigest() != getattr(inventory, "sha256", None):
+        raise TrustIntegrityError("schedule inventory hash differs")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(schema).validate(payload)
+    except (jsonschema.SchemaError, jsonschema.ValidationError) as exc:
+        raise TrustIntegrityError("schedule inventory schema validation failed") from exc
+
+
+def _real_run_stages(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+) -> AcquisitionSummary:
+    from .execution_registry import load_latest_acquisition_checkpoint
+    from .v52_query_plan import (
+        build_schedule_reference_batch,
+        build_static_batch,
+        load_query_batch,
+        publish_query_batch,
+    )
+    from .v52_schedule_inventory import (
+        load_verified_schedule_anchor_inventory,
+        publish_schedule_anchor_inventory,
+    )
+
+    if _real_authenticate(request) != plan:
+        raise TrustIntegrityError("acquisition authority changed before stage execution")
+    runner_guard = _current_runner_guard(request)
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    evidence_root = _ensure_canonical_raw_parent(request)
+    store = _integrity_boundary(
+        "raw evidence store",
+        lambda: V52EvidenceStore(evidence_root),
+    )
+    disk_budget = _DiskBudget(request)
+    latest = _integrity_boundary(
+        "acquisition checkpoint replay",
+        lambda: load_latest_acquisition_checkpoint(root, request.run_spec),
+    )
+    if latest is not None and latest.stage not in {
+        "STATIC_SCHEDULES",
+        "REFERENCE_INPUTS",
+    }:
+        raise OperationalBlock("later acquisition stages are outside C2b")
+
+    static = _integrity_boundary(
+        "static query batch",
+        lambda: build_static_batch(
+            root / _RUN_SPEC_RELATIVE,
+            root / _ACQUISITION_CONTRACT_RELATIVE,
+        ),
+    )
+    fetched = 0
+    resumed = 0
+    network_attempts = 0
+    if latest is None or latest.stage == "STATIC_SCHEDULES":
+        _integrity_boundary(
+            "static query batch publication",
+            lambda: publish_query_batch(root, static),
+        )
+        static_result = _execute_stage(
+            request,
+            plan,
+            store,
+            stage="STATIC_SCHEDULES",
+            batches=(static,),
+            stage_evidence=(),
+            expected_prior=(
+                None if latest is None else latest.receipt_sha256
+            ),
+            fetcher=request.fetcher,
+            runner_guard=runner_guard,
+            disk_budget=disk_budget,
+        )
+        latest = static_result.checkpoint
+        fetched += static_result.fetched
+        resumed += static_result.resumed
+        network_attempts += static_result.network_attempts
+    else:
+        persisted_static = _integrity_boundary(
+            "static query batch replay",
+            lambda: load_query_batch(root, static.batch_id),
+        )
+        if persisted_static != static:
+            raise TrustIntegrityError("persisted static batch authority differs")
+        resumed += len(static.queries)
+
+    if (
+        latest is None
+        or latest.stage not in {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}
+        or latest.pending_query_ids
+        and latest.stage == "STATIC_SCHEDULES"
+        or latest.quarantined_query_ids
+        or latest.split_query_ids
+    ):
+        raise OperationalBlock("STATIC_SCHEDULES is not terminal")
+
+    inventory_kwargs = {
+        "acquisition_contract_path": root / _ACQUISITION_CONTRACT_RELATIVE,
+        "static_batch_id": static.batch_id,
+        "evidence_root": evidence_root,
+    }
+    if latest.stage == "REFERENCE_INPUTS":
+        inventory = _integrity_boundary(
+            "schedule inventory replay",
+            lambda: load_verified_schedule_anchor_inventory(
+                root,
+                request.run_spec,
+                **inventory_kwargs,
+            ),
+        )
+    else:
+        inventory = _integrity_boundary(
+            "schedule inventory publication",
+            lambda: publish_schedule_anchor_inventory(
+                root,
+                request.run_spec,
+                **inventory_kwargs,
+            ),
+        )
+    _validate_schedule_inventory_schema(root, inventory)
+    reference = _integrity_boundary(
+        "reference query batch",
+        lambda: build_schedule_reference_batch(
+            root,
+            root / _RUN_SPEC_RELATIVE,
+            acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+            static_batch_id=static.batch_id,
+            evidence_root=evidence_root,
+        ),
+    )
+    if reference.derived_from_sha256 != inventory.sha256:
+        raise TrustIntegrityError("reference batch schedule inventory binding differs")
+
+    if latest.stage == "REFERENCE_INPUTS":
+        persisted_reference = _integrity_boundary(
+            "reference query batch replay",
+            lambda: load_query_batch(root, reference.batch_id),
+        )
+        if persisted_reference != reference:
+            raise TrustIntegrityError("persisted reference batch authority differs")
+    else:
+        _integrity_boundary(
+            "reference query batch publication",
+            lambda: publish_query_batch(root, reference),
+        )
+
+    cumulative_batches = (static, reference)
+    cumulative_ids = tuple(
+        sorted(logical_query_id(query) for batch in cumulative_batches for query in batch.queries)
+    )
+    terminal_reference = (
+        latest.stage == "REFERENCE_INPUTS"
+        and latest.query_batch_ids == (static.batch_id, reference.batch_id)
+        and latest.completed_query_ids == cumulative_ids
+        and not latest.pending_query_ids
+        and not latest.quarantined_query_ids
+        and not latest.split_query_ids
+    )
+    if terminal_reference:
+        completed, pending, quarantined = _stage_populations(store, cumulative_batches)
+        if completed != cumulative_ids or pending or quarantined:
+            raise TrustIntegrityError("terminal reference evidence replay differs")
+        resumed += len(reference.queries)
+    else:
+        if latest.stage == "REFERENCE_INPUTS" and latest.query_batch_ids != (
+            static.batch_id,
+            reference.batch_id,
+        ):
+            raise TrustIntegrityError("reference checkpoint batch authority differs")
+        reference_result = _execute_stage(
+            request,
+            plan,
+            store,
+            stage="REFERENCE_INPUTS",
+            batches=cumulative_batches,
+            active_batches=(reference,),
+            stage_evidence=(inventory.path,),
+            expected_prior=latest.receipt_sha256,
+            fetcher=request.fetcher,
+            runner_guard=runner_guard,
+            disk_budget=disk_budget,
+        )
+        latest = reference_result.checkpoint
+        fetched += reference_result.fetched
+        resumed += reference_result.resumed
+        network_attempts += reference_result.network_attempts
+
+    if request.stop_after != "reference-inputs":
+        raise OperationalBlock("TIMEZONE_REVIEW orchestration is pending")
+    return AcquisitionSummary(
+        contract_sha256=plan.contract_sha256,
+        query_batch_sha256s=(static.batch_id, reference.batch_id),
+        promoted=0,
+        fetched=fetched,
+        planned_promoted=plan.legacy_dispositions.count("PROMOTED"),
+        planned_fetch_required=plan.legacy_dispositions.count("FETCH_REQUIRED"),
+        resumed=resumed,
+        quarantined=0,
+        pending=0,
+        network_attempts=network_attempts,
+    )
 
 
 def _real_inspect_runtime(
@@ -989,7 +1836,6 @@ def _real_inspect_runtime(
     root = Path(os.path.abspath(os.fspath(request.root)))
     phase_root = root / "audit/v5_2_qd/historical/execution/phase_receipts"
     progress_paths = (
-        phase_root,
         root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints",
         root / "audit/v5_2_qd/historical/acquisition/query_batches",
         root / "data/v5_2_qd/historical/raw",
@@ -1054,6 +1900,7 @@ _REAL_OPS = _AcquireOps(
     runner_lock=_real_runner_lock,
     inspect_runtime=_real_inspect_runtime,
     begin_runtime=_real_begin_runtime,
+    run_stages=_real_run_stages,
 )
 
 
@@ -1084,6 +1931,7 @@ def acquire_sources(
         protected_inventory_path=Path(protected_inventory_path),
         reserve_bytes=reserve_bytes,
         plan_only=plan_only,
+        fetcher=fetcher,
     )
     return _run_acquisition(request, _REAL_OPS)
 
