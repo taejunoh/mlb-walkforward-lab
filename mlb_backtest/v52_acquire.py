@@ -1201,6 +1201,14 @@ class _StageResult:
     network_attempts: int
 
 
+@dataclass(frozen=True)
+class _RemainingWaveResult:
+    fetched: int
+    resumed: int
+    network_attempts: int
+    splits: tuple[tuple[str, SplitRequired], ...]
+
+
 class _StageStopped(BaseException):
     """Internal cooperative stop signal; never exposed as a stage outcome."""
 
@@ -1292,6 +1300,458 @@ def _stage_populations(
             else:
                 pending.append(query_id)
     return tuple(sorted(completed)), tuple(sorted(pending)), tuple(sorted(quarantined))
+
+
+def _remaining_stage_evidence(
+    root: Path,
+    participant_evidence: Sequence[Path],
+    statcast_root_batch_id: str,
+) -> tuple[Path, ...]:
+    if (
+        not isinstance(statcast_root_batch_id, str)
+        or len(statcast_root_batch_id) != 64
+        or any(character not in "0123456789abcdef" for character in statcast_root_batch_id)
+    ):
+        raise TrustIntegrityError("Statcast root batch ID differs")
+    root = Path(os.path.abspath(os.fspath(root)))
+    participant = tuple(Path(path) for path in participant_evidence)
+    if len(participant) != 7 or len(participant) != len(set(participant)):
+        raise TrustIntegrityError("participant stage evidence authority differs")
+    result = tuple(
+        sorted(
+            (
+                *participant,
+                root / _PROTECTED_INVENTORY_RELATIVE,
+                root
+                / "audit/v5_2_qd/historical/acquisition/legacy_decision_inventory.json",
+                root
+                / "audit/v5_2_qd/historical/acquisition/query_batches"
+                / f"{statcast_root_batch_id}.json",
+            ),
+            key=os.fspath,
+        )
+    )
+    if len(result) != 10 or len(result) != len(set(result)):
+        raise TrustIntegrityError("REMAINING stage evidence authority differs")
+    return result
+
+
+def _remaining_populations(
+    store: V52EvidenceStore,
+    batches: Sequence[object],
+    split_query_ids: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    split = tuple(sorted(split_query_ids))
+    if len(split) != len(set(split)):
+        raise TrustIntegrityError("REMAINING split population contains duplicates")
+    split_set = set(split)
+    completed: list[str] = []
+    pending: list[str] = []
+    quarantined: list[str] = []
+    seen: set[str] = set()
+    for batch in batches:
+        queries = getattr(batch, "queries", None)
+        if not isinstance(queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in queries
+        ):
+            raise TypeError("REMAINING batches must contain LogicalQuery tuples")
+        for query in queries:
+            query_id = logical_query_id(query)
+            if query_id in seen:
+                raise TrustIntegrityError("REMAINING query occurs in multiple batches")
+            seen.add(query_id)
+            if query_id in split_set:
+                continue
+            progress = _integrity_boundary(
+                "REMAINING query evidence replay",
+                lambda query=query: store.read_verified_query_progress(query),
+            )
+            if progress.status == "SUCCESS":
+                completed.append(query_id)
+            elif progress.status == "QUARANTINED":
+                quarantined.append(query_id)
+            else:
+                pending.append(query_id)
+    if not split_set <= seen:
+        raise TrustIntegrityError("REMAINING split parent is outside its batches")
+    return (
+        tuple(sorted(completed)),
+        tuple(sorted(pending)),
+        tuple(sorted(quarantined)),
+        split,
+    )
+
+
+def _closed_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _closed_value(child) for key, child in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_closed_value(child) for child in value]
+    return value
+
+
+def _validate_remaining_decisions(
+    partition_batch: object,
+    inventory: object,
+    catalog: object,
+) -> tuple[tuple[LogicalQuery, object], ...]:
+    from .v52_legacy import (
+        PromotionDisposition,
+        ProtectedLegacyCatalog,
+        audit_legacy_candidates_evidence,
+    )
+
+    queries = getattr(partition_batch, "queries", None)
+    payload = getattr(inventory, "payload", None)
+    if (
+        not isinstance(queries, tuple)
+        or len(queries) != 48
+        or any(not isinstance(query, LogicalQuery) for query in queries)
+        or not isinstance(payload, Mapping)
+        or not isinstance(catalog, ProtectedLegacyCatalog)
+    ):
+        raise TrustIntegrityError("REMAINING decision authority differs")
+    decisions = payload.get("decisions")
+    counts = payload.get("counts")
+    if (
+        not isinstance(decisions, tuple)
+        or len(decisions) != 48
+        or not all(isinstance(decision, Mapping) for decision in decisions)
+        or not isinstance(counts, Mapping)
+        or counts.get("promoted_count") != 1
+        or counts.get("fetch_required_count") != 47
+        or counts.get("fatal_integrity_count") != 0
+    ):
+        raise TrustIntegrityError("REMAINING decision counts differ")
+    sealed = {decision.get("candidate_query_id"): decision for decision in decisions}
+    query_ids = tuple(logical_query_id(query) for query in queries)
+    if len(sealed) != 48 or set(sealed) != set(query_ids):
+        raise TrustIntegrityError("REMAINING decision bijection differs")
+
+    try:
+        fresh = audit_legacy_candidates_evidence(queries, catalog)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise TrustIntegrityError("REMAINING fresh decision audit failed") from exc
+    promoted: list[tuple[LogicalQuery, object]] = []
+    dispositions = {"PROMOTED": 0, "FETCH_REQUIRED": 0}
+    for query, evidence in zip(queries, fresh, strict=True):
+        query_id = logical_query_id(query)
+        record = sealed[query_id]
+        disposition = evidence.decision.disposition.value
+        expected_acquisition = (
+            "PROTECTED_LEGACY_REFERENCE"
+            if disposition == "PROMOTED"
+            else "FETCH_REQUIRED"
+        )
+        requested = query.requested_range
+        expected_range = {
+            "year": requested.get("year"),
+            "start_date": requested.get("start_date"),
+            "end_date": requested.get("end_date"),
+        }
+        if (
+            disposition not in dispositions
+            or evidence.decision.query_id != query_id
+            or record.get("parent_query_id") != query.parent_query_id
+            or _closed_value(record.get("range")) != expected_range
+            or record.get("disposition") != disposition
+            or _closed_value(record.get("reason_codes"))
+            != [reason.value for reason in evidence.decision.reason_codes]
+            or _closed_value(record.get("candidate_lineage"))
+            != _closed_value(evidence.candidate_lineage)
+            or record.get("semantic_sha256") != evidence.semantic_sha256
+            or requested.get("acquisition") != expected_acquisition
+        ):
+            raise TrustIntegrityError("REMAINING sealed decision replay differs")
+        dispositions[disposition] += 1
+        if evidence.decision.disposition is PromotionDisposition.PROMOTED:
+            promoted.append((query, evidence.decision))
+    if dispositions != {"PROMOTED": 1, "FETCH_REQUIRED": 47} or len(promoted) != 1:
+        raise TrustIntegrityError("REMAINING fresh decision counts differ")
+    return tuple(promoted)
+
+
+def _promote_remaining(
+    store: V52EvidenceStore,
+    catalog: object,
+    promoted: Sequence[tuple[LogicalQuery, object]],
+) -> tuple[int, int]:
+    from .v52_legacy import (
+        PromotionDecision,
+        ProtectedLegacyCatalog,
+        promote_legacy_candidate,
+    )
+
+    if not isinstance(store, V52EvidenceStore) or not isinstance(
+        catalog, ProtectedLegacyCatalog
+    ):
+        raise TypeError("REMAINING promotion authority differs")
+    values = tuple(promoted)
+    if len(values) != 1:
+        raise TrustIntegrityError("REMAINING requires exactly one promotion")
+    newly_promoted = 0
+    resumed = 0
+    for query, decision in values:
+        if not isinstance(query, LogicalQuery) or not isinstance(
+            decision, PromotionDecision
+        ):
+            raise TrustIntegrityError("REMAINING promotion decision differs")
+        progress = _integrity_boundary(
+            "REMAINING promotion replay",
+            lambda: store.read_verified_query_progress(query),
+        )
+        if progress.status == "QUARANTINED":
+            raise OperationalBlock("REMAINING promotion is quarantined")
+        if progress.status == "SUCCESS":
+            published = progress.published_evidence
+            if (
+                not isinstance(published, PublishedEvidence)
+                or published.storage_mode != "PROTECTED_LEGACY_REFERENCE"
+            ):
+                raise TrustIntegrityError("REMAINING promotion storage mode differs")
+            resumed += 1
+            continue
+        try:
+            promoted_evidence = promote_legacy_candidate(
+                store,
+                query,
+                catalog,
+                decision,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise TrustIntegrityError("REMAINING promotion integrity failed") from exc
+        if promoted_evidence.storage_mode != "PROTECTED_LEGACY_REFERENCE":
+            raise TrustIntegrityError("REMAINING promotion storage mode differs")
+        newly_promoted += 1
+    return newly_promoted, resumed
+
+
+def _validate_terminal_remaining_promotion(
+    store: V52EvidenceStore,
+    promoted: Sequence[tuple[LogicalQuery, object]],
+) -> PublishedEvidence:
+    values = tuple(promoted)
+    if not isinstance(store, V52EvidenceStore) or len(values) != 1:
+        raise TrustIntegrityError("terminal REMAINING promotion authority differs")
+    query, _decision = values[0]
+    if not isinstance(query, LogicalQuery):
+        raise TrustIntegrityError("terminal REMAINING promotion query differs")
+    progress = _integrity_boundary(
+        "terminal REMAINING promotion replay",
+        lambda: store.read_verified_query_progress(query),
+    )
+    published = getattr(progress, "published_evidence", None)
+    if (
+        getattr(progress, "status", None) != "SUCCESS"
+        or not isinstance(published, PublishedEvidence)
+        or published.query_id != logical_query_id(query)
+        or published.storage_mode != "PROTECTED_LEGACY_REFERENCE"
+    ):
+        raise TrustIntegrityError(
+            "terminal REMAINING promotion storage authority differs"
+        )
+    return published
+
+
+def _run_remaining_wave(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+    store: V52EvidenceStore,
+    *,
+    batches: Sequence[object],
+    active_queries: Sequence[LogicalQuery],
+    fetcher: Callable[..., AttemptCapture],
+    query_acquirer: Callable[..., PublishedEvidence] = acquire_with_retries,
+    parser: Callable[[bytes, LogicalQuery], Mapping[str, object]] | None = None,
+    network_gate: Callable[..., None] = _real_before_network,
+    runner_guard: _RunnerGuard | None = None,
+    disk_budget: _DiskBudget | None = None,
+) -> _RemainingWaveResult:
+    """Run one REMAINING leaf wave and join it before exposing split results."""
+    from .v52_source_contracts import recompute_query_sidecar
+
+    batch_ids = tuple(getattr(batch, "batch_id", None) for batch in batches)
+    if not batch_ids or any(not isinstance(value, str) for value in batch_ids):
+        raise TypeError("remaining batches must expose batch IDs")
+    selected_parser = (
+        (lambda raw, query: recompute_query_sidecar(query, raw))
+        if parser is None
+        else parser
+    )
+    selected_queries = tuple(active_queries)
+    if not selected_queries or any(
+        not isinstance(query, LogicalQuery) for query in selected_queries
+    ):
+        raise TypeError("remaining active queries must be a nonempty LogicalQuery set")
+    known = {
+        logical_query_id(query)
+        for batch in batches
+        for query in getattr(batch, "queries", ())
+    }
+    selected_ids = tuple(logical_query_id(query) for query in selected_queries)
+    if len(selected_ids) != len(set(selected_ids)) or not set(selected_ids) <= known:
+        raise TrustIntegrityError("remaining active-leaf authority differs")
+    routes = {logical_query_id(query): _query_host(query) for query in selected_queries}
+    if any(host is None for host in routes.values()):
+        raise TrustIntegrityError("remaining active leaves must require network evidence")
+
+    resumed = 0
+    by_host: dict[str, list[LogicalQuery]] = {host: [] for host in _HOST_WORKERS}
+    for query in selected_queries:
+        progress = _integrity_boundary(
+            "remaining query evidence replay",
+            lambda query=query: store.read_verified_query_progress(query),
+        )
+        if progress.status == "SUCCESS":
+            resumed += 1
+        elif progress.status == "QUARANTINED":
+            raise OperationalBlock("REMAINING contains quarantined query evidence")
+        else:
+            host = routes[logical_query_id(query)]
+            assert isinstance(host, str)
+            by_host[host].append(query)
+
+    network_attempts = 0
+    attempts_by_query: dict[str, int] = {}
+    counter_lock = threading.Lock()
+    stop = threading.Event()
+
+    def check_stop() -> None:
+        if stop.is_set():
+            raise _StageStopped()
+
+    def stop_aware_sleep(seconds: float) -> None:
+        if stop.wait(seconds):
+            raise _StageStopped()
+
+    def counted_fetcher(
+        query: LogicalQuery,
+        *,
+        timeout: float,
+        max_bytes: int,
+    ) -> AttemptCapture:
+        nonlocal network_attempts
+        check_stop()
+        query_id = logical_query_id(query)
+        with counter_lock:
+            check_stop()
+            network_attempts += 1
+            attempts_by_query[query_id] = attempts_by_query.get(query_id, 0) + 1
+        try:
+            check_stop()
+        except _StageStopped:
+            with counter_lock:
+                network_attempts -= 1
+                attempts_by_query[query_id] -= 1
+            raise
+        return fetcher(query, timeout=timeout, max_bytes=max_bytes)
+
+    def guarded_gate(item: LogicalQuery) -> None:
+        check_stop()
+        network_gate(
+            request,
+            plan,
+            stage="REMAINING",
+            query_batch_ids=batch_ids,
+            query=item,
+            runner_guard=runner_guard,
+            disk_budget=disk_budget,
+        )
+
+    def acquire_reserved(query: LogicalQuery) -> bool:
+        query_acquirer(
+            store,
+            query,
+            selected_parser,
+            policy=RetryPolicy(),
+            limits=fetch_limits(query),
+            before_network=guarded_gate,
+            fetcher=counted_fetcher,
+            sleeper=stop_aware_sleep,
+        )
+        progress = _integrity_boundary(
+            "remaining query evidence replay",
+            lambda: store.read_verified_query_progress(query),
+        )
+        if progress.status != "SUCCESS":
+            raise RuntimeError("remaining query returned without verified success")
+        with counter_lock:
+            return attempts_by_query.get(logical_query_id(query), 0) > 0
+
+    def run_one(query: LogicalQuery) -> bool:
+        try:
+            check_stop()
+            if disk_budget is None:
+                return acquire_reserved(query)
+            with disk_budget.reserve(query):
+                check_stop()
+                return acquire_reserved(query)
+        except BaseException as error:
+            if _is_fatal_stage_error(error):
+                stop.set()
+            raise
+
+    futures: list[concurrent.futures.Future[bool]] = []
+    submissions: dict[concurrent.futures.Future[bool], tuple[str, int]] = {}
+    executors: list[concurrent.futures.ThreadPoolExecutor] = []
+    coordinator_error: BaseException | None = None
+    try:
+        submission_index = 0
+        for host, queries in by_host.items():
+            if not queries:
+                continue
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_HOST_WORKERS[host],
+                thread_name_prefix=f"v52-{host}",
+            )
+            executors.append(executor)
+            for query in queries:
+                future = executor.submit(run_one, query)
+                futures.append(future)
+                submissions[future] = (logical_query_id(query), submission_index)
+                submission_index += 1
+        for future in concurrent.futures.as_completed(futures):
+            if future.cancelled():
+                continue
+            error = future.exception()
+            if stop.is_set() or error is not None and _is_fatal_stage_error(error):
+                stop.set()
+                for pending in futures:
+                    pending.cancel()
+                break
+    except BaseException as error:
+        coordinator_error = error
+        stop.set()
+        for future in futures:
+            future.cancel()
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True, cancel_futures=True)
+    if coordinator_error is not None:
+        raise coordinator_error
+
+    fetched = 0
+    failures: list[_StageFailure] = []
+    splits: list[tuple[str, SplitRequired]] = []
+    for future, (query_id, index) in submissions.items():
+        if future.cancelled():
+            continue
+        error = future.exception()
+        if error is None:
+            fetched += bool(future.result())
+        elif isinstance(error, SplitRequired):
+            splits.append((query_id, error))
+        elif not isinstance(error, _StageStopped):
+            failures.append(_StageFailure(query_id, index, error))
+    selected_failure = _select_stage_failure(failures)
+    if selected_failure is not None:
+        raise selected_failure.error
+    return _RemainingWaveResult(
+        fetched=fetched,
+        resumed=resumed,
+        network_attempts=network_attempts,
+        splits=tuple(sorted(splits, key=lambda item: item[0])),
+    )
 
 
 def _query_host(query: LogicalQuery) -> str | None:
@@ -1925,6 +2385,432 @@ def _read_timezone_checkpoint_evidence_snapshot(
             os.close(descriptor)
 
 
+@dataclass(frozen=True)
+class _RemainingStageResult:
+    checkpoint: object
+    query_batch_ids: tuple[str, ...]
+    promoted: int
+    fetched: int
+    resumed: int
+    quarantined: int
+    pending: int
+    network_attempts: int
+
+
+def _materialize_remaining_split(
+    root: Path,
+    evidence_root: Path,
+    parent_batch: object,
+    parent_query: LogicalQuery,
+    required: SplitRequired,
+) -> tuple[object, object]:
+    from .v52_query_plan import (
+        build_statcast_split_batch,
+        load_split_receipt,
+        publish_query_batch,
+        publish_split_receipt,
+    )
+
+    parent_id = logical_query_id(parent_query)
+    child = _integrity_boundary(
+        "REMAINING child batch",
+        lambda: build_statcast_split_batch(root, parent_batch, parent_query),
+    )
+    _integrity_boundary(
+        "REMAINING child batch publication",
+        lambda: publish_query_batch(root, child),
+    )
+    receipt = _integrity_boundary(
+        "REMAINING split receipt replay",
+        lambda: load_split_receipt(root, parent_id, evidence_root=evidence_root),
+    )
+    if receipt is None:
+        receipt = _integrity_boundary(
+            "REMAINING split receipt publication",
+            lambda: publish_split_receipt(
+                root,
+                evidence_root=evidence_root,
+                parent_batch_id=parent_batch.batch_id,
+                parent_query_id=parent_id,
+                reason=required.reason,
+                exhausted_attempt_number=required.exhausted_attempt_number,
+                child_batch_id=child.batch_id,
+            ),
+        )
+    if (
+        receipt.parent_batch_id != parent_batch.batch_id
+        or receipt.parent_query_id != parent_id
+        or receipt.reason != required.reason
+        or receipt.exhausted_attempt_number != required.exhausted_attempt_number
+        or receipt.child_batch_id != child.batch_id
+        or tuple(receipt.child_query_ids)
+        != tuple(logical_query_id(query) for query in child.queries)
+    ):
+        raise TrustIntegrityError("REMAINING split receipt authority differs")
+    return child, receipt
+
+
+def _run_remaining_stage(
+    request: _AcquisitionRequest,
+    plan: _AcquisitionPlan,
+    store: V52EvidenceStore,
+    *,
+    fixed_prefix: Sequence[object],
+    participant_evidence: Sequence[Path],
+    latest: object,
+    evidence_root: Path,
+    runner_guard: _RunnerGuard,
+    disk_budget: _DiskBudget,
+) -> _RemainingStageResult:
+    from .execution_registry import publish_acquisition_checkpoint
+    from .v52_legacy import load_protected_legacy_catalog
+    from .v52_legacy_decision_inventory import (
+        load_verified_legacy_decision_inventory,
+        publish_legacy_decision_inventory,
+    )
+    from .v52_query_plan import (
+        build_legacy_partition_batch,
+        build_statcast_root_batch,
+        load_query_batch,
+        load_split_receipt,
+        publish_query_batch,
+    )
+
+    prefix = tuple(fixed_prefix)
+    if len(prefix) != 3:
+        raise TrustIntegrityError("REMAINING fixed prefix differs")
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    latest_stage = getattr(latest, "stage", None)
+    if latest_stage not in {"PARTICIPANT_DERIVED", "REMAINING"}:
+        raise TrustIntegrityError("REMAINING prior checkpoint differs")
+
+    statcast_root = _integrity_boundary(
+        "Statcast root batch",
+        lambda: build_statcast_root_batch(root),
+    )
+    if (
+        len(plan.query_batch_ids) != 3
+        or statcast_root.batch_id != plan.query_batch_ids[1]
+    ):
+        raise TrustIntegrityError("Statcast root plan authority differs")
+    if latest_stage == "REMAINING":
+        persisted_root = _integrity_boundary(
+            "Statcast root batch replay",
+            lambda: load_query_batch(root, statcast_root.batch_id),
+        )
+        if persisted_root != statcast_root:
+            raise TrustIntegrityError("persisted Statcast root batch differs")
+    else:
+        _integrity_boundary(
+            "Statcast root batch publication",
+            lambda: publish_query_batch(root, statcast_root),
+        )
+
+    inventory = _integrity_boundary(
+        "legacy decision inventory replay"
+        if latest_stage == "REMAINING"
+        else "legacy decision inventory publication",
+        lambda: (
+            load_verified_legacy_decision_inventory(root)
+            if latest_stage == "REMAINING"
+            else publish_legacy_decision_inventory(root)
+        ),
+    )
+    partition = _integrity_boundary(
+        "legacy partition batch",
+        lambda: build_legacy_partition_batch(root),
+    )
+    if latest_stage == "REMAINING":
+        persisted_partition = _integrity_boundary(
+            "legacy partition batch replay",
+            lambda: load_query_batch(root, partition.batch_id),
+        )
+        if persisted_partition != partition:
+            raise TrustIntegrityError("persisted legacy partition batch differs")
+    else:
+        _integrity_boundary(
+            "legacy partition batch publication",
+            lambda: publish_query_batch(root, partition),
+        )
+
+    protected = getattr(inventory, "payload", {}).get("protected_inventory")
+    if not isinstance(protected, Mapping) or not isinstance(
+        protected.get("sha256"), str
+    ):
+        raise TrustIntegrityError("protected legacy decision authority differs")
+    catalog = _integrity_boundary(
+        "protected legacy catalog",
+        lambda: load_protected_legacy_catalog(
+            root,
+            legacy_root=root / _LEGACY_ROOT_RELATIVE,
+            protected_inventory_path=root / _PROTECTED_INVENTORY_RELATIVE,
+            protected_inventory_sha256=str(protected["sha256"]),
+        ),
+    )
+    promoted_decisions = _validate_remaining_decisions(
+        partition,
+        inventory,
+        catalog,
+    )
+    batches = [*prefix, partition]
+    fixed_ids = tuple(batch.batch_id for batch in batches)
+    split_ids: list[str] = []
+    receipts: dict[str, object] = {}
+    if latest_stage == "REMAINING":
+        latest_batch_ids = getattr(latest, "query_batch_ids", None)
+        latest_split_ids = getattr(latest, "split_query_ids", None)
+        if (
+            not isinstance(latest_batch_ids, tuple)
+            or latest_batch_ids[:4] != fixed_ids
+            or not isinstance(latest_split_ids, tuple)
+            or latest_split_ids != tuple(sorted(latest_split_ids))
+        ):
+            raise TrustIntegrityError("REMAINING checkpoint authority differs")
+        for batch_id in latest_batch_ids[4:]:
+            batches.append(
+                _integrity_boundary(
+                    "REMAINING split batch replay",
+                    lambda batch_id=batch_id: load_query_batch(root, batch_id),
+                )
+            )
+        split_ids.extend(latest_split_ids)
+        for parent_id in split_ids:
+            receipt = _integrity_boundary(
+                "REMAINING split receipt replay",
+                lambda parent_id=parent_id: load_split_receipt(
+                    root,
+                    parent_id,
+                    evidence_root=evidence_root,
+                ),
+            )
+            if receipt is None:
+                raise TrustIntegrityError("REMAINING split receipt is missing")
+            receipts[parent_id] = receipt
+        if {receipt.child_batch_id for receipt in receipts.values()} != {
+            batch.batch_id for batch in batches[4:]
+        }:
+            raise TrustIntegrityError("REMAINING split DAG suffix differs")
+    elif (
+        getattr(latest, "query_batch_ids", None)
+        != tuple(batch.batch_id for batch in prefix)
+        or getattr(latest, "pending_query_ids", ())
+        or getattr(latest, "quarantined_query_ids", ())
+        or getattr(latest, "split_query_ids", ())
+    ):
+        raise TrustIntegrityError("terminal participant checkpoint differs")
+
+    stage_evidence = _remaining_stage_evidence(
+        root,
+        participant_evidence,
+        statcast_root.batch_id,
+    )
+    current = latest
+
+    def populations() -> tuple[
+        tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+    ]:
+        return _remaining_populations(store, batches, split_ids)
+
+    def publish_current() -> object:
+        nonlocal current
+        completed, pending, quarantined, split = populations()
+        split_paths = tuple(
+            sorted(
+                (
+                    root
+                    / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                    / f"{parent_id}.json"
+                    for parent_id in split
+                ),
+                key=os.fspath,
+            )
+        )
+        current = _integrity_boundary(
+            "REMAINING checkpoint",
+            lambda: publish_acquisition_checkpoint(
+                root,
+                request.run_spec,
+                expected_prior_checkpoint_sha256=getattr(
+                    current, "receipt_sha256", None
+                ),
+                stage="REMAINING",
+                query_batch_ids=tuple(batch.batch_id for batch in batches),
+                completed_query_ids=completed,
+                pending_query_ids=pending,
+                quarantined_query_ids=quarantined,
+                split_query_ids=split,
+                stage_evidence_receipts=stage_evidence,
+                split_receipt_paths=split_paths,
+            ),
+        )
+        return current
+
+    completed, pending, quarantined, split = populations()
+    prefix_query_ids = {
+        logical_query_id(query) for batch in prefix for query in batch.queries
+    }
+    if not prefix_query_ids <= set(completed):
+        raise TrustIntegrityError("REMAINING prefix evidence is not terminal")
+    if (
+        latest_stage == "REMAINING"
+        and not pending
+        and not quarantined
+        and getattr(latest, "completed_query_ids", None) == completed
+        and getattr(latest, "pending_query_ids", None) == pending
+        and getattr(latest, "quarantined_query_ids", None) == quarantined
+        and getattr(latest, "split_query_ids", None) == split
+        and getattr(latest, "query_batch_ids", None)
+        == tuple(batch.batch_id for batch in batches)
+    ):
+        _validate_terminal_remaining_promotion(store, promoted_decisions)
+        return _RemainingStageResult(
+            latest,
+            tuple(batch.batch_id for batch in batches),
+            0,
+            0,
+            len(set(completed) - prefix_query_ids),
+            0,
+            0,
+            0,
+        )
+
+    if latest_stage == "PARTICIPANT_DERIVED":
+        publish_current()
+    promoted_id = logical_query_id(promoted_decisions[0][0])
+    if quarantined:
+        newly_promoted = 0
+        resumed_promoted = 0
+    else:
+        newly_promoted, resumed_promoted = _promote_remaining(
+            store,
+            catalog,
+            promoted_decisions,
+        )
+        completed, pending, quarantined, _split = populations()
+        if promoted_id not in completed:
+            raise TrustIntegrityError("REMAINING promotion did not become terminal")
+        if newly_promoted or promoted_id not in getattr(
+            current, "completed_query_ids", ()
+        ):
+            publish_current()
+
+    initially_completed = {
+        query_id
+        for query_id in completed
+        if query_id not in prefix_query_ids and query_id != promoted_id
+    }
+    fetched = 0
+    resumed = resumed_promoted + len(initially_completed)
+    network_attempts = 0
+    terminal_failure: TerminalAcquisitionFailure | None = None
+
+    def batch_and_query(parent_id: str) -> tuple[object, LogicalQuery]:
+        matches = [
+            (batch, query)
+            for batch in batches[3:]
+            for query in batch.queries
+            if logical_query_id(query) == parent_id
+        ]
+        if len(matches) != 1:
+            raise TrustIntegrityError("REMAINING split parent binding differs")
+        return matches[0]
+
+    def repair_split(parent_id: str, required: SplitRequired) -> None:
+        parent_batch, parent_query = batch_and_query(parent_id)
+        child, receipt = _materialize_remaining_split(
+            root,
+            evidence_root,
+            parent_batch,
+            parent_query,
+            required,
+        )
+        batches.append(child)
+        split_ids.append(parent_id)
+        split_ids.sort()
+        receipts[parent_id] = receipt
+        publish_current()
+
+    while True:
+        observed: list[tuple[str, SplitRequired]] = []
+        active_queries = tuple(
+            query
+            for batch in batches[3:]
+            for query in batch.queries
+            if logical_query_id(query) not in split_ids
+        )
+        for query in active_queries:
+            progress = _integrity_boundary(
+                "REMAINING active-leaf replay",
+                lambda query=query: store.read_verified_query_progress(query),
+            )
+            terminal = _terminal_progress(progress)
+            if isinstance(terminal, SplitRequired):
+                observed.append((logical_query_id(query), terminal))
+        if observed:
+            for parent_id, required in sorted(observed, key=lambda item: item[0]):
+                repair_split(parent_id, required)
+            continue
+
+        completed, pending, quarantined, _split = populations()
+        if quarantined:
+            if tuple(quarantined) != getattr(current, "quarantined_query_ids", ()):
+                publish_current()
+            error = OperationalBlock(
+                "REMAINING contains quarantined query evidence"
+            )
+            if terminal_failure is not None:
+                raise error from terminal_failure
+            raise error
+        if terminal_failure is not None:
+            raise TrustIntegrityError(
+                "REMAINING terminal failure has no quarantined authority"
+            ) from terminal_failure
+        active_pending = tuple(
+            query
+            for query in active_queries
+            if logical_query_id(query) in set(pending)
+        )
+        if not active_pending:
+            if (
+                getattr(current, "completed_query_ids", None) != completed
+                or getattr(current, "pending_query_ids", None) != pending
+            ):
+                publish_current()
+            return _RemainingStageResult(
+                current,
+                tuple(batch.batch_id for batch in batches),
+                newly_promoted,
+                fetched,
+                resumed,
+                0,
+                0,
+                network_attempts,
+            )
+        try:
+            wave = _run_remaining_wave(
+                request,
+                plan,
+                store,
+                batches=batches,
+                active_queries=active_pending,
+                fetcher=request.fetcher,
+                runner_guard=runner_guard,
+                disk_budget=disk_budget,
+            )
+        except TerminalAcquisitionFailure as exc:
+            terminal_failure = exc
+            continue
+        except OperationalBlock:
+            publish_current()
+            raise
+        fetched += wave.fetched
+        resumed += wave.resumed
+        network_attempts += wave.network_attempts
+        if wave.splits:
+            continue
+        publish_current()
+
+
 def _validate_resumed_timezone_checkpoint(
     checkpoint: object,
     *,
@@ -2016,8 +2902,9 @@ def _real_run_stages(
         "REFERENCE_INPUTS",
         "TIMEZONE_REVIEW",
         "PARTICIPANT_DERIVED",
+        "REMAINING",
     }:
-        raise OperationalBlock("later acquisition stages are outside C2c")
+        raise OperationalBlock("later acquisition stages are outside acquisition")
 
     static = _integrity_boundary(
         "static query batch",
@@ -2069,11 +2956,14 @@ def _real_run_stages(
             "REFERENCE_INPUTS",
             "TIMEZONE_REVIEW",
             "PARTICIPANT_DERIVED",
+            "REMAINING",
         }
-        or latest.pending_query_ids
-        and latest.stage == "STATIC_SCHEDULES"
-        or latest.quarantined_query_ids
-        or latest.split_query_ids
+        or latest.stage == "STATIC_SCHEDULES"
+        and (
+            latest.pending_query_ids
+            or latest.quarantined_query_ids
+            or latest.split_query_ids
+        )
     ):
         raise OperationalBlock("STATIC_SCHEDULES is not terminal")
 
@@ -2086,6 +2976,7 @@ def _real_run_stages(
         "REFERENCE_INPUTS",
         "TIMEZONE_REVIEW",
         "PARTICIPANT_DERIVED",
+        "REMAINING",
     }:
         inventory = _integrity_boundary(
             "schedule inventory replay",
@@ -2122,6 +3013,7 @@ def _real_run_stages(
         "REFERENCE_INPUTS",
         "TIMEZONE_REVIEW",
         "PARTICIPANT_DERIVED",
+        "REMAINING",
     }:
         persisted_reference = _integrity_boundary(
             "reference query batch replay",
@@ -2140,7 +3032,8 @@ def _real_run_stages(
         sorted(logical_query_id(query) for batch in cumulative_batches for query in batch.queries)
     )
     terminal_reference = (
-        latest.stage in {"REFERENCE_INPUTS", "TIMEZONE_REVIEW", "PARTICIPANT_DERIVED"}
+        latest.stage
+        in {"REFERENCE_INPUTS", "TIMEZONE_REVIEW", "PARTICIPANT_DERIVED", "REMAINING"}
         and latest.query_batch_ids[:2] == (static.batch_id, reference.batch_id)
         and set(cumulative_ids).issubset(latest.completed_query_ids)
         and (
@@ -2242,11 +3135,11 @@ def _real_run_stages(
             stage_evidence=timezone_stage_evidence,
         )
     elif (
-        latest.stage != "PARTICIPANT_DERIVED"
+        latest.stage not in {"PARTICIPANT_DERIVED", "REMAINING"}
         or latest.query_batch_ids[:2] != (static.batch_id, reference.batch_id)
         or not set(cumulative_ids).issubset(latest.completed_query_ids)
-        or latest.quarantined_query_ids
-        or latest.split_query_ids
+        or latest.stage == "PARTICIPANT_DERIVED"
+        and (latest.quarantined_query_ids or latest.split_query_ids)
     ):
         raise TrustIntegrityError("timezone checkpoint authority differs")
 
@@ -2255,7 +3148,7 @@ def _real_run_stages(
         publish_game_evidence_inventory,
     )
 
-    if latest.stage == "PARTICIPANT_DERIVED":
+    if latest.stage in {"PARTICIPANT_DERIVED", "REMAINING"}:
         game_inventory = _integrity_boundary(
             "game evidence inventory replay",
             lambda: load_verified_game_evidence_inventory(root),
@@ -2271,7 +3164,7 @@ def _real_run_stages(
     )
     if participant.derived_from_sha256 != game_inventory.sha256:
         raise TrustIntegrityError("participant batch inventory binding differs")
-    if latest.stage == "PARTICIPANT_DERIVED":
+    if latest.stage in {"PARTICIPANT_DERIVED", "REMAINING"}:
         persisted_participant = _integrity_boundary(
             "participant query batch replay",
             lambda: load_query_batch(root, participant.batch_id),
@@ -2295,13 +3188,19 @@ def _real_run_stages(
         sorted((*timezone_stage_evidence, game_inventory.path), key=os.fspath)
     )
     terminal_participant = (
-        latest.stage == "PARTICIPANT_DERIVED"
-        and latest.query_batch_ids
+        latest.stage in {"PARTICIPANT_DERIVED", "REMAINING"}
+        and latest.query_batch_ids[:3]
         == (static.batch_id, reference.batch_id, participant.batch_id)
-        and latest.completed_query_ids == participant_ids
-        and not latest.pending_query_ids
-        and not latest.quarantined_query_ids
-        and not latest.split_query_ids
+        and set(participant_ids).issubset(latest.completed_query_ids)
+        and (
+            latest.stage != "PARTICIPANT_DERIVED"
+            or (
+                latest.completed_query_ids == participant_ids
+                and not latest.pending_query_ids
+                and not latest.quarantined_query_ids
+                and not latest.split_query_ids
+            )
+        )
     )
     if terminal_participant:
         completed, pending, quarantined = _stage_populations(store, participant_batches)
@@ -2326,9 +3225,31 @@ def _real_run_stages(
         resumed += participant_result.resumed
         network_attempts += participant_result.network_attempts
         latest = participant_result.checkpoint
-    if latest.stage != "PARTICIPANT_DERIVED":
+    if latest.stage not in {"PARTICIPANT_DERIVED", "REMAINING"}:
         raise TrustIntegrityError("participant checkpoint authority differs")
-    raise OperationalBlock("REMAINING orchestration is pending")
+    remaining = _run_remaining_stage(
+        request,
+        plan,
+        store,
+        fixed_prefix=participant_batches,
+        participant_evidence=participant_evidence,
+        latest=latest,
+        evidence_root=evidence_root,
+        runner_guard=runner_guard,
+        disk_budget=disk_budget,
+    )
+    return AcquisitionSummary(
+        contract_sha256=plan.contract_sha256,
+        query_batch_sha256s=remaining.query_batch_ids,
+        promoted=remaining.promoted,
+        fetched=fetched + remaining.fetched,
+        planned_promoted=plan.legacy_dispositions.count("PROMOTED"),
+        planned_fetch_required=plan.legacy_dispositions.count("FETCH_REQUIRED"),
+        resumed=resumed + remaining.resumed,
+        quarantined=remaining.quarantined,
+        pending=remaining.pending,
+        network_attempts=network_attempts + remaining.network_attempts,
+    )
 
 
 def _real_inspect_runtime(

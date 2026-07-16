@@ -2428,6 +2428,1434 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 )
         self.assertFalse(published)
 
+    def test_remaining_wave_joins_every_worker_before_returning_sorted_splits(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            SplitRequired,
+            _AcquisitionPlan,
+            _run_remaining_wave,
+        )
+
+        split = _query(statcast=True)
+        completed = dataclasses.replace(
+            _query(statcast=True),
+            parameters={**dict(_query(statcast=True).parameters), "game_date_gt": "2024-06-01", "game_date_lt": "2024-06-01"},
+            requested_range={
+                "year": 2024,
+                "start_date": "2024-06-01",
+                "end_date": "2024-06-01",
+                "acquisition": "FETCH_REQUIRED",
+            },
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(split, completed))
+        release = threading.Event()
+        success_finished = threading.Event()
+
+        def acquire(store, item, parser, **_kwargs):
+            if item == split:
+                release.set()
+                raise SplitRequired("TIMEOUT", 6)
+            self.assertTrue(release.wait(timeout=2))
+            time.sleep(0.05)
+            with store.acquire_query(item) as lease:
+                published = store.publish_fetched(
+                    item,
+                    store.next_attempt_number(lease),
+                    _capture(b"{}"),
+                    parser(b"{}", item),
+                )
+            success_finished.set()
+            return published
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            result = _run_remaining_wave(
+                self._request(plan_only=False, resume=True),
+                _AcquisitionPlan("a" * 64, (batch.batch_id,), ("FETCH_REQUIRED",)),
+                store,
+                batches=(batch,),
+                active_queries=batch.queries,
+                fetcher=lambda *_args, **_kwargs: self.fail("fake acquirer fetched"),
+                query_acquirer=acquire,
+                parser=lambda _raw, _query: {},
+                network_gate=lambda *_args, **_kwargs: None,
+            )
+
+        self.assertTrue(success_finished.is_set())
+        self.assertEqual(result.fetched, 0)
+        self.assertEqual(result.resumed, 0)
+        self.assertEqual(result.network_attempts, 0)
+        self.assertEqual(
+            result.splits,
+            ((logical_query_id(split), SplitRequired("TIMEOUT", 6)),),
+        )
+
+    def test_remaining_stage_evidence_is_the_exact_sorted_ten_path_authority(self) -> None:
+        from mlb_backtest.v52_acquire import _remaining_stage_evidence
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            participant = tuple(
+                root / relative
+                for relative in (
+                    "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json",
+                    "audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json",
+                    "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
+                    "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
+                    "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+                    "config/v5_2_qd/venue_timezones.json",
+                    "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json",
+                )
+            )
+            root_batch_id = "a" * 64
+            actual = _remaining_stage_evidence(root, participant, root_batch_id)
+            expected = tuple(
+                sorted(
+                    (
+                        *participant,
+                        root / "audit/v5_1_bt/protected_raw_inventory.json",
+                        root
+                        / "audit/v5_2_qd/historical/acquisition/legacy_decision_inventory.json",
+                        root
+                        / "audit/v5_2_qd/historical/acquisition/query_batches"
+                        / f"{root_batch_id}.json",
+                    ),
+                    key=os.fspath,
+                )
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(actual), 10)
+
+    def test_remaining_population_classifies_split_parent_outside_pending(self) -> None:
+        from mlb_backtest.v52_acquire import _remaining_populations
+
+        parent = _query(statcast=True)
+        child = dataclasses.replace(
+            _query(statcast=True),
+            parameters={**dict(_query(statcast=True).parameters), "game_date_gt": "2024-06-01", "game_date_lt": "2024-06-01"},
+            requested_range={
+                "year": 2024,
+                "start_date": "2024-06-01",
+                "end_date": "2024-06-01",
+                "acquisition": "FETCH_REQUIRED",
+            },
+        )
+        batch = SimpleNamespace(batch_id="b" * 64, queries=(parent, child))
+        parent_id = logical_query_id(parent)
+        child_id = logical_query_id(child)
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            completed, pending, quarantined, split = _remaining_populations(
+                store,
+                (batch,),
+                (parent_id,),
+            )
+        self.assertEqual(completed, ())
+        self.assertEqual(pending, (child_id,))
+        self.assertEqual(quarantined, ())
+        self.assertEqual(split, (parent_id,))
+
+    def test_remaining_decisions_require_exact_fresh_one_of_forty_eight_promotion(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _validate_remaining_decisions,
+        )
+        from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            LEGACY_ROOT,
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, inventory_path, digest = _legacy_decision_repository(Path(directory))
+            root_batch = build_statcast_root_batch(root)
+            published_root = publish_query_batch(root, root_batch)
+            self.assertTrue(published_root.is_file())
+            inventory = publish_legacy_decision_inventory(root)
+            partition = build_legacy_partition_batch(root)
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=inventory_path,
+                protected_inventory_sha256=digest,
+            )
+            promoted = _validate_remaining_decisions(partition, inventory, catalog)
+            self.assertEqual(len(promoted), 1)
+            self.assertEqual(promoted[0][0].requested_range["acquisition"],
+                             "PROTECTED_LEGACY_REFERENCE")
+
+            payload = dict(inventory.payload)
+            decisions = list(payload["decisions"])
+            decisions[0] = {**dict(decisions[0]), "disposition": "PROMOTED"}
+            payload["decisions"] = tuple(decisions)
+            forged = SimpleNamespace(payload=payload)
+            with self.assertRaisesRegex(TrustIntegrityError, "decision"):
+                _validate_remaining_decisions(partition, forged, catalog)
+
+    def test_remaining_promotion_failure_is_trust_and_has_no_fetch_fallback(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _promote_remaining,
+            _validate_remaining_decisions,
+        )
+        from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            LEGACY_ROOT,
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, inventory_path, digest = _legacy_decision_repository(Path(directory))
+            publish_query_batch(root, build_statcast_root_batch(root))
+            inventory = publish_legacy_decision_inventory(root)
+            partition = build_legacy_partition_batch(root)
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=inventory_path,
+                protected_inventory_sha256=digest,
+            )
+            promoted = _validate_remaining_decisions(partition, inventory, catalog)
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            with (
+                patch(
+                    "mlb_backtest.v52_legacy.promote_legacy_candidate",
+                    side_effect=RuntimeError("promotion drift"),
+                ) as promote,
+                self.assertRaisesRegex(TrustIntegrityError, "promotion"),
+            ):
+                _promote_remaining(store, catalog, promoted)
+            promote.assert_called_once()
+            self.assertEqual(
+                store.read_verified_query_progress(promoted[0][0]).status,
+                "PENDING",
+            )
+
+    def test_terminal_remaining_requires_protected_reference_storage_mode(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _validate_terminal_remaining_promotion,
+        )
+        from mlb_backtest.v52_evidence import PublishedEvidence
+
+        query = _query(statcast=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            root.mkdir(exist_ok=True)
+            store = V52EvidenceStore(root / "raw")
+            before = tuple(root.rglob("*"))
+            for mode, error in (
+                ("FETCHED_RAW", TrustIntegrityError),
+                ("PROTECTED_LEGACY_REFERENCE", None),
+            ):
+                with self.subTest(mode=mode):
+                    progress = SimpleNamespace(
+                        status="SUCCESS",
+                        published_evidence=PublishedEvidence(
+                            query_id=logical_query_id(query),
+                            success_receipt_path=root / "not-read.json",
+                            raw_sha256="a" * 64,
+                            query_sidecar_sha256="b" * 64,
+                            storage_mode=mode,
+                        ),
+                    )
+                    context = (
+                        self.assertRaisesRegex(
+                            TrustIntegrityError, "promotion|storage"
+                        )
+                        if error is not None
+                        else nullcontext()
+                    )
+                    with (
+                        patch.object(
+                            store,
+                            "read_verified_query_progress",
+                            return_value=progress,
+                        ),
+                        context,
+                    ):
+                        _validate_terminal_remaining_promotion(
+                            store,
+                            ((query, object()),),
+                        )
+            after = tuple(root.rglob("*"))
+        self.assertEqual(after, before)
+
+    def test_remaining_fixed_four_checkpoints_promotion_before_fetch(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _DiskBudget,
+            _RemainingWaveResult,
+            _RunnerGuard,
+            _run_remaining_stage,
+        )
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            statcast_root = build_statcast_root_batch(root)
+            # Preview construction is authenticated by the production helper; this
+            # placeholder merely gives the plan its already-sealed partition ID.
+            from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+            from mlb_backtest.v52_legacy_decision_inventory import preview_legacy_decisions
+
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / "data/v5_1_bt/raw",
+                protected_inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
+                protected_inventory_sha256=_digest,
+            )
+            preview = preview_legacy_decisions(
+                statcast_root,
+                catalog,
+                protected_inventory_sha256=_digest,
+            )
+            plan = _AcquisitionPlan(
+                "a" * 64,
+                ("1" * 64, statcast_root.batch_id, preview.partition_batch.batch_id),
+                ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+            )
+            fixed = tuple(
+                SimpleNamespace(batch_id=character * 64, queries=())
+                for character in "234"
+            )
+            latest = SimpleNamespace(
+                stage="PARTICIPANT_DERIVED",
+                receipt_sha256="5" * 64,
+                query_batch_ids=tuple(batch.batch_id for batch in fixed),
+                completed_query_ids=(),
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+            )
+            complete: set[str] = set()
+            events: list[str] = []
+            checkpoint_number = 0
+
+            def populations(_store, batches, split_ids):
+                partition_ids = {
+                    logical_query_id(query) for query in batches[3].queries
+                }
+                return (
+                    tuple(sorted(complete)),
+                    tuple(sorted(partition_ids - complete)),
+                    (),
+                    tuple(sorted(split_ids)),
+                )
+
+            def checkpoint(_root, _run_spec, **kwargs):
+                nonlocal checkpoint_number
+                checkpoint_number += 1
+                events.append("checkpoint")
+                return SimpleNamespace(
+                    receipt_sha256=f"{checkpoint_number + 5:064x}",
+                    **kwargs,
+                )
+
+            def promote(_store, _catalog, promoted):
+                events.append("promote")
+                complete.add(logical_query_id(promoted[0][0]))
+                return (1, 0)
+
+            def wave(_request, _plan, _store, *, active_queries, **_kwargs):
+                events.append("fetch-wave")
+                self.assertTrue(complete)
+                complete.update(logical_query_id(query) for query in active_queries)
+                return _RemainingWaveResult(
+                    len(active_queries), 0, len(active_queries), ()
+                )
+
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._remaining_populations",
+                    side_effect=populations,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._promote_remaining",
+                    side_effect=promote,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._run_remaining_wave",
+                    side_effect=wave,
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=checkpoint,
+                ),
+            ):
+                result = _run_remaining_stage(
+                    request,
+                    plan,
+                    store,
+                    fixed_prefix=fixed,
+                    participant_evidence=tuple(root / f"evidence-{index}" for index in range(7)),
+                    latest=latest,
+                    evidence_root=store.root,
+                    runner_guard=_RunnerGuard(10, 11, root),
+                    disk_budget=_DiskBudget(
+                        request,
+                        free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                    ),
+                )
+        self.assertEqual(events, ["checkpoint", "promote", "checkpoint", "fetch-wave", "checkpoint"])
+        self.assertEqual(result.promoted, 1)
+        self.assertEqual(result.fetched, 47)
+        self.assertEqual(len(result.query_batch_ids), 4)
+
+    def test_remaining_split_materializes_child_before_receipt_and_reconciles(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            SplitRequired,
+            _materialize_remaining_split,
+        )
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            publish_query_batch(root, build_statcast_root_batch(root))
+            publish_legacy_decision_inventory(root)
+            partition = build_legacy_partition_batch(root)
+            publish_query_batch(root, partition)
+            parent = next(
+                query
+                for query in partition.queries
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                and query.requested_range["start_date"]
+                != query.requested_range["end_date"]
+            )
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            capture = dataclasses.replace(
+                _capture(b"partial", error="SIZE_LIMIT"),
+                final_url="https://baseballsavant.mlb.com/statcast_search/csv",
+                response_headers=(("Content-Type", "text/csv"),),
+            )
+            with store.acquire_query(parent) as lease:
+                number = store.next_attempt_number(lease)
+                store.persist_split_attempt(
+                    parent,
+                    number,
+                    capture,
+                    reason="SIZE_LIMIT",
+                )
+            events: list[str] = []
+            from mlb_backtest import v52_query_plan as query_plan
+
+            real_publish_batch = query_plan.publish_query_batch
+            real_publish_receipt = query_plan.publish_split_receipt
+            interrupt_receipt = True
+
+            def publish_batch(*args, **kwargs):
+                events.append("child-batch")
+                return real_publish_batch(*args, **kwargs)
+
+            def publish_receipt(*args, **kwargs):
+                nonlocal interrupt_receipt
+                events.append("split-receipt")
+                if interrupt_receipt:
+                    raise KeyboardInterrupt("after child batch")
+                return real_publish_receipt(*args, **kwargs)
+
+            with (
+                patch(
+                    "mlb_backtest.v52_query_plan.publish_query_batch",
+                    side_effect=publish_batch,
+                ),
+                patch(
+                    "mlb_backtest.v52_query_plan.publish_split_receipt",
+                    side_effect=publish_receipt,
+                ),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "after child batch"):
+                    _materialize_remaining_split(
+                        root,
+                        store.root,
+                        partition,
+                        parent,
+                        SplitRequired("SIZE_LIMIT", number),
+                    )
+                interrupt_receipt = False
+                child, receipt = _materialize_remaining_split(
+                    root,
+                    store.root,
+                    partition,
+                    parent,
+                    SplitRequired("SIZE_LIMIT", number),
+                )
+                first_files = {
+                    path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+                repeated = _materialize_remaining_split(
+                    root,
+                    store.root,
+                    partition,
+                    parent,
+                    SplitRequired("SIZE_LIMIT", number),
+                )
+                second_files = {
+                    path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+                recursive_parent = next(
+                    query
+                    for query in child.queries
+                    if query.requested_range["start_date"]
+                    != query.requested_range["end_date"]
+                )
+                with store.acquire_query(recursive_parent) as lease:
+                    recursive_number = store.next_attempt_number(lease)
+                    store.persist_split_attempt(
+                        recursive_parent,
+                        recursive_number,
+                        capture,
+                        reason="SIZE_LIMIT",
+                    )
+                recursive_child, recursive_receipt = _materialize_remaining_split(
+                    root,
+                    store.root,
+                    child,
+                    recursive_parent,
+                    SplitRequired("SIZE_LIMIT", recursive_number),
+                )
+        self.assertEqual(
+            events[:4],
+            ["child-batch", "split-receipt", "child-batch", "split-receipt"],
+        )
+        self.assertEqual(
+            events[4:],
+            ["child-batch", "child-batch", "split-receipt"],
+        )
+        self.assertEqual(repeated, (child, receipt))
+        self.assertEqual(second_files, first_files)
+        self.assertEqual(recursive_child.derived_from_sha256, child.batch_id)
+        self.assertEqual(recursive_receipt.depth, 2)
+
+    def test_terminal_remaining_replay_is_byte_idempotent_and_zero_network(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _DiskBudget,
+            _RunnerGuard,
+            _run_remaining_stage,
+        )
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_evidence import PublishedEvidence
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            statcast_root = build_statcast_root_batch(root)
+            publish_query_batch(root, statcast_root)
+            publish_legacy_decision_inventory(root)
+            partition = build_legacy_partition_batch(root)
+            publish_query_batch(root, partition)
+            fixed = tuple(
+                SimpleNamespace(batch_id=character * 64, queries=())
+                for character in "234"
+            )
+            completed = tuple(
+                sorted(logical_query_id(query) for query in partition.queries)
+            )
+            latest = SimpleNamespace(
+                stage="REMAINING",
+                receipt_sha256="5" * 64,
+                query_batch_ids=(*tuple(batch.batch_id for batch in fixed), partition.batch_id),
+                completed_query_ids=completed,
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+            )
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            promoted_query = next(
+                query
+                for query in partition.queries
+                if query.requested_range["acquisition"]
+                == "PROTECTED_LEGACY_REFERENCE"
+            )
+            terminal_mode = {"value": "FETCHED_RAW"}
+
+            def terminal_progress(_query):
+                return SimpleNamespace(
+                    status="SUCCESS",
+                    published_evidence=PublishedEvidence(
+                        query_id=logical_query_id(promoted_query),
+                        success_receipt_path=root
+                        / "authenticated-by-public-progress.json",
+                        raw_sha256="a" * 64,
+                        query_sidecar_sha256="b" * 64,
+                        storage_mode=terminal_mode["value"],
+                    ),
+                )
+            before = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._remaining_populations",
+                    return_value=(completed, (), (), ()),
+                ),
+                patch.object(
+                    store,
+                    "read_verified_query_progress",
+                    side_effect=terminal_progress,
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=AssertionError("terminal checkpoint republished"),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._promote_remaining",
+                    side_effect=AssertionError("terminal promotion replayed"),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._run_remaining_wave",
+                    side_effect=AssertionError("terminal network wave reached"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    TrustIntegrityError, "promotion|storage"
+                ):
+                    _run_remaining_stage(
+                        request,
+                        _AcquisitionPlan(
+                            "a" * 64,
+                            ("1" * 64, statcast_root.batch_id, "6" * 64),
+                            ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+                        ),
+                        store,
+                        fixed_prefix=fixed,
+                        participant_evidence=tuple(
+                            root / f"evidence-{index}" for index in range(7)
+                        ),
+                        latest=latest,
+                        evidence_root=store.root,
+                        runner_guard=_RunnerGuard(10, 11, root),
+                        disk_budget=_DiskBudget(
+                            request,
+                            free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                        ),
+                    )
+                self.assertEqual(
+                    {
+                        path.relative_to(root): (
+                            path.read_bytes(),
+                            path.stat().st_ino,
+                        )
+                        for path in root.rglob("*")
+                        if path.is_file()
+                    },
+                    before,
+                )
+                terminal_mode["value"] = "PROTECTED_LEGACY_REFERENCE"
+                result = _run_remaining_stage(
+                    request,
+                    _AcquisitionPlan(
+                        "a" * 64,
+                        ("1" * 64, statcast_root.batch_id, "6" * 64),
+                        ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+                    ),
+                    store,
+                    fixed_prefix=fixed,
+                    participant_evidence=tuple(root / f"evidence-{index}" for index in range(7)),
+                    latest=latest,
+                    evidence_root=store.root,
+                    runner_guard=_RunnerGuard(10, 11, root),
+                    disk_budget=_DiskBudget(
+                        request,
+                        free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                    ),
+                )
+            after = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+        self.assertEqual(after, before)
+        self.assertEqual(result.query_batch_ids, latest.query_batch_ids)
+        self.assertEqual((result.fetched, result.network_attempts), (0, 0))
+
+    def test_remaining_repairs_stale_pending_once_after_terminal_checkpoint_crash(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _DiskBudget,
+            _RunnerGuard,
+            _run_remaining_stage,
+        )
+        from mlb_backtest.v52_evidence import PublishedEvidence
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            publish_legacy_decision_inventory,
+        )
+        from mlb_backtest.v52_query_plan import (
+            build_legacy_partition_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            statcast_root = build_statcast_root_batch(root)
+            publish_query_batch(root, statcast_root)
+            publish_legacy_decision_inventory(root)
+            partition = build_legacy_partition_batch(root)
+            publish_query_batch(root, partition)
+            fixed = tuple(
+                SimpleNamespace(batch_id=character * 64, queries=())
+                for character in "234"
+            )
+            completed = tuple(
+                sorted(logical_query_id(query) for query in partition.queries)
+            )
+            stale_pending_id = logical_query_id(
+                next(
+                    query
+                    for query in partition.queries
+                    if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                )
+            )
+            stale_completed = tuple(
+                query_id for query_id in completed if query_id != stale_pending_id
+            )
+            self.assertFalse(set(stale_completed) & {stale_pending_id})
+            self.assertEqual(
+                set(stale_completed) | {stale_pending_id},
+                set(completed),
+            )
+            stale = SimpleNamespace(
+                stage="REMAINING",
+                receipt_sha256="5" * 64,
+                query_batch_ids=(
+                    *tuple(batch.batch_id for batch in fixed),
+                    partition.batch_id,
+                ),
+                completed_query_ids=stale_completed,
+                pending_query_ids=(stale_pending_id,),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+            )
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            promoted_id = logical_query_id(
+                next(
+                    query
+                    for query in partition.queries
+                    if query.requested_range["acquisition"]
+                    == "PROTECTED_LEGACY_REFERENCE"
+                )
+            )
+            publications: list[SimpleNamespace] = []
+            crash_before_checkpoint = True
+
+            def progress(query):
+                query_id = logical_query_id(query)
+                return SimpleNamespace(
+                    status="SUCCESS",
+                    published_evidence=PublishedEvidence(
+                        query_id=query_id,
+                        success_receipt_path=root / f"{query_id}.success.json",
+                        raw_sha256="a" * 64,
+                        query_sidecar_sha256="b" * 64,
+                        storage_mode=(
+                            "PROTECTED_LEGACY_REFERENCE"
+                            if query_id == promoted_id
+                            else "FETCHED_RAW"
+                        ),
+                    ),
+                )
+
+            def checkpoint(_root, _run_spec, **kwargs):
+                nonlocal crash_before_checkpoint
+                if crash_before_checkpoint:
+                    crash_before_checkpoint = False
+                    raise KeyboardInterrupt("after all success before final checkpoint")
+                value = SimpleNamespace(receipt_sha256="6" * 64, **kwargs)
+                publications.append(value)
+                return value
+
+            shared = {
+                "fixed_prefix": fixed,
+                "participant_evidence": tuple(
+                    root / f"evidence-{index}" for index in range(7)
+                ),
+                "evidence_root": store.root,
+                "runner_guard": _RunnerGuard(10, 11, root),
+                "disk_budget": _DiskBudget(
+                    request,
+                    free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                ),
+            }
+            plan = _AcquisitionPlan(
+                "a" * 64,
+                ("1" * 64, statcast_root.batch_id, "6" * 64),
+                ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+            )
+            before = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._remaining_populations",
+                    return_value=(completed, (), (), ()),
+                ),
+                patch.object(
+                    store,
+                    "read_verified_query_progress",
+                    side_effect=progress,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._promote_remaining",
+                    return_value=(0, 1),
+                ) as promotion,
+                patch(
+                    "mlb_backtest.v52_acquire._run_remaining_wave",
+                    side_effect=AssertionError("successful query refetched"),
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=checkpoint,
+                ) as publication,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "after all success before final checkpoint",
+                ):
+                    _run_remaining_stage(
+                        request,
+                        plan,
+                        store,
+                        latest=stale,
+                        **shared,
+                    )
+                corrected = _run_remaining_stage(
+                    request,
+                    plan,
+                    store,
+                    latest=stale,
+                    **shared,
+                )
+                self.assertEqual(len(publications), 1)
+                self.assertEqual(publications[0].pending_query_ids, ())
+                self.assertEqual(promotion.call_count, 2)
+                corrective_publication_calls = publication.call_count
+                replayed = _run_remaining_stage(
+                    request,
+                    plan,
+                    store,
+                    latest=corrected.checkpoint,
+                    **shared,
+                )
+                self.assertEqual(publication.call_count, corrective_publication_calls)
+                self.assertEqual(promotion.call_count, 2)
+            after = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertEqual(after, before)
+        self.assertIs(replayed.checkpoint, corrected.checkpoint)
+        self.assertEqual((corrected.fetched, corrected.network_attempts), (0, 0))
+        self.assertEqual((replayed.fetched, replayed.network_attempts), (0, 0))
+
+    def test_remaining_receipt_checkpoint_child_fetch_barriers_resume_after_crash(self) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _DiskBudget,
+            _RemainingWaveResult,
+            _RunnerGuard,
+            _materialize_remaining_split,
+            _run_remaining_stage,
+        )
+        from mlb_backtest.v52_legacy import load_protected_legacy_catalog
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            preview_legacy_decisions,
+        )
+        from mlb_backtest.v52_query_plan import build_statcast_root_batch
+        from tests.test_v52_legacy_decision_inventory import (
+            _legacy_decision_repository,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _inventory_path, digest = _legacy_decision_repository(Path(directory))
+            statcast_root = build_statcast_root_batch(root)
+            catalog = load_protected_legacy_catalog(
+                root,
+                legacy_root=root / "data/v5_1_bt/raw",
+                protected_inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
+                protected_inventory_sha256=digest,
+            )
+            preview = preview_legacy_decisions(
+                statcast_root,
+                catalog,
+                protected_inventory_sha256=digest,
+            )
+            plan = _AcquisitionPlan(
+                "a" * 64,
+                ("1" * 64, statcast_root.batch_id, preview.partition_batch.batch_id),
+                ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
+            )
+            fixed = tuple(
+                SimpleNamespace(batch_id=character * 64, queries=())
+                for character in "234"
+            )
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            (root / "data/v5_2_qd/historical").mkdir(parents=True, exist_ok=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            parent = next(
+                query
+                for query in preview.partition_batch.queries
+                if query.requested_range["acquisition"] == "FETCH_REQUIRED"
+                and query.requested_range["start_date"]
+                != query.requested_range["end_date"]
+            )
+            capture = dataclasses.replace(
+                _capture(b"partial", error="SIZE_LIMIT"),
+                final_url="https://baseballsavant.mlb.com/statcast_search/csv",
+                response_headers=(("Content-Type", "text/csv"),),
+            )
+            with store.acquire_query(parent) as lease:
+                attempt = store.next_attempt_number(lease)
+                store.persist_split_attempt(
+                    parent,
+                    attempt,
+                    capture,
+                    reason="SIZE_LIMIT",
+                )
+            parent_id = logical_query_id(parent)
+            promoted_id = next(
+                logical_query_id(query)
+                for query in preview.partition_batch.queries
+                if query.requested_range["acquisition"]
+                == "PROTECTED_LEGACY_REFERENCE"
+            )
+            complete: set[str] = set()
+            durable_checkpoints: list[SimpleNamespace] = []
+            events: list[str] = []
+            crash_split_checkpoint = True
+
+            def populations(_store, batches, split_ids):
+                query_ids = {
+                    logical_query_id(query)
+                    for batch in batches[3:]
+                    for query in batch.queries
+                }
+                split = set(split_ids)
+                return (
+                    tuple(sorted(complete)),
+                    tuple(sorted(query_ids - split - complete)),
+                    (),
+                    tuple(sorted(split)),
+                )
+
+            def promote(_store, _catalog, _promoted):
+                resumed = promoted_id in complete
+                complete.add(promoted_id)
+                events.append("promotion")
+                return (0, 1) if resumed else (1, 0)
+
+            def checkpoint(_root, _run_spec, **kwargs):
+                nonlocal crash_split_checkpoint
+                split = tuple(kwargs["split_query_ids"])
+                pending = tuple(kwargs["pending_query_ids"])
+                if split and crash_split_checkpoint:
+                    events.append("checkpoint-crash")
+                    crash_split_checkpoint = False
+                    raise KeyboardInterrupt("after receipt before checkpoint")
+                label = (
+                    "split-checkpoint"
+                    if split and pending
+                    else "terminal-checkpoint"
+                    if split
+                    else "fixed-checkpoint"
+                )
+                events.append(label)
+                value = SimpleNamespace(
+                    receipt_sha256=f"{len(durable_checkpoints) + 6:064x}",
+                    **kwargs,
+                )
+                durable_checkpoints.append(value)
+                return value
+
+            real_materialize = _materialize_remaining_split
+
+            def materialize(*args, **kwargs):
+                value = real_materialize(*args, **kwargs)
+                events.append("receipt-ready")
+                return value
+
+            wave_calls = 0
+
+            def wave(_request, _plan, _store, *, active_queries, **_kwargs):
+                nonlocal wave_calls
+                wave_calls += 1
+                events.append("child-fetch")
+                self.assertIn(parent_id, durable_checkpoints[-1].split_query_ids)
+                complete.update(logical_query_id(query) for query in active_queries)
+                return _RemainingWaveResult(
+                    len(active_queries), 0, len(active_queries), ()
+                )
+
+            initial = SimpleNamespace(
+                stage="PARTICIPANT_DERIVED",
+                receipt_sha256="5" * 64,
+                query_batch_ids=tuple(batch.batch_id for batch in fixed),
+                completed_query_ids=(),
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+            )
+            shared = {
+                "fixed_prefix": fixed,
+                "participant_evidence": tuple(
+                    root / f"evidence-{index}" for index in range(7)
+                ),
+                "evidence_root": store.root,
+                "runner_guard": _RunnerGuard(10, 11, root),
+                "disk_budget": _DiskBudget(
+                    request,
+                    free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                ),
+            }
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._remaining_populations",
+                    side_effect=populations,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._promote_remaining",
+                    side_effect=promote,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._materialize_remaining_split",
+                    side_effect=materialize,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._run_remaining_wave",
+                    side_effect=wave,
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=checkpoint,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "after receipt before checkpoint"
+                ):
+                    _run_remaining_stage(
+                        request,
+                        plan,
+                        store,
+                        latest=initial,
+                        **shared,
+                    )
+                resume_from = durable_checkpoints[-1]
+                result = _run_remaining_stage(
+                    request,
+                    plan,
+                    store,
+                    latest=resume_from,
+                    **shared,
+                )
+        first_receipt = events.index("receipt-ready")
+        crash = events.index("checkpoint-crash")
+        second_receipt = events.index("receipt-ready", first_receipt + 1)
+        split_checkpoint = events.index("split-checkpoint")
+        child_fetch = events.index("child-fetch")
+        terminal_checkpoint = events.index("terminal-checkpoint")
+        self.assertLess(first_receipt, crash)
+        self.assertLess(crash, second_receipt)
+        self.assertLess(second_receipt, split_checkpoint)
+        self.assertLess(split_checkpoint, child_fetch)
+        self.assertLess(child_fetch, terminal_checkpoint)
+        self.assertEqual(wave_calls, 1)
+        self.assertEqual(len(result.query_batch_ids), 5)
+
+    def test_mixed_split_quarantine_repairs_split_before_operational_resume(self) -> None:
+        from mlb_backtest import v52_legacy_decision_inventory as inventory_module
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TerminalAcquisitionFailure,
+            _AcquisitionPlan,
+            _DiskBudget,
+            _RunnerGuard,
+            _run_remaining_stage,
+        )
+
+        # Load its query-plan aliases before patching the source module below.
+        self.assertTrue(callable(inventory_module.publish_legacy_decision_inventory))
+
+        promoted = _query(statcast=True, single_day=True)
+        split_parent = dataclasses.replace(
+            _query(statcast=True),
+            parameters={"game_date_gt": "2024-05-01", "game_date_lt": "2024-05-04"},
+            requested_range={
+                "acquisition": "FETCH_REQUIRED",
+                "end_date": "2024-05-04",
+                "start_date": "2024-05-01",
+                "year": 2024,
+            },
+        )
+        quarantined_query = dataclasses.replace(
+            _query(statcast=True, single_day=True),
+            parameters={"game_date_gt": "2024-06-01", "game_date_lt": "2024-06-01"},
+            requested_range={
+                "acquisition": "FETCH_REQUIRED",
+                "end_date": "2024-06-01",
+                "start_date": "2024-06-01",
+                "year": 2024,
+            },
+        )
+        promoted = dataclasses.replace(
+            promoted,
+            requested_range={
+                **dict(promoted.requested_range),
+                "acquisition": "PROTECTED_LEGACY_REFERENCE",
+                "protected_inventory_sha256": "9" * 64,
+            },
+        )
+        partition = SimpleNamespace(
+            batch_id="8" * 64,
+            queries=(promoted, split_parent, quarantined_query),
+        )
+        root_batch = SimpleNamespace(batch_id="7" * 64, queries=())
+        child_query = dataclasses.replace(
+            split_parent,
+            parameters={"game_date_gt": "2024-05-01", "game_date_lt": "2024-05-02"},
+            requested_range={
+                **dict(split_parent.requested_range),
+                "end_date": "2024-05-02",
+            },
+            parent_query_id=logical_query_id(split_parent),
+        )
+        child_batch = SimpleNamespace(
+            batch_id="6" * 64,
+            derived_from_sha256=partition.batch_id,
+            queries=(child_query,),
+        )
+        split_parent_id = logical_query_id(split_parent)
+        quarantine_id = logical_query_id(quarantined_query)
+        receipt = SimpleNamespace(
+            parent_batch_id=partition.batch_id,
+            parent_query_id=split_parent_id,
+            reason="SIZE_LIMIT",
+            exhausted_attempt_number=1,
+            child_batch_id=child_batch.batch_id,
+            child_query_ids=(logical_query_id(child_query),),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "data/v5_2_qd/historical").mkdir(parents=True)
+            store = V52EvidenceStore(root / "data/v5_2_qd/historical/raw")
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+            )
+            fixed = tuple(
+                SimpleNamespace(batch_id=character * 64, queries=())
+                for character in "234"
+            )
+            complete = {logical_query_id(promoted)}
+            checkpoints: list[SimpleNamespace] = []
+            materialize_calls = 0
+            wave_calls = 0
+
+            def populations(selected_store, batches, split_ids):
+                completed: list[str] = []
+                pending: list[str] = []
+                quarantined: list[str] = []
+                split = set(split_ids)
+                for batch in batches[3:]:
+                    for query in batch.queries:
+                        query_id = logical_query_id(query)
+                        if query_id in split:
+                            continue
+                        progress = selected_store.read_verified_query_progress(query)
+                        if query_id in complete or progress.status == "SUCCESS":
+                            completed.append(query_id)
+                        elif progress.status == "QUARANTINED":
+                            quarantined.append(query_id)
+                        else:
+                            pending.append(query_id)
+                return (
+                    tuple(sorted(completed)),
+                    tuple(sorted(pending)),
+                    tuple(sorted(quarantined)),
+                    tuple(sorted(split)),
+                )
+
+            def checkpoint(_root, _run_spec, **kwargs):
+                value = SimpleNamespace(
+                    receipt_sha256=f"{len(checkpoints) + 10:064x}",
+                    **kwargs,
+                )
+                checkpoints.append(value)
+                return value
+
+            def mixed_wave(*_args, **_kwargs):
+                nonlocal wave_calls
+                wave_calls += 1
+                self.assertEqual(wave_calls, 1, "split parent was refetched")
+                split_capture = dataclasses.replace(
+                    _capture(b"partial", error="SIZE_LIMIT"),
+                    final_url="https://baseballsavant.mlb.com/statcast_search/csv",
+                    response_headers=(("Content-Type", "text/csv"),),
+                )
+                with store.acquire_query(split_parent) as lease:
+                    split_attempt = store.next_attempt_number(lease)
+                    store.persist_split_attempt(
+                        split_parent,
+                        split_attempt,
+                        split_capture,
+                        reason="SIZE_LIMIT",
+                    )
+                quarantine_capture = dataclasses.replace(
+                    _capture(b"bad", status=404, error="PERMANENT_HTTP"),
+                    final_url="https://baseballsavant.mlb.com/statcast_search/csv",
+                )
+                with store.acquire_query(quarantined_query) as lease:
+                    quarantine_attempt = store.next_attempt_number(lease)
+                    store.quarantine_attempt(
+                        quarantined_query,
+                        quarantine_attempt,
+                        quarantine_capture,
+                        error_classification="PERMANENT_HTTP",
+                    )
+                raise TerminalAcquisitionFailure(
+                    "PERMANENT_HTTP", quarantine_attempt
+                )
+
+            artifact_root = root / "repair-artifacts"
+
+            def materialize(*_args, **_kwargs):
+                nonlocal materialize_calls
+                materialize_calls += 1
+                if materialize_calls == 1:
+                    raise KeyboardInterrupt("during mixed split repair")
+                artifact_root.mkdir(exist_ok=True)
+                for name, contents in (
+                    ("child.json", b"child\n"),
+                    ("receipt.json", b"receipt\n"),
+                ):
+                    path = artifact_root / name
+                    if not path.exists():
+                        path.write_bytes(contents)
+                return child_batch, receipt
+
+            batch_map = {
+                root_batch.batch_id: root_batch,
+                partition.batch_id: partition,
+                child_batch.batch_id: child_batch,
+            }
+            initial = SimpleNamespace(
+                stage="PARTICIPANT_DERIVED",
+                receipt_sha256="5" * 64,
+                query_batch_ids=tuple(batch.batch_id for batch in fixed),
+                completed_query_ids=(),
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+            )
+            shared = {
+                "fixed_prefix": fixed,
+                "participant_evidence": tuple(
+                    root / f"evidence-{index}" for index in range(7)
+                ),
+                "evidence_root": store.root,
+                "runner_guard": _RunnerGuard(10, 11, root),
+                "disk_budget": _DiskBudget(
+                    request,
+                    free_bytes=lambda _root: request.reserve_bytes + 10**10,
+                ),
+            }
+            patches = (
+                patch(
+                    "mlb_backtest.v52_query_plan.build_statcast_root_batch",
+                    return_value=root_batch,
+                ),
+                patch(
+                    "mlb_backtest.v52_query_plan.build_legacy_partition_batch",
+                    return_value=partition,
+                ),
+                patch(
+                    "mlb_backtest.v52_query_plan.load_query_batch",
+                    side_effect=lambda _root, batch_id: batch_map[batch_id],
+                ),
+                patch("mlb_backtest.v52_query_plan.publish_query_batch"),
+                patch(
+                    "mlb_backtest.v52_query_plan.load_split_receipt",
+                    side_effect=lambda _root, parent_id, **_kwargs: (
+                        receipt if parent_id == split_parent_id else None
+                    ),
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy_decision_inventory.publish_legacy_decision_inventory",
+                    return_value=SimpleNamespace(
+                        payload={"protected_inventory": {"sha256": "9" * 64}}
+                    ),
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy_decision_inventory.load_verified_legacy_decision_inventory",
+                    return_value=SimpleNamespace(
+                        payload={"protected_inventory": {"sha256": "9" * 64}}
+                    ),
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy.load_protected_legacy_catalog",
+                    return_value=object(),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._validate_remaining_decisions",
+                    return_value=((promoted, object()),),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._promote_remaining",
+                    return_value=(0, 1),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._remaining_populations",
+                    side_effect=populations,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._run_remaining_wave",
+                    side_effect=mixed_wave,
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._materialize_remaining_split",
+                    side_effect=materialize,
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                    side_effect=checkpoint,
+                ),
+            )
+            with ExitStack() as stack:
+                for context in patches:
+                    stack.enter_context(context)
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "during mixed split repair"
+                ):
+                    _run_remaining_stage(
+                        request,
+                        _AcquisitionPlan(
+                            "a" * 64,
+                            ("1" * 64, root_batch.batch_id, "0" * 64),
+                            ("PROMOTED", "FETCH_REQUIRED", "FETCH_REQUIRED"),
+                        ),
+                        store,
+                        latest=initial,
+                        **shared,
+                    )
+                stale_checkpoint = checkpoints[-1]
+                with self.assertRaisesRegex(OperationalBlock, "quarantined"):
+                    _run_remaining_stage(
+                        request,
+                        _AcquisitionPlan(
+                            "a" * 64,
+                            ("1" * 64, root_batch.batch_id, "0" * 64),
+                            ("PROMOTED", "FETCH_REQUIRED", "FETCH_REQUIRED"),
+                        ),
+                        store,
+                        latest=stale_checkpoint,
+                        **shared,
+                    )
+                mixed_checkpoint = checkpoints[-1]
+                self.assertEqual(mixed_checkpoint.split_query_ids, (split_parent_id,))
+                self.assertEqual(
+                    mixed_checkpoint.quarantined_query_ids, (quarantine_id,)
+                )
+                before = {
+                    path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+                checkpoint_count = len(checkpoints)
+                with self.assertRaisesRegex(OperationalBlock, "quarantined"):
+                    _run_remaining_stage(
+                        request,
+                        _AcquisitionPlan(
+                            "a" * 64,
+                            ("1" * 64, root_batch.batch_id, "0" * 64),
+                            ("PROMOTED", "FETCH_REQUIRED", "FETCH_REQUIRED"),
+                        ),
+                        store,
+                        latest=mixed_checkpoint,
+                        **shared,
+                    )
+                after = {
+                    path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+            self.assertEqual(materialize_calls, 2)
+            self.assertEqual(wave_calls, 1)
+            self.assertEqual(len(checkpoints), checkpoint_count)
+            self.assertEqual(after, before)
+
     def test_real_stage_integrity_failures_translate_to_trust_errors(self) -> None:
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
@@ -2882,6 +4310,12 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 build_participant = stack.enter_context(patch("mlb_backtest.v52_query_plan.build_participant_derived_batch", side_effect=lambda _root: events.append("participant-batch") or participant))
                 publish_batch = stack.enter_context(patch("mlb_backtest.v52_query_plan.publish_query_batch"))
                 execute_stage = stack.enter_context(patch("mlb_backtest.v52_acquire._execute_stage", side_effect=execute))
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._run_remaining_stage",
+                        side_effect=OperationalBlock("REMAINING"),
+                    )
+                )
 
                 with self.assertRaisesRegex(OperationalBlock, "timezone|review|seal"):
                     _real_run_stages(request, plan)
