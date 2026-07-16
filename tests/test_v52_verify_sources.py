@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import importlib
 import json
@@ -10,15 +11,18 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
 from mlb_backtest.diagnostics import canonical_json_bytes
+from mlb_backtest.execution_registry import AcquisitionCheckpoint
 from mlb_backtest.v52_evidence import (
     AttemptCapture,
     LogicalQuery,
     V52EvidenceStore,
     logical_query_id,
 )
+from mlb_backtest.v52_query_plan import QueryBatch, SplitReceipt
 from mlb_backtest.v52_source_contracts import recompute_query_sidecar
 from tests.test_v52_source_schedule import _query, _schedule_raw
 
@@ -26,9 +30,7 @@ from tests.test_v52_source_schedule import _query, _schedule_raw
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "mlb_backtest/v52_verify_sources.py"
 SOURCE_FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
-_VENUE_GUARD_PAYLOAD = json.loads(
-    (SOURCE_FIXTURES / "venues_mini.json").read_bytes()
-)
+_VENUE_GUARD_PAYLOAD = json.loads((SOURCE_FIXTURES / "venues_mini.json").read_bytes())
 _VENUE_GUARD_PAYLOAD["venues"] = _VENUE_GUARD_PAYLOAD["venues"][:1]
 PARSER_IMPORT_GUARD_CASES = (
     "schedule",
@@ -337,7 +339,318 @@ def _forge_sidecar_semantics(root: Path, query: LogicalQuery) -> None:
     success_path.write_bytes(canonical_json_bytes(success) + b"\n")
 
 
+def _graph_fixture(*, recursive: bool = False) -> SimpleNamespace:
+    def query(label: str, parent: str | None = None) -> LogicalQuery:
+        base = _query()
+        return dataclasses.replace(
+            base,
+            parameters={**base.parameters, "fixture": label},
+            requested_range={**base.requested_range, "fixture": label},
+            parent_query_id=parent,
+        )
+
+    root, parent = query("root"), query("parent")
+    parent_id = logical_query_id(parent)
+    left, right = query("left", parent_id), query("right", parent_id)
+    batches = [
+        QueryBatch("1" * 64, "REMAINING", None, (root, parent)),
+        QueryBatch("2" * 64, "REMAINING", "1" * 64, (left, right)),
+    ]
+
+    def receipt(index: int, parent_batch, parent_query, child_batch, depth):
+        return SplitReceipt(
+            str(5 + index) * 64,
+            str(7 + index) * 64,
+            "REMAINING",
+            parent_batch.batch_id,
+            logical_query_id(parent_query),
+            "ROW_CAP",
+            1,
+            depth,
+            child_batch.batch_id,
+            tuple(logical_query_id(item) for item in child_batch.queries),
+            "2026-07-16T12:00:00.000000Z",
+        )
+
+    receipts = [receipt(0, batches[0], parent, batches[1], 1)]
+    completed = [root, left, right]
+    if recursive:
+        left_id = logical_query_id(left)
+        grand = (query("grand-left", left_id), query("grand-right", left_id))
+        batches.append(QueryBatch("3" * 64, "REMAINING", "2" * 64, grand))
+        receipts.append(receipt(1, batches[1], left, batches[2], 2))
+        completed = [root, right, *grand]
+    checkpoint = AcquisitionCheckpoint(
+        4,
+        "a" * 64,
+        "b" * 64,
+        "REMAINING",
+        "2026-07-16T12:00:00.000000Z",
+        "c" * 40,
+        "d" * 64,
+        tuple(batch.batch_id for batch in batches),
+        tuple("e" * 64 for _ in batches),
+        (),
+        (),
+        tuple(
+            item.receipt_sha256
+            for item in sorted(receipts, key=lambda x: x.parent_query_id)
+        ),
+        tuple(sorted(logical_query_id(item) for item in completed)),
+        (),
+        (),
+        tuple(sorted(item.parent_query_id for item in receipts)),
+    )
+    return SimpleNamespace(
+        checkpoint=checkpoint,
+        batches=tuple(batches),
+        receipts=tuple(receipts),
+        root=root,
+        parent=parent,
+        left=left,
+        right=right,
+        completed=tuple(completed),
+    )
+
+
 class V52VerifySourcesTest(unittest.TestCase):
+    def test_completed_query_graph_classifies_root_and_split_leaves(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fx = _graph_fixture()
+        enumerate_graph = getattr(verifier, "_enumerate_completed_query_graph", None)
+        self.assertIsNotNone(enumerate_graph, "missing graph enumerator")
+        graph = enumerate_graph(fx.checkpoint, fx.batches, fx.receipts)
+        self.assertIsInstance(graph, verifier._TerminalQueryGraph)
+        self.assertIs(graph.checkpoint, fx.checkpoint)
+        self.assertEqual(graph.query_batches, fx.batches)
+        self.assertEqual(
+            graph.split_receipts,
+            tuple(
+                {item.parent_query_id: item for item in fx.receipts}[parent_id]
+                for parent_id in fx.checkpoint.split_query_ids
+            ),
+        )
+        self.assertEqual(graph.split_parent_queries, (fx.parent,))
+        self.assertEqual(
+            graph.completed_queries, tuple(sorted(fx.completed, key=logical_query_id))
+        )
+        self.assertEqual(graph.root_queries, (fx.root,))
+        self.assertEqual(
+            graph.split_leaf_queries,
+            tuple(sorted((fx.left, fx.right), key=logical_query_id)),
+        )
+        self.assertNotIn(fx.parent, graph.completed_queries)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            graph.completed_queries = ()
+
+    def test_completed_query_graph_rejects_population_binding_and_cycles(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fx = _graph_fixture()
+        cp, (root_batch, child_batch), (receipt,) = (
+            fx.checkpoint,
+            fx.batches,
+            fx.receipts,
+        )
+        duplicate_batch = dataclasses.replace(child_batch, queries=(fx.root, fx.right))
+        duplicate_receipt = dataclasses.replace(
+            receipt,
+            child_query_ids=tuple(logical_query_id(q) for q in duplicate_batch.queries),
+        )
+        cyclic_root = dataclasses.replace(
+            root_batch, derived_from_sha256=child_batch.batch_id
+        )
+        back = dataclasses.replace(
+            receipt,
+            split_receipt_id="9" * 64,
+            receipt_sha256="f" * 64,
+            parent_batch_id=child_batch.batch_id,
+            parent_query_id=logical_query_id(fx.left),
+            depth=2,
+            child_batch_id=cyclic_root.batch_id,
+            child_query_ids=tuple(logical_query_id(q) for q in cyclic_root.queries),
+        )
+        attacks = (
+            (cp, (root_batch, duplicate_batch), (duplicate_receipt,)),
+            (
+                dataclasses.replace(
+                    cp,
+                    completed_query_ids=tuple(
+                        sorted((*cp.completed_query_ids, logical_query_id(fx.parent)))
+                    ),
+                ),
+                fx.batches,
+                fx.receipts,
+            ),
+            (
+                dataclasses.replace(
+                    cp, completed_query_ids=cp.completed_query_ids[:-1]
+                ),
+                fx.batches,
+                fx.receipts,
+            ),
+            (
+                dataclasses.replace(
+                    cp,
+                    completed_query_ids=tuple(
+                        sorted((*cp.completed_query_ids, "0" * 64))
+                    ),
+                ),
+                fx.batches,
+                fx.receipts,
+            ),
+            (cp, fx.batches, (dataclasses.replace(receipt, parent_batch_id="0" * 64),)),
+            (
+                cp,
+                fx.batches,
+                (
+                    dataclasses.replace(
+                        receipt,
+                        child_query_ids=tuple(reversed(receipt.child_query_ids)),
+                    ),
+                ),
+            ),
+            (
+                dataclasses.replace(
+                    cp,
+                    completed_query_ids=tuple(
+                        sorted((logical_query_id(fx.root), logical_query_id(fx.right)))
+                    ),
+                    split_query_ids=tuple(
+                        sorted((receipt.parent_query_id, back.parent_query_id))
+                    ),
+                    split_receipt_sha256s=tuple(
+                        sorted((receipt.receipt_sha256, back.receipt_sha256))
+                    ),
+                ),
+                (cyclic_root, child_batch),
+                (receipt, back),
+            ),
+        )
+        enumerate_graph = getattr(verifier, "_enumerate_completed_query_graph", None)
+        self.assertIsNotNone(enumerate_graph, "missing graph enumerator")
+        for index, arguments in enumerate(attacks):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                enumerate_graph(*arguments)
+
+    def test_terminal_query_graph_loader_uses_only_sealed_read_only_artifacts(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fx, root = _graph_fixture(recursive=True), Path("/sealed/repository")
+        run_spec = SimpleNamespace(raw={"namespaces": {"raw": "evidence/raw"}})
+        batch_index = {item.batch_id: item for item in fx.batches}
+        receipt_index = {item.parent_query_id: item for item in fx.receipts}
+        loader = getattr(verifier, "_load_terminal_query_graph", None)
+        self.assertIsNotNone(loader, "missing terminal graph loader")
+        with (
+            patch.object(
+                verifier,
+                "load_source_verification_checkpoint",
+                return_value=fx.checkpoint,
+                create=True,
+            ) as checkpoint_loader,
+            patch.object(
+                verifier,
+                "load_query_batch",
+                side_effect=lambda _, key, **kw: batch_index[key],
+                create=True,
+            ) as batch_loader,
+            patch.object(
+                verifier,
+                "load_split_receipt",
+                side_effect=lambda _, key, **kw: receipt_index[key],
+                create=True,
+            ) as receipt_loader,
+            patch.object(Path, "glob", side_effect=AssertionError("must not scan")),
+            patch.object(Path, "rglob", side_effect=AssertionError("must not scan")),
+        ):
+            graph = loader(root, run_spec)
+        checkpoint_loader.assert_called_once_with(root, run_spec)
+        self.assertEqual(
+            batch_loader.call_args_list,
+            [call(root, item.batch_id, read_only_progress=True) for item in fx.batches],
+        )
+        self.assertEqual(
+            receipt_loader.call_args_list,
+            [
+                call(
+                    root,
+                    key,
+                    evidence_root=root / "evidence/raw",
+                    read_only_progress=True,
+                )
+                for key in fx.checkpoint.split_query_ids
+            ],
+        )
+        self.assertEqual(
+            graph.completed_queries, tuple(sorted(fx.completed, key=logical_query_id))
+        )
+        self.assertIs(graph.checkpoint, fx.checkpoint)
+        self.assertEqual(graph.query_batches, fx.batches)
+        self.assertEqual(
+            graph.split_receipts,
+            tuple(receipt_index[parent_id] for parent_id in fx.checkpoint.split_query_ids),
+        )
+        self.assertEqual(
+            graph.split_parent_queries,
+            tuple(sorted((fx.parent, fx.left), key=logical_query_id)),
+        )
+
+    def test_completed_query_recompute_is_query_id_sorted(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        queries, store = tuple(reversed(_graph_fixture().completed)), object()
+        recompute = getattr(verifier, "_recompute_completed_queries", None)
+        self.assertIsNotNone(recompute, "missing completed recompute helper")
+        with patch.object(
+            verifier,
+            "_read_and_recompute_query",
+            side_effect=lambda _, q: {"query_id": logical_query_id(q)},
+        ) as reader:
+            result = recompute(store, queries)
+        ordered = tuple(sorted(queries, key=logical_query_id))
+        self.assertEqual(
+            reader.call_args_list, [call(store, query) for query in ordered]
+        )
+        self.assertEqual(
+            result, tuple({"query_id": logical_query_id(query)} for query in ordered)
+        )
+
+    def test_derived_disposition_is_independently_recomputed_without_mutation(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from tests.test_v52_evidence import _derived_query, _derived_semantics
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, query = Path(directory).resolve() / "raw", _derived_query()
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query):
+                store.publish_derived_disposition(query, _derived_semantics())
+            read_only = V52EvidenceStore.open_read_only(root)
+            expected_sidecar = dict(
+                read_only.read_verified_success(query).query_sidecar
+            )
+            before = _snapshot_tree(root)
+            with patch.object(
+                verifier, "recompute_query_sidecar", wraps=recompute_query_sidecar
+            ) as parser:
+                result = verifier._read_and_recompute_query(read_only, query)
+            parser.assert_called_once_with(query, b"")
+            self.assertEqual(
+                result,
+                {
+                    "query_id": logical_query_id(query),
+                    "query_sidecar": expected_sidecar,
+                    "raw_sha256": None,
+                    "storage_mode": "DERIVED_DISPOSITION",
+                },
+            )
+            self.assertEqual(_snapshot_tree(root), before)
+
     def test_verifier_import_graph_has_no_fetch_or_http_client(self) -> None:
         self.assertTrue(MODULE_PATH.is_file(), "source verifier is not implemented")
         tree = ast.parse(MODULE_PATH.read_bytes(), filename=str(MODULE_PATH))
@@ -362,8 +675,7 @@ class V52VerifySourcesTest(unittest.TestCase):
         }
         self.assertFalse(
             any(
-                imported == forbidden
-                or imported.startswith(f"{forbidden}.")
+                imported == forbidden or imported.startswith(f"{forbidden}.")
                 for imported in imported_modules
                 for forbidden in forbidden_modules
             ),
@@ -452,7 +764,10 @@ class V52VerifySourcesTest(unittest.TestCase):
         from mlb_backtest.v52_verify_sources import _read_and_recompute_query
 
         for mutation in ("sidecar", "raw"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory).resolve() / "raw"
                 _, query, _ = _owned_schedule_evidence(root)
                 if mutation == "sidecar":
@@ -468,9 +783,7 @@ class V52VerifySourcesTest(unittest.TestCase):
                     verified = V52EvidenceStore.open_read_only(
                         root
                     ).read_verified_success(query)
-                    raw_path = root / str(
-                        verified.success_receipt["fetched_raw_path"]
-                    )
+                    raw_path = root / str(verified.success_receipt["fetched_raw_path"])
                     raw_path.write_bytes(raw_path.read_bytes() + b" ")
                 before = _snapshot_tree(root)
 
@@ -493,9 +806,9 @@ class V52VerifySourcesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "raw"
             _, query, _ = _owned_schedule_evidence(root)
-            verified = V52EvidenceStore.open_read_only(
-                root
-            ).read_verified_success(query)
+            verified = V52EvidenceStore.open_read_only(root).read_verified_success(
+                query
+            )
             raw_path = root / str(verified.success_receipt["fetched_raw_path"])
             before = _snapshot_tree(root)
             attacker_snapshots: list[
