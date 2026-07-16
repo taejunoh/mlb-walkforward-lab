@@ -3478,11 +3478,13 @@ def load_latest_acquisition_checkpoint(
         return checkpoints[-1] if checkpoints else None
 
 
-def load_terminal_acquisition_checkpoint(
+def _load_read_only_terminal_acquisition_checkpoint(
     root: Path,
     run_spec: RunSpec,
+    *,
+    allowed_phases: frozenset[str],
+    phase_error: str,
 ) -> AcquisitionCheckpoint:
-    """Read-only authentication of the frozen SOURCES_READY checkpoint head."""
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, registry_payloads = _load_locked(
@@ -3491,10 +3493,8 @@ def load_terminal_acquisition_checkpoint(
             lock_binding,
             read_only_progress=True,
         )
-        if state.phase != "SOURCES_READY":
-            raise ValueError(
-                "terminal acquisition replay requires SOURCES_READY"
-            )
+        if state.phase not in allowed_phases:
+            raise ValueError(phase_error)
         snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
         checkpoints, payloads, names = _load_checkpoints_locked(
             paths,
@@ -3507,6 +3507,32 @@ def load_terminal_acquisition_checkpoint(
         )
         _terminal_checkpoint_head(paths, checkpoints, payloads, names)
         return checkpoints[-1]
+
+
+def load_source_verification_checkpoint(
+    root: Path,
+    run_spec: RunSpec,
+) -> AcquisitionCheckpoint:
+    """Read-only authentication of terminal acquisition evidence for Task 8."""
+    return _load_read_only_terminal_acquisition_checkpoint(
+        root,
+        run_spec,
+        allowed_phases=frozenset({"ACQUIRING", "SOURCES_READY"}),
+        phase_error="source verification requires ACQUIRING or SOURCES_READY",
+    )
+
+
+def load_terminal_acquisition_checkpoint(
+    root: Path,
+    run_spec: RunSpec,
+) -> AcquisitionCheckpoint:
+    """Read-only authentication of the frozen SOURCES_READY checkpoint head."""
+    return _load_read_only_terminal_acquisition_checkpoint(
+        root,
+        run_spec,
+        allowed_phases=frozenset({"SOURCES_READY"}),
+        phase_error="terminal acquisition replay requires SOURCES_READY",
+    )
 
 
 def publish_acquisition_checkpoint(

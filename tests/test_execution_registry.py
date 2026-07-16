@@ -1511,6 +1511,390 @@ class ExecutionRegistryTest(unittest.TestCase):
                     SimpleNamespace(),
                 )
 
+    def test_source_verification_loader_accepts_only_terminal_active_or_ready(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_evidence import V52EvidenceStore
+        from tests.test_v52_evidence import _capture, _query, _sidecar
+
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkpoint_relative = Path("execution/checkpoints")
+            checkpoint_dir = root / checkpoint_relative
+            checkpoint_dir.mkdir(parents=True)
+            contents = canonical_json_bytes({"fixture": "terminal"}) + b"\n"
+            digest = hashlib.sha256(contents).hexdigest()
+            name = f"00000000-{digest}.json"
+            (checkpoint_dir / name).write_bytes(contents)
+            checkpoint = SimpleNamespace(
+                sequence=0,
+                receipt_sha256=digest,
+                stage="REMAINING",
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=("split-parent",),
+            )
+            checkpoint_payload = {
+                "pending_query_ids": [],
+                "quarantined_query_ids": [],
+            }
+            paths = SimpleNamespace(
+                root=root,
+                checkpoints_relative=checkpoint_relative,
+            )
+            head = {
+                "count": 1,
+                "path": (checkpoint_relative / name).as_posix(),
+                "sequence": 0,
+                "sha256": digest,
+                "stage": "REMAINING",
+            }
+            evidence_root = root / "raw"
+            store = V52EvidenceStore(evidence_root)
+            query = _query()
+            with store.acquire_query(query) as lease:
+                published = store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(),
+                    _sidecar(),
+                )
+
+            def snapshot() -> dict[
+                Path,
+                tuple[int, int, int, int, bytes | None],
+            ]:
+                result = {}
+                for path in (root, *sorted(root.rglob("*"))):
+                    metadata = path.lstat()
+                    result[path.relative_to(root)] = (
+                        stat.S_IFMT(metadata.st_mode),
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_size,
+                        path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None,
+                    )
+                return result
+
+            before = snapshot()
+
+            def load_checkpoints(
+                *_args,
+                read_only_progress: bool = False,
+                **_kwargs,
+            ):
+                evidence = (
+                    V52EvidenceStore.open_read_only(evidence_root)
+                    if read_only_progress
+                    else V52EvidenceStore(evidence_root)
+                )
+                progress = evidence.read_verified_query_progress(query)
+                self.assertEqual(progress.status, "SUCCESS")
+                self.assertEqual(progress.published_evidence, published)
+                return (
+                    (checkpoint,),
+                    (checkpoint_payload,),
+                    (name,),
+                )
+
+            for phase in ("ACQUIRING", "SOURCES_READY"):
+                with (
+                    self.subTest(phase=phase),
+                    patch.object(self.registry, "_paths", return_value=paths),
+                    patch.object(
+                        self.registry,
+                        "_registry_lock",
+                        side_effect=shared_lock,
+                    ) as registry_lock,
+                    patch.object(
+                        self.registry,
+                        "_load_locked",
+                        return_value=(
+                            SimpleNamespace(phase=phase),
+                            (
+                                {
+                                    "acquisition_checkpoint_head": (
+                                        head if phase == "SOURCES_READY" else None
+                                    )
+                                },
+                            ),
+                        ),
+                    ) as registry_loader,
+                    patch.object(
+                        self.registry,
+                        "_capture_git_snapshot",
+                        return_value=SimpleNamespace(head="a" * 40),
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_load_checkpoints_locked",
+                        side_effect=load_checkpoints,
+                    ) as checkpoint_loader,
+                ):
+                    loaded = (
+                        self.registry.load_source_verification_checkpoint(
+                            root,
+                            SimpleNamespace(),
+                        )
+                    )
+                    self.assertIs(loaded, checkpoint)
+                    self.assertEqual(
+                        loaded.split_query_ids,
+                        ("split-parent",),
+                    )
+                    self.assertTrue(
+                        registry_loader.call_args.kwargs[
+                            "read_only_progress"
+                        ]
+                    )
+                    self.assertTrue(
+                        checkpoint_loader.call_args.kwargs[
+                            "read_only_progress"
+                        ]
+                    )
+                    self.assertTrue(
+                        checkpoint_loader.call_args.kwargs[
+                            "verify_latest_progress"
+                        ]
+                    )
+                    registry_lock.assert_called_once_with(
+                        paths,
+                        create=False,
+                        exclusive=False,
+                    )
+
+            self.assertEqual(
+                V52EvidenceStore.open_read_only(evidence_root)
+                .read_verified_query_progress(query)
+                .status,
+                "SUCCESS",
+            )
+            self.assertEqual(snapshot(), before)
+
+    def test_source_verification_loader_rejects_wrong_phase_or_population(
+        self,
+    ) -> None:
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkpoint_relative = Path("execution/checkpoints")
+            checkpoint_dir = root / checkpoint_relative
+            checkpoint_dir.mkdir(parents=True)
+            contents = canonical_json_bytes({"fixture": "checkpoint"}) + b"\n"
+            digest = hashlib.sha256(contents).hexdigest()
+            name = f"00000000-{digest}.json"
+            (checkpoint_dir / name).write_bytes(contents)
+            paths = SimpleNamespace(
+                root=root,
+                checkpoints_relative=checkpoint_relative,
+            )
+            cases = (
+                ("DESIGN_ACCEPTED", "REMAINING", (), ()),
+                ("OOF_SEALED", "REMAINING", (), ()),
+                ("ACQUIRING", "PARTICIPANT_DERIVED", (), ()),
+                ("ACQUIRING", "REMAINING", ("pending-query",), ()),
+                ("ACQUIRING", "REMAINING", (), ("bad-query",)),
+            )
+            for phase, stage, pending, quarantined in cases:
+                checkpoint = SimpleNamespace(
+                    sequence=0,
+                    receipt_sha256=digest,
+                    stage=stage,
+                    pending_query_ids=pending,
+                    quarantined_query_ids=quarantined,
+                )
+                payload = {
+                    "pending_query_ids": list(pending),
+                    "quarantined_query_ids": list(quarantined),
+                }
+                with (
+                    self.subTest(
+                        phase=phase,
+                        stage=stage,
+                        pending=pending,
+                        quarantined=quarantined,
+                    ),
+                    patch.object(self.registry, "_paths", return_value=paths),
+                    patch.object(
+                        self.registry,
+                        "_registry_lock",
+                        shared_lock,
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_load_locked",
+                        return_value=(
+                            SimpleNamespace(phase=phase),
+                            ({"acquisition_checkpoint_head": None},),
+                        ),
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_capture_git_snapshot",
+                        return_value=SimpleNamespace(head="a" * 40),
+                    ),
+                    patch.object(
+                        self.registry,
+                        "_load_checkpoints_locked",
+                        return_value=((checkpoint,), (payload,), (name,)),
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "ACQUIRING|SOURCES_READY|terminal|REMAINING",
+                    ),
+                ):
+                    self.registry.load_source_verification_checkpoint(
+                        root,
+                        SimpleNamespace(),
+                    )
+
+    def test_source_verification_loader_never_cleans_owned_failure_state(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_evidence
+        from mlb_backtest.v52_evidence import (
+            AttemptCapture,
+            V52EvidenceStore,
+        )
+        from tests.test_v52_evidence import _query
+
+        @contextlib.contextmanager
+        def shared_lock(*_args, **_kwargs):
+            yield SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "raw"
+            store = V52EvidenceStore(evidence_root)
+            query = _query()
+            capture = AttemptCapture(
+                started_at_utc="2026-07-14T00:00:00.000000Z",
+                ended_at_utc="2026-07-14T00:00:01.000000Z",
+                final_url=None,
+                http_status=None,
+                response_headers=(),
+                body=None,
+                error_classification="PERMANENT_NETWORK",
+            )
+            original_rename = v52_evidence._rename_directory_exclusive_at
+
+            def interrupt_after_transaction_rename(
+                src: object,
+                dst: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                original_rename(src, dst, *args, **kwargs)
+                if src == "failure-transaction" and dst == "payload":
+                    raise OSError("interrupted owned cleanup")
+
+            with store.acquire_query(query) as lease:
+                with (
+                    patch(
+                        "mlb_backtest.v52_evidence._rename_directory_exclusive_at",
+                        side_effect=interrupt_after_transaction_rename,
+                    ),
+                    self.assertRaisesRegex(OSError, "owned cleanup"),
+                ):
+                    store.quarantine_bodyless_attempt(
+                        query,
+                        store.next_attempt_number(lease),
+                        capture,
+                        error_classification="PERMANENT_NETWORK",
+                    )
+
+            def snapshot() -> dict[Path, tuple[int, int, bytes | None]]:
+                return {
+                    path.relative_to(root): (
+                        path.lstat().st_dev,
+                        path.lstat().st_ino,
+                        path.read_bytes() if path.is_file() else None,
+                    )
+                    for path in (root, *sorted(root.rglob("*")))
+                }
+
+            before = snapshot()
+            checkpoint = SimpleNamespace(
+                sequence=0,
+                receipt_sha256="a" * 64,
+                stage="REMAINING",
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+            )
+
+            def load_checkpoints(
+                *_args,
+                read_only_progress: bool = False,
+                **_kwargs,
+            ):
+                evidence = (
+                    V52EvidenceStore.open_read_only(evidence_root)
+                    if read_only_progress
+                    else V52EvidenceStore(evidence_root)
+                )
+                evidence.read_verified_query_progress(query)
+                return (
+                    (checkpoint,),
+                    ({"pending_query_ids": [], "quarantined_query_ids": []},),
+                    (f"00000000-{'a' * 64}.json",),
+                )
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_paths",
+                    return_value=SimpleNamespace(root=root),
+                ),
+                patch.object(
+                    self.registry,
+                    "_registry_lock",
+                    side_effect=shared_lock,
+                ) as registry_lock,
+                patch.object(
+                    self.registry,
+                    "_load_locked",
+                    return_value=(
+                        SimpleNamespace(phase="ACQUIRING"),
+                        ({"acquisition_checkpoint_head": None},),
+                    ),
+                ),
+                patch.object(
+                    self.registry,
+                    "_capture_git_snapshot",
+                    return_value=SimpleNamespace(head="a" * 40),
+                ),
+                patch.object(
+                    self.registry,
+                    "_load_checkpoints_locked",
+                    side_effect=load_checkpoints,
+                ) as checkpoint_loader,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "read-only evidence|recovery|failure",
+                ),
+            ):
+                self.registry.load_source_verification_checkpoint(
+                    root,
+                    SimpleNamespace(),
+                )
+
+            self.assertTrue(
+                checkpoint_loader.call_args.kwargs["read_only_progress"]
+            )
+            registry_lock.assert_called_once_with(
+                SimpleNamespace(root=root),
+                create=False,
+                exclusive=False,
+            )
+            self.assertEqual(snapshot(), before)
+
     def test_active_public_loaders_preserve_recovery_capable_progress_mode(
         self,
     ) -> None:
