@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .execution_registry import (
     AcquisitionCheckpoint,
@@ -49,6 +50,13 @@ from .v52_sources.statcast import (
     validate_statcast_child_coverage,
 )
 from .v52_sources.pitching import recompute_pitching_season_snapshot
+from .v52_sources.references import recompute_reference_sidecar
+from .v52_timezone_review import (
+    _candidate_object as _timezone_candidate_object,
+    _mapping_from_candidate as _timezone_mapping_from_candidate,
+    _review_object as _timezone_review_object,
+    _seal_object as _timezone_seal_object,
+)
 
 
 _STATCAST_ROOT_BATCH_PATH = re.compile(
@@ -93,6 +101,18 @@ _STATCAST_PAYLOAD_KEYS = frozenset(
 )
 _PITCHING_PAYLOAD_KEYS = frozenset(
     {"grain", "query_sidecar_sha256s", "records", "schema_version"}
+)
+_REFERENCE_PAYLOAD_KEYS = frozenset(
+    {
+        "grain",
+        "observed_venue_date_mappings",
+        "schema_version",
+        "team_payload_sha256s",
+        "teams",
+        "timezone_rows",
+        "venue_payload_sha256s",
+        "venues",
+    }
 )
 _PITCHING_RECORD_COMMON_KEYS = frozenset(
     {
@@ -167,11 +187,13 @@ class NormalizedSnapshot:
         "baseball_savant_statcast",
         "mlb_schedule_game_feed",
         "mlb_stats_pitching",
+        "venue_team_timezone_table",
     ]
     grain: Literal[
         "pitch",
         "season_d1_league_pitching_reference",
         "season_game_evidence_snapshot",
+        "effective_dated_venue_team_reference",
     ]
     status: Literal["READY"]
     logical_query_ids: tuple[str, ...]
@@ -389,6 +411,203 @@ def _validate_normalized_snapshot_mapping(
             expected_hashes.append(digest)
         if payload_hashes != expected_hashes:
             raise ValueError("normalized snapshot pitching hash order differs")
+        return envelope
+
+    if source == "venue_team_timezone_table" and grain == (
+        "effective_dated_venue_team_reference"
+    ):
+        split_hashes = _sorted_unique_sha256s(
+            envelope.get("split_receipt_sha256s"),
+            "split receipt hashes",
+            allow_empty=True,
+        )
+        if split_hashes:
+            raise ValueError("reference normalized snapshot cannot own split receipts")
+        payload_value = envelope.get("payload")
+        if (
+            not isinstance(payload_value, Mapping)
+            or set(payload_value) != _REFERENCE_PAYLOAD_KEYS
+        ):
+            raise ValueError("normalized snapshot reference payload keys differ")
+        payload = dict(payload_value)
+        teams = payload.get("teams")
+        venues = payload.get("venues")
+        timezone_rows = payload.get("timezone_rows")
+        observations = payload.get("observed_venue_date_mappings")
+        team_hashes = payload.get("team_payload_sha256s")
+        venue_hashes = payload.get("venue_payload_sha256s")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("grain") != "effective_dated_venue_team_reference"
+            or not isinstance(team_hashes, list)
+            or team_hashes != sorted(set(team_hashes))
+            or len(team_hashes) != 1
+            or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in team_hashes)
+            or not isinstance(venue_hashes, list)
+            or venue_hashes != sorted(set(venue_hashes))
+            or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in venue_hashes)
+            or not isinstance(teams, list)
+            or not teams
+            or not isinstance(venues, list)
+            or not venues
+            or len(query_ids) != 1 + len(venues)
+            or len(venue_hashes) != len(venues)
+            or not isinstance(timezone_rows, list)
+            or not timezone_rows
+            or not isinstance(observations, list)
+            or not observations
+        ):
+            raise ValueError("normalized snapshot reference payload identity differs")
+
+        team_ids: list[int] = []
+        for row in teams:
+            if not isinstance(row, Mapping) or set(row) != {
+                "home_venue_id",
+                "location_name",
+                "team_id",
+                "team_name",
+            }:
+                raise ValueError("normalized snapshot reference team differs")
+            team_id = row.get("team_id")
+            home_venue_id = row.get("home_venue_id")
+            if (
+                type(team_id) is not int
+                or team_id <= 0
+                or type(home_venue_id) is not int
+                or home_venue_id <= 0
+                or any(
+                    not isinstance(row.get(field), str) or not row[field]
+                    for field in ("location_name", "team_name")
+                )
+            ):
+                raise ValueError("normalized snapshot reference team identity differs")
+            team_ids.append(team_id)
+        if team_ids != sorted(set(team_ids)):
+            raise ValueError("normalized snapshot reference team order differs")
+
+        venue_ids: list[int] = []
+        for row in venues:
+            if not isinstance(row, Mapping) or set(row) != {
+                "city",
+                "latitude",
+                "longitude",
+                "venue_id",
+                "venue_name",
+            }:
+                raise ValueError("normalized snapshot reference venue differs")
+            venue_id = row.get("venue_id")
+            latitude = row.get("latitude")
+            longitude = row.get("longitude")
+            if (
+                type(venue_id) is not int
+                or venue_id <= 0
+                or isinstance(latitude, bool)
+                or not isinstance(latitude, (int, float))
+                or not -90 <= latitude <= 90
+                or isinstance(longitude, bool)
+                or not isinstance(longitude, (int, float))
+                or not -180 <= longitude <= 180
+                or any(
+                    not isinstance(row.get(field), str) or not row[field]
+                    for field in ("city", "venue_name")
+                )
+            ):
+                raise ValueError("normalized snapshot reference venue identity differs")
+            venue_ids.append(venue_id)
+        if venue_ids != sorted(set(venue_ids)):
+            raise ValueError("normalized snapshot reference venue order differs")
+
+        normalized_timezone_rows: list[tuple[int, date, date, str]] = []
+        for row in timezone_rows:
+            if not isinstance(row, Mapping) or set(row) != {
+                "effective_end",
+                "effective_start",
+                "time_zone",
+                "venue_id",
+            }:
+                raise ValueError("normalized snapshot reference timezone row differs")
+            venue_id = row.get("venue_id")
+            first = _canonical_day(
+                row.get("effective_start"), "reference timezone effective start"
+            )
+            last = _canonical_day(
+                row.get("effective_end"), "reference timezone effective end"
+            )
+            name = row.get("time_zone")
+            if (
+                type(venue_id) is not int
+                or venue_id not in venue_ids
+                or first > last
+                or not isinstance(name, str)
+                or not name
+            ):
+                raise ValueError("normalized snapshot reference timezone identity differs")
+            try:
+                ZoneInfo(name)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(
+                    "normalized snapshot reference timezone must be IANA"
+                ) from exc
+            normalized_timezone_rows.append((venue_id, first, last, name))
+        if normalized_timezone_rows != sorted(set(normalized_timezone_rows)):
+            raise ValueError("normalized snapshot reference timezone order differs")
+        if {row[0] for row in normalized_timezone_rows} != set(venue_ids):
+            raise ValueError("normalized snapshot reference timezone scope differs")
+        by_venue: dict[int, list[tuple[int, date, date, str]]] = {}
+        for row in normalized_timezone_rows:
+            by_venue.setdefault(row[0], []).append(row)
+        if any(
+            current[1] <= previous[2]
+            for rows in by_venue.values()
+            for previous, current in zip(rows, rows[1:])
+        ):
+            raise ValueError("normalized snapshot reference timezone ranges overlap")
+
+        normalized_observations: list[tuple[int, date, str, bool, bool]] = []
+        used_timezone_rows: set[tuple[int, date, date, str]] = set()
+        for row in observations:
+            if not isinstance(row, Mapping) or set(row) != {
+                "alternate_site",
+                "neutral_site",
+                "official_date",
+                "time_zone",
+                "venue_id",
+            }:
+                raise ValueError("normalized snapshot reference observation differs")
+            venue_id = row.get("venue_id")
+            official = _canonical_day(
+                row.get("official_date"), "reference observation official date"
+            )
+            name = row.get("time_zone")
+            neutral = row.get("neutral_site")
+            alternate = row.get("alternate_site")
+            if (
+                type(venue_id) is not int
+                or venue_id not in venue_ids
+                or official.year != season
+                or not isinstance(name, str)
+                or type(neutral) is not bool
+                or type(alternate) is not bool
+            ):
+                raise ValueError("normalized snapshot reference observation identity differs")
+            matches = [
+                timezone_row
+                for timezone_row in by_venue[venue_id]
+                if timezone_row[1] <= official <= timezone_row[2]
+                and timezone_row[3] == name
+            ]
+            if len(matches) != 1:
+                raise ValueError("normalized snapshot reference observation mapping differs")
+            used_timezone_rows.add(matches[0])
+            normalized_observations.append(
+                (venue_id, official, name, neutral, alternate)
+            )
+        if normalized_observations != sorted(
+            set(normalized_observations), key=lambda row: (row[0], row[1])
+        ):
+            raise ValueError("normalized snapshot reference observation order differs")
+        if used_timezone_rows != set(normalized_timezone_rows):
+            raise ValueError("normalized snapshot reference contains unused timezone rows")
         return envelope
 
     if source != "baseball_savant_statcast" or grain != "pitch":
@@ -1755,6 +1974,620 @@ def _build_pitching_normalized_snapshots(
                 season,
                 [record for _cutoff, record, _sidecar in ordered],
                 payload,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _verified_reference_record(
+    record: VerifiedQueryRecord,
+) -> tuple[dict[str, object], bytes]:
+    if not isinstance(record, VerifiedQueryRecord):
+        raise TypeError("reference records must be VerifiedQueryRecord values")
+    raw = record.retained_raw_bytes
+    query_id = logical_query_id(record.query)
+    if (
+        record.storage_mode not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
+        or not isinstance(raw, bytes)
+        or not raw
+        or record.raw_sha256 != hashlib.sha256(raw).hexdigest()
+        or record.query_id != query_id
+        or not isinstance(record.query_sidecar_bytes, bytes)
+        or not record.query_sidecar_bytes.endswith(b"\n")
+        or record.query_sidecar_sha256
+        != hashlib.sha256(record.query_sidecar_bytes).hexdigest()
+    ):
+        raise ValueError("reference retained raw record binding differs")
+    expected = query_sidecar(raw, record.query, recompute_query_sidecar(record.query, raw))
+    expected_bytes = canonical_json_bytes(expected) + b"\n"
+    if record.query_sidecar_bytes != expected_bytes:
+        raise ValueError("reference query sidecar recomputation differs")
+    return expected, raw
+
+
+def _reference_normalized_snapshot(
+    run_id: str,
+    season: int,
+    records: Sequence[VerifiedQueryRecord],
+    payload: Mapping[str, object],
+) -> NormalizedSnapshot:
+    query_ids = tuple(sorted(record.query_id for record in records))
+    sidecar_hashes = tuple(
+        sorted(record.query_sidecar_sha256 for record in records)
+    )
+    if (
+        not query_ids
+        or len(query_ids) != len(set(query_ids))
+        or len(sidecar_hashes) != len(set(sidecar_hashes))
+    ):
+        raise ValueError("reference normalized snapshot identity is duplicated")
+    envelope: dict[str, object] = {
+        "grain": "effective_dated_venue_team_reference",
+        "logical_query_ids": list(query_ids),
+        "payload": _plain_json(payload),
+        "run_id": run_id,
+        "schema_version": 1,
+        "season": season,
+        "source": "venue_team_timezone_table",
+        "source_query_sidecar_sha256s": list(sidecar_hashes),
+        "split_receipt_sha256s": [],
+        "status": "READY",
+    }
+    envelope = _validate_normalized_snapshot_mapping(envelope)
+    contents = canonical_json_bytes(envelope) + b"\n"
+    digest = hashlib.sha256(contents).hexdigest()
+    raw_hashes = set(payload["team_payload_sha256s"]) | set(  # type: ignore[arg-type]
+        payload["venue_payload_sha256s"]  # type: ignore[arg-type]
+    )
+    if digest in set(query_ids) | set(sidecar_hashes) | raw_hashes:
+        raise ValueError("reference snapshot hash collides with a component hash")
+    frozen_payload = _freeze_json(payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise AssertionError("reference snapshot payload must freeze to a mapping")
+    return NormalizedSnapshot(
+        schema_version=1,
+        run_id=run_id,
+        season=season,
+        source="venue_team_timezone_table",
+        grain="effective_dated_venue_team_reference",
+        status="READY",
+        logical_query_ids=query_ids,
+        source_query_sidecar_sha256s=sidecar_hashes,
+        split_receipt_sha256s=(),
+        payload=frozen_payload,
+        canonical_bytes=contents,
+        sha256=digest,
+    )
+
+
+def _canonical_file_sha256(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_json_bytes(_plain_json(value)) + b"\n").hexdigest()
+
+
+def _validate_reference_terminal_graph_shape(
+    graph: _TerminalQueryGraph,
+) -> None:
+    query_fields = (
+        ("completed_queries", graph.completed_queries),
+        ("root_queries", graph.root_queries),
+        ("split_parent_queries", graph.split_parent_queries),
+        ("split_leaf_queries", graph.split_leaf_queries),
+    )
+    for label, queries in query_fields:
+        if not isinstance(queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in queries
+        ):
+            raise TypeError(f"reference terminal graph {label} differs")
+
+    if not isinstance(graph.statcast_root_batch, QueryBatch):
+        raise TypeError("reference terminal graph Statcast root batch differs")
+    batches = (graph.statcast_root_batch,) + (
+        graph.query_batches if isinstance(graph.query_batches, tuple) else ()
+    )
+    if not isinstance(graph.query_batches, tuple) or any(
+        not isinstance(batch, QueryBatch) for batch in graph.query_batches
+    ):
+        raise TypeError("reference terminal graph query_batches differs")
+    for batch in batches:
+        if not isinstance(batch.queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in batch.queries
+        ):
+            raise TypeError("reference terminal graph batch queries differ")
+
+    if not isinstance(graph.split_receipts, tuple) or any(
+        not isinstance(receipt, SplitReceipt)
+        for receipt in graph.split_receipts
+    ):
+        raise TypeError("reference terminal graph split_receipts differs")
+
+
+def _build_reference_normalized_snapshots(
+    run_id: str,
+    records: Sequence[VerifiedQueryRecord],
+    graph: _TerminalQueryGraph,
+    game_snapshots: Sequence[NormalizedSnapshot],
+    timezone_gate: VerifiedTimezoneGate,
+) -> tuple[NormalizedSnapshot, ...]:
+    """Build immutable effective-dated reference snapshots without I/O."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("reference normalized snapshot run_id differs")
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise TypeError("reference records must be a sequence")
+    if not isinstance(graph, _TerminalQueryGraph):
+        raise TypeError("reference terminal query graph authority differs")
+    _validate_reference_terminal_graph_shape(graph)
+    if isinstance(game_snapshots, (str, bytes)) or not isinstance(
+        game_snapshots, Sequence
+    ):
+        raise TypeError("reference game snapshots must be a sequence")
+    if not isinstance(timezone_gate, VerifiedTimezoneGate):
+        raise TypeError("reference timezone gate authority differs")
+
+    def reference_projection(
+        queries: Sequence[LogicalQuery], label: str
+    ) -> dict[str, LogicalQuery]:
+        projection: dict[str, LogicalQuery] = {}
+        for query in queries:
+            relevant = query.source == "venue_team_timezone_table" or query.grain == (
+                "effective_dated_venue_team_reference"
+            )
+            if not relevant:
+                continue
+            if (
+                query.source != "venue_team_timezone_table"
+                or query.grain != "effective_dated_venue_team_reference"
+            ):
+                raise ValueError(f"reference {label} source or grain differs")
+            query_id = logical_query_id(query)
+            if query_id in projection:
+                raise ValueError(f"reference {label} population is duplicated")
+            projection[query_id] = query
+        return projection
+
+    expected_by_id = reference_projection(graph.completed_queries, "completed-query")
+    if not expected_by_id:
+        raise ValueError("reference terminal graph population is empty")
+    if reference_projection(graph.root_queries, "root-query") != expected_by_id:
+        raise ValueError("reference root/completed query population differs")
+    if reference_projection(graph.split_parent_queries, "split-parent") or (
+        reference_projection(graph.split_leaf_queries, "split-leaf")
+    ):
+        raise ValueError("reference queries cannot use split graph classifications")
+    gate_batch_ids = tuple(timezone_gate.query_batch_ids)
+    gate_batch_hashes = tuple(timezone_gate.query_batch_sha256s)
+    if (
+        len(gate_batch_ids) != 2
+        or len(set(gate_batch_ids)) != 2
+        or len(gate_batch_hashes) != 2
+        or any(
+            not isinstance(item, str) or _SHA256.fullmatch(item) is None
+            for item in (*gate_batch_ids, *gate_batch_hashes)
+        )
+    ):
+        raise ValueError("reference timezone gate batch population differs")
+    gate_hash_by_id = dict(
+        zip(gate_batch_ids, gate_batch_hashes, strict=True)
+    )
+    gate_batches = [
+        batch for batch in graph.query_batches if batch.batch_id in gate_hash_by_id
+    ]
+    canonical_stage_batches = [
+        batch
+        for batch in graph.query_batches
+        if batch.stage in {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}
+    ]
+    if (
+        len(gate_batches) != 2
+        or {batch.batch_id for batch in gate_batches} != set(gate_batch_ids)
+        or len(canonical_stage_batches) != 2
+        or {batch.batch_id for batch in canonical_stage_batches}
+        != set(gate_batch_ids)
+    ):
+        raise ValueError("reference graph/gate batch population differs")
+    batches_by_stage: dict[str, QueryBatch] = {}
+    for batch in gate_batches:
+        if batch.stage in batches_by_stage:
+            raise ValueError("reference graph/gate batch stage is duplicated")
+        batches_by_stage[batch.stage] = batch
+    if set(batches_by_stage) != {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}:
+        raise ValueError("reference graph/gate batch stages differ")
+    static_batch = batches_by_stage["STATIC_SCHEDULES"]
+    batch = batches_by_stage["REFERENCE_INPUTS"]
+    if (
+        static_batch.derived_from_sha256 is not None
+        or batch.derived_from_sha256 != timezone_gate.schedule_inventory_sha256
+        or _make_batch(
+            static_batch.stage,
+            static_batch.derived_from_sha256,
+            static_batch.queries,
+        )
+        != static_batch
+        or _make_batch(batch.stage, batch.derived_from_sha256, batch.queries)
+        != batch
+    ):
+        raise ValueError("reference canonical gate batch authority differs")
+    for authenticated_batch in (static_batch, batch):
+        if gate_hash_by_id[authenticated_batch.batch_id] != (
+            _query_batch_artifact_sha256(authenticated_batch)
+        ):
+            raise ValueError("reference query batch hash binding differs")
+
+    protected_query_by_id: dict[str, LogicalQuery] = {}
+    for authenticated_batch in (static_batch, batch):
+        for query in authenticated_batch.queries:
+            query_id = logical_query_id(query)
+            if query_id in protected_query_by_id:
+                raise ValueError("reference gate batch query population is duplicated")
+            protected_query_by_id[query_id] = query
+
+    def graph_query_population(
+        queries: Sequence[LogicalQuery], label: str
+    ) -> dict[str, LogicalQuery]:
+        population: dict[str, LogicalQuery] = {}
+        for query in queries:
+            query_id = logical_query_id(query)
+            if query_id in population:
+                raise ValueError(f"reference graph {label} is duplicated")
+            population[query_id] = query
+        return population
+
+    completed_population = graph_query_population(
+        graph.completed_queries, "completed-query population"
+    )
+    root_population = graph_query_population(
+        graph.root_queries, "root-query population"
+    )
+    split_parent_population = graph_query_population(
+        graph.split_parent_queries, "split-parent population"
+    )
+    split_leaf_population = graph_query_population(
+        graph.split_leaf_queries, "split-leaf population"
+    )
+    if any(
+        completed_population.get(query_id) != query
+        or root_population.get(query_id) != query
+        for query_id, query in protected_query_by_id.items()
+    ) or set(protected_query_by_id).intersection(
+        set(split_parent_population) | set(split_leaf_population)
+    ):
+        raise ValueError("reference gate batch terminal classification differs")
+
+    relevant_batches = [
+        candidate
+        for candidate in graph.query_batches
+        if reference_projection(candidate.queries, "query-batch")
+    ]
+    batch_population = reference_projection(
+        tuple(query for batch in graph.query_batches for query in batch.queries),
+        "query-batch",
+    )
+    if (
+        batch_population != expected_by_id
+        or relevant_batches != [batch]
+    ):
+        raise ValueError("reference terminal query batch population differs")
+
+    protected_batch_lineage = set(gate_batch_ids)
+    changed = True
+    while changed:
+        changed = False
+        for candidate in graph.query_batches:
+            if (
+                candidate.derived_from_sha256 in protected_batch_lineage
+                and candidate.batch_id not in protected_batch_lineage
+            ):
+                protected_batch_lineage.add(candidate.batch_id)
+                changed = True
+    if any(
+        receipt.parent_query_id in protected_query_by_id
+        or any(
+            child_id in protected_query_by_id
+            for child_id in receipt.child_query_ids
+        )
+        or receipt.parent_batch_id in protected_batch_lineage
+        or receipt.child_batch_id in protected_batch_lineage
+        for receipt in graph.split_receipts
+    ):
+        raise ValueError("reference query/batch lineage appears in split receipts")
+
+    if any(
+        query.run_spec_sha256 != timezone_gate.run_spec_sha256
+        or query.acquisition_contract_sha256
+        != timezone_gate.acquisition_contract_sha256
+        for authenticated_batch in (static_batch, batch)
+        for query in authenticated_batch.queries
+    ):
+        raise ValueError("reference query RunSpec/acquisition binding differs")
+
+    game_by_season: dict[int, NormalizedSnapshot] = {}
+    season_games: dict[int, list[dict[str, object]]] = {
+        season: [] for season in _GAME_SEASONS
+    }
+    observed: dict[tuple[int, str], tuple[bool, bool]] = {}
+    observed_teams: dict[int, set[int]] = {
+        season: set() for season in _GAME_SEASONS
+    }
+    observed_venues: dict[int, set[int]] = {
+        season: set() for season in _GAME_SEASONS
+    }
+    schedule_hashes: set[str] = set()
+    seen_game_pks: set[int] = set()
+    for snapshot in game_snapshots:
+        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        if (
+            not isinstance(snapshot, NormalizedSnapshot)
+            or snapshot.run_id != run_id
+            or snapshot.source != "mlb_schedule_game_feed"
+            or snapshot.grain != "season_game_evidence_snapshot"
+            or snapshot.season in game_by_season
+            or mapping is None
+            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
+            or snapshot.sha256
+            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+        ):
+            raise ValueError("reference game snapshot authority differs")
+        game_by_season[snapshot.season] = snapshot
+        for raw_game in mapping["payload"]["games"]:  # type: ignore[index]
+            game = dict(raw_game)
+            game_pk = game.get("game_pk")
+            venue_id = game.get("venue_id")
+            away = game.get("away_team_id")
+            home = game.get("home_team_id")
+            official = _canonical_day(
+                game.get("official_date"), "reference game official date"
+            )
+            neutral = game.get("neutral_site")
+            alternate = game.get("alternate_site")
+            schedule_hash = game.get("schedule_query_sidecar_sha256")
+            if (
+                type(game_pk) is not int
+                or game_pk <= 0
+                or game_pk in seen_game_pks
+                or type(venue_id) is not int
+                or venue_id <= 0
+                or type(away) is not int
+                or away <= 0
+                or type(home) is not int
+                or home <= 0
+                or official.year != snapshot.season
+                or type(neutral) is not bool
+                or type(alternate) is not bool
+                or not isinstance(schedule_hash, str)
+                or _SHA256.fullmatch(schedule_hash) is None
+            ):
+                raise ValueError("reference game observation differs")
+            key = (venue_id, official.isoformat())
+            disposition = (neutral, alternate)
+            if key in observed and observed[key] != disposition:
+                raise ValueError("conflicting alternate/neutral venue disposition")
+            observed[key] = disposition
+            seen_game_pks.add(game_pk)
+            schedule_hashes.add(schedule_hash)
+            observed_teams[snapshot.season].update((away, home))
+            observed_venues[snapshot.season].add(venue_id)
+            season_games[snapshot.season].append(
+                {
+                    "alternate_site": alternate,
+                    "away_team_id": away,
+                    "game_pk": game_pk,
+                    "home_team_id": home,
+                    "neutral_site": neutral,
+                    "official_date": official.isoformat(),
+                    "venue_id": venue_id,
+                }
+            )
+    if set(game_by_season) != set(_GAME_SEASONS):
+        raise ValueError("reference requires seven verified game snapshots")
+
+    record_by_id: dict[str, tuple[VerifiedQueryRecord, dict[str, object], bytes]] = {}
+    team_by_season: dict[int, tuple[VerifiedQueryRecord, dict[str, object], bytes]] = {}
+    venue_by_id: dict[int, tuple[VerifiedQueryRecord, dict[str, object], bytes]] = {}
+    for record in records:
+        sidecar, raw = _verified_reference_record(record)
+        query = record.query
+        query_id = record.query_id
+        if (
+            query_id not in expected_by_id
+            or expected_by_id[query_id] != query
+            or query_id in record_by_id
+            or query.parent_query_id is not None
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+        ):
+            raise ValueError("reference verified record population differs")
+        semantics = sidecar.get("semantics")
+        if not isinstance(semantics, Mapping):
+            raise ValueError("reference sidecar semantics differ")
+        if query.endpoint == "https://statsapi.mlb.com/api/v1/teams":
+            season = query.requested_range.get("season")
+            if (
+                type(season) is not int
+                or season not in _GAME_SEASONS
+                or season in team_by_season
+                or dict(query.requested_range)
+                != {"season": season, "entity": "teams"}
+            ):
+                raise ValueError("reference team query partition differs")
+            team_by_season[season] = (record, sidecar, raw)
+        else:
+            venue_id = query.requested_range.get("venue_id")
+            if (
+                type(venue_id) is not int
+                or venue_id <= 0
+                or venue_id in venue_by_id
+                or query.endpoint
+                != f"https://statsapi.mlb.com/api/v1/venues/{venue_id}"
+                or dict(query.requested_range) != {"venue_id": venue_id}
+            ):
+                raise ValueError("reference venue query partition differs")
+            venue_by_id[venue_id] = (record, sidecar, raw)
+        record_by_id[query_id] = (record, sidecar, raw)
+    if (
+        set(record_by_id) != set(expected_by_id)
+        or set(team_by_season) != set(_GAME_SEASONS)
+        or set(venue_by_id)
+        != {venue_id for values in observed_venues.values() for venue_id in values}
+    ):
+        raise ValueError("reference READY record coverage differs")
+
+    candidate_value = _plain_json(timezone_gate.candidate)
+    mapping_value = _plain_json(timezone_gate.mapping)
+    reviews_value = tuple(_plain_json(review) for review in timezone_gate.reviews)
+    seal_value = _plain_json(timezone_gate.seal)
+    if (
+        not isinstance(candidate_value, Mapping)
+        or not isinstance(mapping_value, Mapping)
+        or not all(isinstance(review, Mapping) for review in reviews_value)
+        or not isinstance(seal_value, Mapping)
+    ):
+        raise ValueError("reference timezone gate mappings differ")
+    candidate = _timezone_candidate_object(candidate_value)
+    expected_mapping = _timezone_mapping_from_candidate(
+        candidate, require_resolved=True
+    )
+    if dict(mapping_value) != expected_mapping:
+        raise ValueError("reference timezone mapping differs from candidate")
+    if (
+        _canonical_file_sha256(candidate) != timezone_gate.candidate_sha256
+        or _canonical_file_sha256(dict(mapping_value))
+        != timezone_gate.mapping_sha256
+        or len(reviews_value) != 2
+        or len(timezone_gate.review_sha256s) != 2
+        or _canonical_file_sha256(dict(seal_value)) != timezone_gate.seal_sha256
+    ):
+        raise ValueError("reference timezone gate artifact hash differs")
+    candidate_binding = {
+        "path": "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
+        "sha256": timezone_gate.candidate_sha256,
+    }
+    expected_roles = (
+        "TIMEZONE_COVERAGE_REVIEW",
+        "TIMEZONE_SEMANTIC_REVIEW",
+    )
+    review_paths = (
+        "audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json",
+        "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
+    )
+    review_bindings: list[dict[str, object]] = []
+    identities: set[str] = set()
+    for review_value, digest, role, path in zip(
+        reviews_value,
+        timezone_gate.review_sha256s,
+        expected_roles,
+        review_paths,
+        strict=True,
+    ):
+        review = _timezone_review_object(
+            canonical_json_bytes(review_value) + b"\n"
+        )
+        if (
+            _canonical_file_sha256(review) != digest
+            or review["decision"] != "APPROVED"
+            or review["reviewer_role"] != role
+            or review["candidate"] != candidate_binding
+            or review["reviewed_venue_ids"] != candidate["venue_scope"]
+        ):
+            raise ValueError("reference timezone review authority differs")
+        identity = str(review["reviewer_identity"])
+        identities.add(identity)
+        review_bindings.append(
+            {
+                "path": path,
+                "reviewer_identity": identity,
+                "reviewer_role": role,
+                "sha256": digest,
+            }
+        )
+    if len(identities) != 2:
+        raise ValueError("reference timezone reviewers must be distinct")
+    seal = _timezone_seal_object(canonical_json_bytes(seal_value) + b"\n")
+    if seal != dict(seal_value) or seal != {
+        "candidate": candidate_binding,
+        "mapping": {
+            "path": "config/v5_2_qd/venue_timezones.json",
+            "sha256": timezone_gate.mapping_sha256,
+        },
+        "occurred_at_utc": seal["occurred_at_utc"],
+        "receipt_kind": "TIMEZONE_MAPPING_SEAL",
+        "reviews": review_bindings,
+        "schema_version": 1,
+        "venue_scope": candidate["venue_scope"],
+    }:
+        raise ValueError("reference timezone seal authority differs")
+
+    expected_observations = [
+        {
+            "alternate_site": alternate,
+            "neutral_site": neutral,
+            "official_date": official,
+            "venue_id": venue_id,
+        }
+        for (venue_id, official), (neutral, alternate) in sorted(observed.items())
+    ]
+    expected_venue_identities = [
+        venue_by_id[venue_id][1]["semantics"]["venues"][0]  # type: ignore[index]
+        for venue_id in sorted(venue_by_id)
+    ]
+    expected_venue_hashes = sorted(
+        item[0].query_sidecar_sha256 for item in venue_by_id.values()
+    )
+    if (
+        candidate["run_spec_sha256"] != timezone_gate.run_spec_sha256
+        or candidate["acquisition_contract_sha256"]
+        != timezone_gate.acquisition_contract_sha256
+        or candidate["query_batch_ids"] != sorted(gate_batch_ids)
+        or candidate["schedule_sidecar_sha256s"] != sorted(schedule_hashes)
+        or candidate["venue_scope"] != sorted(venue_by_id)
+        or candidate["venue_sidecar_sha256s"] != expected_venue_hashes
+        or candidate["venues"] != expected_venue_identities
+        or candidate["observed_venue_dates"] != expected_observations
+    ):
+        raise ValueError("reference timezone candidate source authority differs")
+
+    mapping_rows = expected_mapping["timezone_rows"]
+    snapshots: list[NormalizedSnapshot] = []
+    for season in _GAME_SEASONS:
+        games = sorted(
+            season_games[season],
+            key=lambda game: (game["official_date"], game["game_pk"]),
+        )
+        venue_ids = observed_venues[season]
+        selected_rows = [
+            row
+            for row in mapping_rows
+            if int(row["venue_id"]) in venue_ids
+            and any(
+                int(game["venue_id"]) == int(row["venue_id"])
+                and _canonical_day(row["effective_start"], "reference timezone start")
+                <= _canonical_day(game["official_date"], "reference game date")
+                <= _canonical_day(row["effective_end"], "reference timezone end")
+                for game in games
+            )
+        ]
+        team_record, _team_sidecar, team_raw = team_by_season[season]
+        selected_venues = [venue_by_id[venue_id] for venue_id in sorted(venue_ids)]
+        payload = recompute_reference_sidecar(
+            [team_raw],
+            [item[2] for item in selected_venues],
+            selected_rows,
+            games,
+        )
+        if (
+            payload["team_payload_sha256s"] != [team_record.raw_sha256]
+            or payload["venue_payload_sha256s"]
+            != sorted(str(item[0].raw_sha256) for item in selected_venues)
+            or {int(row["team_id"]) for row in payload["teams"]}
+            < observed_teams[season]
+            or [int(row["venue_id"]) for row in payload["venues"]]
+            != sorted(venue_ids)
+            or payload["timezone_rows"] != selected_rows
+        ):
+            raise ValueError("reference seasonal aggregate authority differs")
+        direct_records = [team_record] + [item[0] for item in selected_venues]
+        snapshots.append(
+            _reference_normalized_snapshot(
+                run_id, season, direct_records, payload
             )
         )
     return tuple(snapshots)
