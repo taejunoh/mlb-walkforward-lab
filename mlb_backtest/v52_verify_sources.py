@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
@@ -48,6 +48,7 @@ from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
     validate_statcast_child_coverage,
 )
+from .v52_sources.pitching import recompute_pitching_season_snapshot
 
 
 _STATCAST_ROOT_BATCH_PATH = re.compile(
@@ -89,6 +90,20 @@ _STATCAST_PAYLOAD_KEYS = frozenset(
         "statcast_game_pks",
         "unique_pitch_count",
     }
+)
+_PITCHING_PAYLOAD_KEYS = frozenset(
+    {"grain", "query_sidecar_sha256s", "records", "schema_version"}
+)
+_PITCHING_RECORD_COMMON_KEYS = frozenset(
+    {
+        "as_of_date",
+        "consumer_cutoff_dates",
+        "consuming_game_pks",
+        "query_sidecar_sha256",
+    }
+)
+_PITCHING_RECORD_NUMERIC_KEYS = frozenset(
+    {"batters_faced", "earned_runs", "outs"}
 )
 _GAME_INVENTORY_KEYS = frozenset(
     {
@@ -148,8 +163,16 @@ class NormalizedSnapshot:
     schema_version: Literal[1]
     run_id: str
     season: int
-    source: Literal["baseball_savant_statcast", "mlb_schedule_game_feed"]
-    grain: Literal["pitch", "season_game_evidence_snapshot"]
+    source: Literal[
+        "baseball_savant_statcast",
+        "mlb_schedule_game_feed",
+        "mlb_stats_pitching",
+    ]
+    grain: Literal[
+        "pitch",
+        "season_d1_league_pitching_reference",
+        "season_game_evidence_snapshot",
+    ]
     status: Literal["READY"]
     logical_query_ids: tuple[str, ...]
     source_query_sidecar_sha256s: tuple[str, ...]
@@ -271,6 +294,101 @@ def _validate_normalized_snapshot_mapping(
             if not isinstance(game, Mapping) or game.get("season") != season:
                 raise ValueError("normalized snapshot game season differs")
         validate_game_evidence_snapshot(payload)
+        return envelope
+
+    if source == "mlb_stats_pitching" and grain == (
+        "season_d1_league_pitching_reference"
+    ):
+        split_hashes = _sorted_unique_sha256s(
+            envelope.get("split_receipt_sha256s"),
+            "split receipt hashes",
+            allow_empty=True,
+        )
+        if split_hashes:
+            raise ValueError("pitching normalized snapshot cannot own split receipts")
+        payload_value = envelope.get("payload")
+        if (
+            not isinstance(payload_value, Mapping)
+            or set(payload_value) != _PITCHING_PAYLOAD_KEYS
+        ):
+            raise ValueError("normalized snapshot pitching payload keys differ")
+        payload = dict(payload_value)
+        records = payload.get("records")
+        payload_hashes = payload.get("query_sidecar_sha256s")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("grain")
+            != "season_d1_league_pitching_reference"
+            or not isinstance(records, list)
+            or not records
+            or not isinstance(payload_hashes, list)
+            or len(records) != len(query_ids)
+            or len(payload_hashes) != len(records)
+            or any(
+                not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+                for digest in payload_hashes
+            )
+            or len(set(payload_hashes)) != len(payload_hashes)
+            or set(payload_hashes) != set(top_sidecars)
+        ):
+            raise ValueError("normalized snapshot pitching payload identity differs")
+
+        prior_as_of: date | None = None
+        seen_consumers: set[int] = set()
+        expected_hashes: list[str] = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise ValueError("normalized snapshot pitching record differs")
+            keys = set(record)
+            numeric = keys == (
+                _PITCHING_RECORD_COMMON_KEYS | _PITCHING_RECORD_NUMERIC_KEYS
+            )
+            derived = keys == (_PITCHING_RECORD_COMMON_KEYS | {"disposition"})
+            if not numeric and not derived:
+                raise ValueError("normalized snapshot pitching record keys differ")
+            as_of = _canonical_day(
+                record.get("as_of_date"), "pitching record as-of date"
+            )
+            consumers = record.get("consuming_game_pks")
+            cutoffs = record.get("consumer_cutoff_dates")
+            digest = record.get("query_sidecar_sha256")
+            if (
+                as_of.year != season
+                or (prior_as_of is not None and as_of <= prior_as_of)
+                or not isinstance(consumers, list)
+                or not consumers
+                or any(type(game_pk) is not int or game_pk <= 0 for game_pk in consumers)
+                or consumers != sorted(set(consumers))
+                or seen_consumers.intersection(consumers)
+                or not isinstance(cutoffs, Mapping)
+                or dict(cutoffs)
+                != {str(game_pk): as_of.isoformat() for game_pk in consumers}
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+            ):
+                raise ValueError("normalized snapshot pitching record identity differs")
+            if derived:
+                if (
+                    record.get("disposition")
+                    != "PRESEASON_NO_CURRENT_SEASON_PITCHING"
+                    or as_of != SEASON_BOUNDARIES[season][0] - timedelta(days=1)
+                ):
+                    raise ValueError(
+                        "normalized snapshot pitching disposition differs"
+                    )
+            elif (
+                as_of < SEASON_BOUNDARIES[season][0]
+                or any(
+                    type(record.get(field)) is not int or record[field] < 0
+                    for field in _PITCHING_RECORD_NUMERIC_KEYS
+                )
+            ):
+                raise ValueError("normalized snapshot pitching metrics differ")
+            prior_as_of = as_of
+            seen_consumers.update(consumers)
+            expected_hashes.append(digest)
+        if payload_hashes != expected_hashes:
+            raise ValueError("normalized snapshot pitching hash order differs")
         return envelope
 
     if source != "baseball_savant_statcast" or grain != "pitch":
@@ -649,6 +767,49 @@ def _verified_sidecar(record: VerifiedQueryRecord) -> dict[str, object]:
     ):
         raise ValueError("normalized snapshot query sidecar binding differs")
     return sidecar
+
+
+def _verified_pitching_sidecar(
+    record: VerifiedQueryRecord,
+) -> dict[str, object]:
+    """Accept the one closed no-HTTP pitching disposition in addition to raw evidence."""
+    if not isinstance(record, VerifiedQueryRecord):
+        raise TypeError("normalized snapshot records must be VerifiedQueryRecord")
+    if record.storage_mode != "DERIVED_DISPOSITION":
+        return _verified_sidecar(record)
+    query = record.query
+    query_id = logical_query_id(query)
+    if (
+        query.source != "mlb_stats_pitching"
+        or query.grain != "season_d1_league_pitching_reference"
+        or query.endpoint
+        != "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+        or query.requested_range.get("reason")
+        != "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+        or record.query_id != query_id
+        or record.raw_sha256 is not None
+        or record.retained_raw_bytes is not None
+        or not isinstance(record.query_sidecar_bytes, bytes)
+        or not record.query_sidecar_bytes.endswith(b"\n")
+        or hashlib.sha256(record.query_sidecar_bytes).hexdigest()
+        != record.query_sidecar_sha256
+    ):
+        raise ValueError("derived pitching verified query binding differs")
+    semantics = dict(recompute_query_sidecar(query, b""))
+    semantics["reason"] = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+    expected = {
+        "grain": query.grain,
+        "parser_version": query.parser_version,
+        "query_id": query_id,
+        "schema_version": 1,
+        "semantics": semantics,
+        "source": query.source,
+        "storage_mode": "DERIVED_DISPOSITION",
+    }
+    expected_bytes = canonical_json_bytes(expected) + b"\n"
+    if record.query_sidecar_bytes != expected_bytes:
+        raise ValueError("derived pitching query sidecar binding differs")
+    return expected
 
 
 def _binding_sha256(value: object, label: str) -> str:
@@ -1313,6 +1474,286 @@ def _build_statcast_normalized_snapshots(
                 int(root.requested_range["year"]),
                 [record for record, _sidecar in leaves],
                 receipt_hashes,
+                payload,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _pitching_normalized_snapshot(
+    run_id: str,
+    season: int,
+    records: Sequence[VerifiedQueryRecord],
+    payload: Mapping[str, object],
+) -> NormalizedSnapshot:
+    query_ids = tuple(sorted(record.query_id for record in records))
+    sidecar_hashes = tuple(
+        sorted(record.query_sidecar_sha256 for record in records)
+    )
+    if (
+        not query_ids
+        or len(query_ids) != len(set(query_ids))
+        or len(sidecar_hashes) != len(set(sidecar_hashes))
+    ):
+        raise ValueError("pitching normalized snapshot identity is duplicated")
+    envelope: dict[str, object] = {
+        "grain": "season_d1_league_pitching_reference",
+        "logical_query_ids": list(query_ids),
+        "payload": _plain_json(payload),
+        "run_id": run_id,
+        "schema_version": 1,
+        "season": season,
+        "source": "mlb_stats_pitching",
+        "source_query_sidecar_sha256s": list(sidecar_hashes),
+        "split_receipt_sha256s": [],
+        "status": "READY",
+    }
+    envelope = _validate_normalized_snapshot_mapping(envelope)
+    contents = canonical_json_bytes(envelope) + b"\n"
+    digest = hashlib.sha256(contents).hexdigest()
+    if digest in set(query_ids) | set(sidecar_hashes):
+        raise ValueError("normalized snapshot hash collides with a component hash")
+    frozen_payload = _freeze_json(payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise AssertionError("normalized snapshot payload must freeze to a mapping")
+    return NormalizedSnapshot(
+        schema_version=1,
+        run_id=run_id,
+        season=season,
+        source="mlb_stats_pitching",
+        grain="season_d1_league_pitching_reference",
+        status="READY",
+        logical_query_ids=query_ids,
+        source_query_sidecar_sha256s=sidecar_hashes,
+        split_receipt_sha256s=(),
+        payload=frozen_payload,
+        canonical_bytes=contents,
+        sha256=digest,
+    )
+
+
+def _build_pitching_normalized_snapshots(
+    run_id: str,
+    records: Sequence[VerifiedQueryRecord],
+    graph: _TerminalQueryGraph,
+    game_snapshots: Sequence[NormalizedSnapshot],
+) -> tuple[NormalizedSnapshot, ...]:
+    """Build seven immutable D-1 pitching snapshots without I/O."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("pitching normalized snapshot run_id differs")
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise TypeError("pitching normalized snapshot records must be a sequence")
+    if not isinstance(graph, _TerminalQueryGraph):
+        raise TypeError("pitching terminal query graph authority differs")
+    if isinstance(game_snapshots, (str, bytes)) or not isinstance(
+        game_snapshots, Sequence
+    ):
+        raise TypeError("pitching game snapshots must be a sequence")
+
+    def pitching_projection(
+        queries: Sequence[LogicalQuery], label: str
+    ) -> dict[str, LogicalQuery]:
+        projection: dict[str, LogicalQuery] = {}
+        for query in queries:
+            relevant = query.source == "mlb_stats_pitching" or query.grain == (
+                "season_d1_league_pitching_reference"
+            )
+            if not relevant:
+                continue
+            if (
+                query.source != "mlb_stats_pitching"
+                or query.grain != "season_d1_league_pitching_reference"
+            ):
+                raise ValueError(f"pitching {label} source or grain differs")
+            query_id = logical_query_id(query)
+            if query_id in projection:
+                raise ValueError(f"pitching {label} population is duplicated")
+            projection[query_id] = query
+        return projection
+
+    expected_by_id = pitching_projection(
+        graph.completed_queries, "completed-query"
+    )
+    if not expected_by_id:
+        raise ValueError("pitching terminal graph population is empty")
+
+    root_population = pitching_projection(graph.root_queries, "root-query")
+    split_parent_population = pitching_projection(
+        graph.split_parent_queries, "split-parent"
+    )
+    split_leaf_population = pitching_projection(
+        graph.split_leaf_queries, "split-leaf"
+    )
+    if root_population != expected_by_id:
+        raise ValueError("pitching root/completed query population differs")
+    if split_parent_population or split_leaf_population:
+        raise ValueError("pitching queries cannot use split graph classifications")
+    pitching_query_ids = set(expected_by_id)
+    if any(
+        receipt.parent_query_id in pitching_query_ids
+        or any(child_id in pitching_query_ids for child_id in receipt.child_query_ids)
+        for receipt in graph.split_receipts
+    ):
+        raise ValueError("pitching query IDs cannot appear in split receipts")
+
+    batch_population = pitching_projection(
+        tuple(query for batch in graph.query_batches for query in batch.queries),
+        "query-batch",
+    )
+    if batch_population != expected_by_id:
+        raise ValueError("pitching terminal query batch population differs")
+
+    game_by_season: dict[int, NormalizedSnapshot] = {}
+    expected_consumers: dict[tuple[int, date], list[int]] = {}
+    seen_game_pks: set[int] = set()
+    for snapshot in game_snapshots:
+        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        if (
+            not isinstance(snapshot, NormalizedSnapshot)
+            or snapshot.run_id != run_id
+            or snapshot.source != "mlb_schedule_game_feed"
+            or snapshot.grain != "season_game_evidence_snapshot"
+            or snapshot.season in game_by_season
+            or mapping is None
+            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
+            or snapshot.sha256
+            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+        ):
+            raise ValueError("pitching game snapshot authority differs")
+        game_by_season[snapshot.season] = snapshot
+        for game in mapping["payload"]["games"]:  # type: ignore[index]
+            game_pk = game["game_pk"]
+            if type(game_pk) is not int or game_pk in seen_game_pks:
+                raise ValueError("pitching game population is duplicated")
+            seen_game_pks.add(game_pk)
+            if game["played"] is not True:
+                continue
+            official = _canonical_day(
+                game["official_date"], "pitching consumer official date"
+            )
+            cutoff = official - timedelta(days=1)
+            key = (snapshot.season, cutoff)
+            expected_consumers.setdefault(key, []).append(game_pk)
+    if set(game_by_season) != set(_GAME_SEASONS):
+        raise ValueError("pitching requires seven verified game snapshots")
+    expected_consumers = {
+        key: sorted(consumers) for key, consumers in expected_consumers.items()
+    }
+    if {season for season, _cutoff in expected_consumers} != set(_GAME_SEASONS):
+        raise ValueError("pitching requires played consumers in every season")
+
+    record_by_id: dict[str, tuple[VerifiedQueryRecord, dict[str, object]]] = {}
+    grouped: dict[int, list[tuple[date, VerifiedQueryRecord, dict[str, object]]]] = {
+        season: [] for season in _GAME_SEASONS
+    }
+    seen_keys: set[tuple[int, date]] = set()
+    for record in records:
+        sidecar = _verified_pitching_sidecar(record)
+        query = record.query
+        query_id = record.query_id
+        if (
+            query.source != "mlb_stats_pitching"
+            or query.grain != "season_d1_league_pitching_reference"
+            or query_id not in expected_by_id
+            or expected_by_id[query_id] != query
+            or query_id in record_by_id
+            or query.parent_query_id is not None
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or (
+                query.endpoint
+                == "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+            )
+            != (record.storage_mode == "DERIVED_DISPOSITION")
+        ):
+            raise ValueError("pitching verified record population differs")
+        requested = dict(query.requested_range)
+        season = requested.get("season")
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in grouped
+        ):
+            raise ValueError("pitching query season differs")
+        cutoff = _canonical_day(requested.get("as_of_date"), "pitching query cutoff")
+        key = (season, cutoff)
+        consumers = expected_consumers.get(key)
+        if consumers is None or key in seen_keys:
+            raise ValueError("pitching query consumer partition differs")
+        cutoffs = {
+            str(game_pk): cutoff.isoformat() for game_pk in consumers
+        }
+        season_open = SEASON_BOUNDARIES[season][0]
+        if cutoff < season_open:
+            expected_endpoint = (
+                "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+            )
+            expected_parameters: dict[str, object] = {}
+            expected_requested = {
+                "season": season,
+                "as_of_date": cutoff.isoformat(),
+                "consumer_cutoff_dates": cutoffs,
+                "consuming_game_pks": consumers,
+                "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                "reason": "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START",
+            }
+            if cutoff != season_open - timedelta(days=1):
+                raise ValueError("pitching preseason cutoff differs")
+        else:
+            expected_endpoint = "https://statsapi.mlb.com/api/v1/stats"
+            expected_parameters = {
+                "stats": "byDateRange",
+                "group": "pitching",
+                "sportIds": 1,
+                "gameType": "R",
+                "playerPool": "ALL",
+                "limit": 5000,
+                "startDate": season_open.isoformat(),
+                "endDate": cutoff.isoformat(),
+            }
+            expected_requested = {
+                "season": season,
+                "start_date": season_open.isoformat(),
+                "as_of_date": cutoff.isoformat(),
+                "consumer_cutoff_dates": cutoffs,
+                "consuming_game_pks": consumers,
+                "response_completeness": {
+                    "limit": 5000,
+                    "reject_total_splits_at_or_above_limit": True,
+                },
+            }
+        semantics = sidecar.get("semantics")
+        if (
+            query.endpoint != expected_endpoint
+            or dict(query.parameters) != expected_parameters
+            or requested != expected_requested
+            or not isinstance(semantics, Mapping)
+            or semantics.get("season") != season
+            or semantics.get("as_of_date") != cutoff.isoformat()
+            or semantics.get("consuming_game_pks") != consumers
+            or semantics.get("consumer_cutoff_dates") != cutoffs
+        ):
+            raise ValueError("pitching D-1 query or sidecar binding differs")
+        record_by_id[query_id] = (record, sidecar)
+        grouped[season].append((cutoff, record, sidecar))
+        seen_keys.add(key)
+    if set(record_by_id) != set(expected_by_id) or seen_keys != set(
+        expected_consumers
+    ):
+        raise ValueError("pitching READY record coverage differs")
+
+    snapshots: list[NormalizedSnapshot] = []
+    for season in _GAME_SEASONS:
+        ordered = sorted(grouped[season], key=lambda item: item[0])
+        payload = recompute_pitching_season_snapshot(
+            [sidecar for _cutoff, _record, sidecar in ordered]
+        )
+        snapshots.append(
+            _pitching_normalized_snapshot(
+                run_id,
+                season,
+                [record for _cutoff, record, _sidecar in ordered],
                 payload,
             )
         )
