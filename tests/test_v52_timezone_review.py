@@ -9,6 +9,7 @@ import stat
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -931,7 +932,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
             evidence_root = root / "evidence"
             evidence_root.mkdir()
             batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
-            output = AUDIT_NAMESPACE / "timezone-candidate.json"
+            output = FIXED_CANDIDATE
             self.assertEqual(
                 main(
                     [
@@ -959,7 +960,8 @@ class V52TimezoneReviewTest(unittest.TestCase):
             )
             self.assertEqual(candidate["run_spec_sha256"], RUN_SHA)
             self.assertEqual(candidate["acquisition_contract_sha256"], CONTRACT_SHA)
-            with self.assertRaises(FileExistsError):
+            before = (root / output).stat()
+            self.assertEqual(
                 main(
                     [
                         "candidate",
@@ -974,7 +976,177 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--output",
                         output.as_posix(),
                     ]
+                ),
+                0,
+            )
+            after = (root / output).stat()
+            self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+
+    def test_public_candidate_publisher_is_idempotent_and_preserves_resolution(self):
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+        from mlb_backtest.v52_timezone_review import publish_timezone_candidate
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            kwargs = {
+                "root": root,
+                "evidence_root": evidence_root,
+                "batch_ids": [batch.batch_id for batch in batches],
+            }
+            path = publish_timezone_candidate(**kwargs)
+            first = path.stat()
+            self.assertEqual(publish_timezone_candidate(**kwargs), path)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino),
+                             (first.st_dev, first.st_ino))
+
+            resolved = json.loads(path.read_bytes())
+            resolved["timezone_rows"][0]["time_zone"] = "UTC"
+            resolved_bytes = canonical_json_bytes(resolved) + b"\n"
+            path.write_bytes(resolved_bytes)
+            resolved_stat = path.stat()
+            self.assertEqual(publish_timezone_candidate(**kwargs), path)
+            self.assertEqual(path.read_bytes(), resolved_bytes)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino),
+                             (resolved_stat.st_dev, resolved_stat.st_ino))
+
+            for row in resolved["timezone_rows"]:
+                row["time_zone"] = "UTC"
+            resolved_bytes = canonical_json_bytes(resolved) + b"\n"
+            path.write_bytes(resolved_bytes)
+            self.assertEqual(publish_timezone_candidate(**kwargs), path)
+            self.assertEqual(path.read_bytes(), resolved_bytes)
+
+            forged = json.loads(path.read_bytes())
+            forged["run_spec_sha256"] = "f" * 64
+            path.write_bytes(canonical_json_bytes(forged) + b"\n")
+            with self.assertRaisesRegex((ValueError, RuntimeError), "authority|differs"):
+                publish_timezone_candidate(**kwargs)
+
+    def test_candidate_publisher_allows_unobserved_gaps_but_rejects_uncovered_observations(self):
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+        from mlb_backtest.v52_timezone_review import publish_timezone_candidate
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            kwargs = {
+                "root": root,
+                "evidence_root": evidence_root,
+                "batch_ids": [batch.batch_id for batch in batches],
+            }
+            path = publish_timezone_candidate(**kwargs)
+            candidate = json.loads(path.read_bytes())
+            for row in candidate["timezone_rows"]:
+                row["time_zone"] = "UTC"
+            target = next(
+                row
+                for row in candidate["timezone_rows"]
+                if row["effective_start"] < row["effective_end"]
+            )
+            candidate["timezone_rows"].remove(target)
+            split_day = date.fromisoformat(target["effective_start"])
+            first = dict(target, effective_end=split_day.isoformat(), time_zone="UTC")
+            second = dict(
+                target,
+                effective_start=(split_day + timedelta(days=1)).isoformat(),
+                time_zone="America/New_York",
+            )
+            candidate["timezone_rows"].extend((first, second))
+            candidate["timezone_rows"].sort(
+                key=lambda row: (row["venue_id"], row["effective_start"])
+            )
+            valid_bytes = canonical_json_bytes(candidate) + b"\n"
+            path.write_bytes(valid_bytes)
+            before = path.stat()
+
+            self.assertEqual(publish_timezone_candidate(**kwargs), path)
+            self.assertEqual(path.read_bytes(), valid_bytes)
+            self.assertEqual(
+                (path.stat().st_dev, path.stat().st_ino),
+                (before.st_dev, before.st_ino),
+            )
+
+            unobserved_gap = copy.deepcopy(candidate)
+            gap_row = next(
+                row
+                for row in unobserved_gap["timezone_rows"]
+                if row["venue_id"] == target["venue_id"]
+                and row["effective_start"] == second["effective_start"]
+            )
+            gap_row["effective_start"] = (
+                date.fromisoformat(second["effective_start"]) + timedelta(days=1)
+            ).isoformat()
+            gap_bytes = canonical_json_bytes(unobserved_gap) + b"\n"
+            path.write_bytes(gap_bytes)
+            gap_stat = path.stat()
+            self.assertEqual(publish_timezone_candidate(**kwargs), path)
+            self.assertEqual(path.read_bytes(), gap_bytes)
+            self.assertEqual(
+                (path.stat().st_dev, path.stat().st_ino),
+                (gap_stat.st_dev, gap_stat.st_ino),
+            )
+
+            uncovered = copy.deepcopy(candidate)
+            uncovered["timezone_rows"].remove(
+                next(
+                    row
+                    for row in uncovered["timezone_rows"]
+                    if row["venue_id"] == target["venue_id"]
+                    and row["effective_start"] == first["effective_start"]
                 )
+            )
+            path.write_bytes(canonical_json_bytes(uncovered) + b"\n")
+            with self.assertRaisesRegex(ValueError, "coverage|resolve"):
+                publish_timezone_candidate(**kwargs)
+
+            overlap = copy.deepcopy(candidate)
+            overlap_row = next(
+                row
+                for row in overlap["timezone_rows"]
+                if row["venue_id"] == target["venue_id"]
+                and row["effective_start"] == second["effective_start"]
+            )
+            overlap_row["effective_start"] = first["effective_end"]
+            path.write_bytes(canonical_json_bytes(overlap) + b"\n")
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                publish_timezone_candidate(**kwargs)
+
+    def test_candidate_publisher_rejects_source_mutation_at_final_rebind(self):
+        import mlb_backtest.v52_timezone_review as timezone_review
+        from mlb_backtest.v52_evidence import V52EvidenceStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, venue = _sealed_candidate_fixture(root, evidence_root)
+            kwargs = {
+                "root": root,
+                "evidence_root": evidence_root,
+                "batch_ids": [batch.batch_id for batch in batches],
+            }
+            path = timezone_review.publish_timezone_candidate(**kwargs)
+            before = path.read_bytes()
+            success = V52EvidenceStore(evidence_root).read_verified_success(venue)
+
+            def mutate_source() -> None:
+                success.published_evidence.success_receipt_path.unlink()
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_before_timezone_candidate_final_rebind",
+                    side_effect=mutate_source,
+                ),
+                self.assertRaises((ValueError, RuntimeError)),
+            ):
+                timezone_review.publish_timezone_candidate(**kwargs)
+            self.assertEqual(path.read_bytes(), before)
 
     def test_candidate_cli_rejects_duplicate_batch_and_unpublished_query(self):
         from mlb_backtest.v52_evidence import V52EvidenceStore
@@ -996,7 +1168,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 "--batch-id",
                 batches[0].batch_id,
                 "--output",
-                (AUDIT_NAMESPACE / "duplicate.json").as_posix(),
+                FIXED_CANDIDATE.as_posix(),
             ]
             with self.assertRaisesRegex(ValueError, "duplicate.*batch|batch.*duplicate"):
                 main(duplicate)
@@ -1018,7 +1190,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--batch-id",
                         batches[1].batch_id,
                         "--output",
-                        (AUDIT_NAMESPACE / "missing.json").as_posix(),
+                        FIXED_CANDIDATE.as_posix(),
                     ]
                 )
 
@@ -1067,7 +1239,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--batch-id",
                         batches[1].batch_id,
                         "--output",
-                        (AUDIT_NAMESPACE / "mixed.json").as_posix(),
+                        FIXED_CANDIDATE.as_posix(),
                     ]
                 ),
                 0,
@@ -1112,7 +1284,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--batch-id",
                         other_remaining_batch.batch_id,
                         "--output",
-                        (AUDIT_NAMESPACE / "split-batches.json").as_posix(),
+                        FIXED_CANDIDATE.as_posix(),
                     ]
                 ),
                 0,
@@ -1308,7 +1480,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         "--batch-id",
                         batches[1].batch_id,
                         "--output",
-                        (AUDIT_NAMESPACE / "symlink-candidate.json").as_posix(),
+                        FIXED_CANDIDATE.as_posix(),
                     ]
                 )
             with self.assertRaisesRegex(ValueError, "root|symlink"):

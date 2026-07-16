@@ -62,6 +62,22 @@ _SCHEDULE_INVENTORY_RELATIVE = Path(
 _SCHEDULE_INVENTORY_SCHEMA_RELATIVE = Path(
     "schemas/v5_2_schedule_anchor_inventory.schema.json"
 )
+_TIMEZONE_STAGE_EVIDENCE_RELATIVES = (
+    _SCHEDULE_INVENTORY_RELATIVE,
+    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),
+    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json"),
+    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json"),
+    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
+    Path("config/v5_2_qd/venue_timezones.json"),
+)
+_TIMEZONE_STAGE_EVIDENCE_LIMITS = (
+    64 * 1024 * 1024,
+    1024 * 1024,
+    1024 * 1024,
+    64 * 1024 * 1024,
+    1024 * 1024,
+    8 * 1024 * 1024,
+)
 _DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -1632,12 +1648,345 @@ def _validate_schedule_inventory_schema(root: Path, inventory: object) -> None:
         raise TrustIntegrityError("schedule inventory schema validation failed") from exc
 
 
+def _revalidate_gate_directory(
+    descriptor: int,
+    path: str | Path,
+    parent_descriptor: int | None,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(
+            path,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise TrustIntegrityError("timezone gate ancestor is unavailable") from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(linked.st_mode)
+        or not _same_identity(opened, linked)
+    ):
+        raise TrustIntegrityError("timezone gate ancestor identity differs")
+
+
+def _required_gate_leaf_exists(root: Path, relative: Path) -> bool:
+    if relative.is_absolute() or not relative.parts:
+        raise TrustIntegrityError("timezone gate path differs")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    absolute_root = Path(os.path.abspath(os.fspath(root)))
+    descriptors: list[int] = []
+    directories: list[tuple[int, str | Path, int | None]] = []
+    final_descriptor = -1
+    try:
+        try:
+            current = os.open(os.sep, directory_flags)
+        except OSError as exc:
+            raise TrustIntegrityError("timezone gate root is unavailable") from exc
+        descriptors.append(current)
+        directories.append((current, Path(os.sep), None))
+        _revalidate_gate_directory(current, Path(os.sep), None)
+        for component in (*absolute_root.parts[1:], *relative.parent.parts):
+            parent = current
+            try:
+                current = os.open(component, directory_flags, dir_fd=parent)
+            except FileNotFoundError:
+                for descriptor, path, ancestor in directories:
+                    _revalidate_gate_directory(descriptor, path, ancestor)
+                return False
+            except OSError as exc:
+                raise TrustIntegrityError(
+                    "timezone gate ancestor is unavailable or unsafe"
+                ) from exc
+            descriptors.append(current)
+            directories.append((current, component, parent))
+            _revalidate_gate_directory(current, component, parent)
+        try:
+            final_descriptor = os.open(
+                relative.name,
+                file_flags,
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            for descriptor, path, parent in directories:
+                _revalidate_gate_directory(descriptor, path, parent)
+            return False
+        except OSError as exc:
+            raise TrustIntegrityError("timezone gate path is unsafe") from exc
+        try:
+            opened = os.fstat(final_descriptor)
+            linked = os.stat(
+                relative.name,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise TrustIntegrityError("timezone gate path is unavailable") from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or opened.st_nlink != 1
+            or linked.st_nlink != 1
+            or not _same_identity(opened, linked)
+        ):
+            raise TrustIntegrityError("timezone gate path identity differs")
+        for descriptor, path, parent in directories:
+            _revalidate_gate_directory(descriptor, path, parent)
+        rebound = os.stat(
+            relative.name,
+            dir_fd=current,
+            follow_symlinks=False,
+        )
+        if not _same_identity(opened, rebound) or rebound.st_nlink != 1:
+            raise TrustIntegrityError("timezone gate path identity changed")
+        return True
+    finally:
+        if final_descriptor >= 0:
+            os.close(final_descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _load_required_timezone_gate(root: Path) -> object:
+    from .v52_timezone_review import load_verified_timezone_gate
+
+    required_gate_paths = (
+        Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),
+        Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json"),
+        Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
+        Path("config/v5_2_qd/venue_timezones.json"),
+    )
+    for relative in required_gate_paths:
+        if not _required_gate_leaf_exists(root, relative):
+            raise OperationalBlock(
+                "timezone review approvals and seal are required"
+            )
+    return _integrity_boundary(
+        "timezone gate",
+        lambda: load_verified_timezone_gate(root),
+    )
+
+
+def _timezone_checkpoint_file_identity(
+    metadata: os.stat_result,
+) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_timezone_checkpoint_evidence_snapshot(
+    root: Path,
+    path: Path,
+    *,
+    max_bytes: int,
+) -> bytes:
+    absolute_root = Path(os.path.abspath(os.fspath(root)))
+    absolute_path = Path(os.path.abspath(os.fspath(path)))
+    try:
+        relative = absolute_path.relative_to(absolute_root)
+    except ValueError as exc:
+        raise ValueError("timezone checkpoint evidence path differs") from exc
+    if not relative.parts or max_bytes < 0:
+        raise ValueError("timezone checkpoint evidence path or bound differs")
+
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptors: list[int] = []
+    directories: list[tuple[int, str | Path, int | None]] = []
+    file_descriptor = -1
+
+    def revalidate_directory(
+        descriptor: int,
+        component: str | Path,
+        parent: int | None,
+    ) -> None:
+        try:
+            opened = os.fstat(descriptor)
+            linked = os.stat(
+                component,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                "timezone checkpoint evidence ancestor is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or not _same_identity(opened, linked)
+        ):
+            raise ValueError(
+                "timezone checkpoint evidence ancestor identity differs"
+            )
+
+    try:
+        try:
+            current = os.open(os.sep, directory_flags)
+        except OSError as exc:
+            raise ValueError(
+                "timezone checkpoint evidence root is unavailable"
+            ) from exc
+        descriptors.append(current)
+        directories.append((current, Path(os.sep), None))
+        revalidate_directory(current, Path(os.sep), None)
+        for component in (*absolute_root.parts[1:], *relative.parent.parts):
+            parent = current
+            try:
+                current = os.open(component, directory_flags, dir_fd=parent)
+            except OSError as exc:
+                raise ValueError(
+                    "timezone checkpoint evidence ancestor is unsafe"
+                ) from exc
+            descriptors.append(current)
+            directories.append((current, component, parent))
+            revalidate_directory(current, component, parent)
+        try:
+            file_descriptor = os.open(
+                relative.name,
+                file_flags,
+                dir_fd=current,
+            )
+        except OSError as exc:
+            raise ValueError(
+                "timezone checkpoint evidence must be a no-follow regular file"
+            ) from exc
+        try:
+            before = os.fstat(file_descriptor)
+            linked = os.stat(
+                relative.name,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                "timezone checkpoint evidence identity is unavailable"
+            ) from exc
+        before_identity = _timezone_checkpoint_file_identity(before)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before_identity != _timezone_checkpoint_file_identity(linked)
+        ):
+            raise ValueError(
+                "timezone checkpoint evidence must be an unaliased regular file"
+            )
+        if before.st_size > max_bytes:
+            raise ValueError("timezone checkpoint evidence exceeds its read bound")
+
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(file_descriptor, 64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    "timezone checkpoint evidence exceeds its read bound"
+                )
+            chunks.append(chunk)
+
+        try:
+            after = os.fstat(file_descriptor)
+            rebound = os.stat(
+                relative.name,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                "timezone checkpoint evidence changed while reading"
+            ) from exc
+        after_identity = _timezone_checkpoint_file_identity(after)
+        if (
+            before_identity != after_identity
+            or after_identity != _timezone_checkpoint_file_identity(rebound)
+        ):
+            raise ValueError(
+                "timezone checkpoint evidence changed while reading"
+            )
+        for descriptor, component, parent in directories:
+            revalidate_directory(descriptor, component, parent)
+        return b"".join(chunks)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _validate_resumed_timezone_checkpoint(
+    checkpoint: object,
+    *,
+    root: Path,
+    batch_ids: tuple[str, str],
+    completed_query_ids: tuple[str, ...],
+    stage_evidence: tuple[Path, ...],
+) -> None:
+    supplied_paths = getattr(checkpoint, "stage_evidence_receipt_paths", None)
+    expected_evidence = tuple(
+        root / relative for relative in _TIMEZONE_STAGE_EVIDENCE_RELATIVES
+    )
+    if stage_evidence != expected_evidence:
+        raise TrustIntegrityError("timezone checkpoint boundary differs")
+    try:
+        snapshots = tuple(
+            _read_timezone_checkpoint_evidence_snapshot(
+                root,
+                path,
+                max_bytes=max_bytes,
+            )
+            for path, max_bytes in zip(
+                stage_evidence,
+                _TIMEZONE_STAGE_EVIDENCE_LIMITS,
+                strict=True,
+            )
+        )
+        evidence_hashes = tuple(
+            hashlib.sha256(snapshot).hexdigest() for snapshot in snapshots
+        )
+    except (OSError, ValueError) as exc:
+        raise TrustIntegrityError(
+            "timezone checkpoint evidence is unavailable"
+        ) from exc
+    if (
+        tuple(sorted(stage_evidence, key=os.fspath)) != stage_evidence
+        or getattr(checkpoint, "stage", None) != "TIMEZONE_REVIEW"
+        or getattr(checkpoint, "query_batch_ids", None) != batch_ids
+        or getattr(checkpoint, "completed_query_ids", None)
+        != completed_query_ids
+        or getattr(checkpoint, "pending_query_ids", None) != ()
+        or getattr(checkpoint, "quarantined_query_ids", None) != ()
+        or getattr(checkpoint, "split_query_ids", None) != ()
+        or getattr(checkpoint, "split_receipt_sha256s", None) != ()
+        or getattr(checkpoint, "stage_evidence_receipt_sha256s", None)
+        != evidence_hashes
+        or supplied_paths is not None
+        and supplied_paths != stage_evidence
+    ):
+        raise TrustIntegrityError("timezone checkpoint boundary differs")
+
+
 def _real_run_stages(
     request: _AcquisitionRequest,
     plan: _AcquisitionPlan,
 ) -> AcquisitionSummary:
-    from .execution_registry import load_latest_acquisition_checkpoint
+    from .execution_registry import (
+        load_latest_acquisition_checkpoint,
+        publish_acquisition_checkpoint,
+    )
     from .v52_query_plan import (
+        build_participant_derived_batch,
         build_schedule_reference_batch,
         build_static_batch,
         load_query_batch,
@@ -1665,8 +2014,10 @@ def _real_run_stages(
     if latest is not None and latest.stage not in {
         "STATIC_SCHEDULES",
         "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
     }:
-        raise OperationalBlock("later acquisition stages are outside C2b")
+        raise OperationalBlock("later acquisition stages are outside C2c")
 
     static = _integrity_boundary(
         "static query batch",
@@ -1712,7 +2063,13 @@ def _real_run_stages(
 
     if (
         latest is None
-        or latest.stage not in {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}
+        or latest.stage
+        not in {
+            "STATIC_SCHEDULES",
+            "REFERENCE_INPUTS",
+            "TIMEZONE_REVIEW",
+            "PARTICIPANT_DERIVED",
+        }
         or latest.pending_query_ids
         and latest.stage == "STATIC_SCHEDULES"
         or latest.quarantined_query_ids
@@ -1725,7 +2082,11 @@ def _real_run_stages(
         "static_batch_id": static.batch_id,
         "evidence_root": evidence_root,
     }
-    if latest.stage == "REFERENCE_INPUTS":
+    if latest.stage in {
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+    }:
         inventory = _integrity_boundary(
             "schedule inventory replay",
             lambda: load_verified_schedule_anchor_inventory(
@@ -1757,7 +2118,11 @@ def _real_run_stages(
     if reference.derived_from_sha256 != inventory.sha256:
         raise TrustIntegrityError("reference batch schedule inventory binding differs")
 
-    if latest.stage == "REFERENCE_INPUTS":
+    if latest.stage in {
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+    }:
         persisted_reference = _integrity_boundary(
             "reference query batch replay",
             lambda: load_query_batch(root, reference.batch_id),
@@ -1775,12 +2140,18 @@ def _real_run_stages(
         sorted(logical_query_id(query) for batch in cumulative_batches for query in batch.queries)
     )
     terminal_reference = (
-        latest.stage == "REFERENCE_INPUTS"
-        and latest.query_batch_ids == (static.batch_id, reference.batch_id)
-        and latest.completed_query_ids == cumulative_ids
-        and not latest.pending_query_ids
-        and not latest.quarantined_query_ids
-        and not latest.split_query_ids
+        latest.stage in {"REFERENCE_INPUTS", "TIMEZONE_REVIEW", "PARTICIPANT_DERIVED"}
+        and latest.query_batch_ids[:2] == (static.batch_id, reference.batch_id)
+        and set(cumulative_ids).issubset(latest.completed_query_ids)
+        and (
+            latest.stage != "REFERENCE_INPUTS"
+            or (
+                latest.completed_query_ids == cumulative_ids
+                and not latest.pending_query_ids
+                and not latest.quarantined_query_ids
+                and not latest.split_query_ids
+            )
+        )
     )
     if terminal_reference:
         completed, pending, quarantined = _stage_populations(store, cumulative_batches)
@@ -1811,9 +2182,7 @@ def _real_run_stages(
         resumed += reference_result.resumed
         network_attempts += reference_result.network_attempts
 
-    if request.stop_after != "reference-inputs":
-        raise OperationalBlock("TIMEZONE_REVIEW orchestration is pending")
-    return AcquisitionSummary(
+    reference_summary = AcquisitionSummary(
         contract_sha256=plan.contract_sha256,
         query_batch_sha256s=(static.batch_id, reference.batch_id),
         promoted=0,
@@ -1825,6 +2194,141 @@ def _real_run_stages(
         pending=0,
         network_attempts=network_attempts,
     )
+    if request.stop_after == "reference-inputs":
+        return reference_summary
+
+    from .v52_timezone_review import publish_timezone_candidate
+
+    _integrity_boundary(
+        "timezone candidate publication",
+        lambda: publish_timezone_candidate(
+            root=root,
+            evidence_root=evidence_root,
+            batch_ids=(static.batch_id, reference.batch_id),
+        ),
+    )
+    _load_required_timezone_gate(root)
+
+    timezone_stage_evidence = (
+        inventory.path,
+        root / "audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json",
+        root / "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
+        root / "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
+        root / "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+        root / "config/v5_2_qd/venue_timezones.json",
+    )
+    if latest.stage == "REFERENCE_INPUTS":
+        latest = _integrity_boundary(
+            "timezone checkpoint",
+            lambda: publish_acquisition_checkpoint(
+                root,
+                request.run_spec,
+                expected_prior_checkpoint_sha256=latest.receipt_sha256,
+                stage="TIMEZONE_REVIEW",
+                query_batch_ids=(static.batch_id, reference.batch_id),
+                completed_query_ids=cumulative_ids,
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+                stage_evidence_receipts=timezone_stage_evidence,
+            ),
+        )
+    if latest.stage == "TIMEZONE_REVIEW":
+        _validate_resumed_timezone_checkpoint(
+            latest,
+            root=root,
+            batch_ids=(static.batch_id, reference.batch_id),
+            completed_query_ids=cumulative_ids,
+            stage_evidence=timezone_stage_evidence,
+        )
+    elif (
+        latest.stage != "PARTICIPANT_DERIVED"
+        or latest.query_batch_ids[:2] != (static.batch_id, reference.batch_id)
+        or not set(cumulative_ids).issubset(latest.completed_query_ids)
+        or latest.quarantined_query_ids
+        or latest.split_query_ids
+    ):
+        raise TrustIntegrityError("timezone checkpoint authority differs")
+
+    from .v52_game_evidence_inventory import (
+        load_verified_game_evidence_inventory,
+        publish_game_evidence_inventory,
+    )
+
+    if latest.stage == "PARTICIPANT_DERIVED":
+        game_inventory = _integrity_boundary(
+            "game evidence inventory replay",
+            lambda: load_verified_game_evidence_inventory(root),
+        )
+    else:
+        game_inventory = _integrity_boundary(
+            "game evidence inventory publication",
+            lambda: publish_game_evidence_inventory(root),
+        )
+    participant = _integrity_boundary(
+        "participant query batch",
+        lambda: build_participant_derived_batch(root),
+    )
+    if participant.derived_from_sha256 != game_inventory.sha256:
+        raise TrustIntegrityError("participant batch inventory binding differs")
+    if latest.stage == "PARTICIPANT_DERIVED":
+        persisted_participant = _integrity_boundary(
+            "participant query batch replay",
+            lambda: load_query_batch(root, participant.batch_id),
+        )
+        if persisted_participant != participant:
+            raise TrustIntegrityError("persisted participant batch authority differs")
+    else:
+        _integrity_boundary(
+            "participant query batch publication",
+            lambda: publish_query_batch(root, participant),
+        )
+    participant_batches = (static, reference, participant)
+    participant_ids = tuple(
+        sorted(
+            logical_query_id(query)
+            for batch in participant_batches
+            for query in batch.queries
+        )
+    )
+    participant_evidence = tuple(
+        sorted((*timezone_stage_evidence, game_inventory.path), key=os.fspath)
+    )
+    terminal_participant = (
+        latest.stage == "PARTICIPANT_DERIVED"
+        and latest.query_batch_ids
+        == (static.batch_id, reference.batch_id, participant.batch_id)
+        and latest.completed_query_ids == participant_ids
+        and not latest.pending_query_ids
+        and not latest.quarantined_query_ids
+        and not latest.split_query_ids
+    )
+    if terminal_participant:
+        completed, pending, quarantined = _stage_populations(store, participant_batches)
+        if completed != participant_ids or pending or quarantined:
+            raise TrustIntegrityError("terminal participant evidence replay differs")
+        resumed += len(participant.queries)
+    else:
+        participant_result = _execute_stage(
+            request,
+            plan,
+            store,
+            stage="PARTICIPANT_DERIVED",
+            batches=participant_batches,
+            active_batches=(participant,),
+            stage_evidence=participant_evidence,
+            expected_prior=latest.receipt_sha256,
+            fetcher=request.fetcher,
+            runner_guard=runner_guard,
+            disk_budget=disk_budget,
+        )
+        fetched += participant_result.fetched
+        resumed += participant_result.resumed
+        network_attempts += participant_result.network_attempts
+        latest = participant_result.checkpoint
+    if latest.stage != "PARTICIPANT_DERIVED":
+        raise TrustIntegrityError("participant checkpoint authority differs")
+    raise OperationalBlock("REMAINING orchestration is pending")
 
 
 def _real_inspect_runtime(

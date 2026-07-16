@@ -106,6 +106,10 @@ def _before_timezone_gate_final_rebind() -> None:
     """Deterministic verified-gate race-test hook."""
 
 
+def _before_timezone_candidate_final_rebind() -> None:
+    """Deterministic candidate publication race-test hook."""
+
+
 def _canonical_file_bytes(value: object) -> bytes:
     return canonical_json_bytes(value) + b"\n"
 
@@ -1312,6 +1316,105 @@ def build_timezone_candidate(
     )
 
 
+def _validate_replayed_candidate_rows(
+    stored: Mapping[str, object],
+    generated: Mapping[str, object],
+) -> None:
+    rows = _normalize_timezone_rows(stored["timezone_rows"], allow_null=True)
+    expected = _normalize_timezone_rows(
+        generated["timezone_rows"], allow_null=True
+    )
+    if set(rows) != set(expected):
+        raise ValueError("timezone candidate row scope differs")
+    observed = {
+        (int(row["venue_id"]), str(row["official_date"])): (
+            bool(row["neutral_site"]),
+            bool(row["alternate_site"]),
+        )
+        for row in stored["observed_venue_dates"]  # type: ignore[union-attr]
+    }
+    _coverage(rows, observed)
+    if all(row["time_zone"] is not None for values in rows.values() for row in values):
+        _mapping_from_candidate(stored, require_resolved=True)
+
+
+def publish_timezone_candidate(
+    *,
+    root: Path,
+    evidence_root: Path,
+    batch_ids: Sequence[str],
+) -> Path:
+    """Publish or reconcile the one canonical timezone-review candidate."""
+    root = _trusted_root(root)
+    candidate = build_timezone_candidate(
+        root=root,
+        evidence_root=evidence_root,
+        batch_ids=batch_ids,
+    )
+    contents = _canonical_file_bytes(candidate)
+    existing = _read_safe_snapshot(
+        root,
+        _CANDIDATE_PATH,
+        "timezone candidate",
+        missing_ok=True,
+        max_bytes=_MAX_CANDIDATE_BYTES,
+    )
+    if existing is not None:
+        stored = _candidate_object(
+            _json_object(existing.contents, "timezone candidate", canonical=True)
+        )
+        stored_projection = {
+            key: value for key, value in stored.items() if key != "timezone_rows"
+        }
+        candidate_projection = {
+            key: value for key, value in candidate.items() if key != "timezone_rows"
+        }
+        if stored_projection != candidate_projection:
+            raise ValueError("timezone candidate differs from current source authority")
+        _validate_replayed_candidate_rows(stored, candidate)
+        _before_timezone_candidate_final_rebind()
+        rebound = build_timezone_candidate(
+            root=root,
+            evidence_root=evidence_root,
+            batch_ids=batch_ids,
+        )
+        if rebound != candidate:
+            raise ValueError("timezone candidate authority changed during replay")
+        _rebind_safe_snapshot(
+            root,
+            existing,
+            "timezone candidate",
+            max_bytes=_MAX_CANDIDATE_BYTES,
+        )
+        final = build_timezone_candidate(
+            root=root,
+            evidence_root=evidence_root,
+            batch_ids=batch_ids,
+        )
+        if final != candidate:
+            raise ValueError("timezone candidate authority changed during final rebind")
+        return root / _CANDIDATE_PATH
+
+    def rebind() -> None:
+        _before_timezone_candidate_final_rebind()
+        current = build_timezone_candidate(
+            root=root,
+            evidence_root=evidence_root,
+            batch_ids=batch_ids,
+        )
+        if current != candidate:
+            raise ValueError("timezone candidate authority changed before publication")
+
+    path, _ = _reconcile_or_write(
+        root,
+        _CANDIDATE_PATH,
+        contents,
+        "timezone candidate",
+        final_rebind=rebind,
+    )
+    return path
+
+
 def _required_snapshot(
     root: Path,
     relative: Path,
@@ -1804,16 +1907,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = _acquisition_audit_relative(
             arguments.root, arguments.output, "timezone candidate"
         )
-        candidate = build_timezone_candidate(
+        if output != _CANDIDATE_PATH:
+            raise ValueError("timezone candidate output must be the canonical path")
+        publish_timezone_candidate(
             root=arguments.root,
             evidence_root=arguments.evidence_root,
             batch_ids=arguments.batch_id,
-        )
-        _write_safe(
-            arguments.root,
-            output,
-            _canonical_file_bytes(candidate),
-            "timezone candidate",
         )
         return 0
     if arguments.command == "review":
@@ -1847,6 +1946,7 @@ __all__ = [
     "build_timezone_candidate",
     "load_verified_timezone_gate",
     "main",
+    "publish_timezone_candidate",
     "seal_timezone_mapping",
     "validate_timezone_mapping",
     "write_timezone_review_receipt",
