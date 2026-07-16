@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -18,6 +18,7 @@ from typing import ContextManager, Literal
 
 from .v52_legacy_relation import matches_current_query_to_legacy
 from .v52_protected_inventory import (
+    ProtectedMembershipSnapshot,
     parse_protected_raw_inventory_document,
     snapshot_protected_inventory_membership,
 )
@@ -246,6 +247,15 @@ class _RepositoryFileSnapshot:
     relative_path: str
     ancestor_identities: tuple[tuple[int, int], ...]
     file: _RegularSnapshot
+
+
+@dataclass(frozen=True)
+class _ValidatedLegacyReference:
+    reference: dict[str, object]
+    payload: bytes
+    lineage_snapshots: tuple[_RepositoryFileSnapshot, ...]
+    protected_inventory: Mapping[str, object]
+    protected_membership: ProtectedMembershipSnapshot
 
 
 @dataclass(frozen=True)
@@ -4664,11 +4674,7 @@ class V52EvidenceStore:
         query: LogicalQuery,
         legacy_reference: Mapping[str, object],
         semantics: Mapping[str, object] | None,
-    ) -> tuple[
-        dict[str, object],
-        bytes,
-        tuple[_RepositoryFileSnapshot, ...],
-    ]:
+    ) -> _ValidatedLegacyReference:
         reference = _normalized_json_object(legacy_reference, "legacy_reference")
         if set(reference) != _LEGACY_REFERENCE_KEYS:
             raise ValueError("legacy reference lineage keys differ")
@@ -4856,11 +4862,17 @@ class V52EvidenceStore:
             raise ProtectedLegacyPublishReverifyError(
                 "protected legacy membership changed during validation"
             )
-        return reference, payload, (
-            inventory_snapshot,
-            manifest_snapshot,
-            seal_snapshot,
-            payload_snapshot,
+        return _ValidatedLegacyReference(
+            reference=reference,
+            payload=payload,
+            lineage_snapshots=(
+                inventory_snapshot,
+                manifest_snapshot,
+                seal_snapshot,
+                payload_snapshot,
+            ),
+            protected_inventory=inventory,
+            protected_membership=membership,
         )
 
     def publish_legacy_reference(
@@ -4875,9 +4887,13 @@ class V52EvidenceStore:
                 "pending failure transaction recovered; success publication refused"
             )
         self._ensure_unpublished(query)
-        reference, payload, lineage_snapshots = self._validated_legacy_reference(
+        validated = self._validated_legacy_reference(
             query, legacy_reference, query_sidecar
         )
+        reference = validated.reference
+        payload = validated.payload
+        lineage_snapshots = validated.lineage_snapshots
+        repository = self._legacy_repository_root()
         raw_sha256 = _validate_sha256(reference["raw_sha256"], "raw_sha256")
         query_id, descriptors = self._query_fds(query, create=False)
         try:
@@ -4967,6 +4983,16 @@ class V52EvidenceStore:
                 }
                 try:
                     self._rebind_legacy_lineage(lineage_snapshots)
+                    rebound_membership = (
+                        snapshot_protected_inventory_membership(
+                            repository,
+                            validated.protected_inventory,
+                        )
+                    )
+                    if rebound_membership != validated.protected_membership:
+                        raise ValueError(
+                            "protected legacy membership changed before publication"
+                        )
                 except (OSError, RuntimeError, ValueError) as exc:
                     raise ProtectedLegacyPublishReverifyError(
                         "protected publisher lineage revalidation failed"
@@ -5216,6 +5242,7 @@ class V52EvidenceStore:
         missing_ok: bool,
         cleanup_tombstones: bool = True,
         lock_descriptor: int | None = None,
+        inspection: Callable[[VerifiedEvidenceRead], None] | None = None,
     ) -> VerifiedEvidenceRead | None:
         try:
             query_id, descriptors = self._query_fds(query, create=False)
@@ -5320,6 +5347,7 @@ class V52EvidenceStore:
                     raise ValueError("success attempt history binding differs")
 
                 legacy_reference_record: dict[str, object] | None = None
+                legacy_validation: _ValidatedLegacyReference | None = None
                 legacy_lineage_snapshots: tuple[
                     _RepositoryFileSnapshot, ...
                 ] = ()
@@ -5399,12 +5427,13 @@ class V52EvidenceStore:
                     reference = _json_object(
                         object_contents, "protected legacy reference"
                     )
-                    (
-                        legacy_reference_record,
-                        raw_bytes,
-                        legacy_lineage_snapshots,
-                    ) = (
-                        self._validated_legacy_reference(query, reference, None)
+                    legacy_validation = self._validated_legacy_reference(
+                        query, reference, None
+                    )
+                    legacy_reference_record = legacy_validation.reference
+                    raw_bytes = legacy_validation.payload
+                    legacy_lineage_snapshots = (
+                        legacy_validation.lineage_snapshots
                     )
                 else:
                     if (
@@ -5526,78 +5555,132 @@ class V52EvidenceStore:
                     != legacy_reference_record["semantic_sha256"]
                 ):
                     raise ValueError("legacy semantic hash binding differs")
-                (
-                    final_reservations,
-                    final_history,
-                    final_attempt_receipts,
-                    final_attempt_snapshots,
-                ) = self._verified_attempt_bundle(query, attempts_fd)
-                if (
-                    final_reservations != reservations
-                    or final_history != history
-                    or final_attempt_receipts != attempt_receipts
-                    or final_attempt_snapshots != attempt_snapshots
-                ):
-                    raise ValueError(
-                        "attempt namespace or history changed during verified read"
-                    )
-                _rebind_regular_snapshot_at(
-                    sidecars_fd,
-                    sidecar_name,
-                    sidecar_snapshot,
-                    "query semantic sidecar",
+                published = PublishedEvidence(
+                    query_id=query_id,
+                    success_receipt_path=self.root
+                    / "queries"
+                    / query.source
+                    / query_id
+                    / "success.json",
+                    raw_sha256=raw_sha256,
+                    query_sidecar_sha256=sidecar_sha256,
+                    storage_mode=mode,  # type: ignore[arg-type]
                 )
-                if object_snapshot is not None and object_name is not None:
-                    _rebind_regular_snapshot_at(
-                        objects_fd,
-                        object_name,
-                        object_snapshot,
-                        "query object",
-                    )
+                verified_result = VerifiedEvidenceRead(
+                    registered_query=registered_query,
+                    published_evidence=published,
+                    raw_bytes=raw_bytes,
+                    query_sidecar=sidecar,
+                    success_receipt=manifest,
+                    attempt_receipts=attempt_receipts,
+                )
 
-            self._verify_query_chain(query, descriptors)
-            _rebind_regular_snapshot_at(
-                query_fd,
-                "success.json",
-                success_snapshot,
-                "success receipt",
-            )
-            (
-                final_registration_sha256,
-                final_registered_query,
-                final_query_snapshot,
-            ) = self._validated_registered_query(
-                query,
-                query_fd,
-                lock_descriptor=active_lock_descriptor,
-            )
-            if (
-                final_registration_sha256 != registration_sha256
-                or final_registered_query != registered_query
-                or final_query_snapshot != query_snapshot
-            ):
-                raise ValueError("logical query registration changed during read")
-            if legacy_lineage_snapshots:
-                self._rebind_legacy_lineage(legacy_lineage_snapshots)
-            published = PublishedEvidence(
-                query_id=query_id,
-                success_receipt_path=self.root
-                / "queries"
-                / query.source
-                / query_id
-                / "success.json",
-                raw_sha256=raw_sha256,
-                query_sidecar_sha256=sidecar_sha256,
-                storage_mode=mode,  # type: ignore[arg-type]
-            )
-            return VerifiedEvidenceRead(
-                registered_query=registered_query,
-                published_evidence=published,
-                raw_bytes=raw_bytes,
-                query_sidecar=sidecar,
-                success_receipt=manifest,
-                attempt_receipts=attempt_receipts,
-            )
+                def rebind_verified_read() -> None:
+                    for name, descriptor, label in (
+                        ("attempts", attempts_fd, "attempt namespace"),
+                        ("objects", objects_fd, "query object namespace"),
+                        ("sidecars", sidecars_fd, "query sidecar namespace"),
+                    ):
+                        _rebind_directory_at(
+                            query_fd,
+                            name,
+                            descriptor,
+                            label,
+                        )
+                    (
+                        final_reservations,
+                        final_history,
+                        final_attempt_receipts,
+                        final_attempt_snapshots,
+                    ) = self._verified_attempt_bundle(query, attempts_fd)
+                    if (
+                        final_reservations != reservations
+                        or final_history != history
+                        or final_attempt_receipts != attempt_receipts
+                        or final_attempt_snapshots != attempt_snapshots
+                    ):
+                        raise ValueError(
+                            "attempt namespace or history changed during verified read"
+                        )
+                    if mode == "DERIVED_DISPOSITION":
+                        self._ensure_empty_inventory(
+                            objects_fd, "query object"
+                        )
+                    else:
+                        self._ensure_content_slot(
+                            objects_fd,
+                            object_name,  # type: ignore[arg-type]
+                            object_contents,  # type: ignore[arg-type]
+                            "query object binding",
+                        )
+                    if object_snapshot is not None and object_name is not None:
+                        _rebind_regular_snapshot_at(
+                            objects_fd,
+                            object_name,
+                            object_snapshot,
+                            "query object",
+                        )
+                    self._ensure_content_slot(
+                        sidecars_fd,
+                        sidecar_name,
+                        sidecar_contents,
+                        "query sidecar binding",
+                    )
+                    _rebind_regular_snapshot_at(
+                        sidecars_fd,
+                        sidecar_name,
+                        sidecar_snapshot,
+                        "query semantic sidecar",
+                    )
+                    self._verify_query_chain(query, descriptors)
+                    _rebind_regular_snapshot_at(
+                        query_fd,
+                        "success.json",
+                        success_snapshot,
+                        "success receipt",
+                    )
+                    (
+                        final_registration_sha256,
+                        final_registered_query,
+                        final_query_snapshot,
+                    ) = self._validated_registered_query(
+                        query,
+                        query_fd,
+                        lock_descriptor=active_lock_descriptor,
+                    )
+                    if (
+                        final_registration_sha256 != registration_sha256
+                        or final_registered_query != registered_query
+                        or final_query_snapshot != query_snapshot
+                    ):
+                        raise ValueError(
+                            "logical query registration changed during read"
+                        )
+                    if legacy_lineage_snapshots:
+                        self._rebind_legacy_lineage(legacy_lineage_snapshots)
+                    if legacy_validation is not None:
+                        rebound_membership = (
+                            snapshot_protected_inventory_membership(
+                                self._legacy_repository_root(),
+                                legacy_validation.protected_inventory,
+                            )
+                        )
+                        if (
+                            rebound_membership
+                            != legacy_validation.protected_membership
+                        ):
+                            raise ValueError(
+                                "protected legacy membership changed during read"
+                            )
+
+                if inspection is None:
+                    rebind_verified_read()
+                else:
+                    try:
+                        inspection(verified_result)
+                    finally:
+                        rebind_verified_read()
+                return verified_result
         finally:
             try:
                 if recovery_canary_started:
@@ -5610,6 +5693,26 @@ class V52EvidenceStore:
 
     def read_verified_success(self, query: LogicalQuery) -> VerifiedEvidenceRead:
         verified = self._read_verified_success(query, missing_ok=False)
+        if verified is None:
+            raise RuntimeError("success receipt is missing")
+        return verified
+
+    def inspect_verified_success(
+        self,
+        query: LogicalQuery,
+        inspection: Callable[[VerifiedEvidenceRead], None],
+    ) -> VerifiedEvidenceRead:
+        if not self._read_only:
+            raise ValueError(
+                "verified success inspection requires a read-only evidence store"
+            )
+        if not callable(inspection):
+            raise TypeError("inspection must be callable")
+        verified = self._read_verified_success(
+            query,
+            missing_ok=False,
+            inspection=inspection,
+        )
         if verified is None:
             raise RuntimeError("success receipt is missing")
         return verified

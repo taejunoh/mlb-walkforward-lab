@@ -602,6 +602,124 @@ class V52EvidenceTest(unittest.TestCase):
                 self._tree_byte_inode_snapshot(root), attacker_snapshot
             )
 
+    def test_inspection_rejects_directory_generation_replacement(self) -> None:
+        for namespace in ("attempts", "objects", "sidecars"):
+            with self.subTest(namespace=namespace), tempfile.TemporaryDirectory() as td:
+                base = _tmp(td)
+                root = base / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(),
+                        _sidecar(),
+                    )
+                readonly = V52EvidenceStore.open_read_only(root)
+                query_root = (
+                    root / "queries" / query.source / logical_query_id(query)
+                )
+                attacker_snapshot: dict[Path, tuple[object, ...]] | None = None
+
+                def replace_namespace_generation(_verified: object) -> None:
+                    nonlocal attacker_snapshot
+                    current = query_root / namespace
+                    displaced = base / f"{namespace}.displaced"
+                    incoming = base / f"{namespace}.incoming"
+                    shutil.copytree(current, incoming)
+                    current.rename(displaced)
+                    incoming.rename(current)
+                    attacker_snapshot = self._tree_byte_inode_snapshot(base)
+
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "directory|identity|generation|binding|changed|membership",
+                ):
+                    readonly.inspect_verified_success(
+                        query, replace_namespace_generation
+                    )
+
+                self.assertIsNotNone(attacker_snapshot)
+                self.assertEqual(
+                    self._tree_byte_inode_snapshot(base), attacker_snapshot
+                )
+
+    def test_inspection_rejects_unexpected_content_namespace_leaf(self) -> None:
+        for namespace in ("objects", "sidecars"):
+            with self.subTest(namespace=namespace), tempfile.TemporaryDirectory() as td:
+                root = _tmp(td) / "raw"
+                store = V52EvidenceStore(root)
+                query = _query()
+                with store.acquire_query(query) as lease:
+                    store.publish_fetched(
+                        query,
+                        store.next_attempt_number(lease),
+                        _capture(),
+                        _sidecar(),
+                    )
+                readonly = V52EvidenceStore.open_read_only(root)
+                namespace_root = (
+                    root
+                    / "queries"
+                    / query.source
+                    / logical_query_id(query)
+                    / namespace
+                )
+                attacker_snapshot: dict[Path, tuple[object, ...]] | None = None
+
+                def add_unexpected_leaf(_verified: object) -> None:
+                    nonlocal attacker_snapshot
+                    (namespace_root / "unexpected-inspection-canary").write_bytes(
+                        b"must-not-be-accepted"
+                    )
+                    attacker_snapshot = self._tree_byte_inode_snapshot(root)
+
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError),
+                    "inventory|membership|unexpected|ambiguous|changed",
+                ):
+                    readonly.inspect_verified_success(query, add_unexpected_leaf)
+
+                self.assertIsNotNone(attacker_snapshot)
+                self.assertEqual(
+                    self._tree_byte_inode_snapshot(root), attacker_snapshot
+                )
+
+    def test_inspection_rejects_protected_legacy_source_membership_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            with store.acquire_query(query):
+                store.publish_legacy_reference(query, reference, _sidecar())
+            readonly = V52EvidenceStore.open_read_only(store.root)
+            repository = store.root.parents[3]
+            protected_source = (
+                repository / Path(str(reference["payload_path"])).parent
+            )
+            attacker_snapshot: dict[Path, tuple[object, ...]] | None = None
+
+            def add_unexpected_protected_leaf(_verified: object) -> None:
+                nonlocal attacker_snapshot
+                (protected_source / "unexpected-inspection-canary").write_bytes(
+                    b"must-not-be-accepted"
+                )
+                attacker_snapshot = self._tree_byte_inode_snapshot(repository)
+
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError),
+                "protected|legacy|inventory|membership|unexpected|changed",
+            ):
+                readonly.inspect_verified_success(
+                    query, add_unexpected_protected_leaf
+                )
+
+            self.assertIsNotNone(attacker_snapshot)
+            self.assertEqual(
+                self._tree_byte_inode_snapshot(repository), attacker_snapshot
+            )
+
     def test_read_only_split_read_uses_shared_lock_without_cleanup(self) -> None:
         query = dataclasses.replace(
             _query(),
@@ -5318,6 +5436,55 @@ class V52EvidenceTest(unittest.TestCase):
                     query, reference, _sidecar()
                 )
             self.assertEqual(store.verify_success(query), published)
+
+    def test_legacy_publish_membership_change_before_success_is_atomic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store, query, reference = _legacy_fixture(_tmp(td))
+            repository = store.root.parents[3]
+            protected_source = (
+                repository / Path(str(reference["payload_path"])).parent
+            )
+            canary = protected_source / "unexpected-publish-canary"
+            success_path = (
+                store.root
+                / "queries"
+                / query.source
+                / logical_query_id(query)
+                / "success.json"
+            )
+            original_rebind = store._rebind_legacy_lineage
+            attacker_snapshot: dict[Path, tuple[object, ...]] | None = None
+
+            def add_membership_then_rebind(
+                *args: object, **kwargs: object
+            ) -> None:
+                nonlocal attacker_snapshot
+                canary.write_bytes(b"must-not-be-cleaned")
+                attacker_snapshot = self._tree_byte_inode_snapshot(repository)
+                original_rebind(*args, **kwargs)  # type: ignore[arg-type]
+
+            with store.acquire_query(query):
+                with (
+                    patch.object(
+                        store,
+                        "_rebind_legacy_lineage",
+                        side_effect=add_membership_then_rebind,
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "protected|legacy|inventory|membership|verification",
+                    ),
+                ):
+                    store.publish_legacy_reference(query, reference, _sidecar())
+
+            self.assertIsNotNone(attacker_snapshot)
+            self.assertFalse(success_path.exists())
+            self.assertTrue(canary.exists())
+            self.assertEqual(
+                self._tree_byte_inode_snapshot(repository), attacker_snapshot
+            )
 
     def test_legacy_reference_rejects_symlink_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as td:

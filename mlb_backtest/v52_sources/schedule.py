@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
-from ..sources import parse_schedule, validate_schedule_query_coverage
+from ..source_parsers.schedule import parse_schedule, validate_schedule_query_coverage
 from ..v52_evidence import LogicalQuery
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
