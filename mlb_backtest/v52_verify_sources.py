@@ -51,7 +51,10 @@ from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
     validate_statcast_child_coverage,
 )
-from .v52_sources.pitching import recompute_pitching_season_snapshot
+from .v52_sources.pitching import (
+    recompute_career_bf_snapshot,
+    recompute_pitching_season_snapshot,
+)
 from .v52_sources.references import recompute_reference_sidecar
 from .v52_timezone_review import (
     _candidate_object as _timezone_candidate_object,
@@ -130,6 +133,21 @@ _STATCAST_PAYLOAD_KEYS = frozenset(
 _PITCHING_PAYLOAD_KEYS = frozenset(
     {"grain", "query_sidecar_sha256s", "records", "schema_version"}
 )
+_CAREER_PAYLOAD_KEYS = frozenset({"grain", "records", "schema_version"})
+_CAREER_RECORD_KEYS = frozenset(
+    {
+        "baseline_batters_faced",
+        "baseline_inclusive_end_date",
+        "baseline_query_sidecar_sha256",
+        "consumer_cutoff_date",
+        "game_pk",
+        "pitcher_id",
+        "statcast_ready_leaf_sidecar_sha256s",
+        "statcast_split_receipt_sha256s",
+        "total_batters_faced",
+        "verified_statcast_bf",
+    }
+)
 _REFERENCE_PAYLOAD_KEYS = frozenset(
     {
         "grain",
@@ -150,9 +168,7 @@ _PITCHING_RECORD_COMMON_KEYS = frozenset(
         "query_sidecar_sha256",
     }
 )
-_PITCHING_RECORD_NUMERIC_KEYS = frozenset(
-    {"batters_faced", "earned_runs", "outs"}
-)
+_PITCHING_RECORD_NUMERIC_KEYS = frozenset({"batters_faced", "earned_runs", "outs"})
 _GAME_INVENTORY_KEYS = frozenset(
     {
         "acquisition_contract",
@@ -214,12 +230,14 @@ class NormalizedSnapshot:
     source: Literal[
         "baseball_savant_statcast",
         "mlb_schedule_game_feed",
+        "mlb_stats_pitcher_bf",
         "mlb_stats_pitching",
         "prior_schedule_history",
         "venue_team_timezone_table",
     ]
     grain: Literal[
         "pitch",
+        "player_career_batters_faced_reference",
         "season_d1_league_pitching_reference",
         "season_game_evidence_snapshot",
         "verified_game_projection",
@@ -242,9 +260,7 @@ class NormalizedSnapshot:
             "schema_version": self.schema_version,
             "season": self.season,
             "source": self.source,
-            "source_query_sidecar_sha256s": list(
-                self.source_query_sidecar_sha256s
-            ),
+            "source_query_sidecar_sha256s": list(self.source_query_sidecar_sha256s),
             "split_receipt_sha256s": list(self.split_receipt_sha256s),
             "status": self.status,
         }
@@ -277,8 +293,7 @@ def _sorted_unique_sha256s(
     if not isinstance(value, list) or (not value and not allow_empty):
         raise ValueError(f"normalized snapshot {label} differ")
     if any(
-        not isinstance(item, str) or _SHA256.fullmatch(item) is None
-        for item in value
+        not isinstance(item, str) or _SHA256.fullmatch(item) is None for item in value
     ) or value != sorted(set(value)):
         raise ValueError(f"normalized snapshot {label} differ")
     return value
@@ -301,9 +316,7 @@ def _validate_normalized_snapshot_mapping(
         or envelope.get("status") != "READY"
     ):
         raise ValueError("normalized snapshot envelope identity differs")
-    query_ids = _sorted_unique_sha256s(
-        envelope.get("logical_query_ids"), "query IDs"
-    )
+    query_ids = _sorted_unique_sha256s(envelope.get("logical_query_ids"), "query IDs")
     top_sidecars = _sorted_unique_sha256s(
         envelope.get("source_query_sidecar_sha256s"), "sidecar hashes"
     )
@@ -386,12 +399,13 @@ def _validate_normalized_snapshot_mapping(
         seen_game_pks: set[int] = set()
         projected_hashes: list[str] = []
         for row_value in games:
-            if not isinstance(row_value, Mapping) or set(row_value) != _HISTORY_GAME_KEYS:
+            if (
+                not isinstance(row_value, Mapping)
+                or set(row_value) != _HISTORY_GAME_KEYS
+            ):
                 raise ValueError("normalized snapshot history projection keys differ")
             row = dict(row_value)
-            official = _canonical_day(
-                row.get("official_date"), "history official date"
-            )
+            official = _canonical_day(row.get("official_date"), "history official date")
             cutoff = _canonical_day(row.get("history_cutoff"), "history cutoff")
             game_pk = row.get("game_pk")
             if (
@@ -414,10 +428,11 @@ def _validate_normalized_snapshot_mapping(
                     "venue_id",
                 )
             ):
-                raise ValueError("normalized snapshot history positive identity differs")
+                raise ValueError(
+                    "normalized snapshot history positive identity differs"
+                )
             if any(
-                value is not None
-                and (type(value) is not int or value < 0)
+                value is not None and (type(value) is not int or value < 0)
                 for value in (
                     row.get("completed_innings"),
                     row.get("scheduled_innings"),
@@ -425,7 +440,9 @@ def _validate_normalized_snapshot_mapping(
             ):
                 raise ValueError("normalized snapshot history innings differ")
             scheduled_start = row.get("scheduled_start_utc")
-            if not isinstance(scheduled_start, str) or not scheduled_start.endswith("Z"):
+            if not isinstance(scheduled_start, str) or not scheduled_start.endswith(
+                "Z"
+            ):
                 raise ValueError("normalized snapshot history scheduled start differs")
             try:
                 datetime.fromisoformat(scheduled_start[:-1] + "+00:00")
@@ -458,6 +475,94 @@ def _validate_normalized_snapshot_mapping(
             raise ValueError("normalized snapshot history source hashes differ")
         return envelope
 
+    if source == "mlb_stats_pitcher_bf" and grain == (
+        "player_career_batters_faced_reference"
+    ):
+        split_hashes = _sorted_unique_sha256s(
+            envelope.get("split_receipt_sha256s"),
+            "split receipt hashes",
+            allow_empty=True,
+        )
+        payload_value = envelope.get("payload")
+        if (
+            not isinstance(payload_value, Mapping)
+            or set(payload_value) != _CAREER_PAYLOAD_KEYS
+        ):
+            raise ValueError("normalized snapshot career payload keys differ")
+        payload = dict(payload_value)
+        records = payload.get("records")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("grain") != "player_career_batters_faced_reference"
+            or not isinstance(records, list)
+            or not records
+        ):
+            raise ValueError("normalized snapshot career payload identity differs")
+        observed: list[tuple[int, int]] = []
+        lineage_sidecars: set[str] = set()
+        lineage_receipts: set[str] = set()
+        for row_value in records:
+            if (
+                not isinstance(row_value, Mapping)
+                or set(row_value) != _CAREER_RECORD_KEYS
+            ):
+                raise ValueError("normalized snapshot career record keys differ")
+            row = dict(row_value)
+            pitcher_id = row.get("pitcher_id")
+            game_pk = row.get("game_pk")
+            cutoff = _canonical_day(
+                row.get("consumer_cutoff_date"), "career consumer cutoff"
+            )
+            baseline_end = _canonical_day(
+                row.get("baseline_inclusive_end_date"), "career baseline cutoff"
+            )
+            baseline = row.get("baseline_batters_faced")
+            verified = row.get("verified_statcast_bf")
+            total = row.get("total_batters_faced")
+            baseline_hash = row.get("baseline_query_sidecar_sha256")
+            leaf_hashes = row.get("statcast_ready_leaf_sidecar_sha256s")
+            receipt_hashes = row.get("statcast_split_receipt_sha256s")
+            if (
+                type(pitcher_id) is not int
+                or pitcher_id <= 0
+                or type(game_pk) is not int
+                or game_pk <= 0
+                or cutoff.year != season
+                or baseline_end
+                != (date(2017, 12, 31) if season <= 2021 else date(2021, 12, 31))
+                or any(
+                    type(value) is not int or value < 0
+                    for value in (baseline, verified, total)
+                )
+                or total != baseline + verified
+                or not isinstance(baseline_hash, str)
+                or _SHA256.fullmatch(baseline_hash) is None
+                or not isinstance(leaf_hashes, list)
+                or any(
+                    not isinstance(item, str) or _SHA256.fullmatch(item) is None
+                    for item in leaf_hashes
+                )
+                or leaf_hashes != sorted(set(leaf_hashes))
+                or not isinstance(receipt_hashes, list)
+                or any(
+                    not isinstance(item, str) or _SHA256.fullmatch(item) is None
+                    for item in receipt_hashes
+                )
+                or receipt_hashes != sorted(set(receipt_hashes))
+            ):
+                raise ValueError("normalized snapshot career record identity differs")
+            observed.append((pitcher_id, game_pk))
+            lineage_sidecars.add(baseline_hash)
+            lineage_sidecars.update(leaf_hashes)
+            lineage_receipts.update(receipt_hashes)
+        if observed != sorted(set(observed)):
+            raise ValueError("normalized snapshot career record order differs")
+        if top_sidecars != sorted(lineage_sidecars):
+            raise ValueError("normalized snapshot career source lineage differs")
+        if split_hashes != sorted(lineage_receipts):
+            raise ValueError("normalized snapshot career receipt lineage differs")
+        return envelope
+
     if source == "mlb_stats_pitching" and grain == (
         "season_d1_league_pitching_reference"
     ):
@@ -479,8 +584,7 @@ def _validate_normalized_snapshot_mapping(
         payload_hashes = payload.get("query_sidecar_sha256s")
         if (
             payload.get("schema_version") != 1
-            or payload.get("grain")
-            != "season_d1_league_pitching_reference"
+            or payload.get("grain") != "season_d1_league_pitching_reference"
             or not isinstance(records, list)
             or not records
             or not isinstance(payload_hashes, list)
@@ -519,7 +623,9 @@ def _validate_normalized_snapshot_mapping(
                 or (prior_as_of is not None and as_of <= prior_as_of)
                 or not isinstance(consumers, list)
                 or not consumers
-                or any(type(game_pk) is not int or game_pk <= 0 for game_pk in consumers)
+                or any(
+                    type(game_pk) is not int or game_pk <= 0 for game_pk in consumers
+                )
                 or consumers != sorted(set(consumers))
                 or seen_consumers.intersection(consumers)
                 or not isinstance(cutoffs, Mapping)
@@ -531,19 +637,13 @@ def _validate_normalized_snapshot_mapping(
                 raise ValueError("normalized snapshot pitching record identity differs")
             if derived:
                 if (
-                    record.get("disposition")
-                    != "PRESEASON_NO_CURRENT_SEASON_PITCHING"
+                    record.get("disposition") != "PRESEASON_NO_CURRENT_SEASON_PITCHING"
                     or as_of != SEASON_BOUNDARIES[season][0] - timedelta(days=1)
                 ):
-                    raise ValueError(
-                        "normalized snapshot pitching disposition differs"
-                    )
-            elif (
-                as_of < SEASON_BOUNDARIES[season][0]
-                or any(
-                    type(record.get(field)) is not int or record[field] < 0
-                    for field in _PITCHING_RECORD_NUMERIC_KEYS
-                )
+                    raise ValueError("normalized snapshot pitching disposition differs")
+            elif as_of < SEASON_BOUNDARIES[season][0] or any(
+                type(record.get(field)) is not int or record[field] < 0
+                for field in _PITCHING_RECORD_NUMERIC_KEYS
             ):
                 raise ValueError("normalized snapshot pitching metrics differ")
             prior_as_of = as_of
@@ -582,10 +682,16 @@ def _validate_normalized_snapshot_mapping(
             or not isinstance(team_hashes, list)
             or team_hashes != sorted(set(team_hashes))
             or len(team_hashes) != 1
-            or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in team_hashes)
+            or any(
+                not isinstance(item, str) or not _SHA256.fullmatch(item)
+                for item in team_hashes
+            )
             or not isinstance(venue_hashes, list)
             or venue_hashes != sorted(set(venue_hashes))
-            or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in venue_hashes)
+            or any(
+                not isinstance(item, str) or not _SHA256.fullmatch(item)
+                for item in venue_hashes
+            )
             or not isinstance(teams, list)
             or not teams
             or not isinstance(venues, list)
@@ -681,7 +787,9 @@ def _validate_normalized_snapshot_mapping(
                 or not isinstance(name, str)
                 or not name
             ):
-                raise ValueError("normalized snapshot reference timezone identity differs")
+                raise ValueError(
+                    "normalized snapshot reference timezone identity differs"
+                )
             try:
                 ZoneInfo(name)
             except ZoneInfoNotFoundError as exc:
@@ -729,7 +837,9 @@ def _validate_normalized_snapshot_mapping(
                 or type(neutral) is not bool
                 or type(alternate) is not bool
             ):
-                raise ValueError("normalized snapshot reference observation identity differs")
+                raise ValueError(
+                    "normalized snapshot reference observation identity differs"
+                )
             matches = [
                 timezone_row
                 for timezone_row in by_venue[venue_id]
@@ -737,7 +847,9 @@ def _validate_normalized_snapshot_mapping(
                 and timezone_row[3] == name
             ]
             if len(matches) != 1:
-                raise ValueError("normalized snapshot reference observation mapping differs")
+                raise ValueError(
+                    "normalized snapshot reference observation mapping differs"
+                )
             used_timezone_rows.add(matches[0])
             normalized_observations.append(
                 (venue_id, official, name, neutral, alternate)
@@ -747,16 +859,22 @@ def _validate_normalized_snapshot_mapping(
         ):
             raise ValueError("normalized snapshot reference observation order differs")
         if used_timezone_rows != set(normalized_timezone_rows):
-            raise ValueError("normalized snapshot reference contains unused timezone rows")
+            raise ValueError(
+                "normalized snapshot reference contains unused timezone rows"
+            )
         return envelope
 
     if source != "baseball_savant_statcast" or grain != "pitch":
         raise ValueError("normalized snapshot envelope identity differs")
     split_value = envelope.get("split_receipt_sha256s")
-    if not isinstance(split_value, list) or any(
-        not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
-        for digest in split_value
-    ) or len(split_value) != len(set(split_value)):
+    if (
+        not isinstance(split_value, list)
+        or any(
+            not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+            for digest in split_value
+        )
+        or len(split_value) != len(set(split_value))
+    ):
         raise ValueError("normalized snapshot split receipt hashes differ")
 
     payload_value = envelope.get("payload")
@@ -805,7 +923,9 @@ def _validate_normalized_snapshot_mapping(
     ):
         raise ValueError("normalized snapshot Statcast season or coverage differs")
     canonical_children = validate_statcast_child_coverage(coverage, children)
-    if [item.get("query_sidecar_sha256") for item in canonical_children] != child_hashes:
+    if [
+        item.get("query_sidecar_sha256") for item in canonical_children
+    ] != child_hashes:
         raise ValueError("normalized snapshot Statcast child hashes differ")
     if any(
         set(item)
@@ -902,9 +1022,7 @@ def _enumerate_completed_query_graph(
     if not root_batch_ids or child_batch_ids != set(batch_ids) - root_batch_ids:
         raise ValueError("terminal split batch population differs")
     batch_depth = {batch_id: 0 for batch_id in root_batch_ids}
-    receipt_by_child = {
-        receipt.child_batch_id: receipt for receipt in ordered_receipts
-    }
+    receipt_by_child = {receipt.child_batch_id: receipt for receipt in ordered_receipts}
     if set(receipt_by_child) != child_batch_ids:
         raise ValueError("terminal split child batches differ")
 
@@ -932,12 +1050,9 @@ def _enumerate_completed_query_graph(
         child_query_ids = tuple(
             logical_query_id(query) for query in child_batch.queries
         )
-        if (
-            receipt.child_query_ids != child_query_ids
-            or any(
-                query.parent_query_id != receipt.parent_query_id
-                for query in child_batch.queries
-            )
+        if receipt.child_query_ids != child_query_ids or any(
+            query.parent_query_id != receipt.parent_query_id
+            for query in child_batch.queries
         ):
             raise ValueError("terminal split ordered children differ")
         batch_depth[child_batch_id] = receipt.depth
@@ -1103,8 +1218,7 @@ def _verified_sidecar(record: VerifiedQueryRecord) -> dict[str, object]:
     query_id = logical_query_id(record.query)
     if (
         record.query_id != query_id
-        or record.storage_mode
-        not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
+        or record.storage_mode not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
         or record.retained_raw_bytes is not None
         or not isinstance(record.query_sidecar_bytes, bytes)
         or not record.query_sidecar_bytes.endswith(b"\n")
@@ -1141,8 +1255,7 @@ def _verified_pitching_sidecar(
     if (
         query.source != "mlb_stats_pitching"
         or query.grain != "season_d1_league_pitching_reference"
-        or query.endpoint
-        != "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+        or query.endpoint != "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
         or query.requested_range.get("reason")
         != "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
         or record.query_id != query_id
@@ -1198,8 +1311,7 @@ def _normalized_snapshot(
             not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
             for digest in sidecar_hashes
         )
-        or {record.query_sidecar_sha256 for record in records}
-        != set(sidecar_hashes)
+        or {record.query_sidecar_sha256 for record in records} != set(sidecar_hashes)
     ):
         raise ValueError("game snapshot logical query or sidecar population differs")
     envelope: dict[str, object] = {
@@ -1287,7 +1399,11 @@ def _build_game_normalized_snapshots(
                 raise ValueError("game snapshot boxscore gamePk differs")
         else:
             raise ValueError("game snapshot query endpoint differs")
-        if isinstance(season, bool) or not isinstance(season, int) or season not in by_season:
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in by_season
+        ):
             raise ValueError("game snapshot requires exact 2018-2024 seasons")
         if record.query_id in seen_query_ids:
             raise ValueError("game snapshot query population is duplicated")
@@ -1326,9 +1442,7 @@ def _build_game_normalized_snapshots(
                 record.query_sidecar_bytes,
                 record.query_sidecar_sha256,
             )
-        payload = dict(
-            recompute_game_evidence_snapshot([schedule_sidecar], boxscores)
-        )
+        payload = dict(recompute_game_evidence_snapshot([schedule_sidecar], boxscores))
         inputs = tuple(record for record, _sidecar in season_records)
         snapshot_inputs[season] = inputs
         payloads.append(payload)
@@ -1340,9 +1454,11 @@ def _build_game_normalized_snapshots(
     ):
         raise ValueError("schedule and timezone authority binding differs")
     season_sources = schedule_payload.get("season_sources")
-    if isinstance(season_sources, (str, bytes)) or not isinstance(
-        season_sources, Sequence
-    ) or len(season_sources) != len(_GAME_SEASONS):
+    if (
+        isinstance(season_sources, (str, bytes))
+        or not isinstance(season_sources, Sequence)
+        or len(season_sources) != len(_GAME_SEASONS)
+    ):
         raise ValueError("schedule inventory seven-season authority differs")
     for season, value in zip(_GAME_SEASONS, season_sources, strict=True):
         record = schedule_records[season]
@@ -1361,9 +1477,7 @@ def _build_game_normalized_snapshots(
     expected_schedule_hashes = sorted(
         record.query_sidecar_sha256 for record in schedule_records.values()
     )
-    candidate_schedule_hashes = timezone_gate.candidate.get(
-        "schedule_sidecar_sha256s"
-    )
+    candidate_schedule_hashes = timezone_gate.candidate.get("schedule_sidecar_sha256s")
     if list(candidate_schedule_hashes or ()) != expected_schedule_hashes:
         raise ValueError("timezone schedule sidecar authority differs")
     validate_timezone_mapping(timezone_gate.mapping, schedule_sidecars)
@@ -1373,9 +1487,9 @@ def _build_game_normalized_snapshots(
         not isinstance(game_payload, dict)
         or set(game_payload) != _GAME_INVENTORY_KEYS
         or (
-        game_payload.get("artifact_kind") != "GAME_EVIDENCE_INVENTORY"
-        or game_payload.get("schema_version") != 1
-        or game_payload.get("run_id") != run_id
+            game_payload.get("artifact_kind") != "GAME_EVIDENCE_INVENTORY"
+            or game_payload.get("schema_version") != 1
+            or game_payload.get("run_id") != run_id
         )
     ):
         raise ValueError("game inventory identity differs")
@@ -1398,31 +1512,33 @@ def _build_game_normalized_snapshots(
             for value in query_batches
         )
         != timezone_gate.query_batch_ids
-        or tuple(
-            _binding_sha256(value, "game query batch")
-            for value in query_batches
-        )
+        or tuple(_binding_sha256(value, "game query batch") for value in query_batches)
         != timezone_gate.query_batch_sha256s
     ):
         raise ValueError("game inventory query batch authority differs")
-    if _binding_sha256(
-        game_payload.get("schedule_inventory"), "game schedule inventory"
-    ) != schedule_inventory.sha256:
+    if (
+        _binding_sha256(
+            game_payload.get("schedule_inventory"), "game schedule inventory"
+        )
+        != schedule_inventory.sha256
+    ):
         raise ValueError("game schedule inventory authority differs")
     timezone_binding = game_payload.get("timezone_gate")
     if not isinstance(timezone_binding, Mapping):
         raise ValueError("game timezone authority differs")
     reviews = timezone_binding.get("reviews")
-    if isinstance(reviews, (str, bytes)) or not isinstance(reviews, Sequence) or len(reviews) != 2:
+    if (
+        isinstance(reviews, (str, bytes))
+        or not isinstance(reviews, Sequence)
+        or len(reviews) != 2
+    ):
         raise ValueError("game timezone review authority differs")
     if (
         _binding_sha256(timezone_binding.get("candidate"), "game timezone candidate")
         != timezone_gate.candidate_sha256
         or _binding_sha256(timezone_binding.get("mapping"), "game timezone mapping")
         != timezone_gate.mapping_sha256
-        or tuple(
-            _binding_sha256(value, "game timezone review") for value in reviews
-        )
+        or tuple(_binding_sha256(value, "game timezone review") for value in reviews)
         != timezone_gate.review_sha256s
         or _binding_sha256(timezone_binding.get("seal"), "game timezone seal")
         != timezone_gate.seal_sha256
@@ -1443,9 +1559,7 @@ def _build_game_normalized_snapshots(
     )
     played_games = [game for game in expected_games if game["played"] is True]
     starter_ids = {
-        starter_id
-        for game in played_games
-        for starter_id in game["actual_starter_ids"]
+        starter_id for game in played_games for starter_id in game["actual_starter_ids"]
     }
     expected_counts = {
         "game_count": len(expected_games),
@@ -1460,8 +1574,7 @@ def _build_game_normalized_snapshots(
         or set(counts) != _GAME_COUNT_KEYS
         or dict(counts) != expected_counts
         or game_payload.get("games") != expected_games
-        or game_payload.get("source_query_sidecar_sha256s")
-        != expected_sidecar_hashes
+        or game_payload.get("source_query_sidecar_sha256s") != expected_sidecar_hashes
     ):
         raise ValueError("game inventory normalized population differs")
 
@@ -1497,8 +1610,7 @@ def _validate_history_snapshot_lineage(
         game_snapshot.source != "mlb_schedule_game_feed"
         or game_snapshot.grain != "season_game_evidence_snapshot"
         or game_validated != game_mapping
-        or game_snapshot.canonical_bytes
-        != canonical_json_bytes(game_mapping) + b"\n"
+        or game_snapshot.canonical_bytes != canonical_json_bytes(game_mapping) + b"\n"
         or game_snapshot.sha256
         != hashlib.sha256(game_snapshot.canonical_bytes).hexdigest()
         or history_snapshot.source != "prior_schedule_history"
@@ -1571,9 +1683,7 @@ def _history_normalized_snapshot(
         grain="verified_game_projection",
         status="READY",
         logical_query_ids=game_snapshot.logical_query_ids,
-        source_query_sidecar_sha256s=(
-            game_snapshot.source_query_sidecar_sha256s
-        ),
+        source_query_sidecar_sha256s=(game_snapshot.source_query_sidecar_sha256s),
         split_receipt_sha256s=(),
         payload=frozen_payload,
         canonical_bytes=contents,
@@ -1596,7 +1706,9 @@ def _build_history_normalized_snapshots(
     game_by_season: dict[int, NormalizedSnapshot] = {}
     seen_game_pks: set[int] = set()
     for snapshot in game_snapshots:
-        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        mapping = (
+            snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        )
         if (
             not isinstance(snapshot, NormalizedSnapshot)
             or snapshot.run_id != run_id
@@ -1607,8 +1719,7 @@ def _build_history_normalized_snapshots(
             or mapping is None
             or _validate_normalized_snapshot_mapping(mapping) != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
-            or snapshot.sha256
-            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+            or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
             raise ValueError("history game snapshot authority differs")
         opening, closing = SEASON_BOUNDARIES[snapshot.season]
@@ -1625,9 +1736,7 @@ def _build_history_normalized_snapshots(
                 or game.get("season_start_date") != opening.isoformat()
                 or not opening <= official <= closing
             ):
-                raise ValueError(
-                    "history gamePk or frozen season boundary differs"
-                )
+                raise ValueError("history gamePk or frozen season boundary differs")
             seen_game_pks.add(game_pk)
         game_by_season[snapshot.season] = snapshot
     if set(game_by_season) != set(_GAME_SEASONS):
@@ -1640,9 +1749,7 @@ def _build_history_normalized_snapshots(
             game_snapshot.payload,
             source_snapshot_sha256=game_snapshot.sha256,
         )
-        snapshots.append(
-            _history_normalized_snapshot(run_id, game_snapshot, payload)
-        )
+        snapshots.append(_history_normalized_snapshot(run_id, game_snapshot, payload))
     return tuple(snapshots)
 
 
@@ -1654,9 +1761,7 @@ def _statcast_normalized_snapshot(
     payload: Mapping[str, object],
 ) -> NormalizedSnapshot:
     query_ids = tuple(sorted(record.query_id for record in records))
-    sidecar_hashes = tuple(
-        sorted(record.query_sidecar_sha256 for record in records)
-    )
+    sidecar_hashes = tuple(sorted(record.query_sidecar_sha256 for record in records))
     receipts = tuple(receipt_sha256s)
     if (
         not query_ids
@@ -1787,9 +1892,9 @@ def _build_statcast_normalized_snapshots(
         logical_query_id(query): query for query in graph.split_parent_queries
     }
     if (
-        len(completed) != sum(
-            query.source == "baseball_savant_statcast"
-            and query.grain == "pitch"
+        len(completed)
+        != sum(
+            query.source == "baseball_savant_statcast" and query.grain == "pitch"
             for query in graph.completed_queries
         )
         or any(
@@ -1885,7 +1990,9 @@ def _build_statcast_normalized_snapshots(
                 graph_query_by_id[query_id] for query_id in receipt.child_query_ids
             )
             if ordered != bisect_statcast_query(parent):
-                raise ValueError("Statcast split children differ from canonical bisection")
+                raise ValueError(
+                    "Statcast split children differ from canonical bisection"
+                )
 
     root_for_query: dict[str, str] = {}
     for query_id, query in statcast_graph.items():
@@ -1942,8 +2049,7 @@ def _build_statcast_normalized_snapshots(
             != snapshot.as_mapping()
             or snapshot.canonical_bytes
             != canonical_json_bytes(snapshot.as_mapping()) + b"\n"
-            or snapshot.sha256
-            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+            or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
             raise ValueError("Statcast game snapshot authority differs")
         game_by_season[snapshot.season] = snapshot
@@ -1952,7 +2058,8 @@ def _build_statcast_normalized_snapshots(
                 continue
             game_pk = game["game_pk"]  # type: ignore[index]
             official = _canonical_day(
-                game["official_date"], "Statcast played game official_date"  # type: ignore[index]
+                game["official_date"],
+                "Statcast played game official_date",  # type: ignore[index]
             )
             matches = [
                 root_id
@@ -2020,9 +2127,7 @@ def _pitching_normalized_snapshot(
     payload: Mapping[str, object],
 ) -> NormalizedSnapshot:
     query_ids = tuple(sorted(record.query_id for record in records))
-    sidecar_hashes = tuple(
-        sorted(record.query_sidecar_sha256 for record in records)
-    )
+    sidecar_hashes = tuple(sorted(record.query_sidecar_sha256 for record in records))
     if (
         not query_ids
         or len(query_ids) != len(set(query_ids))
@@ -2104,9 +2209,7 @@ def _build_pitching_normalized_snapshots(
             projection[query_id] = query
         return projection
 
-    expected_by_id = pitching_projection(
-        graph.completed_queries, "completed-query"
-    )
+    expected_by_id = pitching_projection(graph.completed_queries, "completed-query")
     if not expected_by_id:
         raise ValueError("pitching terminal graph population is empty")
 
@@ -2114,9 +2217,7 @@ def _build_pitching_normalized_snapshots(
     split_parent_population = pitching_projection(
         graph.split_parent_queries, "split-parent"
     )
-    split_leaf_population = pitching_projection(
-        graph.split_leaf_queries, "split-leaf"
-    )
+    split_leaf_population = pitching_projection(graph.split_leaf_queries, "split-leaf")
     if root_population != expected_by_id:
         raise ValueError("pitching root/completed query population differs")
     if split_parent_population or split_leaf_population:
@@ -2140,7 +2241,9 @@ def _build_pitching_normalized_snapshots(
     expected_consumers: dict[tuple[int, date], list[int]] = {}
     seen_game_pks: set[int] = set()
     for snapshot in game_snapshots:
-        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        mapping = (
+            snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        )
         if (
             not isinstance(snapshot, NormalizedSnapshot)
             or snapshot.run_id != run_id
@@ -2150,8 +2253,7 @@ def _build_pitching_normalized_snapshots(
             or mapping is None
             or _validate_normalized_snapshot_mapping(mapping) != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
-            or snapshot.sha256
-            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+            or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
             raise ValueError("pitching game snapshot authority differs")
         game_by_season[snapshot.season] = snapshot
@@ -2194,10 +2296,7 @@ def _build_pitching_normalized_snapshots(
             or query.parent_query_id is not None
             or query.expected_media_type != "application/json"
             or query.parser_version != "v5.2.1"
-            or (
-                query.endpoint
-                == "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
-            )
+            or (query.endpoint == "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING")
             != (record.storage_mode == "DERIVED_DISPOSITION")
         ):
             raise ValueError("pitching verified record population differs")
@@ -2214,14 +2313,10 @@ def _build_pitching_normalized_snapshots(
         consumers = expected_consumers.get(key)
         if consumers is None or key in seen_keys:
             raise ValueError("pitching query consumer partition differs")
-        cutoffs = {
-            str(game_pk): cutoff.isoformat() for game_pk in consumers
-        }
+        cutoffs = {str(game_pk): cutoff.isoformat() for game_pk in consumers}
         season_open = SEASON_BOUNDARIES[season][0]
         if cutoff < season_open:
-            expected_endpoint = (
-                "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
-            )
+            expected_endpoint = "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
             expected_parameters: dict[str, object] = {}
             expected_requested = {
                 "season": season,
@@ -2271,9 +2366,7 @@ def _build_pitching_normalized_snapshots(
         record_by_id[query_id] = (record, sidecar)
         grouped[season].append((cutoff, record, sidecar))
         seen_keys.add(key)
-    if set(record_by_id) != set(expected_by_id) or seen_keys != set(
-        expected_consumers
-    ):
+    if set(record_by_id) != set(expected_by_id) or seen_keys != set(expected_consumers):
         raise ValueError("pitching READY record coverage differs")
 
     snapshots: list[NormalizedSnapshot] = []
@@ -2288,6 +2381,419 @@ def _build_pitching_normalized_snapshots(
                 season,
                 [record for _cutoff, record, _sidecar in ordered],
                 payload,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _career_normalized_snapshot(
+    run_id: str,
+    season: int,
+    payload: Mapping[str, object],
+    record_by_sidecar_hash: Mapping[str, VerifiedQueryRecord],
+) -> NormalizedSnapshot:
+    rows = payload.get("records")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("career normalized snapshot records are missing")
+    lineage_hashes = sorted(
+        {
+            digest
+            for row in rows
+            for digest in (
+                row["baseline_query_sidecar_sha256"],
+                *row["statcast_ready_leaf_sidecar_sha256s"],
+            )
+        }
+    )
+    if any(digest not in record_by_sidecar_hash for digest in lineage_hashes):
+        raise ValueError("career normalized snapshot source lineage is unknown")
+    lineage_records = [record_by_sidecar_hash[digest] for digest in lineage_hashes]
+    query_ids = tuple(sorted(record.query_id for record in lineage_records))
+    sidecar_hashes = tuple(lineage_hashes)
+    split_hashes = tuple(
+        sorted(
+            {digest for row in rows for digest in row["statcast_split_receipt_sha256s"]}
+        )
+    )
+    if len(query_ids) != len(set(query_ids)) or len(query_ids) != len(sidecar_hashes):
+        raise ValueError("career normalized snapshot identity is duplicated")
+    envelope: dict[str, object] = {
+        "grain": "player_career_batters_faced_reference",
+        "logical_query_ids": list(query_ids),
+        "payload": _plain_json(payload),
+        "run_id": run_id,
+        "schema_version": 1,
+        "season": season,
+        "source": "mlb_stats_pitcher_bf",
+        "source_query_sidecar_sha256s": list(sidecar_hashes),
+        "split_receipt_sha256s": list(split_hashes),
+        "status": "READY",
+    }
+    envelope = _validate_normalized_snapshot_mapping(envelope)
+    contents = canonical_json_bytes(envelope) + b"\n"
+    digest = hashlib.sha256(contents).hexdigest()
+    if digest in set(query_ids) | set(sidecar_hashes) | set(split_hashes):
+        raise ValueError("normalized snapshot hash collides with a component hash")
+    frozen_payload = _freeze_json(payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise AssertionError("normalized snapshot payload must freeze to a mapping")
+    return NormalizedSnapshot(
+        schema_version=1,
+        run_id=run_id,
+        season=season,
+        source="mlb_stats_pitcher_bf",
+        grain="player_career_batters_faced_reference",
+        status="READY",
+        logical_query_ids=query_ids,
+        source_query_sidecar_sha256s=sidecar_hashes,
+        split_receipt_sha256s=split_hashes,
+        payload=frozen_payload,
+        canonical_bytes=contents,
+        sha256=digest,
+    )
+
+
+def _validate_career_terminal_graph_shape(graph: _TerminalQueryGraph) -> None:
+    query_fields = (
+        ("completed_queries", graph.completed_queries),
+        ("root_queries", graph.root_queries),
+        ("split_parent_queries", graph.split_parent_queries),
+        ("split_leaf_queries", graph.split_leaf_queries),
+    )
+    for label, queries in query_fields:
+        if not isinstance(queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in queries
+        ):
+            raise TypeError(f"career terminal graph {label} differs")
+
+    if not isinstance(graph.statcast_root_batch, QueryBatch):
+        raise TypeError("career terminal graph Statcast root batch differs")
+    if not isinstance(graph.query_batches, tuple) or any(
+        not isinstance(batch, QueryBatch) for batch in graph.query_batches
+    ):
+        raise TypeError("career terminal graph query_batches differs")
+    for batch in (graph.statcast_root_batch, *graph.query_batches):
+        if not isinstance(batch.queries, tuple) or any(
+            not isinstance(query, LogicalQuery) for query in batch.queries
+        ):
+            raise TypeError("career terminal graph batch queries differ")
+
+    if not isinstance(graph.split_receipts, tuple) or any(
+        not isinstance(receipt, SplitReceipt) for receipt in graph.split_receipts
+    ):
+        raise TypeError("career terminal graph split_receipts differs")
+
+
+def _build_career_bf_normalized_snapshots(
+    run_id: str,
+    records: Sequence[VerifiedQueryRecord],
+    graph: _TerminalQueryGraph,
+    game_snapshots: Sequence[NormalizedSnapshot],
+) -> tuple[NormalizedSnapshot, ...]:
+    """Build seven snapshots from externally sealed records with internal rebinding.
+
+    A self-consistent ``VerifiedQueryRecord`` is assumed externally sealed by the
+    acquisition checkpoint. This pure builder revalidates all internal bindings,
+    but cannot identify a semantic forgery that has also been re-signed upstream.
+    """
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("career normalized snapshot run_id differs")
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise TypeError("career normalized snapshot records must be a sequence")
+    if not isinstance(graph, _TerminalQueryGraph):
+        raise TypeError("career terminal query graph authority differs")
+    _validate_career_terminal_graph_shape(graph)
+    if isinstance(game_snapshots, (str, bytes)) or not isinstance(
+        game_snapshots, Sequence
+    ):
+        raise TypeError("career game snapshots must be a sequence")
+
+    def projection(
+        queries: Sequence[LogicalQuery], source: str, grain: str, label: str
+    ) -> dict[str, LogicalQuery]:
+        result: dict[str, LogicalQuery] = {}
+        for query in queries:
+            relevant = query.source == source or query.grain == grain
+            if not relevant:
+                continue
+            if query.source != source or query.grain != grain:
+                raise ValueError(f"career {label} source or grain differs")
+            query_id = logical_query_id(query)
+            if query_id in result:
+                raise ValueError(f"career {label} population is duplicated")
+            result[query_id] = query
+        return result
+
+    career_completed = projection(
+        graph.completed_queries,
+        "mlb_stats_pitcher_bf",
+        "player_career_batters_faced_reference",
+        "completed-query",
+    )
+    if not career_completed:
+        raise ValueError("career terminal graph population is empty")
+    if (
+        projection(
+            graph.root_queries,
+            "mlb_stats_pitcher_bf",
+            "player_career_batters_faced_reference",
+            "root-query",
+        )
+        != career_completed
+    ):
+        raise ValueError("career root/completed query population differs")
+    if projection(
+        graph.split_parent_queries,
+        "mlb_stats_pitcher_bf",
+        "player_career_batters_faced_reference",
+        "split-parent",
+    ) or projection(
+        graph.split_leaf_queries,
+        "mlb_stats_pitcher_bf",
+        "player_career_batters_faced_reference",
+        "split-leaf",
+    ):
+        raise ValueError("career baseline queries cannot be split")
+    career_ids = set(career_completed)
+    if any(
+        receipt.parent_query_id in career_ids
+        or set(receipt.child_query_ids).intersection(career_ids)
+        for receipt in graph.split_receipts
+    ):
+        raise ValueError("career baseline query appears in Statcast split lineage")
+    batch_career = projection(
+        tuple(query for batch in graph.query_batches for query in batch.queries),
+        "mlb_stats_pitcher_bf",
+        "player_career_batters_faced_reference",
+        "query-batch",
+    )
+    if batch_career != career_completed:
+        raise ValueError("career terminal query batch population differs")
+
+    statcast_completed = projection(
+        graph.completed_queries,
+        "baseball_savant_statcast",
+        "pitch",
+        "Statcast completed-query",
+    )
+    if not statcast_completed:
+        raise ValueError("career Statcast terminal graph population is empty")
+    statcast_roots = projection(
+        graph.root_queries,
+        "baseball_savant_statcast",
+        "pitch",
+        "Statcast root-query",
+    )
+    statcast_parents = projection(
+        graph.split_parent_queries,
+        "baseball_savant_statcast",
+        "pitch",
+        "Statcast split-parent",
+    )
+    statcast_leaves = projection(
+        graph.split_leaf_queries,
+        "baseball_savant_statcast",
+        "pitch",
+        "Statcast split-leaf",
+    )
+    receipt_parent_ids = {receipt.parent_query_id for receipt in graph.split_receipts}
+    receipt_terminal_child_ids = {
+        child_id
+        for receipt in graph.split_receipts
+        for child_id in receipt.child_query_ids
+        if child_id not in receipt_parent_ids
+    }
+    if set(statcast_parents) != receipt_parent_ids:
+        raise ValueError("career Statcast split-parent classification differs")
+    if set(statcast_leaves) != receipt_terminal_child_ids:
+        raise ValueError("career Statcast split-leaf classification differs")
+    if (
+        set(statcast_roots).intersection(statcast_leaves)
+        or set(statcast_completed) != set(statcast_roots) | set(statcast_leaves)
+    ):
+        raise ValueError("career Statcast terminal classification differs")
+    statcast_batch_population = projection(
+        tuple(query for batch in graph.query_batches for query in batch.queries),
+        "baseball_savant_statcast",
+        "pitch",
+        "Statcast query-batch",
+    )
+    if set(statcast_batch_population) != (
+        set(statcast_roots) | set(statcast_parents) | set(statcast_leaves)
+    ):
+        raise ValueError("career Statcast query-batch population differs")
+
+    game_by_season: dict[int, NormalizedSnapshot] = {}
+    game_season: dict[int, int] = {}
+    expected_consumers: dict[tuple[int, str], dict[int, date]] = {}
+    for snapshot in game_snapshots:
+        mapping = (
+            snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        )
+        if (
+            not isinstance(snapshot, NormalizedSnapshot)
+            or snapshot.run_id != run_id
+            or snapshot.source != "mlb_schedule_game_feed"
+            or snapshot.grain != "season_game_evidence_snapshot"
+            or snapshot.season in game_by_season
+            or mapping is None
+            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
+            or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+        ):
+            raise ValueError("career game snapshot authority differs")
+        game_by_season[snapshot.season] = snapshot
+        played_count = 0
+        for game in mapping["payload"]["games"]:  # type: ignore[index]
+            game_pk = game.get("game_pk")
+            if type(game_pk) is not int or game_pk <= 0 or game_pk in game_season:
+                raise ValueError("career game population is duplicated")
+            game_season[game_pk] = snapshot.season
+            if game.get("played") is not True:
+                continue
+            played_count += 1
+            starters = game.get("actual_starter_ids")
+            if (
+                not isinstance(starters, list)
+                or len(starters) != 2
+                or len(set(starters)) != 2
+                or any(
+                    type(pitcher_id) is not int or pitcher_id <= 0
+                    for pitcher_id in starters
+                )
+            ):
+                raise ValueError("career played game requires two distinct starters")
+            official = _canonical_day(
+                game.get("official_date"), "career consumer official date"
+            )
+            cutoff = official - timedelta(days=1)
+            inclusive_end = (
+                "2017-12-31" if cutoff <= date(2021, 12, 31) else "2021-12-31"
+            )
+            for pitcher_id in starters:
+                expected_consumers.setdefault((pitcher_id, inclusive_end), {})[
+                    game_pk
+                ] = cutoff
+        if played_count == 0:
+            raise ValueError("career requires played consumers in every season")
+    if set(game_by_season) != set(_GAME_SEASONS):
+        raise ValueError("career requires seven verified game snapshots")
+
+    career_records: dict[str, tuple[VerifiedQueryRecord, dict[str, object]]] = {}
+    statcast_records: dict[str, tuple[VerifiedQueryRecord, dict[str, object]]] = {}
+    record_by_sidecar_hash: dict[str, VerifiedQueryRecord] = {}
+    for record in records:
+        if not isinstance(record, VerifiedQueryRecord):
+            raise TypeError("career records must be VerifiedQueryRecord values")
+        if record.query.source == "mlb_stats_pitcher_bf":
+            expected = career_completed
+            destination = career_records
+        elif record.query.source == "baseball_savant_statcast":
+            expected = statcast_completed
+            destination = statcast_records
+        else:
+            raise ValueError("career verified record source population differs")
+        sidecar = _verified_sidecar(record)
+        if (
+            record.query_id not in expected
+            or expected[record.query_id] != record.query
+            or record.query_id in destination
+            or record.query_sidecar_sha256 in record_by_sidecar_hash
+        ):
+            raise ValueError("career verified record population differs")
+        destination[record.query_id] = (record, sidecar)
+        record_by_sidecar_hash[record.query_sidecar_sha256] = record
+    if set(career_records) != set(career_completed) or set(statcast_records) != set(
+        statcast_completed
+    ):
+        raise ValueError("career READY record coverage differs")
+
+    observed_partitions: set[tuple[int, str]] = set()
+    for query_id, (record, sidecar) in career_records.items():
+        query = record.query
+        requested = dict(query.requested_range)
+        pitcher_id = requested.get("pitcher_id")
+        inclusive_end = requested.get("inclusive_end")
+        if (
+            type(pitcher_id) is not int
+            or pitcher_id <= 0
+            or not isinstance(inclusive_end, str)
+        ):
+            raise ValueError("career baseline query identity differs")
+        key = (pitcher_id, inclusive_end)
+        consumers = expected_consumers.get(key)
+        if consumers is None or key in observed_partitions:
+            raise ValueError("career baseline consumer partition differs")
+        consuming_game_pks = sorted(consumers)
+        cutoff_dates = {
+            str(game_pk): consumers[game_pk].isoformat()
+            for game_pk in consuming_game_pks
+        }
+        expected_requested = {
+            "consumer_cutoff_dates": cutoff_dates,
+            "consuming_game_pks": consuming_game_pks,
+            "pitcher_id": pitcher_id,
+            "inclusive_end": inclusive_end,
+        }
+        expected_parameters = {
+            "stats": "byDateRange",
+            "group": "pitching",
+            "gameType": "R",
+            "sportIds": 1,
+            "startDate": "1876-01-01",
+            "endDate": inclusive_end,
+        }
+        semantics = sidecar.get("semantics")
+        if (
+            query.endpoint
+            != f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or query.parent_query_id is not None
+            or dict(query.parameters) != expected_parameters
+            or requested != expected_requested
+            or not isinstance(semantics, Mapping)
+            or semantics.get("pitcher_id") != pitcher_id
+            or semantics.get("inclusive_end_date") != inclusive_end
+            or semantics.get("consuming_game_pks") != consuming_game_pks
+            or semantics.get("consumer_cutoff_dates") != cutoff_dates
+        ):
+            raise ValueError("career baseline query/sidecar binding differs")
+        observed_partitions.add(key)
+    if observed_partitions != set(expected_consumers):
+        raise ValueError("career baseline consumer coverage differs")
+
+    payload = recompute_career_bf_snapshot(
+        [sidecar for _record, sidecar in career_records.values()],
+        statcast_ready_leaf_sidecars=[
+            sidecar for _record, sidecar in statcast_records.values()
+        ],
+        statcast_root_queries=graph.statcast_root_batch.queries,
+        statcast_split_receipts=graph.split_receipts,
+    )
+    rows = payload.get("records")
+    if not isinstance(rows, list):
+        raise ValueError("career aggregate records differ")
+    expected_keys = {
+        (pitcher_id, game_pk)
+        for (pitcher_id, _inclusive_end), consumers in expected_consumers.items()
+        for game_pk in consumers
+    }
+    actual_keys = {(row["pitcher_id"], row["game_pk"]) for row in rows}
+    if actual_keys != expected_keys or len(actual_keys) != len(rows):
+        raise ValueError("career aggregate consumer population differs")
+
+    snapshots: list[NormalizedSnapshot] = []
+    for season in _GAME_SEASONS:
+        season_rows = [row for row in rows if game_season[row["game_pk"]] == season]
+        season_payload = {
+            "schema_version": 1,
+            "grain": "player_career_batters_faced_reference",
+            "records": season_rows,
+        }
+        snapshots.append(
+            _career_normalized_snapshot(
+                run_id, season, season_payload, record_by_sidecar_hash
             )
         )
     return tuple(snapshots)
@@ -2312,7 +2818,9 @@ def _verified_reference_record(
         != hashlib.sha256(record.query_sidecar_bytes).hexdigest()
     ):
         raise ValueError("reference retained raw record binding differs")
-    expected = query_sidecar(raw, record.query, recompute_query_sidecar(record.query, raw))
+    expected = query_sidecar(
+        raw, record.query, recompute_query_sidecar(record.query, raw)
+    )
     expected_bytes = canonical_json_bytes(expected) + b"\n"
     if record.query_sidecar_bytes != expected_bytes:
         raise ValueError("reference query sidecar recomputation differs")
@@ -2326,9 +2834,7 @@ def _reference_normalized_snapshot(
     payload: Mapping[str, object],
 ) -> NormalizedSnapshot:
     query_ids = tuple(sorted(record.query_id for record in records))
-    sidecar_hashes = tuple(
-        sorted(record.query_sidecar_sha256 for record in records)
-    )
+    sidecar_hashes = tuple(sorted(record.query_sidecar_sha256 for record in records))
     if (
         not query_ids
         or len(query_ids) != len(set(query_ids))
@@ -2409,8 +2915,7 @@ def _validate_reference_terminal_graph_shape(
             raise TypeError("reference terminal graph batch queries differ")
 
     if not isinstance(graph.split_receipts, tuple) or any(
-        not isinstance(receipt, SplitReceipt)
-        for receipt in graph.split_receipts
+        not isinstance(receipt, SplitReceipt) for receipt in graph.split_receipts
     ):
         raise TypeError("reference terminal graph split_receipts differs")
 
@@ -2479,9 +2984,7 @@ def _build_reference_normalized_snapshots(
         )
     ):
         raise ValueError("reference timezone gate batch population differs")
-    gate_hash_by_id = dict(
-        zip(gate_batch_ids, gate_batch_hashes, strict=True)
-    )
+    gate_hash_by_id = dict(zip(gate_batch_ids, gate_batch_hashes, strict=True))
     gate_batches = [
         batch for batch in graph.query_batches if batch.batch_id in gate_hash_by_id
     ]
@@ -2494,8 +2997,7 @@ def _build_reference_normalized_snapshots(
         len(gate_batches) != 2
         or {batch.batch_id for batch in gate_batches} != set(gate_batch_ids)
         or len(canonical_stage_batches) != 2
-        or {batch.batch_id for batch in canonical_stage_batches}
-        != set(gate_batch_ids)
+        or {batch.batch_id for batch in canonical_stage_batches} != set(gate_batch_ids)
     ):
         raise ValueError("reference graph/gate batch population differs")
     batches_by_stage: dict[str, QueryBatch] = {}
@@ -2516,8 +3018,7 @@ def _build_reference_normalized_snapshots(
             static_batch.queries,
         )
         != static_batch
-        or _make_batch(batch.stage, batch.derived_from_sha256, batch.queries)
-        != batch
+        or _make_batch(batch.stage, batch.derived_from_sha256, batch.queries) != batch
     ):
         raise ValueError("reference canonical gate batch authority differs")
     for authenticated_batch in (static_batch, batch):
@@ -2575,10 +3076,7 @@ def _build_reference_normalized_snapshots(
         tuple(query for batch in graph.query_batches for query in batch.queries),
         "query-batch",
     )
-    if (
-        batch_population != expected_by_id
-        or relevant_batches != [batch]
-    ):
+    if batch_population != expected_by_id or relevant_batches != [batch]:
         raise ValueError("reference terminal query batch population differs")
 
     protected_batch_lineage = set(gate_batch_ids)
@@ -2595,8 +3093,7 @@ def _build_reference_normalized_snapshots(
     if any(
         receipt.parent_query_id in protected_query_by_id
         or any(
-            child_id in protected_query_by_id
-            for child_id in receipt.child_query_ids
+            child_id in protected_query_by_id for child_id in receipt.child_query_ids
         )
         or receipt.parent_batch_id in protected_batch_lineage
         or receipt.child_batch_id in protected_batch_lineage
@@ -2618,16 +3115,14 @@ def _build_reference_normalized_snapshots(
         season: [] for season in _GAME_SEASONS
     }
     observed: dict[tuple[int, str], tuple[bool, bool]] = {}
-    observed_teams: dict[int, set[int]] = {
-        season: set() for season in _GAME_SEASONS
-    }
-    observed_venues: dict[int, set[int]] = {
-        season: set() for season in _GAME_SEASONS
-    }
+    observed_teams: dict[int, set[int]] = {season: set() for season in _GAME_SEASONS}
+    observed_venues: dict[int, set[int]] = {season: set() for season in _GAME_SEASONS}
     schedule_hashes: set[str] = set()
     seen_game_pks: set[int] = set()
     for snapshot in game_snapshots:
-        mapping = snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        mapping = (
+            snapshot.as_mapping() if isinstance(snapshot, NormalizedSnapshot) else None
+        )
         if (
             not isinstance(snapshot, NormalizedSnapshot)
             or snapshot.run_id != run_id
@@ -2637,8 +3132,7 @@ def _build_reference_normalized_snapshots(
             or mapping is None
             or _validate_normalized_snapshot_mapping(mapping) != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
-            or snapshot.sha256
-            != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+            or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
             raise ValueError("reference game snapshot authority differs")
         game_by_season[snapshot.season] = snapshot
@@ -2719,8 +3213,7 @@ def _build_reference_normalized_snapshots(
                 type(season) is not int
                 or season not in _GAME_SEASONS
                 or season in team_by_season
-                or dict(query.requested_range)
-                != {"season": season, "entity": "teams"}
+                or dict(query.requested_range) != {"season": season, "entity": "teams"}
             ):
                 raise ValueError("reference team query partition differs")
             team_by_season[season] = (record, sidecar, raw)
@@ -2764,8 +3257,7 @@ def _build_reference_normalized_snapshots(
         raise ValueError("reference timezone mapping differs from candidate")
     if (
         _canonical_file_sha256(candidate) != timezone_gate.candidate_sha256
-        or _canonical_file_sha256(dict(mapping_value))
-        != timezone_gate.mapping_sha256
+        or _canonical_file_sha256(dict(mapping_value)) != timezone_gate.mapping_sha256
         or len(reviews_value) != 2
         or len(timezone_gate.review_sha256s) != 2
         or _canonical_file_sha256(dict(seal_value)) != timezone_gate.seal_sha256
@@ -2792,9 +3284,7 @@ def _build_reference_normalized_snapshots(
         review_paths,
         strict=True,
     ):
-        review = _timezone_review_object(
-            canonical_json_bytes(review_value) + b"\n"
-        )
+        review = _timezone_review_object(canonical_json_bytes(review_value) + b"\n")
         if (
             _canonical_file_sha256(review) != digest
             or review["decision"] != "APPROVED"
@@ -2893,16 +3383,13 @@ def _build_reference_normalized_snapshots(
             != sorted(str(item[0].raw_sha256) for item in selected_venues)
             or {int(row["team_id"]) for row in payload["teams"]}
             < observed_teams[season]
-            or [int(row["venue_id"]) for row in payload["venues"]]
-            != sorted(venue_ids)
+            or [int(row["venue_id"]) for row in payload["venues"]] != sorted(venue_ids)
             or payload["timezone_rows"] != selected_rows
         ):
             raise ValueError("reference seasonal aggregate authority differs")
         direct_records = [team_record] + [item[0] for item in selected_venues]
         snapshots.append(
-            _reference_normalized_snapshot(
-                run_id, season, direct_records, payload
-            )
+            _reference_normalized_snapshot(run_id, season, direct_records, payload)
         )
     return tuple(snapshots)
 
@@ -2951,9 +3438,7 @@ def _read_verified_query_record(
                 "storage_mode": "DERIVED_DISPOSITION",
             }
             if dict(verified.query_sidecar) != expected_sidecar:
-                raise ValueError(
-                    "derived query sidecar semantic recomputation differs"
-                )
+                raise ValueError("derived query sidecar semantic recomputation differs")
             raw_sha256 = None
         else:
             if published.storage_mode not in {

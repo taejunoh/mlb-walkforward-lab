@@ -183,6 +183,40 @@
       },
       "required": ["schema_version", "grain", "records", "query_sidecar_sha256s"]
     },
+    "careerRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baseline_batters_faced": {"type": "integer", "minimum": 0},
+        "baseline_inclusive_end_date": {"enum": ["2017-12-31", "2021-12-31"]},
+        "baseline_query_sidecar_sha256": {"$ref": "#/$defs/sha256"},
+        "consumer_cutoff_date": {"$ref": "#/$defs/date"},
+        "game_pk": {"$ref": "#/$defs/positiveId"},
+        "pitcher_id": {"$ref": "#/$defs/positiveId"},
+        "statcast_ready_leaf_sidecar_sha256s": {
+          "type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true
+        },
+        "statcast_split_receipt_sha256s": {
+          "type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true
+        },
+        "total_batters_faced": {"type": "integer", "minimum": 0},
+        "verified_statcast_bf": {"type": "integer", "minimum": 0}
+      },
+      "required": ["baseline_batters_faced", "baseline_inclusive_end_date", "baseline_query_sidecar_sha256", "consumer_cutoff_date", "game_pk", "pitcher_id", "statcast_ready_leaf_sidecar_sha256s", "statcast_split_receipt_sha256s", "total_batters_faced", "verified_statcast_bf"]
+    },
+    "careerPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "grain": {"const": "player_career_batters_faced_reference"},
+        "records": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/careerRecord"}, "uniqueItems": true
+        }
+      },
+      "required": ["schema_version", "grain", "records"]
+    },
     "historyGame": {
       "type": "object",
       "additionalProperties": false,
@@ -278,6 +312,23 @@
     }
   },
   "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+        "source": {"const": "mlb_stats_pitcher_bf"},
+        "grain": {"const": "player_career_batters_faced_reference"},
+        "status": {"const": "READY"},
+        "logical_query_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "source_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "split_receipt_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+        "payload": {"$ref": "#/$defs/careerPayload"}
+      },
+      "required": ["schema_version", "run_id", "season", "source", "grain", "status", "logical_query_ids", "source_query_sidecar_sha256s", "split_receipt_sha256s", "payload"]
+    },
     {
       "type": "object",
       "additionalProperties": false,

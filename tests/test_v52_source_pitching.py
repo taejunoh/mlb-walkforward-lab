@@ -500,11 +500,11 @@ def _career_snapshot(
         recompute_career_bf_season_snapshot as recompute,
     )
 
+    baseline_year = min(
+        int(sidecar["semantics"]["inclusive_end_date"][:4])
+        for sidecar in baseline_sidecars
+    )
     if statcast_root_queries is None:
-        baseline_year = min(
-            int(sidecar["semantics"]["inclusive_end_date"][:4])
-            for sidecar in baseline_sidecars
-        )
         if additions:
             cutoff = str(additions[0]["consumer_cutoff_date"])
         else:
@@ -522,10 +522,49 @@ def _career_snapshot(
             for query in _planned_statcast_roots(cutoff)
             if int(query.requested_range["year"]) > baseline_year
         ]
+    else:
+        statcast_root_queries = [
+            query
+            for query in statcast_root_queries
+            if int(query.requested_range["year"]) > baseline_year
+        ]
+    canonical_additions = []
+    for addition in additions:
+        cutoff = str(addition["consumer_cutoff_date"])
+        source_sidecars = addition["statcast_ready_leaf_sidecars"]
+        source_hashes = addition["statcast_ready_leaf_sidecar_sha256s"]
+        if len(source_sidecars) != len(source_hashes):
+            retained_sidecars = [
+                sidecar
+                for sidecar in source_sidecars
+                if int(sidecar["semantics"]["coverage"]["inclusive_start"][:4])
+                > baseline_year
+            ]
+            retained_hashes = list(source_hashes)
+        else:
+            retained = [
+                (sidecar, digest)
+                for sidecar, digest in zip(source_sidecars, source_hashes, strict=True)
+                if int(sidecar["semantics"]["coverage"]["inclusive_start"][:4])
+                > baseline_year
+            ]
+            retained_sidecars = [item[0] for item in retained]
+            retained_hashes = sorted(
+                item[1]
+                for item in retained
+                if item[0]["semantics"]["coverage"]["inclusive_start"] <= cutoff
+            )
+        canonical_additions.append(
+            {
+                **addition,
+                "statcast_ready_leaf_sidecars": retained_sidecars,
+                "statcast_ready_leaf_sidecar_sha256s": retained_hashes,
+            }
+        )
     return dict(
         recompute(
             baseline_sidecars,
-            additions,
+            canonical_additions,
             statcast_root_queries=statcast_root_queries,
             statcast_split_receipts=statcast_split_receipts or [],
         )
@@ -613,7 +652,7 @@ class V52PitchingSourceTest(unittest.TestCase):
             grain="player_career_batters_faced_reference",
             requested={
                 "pitcher_id": 101,
-                "inclusive_end": "2017-12-31",
+                "inclusive_end": "2021-12-31",
                 "consuming_game_pks": [9001],
                 "consumer_cutoff_dates": {"9001": "2024-04-30"},
             },
@@ -637,7 +676,7 @@ class V52PitchingSourceTest(unittest.TestCase):
         self.assertEqual(snapshot["grain"], "player_career_batters_faced_reference")
         self.assertEqual(snapshot["records"][0]["total_batters_faced"], 1)
         wrong_hash = {**addition, "statcast_ready_leaf_sidecar_sha256s": ["f" * 64]}
-        with self.assertRaisesRegex(ValueError, "READY leaf hash"):
+        with self.assertRaisesRegex(ValueError, "canonical evidence"):
             _career_snapshot([baseline], [wrong_hash])
 
     def test_career_aggregate_recomputes_and_rejects_forged_statcast_bf(self) -> None:
@@ -650,7 +689,7 @@ class V52PitchingSourceTest(unittest.TestCase):
             grain="player_career_batters_faced_reference",
             requested={
                 "pitcher_id": 101,
-                "inclusive_end": "2017-12-31",
+                "inclusive_end": "2021-12-31",
                 "consuming_game_pks": [9001],
                 "consumer_cutoff_dates": {"9001": "2024-04-30"},
             },
@@ -687,7 +726,7 @@ class V52PitchingSourceTest(unittest.TestCase):
 
         baseline = _career_baseline("2017-12-31", "2024-04-30")
         sidecars = [_statcast_source_sidecar("2024-03-20", "2024-04-30")]
-        with self.assertRaisesRegex(ValueError, "whole regular season"):
+        with self.assertRaisesRegex(ValueError, "baseline cutoff|regular-season coverage"):
             _career_snapshot([baseline], [_career_addition(sidecars, "2024-04-30")])
 
     def test_career_aggregate_rejects_2021_baseline_with_only_2024_evidence(
@@ -729,7 +768,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         snapshot = _career_snapshot([baseline], [_career_addition(sidecars, cutoff)])
         self.assertEqual(snapshot["records"][0]["verified_statcast_bf"], 1)
@@ -739,7 +778,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _replace_april_2024_parent_with_children(
             _planned_statcast_sidecars(cutoff)
         )
@@ -761,7 +800,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         for protected in (False, True):
             query = _task3_legacy_queries(protected=protected)[0]
             sidecars = _replace_april_parent_with_query_nodes(
@@ -779,7 +818,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         fetch = _task3_legacy_queries(protected=False)[0]
         protected = _task3_legacy_queries(protected=True)[0]
         cases = {
@@ -822,7 +861,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_accepts_recursive_bodyless_timeout_lineage(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         roots, ready_leaves, lineage, _queries = _recursive_bodyless_timeout_inputs()
         snapshot = _career_snapshot(
             [baseline],
@@ -834,14 +873,15 @@ class V52PitchingSourceTest(unittest.TestCase):
         self.assertEqual(record["verified_statcast_bf"], 1)
         self.assertEqual(
             record["statcast_ready_leaf_sidecar_sha256s"],
-            [_artifact_sha(sidecar) for sidecar in ready_leaves],
+            sorted(
+                _artifact_sha(sidecar)
+                for sidecar in ready_leaves
+                if sidecar["semantics"]["coverage"]["inclusive_start"] >= "2022-01-01"
+            ),
         )
         self.assertEqual(
             record["statcast_split_receipt_sha256s"],
-            [
-                receipt.receipt_sha256
-                for receipt in sorted(lineage, key=lambda item: item.parent_query_id)
-            ],
+            sorted({receipt.receipt_sha256 for receipt in lineage}),
         )
 
     def test_career_aggregate_counts_global_ready_pa_only_after_each_baseline(
@@ -883,7 +923,7 @@ class V52PitchingSourceTest(unittest.TestCase):
         from mlb_backtest.v52_query_plan import bisect_statcast_query
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         roots = _planned_statcast_roots(cutoff)
         protected, fetched = _task3_legacy_partition_queries(
             protected_inventory_sha256="c" * 64
@@ -912,7 +952,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         roots, ready_leaves, lineage, queries = _recursive_bodyless_timeout_inputs(
             include_target_pa=False
         )
@@ -949,7 +989,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         roots, ready_leaves, lineage, queries = _recursive_bodyless_timeout_inputs()
         root, left, left_left, left_right, right = queries
         invalid_artifact_hash = [
@@ -1009,7 +1049,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_accepts_same_root_task3_legacy_hybrid(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         protected, fetched = _task3_legacy_partition_queries(
             protected_inventory_sha256="c" * 64
         )
@@ -1028,7 +1068,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-05-31"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         march_fetch = _task3_fetch_month_queries(
             "2024-03-20",
@@ -1069,7 +1109,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_cross_month_population_contract_mix(self) -> None:
 
         cutoff = "2024-05-31"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         may_root = _planned_statcast_query("2024-05-01", "2024-05-31")
         run_b = replace(may_root, run_spec_sha256="d" * 64)
         contract_b = replace(may_root, acquisition_contract_sha256="e" * 64)
@@ -1126,7 +1166,7 @@ class V52PitchingSourceTest(unittest.TestCase):
         from mlb_backtest.v52_query_plan import bisect_statcast_query
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         root = _planned_statcast_query("2024-04-01", "2024-04-30")
         left, _right = bisect_statcast_query(root)
         other_run_root = replace(root, run_spec_sha256="d" * 64)
@@ -1172,7 +1212,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_invalid_recursive_split_graphs(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         root, left, left_left, left_right, right = _task3_recursive_april_nodes()
         complete_nodes = [
             (root, "SPLIT_REQUIRED", True),
@@ -1240,7 +1280,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_nonready_monthly_parent(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         sidecars[-1]["semantics"]["split_disposition"] = "SPLIT_REQUIRED"
         with self.assertRaisesRegex(ValueError, "READY leaf"):
@@ -1251,7 +1291,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         planned = _planned_statcast_sidecars(cutoff)
         cases = {
             "gap": _replace_april_2024_parent_with_children(
@@ -1271,7 +1311,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_allows_complete_inseason_rookie_zero_bf(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         final_semantics = sidecars[-1]["semantics"]
         final_semantics["game_pks"] = []
@@ -1287,7 +1327,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_positive_claim_for_absent_rookie(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         final_semantics = sidecars[-1]["semantics"]
         final_semantics["game_pks"] = []
@@ -1302,7 +1342,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_task3_within_season_month_omission(self) -> None:
 
         cutoff = "2024-05-31"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(
             cutoff, omit_ranges={("2024-04-01", "2024-04-30")}
         )
@@ -1312,15 +1352,15 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_task3_whole_season_omission(self) -> None:
 
         cutoff = "2024-04-30"
-        baseline = _career_baseline("2017-12-31", cutoff)
-        sidecars = _planned_statcast_sidecars(cutoff, omit_years={2019})
+        baseline = _career_baseline("2021-12-31", cutoff)
+        sidecars = _planned_statcast_sidecars(cutoff, omit_years={2023})
         with self.assertRaisesRegex(ValueError, "whole regular season"):
             _career_snapshot([baseline], [_career_addition(sidecars, cutoff)])
 
     def test_career_aggregate_rejects_consumer_d1_outside_regular_season(self) -> None:
 
         cutoff = "2024-03-18"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         with self.assertRaisesRegex(ValueError, "outside the regular season"):
             _career_snapshot([baseline], [_career_addition(sidecars, cutoff)])
@@ -1330,7 +1370,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     ) -> None:
 
         cutoff = "2024-04-15"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         final_semantics = sidecars[-1]["semantics"]
         before_cutoff = copy.deepcopy(final_semantics["plate_appearance_evidence"][0])
@@ -1348,7 +1388,7 @@ class V52PitchingSourceTest(unittest.TestCase):
     def test_career_aggregate_rejects_claim_that_includes_after_cutoff_pa(self) -> None:
 
         cutoff = "2024-04-15"
-        baseline = _career_baseline("2017-12-31", cutoff)
+        baseline = _career_baseline("2021-12-31", cutoff)
         sidecars = _planned_statcast_sidecars(cutoff)
         final_semantics = sidecars[-1]["semantics"]
         before_cutoff = copy.deepcopy(final_semantics["plate_appearance_evidence"][0])

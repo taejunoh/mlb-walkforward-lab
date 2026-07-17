@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from bisect import bisect_right
+from bisect import bisect_right, insort
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
@@ -60,6 +60,24 @@ _DERIVED_SEMANTIC_KEYS = {
 }
 _PRESEASON_DISPOSITION = "PRESEASON_NO_CURRENT_SEASON_PITCHING"
 _PRESEASON_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+_CAREER_BASELINE_ENDS = (date(2017, 12, 31), date(2021, 12, 31))
+_CAREER_ROOT_RANGES = tuple(
+    (first, last)
+    for season in sorted(SEASON_BOUNDARIES)
+    for first, last in monthly_ranges(*SEASON_BOUNDARIES[season])
+)
+_CAREER_ROOT_STARTS = tuple(first for first, _last in _CAREER_ROOT_RANGES)
+_CAREER_ROOT_ORDINAL_BY_START = {
+    first: ordinal for ordinal, first in enumerate(_CAREER_ROOT_STARTS)
+}
+_CAREER_FIRST_ROOT_ORDINAL_BY_YEAR = {
+    year: _CAREER_ROOT_ORDINAL_BY_START[monthly_ranges(*boundary)[0][0]]
+    for year, boundary in SEASON_BOUNDARIES.items()
+}
+_CAREER_LAST_ROOT_ORDINAL_BY_YEAR = {
+    year: _CAREER_ROOT_ORDINAL_BY_START[monthly_ranges(*boundary)[-1][0]]
+    for year, boundary in SEASON_BOUNDARIES.items()
+}
 
 
 def _day(value: object, label: str) -> date:
@@ -157,7 +175,11 @@ def recompute_pitching_sidecar(
         expected_media_type="application/json",
     )
     season = query.requested_range.get("season")
-    if isinstance(season, bool) or not isinstance(season, int) or season not in SEASON_BOUNDARIES:
+    if (
+        isinstance(season, bool)
+        or not isinstance(season, int)
+        or season not in SEASON_BOUNDARIES
+    ):
         raise ValueError("pitching season must be within 2018-2024")
     season_open = _day(query.requested_range.get("start_date"), "pitching season open")
     if season_open != SEASON_BOUNDARIES[season][0]:
@@ -234,17 +256,20 @@ def recompute_career_bf_sidecar(
     if inclusive_end == date(2021, 12, 31) and any(
         cutoff < inclusive_end for cutoff in cutoffs.values()
     ):
-        raise ValueError("legacy 2021-12-31 BF baseline is allowed only for 2022+ consumers")
+        raise ValueError(
+            "legacy 2021-12-31 BF baseline is allowed only for 2022+ consumers"
+        )
     if any(inclusive_end > cutoff for cutoff in cutoffs.values()):
-        raise ValueError("career BF inclusive end must be no later than every consumer D-1")
+        raise ValueError(
+            "career BF inclusive end must be no later than every consumer D-1"
+        )
     if inclusive_end not in {date(2017, 12, 31), date(2021, 12, 31)}:
         raise ValueError("career BF baseline cutoff is not supported")
     baseline = parse_prior_career_bf(raw, pitcher_id)
     semantics = {
         "baseline_batters_faced": baseline,
         "consumer_cutoff_dates": {
-            str(game_pk): cutoffs[game_pk].isoformat()
-            for game_pk in consumers
+            str(game_pk): cutoffs[game_pk].isoformat() for game_pk in consumers
         },
         "consuming_game_pks": consumers,
         "inclusive_end_date": inclusive_end.isoformat(),
@@ -294,8 +319,7 @@ def _require_task2_sidecar(
             or not consumers
             or any(type(value) is not int or value <= 0 for value in consumers)
             or not isinstance(cutoffs, Mapping)
-            or cutoffs
-            != {str(game_pk): as_of.isoformat() for game_pk in consumers}
+            or cutoffs != {str(game_pk): as_of.isoformat() for game_pk in consumers}
             or semantics.get("disposition") != _PRESEASON_DISPOSITION
             or semantics.get("reason") != _PRESEASON_REASON
         ):
@@ -344,13 +368,13 @@ def _statcast_query_lineage(
             parser_version=canonical["parser_version"],
             parent_query_id=canonical["parent_query_id"],
             run_spec_sha256=canonical["run_spec_sha256"],
-            acquisition_contract_sha256=canonical[
-                "acquisition_contract_sha256"
-            ],
+            acquisition_contract_sha256=canonical["acquisition_contract_sha256"],
         )
         normalized = json.loads(canonical_query_bytes(query))
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Statcast BF source canonical query lineage is invalid") from exc
+        raise ValueError(
+            "Statcast BF source canonical query lineage is invalid"
+        ) from exc
     if (
         normalized != dict(canonical)
         or not isinstance(query.run_spec_sha256, str)
@@ -371,8 +395,7 @@ def _statcast_query_lineage(
         first, last = validate_statcast_query(query)
     except ValueError as exc:
         raise ValueError(
-            "Statcast BF whole regular season or regular-season coverage gap: "
-            f"{exc}"
+            f"Statcast BF whole regular season or regular-season coverage gap: {exc}"
         ) from exc
     if (
         coverage.get("inclusive_start") != first.isoformat()
@@ -466,8 +489,7 @@ def _validate_statcast_population_contract(
     protected_inventories = {
         leaf.query.requested_range.get("protected_inventory_sha256")
         for leaf in ready_leaves
-        if leaf.query.requested_range.get("acquisition")
-        == "PROTECTED_LEGACY_REFERENCE"
+        if leaf.query.requested_range.get("acquisition") == "PROTECTED_LEGACY_REFERENCE"
     }
     if len(protected_inventories) > 1:
         raise ValueError("Statcast population has mixed global protected inventory")
@@ -689,7 +711,9 @@ def _validate_split_receipts(
         receipts_by_parent[receipt.parent_query_id] = receipt
         for child_id in receipt.child_query_ids:
             if child_id in parent_by_child:
-                raise ValueError("Statcast split child lineage overlaps or is duplicated")
+                raise ValueError(
+                    "Statcast split child lineage overlaps or is duplicated"
+                )
             parent_by_child[child_id] = receipt.parent_query_id
 
     for parent_id, receipt in receipts_by_parent.items():
@@ -887,67 +911,57 @@ def _scan_ready_statcast_leaf(
     )
 
 
-def recompute_career_bf_season_snapshot(
-    baseline_sidecars: Sequence[Mapping[str, object]],
-    statcast_bf_additions: Sequence[Mapping[str, object]],
-    *,
-    statcast_root_queries: Sequence[LogicalQuery],
-    statcast_split_receipts: Sequence[SplitReceipt],
-) -> Mapping[str, object]:
-    if not statcast_bf_additions:
-        raise ValueError("verified Statcast BF addition is missing")
-    root_nodes, query_by_id = _validate_statcast_roots(statcast_root_queries)
+@dataclass(frozen=True)
+class _CareerLineagePrefix:
+    nodes: tuple[_StatcastNode, ...]
+    first_dates: tuple[date, ...]
+    leaf_hashes: tuple[tuple[str, ...], ...]
+    receipt_hashes: tuple[tuple[str, ...], ...]
 
-    expected_addition_keys = {
-        "consumer_cutoff_date",
-        "game_pk",
-        "pitcher_id",
-        "statcast_bf",
-        "statcast_ready_leaf_sidecars",
-        "statcast_ready_leaf_sidecar_sha256s",
-    }
-    normalized_additions: list[dict[str, object]] = []
-    sidecar_by_hash: dict[str, Mapping[str, object]] = {}
-    for row in statcast_bf_additions:
-        if not isinstance(row, Mapping) or set(row) != expected_addition_keys:
-            raise ValueError("Statcast BF additions must contain READY leaf lineage")
-        sidecars = row.get("statcast_ready_leaf_sidecars")
-        hashes = row.get("statcast_ready_leaf_sidecar_sha256s")
-        if (
-            isinstance(sidecars, (str, bytes))
-            or not isinstance(sidecars, Sequence)
-            or isinstance(hashes, (str, bytes))
-            or not isinstance(hashes, Sequence)
-        ):
-            raise ValueError("Statcast BF READY leaf lineage is invalid")
-        computed = [_artifact_sha256(sidecar) for sidecar in sidecars]
-        if list(hashes) != computed or len(set(computed)) != len(computed):
-            raise ValueError(
-                "Statcast BF READY leaf hash differs from canonical sidecar"
-            )
-        for digest, sidecar in zip(computed, sidecars):
-            prior = sidecar_by_hash.setdefault(digest, sidecar)
-            if canonical_json_bytes(dict(prior)) != canonical_json_bytes(dict(sidecar)):
-                raise ValueError("Statcast BF READY leaf hash is ambiguous")
-        normalized_additions.append(
-            {
-                "pitcher_id": _positive(row.get("pitcher_id"), "addition pitcher_id"),
-                "game_pk": _positive(row.get("game_pk"), "addition game_pk"),
-                "consumer_cutoff_date": _day(
-                    row.get("consumer_cutoff_date"), "addition cutoff"
-                ).isoformat(),
-                "statcast_bf": row.get("statcast_bf"),
-                "leaf_hashes": computed,
-            }
-        )
+
+@dataclass(frozen=True)
+class _CareerStatcastIndex:
+    terminal_nodes: tuple[_StatcastNode, ...]
+    leaf_hash_by_id: Mapping[str, str]
+    pitcher_dates: Mapping[int, tuple[date, ...]]
+    root_for_query: Mapping[str, str]
+    parent_by_query: Mapping[str, str | None]
+    receipt_hash_by_parent: Mapping[str, str]
+    leaf_root_ordinal_by_id: Mapping[str, int]
+    leaf_receipt_hashes_by_id: Mapping[str, tuple[str, ...]]
+    root_run_end_by_ordinal: Mapping[int, int]
+    lineage_prefix_by_baseline: Mapping[date, _CareerLineagePrefix]
+    lineage_cache: dict[
+        tuple[date, date],
+        tuple[tuple[_StatcastNode, ...], tuple[str, ...], tuple[str, ...]],
+    ]
+
+
+def _build_career_statcast_index(
+    ready_leaf_sidecars: Sequence[Mapping[str, object]],
+    root_queries: Sequence[LogicalQuery],
+    split_receipts: Sequence[SplitReceipt],
+    *,
+    require_complete_roots: bool = True,
+) -> _CareerStatcastIndex:
+    """Authenticate the global Statcast BF graph with one scan per READY leaf."""
+    if isinstance(ready_leaf_sidecars, (str, bytes)) or not isinstance(
+        ready_leaf_sidecars, Sequence
+    ):
+        raise ValueError("statcast_ready_leaf_sidecars must be a sequence")
+    root_nodes, query_by_id = _validate_statcast_roots(root_queries)
+    if require_complete_roots and tuple(
+        (node.first, node.last) for node in root_nodes
+    ) != _CAREER_ROOT_RANGES:
+        raise ValueError("career BF requires the complete 2018-2024 monthly roots")
 
     leaf_by_id: dict[str, _StatcastNode] = {}
     leaf_hash_by_id: dict[str, str] = {}
     pitcher_dates: dict[int, list[date]] = {}
     global_pa_seen: set[tuple[int, int]] = set()
-    for digest, sidecar in sidecar_by_hash.items():
-        node, evidence, actual_digest = _scan_ready_statcast_leaf(sidecar)
-        if actual_digest != digest or node.query_id in leaf_by_id:
+    for sidecar in ready_leaf_sidecars:
+        node, evidence, digest = _scan_ready_statcast_leaf(sidecar)
+        if node.query_id in leaf_by_id:
             raise ValueError(
                 "Statcast READY leaf population contains a duplicate query"
             )
@@ -964,15 +978,16 @@ def recompute_career_bf_season_snapshot(
             pitcher_dates.setdefault(pitcher_id, []).append(game_date)
         leaf_by_id[node.query_id] = node
         leaf_hash_by_id[node.query_id] = digest
+    if not leaf_by_id and (require_complete_roots or root_nodes or split_receipts):
+        raise ValueError("verified Statcast BF READY leaf population is missing")
     for dates in pitcher_dates.values():
         dates.sort()
 
     query_by_id.update({query_id: node.query for query_id, node in leaf_by_id.items()})
-    _seed_bodyless_split_parents(statcast_split_receipts, query_by_id, root_nodes)
-    children_by_parent, receipt_hash_by_parent, generated_ids = _validate_split_receipts(
-        statcast_split_receipts, query_by_id
+    _seed_bodyless_split_parents(split_receipts, query_by_id, root_nodes)
+    children_by_parent, receipt_hash_by_parent, generated_ids = (
+        _validate_split_receipts(split_receipts, query_by_id)
     )
-
     split_parent_nodes = []
     for parent_id in children_by_parent:
         query = query_by_id[parent_id]
@@ -980,15 +995,22 @@ def recompute_career_bf_season_snapshot(
         split_parent_nodes.append(
             _StatcastNode(parent_id, first, last, query, "SPLIT_REQUIRED")
         )
-    all_nodes = [*root_nodes, *split_parent_nodes, *leaf_by_id.values()]
-    if all_nodes:
-        _validate_statcast_population_contract(all_nodes, list(leaf_by_id.values()))
+    _validate_statcast_population_contract(
+        [*root_nodes, *split_parent_nodes, *leaf_by_id.values()],
+        list(leaf_by_id.values()),
+    )
 
     root_ids = {node.query_id for node in root_nodes}
+    root_for_query: dict[str, str] = {}
     consumed_leaf_ids: set[str] = set()
     consumed_receipt_parents: set[str] = set()
 
-    def consume_split_subtree(query_id: str) -> None:
+    def consume_subtree(query_id: str, root_id: str, visiting: set[str]) -> None:
+        if query_id in visiting:
+            raise ValueError("Statcast split lineage contains a cycle")
+        prior_root = root_for_query.setdefault(query_id, root_id)
+        if prior_root != root_id:
+            raise ValueError("Statcast split lineage overlaps monthly roots")
         child_ids = children_by_parent.get(query_id)
         if child_ids is None:
             if query_id not in leaf_by_id:
@@ -1001,7 +1023,7 @@ def recompute_career_bf_season_snapshot(
             raise ValueError("Statcast split parent cannot also be a READY leaf")
         consumed_receipt_parents.add(query_id)
         for child_id in child_ids:
-            consume_split_subtree(child_id)
+            consume_subtree(child_id, root_id, {*visiting, query_id})
 
     for root in root_nodes:
         root_id = root.query_id
@@ -1011,14 +1033,14 @@ def recompute_career_bf_season_snapshot(
                 for leaf in leaf_by_id.values()
                 if leaf.query.parent_query_id == root_id
             ),
-            key=lambda node: (node.first, node.last),
+            key=lambda node: (node.first, node.last, node.query_id),
         )
         if root_id in children_by_parent:
-            consume_split_subtree(root_id)
+            consume_subtree(root_id, root_id, set())
         elif root_id in leaf_by_id:
             if direct_leaves:
                 raise ValueError("Statcast READY root has ambiguous children")
-            consumed_leaf_ids.add(root_id)
+            consume_subtree(root_id, root_id, set())
         else:
             direct_split_parents = [
                 node
@@ -1027,7 +1049,7 @@ def recompute_career_bf_season_snapshot(
             ]
             partition_nodes = sorted(
                 [*direct_leaves, *direct_split_parents],
-                key=lambda node: (node.first, node.last),
+                key=lambda node: (node.first, node.last, node.query_id),
             )
             if not partition_nodes or any(
                 node.query.requested_range.get("acquisition")
@@ -1036,8 +1058,8 @@ def recompute_career_bf_season_snapshot(
             ):
                 raise ValueError(
                     "Statcast first-level legacy partition is missing: "
-                    "regular-season coverage gap/overlap or whole regular season omitted; "
-                    "READY leaf has a wrong parent or orphan"
+                    "regular-season coverage gap/overlap; READY leaf has wrong parent "
+                    "or whole regular season omitted"
                 )
             cursor = root.first
             for node in partition_nodes:
@@ -1051,10 +1073,7 @@ def recompute_career_bf_season_snapshot(
                         "Statcast first-level legacy partition has a gap or overlap"
                     )
                 cursor = node.last + timedelta(days=1)
-                if node.query_id in children_by_parent:
-                    consume_split_subtree(node.query_id)
-                else:
-                    consumed_leaf_ids.add(node.query_id)
+                consume_subtree(node.query_id, root_id, set())
             if cursor != root.last + timedelta(days=1):
                 raise ValueError(
                     "Statcast first-level legacy partition lacks exact cover"
@@ -1068,31 +1087,131 @@ def recompute_career_bf_season_snapshot(
         raise ValueError("Statcast split lineage contains an orphan or cycle")
     if generated_ids.intersection(root_ids):
         raise ValueError("Statcast split lineage contains a cycle")
-
-    terminal_nodes = sorted(
-        leaf_by_id.values(), key=lambda node: (node.first, node.last)
+    terminal_nodes = tuple(
+        sorted(
+            leaf_by_id.values(),
+            key=lambda node: (node.first, node.last, node.query_id),
+        )
     )
-    terminal_hashes = [leaf_hash_by_id[node.query_id] for node in terminal_nodes]
-    split_receipt_hashes = [
-        receipt_hash_by_parent[parent_id]
-        for parent_id in sorted(receipt_hash_by_parent)
-    ]
-    additions: dict[tuple[int, int], Mapping[str, object]] = {}
-    for row in normalized_additions:
-        pitcher_id = row["pitcher_id"]
-        game_pk = row["game_pk"]
-        cutoff = _day(row["consumer_cutoff_date"], "addition cutoff")
-        bf = row.get("statcast_bf")
-        if type(bf) is not int or bf < 0 or row["leaf_hashes"] != terminal_hashes:
-            raise ValueError("Statcast BF addition value/source lineage is invalid")
-        key = (pitcher_id, game_pk)
-        if key in additions:
-            raise ValueError("duplicate Statcast BF addition")
-        additions[key] = {
-            **row,
-            "consumer_cutoff_date": cutoff.isoformat(),
-        }
-    records = []
+    parent_by_query = {
+        query_id: query_by_id[query_id].parent_query_id for query_id in root_for_query
+    }
+    root_ordinal_by_id = {
+        root.query_id: _CAREER_ROOT_ORDINAL_BY_START[root.first]
+        for root in root_nodes
+    }
+    leaf_root_ordinal_by_id = {
+        node.query_id: root_ordinal_by_id[root_for_query[node.query_id]]
+        for node in terminal_nodes
+    }
+    leaf_receipt_hashes_by_id: dict[str, tuple[str, ...]] = {}
+    for node in terminal_nodes:
+        receipt_hashes: set[str] = set()
+        parent_id = parent_by_query.get(node.query_id)
+        visited: set[str] = set()
+        while parent_id is not None:
+            if parent_id in visited:
+                raise ValueError("Statcast split lineage contains a cycle")
+            visited.add(parent_id)
+            receipt_hash = receipt_hash_by_parent.get(parent_id)
+            if receipt_hash is not None:
+                receipt_hashes.add(receipt_hash)
+            parent_id = parent_by_query.get(parent_id)
+        leaf_receipt_hashes_by_id[node.query_id] = tuple(sorted(receipt_hashes))
+
+    root_run_end_by_ordinal: dict[int, int] = {}
+    for ordinal in reversed(sorted(root_ordinal_by_id.values())):
+        root_run_end_by_ordinal[ordinal] = root_run_end_by_ordinal.get(
+            ordinal + 1, ordinal
+        )
+
+    lineage_prefix_by_baseline: dict[date, _CareerLineagePrefix] = {}
+    for baseline_end in _CAREER_BASELINE_ENDS:
+        nodes = tuple(node for node in terminal_nodes if node.first > baseline_end)
+        sorted_leaf_hashes: list[str] = []
+        cumulative_receipt_hashes: set[str] = set()
+        leaf_hash_prefixes: list[tuple[str, ...]] = [()]
+        receipt_hash_prefixes: list[tuple[str, ...]] = [()]
+        for node in nodes:
+            insort(sorted_leaf_hashes, leaf_hash_by_id[node.query_id])
+            cumulative_receipt_hashes.update(
+                leaf_receipt_hashes_by_id[node.query_id]
+            )
+            leaf_hash_prefixes.append(tuple(sorted_leaf_hashes))
+            receipt_hash_prefixes.append(tuple(sorted(cumulative_receipt_hashes)))
+        lineage_prefix_by_baseline[baseline_end] = _CareerLineagePrefix(
+            nodes=nodes,
+            first_dates=tuple(node.first for node in nodes),
+            leaf_hashes=tuple(leaf_hash_prefixes),
+            receipt_hashes=tuple(receipt_hash_prefixes),
+        )
+    return _CareerStatcastIndex(
+        terminal_nodes=terminal_nodes,
+        leaf_hash_by_id=dict(leaf_hash_by_id),
+        pitcher_dates={key: tuple(values) for key, values in pitcher_dates.items()},
+        root_for_query=dict(root_for_query),
+        parent_by_query=parent_by_query,
+        receipt_hash_by_parent=dict(receipt_hash_by_parent),
+        leaf_root_ordinal_by_id=leaf_root_ordinal_by_id,
+        leaf_receipt_hashes_by_id=leaf_receipt_hashes_by_id,
+        root_run_end_by_ordinal=root_run_end_by_ordinal,
+        lineage_prefix_by_baseline=lineage_prefix_by_baseline,
+        lineage_cache={},
+    )
+
+
+def _career_lineage_for_cutoff(
+    index: _CareerStatcastIndex,
+    baseline_end: date,
+    cutoff: date,
+) -> tuple[list[_StatcastNode], list[str], list[str]]:
+    key = (baseline_end, cutoff)
+    cached = index.lineage_cache.get(key)
+    if cached is not None:
+        nodes, leaf_hashes, receipt_hashes = cached
+        return list(nodes), list(leaf_hashes), list(receipt_hashes)
+
+    boundary = SEASON_BOUNDARIES.get(cutoff.year)
+    if boundary is None:
+        raise ValueError("career consumer D-1 is outside the regular season")
+    in_season = boundary[0] <= cutoff <= boundary[1]
+    opening_day_cutoff = cutoff == boundary[0] - timedelta(days=1)
+    if not in_season and not opening_day_cutoff:
+        raise ValueError("career consumer D-1 is outside the regular season")
+    first_year = baseline_end.year + 1
+    start_ordinal = _CAREER_FIRST_ROOT_ORDINAL_BY_YEAR.get(first_year)
+    if start_ordinal is None:
+        raise ValueError("career baseline does not precede an approved Statcast season")
+    if in_season:
+        end_ordinal = bisect_right(_CAREER_ROOT_STARTS, cutoff) - 1
+    else:
+        end_ordinal = _CAREER_LAST_ROOT_ORDINAL_BY_YEAR.get(
+            cutoff.year - 1, start_ordinal - 1
+        )
+    if end_ordinal >= start_ordinal and index.root_run_end_by_ordinal.get(
+        start_ordinal, start_ordinal - 1
+    ) < end_ordinal:
+        raise ValueError("whole regular season Statcast coverage is omitted")
+
+    prefix = index.lineage_prefix_by_baseline.get(baseline_end)
+    if prefix is None:
+        raise ValueError("career baseline cutoff differs from consumer D-1")
+    end = bisect_right(prefix.first_dates, cutoff)
+    cached = (
+        prefix.nodes[:end],
+        prefix.leaf_hashes[end],
+        prefix.receipt_hashes[end],
+    )
+    index.lineage_cache[key] = cached
+    nodes, leaf_hashes, receipt_hashes = cached
+    return list(nodes), list(leaf_hashes), list(receipt_hashes)
+
+
+def _recompute_career_bf_from_index(
+    baseline_sidecars: Sequence[Mapping[str, object]],
+    index: _CareerStatcastIndex,
+) -> Mapping[str, object]:
+    records: list[dict[str, object]] = []
     used: set[tuple[int, int]] = set()
     for sidecar in baseline_sidecars:
         semantics = _require_task2_sidecar(
@@ -1122,61 +1241,50 @@ def recompute_career_bf_season_snapshot(
             is not True
         ):
             raise ValueError("career baseline semantics are invalid")
+        baseline_hash = _artifact_sha256(sidecar)
         for game_pk in consumers:
             key = (pitcher_id, game_pk)
             if key in used:
                 raise ValueError("duplicate career baseline consumer")
             cutoff = _day(cutoffs[str(game_pk)], "career consumer cutoff")
-            if inclusive_end > cutoff or (
-                inclusive_end == date(2021, 12, 31) and cutoff < inclusive_end
-            ):
+            expected_baseline_end = (
+                date(2017, 12, 31)
+                if cutoff <= date(2021, 12, 31)
+                else date(2021, 12, 31)
+            )
+            if inclusive_end != expected_baseline_end:
                 raise ValueError("career baseline cutoff differs from consumer D-1")
-            addition = additions.get((pitcher_id, game_pk))
-            if addition is None:
-                raise ValueError("verified Statcast BF addition is missing")
-            if addition["consumer_cutoff_date"] != cutoffs.get(str(game_pk)):
-                raise ValueError("Statcast BF cutoff differs from career consumer D-1")
-            source_queries = []
-            boundary = SEASON_BOUNDARIES.get(cutoff.year)
-            in_season = boundary is not None and boundary[0] <= cutoff <= boundary[1]
-            for node in terminal_nodes:
-                parent_first, _parent_last, _root = _monthly_root_query(node)
-                if node.first.year <= inclusive_end.year:
-                    continue
-                if node.first.year < cutoff.year or (
-                    in_season
-                    and node.first.year == cutoff.year
-                    and parent_first <= cutoff
-                ):
-                    source_queries.append((node.first, node.last, node.query))
-            _validate_career_statcast_coverage(inclusive_end, cutoff, source_queries)
-            pitcher_evidence_dates = pitcher_dates.get(pitcher_id, [])
-            verified_statcast_bf = bisect_right(
-                pitcher_evidence_dates, cutoff
-            ) - bisect_right(pitcher_evidence_dates, inclusive_end)
-            if addition["statcast_bf"] != verified_statcast_bf:
-                raise ValueError(
-                    "claimed Statcast BF differs from canonical PA evidence"
+            lineage_key = (inclusive_end, cutoff)
+            cached_lineage = index.lineage_cache.get(lineage_key)
+            if cached_lineage is None:
+                _nodes, leaf_hashes, receipt_hashes = _career_lineage_for_cutoff(
+                    index, inclusive_end, cutoff
                 )
-            used.add((pitcher_id, game_pk))
+            else:
+                _nodes, cached_leaf_hashes, cached_receipt_hashes = cached_lineage
+                leaf_hashes = list(cached_leaf_hashes)
+                receipt_hashes = list(cached_receipt_hashes)
+            dates = index.pitcher_dates.get(pitcher_id, ())
+            verified_statcast_bf = bisect_right(dates, cutoff) - bisect_right(
+                dates, inclusive_end
+            )
             records.append(
                 {
                     "pitcher_id": pitcher_id,
                     "game_pk": game_pk,
-                    "consumer_cutoff_date": addition["consumer_cutoff_date"],
+                    "consumer_cutoff_date": cutoff.isoformat(),
                     "baseline_inclusive_end_date": inclusive_end.isoformat(),
                     "baseline_batters_faced": baseline,
                     "verified_statcast_bf": verified_statcast_bf,
                     "total_batters_faced": baseline + verified_statcast_bf,
-                    "baseline_query_sidecar_sha256": _artifact_sha256(sidecar),
-                    "statcast_ready_leaf_sidecar_sha256s": list(terminal_hashes),
-                    "statcast_split_receipt_sha256s": list(split_receipt_hashes),
+                    "baseline_query_sidecar_sha256": baseline_hash,
+                    "statcast_ready_leaf_sidecar_sha256s": leaf_hashes,
+                    "statcast_split_receipt_sha256s": receipt_hashes,
                 }
             )
-    if used != set(additions) or not records:
-        raise ValueError(
-            "Statcast BF additions contain wrong pitcher, consumer, or source lineage"
-        )
+            used.add(key)
+    if not records:
+        raise ValueError("career aggregate requires at least one consumer")
     records.sort(key=lambda row: (row["pitcher_id"], row["game_pk"]))
     return {
         "schema_version": 1,
@@ -1185,7 +1293,125 @@ def recompute_career_bf_season_snapshot(
     }
 
 
+def recompute_career_bf_snapshot(
+    baseline_sidecars: Sequence[Mapping[str, object]],
+    *,
+    statcast_ready_leaf_sidecars: Sequence[Mapping[str, object]],
+    statcast_root_queries: Sequence[LogicalQuery],
+    statcast_split_receipts: Sequence[SplitReceipt],
+) -> Mapping[str, object]:
+    """Globally index Statcast once, then compute every career-BF consumer."""
+    index = _build_career_statcast_index(
+        statcast_ready_leaf_sidecars,
+        statcast_root_queries,
+        statcast_split_receipts,
+    )
+    return _recompute_career_bf_from_index(baseline_sidecars, index)
+
+
+def recompute_career_bf_season_snapshot(
+    baseline_sidecars: Sequence[Mapping[str, object]],
+    statcast_bf_additions: Sequence[Mapping[str, object]],
+    *,
+    statcast_root_queries: Sequence[LogicalQuery],
+    statcast_split_receipts: Sequence[SplitReceipt],
+) -> Mapping[str, object]:
+    """Validate the legacy claim envelope over the shared global BF index."""
+    if not statcast_bf_additions:
+        raise ValueError("verified Statcast BF addition is missing")
+    expected_keys = {
+        "consumer_cutoff_date",
+        "game_pk",
+        "pitcher_id",
+        "statcast_bf",
+        "statcast_ready_leaf_sidecars",
+        "statcast_ready_leaf_sidecar_sha256s",
+    }
+    unique_sidecars: dict[str, Mapping[str, object]] = {}
+    canonical_by_id: dict[str, bytes] = {}
+    claims: dict[tuple[int, int], dict[str, object]] = {}
+    for row in statcast_bf_additions:
+        if not isinstance(row, Mapping) or set(row) != expected_keys:
+            raise ValueError("Statcast BF additions must contain READY leaf lineage")
+        sidecars = row.get("statcast_ready_leaf_sidecars")
+        hashes = row.get("statcast_ready_leaf_sidecar_sha256s")
+        if (
+            isinstance(sidecars, (str, bytes))
+            or not isinstance(sidecars, Sequence)
+            or isinstance(hashes, (str, bytes))
+            or not isinstance(hashes, Sequence)
+        ):
+            raise ValueError("Statcast BF READY leaf lineage is invalid")
+        claimed_hashes = list(hashes)
+        if (
+            any(
+                not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+                for digest in claimed_hashes
+            )
+            or claimed_hashes != sorted(set(claimed_hashes))
+        ):
+            raise ValueError("Statcast BF READY leaf lineage is invalid")
+        query_ids: list[str] = []
+        for sidecar in sidecars:
+            if not isinstance(sidecar, Mapping):
+                raise ValueError("Statcast BF READY leaf lineage is invalid")
+            query_id = sidecar.get("query_id")
+            if not isinstance(query_id, str) or _SHA256.fullmatch(query_id) is None:
+                raise ValueError("Statcast BF READY leaf query identity is invalid")
+            canonical = canonical_json_bytes(dict(sidecar))
+            if query_id in canonical_by_id and canonical_by_id[query_id] != canonical:
+                raise ValueError("Statcast BF READY leaf query is ambiguous")
+            canonical_by_id[query_id] = canonical
+            unique_sidecars[query_id] = sidecar
+            query_ids.append(query_id)
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("Statcast BF READY leaf lineage is duplicated")
+        pitcher_id = _positive(row.get("pitcher_id"), "addition pitcher_id")
+        game_pk = _positive(row.get("game_pk"), "addition game_pk")
+        cutoff = _day(row.get("consumer_cutoff_date"), "addition cutoff")
+        statcast_bf = row.get("statcast_bf")
+        if type(statcast_bf) is not int or statcast_bf < 0:
+            raise ValueError("Statcast BF addition value is invalid")
+        key = (pitcher_id, game_pk)
+        if key in claims:
+            raise ValueError("duplicate Statcast BF addition")
+        claims[key] = {
+            "consumer_cutoff_date": cutoff.isoformat(),
+            "leaf_hashes": claimed_hashes,
+            "statcast_bf": statcast_bf,
+        }
+
+    index = _build_career_statcast_index(
+        tuple(unique_sidecars.values()),
+        statcast_root_queries,
+        statcast_split_receipts,
+        require_complete_roots=False,
+    )
+    computed = _recompute_career_bf_from_index(baseline_sidecars, index)
+    records = computed["records"]
+    computed_by_key = {
+        (record["pitcher_id"], record["game_pk"]): record for record in records
+    }
+    if set(computed_by_key) != set(claims):
+        raise ValueError(
+            "Statcast BF additions contain wrong pitcher, consumer, or source lineage"
+        )
+    authenticated_supply_hashes = set(index.leaf_hash_by_id.values())
+    for key, claim in claims.items():
+        record = computed_by_key[key]
+        claimed_hashes = claim["leaf_hashes"]
+        if (
+            not set(claimed_hashes).issubset(authenticated_supply_hashes)
+            or claimed_hashes != record["statcast_ready_leaf_sidecar_sha256s"]
+            or claim["consumer_cutoff_date"] != record["consumer_cutoff_date"]
+            or claim["statcast_bf"] != record["verified_statcast_bf"]
+        ):
+            raise ValueError("claimed Statcast BF differs from canonical evidence")
+    return computed
+
+
 __all__ = [
+    "recompute_career_bf_snapshot",
     "recompute_career_bf_season_snapshot",
     "recompute_career_bf_sidecar",
     "recompute_pitching_season_snapshot",

@@ -4,6 +4,7 @@ from importlib import import_module
 
 
 _EXPORTS = {
+    "recompute_career_bf_snapshot": ".pitching",
     "recompute_career_bf_season_snapshot": ".pitching",
     "recompute_career_bf_sidecar": ".pitching",
     "recompute_game_evidence_snapshot": ".schedule",
