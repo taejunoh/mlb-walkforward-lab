@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import secrets
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +98,38 @@ class SnapshotStoreInputs:
     replay: SnapshotReplayInputs
     bindings: AuthorityBindings
     current_phase: str
+
+
+@dataclass(frozen=True)
+class PublishReceipt:
+    inventory_sha256: str
+    snapshot_count: int
+
+
+class SnapshotStoreError(Exception):
+    """Base class for immutable snapshot-store publication failures."""
+
+
+class PublishConflict(SnapshotStoreError):
+    """An immutable destination exists with contents other than the requested bytes."""
+
+
+class LockHeld(SnapshotStoreError):
+    """Another publisher owns the store lock."""
+
+
+class PublishError(SnapshotStoreError):
+    """The publication contract or its owned lock could not be safely verified."""
+
+
+@dataclass(frozen=True)
+class _OwnedLock:
+    fd: int
+    path: Path
+    device: int
+    inode: int
+    nonce: str
+    contents: bytes
 
 
 @dataclass(frozen=True)
@@ -571,8 +606,578 @@ def _reject_duplicate_object_keys(pairs: list[tuple[str, object]]) -> dict[str, 
     return value
 
 
+_OPEN_COMMON = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_OPEN_DIRECTORY = _OPEN_COMMON | getattr(os, "O_DIRECTORY", 0)
+
+
+@dataclass(frozen=True)
+class _HeldDirectory:
+    fd: int
+    parent: _HeldDirectory | None
+    name: str | None
+    path: Path
+    device: int
+    inode: int
+
+
+def publish_snapshot_store(
+    root: Path,
+    inventory: SourceInventory,
+    inputs: SnapshotStoreInputs,
+    *,
+    lock_owner: str,
+) -> PublishReceipt:
+    """Atomically expose a content-addressed snapshot set without replacing any file.
+
+    ``source_inventory.json`` is deliberately linked last: everything before it is
+    safe, immutable residue which an identical retry can reuse.
+    """
+    _validate_publish_arguments(root, inventory, inputs, lock_owner)
+    root_dir = _open_root_directory(root)
+    seasons: dict[int, _HeldDirectory] = {}
+    sources: dict[tuple[int, str], _HeldDirectory] = {}
+    try:
+        lock = _acquire_lock(root_dir, inputs.replay.run_id, lock_owner)
+    except BaseException:
+        _close_directory(root_dir)
+        raise
+    primary_error: BaseException | None = None
+    try:
+        replayed, rebuilt = _revalidate_publish_inputs(inventory, inputs)
+        expected_snapshots = _snapshot_bytes_by_sha(replayed, inventory)
+        raw_inventory = inventory_bytes(inventory)
+        inventory_sha256 = hashlib.sha256(raw_inventory).hexdigest()
+
+        for row in inventory.snapshots:
+            season = seasons.get(row.season)
+            if season is None:
+                season = _open_or_create_directory(root_dir, str(row.season), root / str(row.season))
+                seasons[row.season] = season
+            parent = sources.get((row.season, row.source))
+            if parent is None:
+                parent = _open_or_create_directory(season, row.source, root / str(row.season) / row.source)
+                sources[(row.season, row.source)] = parent
+            _publish_test_hook("after_directory_open_before_temp_publish")
+            _rebind_tree(root_dir, seasons.values(), sources.values())
+            relative = Path(row.relative_path)
+            _publish_immutable(
+                parent, relative.name, expected_snapshots[row.snapshot_sha256], inputs.replay.run_id
+            )
+        _hook_and_rebind("after_blobs", root_dir, seasons.values(), sources.values())
+
+        checksum = inventory_sha256.encode("ascii") + b"\n"
+        _publish_immutable(root_dir, "source_inventory.sha256", checksum, inputs.replay.run_id)
+        _hook_and_rebind("after_checksum", root_dir, seasons.values(), sources.values())
+
+        _verify_store_members(root_dir, sources, inventory, expected_snapshots, checksum)
+        _hook_and_rebind("before_inventory_link", root_dir, seasons.values(), sources.values())
+        _publish_immutable(root_dir, "source_inventory.json", raw_inventory, inputs.replay.run_id)
+        _hook_and_rebind("after_inventory", root_dir, seasons.values(), sources.values())
+        _fsync_held_directory(root_dir)
+        _authenticate_lock(lock, root_dir)
+        _verify_committed_store(root_dir, sources, inventory, expected_snapshots, raw_inventory, checksum)
+        _hook_and_rebind("before_lock_release", root_dir, seasons.values(), sources.values())
+        return PublishReceipt(inventory_sha256, len(inventory.snapshots))
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            _release_lock(lock, root_dir)
+        except BaseException as cleanup_error:
+            # A committed inventory is not enough if this invocation cannot prove it
+            # relinquished only the lock it owns.
+            if primary_error is not None:
+                combined = PublishError("owned lock cleanup failed after primary publication failure")
+                combined.primary_error = primary_error  # type: ignore[attr-defined]
+                combined.cleanup_error = cleanup_error  # type: ignore[attr-defined]
+                raise combined from cleanup_error
+            raise PublishError("owned lock cleanup failed") from cleanup_error
+        finally:
+            for directory in reversed(tuple(sources.values())):
+                _close_directory(directory)
+            for directory in reversed(tuple(seasons.values())):
+                _close_directory(directory)
+            _close_directory(root_dir)
+
+
+def _validate_publish_arguments(
+    root: Path, inventory: SourceInventory, inputs: SnapshotStoreInputs, lock_owner: str
+) -> None:
+    if not isinstance(root, Path):
+        raise TypeError("snapshot store root must be a pathlib.Path")
+    if not root.is_absolute():
+        raise ValueError("snapshot store root must be absolute")
+    try:
+        metadata = os.stat(root, follow_symlinks=False)
+    except OSError as exc:
+        raise PublishError("snapshot store root is inaccessible") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PublishError("snapshot store root must be a directory")
+    if not isinstance(inventory, SourceInventory) or not isinstance(inputs, SnapshotStoreInputs):
+        raise TypeError("inventory and inputs must use snapshot-store types")
+    if not _is_safe_identity(lock_owner):
+        raise ValueError("lock_owner must be a safe nonempty identity")
+    if not isinstance(inputs.replay, SnapshotReplayInputs) or not _is_safe_identity(inputs.replay.run_id):
+        raise ValueError("replay run_id must be a safe nonempty identity")
+    if not _is_safe_identity(inventory.run_id):
+        raise ValueError("inventory run_id must be a safe nonempty identity")
+
+
+def _is_safe_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) is not None
+    )
+
+
+def _revalidate_publish_inputs(
+    inventory: SourceInventory, inputs: SnapshotStoreInputs
+) -> tuple[tuple[NormalizedSnapshot, ...], SourceInventory]:
+    try:
+        replayed = tuple(replay_verified_snapshots(inputs.replay))
+        if replayed != tuple(sorted(replayed, key=snapshot_sort_key)):
+            raise PublishError("replayed snapshots are not canonically ordered")
+        rebuilt = build_inventory(inputs)
+    except PublishError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise PublishError("replay or inventory revalidation failed") from exc
+    if rebuilt != inventory:
+        raise PublishError("supplied inventory differs from replayed inputs")
+    if rebuilt.run_id != inputs.replay.run_id:
+        raise PublishError("inventory run_id differs from replay run_id")
+    return replayed, rebuilt
+
+
+def _snapshot_bytes_by_sha(
+    replayed: tuple[NormalizedSnapshot, ...], inventory: SourceInventory
+) -> dict[str, bytes]:
+    if len(replayed) != len(inventory.snapshots):
+        raise PublishError("replay snapshot count differs from inventory")
+    result: dict[str, bytes] = {}
+    for snapshot, row in zip(replayed, inventory.snapshots, strict=True):
+        if (
+            not isinstance(snapshot, NormalizedSnapshot)
+            or snapshot.sha256 != row.snapshot_sha256
+            or snapshot.run_id != inventory.run_id
+            or snapshot.canonical_bytes != canonical_json_bytes(snapshot.as_mapping()) + b"\n"
+            or len(snapshot.canonical_bytes) != row.byte_length
+            or hashlib.sha256(snapshot.canonical_bytes).hexdigest() != row.snapshot_sha256
+        ):
+            raise PublishError("replayed snapshot bytes differ from inventory")
+        result[row.snapshot_sha256] = snapshot.canonical_bytes
+    if len(result) != len(inventory.snapshots):
+        raise PublishError("replay snapshot hashes are not unique")
+    return result
+
+
+def _open_root_directory(root: Path) -> _HeldDirectory:
+    try:
+        fd = os.open(root, os.O_RDONLY | _OPEN_DIRECTORY)
+        opened = os.fstat(fd)
+        named = os.stat(root, follow_symlinks=False)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_directory(named, opened):
+            raise PublishError("snapshot store root changed while opening")
+        return _HeldDirectory(fd, None, None, root, opened.st_dev, opened.st_ino)
+    except PublishError:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError("could not safely open snapshot store root") from exc
+
+
+def _open_or_create_directory(parent: _HeldDirectory, name: str, path: Path) -> _HeldDirectory:
+    _rebind_directory(parent)
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent.fd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise PublishError(f"could not create store directory {name!r}") from exc
+    try:
+        fd = os.open(name, os.O_RDONLY | _OPEN_DIRECTORY, dir_fd=parent.fd)
+        opened = os.fstat(fd)
+        named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        if not _same_directory(named, opened):
+            raise PublishError(f"store directory {name!r} changed while opening")
+        os.fsync(fd)
+        _fsync_held_directory(parent)
+        return _HeldDirectory(fd, parent, name, path, opened.st_dev, opened.st_ino)
+    except PublishError:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError(f"could not safely open store directory {name!r}") from exc
+
+
+def _same_directory(named: os.stat_result, opened: os.stat_result) -> bool:
+    return stat.S_ISDIR(named.st_mode) and stat.S_ISDIR(opened.st_mode) and (
+        named.st_dev,
+        named.st_ino,
+    ) == (opened.st_dev, opened.st_ino)
+
+
+def _rebind_directory(directory: _HeldDirectory) -> None:
+    try:
+        if directory.parent is not None:
+            _rebind_directory(directory.parent)
+        opened = os.fstat(directory.fd)
+        if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            directory.device,
+            directory.inode,
+        ):
+            raise PublishError("held store directory identity changed")
+        if directory.parent is None:
+            named = os.stat(directory.path, follow_symlinks=False)
+        else:
+            named = os.stat(directory.name, dir_fd=directory.parent.fd, follow_symlinks=False)
+        named_path = os.stat(directory.path, follow_symlinks=False)
+        if not _same_directory(named, opened) or not _same_directory(named_path, opened):
+            raise PublishError("store directory pathname no longer binds held directory")
+    except PublishError:
+        raise
+    except OSError as exc:
+        raise PublishError("could not rebind held store directory") from exc
+
+
+def _rebind_tree(
+    root: _HeldDirectory,
+    seasons: object,
+    sources: object,
+) -> None:
+    _rebind_directory(root)
+    for directory in seasons:  # type: ignore[union-attr]
+        _rebind_directory(directory)
+    for directory in sources:  # type: ignore[union-attr]
+        _rebind_directory(directory)
+
+
+def _hook_and_rebind(
+    stage: str, root: _HeldDirectory, seasons: object, sources: object
+) -> None:
+    _publish_test_hook(stage)
+    _rebind_tree(root, seasons, sources)
+
+
+def _close_directory(directory: _HeldDirectory) -> None:
+    try:
+        os.close(directory.fd)
+    except OSError:
+        pass
+
+
+def _acquire_lock(root: _HeldDirectory, run_id: str, lock_owner: str) -> _OwnedLock:
+    name = ".snapshot-store.lock"
+    path = root.path / name
+    nonce = secrets.token_hex(32)
+    contents = canonical_json_bytes({"lock_owner": lock_owner, "nonce": nonce, "run_id": run_id}) + b"\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _OPEN_COMMON
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=root.fd)
+    except FileExistsError as exc:
+        raise LockHeld("snapshot store lock is already held") from exc
+    except OSError as exc:
+        raise PublishError("could not acquire snapshot store lock") from exc
+    try:
+        _write_all(fd, contents)
+        details = os.fstat(fd)
+        _require_regular_single_link(details, "new lock")
+        lock = _OwnedLock(fd, path, details.st_dev, details.st_ino, nonce, contents)
+        _publish_test_hook("after_lock_write_before_acquire_fsync")
+        os.fsync(fd)
+        _fsync_held_directory(root)
+        return lock
+    except BaseException:
+        try:
+            try:
+                _authenticate_lock(lock, root)
+                os.unlink(name, dir_fd=root.fd)
+                _fsync_held_directory(root)
+            except (OSError, SnapshotStoreError, UnboundLocalError):
+                pass
+        finally:
+            os.close(fd)
+        raise
+
+
+def _authenticate_lock(lock: _OwnedLock, root: _HeldDirectory) -> None:
+    try:
+        _rebind_directory(root)
+        descriptor = os.fstat(lock.fd)
+        _require_regular_single_link(descriptor, "owned lock")
+        named = os.stat(lock.path.name, dir_fd=root.fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (lock.device, lock.inode):
+            raise PublishError("owned lock identity changed")
+        read_fd = os.open(lock.path.name, os.O_RDONLY | _OPEN_COMMON, dir_fd=root.fd)
+        try:
+            opened = os.fstat(read_fd)
+            _require_regular_single_link(opened, "owned lock")
+            if (opened.st_dev, opened.st_ino) != (lock.device, lock.inode):
+                raise PublishError("owned lock path changed")
+            if _read_all(read_fd) != lock.contents:
+                raise PublishError("owned lock contents changed")
+            final = os.fstat(read_fd)
+            rebound = os.stat(lock.path.name, dir_fd=root.fd, follow_symlinks=False)
+            if not _same_file_state(final, opened) or not _same_file_state(rebound, opened):
+                raise PublishError("owned lock changed during authentication")
+        finally:
+            os.close(read_fd)
+    except PublishError:
+        raise
+    except OSError as exc:
+        raise PublishError("could not authenticate owned lock") from exc
+
+
+def _release_lock(lock: _OwnedLock, root: _HeldDirectory) -> None:
+    try:
+        _authenticate_lock(lock, root)
+        _publish_test_hook("before_lock_unlink")
+        _authenticate_lock(lock, root)
+        os.unlink(lock.path.name, dir_fd=root.fd)
+        _fsync_held_directory(root)
+    except PublishError:
+        raise
+    except SnapshotStoreError as exc:
+        raise PublishError("could not release owned lock") from exc
+    except OSError as exc:
+        raise PublishError("could not release owned lock") from exc
+    finally:
+        try:
+            os.close(lock.fd)
+        except OSError as exc:
+            # Closing a descriptor is part of safely completing lock ownership.
+            raise PublishError("could not close owned lock") from exc
+
+
+def _publish_immutable(parent: _HeldDirectory, name: str, expected: bytes, run_id: str) -> None:
+    _rebind_directory(parent)
+    temp = f".tmp-{run_id}-{secrets.token_hex(16)}"
+    fd: int | None = None
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _OPEN_COMMON, 0o600, dir_fd=parent.fd)
+        _write_all(fd, expected)
+        details = os.fstat(fd)
+        _require_regular_single_link(details, "temporary publication file")
+        os.fsync(fd)
+        try:
+            os.link(temp, name, src_dir_fd=parent.fd, dst_dir_fd=parent.fd, follow_symlinks=False)
+        except FileExistsError:
+            _verify_immutable(parent, name, expected, retry_run_id=run_id)
+        _unlink_owned_temp(parent, temp, fd, details)
+        fd = None
+        _fsync_held_directory(parent)
+    except PublishConflict:
+        raise
+    except OSError as exc:
+        raise PublishError(f"could not publish immutable file {name!r}") from exc
+    finally:
+        if fd is not None:
+            try:
+                details = os.fstat(fd)
+                _unlink_owned_temp(parent, temp, fd, details)
+            except (OSError, PublishError):
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def _unlink_owned_temp(
+    parent: _HeldDirectory, name: str, fd: int, expected: os.stat_result
+) -> None:
+    current = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    descriptor = os.fstat(fd)
+    if (
+        (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        or (descriptor.st_dev, descriptor.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise PublishError("temporary publication file identity changed")
+    if not stat.S_ISREG(current.st_mode) or current.st_nlink not in {1, 2}:
+        raise PublishError("temporary publication file is no longer a regular owned file")
+    os.unlink(name, dir_fd=parent.fd)
+    os.close(fd)
+
+
+def _verify_store_members(
+    root: _HeldDirectory,
+    sources: Mapping[tuple[int, str], _HeldDirectory],
+    inventory: SourceInventory,
+    snapshots: Mapping[str, bytes],
+    checksum: bytes,
+) -> None:
+    for row in inventory.snapshots:
+        _verify_immutable(sources[(row.season, row.source)], Path(row.relative_path).name, snapshots[row.snapshot_sha256])
+    _verify_immutable(root, "source_inventory.sha256", checksum)
+
+
+def _verify_committed_store(
+    root: _HeldDirectory,
+    sources: Mapping[tuple[int, str], _HeldDirectory],
+    inventory: SourceInventory,
+    snapshots: Mapping[str, bytes],
+    raw_inventory: bytes,
+    checksum: bytes,
+) -> None:
+    _verify_store_members(root, sources, inventory, snapshots, checksum)
+    _verify_immutable(root, "source_inventory.json", raw_inventory)
+    try:
+        if hashlib.sha256(raw_inventory).hexdigest().encode("ascii") + b"\n" != checksum:
+            raise PublishError("inventory checksum differs from inventory bytes")
+    except PublishError:
+        raise
+
+
+def _verify_immutable(
+    parent: _HeldDirectory, name: str, expected: bytes, *, retry_run_id: str | None = None
+) -> None:
+    try:
+        _rebind_directory(parent)
+        fd = os.open(name, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink not in {1, 2}:
+                raise PublishConflict("immutable publication target must be a regular one- or two-link file")
+            actual = _read_all(fd)
+            after = os.fstat(fd)
+            if not _same_file_state(before, after):
+                raise PublishConflict(f"immutable target changed while reading: {name}")
+            _publish_test_hook("after_target_read_before_rebind")
+            _rebind_directory(parent)
+            rebound = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            if not _same_file_state(rebound, before):
+                raise PublishConflict(f"immutable target pathname changed while reading: {name}")
+        finally:
+            os.close(fd)
+    except PublishConflict:
+        raise
+    except OSError as exc:
+        raise PublishConflict(f"immutable target cannot be safely read: {name}") from exc
+    if actual != expected or hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+        raise PublishConflict(f"immutable target bytes differ: {name}")
+    if before.st_nlink == 2:
+        if retry_run_id is None:
+            raise PublishConflict(f"immutable target has an untrusted second link: {name}")
+        _converge_owned_linked_temp(parent, name, before, expected, retry_run_id)
+        _verify_immutable(parent, name, expected)
+
+
+def _converge_owned_linked_temp(
+    parent: _HeldDirectory,
+    target_name: str,
+    target: os.stat_result,
+    expected: bytes,
+    run_id: str,
+) -> None:
+    """Remove only the one authenticated temp hard-link left by a crashed publisher."""
+    _rebind_directory(parent)
+    prefix = f".tmp-{run_id}-"
+    try:
+        aliases: list[str] = []
+        for entry in os.listdir(parent.fd):
+            if entry == target_name:
+                continue
+            details = os.stat(entry, dir_fd=parent.fd, follow_symlinks=False)
+            if (details.st_dev, details.st_ino) == (target.st_dev, target.st_ino):
+                aliases.append(entry)
+        if len(aliases) != 1 or not aliases[0].startswith(prefix):
+            raise PublishConflict("two-link immutable target has no unique owned temp residue")
+        alias = aliases[0]
+        details = os.stat(alias, dir_fd=parent.fd, follow_symlinks=False)
+        if not stat.S_ISREG(details.st_mode) or not _same_file_state(details, target):
+            raise PublishConflict("linked temp residue does not exactly bind immutable target")
+        fd = os.open(alias, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        try:
+            opened = os.fstat(fd)
+            alias_bytes = _read_all(fd)
+            if (
+                not _same_file_state(opened, target)
+                or alias_bytes != expected
+                or hashlib.sha256(alias_bytes).digest() != hashlib.sha256(expected).digest()
+            ):
+                raise PublishConflict("linked temp residue bytes differ from immutable target")
+            rebound = os.stat(alias, dir_fd=parent.fd, follow_symlinks=False)
+            if not _same_file_state(rebound, opened):
+                raise PublishConflict("linked temp residue changed while reading")
+        finally:
+            os.close(fd)
+        os.unlink(alias, dir_fd=parent.fd)
+        _fsync_held_directory(parent)
+        rebound_target = os.stat(target_name, dir_fd=parent.fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(rebound_target.st_mode)
+            or rebound_target.st_nlink != 1
+            or (rebound_target.st_dev, rebound_target.st_ino) != (target.st_dev, target.st_ino)
+        ):
+            raise PublishConflict("immutable target did not converge after owned temp cleanup")
+    except PublishConflict:
+        raise
+    except OSError as exc:
+        raise PublishConflict("could not safely converge linked temp residue") from exc
+
+
+def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino, first.st_mode, first.st_nlink) == (
+        second.st_dev,
+        second.st_ino,
+        second.st_mode,
+        second.st_nlink,
+    )
+
+
+def _require_regular_single_link(details: os.stat_result, label: str) -> None:
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise PublishConflict(f"{label} must be a regular single-link file")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise PublishError("short write while publishing immutable file")
+        view = view[written:]
+
+
+def _read_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 131072)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _fsync_held_directory(directory: _HeldDirectory) -> None:
+    _rebind_directory(directory)
+    os.fsync(directory.fd)
+
+
+def _publish_test_hook(stage: str) -> None:
+    """No-op fault/race boundary used by deterministic publication tests."""
+
+
 __all__ = [
     "AuthorityBinding", "TerminalCheckpointBinding", "AuthorityBindings", "SnapshotStoreInputs",
     "SnapshotInventoryRow", "SourceSeasonInventory", "SourceInventory", "build_inventory",
-    "inventory_bytes", "parse_inventory",
+    "inventory_bytes", "parse_inventory", "PublishReceipt", "SnapshotStoreError",
+    "PublishConflict", "LockHeld", "PublishError", "publish_snapshot_store",
 ]
