@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "v5.2 immutable source inventory",
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*[\\x00-\\x1F\\x7F])(?!.*\\\\)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$)).+$"},
+    "hashes": {"type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"path": {"$ref": "#/$defs/path"}, "sha256": {"$ref": "#/$defs/sha256"}},
+      "required": ["path", "sha256"]
+    },
+    "terminalBinding": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"path": {"$ref": "#/$defs/path"}, "sha256": {"$ref": "#/$defs/sha256"}, "sequence": {"type": "integer", "minimum": 0}, "stage": {"const": "REMAINING"}},
+      "required": ["path", "sha256", "sequence", "stage"]
+    },
+    "sourceGrain": {
+      "oneOf": [
+        {"properties": {"source": {"const": "baseball_savant_statcast"}, "grain": {"const": "pitch"}}},
+        {"properties": {"source": {"const": "mlb_schedule_game_feed"}, "grain": {"const": "season_game_evidence_snapshot"}}},
+        {"properties": {"source": {"const": "mlb_stats_pitcher_bf"}, "grain": {"const": "player_career_batters_faced_reference"}}},
+        {"properties": {"source": {"const": "mlb_stats_pitching"}, "grain": {"const": "season_d1_league_pitching_reference"}}},
+        {"properties": {"source": {"const": "prior_schedule_history"}, "grain": {"const": "verified_game_projection"}}},
+        {"properties": {"source": {"const": "venue_team_timezone_table"}, "grain": {"const": "effective_dated_venue_team_reference"}}}
+      ]
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+        "source": {"enum": ["baseball_savant_statcast", "mlb_schedule_game_feed", "mlb_stats_pitcher_bf", "mlb_stats_pitching", "prior_schedule_history", "venue_team_timezone_table"]},
+        "grain": {"enum": ["pitch", "season_game_evidence_snapshot", "player_career_batters_faced_reference", "season_d1_league_pitching_reference", "verified_game_projection", "effective_dated_venue_team_reference"]},
+        "status": {"const": "READY"}, "snapshot_sha256": {"$ref": "#/$defs/sha256"},
+        "relative_path": {"$ref": "#/$defs/path"}, "byte_length": {"type": "integer", "minimum": 1},
+        "logical_query_ids": {"$ref": "#/$defs/hashes", "minItems": 1}, "source_query_sidecar_sha256s": {"$ref": "#/$defs/hashes", "minItems": 1}, "split_receipt_sha256s": {"$ref": "#/$defs/hashes"}
+      },
+      "required": ["season", "source", "grain", "status", "snapshot_sha256", "relative_path", "byte_length", "logical_query_ids", "source_query_sidecar_sha256s", "split_receipt_sha256s"],
+      "allOf": [{"$ref": "#/$defs/sourceGrain"}]
+    },
+    "sourceSeason": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "season": {"type": "integer", "minimum": 2018, "maximum": 2024},
+        "source": {"enum": ["baseball_savant_statcast", "mlb_schedule_game_feed", "mlb_stats_pitcher_bf", "mlb_stats_pitching", "prior_schedule_history", "venue_team_timezone_table"]},
+        "grain": {"enum": ["pitch", "season_game_evidence_snapshot", "player_career_batters_faced_reference", "season_d1_league_pitching_reference", "verified_game_projection", "effective_dated_venue_team_reference"]},
+        "status": {"const": "READY"}, "snapshot_sha256s": {"$ref": "#/$defs/hashes"}, "logical_query_ids": {"$ref": "#/$defs/hashes"}, "split_receipt_sha256s": {"$ref": "#/$defs/hashes"}
+      },
+      "required": ["season", "source", "grain", "status", "snapshot_sha256s", "logical_query_ids", "split_receipt_sha256s"],
+      "allOf": [{"$ref": "#/$defs/sourceGrain"}]
+    },
+    "counts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "snapshot_count": {"const": 81}, "source_season_count": {"const": 42}, "source_count": {"const": 6},
+        "logical_query_count": {"type": "integer", "minimum": 0}, "split_receipt_count": {"type": "integer", "minimum": 0},
+        "by_source": {"type": "object", "additionalProperties": false, "properties": {"baseball_savant_statcast": {"const": 46}, "mlb_schedule_game_feed": {"const": 7}, "mlb_stats_pitcher_bf": {"const": 7}, "mlb_stats_pitching": {"const": 7}, "prior_schedule_history": {"const": 7}, "venue_team_timezone_table": {"const": 7}}, "required": ["baseball_savant_statcast", "mlb_schedule_game_feed", "mlb_stats_pitcher_bf", "mlb_stats_pitching", "prior_schedule_history", "venue_team_timezone_table"]},
+        "by_season": {"type": "object", "additionalProperties": false, "properties": {"2018": {"const": 12}, "2019": {"const": 12}, "2020": {"const": 8}, "2021": {"const": 12}, "2022": {"const": 12}, "2023": {"const": 13}, "2024": {"const": 12}}, "required": ["2018", "2019", "2020", "2021", "2022", "2023", "2024"]}
+      },
+      "required": ["snapshot_count", "source_season_count", "source_count", "logical_query_count", "split_receipt_count", "by_source", "by_season"]
+    }
+  },
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1}, "artifact_kind": {"const": "V5_2_SOURCE_INVENTORY"}, "run_id": {"type": "string", "minLength": 1}, "status": {"const": "READY_CANDIDATE"},
+    "critical_errors": {"type": "array", "maxItems": 0}, "network_attempts": {"const": 0}, "source_gate_ready": {"const": true},
+    "run_spec": {"$ref": "#/$defs/binding"}, "acquisition_contract": {"$ref": "#/$defs/binding"}, "terminal_checkpoint": {"$ref": "#/$defs/terminalBinding"}, "schedule_inventory": {"$ref": "#/$defs/binding"}, "game_evidence_inventory": {"$ref": "#/$defs/binding"}, "timezone_gate": {"$ref": "#/$defs/binding"},
+    "snapshot_sha256s": {"$ref": "#/$defs/hashes", "minItems": 81, "maxItems": 81}, "logical_query_ids": {"$ref": "#/$defs/hashes"}, "split_receipt_sha256s": {"$ref": "#/$defs/hashes"},
+    "snapshots": {"type": "array", "items": {"$ref": "#/$defs/snapshot"}, "minItems": 81, "maxItems": 81, "uniqueItems": true}, "source_seasons": {"type": "array", "items": {"$ref": "#/$defs/sourceSeason"}, "minItems": 42, "maxItems": 42, "uniqueItems": true}, "counts": {"$ref": "#/$defs/counts"}
+  },
+  "required": ["schema_version", "artifact_kind", "run_id", "status", "critical_errors", "network_attempts", "source_gate_ready", "run_spec", "acquisition_contract", "terminal_checkpoint", "schedule_inventory", "game_evidence_inventory", "timezone_gate", "snapshot_sha256s", "logical_query_ids", "split_receipt_sha256s", "snapshots", "source_seasons", "counts"]
+}

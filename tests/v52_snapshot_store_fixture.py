@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
+from unittest.mock import patch
 
 from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
 from mlb_backtest.v52_game_evidence_inventory import VerifiedGameEvidenceInventory
@@ -15,6 +17,7 @@ from mlb_backtest.v52_verify_sources import (
     SnapshotReplayInputs,
     VerifiedQueryRecord,
     _TerminalQueryGraph,
+    snapshot_sort_key,
 )
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
 
@@ -186,3 +189,43 @@ def _replay_inputs() -> SnapshotReplayInputs:
 
 fake_81 = _fake_81
 replay_inputs = _replay_inputs
+
+
+def store_inputs(*, current_phase: str = "SOURCES_READY"):
+    """Return sealed, deterministic inputs for source-inventory tests."""
+    from mlb_backtest.v52_snapshot_store import (
+        AuthorityBinding,
+        AuthorityBindings,
+        SnapshotStoreInputs,
+        TerminalCheckpointBinding,
+    )
+
+    bindings = AuthorityBindings(
+        run_spec=AuthorityBinding("audit/v5_2_qd/historical/run_spec.json", "a" * 64),
+        acquisition_contract=AuthorityBinding(
+            "audit/v5_2_qd/historical/acquisition_contract.json", "b" * 64
+        ),
+        terminal_checkpoint=TerminalCheckpointBinding(
+            "audit/v5_2_qd/historical/acquisition/checkpoint.json", "c" * 64, 81, "REMAINING"
+        ),
+        schedule_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical/schedule_inventory.json", "d" * 64
+        ),
+        game_evidence_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical/game_evidence_inventory.json", "e" * 64
+        ),
+        timezone_gate=AuthorityBinding(
+            "audit/v5_2_qd/historical/timezone_gate.json", "f" * 64
+        ),
+    )
+    return SnapshotStoreInputs(replay_inputs(), bindings, current_phase)
+
+
+@contextmanager
+def patched_store_replay():
+    """Keep inventory construction hermetic while exercising its replay boundary."""
+    with patch(
+        "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+        return_value=tuple(sorted(fake_81(), key=snapshot_sort_key)),
+    ):
+        yield
