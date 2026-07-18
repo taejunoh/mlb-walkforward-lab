@@ -266,6 +266,87 @@ class NormalizedSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class SnapshotReplayInputs:
+    """Immutable authorities required to replay the complete source set."""
+
+    run_id: str
+    graph: _TerminalQueryGraph
+    records: tuple[VerifiedQueryRecord, ...]
+    game_snapshots: tuple[NormalizedSnapshot, ...]
+    game_inventory: VerifiedGameEvidenceInventory
+    timezone_gate: VerifiedTimezoneGate
+    schedule_inventory: VerifiedScheduleAnchorInventory
+
+    @property
+    def game_evidence_inventory(self) -> VerifiedGameEvidenceInventory:
+        """Backward-compatible descriptive alias for the game authority."""
+        return self.game_inventory
+
+
+def snapshot_sort_key(snapshot: NormalizedSnapshot) -> tuple[object, ...]:
+    """Return the canonical ordering key for a normalized snapshot."""
+    coverage_start = ""
+    coverage_end = ""
+    if snapshot.source == "baseball_savant_statcast":
+        coverage = snapshot.payload.get("parent_coverage")
+        if isinstance(coverage, Mapping):
+            coverage_start = coverage.get("inclusive_start", "")
+            coverage_end = coverage.get("inclusive_end", "")
+    return (
+        snapshot.season,
+        snapshot.source,
+        snapshot.grain,
+        coverage_start,
+        coverage_end,
+    )
+
+
+def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedSnapshot, ...]:
+    """Purely replay all six normalized snapshot families from sealed inputs."""
+    if not isinstance(inputs, SnapshotReplayInputs):
+        raise TypeError("snapshot replay inputs must be SnapshotReplayInputs")
+    schedule = _build_game_normalized_snapshots(
+        inputs.run_id,
+        inputs.records,
+        inputs.game_inventory,
+        inputs.timezone_gate,
+        inputs.schedule_inventory,
+    )
+    if schedule != inputs.game_snapshots:
+        raise ValueError("upstream game snapshot authority differs")
+    statcast = _build_statcast_normalized_snapshots(
+        inputs.run_id, inputs.records, inputs.graph, schedule
+    )
+    pitching = _build_pitching_normalized_snapshots(
+        inputs.run_id, inputs.records, inputs.graph, schedule
+    )
+    reference = _build_reference_normalized_snapshots(
+        inputs.run_id,
+        inputs.records,
+        inputs.graph,
+        schedule,
+        inputs.timezone_gate,
+    )
+    history = _build_history_normalized_snapshots(inputs.run_id, schedule)
+    career = _build_career_bf_normalized_snapshots(
+        inputs.run_id, inputs.records, inputs.graph, schedule
+    )
+    snapshots = tuple(
+        sorted(
+            (*schedule, *statcast, *pitching, *reference, *history, *career),
+            key=snapshot_sort_key,
+        )
+    )
+    if (
+        len(snapshots) != 81
+        or len({snapshot.sha256 for snapshot in snapshots}) != 81
+        or len({(snapshot.season, snapshot.source) for snapshot in snapshots}) != 42
+    ):
+        raise ValueError("replay cardinality must be 81 unique snapshots and 42 source-seasons")
+    return snapshots
+
+
 def _plain_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _plain_json(item) for key, item in value.items()}
