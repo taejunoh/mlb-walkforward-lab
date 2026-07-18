@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import errno
 import hashlib
 import os
 import re
@@ -1308,6 +1309,565 @@ class LoaderTests(unittest.TestCase):
             )
             with self.assertRaises(PublishError):
                 load_snapshot_store(root, inputs)
+
+
+class AttackTests(unittest.TestCase):
+    """Filesystem adversary cases for authoritative snapshot-store names."""
+
+    def _inventory(self):
+        from mlb_backtest.v52_snapshot_store import build_inventory
+
+        with patched_store_replay():
+            return build_inventory(store_inputs())
+
+    def _publish(self, root, inventory):
+        from mlb_backtest.v52_snapshot_store import publish_snapshot_store
+
+        with patched_store_replay():
+            return publish_snapshot_store(
+                root, inventory, store_inputs(), lock_owner="attack-test"
+            )
+
+    def test_publisher_rejects_special_authoritative_leaves_without_opening_or_mutating_them(self):
+        """A FIFO must be refused by metadata, never opened for a blocking read."""
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import LockHeld, SnapshotStoreError
+
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("platform does not provide POSIX FIFOs")
+        inventory = self._inventory()
+        leaves = (
+            ("blob", inventory.snapshots[0].relative_path),
+            ("checksum", "source_inventory.sha256"),
+            ("inventory", "source_inventory.json"),
+            ("lock", ".snapshot-store.lock"),
+        )
+        for leaf_label, relative in leaves:
+            for kind in ("symlink", "hardlink", "fifo", "directory"):
+                with self.subTest(leaf=leaf_label, kind=kind), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    outside = root / "outside"
+                    outside.mkdir()
+                    external = outside / "external-bytes"
+                    external.write_bytes(b"external bytes must not change")
+                    if kind == "symlink":
+                        os.symlink(external, target)
+                    elif kind == "hardlink":
+                        os.link(external, target)
+                    elif kind == "fifo":
+                        os.mkfifo(target)
+                    elif kind == "directory":
+                        target.mkdir()
+                    before_external = external.read_bytes()
+                    original_open = store.os.open
+
+                    def refuse_fifo_open(path, flags, *args, **kwargs):
+                        if kind == "fifo" and leaf_label != "lock" and path == target.name:
+                            raise AssertionError("publisher attempted to open FIFO leaf")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    expected = LockHeld if leaf_label == "lock" else SnapshotStoreError
+                    with patch.object(store.os, "open", side_effect=refuse_fifo_open):
+                        with self.assertRaises(expected):
+                            self._publish(root, inventory)
+                    self.assertEqual(external.read_bytes(), before_external)
+                    self.assertTrue(os.path.lexists(target))
+
+    def test_loader_rejects_fifo_authoritative_leaves_without_opening_or_cleaning_them(self):
+        """The read-only path has the same non-blocking special-file invariant."""
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import LockHeld, PublishError, load_snapshot_store
+
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("platform does not provide POSIX FIFOs")
+        inventory = self._inventory()
+        leaves = (
+            ("blob", inventory.snapshots[0].relative_path),
+            ("checksum", "source_inventory.sha256"),
+            ("inventory", "source_inventory.json"),
+            ("lock", ".snapshot-store.lock"),
+        )
+        for leaf_label, relative in leaves:
+            with self.subTest(leaf=leaf_label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._publish(root, inventory)
+                target = root / relative
+                if target.exists():
+                    target.unlink()
+                os.mkfifo(target)
+                original_open = store.os.open
+
+                def refuse_fifo_open(path, flags, *args, **kwargs):
+                    if leaf_label != "lock" and path == target.name:
+                        raise AssertionError("loader attempted to open FIFO leaf")
+                    return original_open(path, flags, *args, **kwargs)
+
+                expected = LockHeld if leaf_label == "lock" else PublishError
+                with patch.object(store.os, "open", side_effect=refuse_fifo_open):
+                    with self.assertRaises(expected):
+                        load_snapshot_store(root, store_inputs())
+                self.assertTrue(os.path.lexists(target))
+
+    def test_loader_rejects_symlink_hardlink_and_directory_authoritative_leaves_without_cleanup(self):
+        from mlb_backtest.v52_snapshot_store import LockHeld, PublishError, load_snapshot_store
+
+        inventory = self._inventory()
+        leaves = (
+            ("blob", inventory.snapshots[0].relative_path),
+            ("checksum", "source_inventory.sha256"),
+            ("inventory", "source_inventory.json"),
+            ("lock", ".snapshot-store.lock"),
+        )
+        for leaf_label, relative in leaves:
+            for kind in ("symlink", "hardlink", "directory"):
+                with self.subTest(leaf=leaf_label, kind=kind), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    self._publish(root, inventory)
+                    target = root / relative
+                    if target.exists():
+                        target.unlink()
+                    outside = root / "outside"
+                    outside.mkdir()
+                    external = outside / "external-bytes"
+                    external.write_bytes(b"external bytes must not change")
+                    if kind == "symlink":
+                        os.symlink(external, target)
+                    elif kind == "hardlink":
+                        os.link(external, target)
+                    else:
+                        target.mkdir()
+                    before_external = external.read_bytes()
+                    expected = LockHeld if leaf_label == "lock" else PublishError
+                    with self.assertRaises(expected):
+                        load_snapshot_store(root, store_inputs())
+                    self.assertEqual(external.read_bytes(), before_external)
+                    self.assertTrue(os.path.lexists(target))
+
+    def test_unix_socket_authoritative_root_leaves_are_rejected_without_cleanup(self):
+        from mlb_backtest.v52_snapshot_store import LockHeld, PublishError, SnapshotStoreError, load_snapshot_store
+
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("platform does not provide Unix-domain sockets")
+        inventory = self._inventory()
+        for leaf_label, relative in (
+            ("checksum", "source_inventory.sha256"),
+            ("inventory", "source_inventory.json"),
+            ("lock", ".snapshot-store.lock"),
+        ):
+            with self.subTest(mode="publisher", leaf=leaf_label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                target = root / relative
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(target))
+                try:
+                    expected = LockHeld if leaf_label == "lock" else SnapshotStoreError
+                    with self.assertRaises(expected):
+                        self._publish(root, inventory)
+                    self.assertTrue(os.path.lexists(target))
+                finally:
+                    listener.close()
+            with self.subTest(mode="loader", leaf=leaf_label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._publish(root, inventory)
+                target = root / relative
+                if target.exists():
+                    target.unlink()
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(target))
+                try:
+                    expected = LockHeld if leaf_label == "lock" else PublishError
+                    with self.assertRaises(expected):
+                        load_snapshot_store(root, store_inputs())
+                    self.assertTrue(os.path.lexists(target))
+                finally:
+                    listener.close()
+
+    def test_snapshot_blob_unix_socket_substitution_rejects_publisher_and_loader(self):
+        from mlb_backtest.v52_snapshot_store import PublishError, SnapshotStoreError, load_snapshot_store
+
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("platform does not provide Unix-domain sockets")
+        inventory = self._inventory()
+        for mode in ("publisher", "loader"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir="/tmp", prefix="v52-") as directory:
+                root = Path(directory)
+                self.assertTrue(root.is_absolute())
+                target = root / inventory.snapshots[0].relative_path
+                if mode == "publisher":
+                    target.parent.mkdir(parents=True)
+                else:
+                    self._publish(root, inventory)
+                    target.unlink()
+                staging = root / ".socket-staging"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    try:
+                        listener.bind(str(staging))
+                    except OSError as exc:
+                        if exc.errno == errno.ENAMETOOLONG:
+                            self.skipTest("platform sockaddr_un path limit prevents blob socket setup")
+                        raise
+                    os.rename(staging, target)
+                    before = os.lstat(target)
+                    if mode == "publisher":
+                        with self.assertRaises(SnapshotStoreError):
+                            self._publish(root, inventory)
+                    else:
+                        with patched_store_replay():
+                            with self.assertRaises(PublishError):
+                                load_snapshot_store(root, store_inputs())
+                    after = os.lstat(target)
+                    self.assertEqual((after.st_dev, after.st_ino, after.st_mode), (
+                        before.st_dev, before.st_ino, before.st_mode,
+                    ))
+                finally:
+                    listener.close()
+
+    def test_publisher_rebinds_root_season_and_source_before_writing_after_path_replacement(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError
+
+        inventory = self._inventory()
+        first = inventory.snapshots[0]
+        for target_kind in ("root", "season", "source"):
+            for replacement_kind in ("symlink", "different-directory"):
+                with self.subTest(target=target_kind, replacement=replacement_kind), tempfile.TemporaryDirectory() as directory:
+                    container = Path(directory).resolve()
+                    root = container / "root"
+                    root.mkdir()
+                    outside = container / "outside"
+                    outside.mkdir()
+                    swapped = False
+                    outside_state = None
+
+                    def attack(stage):
+                        nonlocal swapped, outside_state
+                        if stage != "after_directory_open_before_temp_publish" or swapped:
+                            return
+                        swapped = True
+                        target = {
+                            "root": root,
+                            "season": root / str(first.season),
+                            "source": root / str(first.season) / first.source,
+                        }[target_kind]
+                        moved = outside / f"moved-{target_kind}"
+                        os.rename(target, moved)
+                        if replacement_kind == "symlink":
+                            os.symlink(outside, target)
+                        else:
+                            target.mkdir()
+                        outside_state = {
+                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
+                            for path in outside.rglob("*") if path.is_file()
+                        }
+
+                    with patch.object(store, "_publish_test_hook", side_effect=attack):
+                        with self.assertRaises(PublishError):
+                            self._publish(root, inventory)
+                    self.assertTrue(swapped)
+                    self.assertEqual(
+                        {
+                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
+                            for path in outside.rglob("*") if path.is_file()
+                        },
+                        outside_state,
+                    )
+                    self.assertTrue(os.path.lexists({
+                        "root": root,
+                        "season": root / str(first.season),
+                        "source": root / str(first.season) / first.source,
+                    }[target_kind]))
+
+    def test_loader_rebinds_root_season_and_source_after_held_directory_open(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, load_snapshot_store
+
+        inventory = self._inventory()
+        first = inventory.snapshots[0]
+        for target_kind in ("root", "season", "source"):
+            for replacement_kind in ("symlink", "different-directory"):
+                with self.subTest(target=target_kind, replacement=replacement_kind), tempfile.TemporaryDirectory() as directory:
+                    container = Path(directory).resolve()
+                    root = container / "root"
+                    root.mkdir()
+                    self._publish(root, inventory)
+                    outside = container / "outside"
+                    outside.mkdir()
+                    swapped = False
+                    outside_state = None
+
+                    def attack(stage):
+                        nonlocal swapped, outside_state
+                        if stage != "after_initial_reads" or swapped:
+                            return
+                        swapped = True
+                        target = {
+                            "root": root,
+                            "season": root / str(first.season),
+                            "source": root / str(first.season) / first.source,
+                        }[target_kind]
+                        moved = outside / f"moved-{target_kind}"
+                        os.rename(target, moved)
+                        if replacement_kind == "symlink":
+                            os.symlink(outside, target)
+                        else:
+                            target.mkdir()
+                        outside_state = {
+                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
+                            for path in outside.rglob("*") if path.is_file()
+                        }
+
+                    with patch.object(store, "_load_test_hook", side_effect=attack):
+                        with self.assertRaises(PublishError):
+                            load_snapshot_store(root, store_inputs())
+                    self.assertTrue(swapped)
+                    self.assertEqual(
+                        {
+                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
+                            for path in outside.rglob("*") if path.is_file()
+                        },
+                        outside_state,
+                    )
+
+    def test_parser_rejects_all_path_escape_components_without_filesystem_access(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import inventory_bytes, parse_inventory
+
+        raw = inventory_bytes(self._inventory())
+        mutations = (
+            ("binding-absolute", "run_spec", "/outside/run_spec.json"),
+            ("binding-parent", "run_spec", "audit/../outside.json"),
+            ("binding-empty", "run_spec", "audit//outside.json"),
+            ("binding-dot", "run_spec", "audit/./outside.json"),
+            ("binding-backslash", "run_spec", "audit\\outside.json"),
+            ("binding-control", "run_spec", "audit/\x7foutside.json"),
+            ("snapshot-absolute", "snapshot", "/outside.snapshot.json"),
+            ("snapshot-parent", "snapshot", "../outside.snapshot.json"),
+            ("snapshot-empty", "snapshot", "2018//outside.snapshot.json"),
+            ("snapshot-dot", "snapshot", "2018/./outside.snapshot.json"),
+            ("snapshot-backslash", "snapshot", "2018\\outside.snapshot.json"),
+            ("snapshot-control", "snapshot", "2018/\x00outside.snapshot.json"),
+        )
+        for label, target, path in mutations:
+            with self.subTest(label=label):
+                candidate = json.loads(raw)
+                if target == "snapshot":
+                    candidate["snapshots"][0]["relative_path"] = path
+                else:
+                    candidate[target]["path"] = path
+                with patch.object(store.os, "open", side_effect=AssertionError("parser opened a path")):
+                    with self.assertRaises((TypeError, ValueError)):
+                        parse_inventory(_canonical_raw(candidate))
+        for label, path in (
+            ("season-mismatch", "2019/baseball_savant_statcast/"),
+            ("source-mismatch", "2018/mlb_stats_pitching/"),
+        ):
+            with self.subTest(label=label):
+                candidate = json.loads(raw)
+                row = candidate["snapshots"][0]
+                row["relative_path"] = path + row["snapshot_sha256"] + ".snapshot.json"
+                with self.assertRaises((TypeError, ValueError)):
+                    parse_inventory(_canonical_raw(candidate))
+
+    def test_concurrent_checksum_and_inventory_links_accept_exact_bytes_and_reject_conflicts(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishConflict, inventory_bytes
+
+        inventory = self._inventory()
+        expected_by_name = {
+            "source_inventory.sha256": hashlib.sha256(inventory_bytes(inventory)).hexdigest().encode() + b"\n",
+            "source_inventory.json": inventory_bytes(inventory),
+        }
+        for target_name, expected_bytes in expected_by_name.items():
+            for race_bytes, error in ((expected_bytes, None), (b"concurrent attacker bytes\n", PublishConflict)):
+                with self.subTest(target=target_name, identical=error is None), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    original_link = store.os.link
+                    tripped = False
+
+                    def race(source, destination, *args, **kwargs):
+                        nonlocal tripped
+                        if not tripped and destination == target_name:
+                            tripped = True
+                            fd = os.open(
+                                destination,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                                0o600,
+                                dir_fd=kwargs["dst_dir_fd"],
+                            )
+                            try:
+                                os.write(fd, race_bytes)
+                            finally:
+                                os.close(fd)
+                            raise FileExistsError
+                        return original_link(source, destination, *args, **kwargs)
+
+                    with patch.object(store.os, "link", side_effect=race):
+                        if error is None:
+                            self._publish(root, inventory)
+                        else:
+                            with self.assertRaises(error):
+                                self._publish(root, inventory)
+                    self.assertTrue(tripped)
+                    self.assertEqual((root / target_name).read_bytes(), race_bytes)
+
+    def test_crash_boundaries_require_operator_lock_handling_before_identical_retry(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError
+
+        inventory = self._inventory()
+        for stage in ("after_blobs", "after_checksum", "before_inventory_link"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+
+                def interrupt(current):
+                    if current == stage:
+                        raise RuntimeError(stage)
+
+                def leave_lock(lock, _root):
+                    os.close(lock.fd)
+                    raise PublishError("simulated crash left lock")
+
+                with patch.object(store, "_publish_test_hook", side_effect=interrupt), patch.object(
+                    store, "_release_lock", side_effect=leave_lock
+                ):
+                    with self.assertRaises(PublishError):
+                        self._publish(root, inventory)
+                lock = root / ".snapshot-store.lock"
+                self.assertTrue(lock.exists())
+                self.assertFalse((root / "source_inventory.json").exists())
+                self.assertEqual(
+                    (root / "source_inventory.sha256").exists(), stage != "after_blobs"
+                )
+                lock.unlink()  # Explicit operator-authorized stale-lock removal.
+                self._publish(root, inventory)
+
+    def test_operator_released_stale_lock_converges_linked_checksum_residue(self):
+        from mlb_backtest.v52_snapshot_store import LockHeld
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._publish(root, inventory)
+            target = root / "source_inventory.sha256"
+            residue = root / ".tmp-fixture-run-crashed-checksum"
+            os.link(target, residue)
+            lock = root / ".snapshot-store.lock"
+            lock.write_bytes(b"operator must release this stale lock\n")
+            with self.assertRaises(LockHeld):
+                self._publish(root, inventory)
+            self.assertTrue(residue.exists())
+            lock.unlink()  # Explicit operator-authorized stale-lock removal.
+            self._publish(root, inventory)
+            self.assertFalse(residue.exists())
+            self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_crash_after_inventory_leaves_exact_loadable_commit_after_operator_lock_handling(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, inventory_bytes, load_snapshot_store
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            def interrupt(stage):
+                if stage == "after_inventory":
+                    raise RuntimeError(stage)
+
+            def leave_lock(lock, _root):
+                os.close(lock.fd)
+                raise PublishError("simulated crash left lock")
+
+            with patch.object(store, "_publish_test_hook", side_effect=interrupt), patch.object(
+                store, "_release_lock", side_effect=leave_lock
+            ):
+                with self.assertRaises(PublishError):
+                    self._publish(root, inventory)
+            self.assertEqual((root / "source_inventory.json").read_bytes(), inventory_bytes(inventory))
+            lock = root / ".snapshot-store.lock"
+            self.assertTrue(lock.exists())
+            lock.unlink()  # Explicit operator-authorized stale-lock removal.
+            with patched_store_replay():
+                loaded = load_snapshot_store(root, store_inputs())
+            self.assertEqual(loaded.inventory, inventory)
+
+    def test_same_store_loads_identically_in_both_allowed_phases_without_mutation(self):
+        from mlb_backtest.v52_snapshot_store import inventory_bytes, load_snapshot_store, read_inventory
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._publish(root, inventory)
+            before = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino, path.stat().st_nlink)
+                for path in root.rglob("*") if path.is_file()
+            }
+            acquiring = store_inputs(current_phase="ACQUIRING")
+            sources_ready = store_inputs(current_phase="SOURCES_READY")
+            with patched_store_replay():
+                acquired = load_snapshot_store(root, acquiring)
+                ready = load_snapshot_store(root, sources_ready)
+            self.assertEqual(acquired.inventory, ready.inventory)
+            self.assertEqual(inventory_bytes(acquired.inventory), inventory_bytes(ready.inventory))
+            self.assertEqual(read_inventory(root), inventory)
+            after = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino, path.stat().st_nlink)
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+    def test_leaf_replacement_between_metadata_check_and_open_uses_nonblocking_read(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, load_snapshot_store
+
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("platform does not provide POSIX FIFO nonblocking opens")
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._publish(root, inventory)
+            target = root / inventory.snapshots[0].relative_path
+            original_open = store.os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and path == target.name:
+                    swapped = True
+                    if not flags & os.O_NONBLOCK:
+                        raise AssertionError("immutable reader opened a raced FIFO without O_NONBLOCK")
+                    target.unlink()
+                    os.mkfifo(target)
+                return original_open(path, flags, *args, **kwargs)
+
+            with patch.object(store.os, "open", side_effect=swap_before_open), patched_store_replay():
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, store_inputs())
+            self.assertTrue(swapped)
+            self.assertTrue(os.path.lexists(target))
+
+    def test_missing_nonblocking_capability_fails_before_opening_an_authoritative_leaf(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, load_snapshot_store
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._publish(root, inventory)
+            original_open = store.os.open
+
+            def permit_directories_only(path, flags, *args, **kwargs):
+                if path in {"source_inventory.sha256", "source_inventory.json"}:
+                    raise AssertionError("opened authoritative leaf without O_NONBLOCK capability")
+                return original_open(path, flags, *args, **kwargs)
+
+            with patch.object(store, "_OPEN_READONLY", None), patch.object(
+                store.os, "open", side_effect=permit_directories_only
+            ):
+                with self.assertRaisesRegex(PublishError, "O_NONBLOCK"):
+                    load_snapshot_store(root, store_inputs())
 
 
 if __name__ == "__main__":

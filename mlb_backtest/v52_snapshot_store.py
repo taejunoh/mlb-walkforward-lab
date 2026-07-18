@@ -1,4 +1,9 @@
-"""Immutable, canonical source-inventory contract for the v5.2 snapshot set."""
+"""Immutable, canonical source-inventory contract for the v5.2 snapshot set.
+
+Supported runtimes require POSIX ``dir_fd``, ``O_DIRECTORY``, ``O_NOFOLLOW``, and
+``O_NONBLOCK`` behavior.  Immutable leaf reads fail closed when that capability
+is unavailable; there is no safe blocking-read fallback for special files.
+"""
 
 from __future__ import annotations
 
@@ -640,6 +645,16 @@ def _reject_duplicate_object_keys(pairs: list[tuple[str, object]]) -> dict[str, 
 
 _OPEN_COMMON = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _OPEN_DIRECTORY = _OPEN_COMMON | getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK: int | None = getattr(os, "O_NONBLOCK", None)
+_OPEN_READONLY: int | None = (
+    _OPEN_COMMON | _O_NONBLOCK if isinstance(_O_NONBLOCK, int) else None
+)
+
+
+def _readonly_open_flags() -> int:
+    if _OPEN_READONLY is None:
+        raise PublishError("immutable snapshot-store reads require O_NONBLOCK")
+    return os.O_RDONLY | _OPEN_READONLY
 
 
 @dataclass(frozen=True)
@@ -875,7 +890,9 @@ def _read_snapshot_bindings(
 def _read_immutable_binding(parent: _HeldDirectory, name: str) -> _ReadBinding:
     try:
         _rebind_directory(parent)
-        fd = os.open(name, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        _require_regular_single_link(named, f"immutable read target {name!r}")
+        fd = os.open(name, _readonly_open_flags(), dir_fd=parent.fd)
         try:
             before = os.fstat(fd)
             _require_regular_single_link(before, f"immutable read target {name!r}")
@@ -1307,7 +1324,7 @@ def _authenticate_lock(lock: _OwnedLock, root: _HeldDirectory) -> None:
         named = os.stat(lock.path.name, dir_fd=root.fd, follow_symlinks=False)
         if (named.st_dev, named.st_ino) != (lock.device, lock.inode):
             raise PublishError("owned lock identity changed")
-        read_fd = os.open(lock.path.name, os.O_RDONLY | _OPEN_COMMON, dir_fd=root.fd)
+        read_fd = os.open(lock.path.name, _readonly_open_flags(), dir_fd=root.fd)
         try:
             opened = os.fstat(read_fd)
             _require_regular_single_link(opened, "owned lock")
@@ -1433,7 +1450,10 @@ def _verify_immutable(
 ) -> None:
     try:
         _rebind_directory(parent)
-        fd = os.open(name, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        if not stat.S_ISREG(named.st_mode) or named.st_nlink not in {1, 2}:
+            raise PublishConflict("immutable publication target must be a regular one- or two-link file")
+        fd = os.open(name, _readonly_open_flags(), dir_fd=parent.fd)
         try:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink not in {1, 2}:
@@ -1486,7 +1506,7 @@ def _converge_owned_linked_temp(
         details = os.stat(alias, dir_fd=parent.fd, follow_symlinks=False)
         if not stat.S_ISREG(details.st_mode) or not _same_file_state(details, target):
             raise PublishConflict("linked temp residue does not exactly bind immutable target")
-        fd = os.open(alias, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        fd = os.open(alias, _readonly_open_flags(), dir_fd=parent.fd)
         try:
             opened = os.fstat(fd)
             alias_bytes = _read_all(fd)
