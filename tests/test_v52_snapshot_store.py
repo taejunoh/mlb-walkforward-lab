@@ -359,6 +359,7 @@ class PublishTests(unittest.TestCase):
                 root, inventory or self._inventory(), inputs or store_inputs(), lock_owner="publish-test"
             )
 
+
     def test_fresh_publish_is_content_addressed_and_removes_owned_lock(self):
         from mlb_backtest.v52_snapshot_store import PublishReceipt, inventory_bytes
 
@@ -728,6 +729,585 @@ class PublishTests(unittest.TestCase):
             self.assertIsInstance(caught.exception.primary_error, RuntimeError)
             self.assertIsInstance(caught.exception.cleanup_error, PublishError)
             self.assertEqual(lock.read_bytes(), b"replacement lock\n")
+
+
+class LoaderTests(unittest.TestCase):
+    """Read-only consumers must replay exactly the published snapshot store."""
+
+    def _publish(self, root, inventory, inputs):
+        from mlb_backtest.v52_snapshot_store import publish_snapshot_store
+
+        with patched_store_replay():
+            return publish_snapshot_store(root, inventory, inputs, lock_owner="loader-test")
+
+    @staticmethod
+    def _tree_state(root):
+        return {
+            path.relative_to(root): (path.read_bytes(), path.stat().st_ino, path.stat().st_nlink)
+            for path in root.rglob("*") if path.is_file()
+        }
+
+    def test_publish_then_load_returns_immutable_exact_replay(self):
+        from mlb_backtest.v52_snapshot_store import (
+            LoadedSnapshotStore,
+            build_inventory,
+            load_snapshot_store,
+            publish_snapshot_store,
+        )
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            publish_snapshot_store(root, inventory, inputs, lock_owner="loader-test")
+            loaded = load_snapshot_store(root, inputs)
+        self.assertIsInstance(loaded, LoadedSnapshotStore)
+        self.assertEqual(loaded.inventory, inventory)
+        self.assertEqual(loaded.snapshots, tuple(sorted(fake_81(), key=verifier.snapshot_sort_key)))
+        with self.assertRaises(FrozenInstanceError):
+            loaded.inventory = inventory  # type: ignore[misc]
+
+    def test_publisher_verifies_with_its_owned_lock_before_release(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import build_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            original = store._load_snapshot_store_held
+            calls = []
+
+            def observe(held_root, observed_inputs, *, owned_lock):
+                calls.append(owned_lock)
+                return original(held_root, observed_inputs, owned_lock=owned_lock)
+
+            with patch.object(store, "_load_snapshot_store_held", side_effect=observe):
+                self._publish(root, inventory, inputs)
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(calls[0], store._OwnedLock)
+
+    def test_public_reader_rejects_any_lock_without_changing_it(self):
+        from mlb_backtest.v52_snapshot_store import LockHeld, build_inventory, load_snapshot_store, read_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            lock = root / ".snapshot-store.lock"
+            lock.write_bytes(b"untrusted lock\n")
+            before = (lock.read_bytes(), lock.stat().st_ino)
+            with self.assertRaises(LockHeld):
+                read_inventory(root)
+            with self.assertRaises(LockHeld):
+                load_snapshot_store(root, inputs)
+            self.assertEqual((lock.read_bytes(), lock.stat().st_ino), before)
+
+    def test_read_inventory_rechecks_lock_created_at_return_boundary(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import LockHeld, build_inventory, read_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            lock = root / ".snapshot-store.lock"
+
+            def create_lock(stage):
+                if stage == "before_read_inventory_return":
+                    lock.write_bytes(b"arrived during read\n")
+
+            with patch.object(store, "_load_test_hook", side_effect=create_lock):
+                with self.assertRaises(LockHeld):
+                    read_inventory(root)
+            self.assertEqual(lock.read_bytes(), b"arrived during read\n")
+
+    def test_read_inventory_rejects_root_path_swapped_at_return_boundary(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, read_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "store"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+
+            def swap_root(stage):
+                if stage == "before_read_inventory_return":
+                    os.rename(root, base / "moved-store")
+                    os.rename(replacement, root)
+
+            with patch.object(store, "_load_test_hook", side_effect=swap_root):
+                with self.assertRaises(PublishError):
+                    read_inventory(root)
+
+    def test_loader_rejects_root_path_swapped_at_final_boundary(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "store"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+
+            def swap_root(stage):
+                if stage == "after_final_blob_reads":
+                    os.rename(root, base / "moved-store")
+                    os.rename(replacement, root)
+
+            with patch.object(store, "_load_test_hook", side_effect=swap_root):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+
+    def test_internal_loader_rejects_forged_owned_lock_for_other_file(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            forged_path = root / "not-the-lock"
+            contents = b"forged lock capability\n"
+            forged_path.write_bytes(contents)
+            fd = os.open(forged_path, os.O_RDONLY)
+            details = os.fstat(fd)
+            forged = store._OwnedLock(
+                fd, forged_path, details.st_dev, details.st_ino, "forged", contents,
+                inputs.replay.run_id, "forged-owner", object(),
+            )
+            held = store._open_readonly_root(root)
+            try:
+                with self.assertRaises(PublishError):
+                    store._load_snapshot_store_held(held, inputs, owned_lock=forged)
+            finally:
+                os.close(fd)
+                store._close_directory(held)
+
+    def test_internal_loader_rejects_wrong_issuer_for_canonical_lock(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            path = root / ".snapshot-store.lock"
+            nonce = "a" * 64
+            contents = json.dumps(
+                {"lock_owner": "forged-owner", "nonce": nonce, "run_id": inputs.replay.run_id},
+                sort_keys=True, separators=(",", ":"),
+            ).encode() + b"\n"
+            path.write_bytes(contents)
+            fd = os.open(path, os.O_RDONLY)
+            details = os.fstat(fd)
+            forged = store._OwnedLock(
+                fd, path, details.st_dev, details.st_ino, nonce, contents,
+                inputs.replay.run_id, "forged-owner", object(),
+            )
+            held = store._open_readonly_root(root)
+            try:
+                with self.assertRaises(PublishError):
+                    store._load_snapshot_store_held(held, inputs, owned_lock=forged)
+                self.assertEqual(path.read_bytes(), contents)
+            finally:
+                os.close(fd)
+                store._close_directory(held)
+
+    def test_loader_rejects_lock_created_after_final_blob_read(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import LockHeld, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            lock = root / ".snapshot-store.lock"
+
+            def create_lock(stage):
+                if stage == "after_final_blob_reads":
+                    lock.write_bytes(b"late lock\n")
+
+            with patch.object(store, "_load_test_hook", side_effect=create_lock):
+                with self.assertRaises(LockHeld):
+                    load_snapshot_store(root, inputs)
+            self.assertEqual(lock.read_bytes(), b"late lock\n")
+
+    def test_loader_uses_two_replays_not_four(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            replay = tuple(sorted(fake_81(), key=verifier.snapshot_sort_key))
+            with patch.object(store, "replay_verified_snapshots", return_value=replay) as called:
+                load_snapshot_store(root, inputs)
+            self.assertEqual(called.call_count, 2)
+
+    def test_loader_rejects_expected_bytes_boundary_divergence(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            original = store._expected_snapshot_bytes
+
+            def diverge(replayed, rebuilt):
+                expected = original(replayed, rebuilt)
+                return expected | {inventory.snapshots[0].snapshot_sha256: b"different bytes"}
+
+            with patch.object(store, "_expected_snapshot_bytes", side_effect=diverge):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+
+    def test_loaded_snapshot_payloads_are_deeply_immutable(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+
+        source = next(snapshot for snapshot in fake_81() if snapshot.source == "baseball_savant_statcast")
+        payload = dict(source.payload)
+        parent_coverage = dict(payload["parent_coverage"])
+        parent_coverage["nested"] = ["mutable", {"again": ["mutable"]}]
+        payload["parent_coverage"] = parent_coverage
+        envelope = source.as_mapping()
+        envelope["payload"] = payload
+        contents = canonical_json_bytes(envelope) + b"\n"
+        replacement = replace(
+            source, payload=payload, canonical_bytes=contents,
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
+        replay = tuple(sorted(
+            (replacement if snapshot.sha256 == source.sha256 else snapshot for snapshot in fake_81()),
+            key=verifier.snapshot_sort_key,
+        ))
+        with patch.object(store, "replay_verified_snapshots", return_value=replay), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = store.build_inventory(inputs)
+            store.publish_snapshot_store(root, inventory, inputs, lock_owner="immutable-test")
+            loaded = store.load_snapshot_store(root, inputs)
+        statcast = next(snapshot for snapshot in loaded.snapshots if snapshot.source == "baseball_savant_statcast")
+        parent_coverage = statcast.payload["parent_coverage"]
+        with self.assertRaises(TypeError):
+            parent_coverage["inclusive_start"] = "changed"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            parent_coverage["nested"][1]["again"] = ()  # type: ignore[index]
+
+    def test_loader_never_calls_write_capabilities_or_changes_tree(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import build_inventory, load_snapshot_store, read_inventory
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            before = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino, path.stat().st_nlink)
+                for path in root.rglob("*") if path.is_file()
+            }
+            original_open = store.os.open
+
+            def readonly_open(path, flags, *args, **kwargs):
+                self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+                self.assertFalse(flags & (os.O_CREAT | os.O_EXCL | os.O_TRUNC | os.O_APPEND))
+                return original_open(path, flags, *args, **kwargs)
+
+            forbidden = AssertionError("loader attempted a write capability")
+            with patch.object(store.os, "open", side_effect=readonly_open), patch.object(
+                store.os, "write", side_effect=forbidden
+            ), patch.object(store.os, "mkdir", side_effect=forbidden), patch.object(
+                store.os, "link", side_effect=forbidden
+            ), patch.object(store.os, "unlink", side_effect=forbidden), patch.object(
+                store.os, "replace", side_effect=forbidden
+            ), patch.object(store.os, "rename", side_effect=forbidden), patch.object(
+                store.os, "fsync", side_effect=forbidden), patch.object(
+                socket, "socket", side_effect=forbidden
+            ):
+                read = read_inventory(root)
+                loaded = load_snapshot_store(root, inputs)
+            self.assertEqual(read, inventory)
+            self.assertEqual(loaded.inventory, inventory)
+            after = {
+                path.relative_to(root): (path.read_bytes(), path.stat().st_ino, path.stat().st_nlink)
+                for path in root.rglob("*") if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+    def test_loader_rejects_bad_checksum_inventory_or_blob_without_cleanup(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            load_snapshot_store,
+        )
+
+        for target in ("source_inventory.sha256", "source_inventory.json", "blob"):
+            with self.subTest(target=target), patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inputs = store_inputs()
+                inventory = build_inventory(inputs)
+                self._publish(root, inventory, inputs)
+                path = root / (inventory.snapshots[0].relative_path if target == "blob" else target)
+                path.write_bytes(b"tampered\n")
+                before = path.read_bytes()
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_loader_rebind_rejects_same_byte_inode_replacement(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            target = root / inventory.snapshots[0].relative_path
+            replacement = target.with_name("replacement.snapshot.json")
+            replacement.write_bytes(target.read_bytes())
+
+            def replace_after_reads(stage):
+                if stage == "after_initial_reads":
+                    os.rename(replacement, target)
+
+            with patch.object(store, "_load_test_hook", side_effect=replace_after_reads):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+
+    def test_loader_rebind_rejects_same_byte_inventory_replacement(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            target = root / "source_inventory.json"
+            replacement = root / "replacement.inventory.json"
+            replacement.write_bytes(target.read_bytes())
+
+            def replace_after_reads(stage):
+                if stage == "after_initial_reads":
+                    os.rename(replacement, target)
+
+            with patch.object(store, "_load_test_hook", side_effect=replace_after_reads):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+
+    def test_loader_ignores_orphans_but_rejects_referenced_hardlink(self):
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            orphan = root / ".tmp-unrelated"
+            orphan.write_bytes(b"orphan")
+            target = root / inventory.snapshots[0].relative_path
+            alias = target.with_name("untrusted-alias")
+            os.link(target, alias)
+            before = (orphan.read_bytes(), orphan.stat().st_ino, alias.stat().st_ino)
+            with self.assertRaises(PublishError):
+                load_snapshot_store(root, inputs)
+            self.assertEqual((orphan.read_bytes(), orphan.stat().st_ino, alias.stat().st_ino), before)
+
+    def test_loader_ignores_unreferenced_temp_and_orphan_blob_without_mutation(self):
+        from mlb_backtest.v52_snapshot_store import build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            temp = root / ".tmp-unreferenced"
+            temp.write_bytes(b"prior publisher residue")
+            first = inventory.snapshots[0]
+            orphan = root / str(first.season) / first.source / "orphan.snapshot.json"
+            orphan.write_bytes(b"unreferenced blob")
+            before = self._tree_state(root)
+            loaded = load_snapshot_store(root, inputs)
+            self.assertEqual(loaded.inventory, inventory)
+            self.assertEqual(self._tree_state(root), before)
+
+    def test_loader_rejects_missing_files_and_malformed_store_members_without_cleanup(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            load_snapshot_store,
+            parse_inventory,
+        )
+
+        cases = (
+            ("missing-checksum", "source_inventory.sha256", None),
+            ("missing-inventory", "source_inventory.json", None),
+            ("missing-blob", "blob", None),
+            ("bad-checksum-syntax", "source_inventory.sha256", b"A" * 64 + b"\n"),
+            ("bad-checksum-newline", "source_inventory.sha256", b"a" * 64),
+            ("invalid-inventory", "source_inventory.json", b"{}\n"),
+            ("noncanonical-inventory", "source_inventory.json", b"{ }\n"),
+            ("malformed-blob", "blob", b"not json\n"),
+            ("tampered-blob", "blob", b'{"changed":true}\n'),
+        )
+        for label, target, contents in cases:
+            with self.subTest(label=label), patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inputs = store_inputs()
+                inventory = build_inventory(inputs)
+                self._publish(root, inventory, inputs)
+                path = root / (inventory.snapshots[0].relative_path if target == "blob" else target)
+                if contents is None:
+                    path.unlink()
+                    expected = False
+                else:
+                    path.write_bytes(contents)
+                    expected = contents
+                    if target == "source_inventory.json":
+                        (root / "source_inventory.sha256").write_bytes(
+                            hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n"
+                        )
+                        with self.assertRaises(ValueError):
+                            parse_inventory(contents)
+                before = self._tree_state(root)
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+                self.assertEqual(path.exists(), expected is not False)
+                if expected is not False:
+                    self.assertEqual(path.read_bytes(), expected)
+                self.assertEqual(self._tree_state(root), before)
+
+    def test_loader_rejects_wrong_authorities_run_id_and_phase_without_mutation(self):
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        binding_names = (
+            "run_spec", "acquisition_contract", "terminal_checkpoint", "schedule_inventory",
+            "game_evidence_inventory", "timezone_gate",
+        )
+        for label in ("run_id", *binding_names, "phase"):
+            with self.subTest(label=label), patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inputs = store_inputs()
+                inventory = build_inventory(inputs)
+                self._publish(root, inventory, inputs)
+                if label == "run_id":
+                    bad_inputs = replace(inputs, replay=replace(inputs.replay, run_id="wrong-run"))
+                elif label == "phase":
+                    bad_inputs = replace(inputs, current_phase="TERMINAL")
+                else:
+                    binding = getattr(inputs.bindings, label)
+                    bad_bindings = replace(inputs.bindings, **{label: replace(binding, sha256="0" * 64)})
+                    bad_inputs = replace(inputs, bindings=bad_bindings)
+                before = self._tree_state(root)
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, bad_inputs)
+                self.assertEqual(self._tree_state(root), before)
+
+    def test_loader_rejects_replay_exception_and_mismatch_without_mutation(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        for label, failure, expected in (
+            ("exception", RuntimeError("replay failed"), RuntimeError),
+            ("mismatch", tuple(reversed(fake_81())), PublishError),
+        ):
+            with self.subTest(label=label), patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inputs = store_inputs()
+                inventory = build_inventory(inputs)
+                self._publish(root, inventory, inputs)
+                before = self._tree_state(root)
+                with patch.object(store, "replay_verified_snapshots", side_effect=failure):
+                    with self.assertRaises(expected):
+                        load_snapshot_store(root, inputs)
+                self.assertEqual(self._tree_state(root), before)
+
+    def test_loader_rejects_replay_mutated_between_first_and_second_replay(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, build_inventory, load_snapshot_store
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            before = self._tree_state(root)
+            changed = False
+            stable = tuple(sorted(fake_81(), key=verifier.snapshot_sort_key))
+
+            def mutate_at_boundary(stage):
+                nonlocal changed
+                if stage == "between_replays":
+                    changed = True
+
+            def replay(_inputs):
+                return tuple(reversed(stable)) if changed else stable
+
+            with patch.object(store, "_load_test_hook", side_effect=mutate_at_boundary), patch.object(
+                store, "replay_verified_snapshots", side_effect=replay
+            ):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, inputs)
+            self.assertTrue(changed)
+            self.assertEqual(self._tree_state(root), before)
+
+    def test_loader_rejects_checksum_valid_same_season_statcast_permutation(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            load_snapshot_store,
+            parse_inventory,
+        )
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            raw = json.loads((root / "source_inventory.json").read_bytes())
+            indexes = [
+                index for index, row in enumerate(raw["snapshots"])
+                if row["season"] == 2018 and row["source"] == "baseball_savant_statcast"
+            ]
+            self.assertGreater(len(indexes), 1)
+            reordered = list(reversed([raw["snapshots"][index] for index in indexes]))
+            for index, row in zip(indexes, reordered, strict=True):
+                raw["snapshots"][index] = row
+            raw["snapshot_sha256s"] = [row["snapshot_sha256"] for row in raw["snapshots"]]
+            source_season = next(
+                row for row in raw["source_seasons"]
+                if row["season"] == 2018 and row["source"] == "baseball_savant_statcast"
+            )
+            source_season["snapshot_sha256s"] = [row["snapshot_sha256"] for row in reordered]
+            tampered = _canonical_raw(raw)
+            parse_inventory(tampered)
+            (root / "source_inventory.json").write_bytes(tampered)
+            (root / "source_inventory.sha256").write_bytes(
+                hashlib.sha256(tampered).hexdigest().encode() + b"\n"
+            )
+            with self.assertRaises(PublishError):
+                load_snapshot_store(root, inputs)
 
 
 if __name__ == "__main__":

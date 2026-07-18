@@ -10,11 +10,11 @@ import secrets
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
-import jsonschema
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 from .v52_source_contracts import canonical_json_bytes
@@ -27,6 +27,7 @@ from .v52_verify_sources import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LOCK_ISSUER = object()
 _SOURCES = (
     "baseball_savant_statcast",
     "mlb_schedule_game_feed",
@@ -106,6 +107,17 @@ class PublishReceipt:
     snapshot_count: int
 
 
+@dataclass(frozen=True)
+class LoadedSnapshotStore:
+    """A fully revalidated, immutable replay of a published snapshot store."""
+
+    inventory: SourceInventory
+    snapshots: tuple[NormalizedSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "snapshots", tuple(self.snapshots))
+
+
 class SnapshotStoreError(Exception):
     """Base class for immutable snapshot-store publication failures."""
 
@@ -130,6 +142,9 @@ class _OwnedLock:
     inode: int
     nonce: str
     contents: bytes
+    run_id: str
+    lock_owner: str
+    issuer: object
 
 
 @dataclass(frozen=True)
@@ -263,6 +278,11 @@ class SourceInventory:
 
 def build_inventory(inputs: SnapshotStoreInputs) -> SourceInventory:
     """Replay sealed normalized snapshots into the closed source-inventory contract."""
+    _validate_build_inputs(inputs)
+    return _build_inventory_from_replayed(inputs, tuple(replay_verified_snapshots(inputs.replay)))
+
+
+def _validate_build_inputs(inputs: SnapshotStoreInputs) -> None:
     if not isinstance(inputs, SnapshotStoreInputs):
         raise TypeError("snapshot store inputs must be SnapshotStoreInputs")
     if inputs.current_phase not in {"ACQUIRING", "SOURCES_READY"}:
@@ -272,7 +292,12 @@ def build_inventory(inputs: SnapshotStoreInputs) -> SourceInventory:
     _validate_bindings(inputs.bindings)
     if not isinstance(inputs.replay.run_id, str) or not inputs.replay.run_id:
         raise ValueError("replay run_id must be a nonempty string")
-    snapshots = replay_verified_snapshots(inputs.replay)
+
+
+def _build_inventory_from_replayed(
+    inputs: SnapshotStoreInputs, snapshots: tuple[NormalizedSnapshot, ...]
+) -> SourceInventory:
+    _validate_build_inputs(inputs)
     if tuple(snapshots) != tuple(sorted(snapshots, key=snapshot_sort_key)):
         raise ValueError("replayed snapshots must use canonical snapshot_sort_key order")
     rows = tuple(_row_from_snapshot(snapshot, inputs.replay.run_id) for snapshot in snapshots)
@@ -548,12 +573,19 @@ def _require_sha(value: object, label: str) -> None:
 
 
 def _validate_schema(payload: Mapping[str, object]) -> None:
-    schema = json.loads((Path(__file__).resolve().parent.parent / "schemas" / "v5_2_source_inventory.schema.json").read_text(encoding="utf-8"))
     try:
-        Draft202012Validator.check_schema(schema)
-        jsonschema.validate(dict(payload), schema, format_checker=FormatChecker())
+        _inventory_schema_validator().validate(dict(payload))
     except (ValidationError, ValueError) as exc:
         raise ValueError("source inventory schema validation failed") from exc
+
+
+@lru_cache(maxsize=1)
+def _inventory_schema_validator() -> Draft202012Validator:
+    schema = json.loads(
+        (Path(__file__).resolve().parent.parent / "schemas" / "v5_2_source_inventory.schema.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema, format_checker=FormatChecker())
 
 
 def _array(value: object, label: str) -> list[object]:
@@ -620,6 +652,334 @@ class _HeldDirectory:
     inode: int
 
 
+@dataclass(frozen=True)
+class _ReadBinding:
+    contents: bytes
+    device: int
+    inode: int
+    mode: int
+    nlink: int
+
+
+def read_inventory(root: Path) -> SourceInventory:
+    """Read and canonically parse the committed inventory without mutating the store."""
+    held = _open_readonly_root(root)
+    try:
+        _reject_unowned_lock(held)
+        _, _, inventory = _read_inventory_bindings(held)
+        _load_test_hook("before_read_inventory_return")
+        _reject_unowned_lock(held)
+        return inventory
+    finally:
+        _close_directory(held)
+
+
+def load_snapshot_store(root: Path, inputs: SnapshotStoreInputs) -> LoadedSnapshotStore:
+    """Read only an exactly replayable committed store; never repair its residue."""
+    held = _open_readonly_root(root)
+    try:
+        _reject_unowned_lock(held)
+        return _load_snapshot_store_held(held, inputs, owned_lock=None)
+    finally:
+        _close_directory(held)
+
+
+def _load_snapshot_store_held(
+    root: _HeldDirectory,
+    inputs: SnapshotStoreInputs,
+    *,
+    owned_lock: _OwnedLock | None,
+) -> LoadedSnapshotStore:
+    """The publisher-only path accepts a held lock capability, never a nonce string."""
+    _validate_load_inputs(inputs)
+    if owned_lock is None:
+        _reject_unowned_lock(root)
+    else:
+        if not isinstance(owned_lock, _OwnedLock):
+            raise PublishError("loader lock proof must be an owned lock capability")
+        _authenticate_lock(owned_lock, root)
+
+    checksum, inventory_binding, inventory = _read_inventory_bindings(root)
+    _validate_loaded_authorities(inventory, inputs)
+    directories = _open_inventory_directories(root, inventory)
+    try:
+        initial_blobs = _read_snapshot_bindings(directories, inventory)
+        _validate_blob_bindings(initial_blobs, inventory)
+        _load_test_hook("after_initial_reads")
+
+        first_replayed, first_inventory = _fresh_replay_and_inventory(inputs)
+        first_expected = _validate_replay_matches_inventory(first_replayed, first_inventory, inventory)
+        _validate_blob_bindings(initial_blobs, inventory, first_expected)
+        _load_test_hook("between_replays")
+        second_replayed, second_inventory = _fresh_replay_and_inventory(inputs)
+        second_expected = _validate_replay_matches_inventory(second_replayed, second_inventory, inventory)
+        if (
+            first_replayed != second_replayed
+            or first_inventory != second_inventory
+            or first_expected != second_expected
+        ):
+            raise PublishError("replay changed while loading snapshot store")
+
+        _reject_unowned_lock(root) if owned_lock is None else _authenticate_lock(owned_lock, root)
+        final_checksum, final_inventory_binding, final_inventory = _read_inventory_bindings(root)
+        if (
+            final_checksum != checksum
+            or final_inventory_binding != inventory_binding
+            or final_inventory != inventory
+        ):
+            raise PublishError("inventory changed while loading snapshot store")
+        final_blobs = _read_snapshot_bindings(directories, inventory)
+        if final_blobs != initial_blobs:
+            raise PublishError("snapshot blob changed while loading snapshot store")
+        _validate_blob_bindings(final_blobs, inventory, first_expected)
+        _load_test_hook("after_final_blob_reads")
+        frozen_snapshots = _freeze_replayed_snapshots(first_replayed)
+        _reject_unowned_lock(root) if owned_lock is None else _authenticate_lock(owned_lock, root)
+        return LoadedSnapshotStore(inventory, frozen_snapshots)
+    finally:
+        _close_inventory_directories(directories)
+
+
+def _validate_load_inputs(inputs: SnapshotStoreInputs) -> None:
+    if not isinstance(inputs, SnapshotStoreInputs):
+        raise TypeError("snapshot store inputs must be SnapshotStoreInputs")
+    if inputs.current_phase not in {"ACQUIRING", "SOURCES_READY"}:
+        raise PublishError("snapshot store can only be loaded while acquiring or sources-ready")
+    if not isinstance(inputs.replay, SnapshotReplayInputs) or not isinstance(inputs.bindings, AuthorityBindings):
+        raise TypeError("snapshot store inputs contain invalid authorities")
+    _validate_bindings(inputs.bindings)
+
+
+def _validate_loaded_authorities(inventory: SourceInventory, inputs: SnapshotStoreInputs) -> None:
+    if inventory.run_id != inputs.replay.run_id or inventory.bindings != inputs.bindings:
+        raise PublishError("stored inventory authority bindings differ from inputs")
+
+
+def _open_readonly_root(root: Path) -> _HeldDirectory:
+    if not isinstance(root, Path):
+        raise TypeError("snapshot store root must be a pathlib.Path")
+    if not root.is_absolute():
+        raise ValueError("snapshot store root must be absolute")
+    try:
+        named = os.stat(root, follow_symlinks=False)
+        if not stat.S_ISDIR(named.st_mode):
+            raise PublishError("snapshot store root must be an existing directory")
+        fd = os.open(root, os.O_RDONLY | _OPEN_DIRECTORY)
+        opened = os.fstat(fd)
+        if not _same_directory(named, opened):
+            raise PublishError("snapshot store root changed while opening")
+        return _HeldDirectory(fd, None, None, root, opened.st_dev, opened.st_ino)
+    except PublishError:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError("could not safely open snapshot store root") from exc
+
+
+def _reject_unowned_lock(root: _HeldDirectory) -> None:
+    try:
+        _rebind_directory(root)
+        os.stat(".snapshot-store.lock", dir_fd=root.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PublishError("could not inspect snapshot store lock namespace") from exc
+    raise LockHeld("snapshot store lock is already held")
+
+
+def _read_inventory_bindings(root: _HeldDirectory) -> tuple[_ReadBinding, _ReadBinding, SourceInventory]:
+    checksum = _read_immutable_binding(root, "source_inventory.sha256")
+    if re.fullmatch(rb"[0-9a-f]{64}\n", checksum.contents) is None:
+        raise PublishError("inventory checksum must be lowercase SHA-256 plus newline")
+    raw_inventory = _read_immutable_binding(root, "source_inventory.json")
+    if hashlib.sha256(raw_inventory.contents).hexdigest().encode("ascii") + b"\n" != checksum.contents:
+        raise PublishError("inventory checksum differs from inventory bytes")
+    try:
+        return checksum, raw_inventory, parse_inventory(raw_inventory.contents)
+    except (TypeError, ValueError) as exc:
+        raise PublishError("stored inventory is invalid") from exc
+
+
+def _open_inventory_directories(
+    root: _HeldDirectory, inventory: SourceInventory
+) -> dict[tuple[int, str], _HeldDirectory]:
+    directories: dict[tuple[int, str], _HeldDirectory] = {}
+    seasons: dict[int, _HeldDirectory] = {}
+    try:
+        for row in inventory.snapshots:
+            season = seasons.get(row.season)
+            if season is None:
+                season = _open_existing_directory(root, str(row.season), root.path / str(row.season))
+                seasons[row.season] = season
+            key = (row.season, row.source)
+            if key not in directories:
+                directories[key] = _open_existing_directory(
+                    season, row.source, season.path / row.source
+                )
+        return directories
+    except BaseException:
+        _close_inventory_directories(directories)
+        for season in reversed(tuple(seasons.values())):
+            if all(season is not directory.parent for directory in directories.values()):
+                _close_directory(season)
+        raise
+
+
+def _open_existing_directory(parent: _HeldDirectory, name: str, path: Path) -> _HeldDirectory:
+    try:
+        _rebind_directory(parent)
+        fd = os.open(name, os.O_RDONLY | _OPEN_DIRECTORY, dir_fd=parent.fd)
+        opened = os.fstat(fd)
+        named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        if not _same_directory(named, opened):
+            raise PublishError(f"store directory {name!r} cannot be safely opened")
+        return _HeldDirectory(fd, parent, name, path, opened.st_dev, opened.st_ino)
+    except PublishError:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError(f"store directory {name!r} cannot be safely opened") from exc
+
+
+def _close_inventory_directories(directories: Mapping[tuple[int, str], _HeldDirectory]) -> None:
+    for directory in reversed(tuple(directories.values())):
+        _close_directory(directory)
+    seasons = {directory.parent for directory in directories.values() if directory.parent is not None}
+    for season in seasons:
+        _close_directory(season)
+
+
+def _read_snapshot_bindings(
+    directories: Mapping[tuple[int, str], _HeldDirectory], inventory: SourceInventory
+) -> tuple[_ReadBinding, ...]:
+    return tuple(
+        _read_immutable_binding(directories[(row.season, row.source)], Path(row.relative_path).name)
+        for row in inventory.snapshots
+    )
+
+
+def _read_immutable_binding(parent: _HeldDirectory, name: str) -> _ReadBinding:
+    try:
+        _rebind_directory(parent)
+        fd = os.open(name, os.O_RDONLY | _OPEN_COMMON, dir_fd=parent.fd)
+        try:
+            before = os.fstat(fd)
+            _require_regular_single_link(before, f"immutable read target {name!r}")
+            contents = _read_all(fd)
+            after = os.fstat(fd)
+            if not _same_file_state(before, after):
+                raise PublishError(f"immutable read target changed while reading: {name}")
+            _rebind_directory(parent)
+            rebound = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            if not _same_file_state(rebound, before):
+                raise PublishError(f"immutable read target pathname changed while reading: {name}")
+            return _ReadBinding(contents, before.st_dev, before.st_ino, before.st_mode, before.st_nlink)
+        finally:
+            os.close(fd)
+    except PublishError:
+        raise
+    except (OSError, PublishConflict) as exc:
+        raise PublishError(f"immutable read target cannot be safely read: {name}") from exc
+
+
+def _validate_blob_bindings(
+    bindings: tuple[_ReadBinding, ...],
+    inventory: SourceInventory,
+    expected: Mapping[str, bytes] | None = None,
+) -> None:
+    if len(bindings) != len(inventory.snapshots):
+        raise PublishError("snapshot blob count differs from inventory")
+    for binding, row in zip(bindings, inventory.snapshots, strict=True):
+        if len(binding.contents) != row.byte_length:
+            raise PublishError("snapshot blob length differs from inventory")
+        if hashlib.sha256(binding.contents).hexdigest() != row.snapshot_sha256:
+            raise PublishError("snapshot blob checksum differs from inventory")
+        if expected is not None and binding.contents != expected.get(row.snapshot_sha256):
+            raise PublishError("snapshot blob bytes differ from fresh replay")
+        try:
+            payload = json.loads(binding.contents.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise PublishError("snapshot blob is not canonical JSON") from exc
+        if not isinstance(payload, dict) or binding.contents != canonical_json_bytes(payload) + b"\n":
+            raise PublishError("snapshot blob is not canonical JSON")
+
+
+def _fresh_replay_and_inventory(
+    inputs: SnapshotStoreInputs,
+) -> tuple[tuple[NormalizedSnapshot, ...], SourceInventory]:
+    try:
+        replayed = tuple(replay_verified_snapshots(inputs.replay))
+        if replayed != tuple(sorted(replayed, key=snapshot_sort_key)):
+            raise PublishError("replayed snapshots are not canonically ordered")
+        inventory = _build_inventory_from_replayed(inputs, replayed)
+    except PublishError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise PublishError("fresh snapshot replay failed") from exc
+    return replayed, inventory
+
+
+def _validate_replay_matches_inventory(
+    replayed: tuple[NormalizedSnapshot, ...], rebuilt: SourceInventory, stored: SourceInventory
+) -> Mapping[str, bytes]:
+    if rebuilt != stored:
+        raise PublishError("stored inventory differs from fresh replay")
+    try:
+        expected = _expected_snapshot_bytes(replayed, rebuilt)
+    except (TypeError, ValueError, PublishError) as exc:
+        raise PublishError("fresh replay differs from rebuilt inventory") from exc
+    if len(expected) != 81:
+        raise PublishError("fresh replay does not contain the closed snapshot set")
+    return expected
+
+
+def _expected_snapshot_bytes(
+    replayed: tuple[NormalizedSnapshot, ...], inventory: SourceInventory
+) -> Mapping[str, bytes]:
+    return _snapshot_bytes_by_sha(replayed, inventory)
+
+
+def _freeze_replayed_snapshots(
+    replayed: tuple[NormalizedSnapshot, ...],
+) -> tuple[NormalizedSnapshot, ...]:
+    frozen: list[NormalizedSnapshot] = []
+    for snapshot in replayed:
+        payload = _freeze_json(snapshot.payload)
+        if not isinstance(payload, Mapping):
+            raise PublishError("replayed snapshot payload must be a mapping")
+        copied = NormalizedSnapshot(
+            snapshot.schema_version, snapshot.run_id, snapshot.season, snapshot.source,
+            snapshot.grain, snapshot.status, tuple(snapshot.logical_query_ids),
+            tuple(snapshot.source_query_sidecar_sha256s), tuple(snapshot.split_receipt_sha256s),
+            payload, snapshot.canonical_bytes, snapshot.sha256,
+        )
+        if (
+            copied.canonical_bytes != canonical_json_bytes(copied.as_mapping()) + b"\n"
+            or hashlib.sha256(copied.canonical_bytes).hexdigest() != copied.sha256
+        ):
+            raise PublishError("frozen replay snapshot differs from its canonical bytes")
+        frozen.append(copied)
+    return tuple(frozen)
+
+
+def _load_test_hook(stage: str) -> None:
+    """No-op deterministic race boundary for read-only loader tests."""
+
+
 def publish_snapshot_store(
     root: Path,
     inventory: SourceInventory,
@@ -676,6 +1036,7 @@ def publish_snapshot_store(
         _fsync_held_directory(root_dir)
         _authenticate_lock(lock, root_dir)
         _verify_committed_store(root_dir, sources, inventory, expected_snapshots, raw_inventory, checksum)
+        _load_snapshot_store_held(root_dir, inputs, owned_lock=lock)
         _hook_and_rebind("before_lock_release", root_dir, seasons.values(), sources.values())
         return PublishReceipt(inventory_sha256, len(inventory.snapshots))
     except BaseException as exc:
@@ -899,7 +1260,10 @@ def _acquire_lock(root: _HeldDirectory, run_id: str, lock_owner: str) -> _OwnedL
         _write_all(fd, contents)
         details = os.fstat(fd)
         _require_regular_single_link(details, "new lock")
-        lock = _OwnedLock(fd, path, details.st_dev, details.st_ino, nonce, contents)
+        lock = _OwnedLock(
+            fd, path, details.st_dev, details.st_ino, nonce, contents,
+            run_id, lock_owner, _LOCK_ISSUER,
+        )
         _publish_test_hook("after_lock_write_before_acquire_fsync")
         os.fsync(fd)
         _fsync_held_directory(root)
@@ -920,6 +1284,24 @@ def _acquire_lock(root: _HeldDirectory, run_id: str, lock_owner: str) -> _OwnedL
 def _authenticate_lock(lock: _OwnedLock, root: _HeldDirectory) -> None:
     try:
         _rebind_directory(root)
+        expected_path = root.path / ".snapshot-store.lock"
+        expected_contents = canonical_json_bytes({
+            "lock_owner": lock.lock_owner,
+            "nonce": lock.nonce,
+            "run_id": lock.run_id,
+        }) + b"\n"
+        if (
+            lock.issuer is not _LOCK_ISSUER
+            or lock.path != expected_path
+            or lock.path.name != ".snapshot-store.lock"
+            or lock.path.parent != root.path
+            or not _is_safe_identity(lock.run_id)
+            or not _is_safe_identity(lock.lock_owner)
+            or not isinstance(lock.nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", lock.nonce) is None
+            or lock.contents != expected_contents
+        ):
+            raise PublishError("owned lock does not bind the canonical lock namespace")
         descriptor = os.fstat(lock.fd)
         _require_regular_single_link(descriptor, "owned lock")
         named = os.stat(lock.path.name, dir_fd=root.fd, follow_symlinks=False)
@@ -1178,6 +1560,7 @@ def _publish_test_hook(stage: str) -> None:
 __all__ = [
     "AuthorityBinding", "TerminalCheckpointBinding", "AuthorityBindings", "SnapshotStoreInputs",
     "SnapshotInventoryRow", "SourceSeasonInventory", "SourceInventory", "build_inventory",
-    "inventory_bytes", "parse_inventory", "PublishReceipt", "SnapshotStoreError",
-    "PublishConflict", "LockHeld", "PublishError", "publish_snapshot_store",
+    "inventory_bytes", "parse_inventory", "PublishReceipt", "LoadedSnapshotStore",
+    "SnapshotStoreError", "PublishConflict", "LockHeld", "PublishError", "read_inventory",
+    "load_snapshot_store", "publish_snapshot_store",
 ]
