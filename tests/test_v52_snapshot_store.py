@@ -1870,6 +1870,198 @@ class AttackTests(unittest.TestCase):
                     load_snapshot_store(root, store_inputs())
 
 
+class EvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _reports() -> Path:
+        return Path(__file__).resolve().parents[1] / "reports" / "v5_2_qd"
+
+    def test_publish_evidence_has_exact_closed_keys(self):
+        reports = self._reports()
+        value = json.loads(
+            (reports / "source_snapshot_store_publish.json").read_bytes()
+        )
+        expected = {
+            "evidence_scope",
+            "canonical_historical_publish_performed",
+            "run_id",
+            "inventory_sha256",
+            "snapshot_count",
+            "source_season_count",
+            "source_count",
+            "inventory_status",
+            "by_source",
+            "by_season",
+            "commands",
+            "protected_duplicates_untouched",
+        }
+        self.assertEqual(set(value), expected)
+        self.assertEqual(value["evidence_scope"], "HERMETIC_CONTRACT_FIXTURE")
+        self.assertFalse(value["canonical_historical_publish_performed"])
+        self.assertEqual(
+            (value["snapshot_count"], value["source_season_count"], value["source_count"]),
+            (81, 42, 6),
+        )
+        self.assertEqual(value["inventory_status"], "READY_CANDIDATE")
+        self.assertRegex(value["inventory_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(value["protected_duplicates_untouched"])
+
+    def test_publish_evidence_values_are_canonical_and_disclosed(self):
+        from mlb_backtest import v52_snapshot_store as store
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+
+        report = self._reports() / "source_snapshot_store_publish.json"
+        raw = report.read_bytes()
+        value = json.loads(raw)
+        self.assertEqual(raw, canonical_json_bytes(value) + b"\n")
+        with tempfile.TemporaryDirectory() as directory, patched_store_replay():
+            inputs = store_inputs()
+            inventory = store.build_inventory(inputs)
+            receipt = store.publish_snapshot_store(
+                Path(directory), inventory, inputs, lock_owner="evidence-test"
+            )
+        self.assertEqual(value["run_id"], "fixture-run")
+        self.assertEqual(value["inventory_sha256"], receipt.inventory_sha256)
+        self.assertEqual(
+            value["by_source"],
+            {
+                "baseball_savant_statcast": 46,
+                "mlb_schedule_game_feed": 7,
+                "mlb_stats_pitcher_bf": 7,
+                "mlb_stats_pitching": 7,
+                "prior_schedule_history": 7,
+                "venue_team_timezone_table": 7,
+            },
+        )
+        self.assertEqual(
+            value["by_season"],
+            {"2018": 12, "2019": 12, "2020": 8, "2021": 12, "2022": 12, "2023": 13, "2024": 12},
+        )
+        self.assertEqual(
+            value["commands"],
+            [
+                "python3 -m unittest discover -s tests -p 'test*.py' -v",
+                "ruff check mlb_backtest tests",
+            ],
+        )
+        markdown = (self._reports() / "source_snapshot_store_publish.md").read_text()
+        self.assertIn("canonical historical publish was NOT performed", markdown)
+        self.assertIn("Real publish remains blocked until actual sealed SnapshotStoreInputs exist", markdown)
+        self.assertIn(receipt.inventory_sha256, markdown)
+        self.assertIn("81 snapshots, 42 source-season pairs, 6 sources", markdown)
+
+    def test_protected_duplicate_status_requires_exact_four_untracked_entries(self):
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        paths = sorted(writer.PROTECTED_DUPLICATES)
+
+        def raw(entries):
+            return b"".join(
+                f"{status} {path}".encode() + b"\0"
+                for status, path in entries
+            )
+
+        expected = [("??", path) for path in paths]
+        self.assertTrue(writer._protected_status_is_expected(raw(expected)))
+        self.assertFalse(writer._protected_status_is_expected(raw(expected[:-1])))
+        self.assertFalse(writer._protected_status_is_expected(b""))
+        for status in ("M ", " M", "D ", " D", "R "):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    writer._protected_status_is_expected(
+                        raw([(status, path) for path in paths])
+                    )
+                )
+        self.assertFalse(
+            writer._protected_status_is_expected(
+                raw(expected + [("??", "extra/unexpected.txt")])
+            )
+        )
+
+    def test_evidence_writer_is_hermetic_and_does_not_advance_phase(self):
+        import socket
+        import urllib.request
+
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        canonical = writer.CANONICAL_SOURCES
+        self.assertFalse(os.path.lexists(canonical))
+        phases: list[str] = []
+        original_store_inputs = writer.fixture.store_inputs
+
+        def capture_inputs(*args, **kwargs):
+            inputs = original_store_inputs(*args, **kwargs)
+            phases.append(inputs.current_phase)
+            return inputs
+
+        with patch.object(writer.fixture, "store_inputs", side_effect=capture_inputs), patch.object(
+            urllib.request, "urlopen", side_effect=AssertionError("network")
+        ), patch.object(socket, "socket", side_effect=AssertionError("network")):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                generated_json, generated_markdown = writer.generate_to(output)
+                self.assertEqual(
+                    generated_json,
+                    (self._reports() / "source_snapshot_store_publish.json").read_bytes(),
+                )
+                self.assertEqual(
+                    generated_markdown,
+                    (self._reports() / "source_snapshot_store_publish.md").read_bytes(),
+                )
+                self.assertEqual(
+                    (output / "source_snapshot_store_publish.json").read_bytes(),
+                    generated_json,
+                )
+                self.assertEqual(
+                    (output / "source_snapshot_store_publish.md").read_bytes(),
+                    generated_markdown,
+                )
+                self.assertFalse(
+                    any(path.name.startswith(".") for path in output.iterdir())
+                )
+        self.assertFalse(os.path.lexists(canonical))
+        self.assertEqual(phases, ["SOURCES_READY"])
+        self.assertFalse(
+            json.loads(
+                (self._reports() / "source_snapshot_store_publish.json").read_bytes()
+            )["canonical_historical_publish_performed"]
+        )
+
+    def test_atomic_report_write_cleans_owned_temp_on_replace_failure(self):
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "report.json"
+            with patch.object(writer.os, "replace", side_effect=RuntimeError("replace")):
+                with self.assertRaisesRegex(RuntimeError, "replace"):
+                    writer._atomic_write(target, b"report")
+            self.assertFalse(target.exists())
+            self.assertEqual(tuple(Path(directory).iterdir()), ())
+
+    def test_generation_rejects_canonical_historical_output_path(self):
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        self.assertFalse(os.path.lexists(writer.CANONICAL_SOURCES))
+        with self.assertRaisesRegex(AssertionError, "canonical historical sources"):
+            writer.generate_to(writer.CANONICAL_SOURCES)
+        self.assertFalse(os.path.lexists(writer.CANONICAL_SOURCES))
+
+    def test_git_status_uses_sanitized_environment_and_exact_repository(self):
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        contaminated = {
+            "GIT_DIR": "/tmp/not-this-repository",
+            "GIT_WORK_TREE": "/tmp/not-this-tree",
+            "GIT_INDEX_FILE": "/tmp/not-this-index",
+            "GIT_COMMON_DIR": "/tmp/not-this-common",
+            "GIT_OBJECT_DIRECTORY": "/tmp/not-this-objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/not-this-alternates",
+        }
+        with patch.dict(os.environ, contaminated, clear=False):
+            self.assertTrue(writer._protected_duplicates_untouched())
+            sanitized = writer._sanitized_git_env()
+        self.assertTrue(all(key not in sanitized for key in contaminated))
+
+
 if __name__ == "__main__":
     unittest.main()
 
