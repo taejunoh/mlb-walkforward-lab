@@ -3105,6 +3105,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 evidence_root=(
                     root / run_spec.raw["namespaces"]["raw"]
                 ),
+                read_only_progress=False,
             )
 
     def test_checkpoint_publish_evidence_race_leaves_no_poisoned_head(self) -> None:
@@ -3237,7 +3238,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     validation_receipts=evidence,
                 )
 
-    def test_non_static_checkpoint_stages_fail_closed_until_authority_exists(
+    def test_non_static_checkpoint_stages_require_their_own_batch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3248,7 +3249,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "REMAINING",
             ):
                 with self.subTest(stage=stage), self.assertRaisesRegex(
-                    ValueError, "authority|implemented|unavailable"
+                    ValueError,
+                    rf"\Acheckpoint {stage} stage lacks its batch\Z",
                 ):
                     self.registry.publish_acquisition_checkpoint(
                         root,

@@ -1745,22 +1745,22 @@ class ProspectiveProtocolTest(unittest.TestCase):
                 )
 
             def append(successful):
-                with self._trusted_clock("2026-07-13T22:24:00Z"):
-                    return protocols.record_prospective_snapshot(
-                        root,
-                        official_date="2026-07-13",
-                        game_pk=777001,
-                        observed_scheduled_start_utc="2026-07-13T23:10:00Z",
-                        successful=successful,
-                        away_starter_present=True,
-                        home_starter_present=True,
-                        away_lineup_count=9,
-                        home_lineup_count=9,
-                        clock_evidence=None,
-                    )
+                return protocols.record_prospective_snapshot(
+                    root,
+                    official_date="2026-07-13",
+                    game_pk=777001,
+                    observed_scheduled_start_utc="2026-07-13T23:10:00Z",
+                    successful=successful,
+                    away_starter_present=True,
+                    home_starter_present=True,
+                    away_lineup_count=9,
+                    home_lineup_count=9,
+                    clock_evidence=None,
+                )
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                receipts = tuple(executor.map(append, (True, False)))
+            with self._trusted_clock("2026-07-13T22:24:00Z"):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    receipts = tuple(executor.map(append, (True, False)))
             self.assertEqual({receipt.sequence for receipt in receipts}, {1, 2})
             state, loaded = protocols.load_prospective_snapshot_ledger(
                 root, official_date="2026-07-13", game_pk=777001

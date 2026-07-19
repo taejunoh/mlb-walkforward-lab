@@ -199,7 +199,7 @@ V51_REQUIRED_FILES = tuple(
 
 TASK7D_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "14c2c6d324f427be2c04fc9979cffae5e7f1d90a4b4f923fa0439f6958d96d28"
+        "1f5c4e7a99c020c55474e971ca4659eb73d681f4340b8ec7553491aa048925b5"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
         "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
@@ -1587,11 +1587,13 @@ def task11_artifact_status(root: Path) -> dict[str, str]:
     return result
 
 
-def verify_task11_phase(status: Mapping[str, str], *, delivery_requested: bool) -> None:
-    expected_value = "PRESENT" if delivery_requested else "ABSENT"
-    expected = {"html": expected_value, "delivery_receipt": expected_value}
-    if dict(status) != expected:
-        raise ValueError("Task 11 delivery artifact differs from requested phase")
+def verify_task11_phase(status: Mapping[str, str]) -> None:
+    allowed = (
+        {"html": "ABSENT", "delivery_receipt": "ABSENT"},
+        {"html": "PRESENT", "delivery_receipt": "PRESENT"},
+    )
+    if dict(status) not in allowed:
+        raise ValueError("Task 11 delivery artifact pair differs")
 
 
 def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, object]:
@@ -1601,7 +1603,7 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
     inventory_path = root / "protocols/v5_2_qd/v51_protected_inventory.json"
     verify_required_inputs(root)
     task11 = task11_artifact_status(root)
-    verify_task11_phase(task11, delivery_requested=outputs is not None)
+    verify_task11_phase(task11)
     entry_scope = capture_current_scope(root)
     entry_integrity, entry_evidence = capture_v51_integrity(root, inventory_path)
     inventory = load_canonical_json(
@@ -1646,9 +1648,9 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
             "prospective observations exist before collector implementation"
         )
     html = None
-    if outputs is not None:
+    if task11["html"] == "PRESENT":
         html = verify_html_payload(
-            outputs / "mlb_v5_1_100_pick_diagnostic.html",
+            FINAL_HTML_PATH,
             root / "reports/v5_1_bt/diagnostic_100_artifact.json",
             root / "reports/v5_1_bt/report_delivery_receipt.json",
         )
@@ -1674,11 +1676,13 @@ def verify_design_deliverables(root: Path, outputs: Path | None) -> dict[str, ob
             "prospective observations exist before collector implementation"
         )
     final_task11 = task11_artifact_status(root)
-    verify_task11_phase(final_task11, delivery_requested=outputs is not None)
+    verify_task11_phase(final_task11)
+    if final_task11 != task11:
+        raise ValueError("Task 11 delivery artifact changed during verification")
     exit_scope = capture_current_scope(root)
     if entry_scope != exit_scope:
         raise ValueError("current-scope fingerprint changed during verification")
-    if outputs is not None:
+    if html is not None:
         if not isinstance(html, Mapping):
             raise ValueError("verified HTML fingerprint is missing")
         stored_fingerprint = html.get("fingerprint")

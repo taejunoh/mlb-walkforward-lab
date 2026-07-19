@@ -301,6 +301,7 @@ class DesignVerificationTest(unittest.TestCase):
 
     def test_current_deliverables_cross_validate(self) -> None:
         receipt = verify_design_deliverables(ROOT, outputs=None)
+        html = receipt.pop("html")
         self.assertEqual(
             receipt,
             {
@@ -323,15 +324,15 @@ class DesignVerificationTest(unittest.TestCase):
                     "small_sealed_guard": "sha256",
                 },
                 "task11": {
-                    "html": "ABSENT",
-                    "delivery_receipt": "ABSENT",
+                    "html": "PRESENT",
+                    "delivery_receipt": "PRESENT",
                 },
-                "html": None,
             },
         )
-        self.assertFalse(FINAL_HTML_PATH.exists())
-        self.assertFalse(
-            (ROOT / "reports/v5_1_bt/report_delivery_receipt.json").exists()
+        self.assertIsInstance(html, dict)
+        self.assertEqual(html.get("path"), str(FINAL_HTML_PATH))
+        self.assertEqual(
+            html.get("receipt", {}).get("html"), str(FINAL_HTML_PATH)
         )
 
     def test_every_deterministic_json_rejects_trailing_whitespace(self) -> None:
@@ -435,20 +436,31 @@ class DesignVerificationTest(unittest.TestCase):
         self.assertEqual(sealed_metadata(), before)
 
     def test_task11_artifacts_are_phase_gated(self) -> None:
-        verify_task11_phase(
+        for status in (
             {"html": "ABSENT", "delivery_receipt": "ABSENT"},
-            delivery_requested=False,
-        )
-        verify_task11_phase(
             {"html": "PRESENT", "delivery_receipt": "PRESENT"},
-            delivery_requested=True,
-        )
-        for status, requested in (
-            ({"html": "PRESENT", "delivery_receipt": "PRESENT"}, False),
-            ({"html": "ABSENT", "delivery_receipt": "ABSENT"}, True),
+        ):
+            verify_task11_phase(status)
+        for status in (
+            {"html": "PRESENT", "delivery_receipt": "ABSENT"},
+            {"html": "ABSENT", "delivery_receipt": "PRESENT"},
         ):
             with self.assertRaisesRegex(ValueError, "Task 11 delivery artifact"):
-                verify_task11_phase(status, delivery_requested=requested)
+                verify_task11_phase(status)
+
+    def test_task11_artifact_pair_cannot_change_during_verification(self) -> None:
+        absent = {"html": "ABSENT", "delivery_receipt": "ABSENT"}
+        present = {"html": "PRESENT", "delivery_receipt": "PRESENT"}
+        with (
+            patch(
+                "mlb_backtest.verify_v52_design.task11_artifact_status",
+                side_effect=(absent, present),
+            ),
+            self.assertRaisesRegex(
+                ValueError, "Task 11 delivery artifact changed during verification"
+            ),
+        ):
+            verify_design_deliverables(ROOT, outputs=None)
 
     def test_delivery_paths_are_exact_constants(self) -> None:
         html, receipt = validate_delivery_paths(ROOT, FINAL_HTML_PATH.parent)
@@ -888,7 +900,30 @@ class DesignVerificationTest(unittest.TestCase):
         real_popen = subprocess.Popen
         real_subprocess_run = subprocess.run
 
-        def validate_git_invocation(args, cwd, environment):
+        def validate_subprocess_invocation(args, cwd, environment):
+            node_command = [
+                "node",
+                (
+                    "/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/"
+                    "data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/"
+                    "verify_portable_artifact.mjs"
+                ),
+                "--html",
+                str(FINAL_HTML_PATH),
+                "--artifact",
+                str(ROOT / "reports/v5_1_bt/diagnostic_100_artifact.json"),
+            ]
+            if args == node_command:
+                if (
+                    cwd
+                    != Path(
+                        "/Users/taejunoh/.codex/plugins/cache/openai-curated-remote/"
+                        "data-analytics/0.2.8-13ceeea1f599"
+                    )
+                    or environment is not None
+                ):
+                    raise AssertionError("HTML verifier execution context differs")
+                return
             allowed_prefixes = {
                 "ls-tree": ["git", "ls-tree", "-r", "-z", "--full-tree"],
                 "ls-files": ["git", "ls-files", "-z", "--"],
@@ -937,7 +972,18 @@ class DesignVerificationTest(unittest.TestCase):
             return real_os_open(path, flags, *args, **kwargs)
 
         def guarded_subprocess_run(args, *positional, **kwargs):
-            validate_git_invocation(args, kwargs.get("cwd"), kwargs.get("env"))
+            validate_subprocess_invocation(
+                args, kwargs.get("cwd"), kwargs.get("env")
+            )
+            if args[0] == "node":
+                if (
+                    set(kwargs) != {"cwd", "check", "capture_output", "text"}
+                    or kwargs["check"] is not False
+                    or kwargs["capture_output"] is not True
+                    or kwargs["text"] is not True
+                ):
+                    raise AssertionError("HTML verifier execution mode differs")
+                return real_subprocess_run(args, *positional, **kwargs)
             if set(kwargs) != {"cwd", "check", "capture_output", "env"}:
                 raise AssertionError(f"subprocess kwargs differ: {kwargs!r}")
             if kwargs["check"] is not False or kwargs["capture_output"] is not True:
@@ -945,7 +991,9 @@ class DesignVerificationTest(unittest.TestCase):
             return real_subprocess_run(args, *positional, **kwargs)
 
         def guarded_popen(args, *positional, **kwargs):
-            validate_git_invocation(args, kwargs.get("cwd"), kwargs.get("env"))
+            validate_subprocess_invocation(
+                args, kwargs.get("cwd"), kwargs.get("env")
+            )
             return real_popen(args, *positional, **kwargs)
 
         patches = (
