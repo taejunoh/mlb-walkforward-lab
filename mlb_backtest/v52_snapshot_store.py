@@ -365,7 +365,7 @@ def _row_from_snapshot(snapshot: NormalizedSnapshot, run_id: str) -> SnapshotInv
         snapshot.season, snapshot.source, snapshot.grain, snapshot.status, snapshot.sha256,
         f"{snapshot.season}/{snapshot.source}/{snapshot.sha256}.snapshot.json",
         len(snapshot.canonical_bytes), tuple(sorted(snapshot.logical_query_ids)),
-        tuple(sorted(snapshot.source_query_sidecar_sha256s)), tuple(sorted(snapshot.split_receipt_sha256s)),
+        tuple(sorted(snapshot.source_query_sidecar_sha256s)), tuple(snapshot.split_receipt_sha256s),
     )
 
 
@@ -532,8 +532,12 @@ def _validate_snapshot_row(row: SnapshotInventoryRow) -> None:
         (row.source_query_sidecar_sha256s, "source sidecar sha256s", True),
         (row.split_receipt_sha256s, "split receipt sha256s", False),
     ):
-        if not isinstance(values, tuple) or values != tuple(sorted(set(values))):
-            raise ValueError(f"{label} must be sorted and unique")
+        if not isinstance(values, tuple):
+            raise ValueError(f"{label} must be a tuple")
+        if (must_equal and values != tuple(sorted(set(values)))) or (
+            not must_equal and len(values) != len(set(values))
+        ):
+            raise ValueError(f"{label} must be {'sorted and ' if must_equal else ''}unique")
         for value in values:
             _require_sha(value, label)
     if not row.logical_query_ids or not row.source_query_sidecar_sha256s:

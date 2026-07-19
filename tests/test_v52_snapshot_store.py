@@ -163,6 +163,50 @@ class InventoryTests(unittest.TestCase):
             payload["snapshot_sha256s"],
         )
 
+    def test_snapshot_rows_preserve_verifier_receipt_order(self):
+        from mlb_backtest.v52_snapshot_store import build_inventory
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+
+        snapshots = list(fake_81())
+        original = next(
+            snapshot
+            for snapshot in snapshots
+            if snapshot.source == "baseball_savant_statcast"
+        )
+        receipt_order = ("f" * 64, "a" * 64)
+        envelope = original.as_mapping()
+        envelope["split_receipt_sha256s"] = list(receipt_order)
+        canonical_bytes = canonical_json_bytes(envelope) + b"\n"
+        replacement = replace(
+            original,
+            split_receipt_sha256s=receipt_order,
+            canonical_bytes=canonical_bytes,
+            sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+        )
+        snapshots[snapshots.index(original)] = replacement
+        snapshots.sort(key=verifier.snapshot_sort_key)
+
+        with patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=tuple(snapshots),
+        ):
+            inventory = build_inventory(store_inputs())
+
+        row = next(
+            row
+            for row in inventory.snapshots
+            if row.snapshot_sha256 == replacement.sha256
+        )
+        self.assertEqual(row.split_receipt_sha256s, receipt_order)
+        self.assertEqual(inventory.split_receipt_sha256s, tuple(sorted(receipt_order)))
+        statcast = next(
+            row
+            for row in inventory.source_seasons
+            if row.season == replacement.season
+            and row.source == replacement.source
+        )
+        self.assertEqual(statcast.split_receipt_sha256s, tuple(sorted(receipt_order)))
+
     def test_phase_does_not_change_inventory_and_values_are_immutable(self):
         from mlb_backtest.v52_snapshot_store import build_inventory
 
