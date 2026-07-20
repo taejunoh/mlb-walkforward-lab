@@ -217,6 +217,7 @@ class StatusAndPreflightTests(unittest.TestCase):
         self.assertFalse(report.review_ready)
         self.assertFalse(report.replay_ready)
         self.assertFalse(report.advance_ready)
+        self.assertEqual(report.blockers, ())
         rendered = dataclasses.asdict(report)
         self.assertNotIn("selected_review_receipts", rendered)
         self.assertNotIn("selected_replay_receipts", rendered)
@@ -229,6 +230,27 @@ class StatusAndPreflightTests(unittest.TestCase):
         self.assertTrue(report.review_ready)
         self.assertTrue(report.replay_ready)
         self.assertFalse(report.advance_ready)
+
+    def test_status_rejects_different_authenticated_published_inventory(self) -> None:
+        published = dataclasses.replace(self.inventory, run_id="other-valid-run")
+        self.assertNotEqual(inventory_bytes(published), inventory_bytes(self.inventory))
+        before = tree_snapshot(self.root)
+        with patch.object(
+            orchestration,
+            "load_snapshot_store",
+            return_value=SimpleNamespace(inventory=published),
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertEqual(report.phase, "ACQUIRING")
+        self.assertTrue(report.publish_ready)
+        self.assertFalse(report.review_ready)
+        self.assertFalse(report.replay_ready)
+        self.assertFalse(report.advance_ready)
+        self.assertEqual(report.blockers, ())
+        rendered = dataclasses.asdict(report)
+        self.assertNotIn("selected_review_receipts", rendered)
+        self.assertNotIn("selected_replay_receipts", rendered)
+        self.assertEqual(tree_snapshot(self.root), before)
 
     def test_status_reports_unsafe_published_store_as_a_blocker(self) -> None:
         source_root = self.root / "data/v5_2_qd/historical/sources"
