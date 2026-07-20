@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -123,6 +124,36 @@ class _ContextBaseTests(unittest.TestCase):
             os.mkfifo(fifo)
             with self.assertRaises(ValueError):
                 orchestration._read_explicit_artifact(root, fifo, "fifo")
+
+    def test_safe_reader_enforces_preflight_and_streaming_byte_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b"x" * 65)
+            sparse = root / "sparse.json"
+            with sparse.open("wb") as handle:
+                handle.seek(1024 * 1024)
+                handle.write(b"x")
+            before_fds = len(os.listdir("/dev/fd"))
+            for path in (oversized, sparse):
+                with self.subTest(path=path.name), self.assertRaisesRegex(
+                    ValueError, "bounded read limit"
+                ):
+                    orchestration._read_explicit_artifact(
+                        root, path, path.name, max_bytes=64
+                    )
+            growing = root / "growing.json"
+            growing.write_bytes(b"x")
+            chunks = iter((b"a" * 40, b"b" * 40))
+            with patch.object(
+                orchestration.os,
+                "read",
+                side_effect=lambda _fd, _size: next(chunks, b""),
+            ), self.assertRaisesRegex(ValueError, "bounded read limit"):
+                orchestration._read_explicit_artifact(
+                    root, growing, "growing", max_bytes=64
+                )
+            self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
     def test_safe_reader_rejects_ancestor_swap_without_fd_leak(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1086,12 +1117,14 @@ class ReviewTests(unittest.TestCase):
             self.root
             / "audit/v5_2_qd/historical/acquisition/source_reviews/review.json"
         )
+        self.commit_path = self.receipt_path.with_name("review.commit.json")
         self.request = orchestration.ReviewRequest(
             "independent-source-auditor",
             "independent-source-auditor",
             "APPROVED",
             self.query_ids_path,
             self.receipt_path,
+            self.commit_path,
         )
 
     def tearDown(self) -> None:
@@ -1148,6 +1181,18 @@ class ReviewTests(unittest.TestCase):
             },
         )
         self.assertEqual(report.receipt_kind, "SOURCE_REVIEW")
+        self.assertEqual(report.commit_path, self.commit_path)
+        marker = json.loads(report.commit_path.read_bytes())
+        self.assertEqual(marker["receipt_kind"], "SOURCE_RECEIPT_COMMIT")
+        self.assertEqual(marker["committed_receipt_kind"], "SOURCE_REVIEW")
+        self.assertEqual(marker["source_receipt"], {
+            "path": self.receipt_path.relative_to(self.root).as_posix(),
+            "sha256": report.sha256,
+        })
+        self.assertEqual(
+            report.commit_sha256,
+            hashlib.sha256(report.commit_path.read_bytes()).hexdigest(),
+        )
 
     def test_review_allows_rejected_decision(self) -> None:
         request = dataclasses.replace(self.request, decision="REJECTED")
@@ -1192,6 +1237,26 @@ class ReviewTests(unittest.TestCase):
             self._write()
         self.assertEqual(conflict.exception.exit_code, 6)
 
+    def test_review_commit_marker_conflict_leaves_uncommitted_receipt(self) -> None:
+        existing = b'{"existing":true}\n'
+        self.commit_path.write_bytes(existing)
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual(raised.exception.exit_code, 6)
+        self.assertTrue(self.receipt_path.is_file())
+        self.assertEqual(self.commit_path.read_bytes(), existing)
+
+    def test_review_requires_distinct_receipt_and_commit_paths(self) -> None:
+        request = dataclasses.replace(
+            self.request, write_commit=self.request.write_receipt
+        )
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(request)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "PATH_UNSAFE", 5
+        ))
+        self.assertFalse(self.receipt_path.exists())
+
     def test_review_rejects_symlinked_receipt_ancestor(self) -> None:
         external = self.root / "external-receipts"
         external.mkdir()
@@ -1233,6 +1298,19 @@ class ReviewTests(unittest.TestCase):
                     self._write(request)
                 self.assertEqual(raised.exception.error_code, "QUERY_IDS_INVALID")
 
+    def test_review_rejects_oversized_query_document_without_fd_leak(self) -> None:
+        with self.query_ids_path.open("wb") as handle:
+            handle.seek(orchestration._MAX_QUERY_IDS_DOCUMENT_BYTES)
+            handle.write(b"x")
+        before_fds = len(os.listdir("/dev/fd"))
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "QUERY_IDS_INVALID", 3
+        ))
+        self.assertFalse(self.receipt_path.exists())
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
     def test_review_schema_failure_never_creates_a_receipt(self) -> None:
         with self.assertRaises(orchestration.FinalizationError) as raised:
             self._write(validator_side_effect=ValueError("schema drift"))
@@ -1263,6 +1341,7 @@ class ReviewTests(unittest.TestCase):
             "POSTCONDITION_FAILED", 5
         ))
         self.assertTrue(self.receipt_path.is_file())
+        self.assertFalse(self.commit_path.exists())
         payload = json.loads(self.receipt_path.read_bytes())
         self.assertEqual(payload["reviewed_query_ids"], list(self.query_ids))
         self.assertEqual(
@@ -1307,6 +1386,149 @@ class ReviewTests(unittest.TestCase):
         failures = [item for item in outcomes if isinstance(item, orchestration.FinalizationError)]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].exit_code, 6)
+
+
+class ReviewGitIntegrationTests(unittest.TestCase):
+    def test_write_review_uses_real_clean_git_bound_schema_validator(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            root, run_spec = fixture.make_repo(Path(directory))
+            inputs = store_inputs()
+            with patched_store_replay():
+                inventory = dataclasses.replace(
+                    build_inventory(inputs), run_id=run_spec.run_id
+                )
+            registry = ExecutionRegistryState("ACQUIRING", 7, "a" * 64, "b" * 64)
+            checkpoint = AcquisitionCheckpoint(
+                9, "c" * 64, "d" * 64, "REMAINING",
+                "2026-07-20T00:00:00.000000Z", "e" * 40, "f" * 64,
+                (), (), (), (), (), (), (), (), (), (),
+            )
+            git_head = subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            context = orchestration.FinalizationContext(
+                root,
+                root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                root / "protocols/v5_2_qd/historical_source_acquisition.json",
+                root / "audit/v5_1_bt/protected_raw_inventory.json",
+                run_spec,
+                registry,
+                checkpoint,
+                inputs,
+                inventory,
+                "ACQUIRING",
+                git_head,
+                (),
+            )
+            query_ids = inventory.logical_query_ids[:2]
+            selection = (
+                root
+                / "audit/v5_2_qd/historical/acquisition/source_reviews/query_ids.json"
+            )
+            selection.parent.mkdir(parents=True)
+            selection.write_bytes(
+                canonical_json_bytes({"query_ids": list(query_ids)}) + b"\n"
+            )
+            receipt = selection.with_name("review.json")
+            commit = selection.with_name("review.commit.json")
+            request = orchestration.ReviewRequest(
+                "independent-source-auditor",
+                "independent-source-auditor",
+                "APPROVED",
+                selection,
+                receipt,
+                commit,
+            )
+            preflight = orchestration.PreflightReport(
+                "ACQUIRING",
+                "PASS",
+                hashlib.sha256(inventory_bytes(inventory)).hexdigest(),
+                len(inventory.snapshots),
+                0,
+                (),
+            )
+            status = orchestration.StatusReport(
+                "ACQUIRING", None, True, True, True, False, ()
+            )
+            validator = orchestration.execution_registry.validate_source_receipt_schema
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(
+                    orchestration,
+                    "_utc_now",
+                    return_value="2026-07-20T00:00:00.000000Z",
+                ),
+                patch.object(
+                    orchestration.execution_registry,
+                    "validate_source_receipt_schema",
+                    wraps=validator,
+                ) as validated,
+            ):
+                report = orchestration.write_review(context, request)
+            self.assertEqual(report.path, receipt)
+            self.assertEqual(validated.call_count, 2)
+            call_kwargs = validated.call_args_list[0].kwargs
+            self.assertEqual(
+                call_kwargs["schema_name"],
+                "v5_2_source_review_receipt.schema.json",
+            )
+            self.assertEqual(
+                call_kwargs["payload"], json.loads(receipt.read_bytes())
+            )
+            self.assertEqual(
+                validated.call_args_list[1].kwargs["schema_name"],
+                "v5_2_source_receipt_commit.schema.json",
+            )
+
+            def validate_with_extra(*args: object, **kwargs: object) -> None:
+                altered = dict(kwargs["payload"])
+                altered["unexpected"] = True
+                validator(
+                    args[0],
+                    git_head=kwargs["git_head"],
+                    schema_name=kwargs["schema_name"],
+                    payload=altered,
+                )
+
+            extra_request = dataclasses.replace(
+                request, write_receipt=selection.with_name("extra.json")
+            )
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(
+                    orchestration.execution_registry,
+                    "validate_source_receipt_schema",
+                    side_effect=validate_with_extra,
+                ),
+                self.assertRaises(orchestration.FinalizationError) as extra_error,
+            ):
+                orchestration.write_review(context, extra_request)
+            self.assertEqual(extra_error.exception.exit_code, 5)
+            self.assertFalse(extra_request.write_receipt.exists())
+
+            schema_path = root / "schemas/v5_2_source_review_receipt.schema.json"
+            schema_path.write_bytes(b"{}\n")
+            drift_request = dataclasses.replace(
+                request, write_receipt=selection.with_name("schema-drift.json")
+            )
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                self.assertRaises(orchestration.FinalizationError) as drift_error,
+            ):
+                orchestration.write_review(context, drift_request)
+            self.assertEqual(drift_error.exception.exit_code, 5)
+            self.assertFalse(drift_request.write_receipt.exists())
 
 
 if __name__ == "__main__":

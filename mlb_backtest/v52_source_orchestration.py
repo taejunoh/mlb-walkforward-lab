@@ -61,6 +61,7 @@ _TIMEZONE_SEAL = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.
 _SOURCE_ROOT_RELATIVE = Path("data/v5_2_qd/historical/sources")
 _SOURCE_REVIEW_PREFIX = "audit/v5_2_qd/historical/acquisition/source_reviews/"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_QUERY_IDS_DOCUMENT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,7 @@ class ReviewRequest:
     decision: Literal["APPROVED", "REJECTED"]
     query_ids_file: Path
     write_receipt: Path
+    write_commit: Path
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,17 @@ class ReceiptReport:
     path: Path
     sha256: str
     receipt_kind: Literal["SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY"]
+    commit_path: Path
+    commit_sha256: str
+
+
+@dataclass(frozen=True)
+class _UncommittedReceipt:
+    path: Path
+    sha256: str
+    receipt_kind: Literal[
+        "SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY", "SOURCE_RECEIPT_COMMIT"
+    ]
 
 
 ReviewReport = ReceiptReport
@@ -321,7 +334,15 @@ def _relative_artifact(root: Path, value: Path, label: str) -> tuple[str, Path]:
     return _relative_under_root(trusted, value, label)
 
 
-def _read_explicit_artifact(root: Path, value: Path, label: str) -> tuple[str, bytes]:
+def _read_explicit_artifact(
+    root: Path,
+    value: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[str, bytes]:
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise ValueError(f"{label} bounded read limit is invalid")
     handle = _open_trusted_root(root)
     opened_directories: list[int] = []
     descriptor = -1
@@ -363,8 +384,14 @@ def _read_explicit_artifact(root: Path, value: Path, label: str) -> tuple[str, b
             or _identity(opened) != _identity(before)
         ):
             raise ValueError(f"{label} must be an unaliased regular file")
+        if max_bytes is not None and opened.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds its bounded read limit")
         chunks: list[bytes] = []
+        total = 0
         while chunk := os.read(descriptor, 64 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError(f"{label} exceeds its bounded read limit")
             chunks.append(chunk)
         after = os.fstat(descriptor)
         rebound = os.stat(relative_path.name, dir_fd=current, follow_symlinks=False)
@@ -1026,7 +1053,12 @@ def _load_query_ids_document(
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Load one explicit, canonical selection from the review namespace."""
     try:
-        relative, raw = _read_explicit_artifact(root, path, "review query IDs")
+        relative, raw = _read_explicit_artifact(
+            root,
+            path,
+            "review query IDs",
+            max_bytes=_MAX_QUERY_IDS_DOCUMENT_BYTES,
+        )
         value = _canonical_object(raw, "review query IDs")
     except (FinalizationError, ValueError) as exc:
         raise FinalizationError(
@@ -1092,12 +1124,16 @@ def _write_validated_receipt(
     schema_name: Literal[
         "v5_2_source_review_receipt.schema.json",
         "v5_2_clean_source_replay_receipt.schema.json",
+        "v5_2_source_receipt_commit.schema.json",
     ],
     expected_prefix: str,
+    pre_write_rebind: Callable[[], None] | None = None,
     final_rebind: Callable[[], None] | None = None,
-) -> ReceiptReport:
+) -> _UncommittedReceipt:
     kind = payload.get("receipt_kind")
-    if kind not in {"SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY"}:
+    if kind not in {
+        "SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY", "SOURCE_RECEIPT_COMMIT"
+    }:
         raise FinalizationError("POSTCONDITION_FAILED", "receipt kind differs", (), 5)
     git_head = payload.get("git_head")
     if not isinstance(git_head, str):
@@ -1109,6 +1145,8 @@ def _write_validated_receipt(
         )
     except ValueError as exc:
         raise FinalizationError("POSTCONDITION_FAILED", str(exc), (), 5) from exc
+    if pre_write_rebind is not None:
+        pre_write_rebind()
     relative = _write_receipt_exclusive(root, path, raw, expected_prefix)
     if final_rebind is not None:
         final_rebind()
@@ -1120,7 +1158,7 @@ def _write_validated_receipt(
         raise FinalizationError(
             "POSTCONDITION_FAILED", "source receipt changed", (relative,), 5
         )
-    return ReceiptReport(
+    return _UncommittedReceipt(
         root / relative,
         hashlib.sha256(raw).hexdigest(),
         kind,
@@ -1144,6 +1182,19 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         )
     if request.decision not in {"APPROVED", "REJECTED"}:
         raise FinalizationError("REVIEWER_INVALID", "review decision differs", (), 3)
+    try:
+        receipt_relative = v52_timezone_review._relative(
+            context.root, request.write_receipt, "source review receipt"
+        )
+        commit_relative = v52_timezone_review._relative(
+            context.root, request.write_commit, "source review commit"
+        )
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    if receipt_relative == commit_relative:
+        raise FinalizationError(
+            "PATH_UNSAFE", "source receipt and commit marker must be distinct", (), 5
+        )
     status = read_status(context)
     if not status.review_ready:
         raise FinalizationError(
@@ -1214,13 +1265,45 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
                 "POSTCONDITION_FAILED", "preflight changed before publication", (), 5
             )
 
-    return _write_validated_receipt(
+    receipt = _write_validated_receipt(
         context.root,
         request.write_receipt,
         payload,
         schema_name="v5_2_source_review_receipt.schema.json",
         expected_prefix=_SOURCE_REVIEW_PREFIX,
         final_rebind=rebind_dependencies,
+    )
+    marker_payload: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+        "committed_receipt_kind": "SOURCE_REVIEW",
+        "run_id": context.run_spec.run_id,
+        "critical_errors": [],
+        "source_receipt": {
+            "path": receipt.path.relative_to(context.root).as_posix(),
+            "sha256": receipt.sha256,
+        },
+        "run_spec": context.snapshot_inputs.bindings.run_spec.as_mapping(),
+        "acquisition_contract": (
+            context.snapshot_inputs.bindings.acquisition_contract.as_mapping()
+        ),
+        "git_head": context.git_head,
+        "occurred_at_utc": _utc_now(),
+    }
+    marker = _write_validated_receipt(
+        context.root,
+        request.write_commit,
+        marker_payload,
+        schema_name="v5_2_source_receipt_commit.schema.json",
+        expected_prefix=_SOURCE_REVIEW_PREFIX,
+        pre_write_rebind=rebind_dependencies,
+    )
+    return ReceiptReport(
+        receipt.path,
+        receipt.sha256,
+        "SOURCE_REVIEW",
+        marker.path,
+        marker.sha256,
     )
 
 
