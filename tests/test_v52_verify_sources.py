@@ -820,26 +820,32 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
         self.assertEqual(result.records, self.records)
         self.assertEqual(result.game_snapshots, self.snapshots)
         open_store.assert_called_once_with(self.evidence_root)
-        self.assertTrue(
-            mocks["load_verified_schedule_anchor_inventory"].call_args.kwargs[
-                "read_only_progress"
-            ]
+        mocks["load_verified_schedule_anchor_inventory"].assert_called_once_with(
+            self.root,
+            self.run_spec,
+            acquisition_contract_path=self.contract_path,
+            static_batch_id=self.graph.query_batches[0].batch_id,
+            evidence_root=self.evidence_root,
+            read_only_progress=True,
         )
-        self.assertTrue(
-            mocks["load_verified_game_evidence_inventory"].call_args.kwargs[
-                "read_only_progress"
-            ]
+        mocks["load_verified_timezone_gate"].assert_called_once_with(
+            self.root,
+            read_only_progress=True,
         )
-        self.assertTrue(
-            mocks["load_verified_timezone_gate"].call_args.kwargs[
-                "read_only_progress"
-            ]
+        mocks["load_verified_game_evidence_inventory"].assert_called_once_with(
+            self.root,
+            read_only_progress=True,
         )
-        self.assertEqual(
-            mocks["load_verified_schedule_anchor_inventory"].call_args.kwargs[
-                "static_batch_id"
-            ],
-            self.graph.query_batches[0].batch_id,
+        store = open_store.return_value
+        mocks["_recompute_verified_query_records"].assert_called_once_with(
+            store, self.graph.completed_queries
+        )
+        mocks["_build_game_normalized_snapshots"].assert_called_once_with(
+            self.run_spec.run_id,
+            self.records,
+            self.games,
+            self.timezone,
+            self.schedule,
         )
 
     def test_factory_fails_closed_without_exactly_one_static_schedule_batch(self) -> None:
