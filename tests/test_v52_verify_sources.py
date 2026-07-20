@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import DEFAULT, call, patch
 
 import jsonschema
 
@@ -755,6 +755,153 @@ def _normalized_game_authority() -> SimpleNamespace:
         game_inventory=game_inventory,
         per_season_payloads=tuple(per_season_payloads),
     )
+
+
+class SnapshotReplayInputFactoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        self.verifier = verifier
+        fx = _graph_fixture()
+        static_batch = dataclasses.replace(fx.batches[0], stage="STATIC_SCHEDULES")
+        self.graph = SimpleNamespace(
+            **{
+                **vars(fx),
+                "query_batches": (static_batch, *fx.batches[1:]),
+                "completed_queries": fx.completed,
+            }
+        )
+        self.root = Path("/sealed/repository")
+        self.evidence_root = self.root / "evidence/raw"
+        self.run_spec = SimpleNamespace(
+            run_id="historical_walkforward_500",
+            raw={"namespaces": {"raw": "evidence/raw"}},
+        )
+        self.contract_path = self.root / "contract.json"
+        self.schedule = object()
+        self.games = object()
+        self.timezone = object()
+        self.records = (object(),)
+        self.snapshots = (object(),)
+
+    def _patch_factory(self):
+        verifier = self.verifier
+        return patch.multiple(
+            verifier,
+            _load_terminal_query_graph=DEFAULT,
+            load_verified_schedule_anchor_inventory=DEFAULT,
+            load_verified_game_evidence_inventory=DEFAULT,
+            load_verified_timezone_gate=DEFAULT,
+            _recompute_verified_query_records=DEFAULT,
+            _build_game_normalized_snapshots=DEFAULT,
+            create=True,
+        )
+
+    def test_load_snapshot_replay_inputs_uses_only_verified_readers(self) -> None:
+        verifier = self.verifier
+        with self._patch_factory() as mocks, patch.object(
+            verifier.V52EvidenceStore, "open_read_only", return_value=object()
+        ) as open_store, patch.object(
+            Path, "resolve", side_effect=AssertionError("must not resolve")
+        ):
+            mocks["_load_terminal_query_graph"].return_value = self.graph
+            mocks["load_verified_schedule_anchor_inventory"].return_value = self.schedule
+            mocks["load_verified_game_evidence_inventory"].return_value = self.games
+            mocks["load_verified_timezone_gate"].return_value = self.timezone
+            mocks["_recompute_verified_query_records"].return_value = self.records
+            mocks["_build_game_normalized_snapshots"].return_value = self.snapshots
+            result = verifier.load_snapshot_replay_inputs(
+                self.root,
+                self.run_spec,
+                acquisition_contract_path=self.contract_path,
+            )
+
+        self.assertIsInstance(result, verifier.SnapshotReplayInputs)
+        self.assertEqual(result.records, self.records)
+        self.assertEqual(result.game_snapshots, self.snapshots)
+        open_store.assert_called_once_with(self.evidence_root)
+        self.assertTrue(
+            mocks["load_verified_schedule_anchor_inventory"].call_args.kwargs[
+                "read_only_progress"
+            ]
+        )
+        self.assertTrue(
+            mocks["load_verified_game_evidence_inventory"].call_args.kwargs[
+                "read_only_progress"
+            ]
+        )
+        self.assertTrue(
+            mocks["load_verified_timezone_gate"].call_args.kwargs[
+                "read_only_progress"
+            ]
+        )
+        self.assertEqual(
+            mocks["load_verified_schedule_anchor_inventory"].call_args.kwargs[
+                "static_batch_id"
+            ],
+            self.graph.query_batches[0].batch_id,
+        )
+
+    def test_factory_fails_closed_without_exactly_one_static_schedule_batch(self) -> None:
+        verifier = self.verifier
+        no_static = SimpleNamespace(
+            **{
+                **vars(self.graph),
+                "query_batches": tuple(
+                    dataclasses.replace(batch, stage="REMAINING")
+                    for batch in self.graph.query_batches
+                ),
+            }
+        )
+        two_static = SimpleNamespace(
+            **{
+                **vars(self.graph),
+                "query_batches": tuple(
+                    dataclasses.replace(batch, stage="STATIC_SCHEDULES")
+                    for batch in self.graph.query_batches
+                ),
+            }
+        )
+        for graph in (no_static, two_static):
+            with self.subTest(graph=graph), patch.object(
+                verifier, "_load_terminal_query_graph", return_value=graph
+            ), self.assertRaises(ValueError):
+                verifier.load_snapshot_replay_inputs(
+                    self.root,
+                    self.run_spec,
+                    acquisition_contract_path=self.contract_path,
+                )
+
+    def test_factory_rejects_unsafe_raw_namespace_lexically(self) -> None:
+        verifier = self.verifier
+        for raw in ("", "/tmp/raw", "raw\\nested", ".", "raw//nested", "raw/./x", "raw/../x"):
+            with self.subTest(raw=raw):
+                run_spec = SimpleNamespace(
+                    run_id=self.run_spec.run_id,
+                    raw={"namespaces": {"raw": raw}},
+                )
+                with patch.object(
+                    verifier, "_load_terminal_query_graph", return_value=self.graph
+                ), self.assertRaises(ValueError):
+                    verifier.load_snapshot_replay_inputs(
+                        self.root,
+                        run_spec,
+                        acquisition_contract_path=self.contract_path,
+                    )
+
+    def test_factory_propagates_second_load_authority_change(self) -> None:
+        verifier = self.verifier
+        with self._patch_factory() as mocks:
+            mocks["_load_terminal_query_graph"].return_value = self.graph
+            mocks["load_verified_schedule_anchor_inventory"].side_effect = ValueError(
+                "schedule inventory authority changed during verified load"
+            )
+            with self.assertRaisesRegex(ValueError, "authority changed"):
+                verifier.load_snapshot_replay_inputs(
+                    self.root,
+                    self.run_spec,
+                    acquisition_contract_path=self.contract_path,
+                )
 
 
 class V52VerifySourcesTest(unittest.TestCase):

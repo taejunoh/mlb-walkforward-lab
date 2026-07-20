@@ -16,11 +16,19 @@ from .execution_registry import (
 )
 from .v52_game_evidence_inventory import (
     VerifiedGameEvidenceInventory,
+    load_verified_game_evidence_inventory,
     validate_game_evidence_snapshot,
 )
-from .v52_schedule_inventory import VerifiedScheduleAnchorInventory
+from .v52_schedule_inventory import (
+    VerifiedScheduleAnchorInventory,
+    load_verified_schedule_anchor_inventory,
+)
 from .v52_sources.schedule import recompute_game_evidence_snapshot
-from .v52_timezone_review import VerifiedTimezoneGate, validate_timezone_mapping
+from .v52_timezone_review import (
+    VerifiedTimezoneGate,
+    load_verified_timezone_gate,
+    validate_timezone_mapping,
+)
 from .protocols import RunSpec
 
 from .v52_evidence import (
@@ -1246,6 +1254,79 @@ def _load_terminal_query_graph(
         batches,
         tuple(receipt for receipt in receipts if receipt is not None),
         statcast_root_batch,
+    )
+
+
+def _safe_raw_namespace(run_spec: RunSpec) -> Path:
+    """Return the RunSpec raw namespace after lexical path validation.
+
+    The namespace is intentionally validated without resolving it.  The
+    verified authority loaders own filesystem identity and symlink checks;
+    this helper only prevents path traversal and platform separator tricks
+    before constructing the evidence root.
+    """
+    namespaces = getattr(run_spec, "raw", None)
+    namespaces = namespaces.get("namespaces") if isinstance(namespaces, Mapping) else None
+    raw_namespace = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(raw_namespace, str) or not raw_namespace:
+        raise ValueError("source verification raw namespace differs")
+    if "\\" in raw_namespace:
+        raise ValueError("source verification raw namespace must use slash separators")
+    raw_path = Path(raw_namespace)
+    if raw_path.is_absolute():
+        raise ValueError("source verification raw namespace must be relative")
+    parts = raw_namespace.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("source verification raw namespace contains unsafe segment")
+    return raw_path
+
+
+def load_snapshot_replay_inputs(
+    root: Path,
+    run_spec: RunSpec,
+    *,
+    acquisition_contract_path: Path,
+) -> SnapshotReplayInputs:
+    """Load immutable, verified authorities needed for source replay.
+
+    Only terminal registry evidence and the existing read-only authority
+    loaders are consulted.  No network access, writes, cleanup, or directory
+    scans are performed by this factory.
+    """
+    graph = _load_terminal_query_graph(root, run_spec)
+    static_batches = tuple(
+        batch for batch in graph.query_batches if batch.stage == "STATIC_SCHEDULES"
+    )
+    if len(static_batches) != 1:
+        raise ValueError("source verification requires one STATIC_SCHEDULES batch")
+
+    raw_relative = _safe_raw_namespace(run_spec)
+    evidence_root = root / raw_relative
+    schedule = load_verified_schedule_anchor_inventory(
+        root,
+        run_spec,
+        acquisition_contract_path=acquisition_contract_path,
+        static_batch_id=static_batches[0].batch_id,
+        evidence_root=evidence_root,
+        read_only_progress=True,
+    )
+    timezone = load_verified_timezone_gate(root, read_only_progress=True)
+    games = load_verified_game_evidence_inventory(root, read_only_progress=True)
+    store = V52EvidenceStore.open_read_only(evidence_root)
+    records = tuple(_recompute_verified_query_records(store, graph.completed_queries))
+    game_snapshots = tuple(
+        _build_game_normalized_snapshots(
+            run_spec.run_id, records, games, timezone, schedule
+        )
+    )
+    return SnapshotReplayInputs(
+        run_spec.run_id,
+        graph,
+        records,
+        game_snapshots,
+        games,
+        timezone,
+        schedule,
     )
 
 
