@@ -913,6 +913,7 @@ def _validate_sources_ready_evidence(
     receipt_hashes: set[str] = set()
     dependent_snapshots: list[_ArtifactSnapshot] = []
     reviewed_query_ids: tuple[str, ...] | None = None
+    seen_replay = False
     run_spec = _validate_binding_value(base["run_spec"], "run spec")
     acquisition_contract = _validate_binding_value(
         base["acquisition_contract"], "acquisition contract"
@@ -952,6 +953,8 @@ def _validate_sources_ready_evidence(
             if dependency not in dependent_snapshots:
                 dependent_snapshots.append(dependency)
         if kind == "SOURCE_REVIEW":
+            if seen_replay:
+                raise ValueError("source review markers must precede clean replays")
             if not set(receipt_queries).issubset(inventory_query_ids):
                 raise ValueError(
                     "source review query IDs are outside the inventory"
@@ -962,6 +965,7 @@ def _validate_sources_ready_evidence(
                 raise ValueError("source review query ID subsets differ")
             reviews += 1
         else:
+            seen_replay = True
             if receipt_queries != inventory_query_ids:
                 raise ValueError(
                     "clean source replay query IDs differ from inventory"
@@ -3799,6 +3803,75 @@ def load_terminal_acquisition_checkpoint(
         allowed_phases=frozenset({"SOURCES_READY"}),
         phase_error="terminal acquisition replay requires SOURCES_READY",
     )
+
+
+def validate_sources_ready_evidence_set(
+    root: Path,
+    run_spec: RunSpec,
+    *,
+    inventory_path: Path,
+    checkpoint_path: Path,
+    validation_receipts: Sequence[Path],
+) -> None:
+    """Read-only authentication for one explicit SOURCES_READY evidence set.
+
+    This is the service-facing source-gate authority.  It validates the exact
+    caller order under the registry's shared lock without publishing a phase
+    receipt, creating quarantine evidence, or repairing any state.
+    """
+    paths = _paths(root, run_spec)
+    with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
+        state, payloads = _load_locked(
+            paths, run_spec, lock_binding, read_only_progress=True
+        )
+        if state.phase not in {"ACQUIRING", "SOURCES_READY"}:
+            raise ValueError(
+                "source evidence validation requires ACQUIRING or SOURCES_READY"
+            )
+        base = payloads[0]
+        snapshot = _capture_git_snapshot(paths.root, base)
+        inventory_snapshot = _capture_artifact(
+            paths.root, inventory_path, "phase inventory"
+        )
+        validation_snapshots = _artifact_snapshots(
+            paths.root, validation_receipts, "validation receipt"
+        )
+        _validate_sources_ready_evidence(
+            inventory_snapshot,
+            validation_snapshots,
+            run_id=run_spec.run_id,
+            root=paths.root,
+            base=base,
+            trusted_git=snapshot,
+        )
+        checkpoints, checkpoint_payloads, checkpoint_names = (
+            _load_checkpoints_locked(
+                paths,
+                run_spec,
+                payloads,
+                snapshot,
+                lock_binding,
+                verify_latest_progress=True,
+                read_only_progress=True,
+            )
+        )
+        checkpoint_head = _terminal_checkpoint_head(
+            paths, checkpoints, checkpoint_payloads, checkpoint_names
+        )
+        supplied_checkpoint = _capture_artifact(
+            paths.root, checkpoint_path, "terminal acquisition checkpoint"
+        )
+        if supplied_checkpoint.binding != {
+            "path": checkpoint_head["path"],
+            "sha256": checkpoint_head["sha256"],
+        }:
+            raise ValueError("terminal acquisition checkpoint differs")
+        _verify_artifact_snapshots(
+            paths.root,
+            (*validation_snapshots, inventory_snapshot, supplied_checkpoint),
+            "source evidence",
+        )
+        _verify_git_snapshot(paths.root, snapshot)
 
 
 def publish_acquisition_checkpoint(

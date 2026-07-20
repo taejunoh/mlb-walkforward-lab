@@ -6842,6 +6842,62 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             self.assertEqual(state.phase, "SOURCES_READY")
 
+    def test_public_sources_ready_prevalidator_is_read_only_for_valid_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            checkpoint = next(
+                (root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints").iterdir()
+            )
+            before = tuple(
+                sorted(
+                    (path.relative_to(root).as_posix(), path.lstat().st_ino, path.read_bytes())
+                    for path in (root / "audit/v5_2_qd/historical/execution").rglob("*")
+                    if path.is_file()
+                )
+            )
+            self.registry.validate_sources_ready_evidence_set(
+                root,
+                run_spec,
+                inventory_path=inventory,
+                checkpoint_path=checkpoint,
+                validation_receipts=evidence,
+            )
+            after = tuple(
+                sorted(
+                    (path.relative_to(root).as_posix(), path.lstat().st_ino, path.read_bytes())
+                    for path in (root / "audit/v5_2_qd/historical/execution").rglob("*")
+                    if path.is_file()
+                )
+            )
+            self.assertEqual(after, before)
+
+    def test_public_sources_ready_prevalidator_rejects_duplicate_markers_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            checkpoint = next(
+                (root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints").iterdir()
+            )
+            receipts = root / RECEIPTS_RELATIVE
+            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+            with self.assertRaises(ValueError):
+                self.registry.validate_sources_ready_evidence_set(
+                    root,
+                    run_spec,
+                    inventory_path=inventory,
+                    checkpoint_path=checkpoint,
+                    validation_receipts=(evidence[0], evidence[1], evidence[1]),
+                )
+            self.assertEqual(
+                tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())),
+                before,
+            )
+
     def test_sources_ready_exact_retry_returns_existing_without_new_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))

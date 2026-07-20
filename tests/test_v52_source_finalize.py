@@ -108,6 +108,7 @@ class _ContextBaseTests(unittest.TestCase):
             with (
                 patch.object(orchestration, "read_status", return_value=status),
                 patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
                 patch.object(orchestration.execution_registry, "advance_execution_phase", return_value=advanced) as advance,
             ):
                 report = orchestration.advance_sources_ready(context, request)
@@ -116,39 +117,10 @@ class _ContextBaseTests(unittest.TestCase):
                 root, context.run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
                 inventory_path=inventory_path, validation_receipts=tuple(markers),
             )
-
-    def test_advance_marker_preinspection_rejects_unsafe_and_group_swapped_inputs(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            review = root / "audit/v5_2_qd/historical/acquisition/source_reviews/review.commit.json"
-            review.parent.mkdir(parents=True)
-            review.write_bytes(canonical_json_bytes({
-                "receipt_kind": "SOURCE_RECEIPT_COMMIT",
-                "committed_receipt_kind": "SOURCE_REVIEW",
-                "source_receipt": {
-                    "path": "audit/v5_2_qd/historical/acquisition/source_reviews/review.json",
-                    "sha256": "a" * 64,
-                },
-            }) + b"\n")
-            with self.assertRaises(orchestration.FinalizationError) as swapped:
-                orchestration._read_source_commit_marker(
-                    root, review, expected_kind="CLEAN_SOURCE_REPLAY"
-                )
-            self.assertEqual(swapped.exception.exit_code, 4)
-            for kind in ("symlink", "hardlink", "fifo"):
-                with self.subTest(kind=kind):
-                    candidate = review.with_name(f"{kind}.commit.json")
-                    if kind == "symlink":
-                        candidate.symlink_to(review)
-                    elif kind == "hardlink":
-                        os.link(review, candidate)
-                    else:
-                        os.mkfifo(candidate)
-                    with self.assertRaises(orchestration.FinalizationError) as unsafe:
-                        orchestration._read_source_commit_marker(
-                            root, candidate, expected_kind="SOURCE_REVIEW"
-                        )
-                    self.assertEqual(unsafe.exception.exit_code, 5)
+            validate.assert_called_once_with(
+                root, context.run_spec, inventory_path=inventory_path,
+                checkpoint_path=checkpoint_path, validation_receipts=tuple(markers),
+            )
 
     def test_context_types_are_frozen_with_canonical_defaults(self) -> None:
         args = orchestration.CommonArgs()
@@ -303,6 +275,100 @@ class _ContextBaseTests(unittest.TestCase):
                 if moved.exists():
                     moved.rename(anchor)
             self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
+
+class AdvanceTests(unittest.TestCase):
+    """Explicit source-gate selection is validated before the one advance call."""
+
+    def _fixture(self, root: Path) -> tuple[object, object, list[Path]]:
+        checkpoint = orchestration.AcquisitionCheckpoint(
+            0, "c" * 64, None, "REMAINING", "2026-07-20T00:00:00.000000Z",
+            "e" * 40, "f" * 64, (), (), (), (), (), (), (), (), (), (),
+        )
+        checkpoint_path = root / orchestration._checkpoint_path(checkpoint)
+        inventory_path = root / "data/v5_2_qd/historical/sources/source_inventory.json"
+        checkpoint_path.parent.mkdir(parents=True)
+        inventory_path.parent.mkdir(parents=True)
+        checkpoint_path.write_bytes(b'{"checkpoint":true}\n')
+        inventory_path.write_bytes(b'{"inventory":true}\n')
+        markers = []
+        for relative in (
+            "audit/v5_2_qd/historical/acquisition/source_reviews/review.commit.json",
+            "audit/v5_2_qd/historical/acquisition/source_replays/replay-one.commit.json",
+            "audit/v5_2_qd/historical/acquisition/source_replays/replay-two.commit.json",
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"{}\n")
+            markers.append(path)
+        context = orchestration.FinalizationContext(
+            root, root / "run.json", root / "contract.json", root / "protected.json",
+            SimpleNamespace(run_id="run"),
+            ExecutionRegistryState("ACQUIRING", 1, "a" * 64, "b" * 64),
+            checkpoint, object(), object(), "ACQUIRING", "e" * 40, (),
+        )
+        request = orchestration.AdvanceRequest(
+            (markers[0],), (markers[1], markers[2]), checkpoint_path, inventory_path
+        )
+        return context, request, markers
+
+    def test_invalid_prevalidation_never_calls_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context, request, _markers = self._fixture(root)
+            status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+            preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set", side_effect=ValueError("bad receipt")),
+                patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                self.assertRaises(orchestration.FinalizationError) as raised,
+            ):
+                orchestration.advance_sources_ready(context, request)
+            self.assertEqual(raised.exception.error_code, "RECEIPT_SET_INVALID")
+            advance.assert_not_called()
+
+    def test_prevalidation_failures_never_call_advance(self) -> None:
+        for message, expected in (
+            ("raw receipt differs", "RECEIPT_SET_INVALID"),
+            ("review subset differs", "RECEIPT_SET_INVALID"),
+            ("replay UUID differs", "RECEIPT_SET_INVALID"),
+            ("inventory binding differs", "RECEIPT_SET_INVALID"),
+            ("Git binding differs", "AUTHORITY_BLOCKED"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                context, request, _markers = self._fixture(root)
+                status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+                preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set", side_effect=ValueError(message)),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                    self.assertRaises(orchestration.FinalizationError) as raised,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(raised.exception.error_code, expected)
+                advance.assert_not_called()
+
+    def test_unsafe_marker_never_calls_prevalidator_or_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context, request, markers = self._fixture(root)
+            unsafe = markers[0].with_name("linked.commit.json")
+            unsafe.symlink_to(markers[0])
+            request = dataclasses.replace(request, review_receipts=(unsafe,))
+            with (
+                patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
+                patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                self.assertRaises(orchestration.FinalizationError) as raised,
+            ):
+                orchestration.advance_sources_ready(context, request)
+            self.assertEqual(raised.exception.exit_code, 5)
+            validate.assert_not_called()
+            advance.assert_not_called()
 
 
 class StatusAndPreflightTests(unittest.TestCase):
