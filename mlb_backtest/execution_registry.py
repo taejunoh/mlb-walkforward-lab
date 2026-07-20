@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import Iterator
 
 from jsonschema import Draft202012Validator, FormatChecker
-from jsonschema.exceptions import SchemaError, ValidationError
-
 from mlb_backtest.diagnostics import canonical_json_bytes
 from mlb_backtest.protocols import RunSpec
 
@@ -641,22 +639,36 @@ def _source_inventory_payload(
 
 
 def _validate_bound_schema(
-    root: Path, schema_name: str, payload: Mapping[str, object]
-) -> None:
+    root: Path,
+    trusted_git: _GitSnapshot,
+    schema_name: str,
+    payload: Mapping[str, object],
+) -> _ArtifactSnapshot:
     snapshot = _capture_artifact(
         root,
         root / "schemas" / schema_name,
         "source receipt schema",
     )
+    trusted = next(
+        (
+            item.artifact
+            for item in trusted_git.files
+            if item.artifact.path == snapshot.path
+        ),
+        None,
+    )
+    if trusted is None or snapshot != trusted:
+        raise ValueError("source receipt schema trusted binding differs")
     schema = _canonical_object(snapshot.contents, "source receipt schema")
     try:
         Draft202012Validator.check_schema(schema)
         Draft202012Validator(
             schema, format_checker=FormatChecker()
         ).validate(payload)
-    except (SchemaError, ValidationError) as exc:
+    except Exception as exc:
         raise ValueError("source evidence receipt schema validation failed") from exc
     _verify_artifact_snapshot(root, snapshot, "source receipt schema")
+    return snapshot
 
 
 def _source_receipt_payload(
@@ -670,14 +682,17 @@ def _source_receipt_payload(
     git_head: str,
     run_spec: Mapping[str, object],
     acquisition_contract: Mapping[str, object],
-) -> tuple[str, tuple[str, ...], str | None]:
+    trusted_git: _GitSnapshot,
+) -> tuple[str, tuple[str, ...], str | None, tuple[_ArtifactSnapshot, ...]]:
     payload = _canonical_object(contents, "source evidence receipt")
     schema_name = (
         "v5_2_source_review_receipt.schema.json"
         if payload.get("receipt_kind") == "SOURCE_REVIEW"
         else "v5_2_clean_source_replay_receipt.schema.json"
     )
-    _validate_bound_schema(root, schema_name, payload)
+    schema_snapshot = _validate_bound_schema(
+        root, trusted_git, schema_name, payload
+    )
     if (
         payload["run_id"] != run_id
         or payload.get("inventory_sha256") != inventory_sha256
@@ -722,7 +737,7 @@ def _source_receipt_payload(
         ):
             raise ValueError("review query ID document selection differs")
         _verify_artifact_snapshot(root, document, "review query IDs document")
-        return kind, queries, None
+        return kind, queries, None, (schema_snapshot, document)
     if kind == "CLEAN_SOURCE_REPLAY":
         if (
             not path.startswith(_SOURCE_REPLAY_PREFIX)
@@ -739,7 +754,7 @@ def _source_receipt_payload(
             ) from exc
         if parsed.version != 4 or str(parsed) != execution_id:
             raise ValueError("clean replay execution ID is not canonical UUIDv4")
-        return kind, queries, execution_id
+        return kind, queries, execution_id, (schema_snapshot,)
     raise ValueError("unknown source evidence receipt kind")
 
 
@@ -750,7 +765,8 @@ def _validate_sources_ready_evidence(
     run_id: str,
     root: Path,
     base: Mapping[str, object],
-) -> None:
+    trusted_git: _GitSnapshot,
+) -> tuple[_ArtifactSnapshot, ...]:
     if inventory.path != _SOURCE_INVENTORY_PATH:
         raise ValueError("SOURCES_READY requires the canonical source inventory")
     snapshots, inventory_query_ids = _source_inventory_payload(
@@ -760,6 +776,7 @@ def _validate_sources_ready_evidence(
     replay_paths: set[str] = set()
     replay_hashes: set[str] = set()
     replay_execution_ids: set[str] = set()
+    dependent_snapshots: list[_ArtifactSnapshot] = []
     reviewed_query_ids: tuple[str, ...] | None = None
     run_spec = _validate_binding_value(base["run_spec"], "run spec")
     acquisition_contract = _validate_binding_value(
@@ -769,7 +786,7 @@ def _validate_sources_ready_evidence(
     if not isinstance(git_head, str) or not _GIT_HEAD.fullmatch(git_head):
         raise ValueError("source evidence base Git binding differs")
     for artifact in validation_values:
-        kind, receipt_queries, execution_id = _source_receipt_payload(
+        kind, receipt_queries, execution_id, dependencies = _source_receipt_payload(
             root,
             artifact.contents,
             path=artifact.path,
@@ -779,7 +796,11 @@ def _validate_sources_ready_evidence(
             git_head=git_head,
             run_spec=run_spec,
             acquisition_contract=acquisition_contract,
+            trusted_git=trusted_git,
         )
+        for dependency in dependencies:
+            if dependency not in dependent_snapshots:
+                dependent_snapshots.append(dependency)
         if kind == "SOURCE_REVIEW":
             if not set(receipt_queries).issubset(inventory_query_ids):
                 raise ValueError(
@@ -814,6 +835,7 @@ def _validate_sources_ready_evidence(
         raise ValueError(
             "SOURCES_READY requires an approved review and two clean replays"
         )
+    return tuple(dependent_snapshots)
 
 
 def _binding(root: Path, path: Path, label: str) -> dict[str, str]:
@@ -1439,7 +1461,8 @@ def _validate_phase_evidence(
     *,
     root: Path,
     run_id: str,
-) -> None:
+    trusted_git: _GitSnapshot,
+) -> tuple[_ArtifactSnapshot, ...]:
     if phase in {"DESIGN_ACCEPTED", "ACQUIRING"}:
         lineage = _exact_object(
             base["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
@@ -1451,16 +1474,16 @@ def _validate_phase_evidence(
             raise ValueError(
                 f"{phase} must bind the Task0 protected inventory directly"
             )
-        return
+        return ()
     if phase == "SOURCES_READY":
-        _validate_sources_ready_evidence(
+        return _validate_sources_ready_evidence(
             inventory,
             validations,
             run_id=run_id,
             root=root,
             base=base,
+            trusted_git=trusted_git,
         )
-        return
     raise ValueError(f"execution phase {phase} has no implemented evidence validator")
 
 
@@ -1789,6 +1812,23 @@ def _load_locked(
         if not isinstance(git_head, str) or not _GIT_HEAD.fullmatch(git_head):
             raise ValueError("execution receipt Git head differs")
         _validate_common_bindings(paths.root, payload, run_spec)
+        current_bindings = {
+            key: payload[key]
+            for key in (
+                "run_spec",
+                "approved_design",
+                "implementation_plan",
+                "acquisition_contract",
+                "task0_lineage",
+            )
+        }
+        if stable_bindings is None:
+            stable_bindings = current_bindings
+            trusted_git = _capture_git_snapshot(paths.root, payload)
+        elif current_bindings != stable_bindings:
+            raise ValueError("execution registry binding fork differs")
+        if trusted_git is None or git_head != trusted_git.head:
+            raise ValueError("execution receipt Git HEAD differs from trusted snapshot")
         inventory = _exact_object(payload.get("inventory"), _BINDING_KEYS, "phase inventory")
         inventory_snapshot = _capture_artifact(
             paths.root, paths.root / str(inventory["path"]), "phase inventory"
@@ -1805,15 +1845,8 @@ def _load_locked(
             validation_snapshots,
             root=paths.root,
             run_id=run_spec.run_id,
+            trusted_git=trusted_git,
         )
-        current_bindings = {key: payload[key] for key in ("run_spec", "approved_design", "implementation_plan", "acquisition_contract", "task0_lineage")}
-        if stable_bindings is None:
-            stable_bindings = current_bindings
-            trusted_git = _capture_git_snapshot(paths.root, payload)
-        elif current_bindings != stable_bindings:
-            raise ValueError("execution registry binding fork differs")
-        if trusted_git is None or git_head != trusted_git.head:
-            raise ValueError("execution receipt Git HEAD differs from trusted snapshot")
         payloads.append(payload)
         phase_receipt_sha[phase] = receipt_sha
         prior_sha = receipt_sha
@@ -3809,14 +3842,16 @@ def advance_execution_phase(
         validations = [artifact.binding for artifact in validation_snapshots]
         checkpoint_snapshot: _ArtifactSnapshot | None = None
         checkpoint_verifier: Callable[[], None] | None = None
+        source_evidence_snapshots: tuple[_ArtifactSnapshot, ...] = ()
         try:
-            _validate_phase_evidence(
+            source_evidence_snapshots = _validate_phase_evidence(
                 next_phase,
                 base,
                 inventory_snapshot,
                 validation_snapshots,
                 root=paths.root,
                 run_id=run_spec.run_id,
+                trusted_git=snapshot,
             )
             checkpoint_head: Mapping[str, object] | None = None
             if next_phase == "SOURCES_READY":
@@ -3919,24 +3954,45 @@ def advance_execution_phase(
             )
             raise ValueError("direct phase artifact evidence failed") from exc
         relative = paths.receipts_relative / f"{state.sequence + 1:06d}-{next_phase}-{digest}.json"
-        _publish_locked(
-            paths,
-            snapshot,
-            lock_binding,
-            relative,
-            contents,
-            "execution receipt",
-            (
-                inventory_snapshot,
-                *validation_snapshots,
-                *((checkpoint_snapshot,) if checkpoint_snapshot else ()),
-            ),
-            expected_receipt_names=(
-                *(_success_receipt_name(item) for item in payloads),
-                relative.name,
-            ),
-            state_verifier=checkpoint_verifier,
-        )
+        try:
+            _publish_locked(
+                paths,
+                snapshot,
+                lock_binding,
+                relative,
+                contents,
+                "execution receipt",
+                (
+                    inventory_snapshot,
+                    *validation_snapshots,
+                    *source_evidence_snapshots,
+                    *((checkpoint_snapshot,) if checkpoint_snapshot else ()),
+                ),
+                expected_receipt_names=(
+                    *(_success_receipt_name(item) for item in payloads),
+                    relative.name,
+                ),
+                state_verifier=checkpoint_verifier,
+            )
+        except ValueError as exc:
+            _publish_quarantine_locked(
+                paths,
+                run_spec,
+                state,
+                base,
+                next_phase,
+                validations,
+                snapshot,
+                lock_binding,
+                inventory=inventory,
+                error_classification=(
+                    "DIRECT_INVENTORY_MISMATCH"
+                    if next_phase == "ACQUIRING"
+                    else "SOURCE_GATE_EVIDENCE_INVALID"
+                ),
+                evidence_snapshots=(inventory_snapshot, *validation_snapshots),
+            )
+            raise ValueError("direct phase artifact evidence failed") from exc
         return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
 
 

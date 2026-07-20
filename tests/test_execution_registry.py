@@ -5555,6 +5555,113 @@ class ExecutionRegistryTest(unittest.TestCase):
                     (review, replay_one, replay_two),
                 )
 
+    def test_source_schema_must_match_trusted_snapshot_through_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            review, replay_one, replay_two = evidence
+            replay_payload = json.loads(replay_one.read_bytes())
+            replay_payload["unexpected"] = True
+            replay_one.write_bytes(canonical_json_bytes(replay_payload) + b"\n")
+            schema_path = root / "schemas/v5_2_clean_source_replay_receipt.schema.json"
+            strict = schema_path.read_bytes()
+            original = self.registry._validate_bound_schema
+
+            def replace_schema_during_validation(*args: object, **kwargs: object) -> object:
+                if "v5_2_clean_source_replay_receipt.schema.json" not in args:
+                    return original(*args, **kwargs)
+                permissive = json.loads(strict)
+                permissive["additionalProperties"] = True
+                schema_path.write_bytes(canonical_json_bytes(permissive) + b"\n")
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    schema_path.write_bytes(strict)
+
+            with patch.object(
+                self.registry,
+                "_validate_bound_schema",
+                side_effect=replace_schema_during_validation,
+            ), self.assertRaisesRegex(ValueError, "schema|source|evidence|binding|Git"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=(review, replay_one, replay_two),
+                )
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                [],
+            )
+
+    def test_late_query_id_document_mutation_quarantines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            review, replay_one, replay_two = evidence
+            review_payload = json.loads(review.read_bytes())
+            selection = root / review_payload["query_ids_document"]["path"]
+            mutated = False
+
+            def mutate_document_once() -> None:
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    selection.write_bytes(
+                        canonical_json_bytes({"query_ids": ["2" * 64, "1" * 64]})
+                        + b"\n"
+                    )
+
+            with patch.object(
+                self.registry,
+                "_before_registry_publish",
+                side_effect=mutate_document_once,
+            ):
+                self._assert_sources_ready_rejected_and_quarantined(
+                    root,
+                    run_spec,
+                    initial,
+                    inventory,
+                    (review, replay_one, replay_two),
+                )
+
+    def test_unresolvable_source_receipt_schema_quarantines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            schema_path = root / "schemas/v5_2_source_review_receipt.schema.json"
+            strict = schema_path.read_bytes()
+            original = self.registry._canonical_object
+
+            def parse_broken_schema(contents: bytes, label: str) -> object:
+                if label == "source receipt schema" and contents == strict:
+                    broken = json.loads(strict)
+                    broken["properties"]["decision"] = {"$ref": "#/$defs/missing"}
+                    return broken
+                return original(contents, label)
+
+            with patch.object(
+                self.registry,
+                "_canonical_object",
+                side_effect=parse_broken_schema,
+            ):
+                self._assert_sources_ready_rejected_and_quarantined(
+                    root,
+                    run_spec,
+                    initial,
+                    inventory,
+                    evidence,
+                )
+
     def test_publication_rejects_replaced_execution_namespace(self) -> None:
         for operation in ("initialize", "advance", "quarantine"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
