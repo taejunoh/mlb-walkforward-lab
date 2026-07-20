@@ -411,6 +411,8 @@ class AdvanceTests(unittest.TestCase):
                     inventory_path=inventory, validation_receipts=markers,
                 )
                 review = fixture.source_receipt_from_marker(root, markers[0])
+                original_review = review.read_bytes()
+                original_marker = markers[0].read_bytes()
                 rejected = json.loads(review.read_bytes())
                 rejected["decision"] = "REJECTED"
                 review.write_bytes(canonical_json_bytes(rejected) + b"\n")
@@ -424,6 +426,20 @@ class AdvanceTests(unittest.TestCase):
                     orchestration.advance_sources_ready(context, request)
                 self.assertEqual(rejected_error.exception.error_code, "RECEIPT_SET_INVALID")
                 rejected_advance.assert_not_called()
+                review.write_bytes(original_review)
+                markers[0].write_bytes(original_marker)
+                crossed = json.loads(markers[0].read_bytes())
+                crossed["acquisition_contract"]["sha256"] = "0" * 64
+                markers[0].write_bytes(canonical_json_bytes(crossed) + b"\n")
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as crossed_advance,
+                    self.assertRaises(orchestration.FinalizationError) as crossed_error,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(crossed_error.exception.error_code, "RECEIPT_SET_INVALID")
+                crossed_advance.assert_not_called()
             finally:
                 fixture.tearDown()
 
