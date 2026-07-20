@@ -169,6 +169,7 @@ class _UncommittedReceipt:
     receipt_kind: Literal[
         "SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY", "SOURCE_RECEIPT_COMMIT"
     ]
+    snapshot: v52_timezone_review._SafeSnapshot
 
 
 ReviewReport = ReceiptReport
@@ -1151,10 +1152,15 @@ def _write_validated_receipt(
     if final_rebind is not None:
         final_rebind()
     try:
-        rebound = _read_explicit_artifact(root, root / relative, "source receipt")[1]
+        snapshot = v52_timezone_review._read_safe_snapshot(
+            root,
+            root / relative,
+            "source receipt",
+            max_bytes=len(raw),
+        )
     except ValueError as exc:
         raise FinalizationError("POSTCONDITION_FAILED", str(exc), (relative,), 5) from exc
-    if rebound != raw:
+    if snapshot is None or snapshot.contents != raw:
         raise FinalizationError(
             "POSTCONDITION_FAILED", "source receipt changed", (relative,), 5
         )
@@ -1162,6 +1168,7 @@ def _write_validated_receipt(
         root / relative,
         hashlib.sha256(raw).hexdigest(),
         kind,
+        snapshot,
     )
 
 
@@ -1290,13 +1297,49 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         "git_head": context.git_head,
         "occurred_at_utc": _utc_now(),
     }
+
+    def rebind_marker_dependencies() -> None:
+        rebind_dependencies()
+        expected_binding = {
+            "path": receipt.path.relative_to(context.root).as_posix(),
+            "sha256": receipt.sha256,
+        }
+        if marker_payload["source_receipt"] != expected_binding:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt commit binding changed before publication",
+                (expected_binding["path"],),
+                5,
+            )
+        try:
+            v52_timezone_review._rebind_safe_snapshot(
+                context.root,
+                receipt.snapshot,
+                "committed source receipt",
+                max_bytes=len(receipt.snapshot.contents),
+            )
+        except ValueError as exc:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt changed before commit publication",
+                (expected_binding["path"],),
+                5,
+            ) from exc
+        if hashlib.sha256(receipt.snapshot.contents).hexdigest() != receipt.sha256:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt hash changed before commit publication",
+                (expected_binding["path"],),
+                5,
+            )
+
     marker = _write_validated_receipt(
         context.root,
         request.write_commit,
         marker_payload,
         schema_name="v5_2_source_receipt_commit.schema.json",
         expected_prefix=_SOURCE_REVIEW_PREFIX,
-        pre_write_rebind=rebind_dependencies,
+        pre_write_rebind=rebind_marker_dependencies,
     )
     return ReceiptReport(
         receipt.path,

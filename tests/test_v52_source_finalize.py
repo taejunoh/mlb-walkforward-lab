@@ -1351,6 +1351,46 @@ class ReviewTests(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_review_rebinds_receipt_inode_and_bytes_immediately_before_marker(self) -> None:
+        for attack in ("tamper", "replace"):
+            with self.subTest(attack=attack):
+                displaced = self.receipt_path.with_name("review.displaced.json")
+                for candidate in (self.receipt_path, self.commit_path, displaced):
+                    if candidate.exists():
+                        candidate.unlink()
+
+                def attack_before_marker(
+                    _root: Path, *, schema_name: str, **_kwargs: object
+                ) -> None:
+                    if schema_name != "v5_2_source_receipt_commit.schema.json":
+                        return
+                    if attack == "tamper":
+                        self.receipt_path.write_bytes(b"attacker-tamper\n")
+                    else:
+                        self.receipt_path.rename(displaced)
+                        self.receipt_path.write_bytes(b"attacker-replacement\n")
+
+                with self.assertRaises(orchestration.FinalizationError) as raised:
+                    self._write(validator_side_effect=attack_before_marker)
+                self.assertEqual(
+                    (raised.exception.error_code, raised.exception.exit_code),
+                    ("POSTCONDITION_FAILED", 5),
+                )
+                self.assertFalse(self.commit_path.exists())
+                self.assertEqual(
+                    self.receipt_path.read_bytes(),
+                    (
+                        b"attacker-tamper\n"
+                        if attack == "tamper"
+                        else b"attacker-replacement\n"
+                    ),
+                )
+                if attack == "replace":
+                    self.assertTrue(displaced.is_file())
+                self.receipt_path.unlink()
+                if displaced.exists():
+                    displaced.unlink()
+
     def test_same_explicit_receipt_path_allows_one_concurrent_writer(self) -> None:
         outcomes: list[object] = []
         gate = threading.Barrier(2)
