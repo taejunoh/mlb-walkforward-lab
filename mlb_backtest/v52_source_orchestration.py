@@ -31,11 +31,13 @@ from .v52_query_plan import _load_static_contracts
 from .v52_snapshot_store import (
     AuthorityBinding,
     AuthorityBindings,
+    SnapshotStoreError,
     SnapshotStoreInputs,
     SourceInventory,
     TerminalCheckpointBinding,
     build_inventory,
     inventory_bytes,
+    load_snapshot_store,
 )
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import load_snapshot_replay_inputs
@@ -581,7 +583,127 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
     )
 
 
+def _checkpoint_status(checkpoint: AcquisitionCheckpoint | None) -> Mapping[str, object] | None:
+    if checkpoint is None:
+        return None
+    return {
+        "sequence": checkpoint.sequence,
+        "stage": checkpoint.stage,
+        "head": checkpoint.receipt_sha256,
+        "pending_count": len(checkpoint.pending_query_ids),
+        "quarantine_count": len(checkpoint.quarantined_query_ids),
+    }
+
+
+def _has_terminal_checkpoint(checkpoint: AcquisitionCheckpoint | None) -> bool:
+    return bool(
+        checkpoint is not None
+        and checkpoint.stage == "REMAINING"
+        and not checkpoint.pending_query_ids
+        and not checkpoint.quarantined_query_ids
+    )
+
+
+def _context_is_ready_for_mutation(context: FinalizationContext) -> bool:
+    return bool(
+        not context.blockers
+        and context.run_spec is not None
+        and context.registry is not None
+        and context.checkpoint is not None
+        and context.snapshot_inputs is not None
+        and context.inventory is not None
+        and context.git_head is not None
+        and context.registry.phase == context.phase
+        and _has_terminal_checkpoint(context.checkpoint)
+    )
+
+
+def _published_inventory_matches(
+    context: FinalizationContext,
+) -> tuple[bool, Blocker | None]:
+    """Authenticate the already-published inventory without repairing it."""
+    if context.inventory is None or context.snapshot_inputs is None:
+        return False, None
+    source_root = _source_root(context.root)
+    try:
+        loaded = load_snapshot_store(source_root, context.snapshot_inputs)
+        return inventory_bytes(loaded.inventory) == inventory_bytes(context.inventory), None
+    except (SnapshotStoreError, OSError, ValueError, TypeError):
+        try:
+            os.lstat(source_root)
+        except FileNotFoundError:
+            return False, None
+        return False, Blocker(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            "published source inventory is unsafe or differs from the context",
+            (source_root.relative_to(context.root).as_posix(),),
+        )
+
+
+def read_status(context: FinalizationContext) -> StatusReport:
+    """Return advisory readiness without selecting receipts or changing phase."""
+    blockers = list(context.blockers)
+    base_ready = _context_is_ready_for_mutation(context)
+    published_matches = False
+    if base_ready and context.phase == "ACQUIRING":
+        published_matches, publication_blocker = _published_inventory_matches(context)
+        if publication_blocker is not None:
+            blockers.append(publication_blocker)
+    mutable = base_ready and not blockers and context.phase == "ACQUIRING"
+    return StatusReport(
+        context.phase,
+        _checkpoint_status(context.checkpoint),
+        mutable,
+        mutable and published_matches,
+        mutable and published_matches,
+        False,
+        tuple(blockers),
+    )
+
+
+def _rebuild_context_inventory(context: FinalizationContext) -> SourceInventory:
+    rebound = build_context(
+        CommonArgs(
+            root=context.root,
+            run_spec=context.run_spec_path,
+            acquisition_contract=context.acquisition_contract_path,
+            protected_inventory=context.protected_inventory_path,
+        )
+    )
+    before = (context.root, context.phase, context.registry, context.checkpoint)
+    after = (rebound.root, rebound.phase, rebound.registry, rebound.checkpoint)
+    if before != after or rebound.inventory is None:
+        raise FinalizationError(
+            "AUTHORITY_CHANGED", "finalization authority changed", (), 5
+        )
+    return rebound.inventory
+
+
+def run_preflight(context: FinalizationContext) -> PreflightReport:
+    """Rebuild and compare the candidate inventory without writing any state."""
+    if context.blockers or context.inventory is None:
+        return PreflightReport(
+            context.phase, "BLOCKED", None, 0, 0, context.blockers
+        )
+    first = inventory_bytes(context.inventory)
+    rebound = _rebuild_context_inventory(context)
+    second = inventory_bytes(rebound)
+    if first != second:
+        raise FinalizationError(
+            "AUTHORITY_CHANGED", "inventory changed during preflight", (), 5
+        )
+    return PreflightReport(
+        context.phase,
+        "PASS",
+        hashlib.sha256(first).hexdigest(),
+        len(context.inventory.snapshots),
+        0,
+        (),
+    )
+
+
 __all__ = [
     "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
-    "PreflightReport", "StatusReport", "build_context",
+    "PreflightReport", "StatusReport", "build_context", "read_status",
+    "run_preflight",
 ]

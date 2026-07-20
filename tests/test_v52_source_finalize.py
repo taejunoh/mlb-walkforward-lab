@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import tempfile
 import unittest
@@ -11,8 +12,9 @@ from unittest.mock import call, patch
 
 from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
-from mlb_backtest.v52_snapshot_store import AuthorityBinding
+from mlb_backtest.v52_snapshot_store import AuthorityBinding, build_inventory, inventory_bytes
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
+from tests.v52_snapshot_store_fixture import patched_store_replay, store_inputs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +35,7 @@ def tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
     )
 
 
-class ContextTests(unittest.TestCase):
+class _ContextBaseTests(unittest.TestCase):
     def test_context_types_are_frozen_with_canonical_defaults(self) -> None:
         args = orchestration.CommonArgs()
         self.assertEqual(args.root, Path("."))
@@ -158,6 +160,194 @@ class ContextTests(unittest.TestCase):
                     moved.rename(anchor)
             self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
+
+class StatusAndPreflightTests(unittest.TestCase):
+    """The advisory/read-only finalization surface must never select or mutate."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name).resolve()
+        self.inputs = store_inputs()
+        with patched_store_replay():
+            self.inventory = build_inventory(self.inputs)
+        self.registry = ExecutionRegistryState("ACQUIRING", 7, "a" * 64, "b" * 64)
+        self.checkpoint = AcquisitionCheckpoint(
+            9,
+            "c" * 64,
+            "d" * 64,
+            "REMAINING",
+            "2026-07-20T00:00:00.000000Z",
+            "e" * 40,
+            "f" * 64,
+            (), (), (), (), (), (), (), (), (), (),
+        )
+        self.context = orchestration.FinalizationContext(
+            self.root,
+            self.root / "run.json",
+            self.root / "contract.json",
+            self.root / "protected.json",
+            SimpleNamespace(run_id="run"),
+            self.registry,
+            self.checkpoint,
+            self.inputs,
+            self.inventory,
+            "ACQUIRING",
+            "e" * 40,
+            (),
+        )
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_status_and_preflight_symbols_are_public(self) -> None:
+        self.assertIn("read_status", orchestration.__all__)
+        self.assertIn("run_preflight", orchestration.__all__)
+
+    def test_status_never_selects_receipts_or_infers_phase(self) -> None:
+        report = orchestration.read_status(self.context)
+        self.assertEqual(report.phase, "ACQUIRING")
+        self.assertEqual(report.checkpoint, {
+            "sequence": 9,
+            "stage": "REMAINING",
+            "head": "c" * 64,
+            "pending_count": 0,
+            "quarantine_count": 0,
+        })
+        self.assertTrue(report.publish_ready)
+        self.assertFalse(report.review_ready)
+        self.assertFalse(report.replay_ready)
+        self.assertFalse(report.advance_ready)
+        rendered = dataclasses.asdict(report)
+        self.assertNotIn("selected_review_receipts", rendered)
+        self.assertNotIn("selected_replay_receipts", rendered)
+
+    def test_status_requires_authenticated_published_inventory_for_later_gates(self) -> None:
+        with patch.object(
+            orchestration, "load_snapshot_store", return_value=SimpleNamespace(inventory=self.inventory)
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertTrue(report.review_ready)
+        self.assertTrue(report.replay_ready)
+        self.assertFalse(report.advance_ready)
+
+    def test_status_reports_unsafe_published_store_as_a_blocker(self) -> None:
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        source_root.mkdir(parents=True)
+        before = tree_snapshot(self.root)
+        report = orchestration.read_status(self.context)
+        self.assertFalse(report.publish_ready)
+        self.assertFalse(report.review_ready)
+        self.assertIn(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            {blocker.code for blocker in report.blockers},
+        )
+        self.assertEqual(tree_snapshot(self.root), before)
+
+    def test_status_blocks_partial_or_non_acquiring_context_without_mutation(self) -> None:
+        partial = dataclasses.replace(
+            self.context,
+            checkpoint=None,
+            inventory=None,
+            phase="SOURCES_READY",
+            blockers=(orchestration.Blocker("PARTIAL", "partial authority"),),
+        )
+        report = orchestration.read_status(partial)
+        self.assertEqual(report.phase, "SOURCES_READY")
+        self.assertIsNone(report.checkpoint)
+        self.assertEqual(
+            (report.publish_ready, report.review_ready, report.replay_ready, report.advance_ready),
+            (False, False, False, False),
+        )
+        self.assertEqual(report.blockers, partial.blockers)
+
+    def test_preflight_is_read_only_and_returns_recomputed_digest(self) -> None:
+        before = tree_snapshot(self.root)
+        with patch.object(orchestration, "build_context", return_value=self.context) as rebuild:
+            report = orchestration.run_preflight(self.context)
+        self.assertEqual(report.status, "PASS")
+        self.assertEqual(
+            report.inventory_sha256,
+            hashlib.sha256(inventory_bytes(self.context.inventory)).hexdigest(),
+        )
+        self.assertEqual(report.snapshot_count, len(self.inventory.snapshots))
+        self.assertEqual(report.network_attempts, 0)
+        rebuild.assert_called_once_with(
+            orchestration.CommonArgs(
+                root=self.root,
+                run_spec=self.context.run_spec_path,
+                acquisition_contract=self.context.acquisition_contract_path,
+                protected_inventory=self.context.protected_inventory_path,
+            )
+        )
+        self.assertEqual(tree_snapshot(self.root), before)
+        self.assertFalse((self.root / "data/v5_2_qd/historical/sources").exists())
+
+    def test_preflight_never_calls_write_or_git_capabilities(self) -> None:
+        with (
+            patch.object(orchestration, "build_context", return_value=self.context),
+            patch.object(orchestration.os, "mkdir", side_effect=AssertionError("mkdir")) as mkdir,
+            patch.object(orchestration.os, "write", side_effect=AssertionError("write")) as write,
+            patch.object(orchestration.subprocess, "run", side_effect=AssertionError("git")) as git,
+        ):
+            report = orchestration.run_preflight(self.context)
+        self.assertEqual(report.status, "PASS")
+        mkdir.assert_not_called()
+        write.assert_not_called()
+        git.assert_not_called()
+
+    def test_preflight_returns_blocked_without_rebuild(self) -> None:
+        blocked = dataclasses.replace(
+            self.context,
+            inventory=None,
+            blockers=(orchestration.Blocker("REGISTRY_ABSENT", "absent"),),
+            phase="ABSENT",
+        )
+        with patch.object(orchestration, "build_context") as rebuild:
+            report = orchestration.run_preflight(blocked)
+        self.assertEqual(
+            report,
+            orchestration.PreflightReport("ABSENT", "BLOCKED", None, 0, 0, blocked.blockers),
+        )
+        rebuild.assert_not_called()
+
+    def test_preflight_allows_already_sources_ready_context(self) -> None:
+        ready = dataclasses.replace(
+            self.context,
+            registry=dataclasses.replace(self.registry, phase="SOURCES_READY"),
+            phase="SOURCES_READY",
+        )
+        with patch.object(orchestration, "build_context", return_value=ready):
+            report = orchestration.run_preflight(ready)
+        self.assertEqual(report.phase, "SOURCES_READY")
+        self.assertEqual(report.status, "PASS")
+
+    def test_rebuild_rejects_changed_phase_registry_or_checkpoint(self) -> None:
+        for changed in (
+            dataclasses.replace(self.context, phase="SOURCES_READY"),
+            dataclasses.replace(self.context, registry=dataclasses.replace(self.registry, sequence=8)),
+            dataclasses.replace(self.context, checkpoint=dataclasses.replace(self.checkpoint, sequence=10)),
+            dataclasses.replace(self.context, inventory=None),
+        ):
+            with self.subTest(changed=changed), patch.object(
+                orchestration, "build_context", return_value=changed
+            ):
+                with self.assertRaises(orchestration.FinalizationError) as raised:
+                    orchestration._rebuild_context_inventory(self.context)
+            self.assertEqual(raised.exception.error_code, "AUTHORITY_CHANGED")
+            self.assertEqual(raised.exception.exit_code, 5)
+
+    def test_preflight_rejects_rebuilt_inventory_byte_change(self) -> None:
+        rebound = dataclasses.replace(self.context, inventory=SimpleNamespace())
+        with (
+            patch.object(orchestration, "build_context", return_value=rebound),
+            patch.object(orchestration, "inventory_bytes", side_effect=(b"first\n", b"second\n")),
+        ):
+            with self.assertRaises(orchestration.FinalizationError) as raised:
+                orchestration.run_preflight(self.context)
+        self.assertEqual(raised.exception.error_code, "AUTHORITY_CHANGED")
+        self.assertEqual(raised.exception.exit_code, 5)
+
+class ContextTests(_ContextBaseTests):
     def test_canonical_object_rejects_duplicate_and_noncanonical_json(self) -> None:
         with self.assertRaises(orchestration.FinalizationError) as duplicate:
             orchestration._canonical_object(b'{"a":1,"a":2}\n', "authority")
