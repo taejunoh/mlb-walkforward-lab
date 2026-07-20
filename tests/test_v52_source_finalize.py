@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import os
 import tempfile
@@ -589,6 +590,69 @@ class PublishTests(StatusAndPreflightTests):
             "PUBLISH_FAILED", 5
         ))
         self.assertFalse((self.root / "data").exists())
+
+    def test_source_root_open_failure_cleans_all_created_fixed_directories_and_fds(self) -> None:
+        for failed_component in ("data", "v5_2_qd", "historical"):
+            with self.subTest(component=failed_component), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                before_tree = tree_snapshot(root)
+                before_fds = len(os.listdir("/dev/fd"))
+
+                def fail_after_component(component: str) -> None:
+                    if component == failed_component:
+                        raise RuntimeError(f"injected after {component}")
+
+                with patch.object(
+                    orchestration,
+                    "_trusted_descendant_test_hook",
+                    side_effect=fail_after_component,
+                ), self.assertRaisesRegex(RuntimeError, f"injected after {failed_component}"):
+                    orchestration._open_or_create_source_root(root)
+                self.assertEqual(tree_snapshot(root), before_tree)
+                self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
+    def test_source_root_failure_never_deletes_replaced_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            moved = root / "owned-data-moved"
+
+            def replace_and_fail(component: str) -> None:
+                if component == "data":
+                    (root / "data").rename(moved)
+                    (root / "data").mkdir()
+                    (root / "data/attacker.txt").write_bytes(b"attacker\n")
+                    raise RuntimeError("injected replacement")
+
+            with patch.object(
+                orchestration,
+                "_trusted_descendant_test_hook",
+                side_effect=replace_and_fail,
+            ), self.assertRaisesRegex(RuntimeError, "injected replacement"):
+                orchestration._open_or_create_source_root(root)
+            self.assertEqual((root / "data/attacker.txt").read_bytes(), b"attacker\n")
+            self.assertTrue(moved.is_dir())
+
+    def test_source_root_cleanup_failure_preserves_primary_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            def fail_after_data(component: str) -> None:
+                if component == "data":
+                    raise RuntimeError("primary failure")
+
+            cleanup_failure = PermissionError(errno.EACCES, "cleanup denied")
+            with patch.object(
+                orchestration,
+                "_trusted_descendant_test_hook",
+                side_effect=fail_after_data,
+            ), patch.object(
+                orchestration.os,
+                "rmdir",
+                side_effect=cleanup_failure,
+            ), self.assertRaisesRegex(ValueError, "cleanup failed") as raised:
+                orchestration._open_or_create_source_root(root)
+            self.assertIsInstance(raised.exception.primary_error, RuntimeError)
+            self.assertIs(raised.exception.cleanup_error.__cause__, cleanup_failure)
 
     def test_postcondition_mismatch_is_a_stable_failure(self) -> None:
         different = dataclasses.replace(self.inventory, run_id="different-run")

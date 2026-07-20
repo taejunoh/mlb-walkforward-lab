@@ -6,6 +6,7 @@ source-finalization commands.  It performs no publication or cleanup.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -176,6 +177,15 @@ class _TrustedRootHandle:
     root: Path
     descriptors: tuple[int, ...]
     component_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CreatedSourceDirectory:
+    parent_fd: int
+    child_fd: int
+    name: str
+    device: int
+    inode: int
 
 
 def _directory_flags() -> int:
@@ -451,23 +461,22 @@ def _open_optional_trusted_descendant(
 
 def _open_or_create_source_root(
     root: Path,
-) -> tuple[_TrustedRootHandle, tuple[tuple[int, str], ...]]:
+) -> tuple[_TrustedRootHandle, tuple[_CreatedSourceDirectory, ...]]:
     """Return the fixed source target through held no-follow directory FDs only."""
     root_handle = _open_trusted_root(root)
     descriptors = list(root_handle.descriptors)
     names = list(root_handle.component_names)
-    created: list[tuple[int, str]] = []
+    created: list[_CreatedSourceDirectory] = []
     current = descriptors[-1]
     try:
         for component in _SOURCE_ROOT_RELATIVE.parts:
+            created_here = False
             try:
                 child = os.open(component, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
-                parent_index = len(descriptors) - 1
                 try:
                     os.mkdir(component, 0o700, dir_fd=current)
-                    os.fsync(current)
-                    created.append((parent_index, component))
+                    created_here = True
                 except FileExistsError:
                     # A concurrent publisher won creation under this same held parent.
                     # Re-open it no-follow below and apply the normal identity checks.
@@ -478,6 +487,8 @@ def _open_or_create_source_root(
                     child = os.open(component, _directory_flags(), dir_fd=current)
                 except OSError as exc:
                     raise ValueError("could not safely open fixed source directory") from exc
+            descriptors.append(child)
+            names.append(component)
             try:
                 opened = os.fstat(child)
                 linked = os.stat(component, dir_fd=current, follow_symlinks=False)
@@ -488,11 +499,19 @@ def _open_or_create_source_root(
                     != (linked.st_dev, linked.st_ino)
                 ):
                     raise ValueError("fixed source directory must be a no-follow directory")
+                if created_here:
+                    created.append(
+                        _CreatedSourceDirectory(
+                            current,
+                            child,
+                            component,
+                            opened.st_dev,
+                            opened.st_ino,
+                        )
+                    )
+                    os.fsync(current)
             except BaseException:
-                os.close(child)
                 raise
-            descriptors.append(child)
-            names.append(component)
             current = child
             _trusted_descendant_test_hook(component)
         result = _TrustedRootHandle(
@@ -502,35 +521,67 @@ def _open_or_create_source_root(
         )
         _assert_trusted_root(result)
         return result, tuple(created)
-    except OSError as exc:
-        _close_descriptors(descriptors)
-        raise ValueError("fixed source directory is unsafe or unavailable") from exc
-    except BaseException:
-        _close_descriptors(descriptors)
-        raise
+    except BaseException as exc:
+        primary: BaseException = (
+            ValueError("fixed source directory is unsafe or unavailable")
+            if isinstance(exc, OSError)
+            else exc
+        )
+        if primary is not exc:
+            primary.__cause__ = exc
+        partial = _TrustedRootHandle(
+            root_handle.root,
+            tuple(descriptors),
+            tuple(names),
+        )
+        try:
+            _cleanup_empty_created_source_directories(partial, created)
+        except BaseException as cleanup_error:
+            combined = ValueError("created source directory cleanup failed")
+            combined.primary_error = primary  # type: ignore[attr-defined]
+            combined.cleanup_error = cleanup_error  # type: ignore[attr-defined]
+            raise combined from cleanup_error
+        finally:
+            _close_descriptors(descriptors)
+        raise primary
 
 
 def _cleanup_empty_created_source_directories(
-    handle: _TrustedRootHandle, created: Sequence[tuple[int, str]]
+    handle: _TrustedRootHandle, created: Sequence[_CreatedSourceDirectory]
 ) -> None:
     """Remove only still-empty directories created by this failed invocation."""
-    for parent_index, name in reversed(tuple(created)):
+    descriptor_set = frozenset(handle.descriptors)
+    for item in reversed(tuple(created)):
+        if item.parent_fd not in descriptor_set or item.child_fd not in descriptor_set:
+            raise ValueError("created directory cleanup capability is invalid")
         try:
-            parent = handle.descriptors[parent_index]
-            child = handle.descriptors[parent_index + 1]
-            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            opened = os.fstat(child)
+            linked = os.stat(item.name, dir_fd=item.parent_fd, follow_symlinks=False)
+            opened = os.fstat(item.child_fd)
             if (
                 not stat.S_ISDIR(linked.st_mode)
                 or not stat.S_ISDIR(opened.st_mode)
-                or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+                or (opened.st_dev, opened.st_ino) != (item.device, item.inode)
+                or (linked.st_dev, linked.st_ino) != (item.device, item.inode)
             ):
                 continue
-            os.rmdir(name, dir_fd=parent)
-            os.fsync(parent)
-        except OSError:
-            # Immutable residue is never removed: only empty directories are eligible.
+            if os.listdir(item.child_fd):
+                continue
+            rebound = os.stat(
+                item.name, dir_fd=item.parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(rebound.st_mode)
+                or (rebound.st_dev, rebound.st_ino) != (item.device, item.inode)
+            ):
+                continue
+            os.rmdir(item.name, dir_fd=item.parent_fd)
+            os.fsync(item.parent_fd)
+        except FileNotFoundError:
             continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                continue
+            raise ValueError("created source directory cleanup failed") from exc
 
 
 def _canonical_inventory_exists(source_root: Path) -> bool:

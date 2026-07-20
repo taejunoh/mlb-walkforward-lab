@@ -427,6 +427,40 @@ class PublishTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def test_fd_publish_stays_on_opened_directory_after_path_is_rebound(self):
+        from mlb_backtest.v52_snapshot_store import (
+            inventory_bytes,
+            publish_snapshot_store_from_fd,
+        )
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            original = base / "source-root"
+            original.mkdir()
+            moved = base / "held-source-root"
+            external = base / "external"
+            external.mkdir()
+            fd = os.open(original, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            before_fds = len(os.listdir("/dev/fd"))
+            try:
+                original.rename(moved)
+                original.symlink_to(external, target_is_directory=True)
+                with patched_store_replay():
+                    outcome = publish_snapshot_store_from_fd(
+                        fd, inventory, store_inputs(), lock_owner="fd-path-rebind"
+                    )
+                self.assertTrue(outcome.created)
+                self.assertEqual(
+                    moved.joinpath("source_inventory.json").read_bytes(),
+                    inventory_bytes(inventory),
+                )
+                self.assertEqual(tuple(external.iterdir()), ())
+                self.assertTrue(stat.S_ISDIR(os.fstat(fd).st_mode))
+                self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+            finally:
+                os.close(fd)
+
 
     def test_fresh_publish_is_content_addressed_and_removes_owned_lock(self):
         from mlb_backtest.v52_snapshot_store import PublishReceipt, inventory_bytes
