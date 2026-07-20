@@ -408,7 +408,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         terminal_checkpoint: bool = True,
     ) -> tuple[Path, tuple[Path, Path, Path]]:
         snapshots = ["a" * 64, "b" * 64]
-        reviewed_query_ids = ["query-001", "query-002"]
+        reviewed_query_ids = ["1" * 64, "2" * 64]
         inventory = self.write_artifact(
             root,
             SOURCE_INVENTORY_RELATIVE.as_posix(),
@@ -423,11 +423,29 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "status": "READY_CANDIDATE",
             },
         )
+        selection = self.write_artifact(
+            root,
+            "audit/v5_2_qd/historical/acquisition/source_reviews/query_ids.json",
+            {"query_ids": reviewed_query_ids},
+        )
+        run_spec_path = root / "protocols/v5_2_qd/historical_walkforward_500.json"
+        acquisition_contract_path = (
+            root / "protocols/v5_2_qd/historical_source_acquisition.json"
+        )
         common = {
             "critical_errors": [],
+            "acquisition_contract": {
+                "path": acquisition_contract_path.relative_to(root).as_posix(),
+                "sha256": _sha256(acquisition_contract_path),
+            },
+            "git_head": _git(root, "rev-parse", "HEAD"),
             "inventory_sha256": _sha256(inventory),
             "reviewed_query_ids": reviewed_query_ids,
             "run_id": "historical_walkforward_500",
+            "run_spec": {
+                "path": run_spec_path.relative_to(root).as_posix(),
+                "sha256": _sha256(run_spec_path),
+            },
             "schema_version": 1,
             "snapshot_sha256s": snapshots,
         }
@@ -437,8 +455,14 @@ class ExecutionRegistryTest(unittest.TestCase):
             {
                 **common,
                 "decision": "APPROVED",
+                "occurred_at_utc": "2026-07-20T00:00:00.000000Z",
+                "query_ids_document": {
+                    "path": selection.relative_to(root).as_posix(),
+                    "sha256": _sha256(selection),
+                },
                 "receipt_kind": "SOURCE_REVIEW",
                 "reviewer_identity": "independent-source-auditor",
+                "reviewer_role": "independent-source-auditor",
             },
         )
         replays = tuple(
@@ -447,13 +471,17 @@ class ExecutionRegistryTest(unittest.TestCase):
                 f"audit/v5_2_qd/historical/acquisition/source_replays/replay-{index}.json",
                 {
                     **common,
+                    "execution_id": execution_id,
                     "network_attempts": 0,
-                    "recorded_at_utc": f"2026-07-13T00:00:0{index}.000000Z",
+                    "recorded_at_utc": f"2026-07-20T00:00:0{index}.000000Z",
                     "receipt_kind": "CLEAN_SOURCE_REPLAY",
                     "status": "PASS",
                 },
             )
-            for index in (1, 2)
+            for index, execution_id in (
+                (1, "11111111-1111-4111-8111-111111111111"),
+                (2, "22222222-2222-4222-8222-222222222222"),
+            )
         )
         if terminal_checkpoint:
             self.install_terminal_checkpoint_stub(root)
@@ -4625,7 +4653,12 @@ class ExecutionRegistryTest(unittest.TestCase):
             inventory, evidence = self.write_real_source_evidence(root)
             review, replay_one, replay_two = evidence
             review_payload = json.loads(review.read_bytes())
-            review_payload["reviewed_query_ids"] = ["query-001"]
+            review_payload["reviewed_query_ids"] = ["1" * 64]
+            selection = root / review_payload["query_ids_document"]["path"]
+            selection.write_bytes(
+                canonical_json_bytes({"query_ids": ["1" * 64]}) + b"\n"
+            )
+            review_payload["query_ids_document"]["sha256"] = _sha256(selection)
             review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
 
             state = self.registry.advance_execution_phase(
@@ -4657,9 +4690,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 replacements = {
                     "empty": [],
                     "outside": ["outside-query"],
-                    "duplicate": ["query-001", "query-001"],
-                    "unsorted": ["query-002", "query-001"],
-                    "partial_replay": ["query-001"],
+                    "duplicate": ["1" * 64, "1" * 64],
+                    "unsorted": ["2" * 64, "1" * 64],
+                    "partial_replay": ["1" * 64],
                 }
                 payload["reviewed_query_ids"] = replacements[case]
                 target.write_bytes(canonical_json_bytes(payload) + b"\n")
@@ -5392,6 +5425,135 @@ class ExecutionRegistryTest(unittest.TestCase):
                 (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
             )
             jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
+
+    def _assert_sources_ready_rejected_and_quarantined(
+        self,
+        root: Path,
+        run_spec: object,
+        initial: object,
+        inventory: Path,
+        evidence: tuple[Path, ...],
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "schema|source|evidence|review|replay|binding"):
+            self.registry.advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="ACQUIRING",
+                next_phase="SOURCES_READY",
+                inventory_path=inventory,
+                validation_receipts=evidence,
+            )
+        self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+        quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+        receipts = list(quarantine.iterdir())
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(
+            json.loads(receipts[0].read_bytes())["error_classification"],
+            "SOURCE_GATE_EVIDENCE_INVALID",
+        )
+
+    def test_source_receipt_schema_cannot_be_bypassed(self) -> None:
+        cases = (
+            "extra_replay_key",
+            "missing_reviewer_role",
+            "wrong_reviewer_role",
+            "missing_execution_id",
+            "malformed_execution_id",
+            "non_v4_execution_id",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(
+                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+                )
+                inventory, evidence = self.write_real_source_evidence(root)
+                review, replay_one, replay_two = evidence
+                target = review if "reviewer" in case else replay_one
+                payload = json.loads(target.read_bytes())
+                if case == "extra_replay_key":
+                    payload["unexpected"] = True
+                elif case == "missing_reviewer_role":
+                    del payload["reviewer_role"]
+                elif case == "wrong_reviewer_role":
+                    payload["reviewer_role"] = "source-operator"
+                elif case == "missing_execution_id":
+                    del payload["execution_id"]
+                elif case == "malformed_execution_id":
+                    payload["execution_id"] = "not-a-uuid"
+                else:
+                    payload["execution_id"] = "11111111-1111-1111-8111-111111111111"
+                target.write_bytes(canonical_json_bytes(payload) + b"\n")
+                self._assert_sources_ready_rejected_and_quarantined(
+                    root,
+                    run_spec,
+                    initial,
+                    inventory,
+                    (review, replay_one, replay_two),
+                )
+
+    def test_duplicate_replay_execution_id_cannot_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            review, replay_one, replay_two = evidence
+            payload = json.loads(replay_two.read_bytes())
+            payload["execution_id"] = json.loads(replay_one.read_bytes())["execution_id"]
+            replay_two.write_bytes(canonical_json_bytes(payload) + b"\n")
+            self._assert_sources_ready_rejected_and_quarantined(
+                root,
+                run_spec,
+                initial,
+                inventory,
+                (review, replay_one, replay_two),
+            )
+
+    def test_review_query_id_document_is_rebound(self) -> None:
+        cases = ("path", "hash", "contents")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(
+                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+                )
+                inventory, evidence = self.write_real_source_evidence(root)
+                review, replay_one, replay_two = evidence
+                review_payload = json.loads(review.read_bytes())
+                selection = root / review_payload["query_ids_document"]["path"]
+                if case == "path":
+                    replacement = self.write_artifact(
+                        root,
+                        "audit/v5_2_qd/historical/acquisition/source_replays/query_ids.json",
+                        json.loads(selection.read_bytes()),
+                    )
+                    review_payload["query_ids_document"] = {
+                        "path": replacement.relative_to(root).as_posix(),
+                        "sha256": _sha256(replacement),
+                    }
+                    review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+                elif case == "hash":
+                    selection.write_bytes(
+                        canonical_json_bytes({"query_ids": ["2" * 64, "1" * 64]})
+                        + b"\n"
+                    )
+                else:
+                    selection.write_bytes(
+                        canonical_json_bytes({"query_ids": ["2" * 64, "1" * 64]})
+                        + b"\n"
+                    )
+                    review_payload["query_ids_document"]["sha256"] = _sha256(selection)
+                    review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+                self._assert_sources_ready_rejected_and_quarantined(
+                    root,
+                    run_spec,
+                    initial,
+                    inventory,
+                    (review, replay_one, replay_two),
+                )
 
     def test_publication_rejects_replaced_execution_namespace(self) -> None:
         for operation in ("initialize", "advance", "quarantine"):

@@ -7,12 +7,16 @@ import os
 import re
 import stat
 import subprocess
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from mlb_backtest.diagnostics import canonical_json_bytes
 from mlb_backtest.protocols import RunSpec
@@ -636,47 +640,106 @@ def _source_inventory_payload(
     )
 
 
+def _validate_bound_schema(
+    root: Path, schema_name: str, payload: Mapping[str, object]
+) -> None:
+    snapshot = _capture_artifact(
+        root,
+        root / "schemas" / schema_name,
+        "source receipt schema",
+    )
+    schema = _canonical_object(snapshot.contents, "source receipt schema")
+    try:
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(
+            schema, format_checker=FormatChecker()
+        ).validate(payload)
+    except (SchemaError, ValidationError) as exc:
+        raise ValueError("source evidence receipt schema validation failed") from exc
+    _verify_artifact_snapshot(root, snapshot, "source receipt schema")
+
+
 def _source_receipt_payload(
+    root: Path,
     contents: bytes,
     *,
     path: str,
     run_id: str,
     inventory_sha256: str,
     snapshot_sha256s: tuple[str, ...],
-) -> tuple[str, tuple[str, ...]]:
+    git_head: str,
+    run_spec: Mapping[str, object],
+    acquisition_contract: Mapping[str, object],
+) -> tuple[str, tuple[str, ...], str | None]:
     payload = _canonical_object(contents, "source evidence receipt")
+    schema_name = (
+        "v5_2_source_review_receipt.schema.json"
+        if payload.get("receipt_kind") == "SOURCE_REVIEW"
+        else "v5_2_clean_source_replay_receipt.schema.json"
+    )
+    _validate_bound_schema(root, schema_name, payload)
     if (
-        type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 1
-        or payload.get("run_id") != run_id
+        payload["run_id"] != run_id
         or payload.get("inventory_sha256") != inventory_sha256
-        or payload.get("critical_errors") != []
-        or _sha256_list(payload.get("snapshot_sha256s"), "receipt snapshots")
-        != snapshot_sha256s
+        or tuple(payload["snapshot_sha256s"]) != snapshot_sha256s
     ):
-        raise ValueError("source evidence receipt binding failed")
-    kind = payload.get("receipt_kind")
+        raise ValueError("source evidence receipt inventory binding failed")
+    if payload["git_head"] != git_head:
+        raise ValueError("source evidence receipt git binding differs")
+    if (
+        payload["run_spec"] != run_spec
+        or payload["acquisition_contract"] != acquisition_contract
+    ):
+        raise ValueError("source evidence receipt protocol binding differs")
+    kind = payload["receipt_kind"]
+    queries = _sorted_string_list(payload["reviewed_query_ids"], "reviewed query IDs")
     if kind == "SOURCE_REVIEW":
         if (
             not path.startswith(_SOURCE_REVIEW_PREFIX)
-            or payload.get("reviewer_identity") != "independent-source-auditor"
-            or payload.get("decision") != "APPROVED"
+            or payload["decision"] != "APPROVED"
         ):
             raise ValueError("independent source review is not approved")
-        return kind, _sorted_string_list(
-            payload.get("reviewed_query_ids"), "reviewed query IDs"
+        document_binding = _validate_binding_value(
+            payload["query_ids_document"], "review query IDs document"
         )
+        if not str(document_binding["path"]).startswith(_SOURCE_REVIEW_PREFIX):
+            raise ValueError("review query ID document is outside review namespace")
+        document = _capture_artifact(
+            root,
+            root / str(document_binding["path"]),
+            "review query IDs document",
+        )
+        if document.binding != dict(document_binding):
+            raise ValueError("review query ID document binding differs")
+        selected = _canonical_object(
+            document.contents, "review query IDs document"
+        )
+        selection = selected.get("query_ids")
+        if (
+            set(selected) != {"query_ids"}
+            or not isinstance(selection, list)
+            or tuple(selection) != queries
+        ):
+            raise ValueError("review query ID document selection differs")
+        _verify_artifact_snapshot(root, document, "review query IDs document")
+        return kind, queries, None
     if kind == "CLEAN_SOURCE_REPLAY":
         if (
             not path.startswith(_SOURCE_REPLAY_PREFIX)
-            or payload.get("status") != "PASS"
-            or type(payload.get("network_attempts")) is not int
-            or payload.get("network_attempts") != 0
         ):
-            raise ValueError("clean source replay failed")
-        return kind, _string_list(
-            payload.get("reviewed_query_ids"), "reviewed query IDs"
-        )
+            raise ValueError("clean source replay is outside replay namespace")
+        execution_id = payload["execution_id"]
+        if not isinstance(execution_id, str):
+            raise ValueError("clean replay execution ID is not canonical UUIDv4")
+        try:
+            parsed = uuid.UUID(execution_id)
+        except ValueError as exc:
+            raise ValueError(
+                "clean replay execution ID is not canonical UUIDv4"
+            ) from exc
+        if parsed.version != 4 or str(parsed) != execution_id:
+            raise ValueError("clean replay execution ID is not canonical UUIDv4")
+        return kind, queries, execution_id
     raise ValueError("unknown source evidence receipt kind")
 
 
@@ -685,6 +748,8 @@ def _validate_sources_ready_evidence(
     validation_values: Sequence[_ArtifactSnapshot],
     *,
     run_id: str,
+    root: Path,
+    base: Mapping[str, object],
 ) -> None:
     if inventory.path != _SOURCE_INVENTORY_PATH:
         raise ValueError("SOURCES_READY requires the canonical source inventory")
@@ -694,14 +759,26 @@ def _validate_sources_ready_evidence(
     reviews = 0
     replay_paths: set[str] = set()
     replay_hashes: set[str] = set()
+    replay_execution_ids: set[str] = set()
     reviewed_query_ids: tuple[str, ...] | None = None
+    run_spec = _validate_binding_value(base["run_spec"], "run spec")
+    acquisition_contract = _validate_binding_value(
+        base["acquisition_contract"], "acquisition contract"
+    )
+    git_head = base.get("git_head")
+    if not isinstance(git_head, str) or not _GIT_HEAD.fullmatch(git_head):
+        raise ValueError("source evidence base Git binding differs")
     for artifact in validation_values:
-        kind, receipt_queries = _source_receipt_payload(
+        kind, receipt_queries, execution_id = _source_receipt_payload(
+            root,
             artifact.contents,
             path=artifact.path,
             run_id=run_id,
             inventory_sha256=inventory.sha256,
             snapshot_sha256s=snapshots,
+            git_head=git_head,
+            run_spec=run_spec,
+            acquisition_contract=acquisition_contract,
         )
         if kind == "SOURCE_REVIEW":
             if not set(receipt_queries).issubset(inventory_query_ids):
@@ -725,7 +802,15 @@ def _validate_sources_ready_evidence(
                 raise ValueError("clean source replay receipt is duplicated")
             replay_paths.add(artifact.path)
             replay_hashes.add(artifact.sha256)
-    if reviews < 1 or len(replay_paths) != 2:
+            if execution_id is None or execution_id in replay_execution_ids:
+                raise ValueError("clean source replay execution ID is duplicated")
+            replay_execution_ids.add(execution_id)
+    if (
+        reviews < 1
+        or len(replay_paths) != 2
+        or len(replay_hashes) != 2
+        or len(replay_execution_ids) != 2
+    ):
         raise ValueError(
             "SOURCES_READY requires an approved review and two clean replays"
         )
@@ -1352,6 +1437,7 @@ def _validate_phase_evidence(
     inventory: _ArtifactSnapshot,
     validations: Sequence[_ArtifactSnapshot],
     *,
+    root: Path,
     run_id: str,
 ) -> None:
     if phase in {"DESIGN_ACCEPTED", "ACQUIRING"}:
@@ -1371,6 +1457,8 @@ def _validate_phase_evidence(
             inventory,
             validations,
             run_id=run_id,
+            root=root,
+            base=base,
         )
         return
     raise ValueError(f"execution phase {phase} has no implemented evidence validator")
@@ -1715,6 +1803,7 @@ def _load_locked(
             payloads[0] if payloads else payload,
             inventory_snapshot,
             validation_snapshots,
+            root=paths.root,
             run_id=run_spec.run_id,
         )
         current_bindings = {key: payload[key] for key in ("run_spec", "approved_design", "implementation_plan", "acquisition_contract", "task0_lineage")}
@@ -3726,6 +3815,7 @@ def advance_execution_phase(
                 base,
                 inventory_snapshot,
                 validation_snapshots,
+                root=paths.root,
                 run_id=run_spec.run_id,
             )
             checkpoint_head: Mapping[str, object] | None = None
