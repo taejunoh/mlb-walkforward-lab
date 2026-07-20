@@ -709,7 +709,7 @@ def _published_inventory_matches(
     except (SnapshotStoreError, OSError, ValueError, TypeError):
         return False, Blocker(
             "PUBLISHED_INVENTORY_UNAUTHENTICATED",
-            "published source inventory is unsafe or differs from the context",
+            "published source inventory is unsafe or unavailable",
             (source_root.relative_to(context.root).as_posix(),),
         )
     if inventory_bytes(loaded.inventory) != inventory_bytes(context.inventory):

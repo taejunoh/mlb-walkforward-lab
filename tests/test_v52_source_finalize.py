@@ -286,6 +286,15 @@ class StatusAndPreflightTests(unittest.TestCase):
             "PUBLISHED_INVENTORY_UNAUTHENTICATED",
             {blocker.code for blocker in report.blockers},
         )
+        blocker = next(
+            item
+            for item in report.blockers
+            if item.code == "PUBLISHED_INVENTORY_UNAUTHENTICATED"
+        )
+        self.assertEqual(
+            blocker.message,
+            "published source inventory is unsafe or unavailable",
+        )
         self.assertEqual(tree_snapshot(self.root), before)
 
     def test_status_rejects_existing_source_ancestor_symlink_without_external_read(self) -> None:
