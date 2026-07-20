@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from . import v52_timezone_review
 from .execution_registry import (
     AcquisitionCheckpoint,
     ExecutionRegistryState,
@@ -156,21 +155,108 @@ def _require_mutable_context(
     return context
 
 
-def _trusted_root(value: Path) -> Path:
-    """Return an absolute root only after every lexical ancestor is trusted."""
+@dataclass(frozen=True)
+class _TrustedRootHandle:
+    root: Path
+    descriptors: tuple[int, ...]
+    component_names: tuple[str, ...]
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _close_descriptors(descriptors: Sequence[int]) -> None:
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+
+
+def _open_trusted_root(value: Path) -> _TrustedRootHandle:
     supplied = Path(os.path.abspath(os.fspath(value)))
+    descriptors: list[int] = []
+    names: list[str] = []
     try:
-        for node in (*reversed(supplied.parents), supplied):
-            metadata = node.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                raise ValueError("finalization root ancestors must be no-follow directories")
+        current = os.open(os.sep, _directory_flags())
+        descriptors.append(current)
+        for component in supplied.parts[1:]:
+            child = os.open(component, _directory_flags(), dir_fd=current)
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError(
+                        "finalization root ancestors must be no-follow directories"
+                    )
+            except BaseException:
+                os.close(child)
+                raise
+            descriptors.append(child)
+            names.append(component)
+            current = child
+        return _TrustedRootHandle(supplied, tuple(descriptors), tuple(names))
     except OSError as exc:
-        raise ValueError("finalization root is unavailable") from exc
-    return supplied
+        _close_descriptors(descriptors)
+        raise ValueError("finalization root is unavailable or unsafe") from exc
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
 
 
-def _relative_artifact(root: Path, value: Path, label: str) -> tuple[str, Path]:
-    trusted = _trusted_root(root)
+def _assert_trusted_root(handle: _TrustedRootHandle) -> None:
+    try:
+        for index, component in enumerate(handle.component_names):
+            parent = handle.descriptors[index]
+            child = handle.descriptors[index + 1]
+            opened = os.fstat(child)
+            linked = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (linked.st_dev, linked.st_ino)
+            ):
+                raise ValueError("finalization root identity changed")
+    except OSError as exc:
+        raise ValueError("finalization root identity changed") from exc
+
+
+def _after_trusted_root_open() -> None:
+    """Deterministic ancestor-swap test hook."""
+
+
+def _trusted_root(value: Path) -> Path:
+    """Return an absolute root authenticated by a no-follow descriptor chain."""
+    handle = _open_trusted_root(value)
+    try:
+        _assert_trusted_root(handle)
+        return handle.root
+    finally:
+        _close_descriptors(handle.descriptors)
+
+
+def _relative_under_root(root: Path, value: Path, label: str) -> tuple[str, Path]:
     supplied = os.fspath(value)
     if "\\" in supplied:
         raise ValueError(f"{label} path must use slash separators")
@@ -178,25 +264,79 @@ def _relative_artifact(root: Path, value: Path, label: str) -> tuple[str, Path]:
     if candidate.is_absolute():
         candidate = Path(os.path.abspath(candidate))
         try:
-            relative = candidate.relative_to(trusted)
+            relative = candidate.relative_to(root)
         except ValueError as exc:
             raise ValueError(f"{label} path must stay under root") from exc
     else:
         relative = candidate
     if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
         raise ValueError(f"{label} path must stay under root")
-    return relative.as_posix(), trusted / relative
+    return relative.as_posix(), root / relative
+
+
+def _relative_artifact(root: Path, value: Path, label: str) -> tuple[str, Path]:
+    trusted = _trusted_root(root)
+    return _relative_under_root(trusted, value, label)
 
 
 def _read_explicit_artifact(root: Path, value: Path, label: str) -> tuple[str, bytes]:
-    relative, _ = _relative_artifact(root, value, label)
+    handle = _open_trusted_root(root)
+    opened_directories: list[int] = []
+    descriptor = -1
     try:
-        safe_relative, contents = v52_timezone_review._read_safe(
-            _trusted_root(root), Path(relative), label
+        _after_trusted_root_open()
+        _assert_trusted_root(handle)
+        relative, _ = _relative_under_root(handle.root, value, label)
+        relative_path = Path(relative)
+        current = handle.descriptors[-1]
+        for component in relative_path.parent.parts:
+            child = os.open(component, _directory_flags(), dir_fd=current)
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError(f"{label} ancestor identity changed")
+            except BaseException:
+                os.close(child)
+                raise
+            opened_directories.append(child)
+            current = child
+        before = os.stat(relative_path.name, dir_fd=current, follow_symlinks=False)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
+        descriptor = os.open(relative_path.name, flags, dir_fd=current)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _identity(opened) != _identity(before)
+        ):
+            raise ValueError(f"{label} must be an unaliased regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 64 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        rebound = os.stat(relative_path.name, dir_fd=current, follow_symlinks=False)
+        if _identity(before) != _identity(after) or _identity(after) != _identity(rebound):
+            raise ValueError(f"{label} identity changed while reading")
+        _assert_trusted_root(handle)
+        return relative, b"".join(chunks)
     except OSError as exc:
         raise ValueError(f"{label} is unsafe or unreadable") from exc
-    return safe_relative.as_posix(), contents
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _close_descriptors(opened_directories)
+        _close_descriptors(handle.descriptors)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -349,8 +489,12 @@ def _rebind_context_authorities(
         )
         final_inventory_bytes = inventory_bytes(rebound)
         final_git_head = _git_head(root)
-    except FinalizationError:
-        raise
+    except FinalizationError as exc:
+        if exc.error_code == "AUTHORITY_CHANGED":
+            raise
+        raise _authority_changed(
+            f"source inventory authority changed during context build: {exc.message}"
+        ) from exc
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise _authority_changed("source inventory authority changed during context build") from exc
     if final_inventory_bytes != initial_inventory_bytes:

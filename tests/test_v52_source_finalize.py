@@ -113,6 +113,51 @@ class ContextTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 orchestration._read_explicit_artifact(root, fifo, "fifo")
 
+    def test_safe_reader_rejects_ancestor_swap_without_fd_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            anchor = base / "anchor"
+            root = anchor / "repo"
+            trusted_protocol = root / "protocols/v5_2_qd"
+            trusted_protocol.mkdir(parents=True)
+            (trusted_protocol / "historical_walkforward_500.json").write_bytes(
+                b'{"source":"trusted"}\n'
+            )
+            external = base / "external"
+            external_protocol = external / "repo/protocols/v5_2_qd"
+            external_protocol.mkdir(parents=True)
+            (external_protocol / "historical_walkforward_500.json").write_bytes(
+                b'{"source":"external"}\n'
+            )
+            moved = base / "moved-anchor"
+
+            def swap_ancestor() -> None:
+                anchor.rename(moved)
+                anchor.symlink_to(external, target_is_directory=True)
+
+            before_fds = len(os.listdir("/dev/fd"))
+            try:
+                with patch.object(
+                    orchestration,
+                    "_after_trusted_root_open",
+                    side_effect=swap_ancestor,
+                ), patch.object(
+                    orchestration,
+                    "_canonical_object",
+                    wraps=orchestration._canonical_object,
+                ) as canonical:
+                    with self.assertRaises(orchestration.FinalizationError) as raised:
+                        orchestration.build_context(orchestration.CommonArgs(root=root))
+                    self.assertEqual(raised.exception.error_code, "AUTHORITY_MALFORMED")
+                    self.assertEqual(raised.exception.exit_code, 3)
+                    canonical.assert_not_called()
+            finally:
+                if anchor.is_symlink():
+                    anchor.unlink()
+                if moved.exists():
+                    moved.rename(anchor)
+            self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
     def test_canonical_object_rejects_duplicate_and_noncanonical_json(self) -> None:
         with self.assertRaises(orchestration.FinalizationError) as duplicate:
             orchestration._canonical_object(b'{"a":1,"a":2}\n', "authority")
@@ -227,7 +272,7 @@ class ContextTests(unittest.TestCase):
         for changed in (
             "run_spec", "contract", "run_spec_malformed", "run_spec_noncanonical",
             "contract_malformed", "contract_noncanonical", "membership", "registry",
-            "checkpoint", "inventory", "git",
+            "checkpoint", "inventory", "git", "git_missing",
         ):
             final_run_spec = {
                 "run_spec": b'{"a":2}\n',
@@ -276,9 +321,16 @@ class ContextTests(unittest.TestCase):
                     return_value=b"inventory\n" if changed != "inventory" else b"changed\n",
                     ),
                     patch.object(
-                    orchestration,
-                    "_git_head",
-                    return_value="f" * 40 if changed != "git" else "0" * 40,
+                        orchestration,
+                        "_git_head",
+                        side_effect=(
+                            orchestration.FinalizationError(
+                                "AUTHORITY_MISSING", "Git head is unavailable", (), 3
+                            )
+                            if changed == "git_missing"
+                            else None
+                        ),
+                        return_value="f" * 40 if changed != "git" else "0" * 40,
                     ),
                 )
                 for patcher in patchers:
