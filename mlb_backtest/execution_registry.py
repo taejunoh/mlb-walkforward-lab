@@ -4041,7 +4041,7 @@ def publish_acquisition_checkpoint(
         return final_checkpoints[-1]
 
 
-def advance_execution_phase(
+def _advance_execution_phase(
     root: Path,
     run_spec: RunSpec,
     *,
@@ -4338,6 +4338,48 @@ def advance_execution_phase(
             ),
             created=True,
         )
+
+
+def advance_execution_phase(
+    root: Path,
+    run_spec: RunSpec,
+    *,
+    expected_phase: str,
+    next_phase: str,
+    inventory_path: Path,
+    validation_receipts: Sequence[Path],
+) -> ExecutionRegistryState:
+    """Advance one generic phase using the original Task2 public contract."""
+    result = _advance_execution_phase(
+        root, run_spec, expected_phase=expected_phase, next_phase=next_phase,
+        inventory_path=inventory_path, validation_receipts=validation_receipts,
+    )
+    assert isinstance(result, ExecutionRegistryState)
+    return result
+
+
+def advance_sources_ready_phase(
+    root: Path,
+    run_spec: RunSpec,
+    *,
+    inventory_path: Path,
+    validation_receipts: Sequence[Path],
+    expected_checkpoint_path: Path,
+) -> ExecutionPhaseAdvance:
+    """Atomically bind explicit source evidence and checkpoint to SOURCES_READY."""
+    result = _advance_execution_phase(
+        root,
+        run_spec,
+        expected_phase="ACQUIRING",
+        next_phase="SOURCES_READY",
+        inventory_path=inventory_path,
+        validation_receipts=validation_receipts,
+        expected_checkpoint_path=expected_checkpoint_path,
+        atomic_source_gate=True,
+        return_transition_result=True,
+    )
+    assert isinstance(result, ExecutionPhaseAdvance)
+    return result
 
 
 def quarantine_execution_transition(

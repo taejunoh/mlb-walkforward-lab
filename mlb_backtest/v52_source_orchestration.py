@@ -1672,16 +1672,12 @@ def advance_sources_ready(
         )
         raise FinalizationError(error_code, "source receipt set is invalid", (), 4) from exc
     try:
-        transition = execution_registry.advance_execution_phase(
+        transition = execution_registry.advance_sources_ready_phase(
             context.root,
             context.run_spec,
-            expected_phase="ACQUIRING",
-            next_phase="SOURCES_READY",
             inventory_path=context.root / inventory_relative,
             validation_receipts=tuple(context.root / relative for relative in marker_paths),
             expected_checkpoint_path=context.root / checkpoint_relative,
-            atomic_source_gate=True,
-            return_transition_result=True,
         )
     except ValueError as exc:
         message = str(exc)

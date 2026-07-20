@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -111,7 +112,7 @@ class _ContextBaseTests(unittest.TestCase):
                 patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
                 patch.object(
                     orchestration.execution_registry,
-                    "advance_execution_phase",
+                    "advance_sources_ready_phase",
                     return_value=orchestration.execution_registry.ExecutionPhaseAdvance(
                         advanced, created=True
                     ),
@@ -120,10 +121,9 @@ class _ContextBaseTests(unittest.TestCase):
                 report = orchestration.advance_sources_ready(context, request)
             self.assertEqual(report, orchestration.AdvanceReport("ADVANCED", "SOURCES_READY", "d" * 64))
             advance.assert_called_once_with(
-                root, context.run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                root, context.run_spec,
                 inventory_path=inventory_path, validation_receipts=tuple(markers),
-                expected_checkpoint_path=checkpoint_path, atomic_source_gate=True,
-                return_transition_result=True,
+                expected_checkpoint_path=checkpoint_path,
             )
             validate.assert_called_once_with(
                 root, context.run_spec, inventory_path=inventory_path,
@@ -179,11 +179,18 @@ class _ContextBaseTests(unittest.TestCase):
                 patch.object(orchestration, "read_status", return_value=status),
                 patch.object(orchestration, "run_preflight", return_value=preflight),
                 patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
-                patch.object(orchestration.execution_registry, "advance_execution_phase", return_value=result),
+                patch.object(orchestration.execution_registry, "advance_sources_ready_phase", return_value=result),
             ):
                 report = orchestration.advance_sources_ready(context, request)
             self.assertEqual(report, orchestration.AdvanceReport("EXISTING", "SOURCES_READY", "d" * 64))
             validate.assert_called_once()
+
+    def test_generic_advance_preserves_task2_public_signature(self) -> None:
+        signature = inspect.signature(orchestration.execution_registry.advance_execution_phase)
+        self.assertEqual(
+            tuple(signature.parameters),
+            ("root", "run_spec", "expected_phase", "next_phase", "inventory_path", "validation_receipts"),
+        )
 
     def test_context_types_are_frozen_with_canonical_defaults(self) -> None:
         args = orchestration.CommonArgs()
@@ -385,7 +392,7 @@ class AdvanceTests(unittest.TestCase):
                 patch.object(orchestration, "read_status", return_value=status),
                 patch.object(orchestration, "run_preflight", return_value=preflight),
                 patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set", side_effect=ValueError("bad receipt")),
-                patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as advance,
                 self.assertRaises(orchestration.FinalizationError) as raised,
             ):
                 orchestration.advance_sources_ready(context, request)
@@ -409,7 +416,7 @@ class AdvanceTests(unittest.TestCase):
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
                     patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set", side_effect=ValueError(message)),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as advance,
                     self.assertRaises(orchestration.FinalizationError) as raised,
                 ):
                     orchestration.advance_sources_ready(context, request)
@@ -425,7 +432,7 @@ class AdvanceTests(unittest.TestCase):
             request = dataclasses.replace(request, review_receipts=(unsafe,))
             with (
                 patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
-                patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as advance,
                 self.assertRaises(orchestration.FinalizationError) as raised,
             ):
                 orchestration.advance_sources_ready(context, request)
@@ -467,7 +474,7 @@ class AdvanceTests(unittest.TestCase):
                     patch.object(orchestration, "run_preflight", return_value=preflight),
                     patch.object(
                         orchestration.execution_registry,
-                        "advance_execution_phase",
+                        "advance_sources_ready_phase",
                         return_value=orchestration.execution_registry.ExecutionPhaseAdvance(
                             advanced, created=True
                         ),
@@ -476,10 +483,9 @@ class AdvanceTests(unittest.TestCase):
                     report = orchestration.advance_sources_ready(context, request)
                 self.assertEqual(report.status, "ADVANCED")
                 advance.assert_called_once_with(
-                    root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                    root, run_spec,
                     inventory_path=inventory, validation_receipts=markers,
-                    expected_checkpoint_path=checkpoint_path, atomic_source_gate=True,
-                    return_transition_result=True,
+                    expected_checkpoint_path=checkpoint_path,
                 )
                 review = fixture.source_receipt_from_marker(root, markers[0])
                 original_review = review.read_bytes()
@@ -491,7 +497,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as rejected_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as rejected_advance,
                     self.assertRaises(orchestration.FinalizationError) as rejected_error,
                 ):
                     orchestration.advance_sources_ready(context, request)
@@ -505,7 +511,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as crossed_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as crossed_advance,
                     self.assertRaises(orchestration.FinalizationError) as crossed_error,
                 ):
                     orchestration.advance_sources_ready(context, request)
@@ -537,7 +543,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as subset_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as subset_advance,
                     self.assertRaises(orchestration.FinalizationError) as subset_error,
                 ):
                     orchestration.advance_sources_ready(context, subset_request)
@@ -553,7 +559,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as uuid_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as uuid_advance,
                     self.assertRaises(orchestration.FinalizationError) as uuid_error,
                 ):
                     orchestration.advance_sources_ready(context, request)
@@ -567,7 +573,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as stale_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as stale_advance,
                     self.assertRaises(orchestration.FinalizationError) as stale_error,
                 ):
                     orchestration.advance_sources_ready(context, stale_request)
@@ -580,7 +586,7 @@ class AdvanceTests(unittest.TestCase):
                 with (
                     patch.object(orchestration, "read_status", return_value=status),
                     patch.object(orchestration, "run_preflight", return_value=preflight),
-                    patch.object(orchestration.execution_registry, "advance_execution_phase") as inventory_advance,
+                    patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as inventory_advance,
                     self.assertRaises(orchestration.FinalizationError) as inventory_error,
                 ):
                     orchestration.advance_sources_ready(context, request)
@@ -605,7 +611,7 @@ class AdvanceTests(unittest.TestCase):
                 with self.subTest(exit_code=exit_code):
                     with (
                         patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
-                        patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                        patch.object(orchestration.execution_registry, "advance_sources_ready_phase") as advance,
                         self.assertRaises(orchestration.FinalizationError) as raised,
                     ):
                         orchestration.advance_sources_ready(context, candidate)
