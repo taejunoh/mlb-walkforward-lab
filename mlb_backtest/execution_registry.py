@@ -227,6 +227,10 @@ class _ReceiptMembershipError(ValueError):
     """The visible receipt directory cannot be safely changed by this operation."""
 
 
+class _LateSourceEvidenceError(ValueError):
+    """A selected SOURCES_READY dependent artifact changed before publication."""
+
+
 @dataclass(frozen=True)
 class ExecutionRegistryState:
     phase: str
@@ -3954,6 +3958,21 @@ def advance_execution_phase(
             )
             raise ValueError("direct phase artifact evidence failed") from exc
         relative = paths.receipts_relative / f"{state.sequence + 1:06d}-{next_phase}-{digest}.json"
+        def verify_source_evidence_and_checkpoint() -> None:
+            if source_evidence_snapshots:
+                try:
+                    _verify_artifact_snapshots(
+                        paths.root,
+                        source_evidence_snapshots,
+                        "late source evidence",
+                    )
+                except ValueError as exc:
+                    raise _LateSourceEvidenceError(
+                        "late source evidence changed before publication"
+                    ) from exc
+            if checkpoint_verifier is not None:
+                checkpoint_verifier()
+
         try:
             _publish_locked(
                 paths,
@@ -3965,21 +3984,15 @@ def advance_execution_phase(
                 (
                     inventory_snapshot,
                     *validation_snapshots,
-                    *source_evidence_snapshots,
                     *((checkpoint_snapshot,) if checkpoint_snapshot else ()),
                 ),
                 expected_receipt_names=(
                     *(_success_receipt_name(item) for item in payloads),
                     relative.name,
                 ),
-                state_verifier=checkpoint_verifier,
+                state_verifier=verify_source_evidence_and_checkpoint,
             )
-        except ValueError as exc:
-            try:
-                _verify_lock_binding(paths, lock_binding)
-                _verify_git_snapshot(paths.root, snapshot)
-            except ValueError as trust_exc:
-                raise exc from trust_exc
+        except _LateSourceEvidenceError as exc:
             _publish_quarantine_locked(
                 paths,
                 run_spec,
