@@ -587,6 +587,7 @@ class AdvanceTests(unittest.TestCase):
                 self.assertEqual(inventory_error.exception.error_code, "RECEIPT_SET_INVALID")
                 inventory_advance.assert_not_called()
             finally:
+                fixture.doCleanups()
                 fixture.tearDown()
 
     def test_missing_directory_glob_and_replay_cardinality_fail_before_advance(self) -> None:
@@ -611,6 +612,141 @@ class AdvanceTests(unittest.TestCase):
                     self.assertEqual(raised.exception.exit_code, exit_code)
                     validate.assert_not_called()
                     advance.assert_not_called()
+
+    def test_atomic_source_gate_rejects_competing_authority_without_writes(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            root, run_spec = fixture.make_repo(Path(directory))
+            try:
+                fixture.initialize(root, run_spec)
+                fixture.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+                inventory, markers = fixture.write_real_source_evidence(root)
+                checkpoint = orchestration.load_source_verification_checkpoint(root, run_spec)
+                checkpoint_path = root / orchestration._checkpoint_path(checkpoint)
+                state = orchestration.load_execution_registry(root, run_spec)
+                context = orchestration.FinalizationContext(
+                    root, root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                    root / "protocols/v5_2_qd/historical_source_acquisition.json",
+                    root / "audit/v5_1_bt/protected_raw_inventory.json",
+                    run_spec, state, checkpoint, object(), object(), "ACQUIRING",
+                    subprocess.run(("git", "rev-parse", "HEAD"), cwd=root, check=True,
+                                   capture_output=True, text=True).stdout.strip(), (),
+                )
+                request = orchestration.AdvanceRequest(
+                    (markers[0],), (markers[1], markers[2]), checkpoint_path, inventory
+                )
+                status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+                preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
+                phase_receipts = root / "audit/v5_2_qd/historical/execution/phase_receipts"
+                quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+
+                def registry_writes() -> tuple[tuple[str, bytes], tuple[str, bytes]]:
+                    def contents(directory: Path) -> tuple[tuple[str, bytes], ...]:
+                        if not directory.exists():
+                            return ()
+                        return tuple(sorted(
+                            (path.name, path.read_bytes()) for path in directory.iterdir()
+                        ))
+                    return contents(phase_receipts), contents(quarantine)
+
+                original_validate = orchestration.execution_registry.validate_sources_ready_evidence_set
+                checkpoint_loader = orchestration.execution_registry._load_checkpoints_locked
+                original_checkpoint_result = checkpoint_loader.return_value
+                replacement_bytes = b'{"fixture":"replacement-checkpoint"}\n'
+                replacement_digest = hashlib.sha256(replacement_bytes).hexdigest()
+                replacement_name = f"00000000-{replacement_digest}.json"
+                replacement_path = checkpoint_path.with_name(replacement_name)
+                replacement_path.write_bytes(replacement_bytes)
+                replacement = dataclasses.replace(
+                    checkpoint, receipt_sha256=replacement_digest
+                )
+
+                def swap_checkpoint(*args: object, **kwargs: object) -> None:
+                    original_validate(*args, **kwargs)
+                    checkpoint_loader.return_value = (
+                        (replacement,),
+                        ({"pending_query_ids": [], "quarantined_query_ids": []},),
+                        (replacement_name,),
+                    )
+
+                before = registry_writes()
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(
+                        orchestration.execution_registry,
+                        "validate_sources_ready_evidence_set",
+                        side_effect=swap_checkpoint,
+                    ),
+                    self.assertRaises(orchestration.FinalizationError) as swapped,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(swapped.exception.error_code, "RECEIPT_SET_INVALID")
+                self.assertEqual(registry_writes(), before)
+                checkpoint_loader.return_value = original_checkpoint_result
+
+                original_marker = markers[0].read_bytes()
+
+                def mutate_evidence(*args: object, **kwargs: object) -> None:
+                    original_validate(*args, **kwargs)
+                    markers[0].write_bytes(b"{}\n")
+
+                before = registry_writes()
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(
+                        orchestration.execution_registry,
+                        "validate_sources_ready_evidence_set",
+                        side_effect=mutate_evidence,
+                    ),
+                    self.assertRaises(orchestration.FinalizationError) as mutated,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(mutated.exception.error_code, "RECEIPT_SET_INVALID")
+                self.assertEqual(registry_writes(), before)
+                markers[0].write_bytes(original_marker)
+
+                barrier = threading.Barrier(2)
+                reports: list[orchestration.AdvanceReport] = []
+                failures: list[BaseException] = []
+
+                def concurrent_validate(*args: object, **kwargs: object) -> None:
+                    original_validate(*args, **kwargs)
+                    barrier.wait(timeout=10)
+
+                def advance() -> None:
+                    try:
+                        reports.append(orchestration.advance_sources_ready(context, request))
+                    except BaseException as exc:
+                        failures.append(exc)
+
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(
+                        orchestration.execution_registry,
+                        "validate_sources_ready_evidence_set",
+                        side_effect=concurrent_validate,
+                    ),
+                ):
+                    first = threading.Thread(target=advance)
+                    second = threading.Thread(target=advance)
+                    first.start()
+                    second.start()
+                    first.join(timeout=120)
+                    second.join(timeout=120)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(sorted(report.status for report in reports), ["ADVANCED", "EXISTING"])
+                self.assertEqual(len(registry_writes()[0]), len(before[0]) + 1)
+            finally:
+                fixture.doCleanups()
+                fixture.tearDown()
 
     def test_sources_ready_service_retry_returns_existing_without_new_receipt(self) -> None:
         from tests.test_execution_registry import ExecutionRegistryTest
@@ -646,6 +782,7 @@ class AdvanceTests(unittest.TestCase):
                 self.assertEqual(report, orchestration.AdvanceReport("EXISTING", "SOURCES_READY", advanced.receipt_sha256))
                 self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
             finally:
+                fixture.doCleanups()
                 fixture.tearDown()
 
 
