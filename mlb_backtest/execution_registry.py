@@ -4067,7 +4067,12 @@ def _advance_execution_phase(
         return transition_state
 
     with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
-        state, payloads = _load_locked(paths, run_spec, lock_binding)
+        state, payloads = _load_locked(
+            paths,
+            run_spec,
+            lock_binding,
+            read_only_progress=atomic_source_gate,
+        )
         # SOURCES_READY is the sole idempotent transition: an interrupted caller
         # may retry only the exact immutable evidence set that sealed the head.
         # Authenticate before branching so a retry can never become a second
@@ -4111,6 +4116,7 @@ def _advance_execution_phase(
                     snapshot,
                     lock_binding,
                     verify_latest_progress=True,
+                    read_only_progress=atomic_source_gate,
                 )
             )
             checkpoint_head = _terminal_checkpoint_head(
@@ -4173,6 +4179,7 @@ def _advance_execution_phase(
                         snapshot,
                         lock_binding,
                         verify_latest_progress=True,
+                        read_only_progress=atomic_source_gate,
                     )
                 )
                 checkpoint_head = _terminal_checkpoint_head(
@@ -4209,6 +4216,7 @@ def _advance_execution_phase(
                             snapshot,
                             lock_binding,
                             verify_latest_progress=True,
+                            read_only_progress=atomic_source_gate,
                         )
                     )
                     if (

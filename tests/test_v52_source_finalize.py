@@ -648,6 +648,12 @@ class AdvanceTests(unittest.TestCase):
                 preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
                 phase_receipts = root / "audit/v5_2_qd/historical/execution/phase_receipts"
                 quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
+                recovery_root = root / "data/v5_2_qd/historical/evidence/recovery-canary"
+                recovery_root.mkdir(parents=True)
+                (recovery_root / ".failure-cleanup.intent.tombstone").write_bytes(
+                    b'{"recovery":"pending"}\n'
+                )
+                recovery_before = tree_snapshot(recovery_root)
 
                 def registry_writes() -> tuple[tuple[str, bytes], tuple[str, bytes]]:
                     def contents(directory: Path) -> tuple[tuple[str, bytes], ...]:
@@ -669,6 +675,7 @@ class AdvanceTests(unittest.TestCase):
                 replacement = dataclasses.replace(
                     checkpoint, receipt_sha256=replacement_digest
                 )
+                checkpoint_loader.reset_mock()
 
                 def swap_checkpoint(*args: object, **kwargs: object) -> None:
                     original_validate(*args, **kwargs)
@@ -692,6 +699,12 @@ class AdvanceTests(unittest.TestCase):
                     orchestration.advance_sources_ready(context, request)
                 self.assertEqual(swapped.exception.error_code, "RECEIPT_SET_INVALID")
                 self.assertEqual(registry_writes(), before)
+                self.assertEqual(tree_snapshot(recovery_root), recovery_before)
+                self.assertTrue(checkpoint_loader.call_args_list)
+                self.assertTrue(all(
+                    item.kwargs.get("read_only_progress") is True
+                    for item in checkpoint_loader.call_args_list
+                ))
                 checkpoint_loader.return_value = original_checkpoint_result
 
                 original_marker = markers[0].read_bytes()
@@ -714,6 +727,7 @@ class AdvanceTests(unittest.TestCase):
                     orchestration.advance_sources_ready(context, request)
                 self.assertEqual(mutated.exception.error_code, "RECEIPT_SET_INVALID")
                 self.assertEqual(registry_writes(), before)
+                self.assertEqual(tree_snapshot(recovery_root), recovery_before)
                 markers[0].write_bytes(original_marker)
 
                 barrier = threading.Barrier(2)
