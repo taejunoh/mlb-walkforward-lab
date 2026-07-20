@@ -410,6 +410,20 @@ class AdvanceTests(unittest.TestCase):
                     root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
                     inventory_path=inventory, validation_receipts=markers,
                 )
+                review = fixture.source_receipt_from_marker(root, markers[0])
+                rejected = json.loads(review.read_bytes())
+                rejected["decision"] = "REJECTED"
+                review.write_bytes(canonical_json_bytes(rejected) + b"\n")
+                fixture.rebind_source_marker(markers[0], review)
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as rejected_advance,
+                    self.assertRaises(orchestration.FinalizationError) as rejected_error,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(rejected_error.exception.error_code, "RECEIPT_SET_INVALID")
+                rejected_advance.assert_not_called()
             finally:
                 fixture.tearDown()
 
