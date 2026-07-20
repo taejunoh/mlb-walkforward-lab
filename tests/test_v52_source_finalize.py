@@ -370,6 +370,108 @@ class AdvanceTests(unittest.TestCase):
             validate.assert_not_called()
             advance.assert_not_called()
 
+    def test_actual_prevalidator_authenticates_explicit_markers_before_one_advance(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            root, run_spec = fixture.make_repo(Path(directory))
+            try:
+                fixture.initialize(root, run_spec)
+                fixture.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+                inventory, markers = fixture.write_real_source_evidence(root)
+                checkpoint = orchestration.load_source_verification_checkpoint(root, run_spec)
+                checkpoint_path = root / orchestration._checkpoint_path(checkpoint)
+                state = orchestration.load_execution_registry(root, run_spec)
+                context = orchestration.FinalizationContext(
+                    root,
+                    root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                    root / "protocols/v5_2_qd/historical_source_acquisition.json",
+                    root / "audit/v5_1_bt/protected_raw_inventory.json",
+                    run_spec, state, checkpoint, object(), object(), "ACQUIRING",
+                    subprocess.run(("git", "rev-parse", "HEAD"), cwd=root, check=True,
+                                   capture_output=True, text=True).stdout.strip(), (),
+                )
+                request = orchestration.AdvanceRequest(
+                    (markers[0],), (markers[1], markers[2]), checkpoint_path, inventory
+                )
+                status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+                preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
+                advanced = ExecutionRegistryState("SOURCES_READY", 2, "d" * 64, "b" * 64)
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase", return_value=advanced) as advance,
+                ):
+                    report = orchestration.advance_sources_ready(context, request)
+                self.assertEqual(report.status, "ADVANCED")
+                advance.assert_called_once_with(
+                    root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                    inventory_path=inventory, validation_receipts=markers,
+                )
+            finally:
+                fixture.tearDown()
+
+    def test_missing_directory_glob_and_replay_cardinality_fail_before_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context, request, markers = self._fixture(root)
+            directory_marker = markers[0].parent
+            cases = (
+                (dataclasses.replace(request, review_receipts=(root / "missing.commit.json",)), 5),
+                (dataclasses.replace(request, review_receipts=(root / "*.commit.json",)), 5),
+                (dataclasses.replace(request, review_receipts=(directory_marker,)), 5),
+                (dataclasses.replace(request, replay_receipts=(markers[1],)), 4),  # type: ignore[arg-type]
+            )
+            for candidate, exit_code in cases:
+                with self.subTest(exit_code=exit_code):
+                    with (
+                        patch.object(orchestration.execution_registry, "validate_sources_ready_evidence_set") as validate,
+                        patch.object(orchestration.execution_registry, "advance_execution_phase") as advance,
+                        self.assertRaises(orchestration.FinalizationError) as raised,
+                    ):
+                        orchestration.advance_sources_ready(context, candidate)
+                    self.assertEqual(raised.exception.exit_code, exit_code)
+                    validate.assert_not_called()
+                    advance.assert_not_called()
+
+    def test_sources_ready_service_retry_returns_existing_without_new_receipt(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            root, run_spec = fixture.make_repo(Path(directory))
+            try:
+                fixture.initialize(root, run_spec)
+                fixture.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+                inventory, markers = fixture.write_real_source_evidence(root)
+                advanced = orchestration.execution_registry.advance_execution_phase(
+                    root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                    inventory_path=inventory, validation_receipts=markers,
+                )
+                checkpoint = orchestration.load_source_verification_checkpoint(root, run_spec)
+                context = orchestration.FinalizationContext(
+                    root, root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                    root / "protocols/v5_2_qd/historical_source_acquisition.json",
+                    root / "audit/v5_1_bt/protected_raw_inventory.json",
+                    run_spec, advanced, checkpoint, object(), object(), "SOURCES_READY",
+                    subprocess.run(("git", "rev-parse", "HEAD"), cwd=root, check=True,
+                                   capture_output=True, text=True).stdout.strip(), (),
+                )
+                request = orchestration.AdvanceRequest(
+                    (markers[0],), (markers[1], markers[2]),
+                    root / orchestration._checkpoint_path(checkpoint), inventory,
+                )
+                receipts = root / "audit/v5_2_qd/historical/execution/phase_receipts"
+                before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+                report = orchestration.advance_sources_ready(context, request)
+                self.assertEqual(report, orchestration.AdvanceReport("EXISTING", "SOURCES_READY", advanced.receipt_sha256))
+                self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
+            finally:
+                fixture.tearDown()
+
 
 class StatusAndPreflightTests(unittest.TestCase):
     """The advisory/read-only finalization surface must never select or mutate."""
