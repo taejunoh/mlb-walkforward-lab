@@ -175,6 +175,7 @@ BOUND_SCHEMA_PATHS = (
     Path("schemas/v5_2_venue_timezones.schema.json"),
     Path("schemas/v5_2_source_review_receipt.schema.json"),
     Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
+    Path("schemas/v5_2_source_receipt_commit.schema.json"),
 )
 BOUND_EXECUTION_CODE = (
     *ACQUISITION_EXECUTION_IMPORT_CLOSURE,
@@ -291,7 +292,8 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, _run_spec = self.make_repo(Path(directory))
             _inventory, evidence = self.write_real_source_evidence(root)
-            review, _replay_one, _replay_two = evidence
+            review_marker, _replay_one, _replay_two = evidence
+            review = self.source_receipt_from_marker(root, review_marker)
             payload = json.loads(review.read_bytes())
             head = _git(root, "rev-parse", "HEAD")
 
@@ -441,6 +443,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         root: Path,
         *,
         terminal_checkpoint: bool = True,
+        commit_markers: bool = True,
     ) -> tuple[Path, tuple[Path, Path, Path]]:
         snapshots = ["a" * 64, "b" * 64]
         reviewed_query_ids = ["1" * 64, "2" * 64]
@@ -518,9 +521,48 @@ class ExecutionRegistryTest(unittest.TestCase):
                 (2, "22222222-2222-4222-8222-222222222222"),
             )
         )
+        receipts = (review, *replays)
+        markers = tuple(
+            self.write_artifact(
+                root,
+                (
+                    "audit/v5_2_qd/historical/acquisition/source_reviews/"
+                    if index == 0
+                    else "audit/v5_2_qd/historical/acquisition/source_replays/"
+                )
+                + f"receipt-{index + 1}.commit.json",
+                {
+                    "schema_version": 1,
+                    "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+                    "committed_receipt_kind": (
+                        "SOURCE_REVIEW" if index == 0 else "CLEAN_SOURCE_REPLAY"
+                    ),
+                    "run_id": "historical_walkforward_500",
+                    "critical_errors": [],
+                    "source_receipt": {
+                        "path": receipt.relative_to(root).as_posix(),
+                        "sha256": _sha256(receipt),
+                    },
+                    "run_spec": common["run_spec"],
+                    "acquisition_contract": common["acquisition_contract"],
+                    "git_head": common["git_head"],
+                    "occurred_at_utc": f"2026-07-20T00:00:1{index}.000000Z",
+                },
+            )
+            for index, receipt in enumerate(receipts)
+        )
         if terminal_checkpoint:
             self.install_terminal_checkpoint_stub(root)
-        return inventory, (review, *replays)
+        return inventory, markers if commit_markers else receipts
+
+    def source_receipt_from_marker(self, root: Path, marker: Path) -> Path:
+        payload = json.loads(marker.read_bytes())
+        return root / payload["source_receipt"]["path"]
+
+    def rebind_source_marker(self, marker: Path, receipt: Path) -> None:
+        payload = json.loads(marker.read_bytes())
+        payload["source_receipt"]["sha256"] = _sha256(receipt)
+        marker.write_bytes(canonical_json_bytes(payload) + b"\n")
 
     def install_terminal_checkpoint_stub(self, root: Path) -> None:
         checkpoint_dir = (
@@ -1323,6 +1365,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     binding["properties"]["path"]["pattern"],
                     r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$",
                 )
+
                 self.assertEqual(
                     binding["properties"]["sha256"],
                     {"$ref": "#/$defs/sha256"},
@@ -1673,6 +1716,48 @@ class ExecutionRegistryTest(unittest.TestCase):
                         mutate(candidate)
                         with self.assertRaises(jsonschema.ValidationError):
                             validator.validate(candidate)
+
+    def test_source_receipt_commit_schema_freezes_semantic_contract(self) -> None:
+        path = ROOT / "schemas/v5_2_source_receipt_commit.schema.json"
+        schema = json.loads(path.read_bytes())
+        jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertEqual(path.read_bytes(), canonical_json_bytes(schema) + b"\n")
+        expected = {
+            "schema_version", "receipt_kind", "committed_receipt_kind", "run_id",
+            "critical_errors", "source_receipt", "run_spec",
+            "acquisition_contract", "git_head", "occurred_at_utc",
+        }
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["properties"]), expected)
+        self.assertEqual(set(schema["required"]), expected)
+        valid = {
+            "schema_version": 1,
+            "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+            "committed_receipt_kind": "SOURCE_REVIEW",
+            "run_id": "historical_walkforward_500",
+            "critical_errors": [],
+            "source_receipt": {"path": "audit/review.json", "sha256": "a" * 64},
+            "run_spec": {"path": "protocols/run.json", "sha256": "b" * 64},
+            "acquisition_contract": {"path": "protocols/acq.json", "sha256": "c" * 64},
+            "git_head": "d" * 40,
+            "occurred_at_utc": "2026-07-20T00:00:00.000000Z",
+        }
+        jsonschema.validate(valid, schema, format_checker=FORMAT_CHECKER)
+        for field, value in (
+            ("receipt_kind", "SOURCE_REVIEW"),
+            ("committed_receipt_kind", "UNKNOWN"),
+            ("critical_errors", ["x"]),
+            ("git_head", "bad"),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(valid)
+                invalid[field] = value
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(invalid, schema, format_checker=FORMAT_CHECKER)
+        extra = dict(valid)
+        extra["unexpected"] = True
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(extra, schema, format_checker=FORMAT_CHECKER)
 
     def test_remaining_checkpoint_schema_requires_fixed_four_batch_prefix_and_split_suffix(
         self,
@@ -4686,7 +4771,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.initialize(root, run_spec)
             self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
-            review, replay_one, replay_two = evidence
+            review_marker, replay_one, replay_two = evidence
+            review = self.source_receipt_from_marker(root, review_marker)
             review_payload = json.loads(review.read_bytes())
             review_payload["reviewed_query_ids"] = ["1" * 64]
             selection = root / review_payload["query_ids_document"]["path"]
@@ -4695,6 +4781,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             review_payload["query_ids_document"]["sha256"] = _sha256(selection)
             review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+            self.rebind_source_marker(review_marker, review)
 
             state = self.registry.advance_execution_phase(
                 root,
@@ -4702,7 +4789,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 expected_phase="ACQUIRING",
                 next_phase="SOURCES_READY",
                 inventory_path=inventory,
-                validation_receipts=(review, replay_one, replay_two),
+                validation_receipts=evidence,
             )
             self.assertEqual(state.phase, "SOURCES_READY")
             self.assertEqual(
@@ -4719,8 +4806,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                     root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
                 )
                 inventory, evidence = self.write_real_source_evidence(root)
-                review, replay_one, replay_two = evidence
-                target = replay_one if case == "partial_replay" else review
+                review_marker, replay_one_marker, replay_two_marker = evidence
+                target_marker = (
+                    replay_one_marker if case == "partial_replay" else review_marker
+                )
+                target = self.source_receipt_from_marker(root, target_marker)
                 payload = json.loads(target.read_bytes())
                 replacements = {
                     "empty": [],
@@ -4731,6 +4821,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 }
                 payload["reviewed_query_ids"] = replacements[case]
                 target.write_bytes(canonical_json_bytes(payload) + b"\n")
+                self.rebind_source_marker(target_marker, target)
 
                 with self.assertRaisesRegex(ValueError, "artifact|evidence|query"):
                     self.registry.advance_execution_phase(
@@ -4739,7 +4830,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                         expected_phase="ACQUIRING",
                         next_phase="SOURCES_READY",
                         inventory_path=inventory,
-                        validation_receipts=(review, replay_one, replay_two),
+                        validation_receipts=evidence,
                     )
                 self.assertEqual(
                     self.registry.load_execution_registry(root, run_spec), initial
@@ -5128,13 +5219,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                 inventory_path=inventory,
                 validation_receipts=evidence,
             )
-            review = evidence[0]
+            review_marker = evidence[0]
+            review = self.source_receipt_from_marker(root, review_marker)
             review_payload = json.loads(review.read_bytes())
             review_payload["reviewed_query_ids"] = ["unrelated-query"]
             review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+            self.rebind_source_marker(review_marker, review)
             receipt = next(path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000002-"))
             payload = json.loads(receipt.read_bytes())
-            payload["validation_receipts"][0]["sha256"] = _sha256(review)
+            payload["validation_receipts"][0]["sha256"] = _sha256(review_marker)
             self.replace_receipt_payload(receipt, payload)
             with self.assertRaisesRegex(ValueError, "source|query|phase|evidence"):
                 self.registry.load_execution_registry(root, run_spec)
@@ -5277,7 +5370,10 @@ class ExecutionRegistryTest(unittest.TestCase):
                     root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
                 )
                 inventory, evidence = self.write_real_source_evidence(root)
-                review, replay_one, replay_two = evidence
+                review_marker, replay_one_marker, replay_two_marker = evidence
+                review = self.source_receipt_from_marker(root, review_marker)
+                replay_one = self.source_receipt_from_marker(root, replay_one_marker)
+                replay_two = self.source_receipt_from_marker(root, replay_two_marker)
                 if case == "inventory_status":
                     payload = json.loads(inventory.read_bytes())
                     payload["status"] = "FAILED"
@@ -5286,32 +5382,39 @@ class ExecutionRegistryTest(unittest.TestCase):
                     payload = json.loads(review.read_bytes())
                     payload["critical_errors"] = [{"code": "FAILED"}]
                     review.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(review_marker, review)
                 elif case == "network_attempts":
                     payload = json.loads(replay_one.read_bytes())
                     payload["network_attempts"] = 1
                     replay_one.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(replay_one_marker, replay_one)
                 elif case == "review_decision":
                     payload = json.loads(review.read_bytes())
                     payload["decision"] = "REJECTED"
                     review.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(review_marker, review)
                 elif case == "replay_status":
                     payload = json.loads(replay_two.read_bytes())
                     payload["status"] = "FAIL"
                     replay_two.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(replay_two_marker, replay_two)
                 elif case == "missing_replay":
-                    evidence = (review, replay_one)
+                    evidence = (review_marker, replay_one_marker)
                 elif case == "inventory_hash":
                     payload = json.loads(review.read_bytes())
                     payload["inventory_sha256"] = "f" * 64
                     review.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(review_marker, review)
                 elif case == "snapshot_hashes":
                     payload = json.loads(replay_one.read_bytes())
                     payload["snapshot_sha256s"] = ["c" * 64]
                     replay_one.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(replay_one_marker, replay_one)
                 elif case == "reviewed_query_ids":
                     payload = json.loads(replay_two.read_bytes())
                     payload["reviewed_query_ids"] = ["different-query"]
                     replay_two.write_bytes(canonical_json_bytes(payload) + b"\n")
+                    self.rebind_source_marker(replay_two_marker, replay_two)
                 with self.assertRaisesRegex(ValueError, "artifact|evidence"):
                     self.registry.advance_execution_phase(
                         root,
@@ -5375,6 +5478,109 @@ class ExecutionRegistryTest(unittest.TestCase):
                 receipts[0].read_bytes(), canonical_json_bytes(payload) + b"\n"
             )
 
+    def test_sources_ready_rejects_markerless_raw_source_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, raw_receipts = self.write_real_source_evidence(
+                root, commit_markers=False
+            )
+            with self.assertRaisesRegex(ValueError, "source|evidence|commit"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=raw_receipts,
+                )
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+
+    def test_source_commit_marker_binding_and_underlying_uniqueness_are_enforced(self) -> None:
+        for case in ("tampered_hash", "duplicate_underlying"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(
+                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+                )
+                inventory, evidence = self.write_real_source_evidence(root)
+                _review_marker, replay_one_marker, replay_two_marker = evidence
+                payload = json.loads(replay_two_marker.read_bytes())
+                if case == "tampered_hash":
+                    payload["source_receipt"]["sha256"] = "f" * 64
+                else:
+                    payload["source_receipt"] = json.loads(
+                        replay_one_marker.read_bytes()
+                    )["source_receipt"]
+                replay_two_marker.write_bytes(canonical_json_bytes(payload) + b"\n")
+                self._assert_sources_ready_rejected_and_quarantined(
+                    root, run_spec, initial, inventory, evidence
+                )
+
+    def test_source_commit_marker_and_receipt_reject_aliased_file_types(self) -> None:
+        for target_kind, attack in (
+            ("marker", "symlink"),
+            ("marker", "hardlink"),
+            ("marker", "fifo"),
+            ("receipt", "alias"),
+            ("receipt", "symlink"),
+            ("receipt", "hardlink"),
+            ("receipt", "fifo"),
+        ):
+            with (
+                self.subTest(target_kind=target_kind, attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root, run_spec = self.make_repo(Path(directory))
+                self.initialize(root, run_spec)
+                initial = self.advance(
+                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
+                )
+                inventory, evidence = self.write_real_source_evidence(root)
+                marker = evidence[0]
+                receipt = self.source_receipt_from_marker(root, marker)
+                alias = marker.with_name(f"{target_kind}-{attack}.json")
+                if attack == "alias":
+                    payload = json.loads(marker.read_bytes())
+                    payload["source_receipt"] = {
+                        "path": marker.relative_to(root).as_posix(),
+                        "sha256": _sha256(marker),
+                    }
+                    marker.write_bytes(canonical_json_bytes(payload) + b"\n")
+                elif attack == "symlink":
+                    alias.symlink_to(marker if target_kind == "marker" else receipt)
+                elif attack == "hardlink":
+                    os.link(marker if target_kind == "marker" else receipt, alias)
+                else:
+                    os.mkfifo(alias)
+                attacked = evidence
+                if target_kind == "marker" and attack != "alias":
+                    attacked = (alias, *evidence[1:])
+                elif target_kind == "receipt" and attack != "alias":
+                    payload = json.loads(marker.read_bytes())
+                    payload["source_receipt"] = {
+                        "path": alias.relative_to(root).as_posix(),
+                        "sha256": (
+                            _sha256(receipt) if attack != "fifo" else "a" * 64
+                        ),
+                    }
+                    marker.write_bytes(canonical_json_bytes(payload) + b"\n")
+                with self.assertRaisesRegex(
+                    ValueError, "artifact|source|evidence|alias|regular|unsafe"
+                ):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="ACQUIRING",
+                        next_phase="SOURCES_READY",
+                        inventory_path=inventory,
+                        validation_receipts=attacked,
+                    )
+                self.assertEqual(
+                    self.registry.load_execution_registry(root, run_spec), initial
+                )
     def test_sources_ready_missing_receipts_quarantines_with_inventory_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
@@ -5504,8 +5710,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                     root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
                 )
                 inventory, evidence = self.write_real_source_evidence(root)
-                review, replay_one, replay_two = evidence
-                target = review if "reviewer" in case else replay_one
+                review_marker, replay_one_marker, _replay_two_marker = evidence
+                target_marker = (
+                    review_marker if "reviewer" in case else replay_one_marker
+                )
+                target = self.source_receipt_from_marker(root, target_marker)
                 payload = json.loads(target.read_bytes())
                 if case == "extra_replay_key":
                     payload["unexpected"] = True
@@ -5520,12 +5729,13 @@ class ExecutionRegistryTest(unittest.TestCase):
                 else:
                     payload["execution_id"] = "11111111-1111-1111-8111-111111111111"
                 target.write_bytes(canonical_json_bytes(payload) + b"\n")
+                self.rebind_source_marker(target_marker, target)
                 self._assert_sources_ready_rejected_and_quarantined(
                     root,
                     run_spec,
                     initial,
                     inventory,
-                    (review, replay_one, replay_two),
+                    evidence,
                 )
 
     def test_duplicate_replay_execution_id_cannot_advance(self) -> None:
@@ -5534,16 +5744,19 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.initialize(root, run_spec)
             initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
-            review, replay_one, replay_two = evidence
+            review_marker, replay_one_marker, replay_two_marker = evidence
+            replay_one = self.source_receipt_from_marker(root, replay_one_marker)
+            replay_two = self.source_receipt_from_marker(root, replay_two_marker)
             payload = json.loads(replay_two.read_bytes())
             payload["execution_id"] = json.loads(replay_one.read_bytes())["execution_id"]
             replay_two.write_bytes(canonical_json_bytes(payload) + b"\n")
+            self.rebind_source_marker(replay_two_marker, replay_two)
             self._assert_sources_ready_rejected_and_quarantined(
                 root,
                 run_spec,
                 initial,
                 inventory,
-                (review, replay_one, replay_two),
+                (review_marker, replay_one_marker, replay_two_marker),
             )
 
     def test_review_query_id_document_is_rebound(self) -> None:
@@ -5556,7 +5769,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                     root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
                 )
                 inventory, evidence = self.write_real_source_evidence(root)
-                review, replay_one, replay_two = evidence
+                review_marker, _replay_one_marker, _replay_two_marker = evidence
+                review = self.source_receipt_from_marker(root, review_marker)
                 review_payload = json.loads(review.read_bytes())
                 selection = root / review_payload["query_ids_document"]["path"]
                 if case == "path":
@@ -5570,6 +5784,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                         "sha256": _sha256(replacement),
                     }
                     review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+                    self.rebind_source_marker(review_marker, review)
                 elif case == "hash":
                     selection.write_bytes(
                         canonical_json_bytes({"query_ids": ["2" * 64, "1" * 64]})
@@ -5582,12 +5797,13 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
                     review_payload["query_ids_document"]["sha256"] = _sha256(selection)
                     review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
+                    self.rebind_source_marker(review_marker, review)
                 self._assert_sources_ready_rejected_and_quarantined(
                     root,
                     run_spec,
                     initial,
                     inventory,
-                    (review, replay_one, replay_two),
+                    evidence,
                 )
 
     def test_source_schema_must_match_trusted_snapshot_through_validation(self) -> None:
@@ -5596,10 +5812,12 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.initialize(root, run_spec)
             initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
-            review, replay_one, replay_two = evidence
+            _review_marker, replay_one_marker, _replay_two_marker = evidence
+            replay_one = self.source_receipt_from_marker(root, replay_one_marker)
             replay_payload = json.loads(replay_one.read_bytes())
             replay_payload["unexpected"] = True
             replay_one.write_bytes(canonical_json_bytes(replay_payload) + b"\n")
+            self.rebind_source_marker(replay_one_marker, replay_one)
             schema_path = root / "schemas/v5_2_clean_source_replay_receipt.schema.json"
             strict = schema_path.read_bytes()
             original = self.registry._validate_bound_schema
@@ -5626,7 +5844,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     expected_phase="ACQUIRING",
                     next_phase="SOURCES_READY",
                     inventory_path=inventory,
-                    validation_receipts=(review, replay_one, replay_two),
+                    validation_receipts=evidence,
                 )
             self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
             self.assertEqual(
@@ -5640,7 +5858,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.initialize(root, run_spec)
             initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
-            review, replay_one, replay_two = evidence
+            review_marker, _replay_one_marker, _replay_two_marker = evidence
+            review = self.source_receipt_from_marker(root, review_marker)
             review_payload = json.loads(review.read_bytes())
             selection = root / review_payload["query_ids_document"]["path"]
             mutated = False
@@ -5664,7 +5883,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     run_spec,
                     initial,
                     inventory,
-                    (review, replay_one, replay_two),
+                    evidence,
                 )
 
     def test_late_tracked_schema_mutation_preserves_publish_failure(self) -> None:

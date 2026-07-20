@@ -154,6 +154,7 @@ _BOUND_EXECUTION_CODE = (
     "schemas/v5_2_venue_timezones.schema.json",
     "schemas/v5_2_source_review_receipt.schema.json",
     "schemas/v5_2_clean_source_replay_receipt.schema.json",
+    "schemas/v5_2_source_receipt_commit.schema.json",
 )
 ACQUISITION_STAGES: tuple[str, ...] = (
     "STATIC_SCHEDULES",
@@ -683,6 +684,7 @@ _SOURCE_RECEIPT_SCHEMAS = frozenset(
     {
         "v5_2_source_review_receipt.schema.json",
         "v5_2_clean_source_replay_receipt.schema.json",
+        "v5_2_source_receipt_commit.schema.json",
     }
 )
 
@@ -694,6 +696,7 @@ def validate_source_receipt_schema(
     schema_name: Literal[
         "v5_2_source_review_receipt.schema.json",
         "v5_2_clean_source_replay_receipt.schema.json",
+        "v5_2_source_receipt_commit.schema.json",
     ],
     payload: Mapping[str, object],
 ) -> None:
@@ -718,7 +721,7 @@ def validate_source_receipt_schema(
     _verify_git_snapshot(root, trusted)
 
 
-def _source_receipt_payload(
+def _uncommitted_source_receipt_payload(
     root: Path,
     contents: bytes,
     *,
@@ -805,6 +808,87 @@ def _source_receipt_payload(
     raise ValueError("unknown source evidence receipt kind")
 
 
+def _source_receipt_payload(
+    root: Path,
+    contents: bytes,
+    *,
+    path: str,
+    run_id: str,
+    inventory_sha256: str,
+    snapshot_sha256s: tuple[str, ...],
+    git_head: str,
+    run_spec: Mapping[str, object],
+    acquisition_contract: Mapping[str, object],
+    trusted_git: _GitSnapshot,
+) -> tuple[
+    str,
+    tuple[str, ...],
+    str | None,
+    tuple[_ArtifactSnapshot, ...],
+    str,
+    str,
+]:
+    """Resolve one explicit commit marker to its immutable source receipt."""
+    marker = _canonical_object(contents, "source receipt commit marker")
+    marker_schema = _validate_bound_schema(
+        root,
+        trusted_git,
+        "v5_2_source_receipt_commit.schema.json",
+        marker,
+    )
+    committed_kind = marker["committed_receipt_kind"]
+    expected_prefix = (
+        _SOURCE_REVIEW_PREFIX
+        if committed_kind == "SOURCE_REVIEW"
+        else _SOURCE_REPLAY_PREFIX
+    )
+    if not path.startswith(expected_prefix):
+        raise ValueError("source receipt commit marker is outside its namespace")
+    if (
+        marker["run_id"] != run_id
+        or marker["git_head"] != git_head
+        or marker["run_spec"] != run_spec
+        or marker["acquisition_contract"] != acquisition_contract
+    ):
+        raise ValueError("source receipt commit marker authority binding differs")
+    receipt_binding = _validate_binding_value(
+        marker["source_receipt"], "committed source receipt"
+    )
+    receipt_path = str(receipt_binding["path"])
+    if receipt_path == path or not receipt_path.startswith(expected_prefix):
+        raise ValueError("source receipt commit marker aliases its source receipt")
+    receipt = _capture_artifact(
+        root, root / receipt_path, "committed source receipt"
+    )
+    if receipt.binding != dict(receipt_binding):
+        raise ValueError("committed source receipt binding differs")
+    kind, queries, execution_id, dependencies = (
+        _uncommitted_source_receipt_payload(
+            root,
+            receipt.contents,
+            path=receipt.path,
+            run_id=run_id,
+            inventory_sha256=inventory_sha256,
+            snapshot_sha256s=snapshot_sha256s,
+            git_head=git_head,
+            run_spec=run_spec,
+            acquisition_contract=acquisition_contract,
+            trusted_git=trusted_git,
+        )
+    )
+    if kind != committed_kind:
+        raise ValueError("source receipt commit marker kind differs")
+    _verify_artifact_snapshot(root, receipt, "committed source receipt")
+    return (
+        kind,
+        queries,
+        execution_id,
+        (marker_schema, receipt, *dependencies),
+        receipt.path,
+        receipt.sha256,
+    )
+
+
 def _validate_sources_ready_evidence(
     inventory: _ArtifactSnapshot,
     validation_values: Sequence[_ArtifactSnapshot],
@@ -823,6 +907,10 @@ def _validate_sources_ready_evidence(
     replay_paths: set[str] = set()
     replay_hashes: set[str] = set()
     replay_execution_ids: set[str] = set()
+    marker_paths: set[str] = set()
+    marker_hashes: set[str] = set()
+    receipt_paths: set[str] = set()
+    receipt_hashes: set[str] = set()
     dependent_snapshots: list[_ArtifactSnapshot] = []
     reviewed_query_ids: tuple[str, ...] | None = None
     run_spec = _validate_binding_value(base["run_spec"], "run spec")
@@ -833,7 +921,14 @@ def _validate_sources_ready_evidence(
     if not isinstance(git_head, str) or not _GIT_HEAD.fullmatch(git_head):
         raise ValueError("source evidence base Git binding differs")
     for artifact in validation_values:
-        kind, receipt_queries, execution_id, dependencies = _source_receipt_payload(
+        (
+            kind,
+            receipt_queries,
+            execution_id,
+            dependencies,
+            receipt_path,
+            receipt_sha256,
+        ) = _source_receipt_payload(
             root,
             artifact.contents,
             path=artifact.path,
@@ -845,6 +940,14 @@ def _validate_sources_ready_evidence(
             acquisition_contract=acquisition_contract,
             trusted_git=trusted_git,
         )
+        if artifact.path in marker_paths or artifact.sha256 in marker_hashes:
+            raise ValueError("source receipt commit marker is duplicated")
+        marker_paths.add(artifact.path)
+        marker_hashes.add(artifact.sha256)
+        if receipt_path in receipt_paths or receipt_sha256 in receipt_hashes:
+            raise ValueError("committed source receipt is duplicated")
+        receipt_paths.add(receipt_path)
+        receipt_hashes.add(receipt_sha256)
         for dependency in dependencies:
             if dependency not in dependent_snapshots:
                 dependent_snapshots.append(dependency)
@@ -875,6 +978,10 @@ def _validate_sources_ready_evidence(
             replay_execution_ids.add(execution_id)
     if (
         reviews < 1
+        or len(marker_paths) != 3
+        or len(marker_hashes) != 3
+        or len(receipt_paths) != 3
+        or len(receipt_hashes) != 3
         or len(replay_paths) != 2
         or len(replay_hashes) != 2
         or len(replay_execution_ids) != 2
