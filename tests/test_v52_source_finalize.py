@@ -225,16 +225,28 @@ class ContextTests(unittest.TestCase):
             timezone_gate=SimpleNamespace(seal_sha256="3" * 64),
         )
         for changed in (
-            "run_spec", "contract", "membership", "registry", "checkpoint", "inventory", "git",
+            "run_spec", "contract", "run_spec_malformed", "run_spec_noncanonical",
+            "contract_malformed", "contract_noncanonical", "membership", "registry",
+            "checkpoint", "inventory", "git",
         ):
+            final_run_spec = {
+                "run_spec": b'{"a":2}\n',
+                "run_spec_malformed": b"not-json\n",
+                "run_spec_noncanonical": b'{"a":1, "b":2}\n',
+            }.get(changed, b'{"a":1}\n')
+            final_contract = {
+                "contract": b'{"b":3}\n',
+                "contract_malformed": b"not-json\n",
+                "contract_noncanonical": b'{"a":1, "b":2}\n',
+            }.get(changed, b'{"b":2}\n')
             with self.subTest(changed=changed), ExitStack() as stack:
                 patchers = (
                     patch.object(
                     orchestration,
                     "_read_explicit_artifact",
                     side_effect=[
-                        ("run.json", b'{"a":1}\n' if changed != "run_spec" else b'{"a":2}\n'),
-                        ("contract.json", b'{"b":2}\n' if changed != "contract" else b'{"b":3}\n'),
+                        ("run.json", final_run_spec),
+                        ("contract.json", final_contract),
                     ],
                     ),
                     patch.object(orchestration, "_load_static_contracts"),

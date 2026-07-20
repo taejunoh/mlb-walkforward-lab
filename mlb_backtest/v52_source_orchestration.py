@@ -307,8 +307,10 @@ def _rebind_context_authorities(
         _canonical_object(final_run_spec_bytes, "RunSpec")
         _canonical_object(final_contract_bytes, "acquisition contract")
         _load_static_contracts(run_spec_path, contract_path)
-    except FinalizationError:
-        raise
+    except FinalizationError as exc:
+        raise _authority_changed(
+            f"static authority changed during context build: {exc.message}"
+        ) from exc
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise _authority_changed("static authority changed during context build") from exc
     if final_run_spec_bytes != initial_run_spec_bytes:
