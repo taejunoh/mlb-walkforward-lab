@@ -463,14 +463,21 @@ def _open_or_create_source_root(
             try:
                 child = os.open(component, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
+                parent_index = len(descriptors) - 1
                 try:
-                    parent_index = len(descriptors) - 1
                     os.mkdir(component, 0o700, dir_fd=current)
                     os.fsync(current)
-                    child = os.open(component, _directory_flags(), dir_fd=current)
                     created.append((parent_index, component))
+                except FileExistsError:
+                    # A concurrent publisher won creation under this same held parent.
+                    # Re-open it no-follow below and apply the normal identity checks.
+                    pass
                 except OSError as exc:
                     raise ValueError("could not safely create fixed source directory") from exc
+                try:
+                    child = os.open(component, _directory_flags(), dir_fd=current)
+                except OSError as exc:
+                    raise ValueError("could not safely open fixed source directory") from exc
             try:
                 opened = os.fstat(child)
                 linked = os.stat(component, dir_fd=current, follow_symlinks=False)
@@ -916,7 +923,7 @@ def _converge_identical_locked_publish(
     handle: _TrustedRootHandle, context: FinalizationContext, expected: bytes
 ) -> PublishReport:
     """Wait briefly for a competing publisher, never writing while its lock exists."""
-    for _ in range(5):
+    for _ in range(25):
         try:
             inventory = _load_published_inventory_from_handle(handle, context)
         except LockHeld:

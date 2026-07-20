@@ -676,6 +676,49 @@ class PublishTests(StatusAndPreflightTests):
         self.assertEqual(failures, [])
         self.assertEqual(sorted(report.status for report in reports), ["EXISTING", "PUBLISHED"])
 
+    def test_concurrent_fixed_source_root_creation_converges_after_mkdir_race(self) -> None:
+        barrier = threading.Barrier(2)
+        original_mkdir = orchestration.os.mkdir
+        reports: list[orchestration.PublishReport] = []
+        failures: list[BaseException] = []
+
+        def raced_mkdir(name: object, *args: object, **kwargs: object) -> None:
+            if name == "data":
+                barrier.wait(timeout=3)
+            original_mkdir(name, *args, **kwargs)
+
+        def publish() -> None:
+            try:
+                reports.append(
+                    orchestration.publish_inventory(self.context, lock_owner="mkdir-race")
+                )
+            except BaseException as exc:  # asserted below in the parent test
+                failures.append(exc)
+
+        before_fds = len(os.listdir("/dev/fd"))
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), patch.object(orchestration.os, "mkdir", side_effect=raced_mkdir):
+            first = threading.Thread(target=publish)
+            second = threading.Thread(target=publish)
+            first.start()
+            second.start()
+            first.join(timeout=10)
+            second.join(timeout=10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(sorted(report.status for report in reports), ["EXISTING", "PUBLISHED"])
+        source = self.root / "data/v5_2_qd/historical/sources/source_inventory.json"
+        before = (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes())
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ):
+            retry = orchestration.publish_inventory(self.context, lock_owner="mkdir-race")
+        self.assertEqual(retry.status, "EXISTING")
+        self.assertEqual(before, (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes()))
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
     def test_concurrent_different_publication_conflicts_without_changing_winner(self) -> None:
         import mlb_backtest.v52_snapshot_store as store
 
