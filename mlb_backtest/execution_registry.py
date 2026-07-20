@@ -3993,6 +3993,11 @@ def advance_execution_phase(
                 state_verifier=verify_source_evidence_and_checkpoint,
             )
         except _LateSourceEvidenceError as exc:
+            try:
+                _verify_lock_binding(paths, lock_binding)
+                _verify_git_snapshot(paths.root, snapshot)
+            except ValueError as trust_exc:
+                raise exc from trust_exc
             _publish_quarantine_locked(
                 paths,
                 run_spec,

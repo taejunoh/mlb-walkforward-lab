@@ -5667,6 +5667,58 @@ class ExecutionRegistryTest(unittest.TestCase):
                 [],
             )
 
+    def test_late_source_evidence_schema_mutation_preserves_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            schema_path = root / "schemas/v5_2_clean_source_replay_receipt.schema.json"
+            strict = schema_path.read_bytes()
+            original_rebind = self.registry._verify_artifact_snapshots
+            mutated = False
+            hook_calls = 0
+
+            def mutate_after_dynamic_rebind(
+                artifact_root: Path,
+                snapshots: object,
+                label: str,
+            ) -> None:
+                nonlocal mutated
+                original_rebind(artifact_root, snapshots, label)
+                if label == "dynamic phase evidence" and not mutated:
+                    mutated = True
+                    schema_path.write_bytes(strict)
+
+            def count_hook() -> None:
+                nonlocal hook_calls
+                hook_calls += 1
+
+            with patch.object(
+                self.registry,
+                "_verify_artifact_snapshots",
+                side_effect=mutate_after_dynamic_rebind,
+            ), patch.object(
+                self.registry,
+                "_before_registry_publish",
+                side_effect=count_hook,
+            ), self.assertRaisesRegex(ValueError, "late source evidence"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+            self.assertTrue(mutated)
+            self.assertEqual(hook_calls, 1)
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                [],
+            )
+
     def test_unresolvable_source_receipt_schema_quarantines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
