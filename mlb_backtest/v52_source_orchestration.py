@@ -1,7 +1,7 @@
 """Authenticated, network-free authorities for v5.2 source finalization.
 
-This module intentionally owns the small shared vocabulary used by all staged
-source-finalization commands.  It performs no publication or cleanup.
+It owns authenticated orchestration for staged commands: read-only context,
+status, and preflight checks plus explicit capability-bound publication.
 """
 
 from __future__ import annotations
