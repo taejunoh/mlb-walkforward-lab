@@ -245,6 +245,14 @@ class ExecutionRegistryState:
 
 
 @dataclass(frozen=True)
+class ExecutionPhaseAdvance:
+    """The authenticated result of a phase advance or exact idempotent retry."""
+
+    state: ExecutionRegistryState
+    created: bool
+
+
+@dataclass(frozen=True)
 class AcquisitionCheckpoint:
     sequence: int
     receipt_sha256: str
@@ -4041,12 +4049,23 @@ def advance_execution_phase(
     next_phase: str,
     inventory_path: Path,
     validation_receipts: Sequence[Path],
-) -> ExecutionRegistryState:
+    expected_checkpoint_path: Path | None = None,
+    atomic_source_gate: bool = False,
+    return_transition_result: bool = False,
+) -> ExecutionRegistryState | ExecutionPhaseAdvance:
     paths = _paths(root, run_spec)
     if expected_phase not in PHASES or next_phase not in PHASES or PHASES.index(next_phase) != PHASES.index(expected_phase) + 1:
         raise ValueError("execution transition must use the immediate next phase")
     if next_phase not in {"ACQUIRING", "SOURCES_READY"}:
         raise ValueError("execution transition fails closed until a phase validator exists")
+
+    def transition_result(
+        transition_state: ExecutionRegistryState, *, created: bool
+    ) -> ExecutionRegistryState | ExecutionPhaseAdvance:
+        if return_transition_result:
+            return ExecutionPhaseAdvance(transition_state, created)
+        return transition_state
+
     with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
         state, payloads = _load_locked(paths, run_spec, lock_binding)
         # SOURCES_READY is the sole idempotent transition: an interrupted caller
@@ -4097,6 +4116,14 @@ def advance_execution_phase(
             checkpoint_head = _terminal_checkpoint_head(
                 paths, checkpoints, checkpoint_payloads, checkpoint_names
             )
+            if expected_checkpoint_path is not None:
+                expected_checkpoint = _capture_artifact(
+                    paths.root, expected_checkpoint_path, "expected terminal acquisition checkpoint"
+                )
+                if expected_checkpoint.binding != {
+                    "path": checkpoint_head["path"], "sha256": checkpoint_head["sha256"]
+                }:
+                    raise ValueError("SOURCES_READY retry checkpoint differs")
             if current.get("acquisition_checkpoint_head") != checkpoint_head:
                 raise ValueError("SOURCES_READY retry checkpoint differs")
             _verify_artifact_snapshot(paths.root, inventory_snapshot, "phase inventory")
@@ -4104,7 +4131,7 @@ def advance_execution_phase(
                 paths.root, validation_snapshots, "validation receipt"
             )
             _verify_git_snapshot(paths.root, snapshot)
-            return state
+            return transition_result(state, created=False)
         if state.phase != expected_phase:
             raise ValueError(
                 "execution transition replay or expected phase differs from "
@@ -4166,6 +4193,12 @@ def advance_execution_phase(
                     raise ValueError(
                         "terminal acquisition checkpoint snapshot differs"
                     )
+                if expected_checkpoint_path is not None:
+                    expected_checkpoint = _capture_artifact(
+                        paths.root, expected_checkpoint_path, "expected terminal acquisition checkpoint"
+                    )
+                    if expected_checkpoint.binding != checkpoint_snapshot.binding:
+                        raise ValueError("terminal acquisition checkpoint differs")
 
                 def verify_checkpoint_state() -> None:
                     verified, verified_payloads, verified_names = (
@@ -4217,6 +4250,8 @@ def advance_execution_phase(
             }
             contents, digest = _success_contents(payload)
         except ValueError as exc:
+            if atomic_source_gate and next_phase == "SOURCES_READY":
+                raise ValueError("atomic source gate evidence failed") from exc
             error_classification = (
                 "DIRECT_INVENTORY_MISMATCH"
                 if next_phase == "ACQUIRING"
@@ -4277,6 +4312,8 @@ def advance_execution_phase(
                 _verify_git_snapshot(paths.root, snapshot)
             except ValueError as trust_exc:
                 raise exc from trust_exc
+            if atomic_source_gate and next_phase == "SOURCES_READY":
+                raise ValueError("atomic source gate evidence failed") from exc
             _publish_quarantine_locked(
                 paths,
                 run_spec,
@@ -4295,7 +4332,12 @@ def advance_execution_phase(
                 evidence_snapshots=(inventory_snapshot, *validation_snapshots),
             )
             raise ValueError("direct phase artifact evidence failed") from exc
-        return ExecutionRegistryState(next_phase, state.sequence + 1, digest, inventory["sha256"])
+        return transition_result(
+            ExecutionRegistryState(
+                next_phase, state.sequence + 1, digest, inventory["sha256"]
+            ),
+            created=True,
+        )
 
 
 def quarantine_execution_transition(

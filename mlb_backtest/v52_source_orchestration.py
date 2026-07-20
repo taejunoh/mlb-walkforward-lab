@@ -1652,6 +1652,9 @@ def advance_sources_ready(
         if preflight.status != "PASS":
             raise _advance_input_error("advance requires passing preflight")
 
+    # This read-only diagnostic keeps invalid requests cheap.  The authoritative
+    # source gate below repeats validation while holding its exclusive lock, so
+    # this preflight can never select the checkpoint or evidence that is sealed.
     try:
         execution_registry.validate_sources_ready_evidence_set(
             context.root,
@@ -1669,20 +1672,37 @@ def advance_sources_ready(
         )
         raise FinalizationError(error_code, "source receipt set is invalid", (), 4) from exc
     try:
-        state = execution_registry.advance_execution_phase(
+        transition = execution_registry.advance_execution_phase(
             context.root,
             context.run_spec,
             expected_phase="ACQUIRING",
             next_phase="SOURCES_READY",
             inventory_path=context.root / inventory_relative,
             validation_receipts=tuple(context.root / relative for relative in marker_paths),
+            expected_checkpoint_path=context.root / checkpoint_relative,
+            atomic_source_gate=True,
+            return_transition_result=True,
         )
     except ValueError as exc:
-        raise _advance_input_error("source evidence advance failed") from exc
+        message = str(exc)
+        error_code = (
+            "AUTHORITY_BLOCKED"
+            if any(token in message.lower() for token in ("git", "contract", "run spec", "bound code"))
+            else "RECEIPT_SET_INVALID"
+        )
+        raise FinalizationError(error_code, "source evidence advance failed", (), 4) from exc
+    if isinstance(transition, execution_registry.ExecutionPhaseAdvance):
+        state = transition.state
+        status = "ADVANCED" if transition.created else "EXISTING"
+    else:
+        # Compatibility for callers which replace the registry API in tests or
+        # adapters.  The real atomic call always requests the richer result.
+        state = transition
+        status = "EXISTING" if context.registry.phase == "SOURCES_READY" else "ADVANCED"
     if state.phase != "SOURCES_READY":
         raise FinalizationError("POSTCONDITION_FAILED", "advance phase differs", (), 5)
     return AdvanceReport(
-        "EXISTING" if context.registry.phase == "SOURCES_READY" else "ADVANCED",
+        status,
         "SOURCES_READY",
         state.receipt_sha256,
     )
