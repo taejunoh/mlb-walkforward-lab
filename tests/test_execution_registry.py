@@ -147,6 +147,7 @@ ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.v52_query_plan",
     "mlb_backtest.v52_schedule_inventory",
     "mlb_backtest.v52_source_contracts",
+    "mlb_backtest.v52_source_orchestration",
     "mlb_backtest.v52_timezone_review",
 )
 PASSIVE_IMPORT_CLOSURE_EXCLUSIONS = frozenset(
@@ -285,6 +286,40 @@ class ExecutionRegistryTest(unittest.TestCase):
         from mlb_backtest import execution_registry
 
         self.registry = execution_registry
+
+    def test_public_source_receipt_validator_requires_clean_bound_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, _run_spec = self.make_repo(Path(directory))
+            _inventory, evidence = self.write_real_source_evidence(root)
+            review, _replay_one, _replay_two = evidence
+            payload = json.loads(review.read_bytes())
+            head = _git(root, "rev-parse", "HEAD")
+
+            self.registry.validate_source_receipt_schema(
+                root,
+                git_head=head,
+                schema_name="v5_2_source_review_receipt.schema.json",
+                payload=payload,
+            )
+
+            payload["unexpected"] = True
+            with self.assertRaisesRegex(ValueError, "schema validation"):
+                self.registry.validate_source_receipt_schema(
+                    root,
+                    git_head=head,
+                    schema_name="v5_2_source_review_receipt.schema.json",
+                    payload=payload,
+                )
+
+            schema = root / "schemas/v5_2_source_review_receipt.schema.json"
+            schema.write_bytes(b"{}\n")
+            with self.assertRaisesRegex(ValueError, "HEAD, index, or worktree"):
+                self.registry.validate_source_receipt_schema(
+                    root,
+                    git_head=head,
+                    schema_name="v5_2_source_review_receipt.schema.json",
+                    payload=json.loads(review.read_bytes()),
+                )
 
     def make_repo(
         self, parent: Path, *, remaining_authority: bool = False

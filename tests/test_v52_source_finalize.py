@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -1033,6 +1035,278 @@ class ContextTests(_ContextBaseTests):
                     )
                 self.assertEqual(raised.exception.error_code, "AUTHORITY_CHANGED")
                 self.assertEqual(raised.exception.exit_code, 5)
+
+class ReviewTests(unittest.TestCase):
+    """Explicit independent reviews must bind an audited selection document."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name).resolve()
+        self.inputs = store_inputs()
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        source_root.mkdir(parents=True)
+        with patched_store_replay():
+            self.inventory = build_inventory(self.inputs)
+            publish_snapshot_store(
+                source_root,
+                self.inventory,
+                self.inputs,
+                lock_owner="review-test",
+            )
+        self.registry = ExecutionRegistryState("ACQUIRING", 7, "a" * 64, "b" * 64)
+        self.checkpoint = AcquisitionCheckpoint(
+            9, "c" * 64, "d" * 64, "REMAINING",
+            "2026-07-20T00:00:00.000000Z", "e" * 40, "f" * 64,
+            (), (), (), (), (), (), (), (), (), (),
+        )
+        self.context = orchestration.FinalizationContext(
+            self.root,
+            self.root / "run.json",
+            self.root / "contract.json",
+            self.root / "protected.json",
+            SimpleNamespace(run_id="fixture-run"),
+            self.registry,
+            self.checkpoint,
+            self.inputs,
+            self.inventory,
+            "ACQUIRING",
+            "e" * 40,
+            (),
+        )
+        self.query_ids = self.inventory.logical_query_ids[:2]
+        self.query_ids_path = (
+            self.root
+            / "audit/v5_2_qd/historical/acquisition/source_reviews/query_ids.json"
+        )
+        self.query_ids_path.parent.mkdir(parents=True)
+        self.query_ids_path.write_bytes(
+            canonical_json_bytes({"query_ids": list(self.query_ids)}) + b"\n"
+        )
+        self.receipt_path = (
+            self.root
+            / "audit/v5_2_qd/historical/acquisition/source_reviews/review.json"
+        )
+        self.request = orchestration.ReviewRequest(
+            "independent-source-auditor",
+            "independent-source-auditor",
+            "APPROVED",
+            self.query_ids_path,
+            self.receipt_path,
+        )
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _write(
+        self,
+        request: object | None = None,
+        *,
+        validator_side_effect: object | None = None,
+        preflight_side_effect: object | None = None,
+    ) -> object:
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING",
+            "PASS",
+            hashlib.sha256(inventory_bytes(self.inventory)).hexdigest(),
+            len(self.inventory.snapshots),
+            0,
+            (),
+        )
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration.execution_registry,
+                "validate_source_receipt_schema",
+                create=True,
+            ) as validator,
+            patch.object(orchestration, "_utc_now", return_value="2026-07-20T00:00:00.000000Z", create=True),
+            patch.object(
+                orchestration,
+                "run_preflight",
+                side_effect=preflight_side_effect or (lambda _context: preflight),
+            ),
+        ):
+            validator.side_effect = validator_side_effect
+            return orchestration.write_review(self.context, request or self.request)
+
+    def test_review_receipt_binds_explicit_query_document(self) -> None:
+        report = self._write()
+        payload = json.loads(report.path.read_bytes())
+        self.assertEqual(payload["query_ids_document"], {
+            "path": self.query_ids_path.relative_to(self.root).as_posix(),
+            "sha256": hashlib.sha256(self.query_ids_path.read_bytes()).hexdigest(),
+        })
+        self.assertEqual(payload["reviewed_query_ids"], list(self.query_ids))
+        self.assertEqual(payload["decision"], "APPROVED")
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version", "receipt_kind", "run_id", "critical_errors",
+                "reviewer_identity", "reviewer_role", "decision", "reviewed_query_ids",
+                "query_ids_document", "inventory_sha256", "snapshot_sha256s", "run_spec",
+                "acquisition_contract", "git_head", "occurred_at_utc",
+            },
+        )
+        self.assertEqual(report.receipt_kind, "SOURCE_REVIEW")
+
+    def test_review_allows_rejected_decision(self) -> None:
+        request = dataclasses.replace(self.request, decision="REJECTED")
+        report = self._write(request)
+        self.assertEqual(json.loads(report.path.read_bytes())["decision"], "REJECTED")
+
+    def test_review_rejects_invalid_reviewer_before_writing(self) -> None:
+        for field in ("reviewer_identity", "reviewer_role"):
+            with self.subTest(field=field):
+                request = dataclasses.replace(self.request, **{field: "source-operator"})
+                with self.assertRaisesRegex(orchestration.FinalizationError, "reviewer") as raised:
+                    self._write(request)
+                self.assertEqual(raised.exception.error_code, "REVIEWER_INVALID")
+                self.assertFalse(self.receipt_path.exists())
+
+    def test_review_rejects_noncanonical_or_unknown_query_document(self) -> None:
+        for query_ids in (
+            list(reversed(self.query_ids)),
+            [self.query_ids[0], self.query_ids[0]],
+            ["f" * 64],
+            ["not-a-sha"],
+        ):
+            with self.subTest(query_ids=query_ids):
+                self.query_ids_path.write_bytes(
+                    canonical_json_bytes({"query_ids": query_ids}) + b"\n"
+                )
+                with self.assertRaises(orchestration.FinalizationError) as raised:
+                    self._write()
+                self.assertEqual(raised.exception.error_code, "QUERY_IDS_INVALID")
+                self.assertFalse(self.receipt_path.exists())
+
+    def test_review_rejects_outside_namespace_and_existing_path(self) -> None:
+        outside = dataclasses.replace(
+            self.request,
+            write_receipt=self.root / "audit/v5_2_qd/historical/acquisition/review.json",
+        )
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(outside)
+        self.assertEqual(raised.exception.error_code, "PATH_UNSAFE")
+        self._write()
+        with self.assertRaises(orchestration.FinalizationError) as conflict:
+            self._write()
+        self.assertEqual(conflict.exception.exit_code, 6)
+
+    def test_review_rejects_symlinked_receipt_ancestor(self) -> None:
+        external = self.root / "external-receipts"
+        external.mkdir()
+        swapped = self.receipt_path.parent / "swapped"
+        swapped.symlink_to(external, target_is_directory=True)
+        request = dataclasses.replace(
+            self.request, write_receipt=swapped / "review.json"
+        )
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(request)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "PATH_UNSAFE", 5
+        ))
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_review_requires_authenticated_published_inventory(self) -> None:
+        shutil.rmtree(self.root / "data")
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "PREFLIGHT_BLOCKED", 4
+        ))
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_review_rejects_unsafe_query_document_file_types(self) -> None:
+        external = self.root / "external.json"
+        external.write_bytes(self.query_ids_path.read_bytes())
+        for kind in ("symlink", "hardlink", "fifo"):
+            with self.subTest(kind=kind):
+                candidate = self.query_ids_path.with_name(f"{kind}.json")
+                if kind == "symlink":
+                    candidate.symlink_to(external)
+                elif kind == "hardlink":
+                    os.link(self.query_ids_path, candidate)
+                else:
+                    os.mkfifo(candidate)
+                request = dataclasses.replace(self.request, query_ids_file=candidate)
+                with self.assertRaises(orchestration.FinalizationError) as raised:
+                    self._write(request)
+                self.assertEqual(raised.exception.error_code, "QUERY_IDS_INVALID")
+
+    def test_review_schema_failure_never_creates_a_receipt(self) -> None:
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(validator_side_effect=ValueError("schema drift"))
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "POSTCONDITION_FAILED", 5
+        ))
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_review_document_tamper_during_final_rebind_fails_closed(self) -> None:
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING", "PASS", "x" * 64, len(self.inventory.snapshots), 0, ()
+        )
+        calls = 0
+
+        def mutate_on_final_rebind(_context: object) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.query_ids_path.write_bytes(
+                    canonical_json_bytes({"query_ids": list(reversed(self.query_ids))})
+                    + b"\n"
+                )
+            return preflight
+
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(preflight_side_effect=mutate_on_final_rebind)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "POSTCONDITION_FAILED", 5
+        ))
+        self.assertTrue(self.receipt_path.is_file())
+        payload = json.loads(self.receipt_path.read_bytes())
+        self.assertEqual(payload["reviewed_query_ids"], list(self.query_ids))
+        self.assertEqual(
+            payload["query_ids_document"]["sha256"],
+            hashlib.sha256(
+                canonical_json_bytes({"query_ids": list(self.query_ids)}) + b"\n"
+            ).hexdigest(),
+        )
+
+    def test_same_explicit_receipt_path_allows_one_concurrent_writer(self) -> None:
+        outcomes: list[object] = []
+        gate = threading.Barrier(2)
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING",
+            "PASS",
+            hashlib.sha256(inventory_bytes(self.inventory)).hexdigest(),
+            len(self.inventory.snapshots),
+            0,
+            (),
+        )
+
+        def write_once() -> None:
+            gate.wait()
+            try:
+                outcomes.append(orchestration.write_review(self.context, self.request))
+            except orchestration.FinalizationError as exc:
+                outcomes.append(exc)
+
+        with (
+            patched_store_replay(),
+            patch.object(orchestration.execution_registry, "validate_source_receipt_schema"),
+            patch.object(orchestration, "_utc_now", return_value="2026-07-20T00:00:00.000000Z"),
+            patch.object(orchestration, "run_preflight", return_value=preflight),
+        ):
+            threads = [threading.Thread(target=write_once) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(sum(isinstance(item, orchestration.ReceiptReport) for item in outcomes), 1)
+        failures = [item for item in outcomes if isinstance(item, orchestration.FinalizationError)]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].exit_code, 6)
 
 
 if __name__ == "__main__":

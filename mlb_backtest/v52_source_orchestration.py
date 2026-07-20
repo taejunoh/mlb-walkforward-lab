@@ -9,14 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from . import execution_registry
 from .execution_registry import (
     AcquisitionCheckpoint,
     ExecutionRegistryState,
@@ -47,6 +50,7 @@ from .v52_snapshot_store import (
 )
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import load_snapshot_replay_inputs
+from . import v52_timezone_review
 
 
 _RUN_SPEC_DEFAULT = Path("protocols/v5_2_qd/historical_walkforward_500.json")
@@ -55,6 +59,8 @@ _PROTECTED_DEFAULT = Path("audit/v5_1_bt/protected_raw_inventory.json")
 _CHECKPOINT_ROOT = Path("audit/v5_2_qd/historical/execution/acquisition_checkpoints")
 _TIMEZONE_SEAL = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json")
 _SOURCE_ROOT_RELATIVE = Path("data/v5_2_qd/historical/sources")
+_SOURCE_REVIEW_PREFIX = "audit/v5_2_qd/historical/acquisition/source_reviews/"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,26 @@ class PublishReport:
     status: Literal["PUBLISHED", "EXISTING"]
     inventory_sha256: str
     snapshot_count: int
+
+
+@dataclass(frozen=True)
+class ReviewRequest:
+    reviewer_identity: str
+    reviewer_role: str
+    decision: Literal["APPROVED", "REJECTED"]
+    query_ids_file: Path
+    write_receipt: Path
+
+
+@dataclass(frozen=True)
+class ReceiptReport:
+    path: Path
+    sha256: str
+    receipt_kind: Literal["SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY"]
+
+
+ReviewReport = ReceiptReport
+ReplayReport = ReceiptReport
 
 
 class FinalizationError(Exception):
@@ -991,8 +1017,216 @@ def publish_inventory(
         _close_descriptors(handle.descriptors)
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _load_query_ids_document(
+    root: Path, path: Path
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Load one explicit, canonical selection from the review namespace."""
+    try:
+        relative, raw = _read_explicit_artifact(root, path, "review query IDs")
+        value = _canonical_object(raw, "review query IDs")
+    except (FinalizationError, ValueError) as exc:
+        raise FinalizationError(
+            "QUERY_IDS_INVALID", "review query ID document is invalid", (), 3
+        ) from exc
+    if not relative.startswith(_SOURCE_REVIEW_PREFIX):
+        raise FinalizationError(
+            "QUERY_IDS_INVALID",
+            "review query ID document is outside review namespace",
+            (relative,),
+            3,
+        )
+    selection = value.get("query_ids")
+    if (
+        set(value) != {"query_ids"}
+        or not isinstance(selection, list)
+        or not selection
+        or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in selection)
+        or tuple(selection) != tuple(sorted(set(selection)))
+    ):
+        raise FinalizationError(
+            "QUERY_IDS_INVALID", "query IDs must be sorted unique SHA-256 values", (relative,), 3
+        )
+    return tuple(selection), {"path": relative, "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _write_receipt_exclusive(
+    root: Path, path: Path, raw: bytes, expected_prefix: str
+) -> str:
+    """Append an immutable receipt at one explicit path, never reconciling it."""
+    try:
+        relative = v52_timezone_review._relative(root, path, "source receipt")
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    lexical = relative.as_posix()
+    if (
+        not lexical.startswith(expected_prefix)
+        or len(relative.parts) <= len(Path(expected_prefix).parts) - 1
+        or relative.name in {"", ".", ".."}
+    ):
+        raise FinalizationError(
+            "PATH_UNSAFE", "source receipt is outside its namespace", (lexical,), 5
+        )
+    try:
+        published, snapshot = v52_timezone_review._write_safe(
+            root, relative, raw, "source receipt"
+        )
+        v52_timezone_review._rebind_safe_snapshot(root, snapshot, "source receipt")
+    except FileExistsError as exc:
+        raise FinalizationError(
+            "RECEIPT_CONFLICT", "source receipt path already exists", (lexical,), 6
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (lexical,), 5) from exc
+    return published.relative_to(Path(os.path.abspath(root))).as_posix()
+
+
+def _write_validated_receipt(
+    root: Path,
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    schema_name: Literal[
+        "v5_2_source_review_receipt.schema.json",
+        "v5_2_clean_source_replay_receipt.schema.json",
+    ],
+    expected_prefix: str,
+    final_rebind: Callable[[], None] | None = None,
+) -> ReceiptReport:
+    kind = payload.get("receipt_kind")
+    if kind not in {"SOURCE_REVIEW", "CLEAN_SOURCE_REPLAY"}:
+        raise FinalizationError("POSTCONDITION_FAILED", "receipt kind differs", (), 5)
+    git_head = payload.get("git_head")
+    if not isinstance(git_head, str):
+        raise FinalizationError("POSTCONDITION_FAILED", "receipt Git binding differs", (), 5)
+    raw = canonical_json_bytes(payload) + b"\n"
+    try:
+        execution_registry.validate_source_receipt_schema(
+            root, git_head=git_head, schema_name=schema_name, payload=payload
+        )
+    except ValueError as exc:
+        raise FinalizationError("POSTCONDITION_FAILED", str(exc), (), 5) from exc
+    relative = _write_receipt_exclusive(root, path, raw, expected_prefix)
+    if final_rebind is not None:
+        final_rebind()
+    try:
+        rebound = _read_explicit_artifact(root, root / relative, "source receipt")[1]
+    except ValueError as exc:
+        raise FinalizationError("POSTCONDITION_FAILED", str(exc), (relative,), 5) from exc
+    if rebound != raw:
+        raise FinalizationError(
+            "POSTCONDITION_FAILED", "source receipt changed", (relative,), 5
+        )
+    return ReceiptReport(
+        root / relative,
+        hashlib.sha256(raw).hexdigest(),
+        kind,
+    )
+
+
+def write_review(context: FinalizationContext, request: ReviewRequest) -> ReviewReport:
+    """Record one explicit, independently selected source review.
+
+    Writing is permitted only after the candidate inventory has been published
+    and independently re-preflighted; neither receipt discovery nor implicit
+    selection is supported.
+    """
+    context = _require_mutable_context(context, phase="ACQUIRING")
+    if (
+        request.reviewer_identity != "independent-source-auditor"
+        or request.reviewer_role != "independent-source-auditor"
+    ):
+        raise FinalizationError(
+            "REVIEWER_INVALID", "reviewer identity or role differs", (), 3
+        )
+    if request.decision not in {"APPROVED", "REJECTED"}:
+        raise FinalizationError("REVIEWER_INVALID", "review decision differs", (), 3)
+    status = read_status(context)
+    if not status.review_ready:
+        raise FinalizationError(
+            "PREFLIGHT_BLOCKED", "review requires an authenticated published inventory", (), 4
+        )
+    preflight = run_preflight(context)
+    if preflight.status != "PASS":
+        raise FinalizationError("PREFLIGHT_BLOCKED", "review requires passing preflight", (), 4)
+    query_ids, document = _load_query_ids_document(context.root, request.query_ids_file)
+    if context.inventory is None or context.snapshot_inputs is None or context.run_spec is None or context.git_head is None:
+        raise FinalizationError("AUTHORITY_MISSING", "review authority is missing", (), 3)
+    if not set(query_ids).issubset(context.inventory.logical_query_ids):
+        raise FinalizationError(
+            "QUERY_IDS_INVALID", "review selection is outside inventory", (document["path"],), 3
+        )
+    raw_inventory = inventory_bytes(context.inventory)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_kind": "SOURCE_REVIEW",
+        "run_id": context.run_spec.run_id,
+        "critical_errors": [],
+        "reviewer_identity": request.reviewer_identity,
+        "reviewer_role": request.reviewer_role,
+        "decision": request.decision,
+        "reviewed_query_ids": list(query_ids),
+        "query_ids_document": document,
+        "inventory_sha256": hashlib.sha256(raw_inventory).hexdigest(),
+        "snapshot_sha256s": list(context.inventory.snapshot_sha256s),
+        "run_spec": context.snapshot_inputs.bindings.run_spec.as_mapping(),
+        "acquisition_contract": context.snapshot_inputs.bindings.acquisition_contract.as_mapping(),
+        "git_head": context.git_head,
+        "occurred_at_utc": _utc_now(),
+    }
+    # Re-read the explicit selection after calculating the payload, then do a
+    # second read-only preflight before making the receipt visible.
+    rebound_ids, rebound_document = _load_query_ids_document(
+        context.root, request.query_ids_file
+    )
+    if rebound_ids != query_ids or rebound_document != document:
+        raise FinalizationError(
+            "POSTCONDITION_FAILED", "review query ID document changed", (document["path"],), 5
+        )
+    final_preflight = run_preflight(context)
+    if final_preflight != preflight:
+        raise FinalizationError("POSTCONDITION_FAILED", "preflight changed", (), 5)
+
+    def rebind_dependencies() -> None:
+        try:
+            final_ids, final_document = _load_query_ids_document(
+                context.root, request.query_ids_file
+            )
+        except FinalizationError as exc:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "review query ID document changed before publication",
+                (document["path"],),
+                5,
+            ) from exc
+        if final_ids != query_ids or final_document != document:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "review query ID document changed before publication",
+                (document["path"],),
+                5,
+            )
+        if run_preflight(context) != preflight:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED", "preflight changed before publication", (), 5
+            )
+
+    return _write_validated_receipt(
+        context.root,
+        request.write_receipt,
+        payload,
+        schema_name="v5_2_source_review_receipt.schema.json",
+        expected_prefix=_SOURCE_REVIEW_PREFIX,
+        final_rebind=rebind_dependencies,
+    )
+
+
 __all__ = [
     "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
-    "PreflightReport", "PublishReport", "StatusReport", "build_context",
-    "publish_inventory", "read_status", "run_preflight",
+    "PreflightReport", "PublishReport", "ReceiptReport", "ReplayReport",
+    "ReviewReport", "ReviewRequest", "StatusReport", "build_context",
+    "publish_inventory", "read_status", "run_preflight", "write_review",
 ]

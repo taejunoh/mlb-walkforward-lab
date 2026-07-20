@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 from mlb_backtest.diagnostics import canonical_json_bytes
@@ -131,12 +131,16 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/v52_schedule_inventory.py",
     "mlb_backtest/v52_seasons.py",
     "mlb_backtest/v52_source_contracts.py",
+    "mlb_backtest/v52_source_orchestration.py",
+    "mlb_backtest/v52_snapshot_store.py",
     "mlb_backtest/v52_sources/__init__.py",
+    "mlb_backtest/v52_sources/history.py",
     "mlb_backtest/v52_sources/pitching.py",
     "mlb_backtest/v52_sources/references.py",
     "mlb_backtest/v52_sources/schedule.py",
     "mlb_backtest/v52_sources/statcast.py",
     "mlb_backtest/v52_timezone_review.py",
+    "mlb_backtest/v52_verify_sources.py",
     "mlb_backtest/verify_v52_design.py",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_schedule_anchor_inventory.schema.json",
@@ -673,6 +677,45 @@ def _validate_bound_schema(
         raise ValueError("source evidence receipt schema validation failed") from exc
     _verify_artifact_snapshot(root, snapshot, "source receipt schema")
     return snapshot
+
+
+_SOURCE_RECEIPT_SCHEMAS = frozenset(
+    {
+        "v5_2_source_review_receipt.schema.json",
+        "v5_2_clean_source_replay_receipt.schema.json",
+    }
+)
+
+
+def validate_source_receipt_schema(
+    root: Path,
+    *,
+    git_head: str,
+    schema_name: Literal[
+        "v5_2_source_review_receipt.schema.json",
+        "v5_2_clean_source_replay_receipt.schema.json",
+    ],
+    payload: Mapping[str, object],
+) -> None:
+    """Validate a source receipt only against the current clean bound code.
+
+    This is intentionally a small public trust boundary: receipt writers cannot
+    fabricate the registry's private Git snapshot to validate a mutable schema.
+    """
+    if schema_name not in _SOURCE_RECEIPT_SCHEMAS:
+        raise ValueError("source receipt schema is not approved")
+    if not isinstance(git_head, str) or not _GIT_HEAD.fullmatch(git_head):
+        raise ValueError("source receipt Git binding differs")
+    actual_head = _git(root, "rev-parse", "HEAD")
+    if actual_head != git_head:
+        raise ValueError("source receipt Git binding differs")
+    files = tuple(
+        _capture_git_file(root, relative, "bound execution code")
+        for relative in _BOUND_EXECUTION_CODE
+    )
+    trusted = _GitSnapshot(actual_head, files)
+    _validate_bound_schema(root, trusted, schema_name, payload)
+    _verify_git_snapshot(root, trusted)
 
 
 def _source_receipt_payload(
