@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import errno
 import hashlib
 import os
 import tempfile
@@ -278,9 +277,20 @@ class StatusAndPreflightTests(unittest.TestCase):
         self.assertNotIn("selected_replay_receipts", rendered)
         self.assertEqual(tree_snapshot(self.root), before)
 
-    def test_status_reports_unsafe_published_store_as_a_blocker(self) -> None:
+    def test_status_treats_authenticated_empty_source_root_as_unpublished(self) -> None:
         source_root = self.root / "data/v5_2_qd/historical/sources"
         source_root.mkdir(parents=True)
+        before = tree_snapshot(self.root)
+        report = orchestration.read_status(self.context)
+        self.assertTrue(report.publish_ready)
+        self.assertFalse(report.review_ready)
+        self.assertEqual(report.blockers, ())
+        self.assertEqual(tree_snapshot(self.root), before)
+
+    def test_status_reports_nonempty_partial_store_as_unsafe(self) -> None:
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        source_root.mkdir(parents=True)
+        (source_root / "partial.tmp").write_bytes(b"partial\n")
         before = tree_snapshot(self.root)
         report = orchestration.read_status(self.context)
         self.assertFalse(report.publish_ready)
@@ -288,15 +298,6 @@ class StatusAndPreflightTests(unittest.TestCase):
         self.assertIn(
             "PUBLISHED_INVENTORY_UNAUTHENTICATED",
             {blocker.code for blocker in report.blockers},
-        )
-        blocker = next(
-            item
-            for item in report.blockers
-            if item.code == "PUBLISHED_INVENTORY_UNAUTHENTICATED"
-        )
-        self.assertEqual(
-            blocker.message,
-            "published source inventory is unsafe or unavailable",
         )
         self.assertEqual(tree_snapshot(self.root), before)
 
@@ -581,7 +582,8 @@ class PublishTests(StatusAndPreflightTests):
         ))
         self.assertFalse((self.root / "data").exists())
 
-    def test_failed_publish_cleans_only_empty_fixed_directories(self) -> None:
+    def test_failed_publish_leaves_safe_empty_fixed_residue_and_retry_converges(self) -> None:
+        before_fds = len(os.listdir("/dev/fd"))
         with patch.object(
             orchestration, "run_preflight", return_value=self._passing_preflight()
         ), self.assertRaises(orchestration.FinalizationError) as raised:
@@ -589,13 +591,21 @@ class PublishTests(StatusAndPreflightTests):
         self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
             "PUBLISH_FAILED", 5
         ))
-        self.assertFalse((self.root / "data").exists())
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        self.assertTrue(source_root.is_dir())
+        self.assertEqual(tuple(source_root.iterdir()), ())
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ):
+            first = orchestration.publish_inventory(self.context, lock_owner="safe-retry")
+            second = orchestration.publish_inventory(self.context, lock_owner="safe-retry")
+        self.assertEqual((first.status, second.status), ("PUBLISHED", "EXISTING"))
 
-    def test_source_root_open_failure_cleans_all_created_fixed_directories_and_fds(self) -> None:
+    def test_source_root_open_failure_leaves_only_empty_fixed_residue_and_closes_fds(self) -> None:
         for failed_component in ("data", "v5_2_qd", "historical"):
             with self.subTest(component=failed_component), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
-                before_tree = tree_snapshot(root)
                 before_fds = len(os.listdir("/dev/fd"))
 
                 def fail_after_component(component: str) -> None:
@@ -608,10 +618,12 @@ class PublishTests(StatusAndPreflightTests):
                     side_effect=fail_after_component,
                 ), self.assertRaisesRegex(RuntimeError, f"injected after {failed_component}"):
                     orchestration._open_or_create_source_root(root)
-                self.assertEqual(tree_snapshot(root), before_tree)
+                self.assertTrue((root / "data").is_dir())
+                self.assertFalse(any(path.is_file() for path in root.rglob("*")))
+                self.assertFalse(any(path.name == ".snapshot-store.lock" for path in root.rglob("*")))
                 self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
-    def test_source_root_failure_never_deletes_replaced_directory(self) -> None:
+    def test_source_root_failure_never_rmdirs_empty_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             moved = root / "owned-data-moved"
@@ -620,39 +632,23 @@ class PublishTests(StatusAndPreflightTests):
                 if component == "data":
                     (root / "data").rename(moved)
                     (root / "data").mkdir()
-                    (root / "data/attacker.txt").write_bytes(b"attacker\n")
                     raise RuntimeError("injected replacement")
 
             with patch.object(
                 orchestration,
                 "_trusted_descendant_test_hook",
                 side_effect=replace_and_fail,
-            ), self.assertRaisesRegex(RuntimeError, "injected replacement"):
-                orchestration._open_or_create_source_root(root)
-            self.assertEqual((root / "data/attacker.txt").read_bytes(), b"attacker\n")
-            self.assertTrue(moved.is_dir())
-
-    def test_source_root_cleanup_failure_preserves_primary_error(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-
-            def fail_after_data(component: str) -> None:
-                if component == "data":
-                    raise RuntimeError("primary failure")
-
-            cleanup_failure = PermissionError(errno.EACCES, "cleanup denied")
-            with patch.object(
-                orchestration,
-                "_trusted_descendant_test_hook",
-                side_effect=fail_after_data,
             ), patch.object(
                 orchestration.os,
                 "rmdir",
-                side_effect=cleanup_failure,
-            ), self.assertRaisesRegex(ValueError, "cleanup failed") as raised:
+                side_effect=AssertionError("rmdir must never be called"),
+            ) as rmdir, self.assertRaisesRegex(RuntimeError, "injected replacement"):
                 orchestration._open_or_create_source_root(root)
-            self.assertIsInstance(raised.exception.primary_error, RuntimeError)
-            self.assertIs(raised.exception.cleanup_error.__cause__, cleanup_failure)
+            rmdir.assert_not_called()
+            self.assertTrue((root / "data").is_dir())
+            self.assertEqual(tuple((root / "data").iterdir()), ())
+            self.assertTrue(moved.is_dir())
+            self.assertNotEqual((root / "data").stat().st_ino, moved.stat().st_ino)
 
     def test_postcondition_mismatch_is_a_stable_failure(self) -> None:
         different = dataclasses.replace(self.inventory, run_id="different-run")

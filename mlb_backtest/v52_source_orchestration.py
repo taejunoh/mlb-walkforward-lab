@@ -6,7 +6,6 @@ source-finalization commands.  It performs no publication or cleanup.
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
@@ -177,15 +176,6 @@ class _TrustedRootHandle:
     root: Path
     descriptors: tuple[int, ...]
     component_names: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class _CreatedSourceDirectory:
-    parent_fd: int
-    child_fd: int
-    name: str
-    device: int
-    inode: int
 
 
 def _directory_flags() -> int:
@@ -459,24 +449,24 @@ def _open_optional_trusted_descendant(
         raise
 
 
-def _open_or_create_source_root(
-    root: Path,
-) -> tuple[_TrustedRootHandle, tuple[_CreatedSourceDirectory, ...]]:
-    """Return the fixed source target through held no-follow directory FDs only."""
+def _open_or_create_source_root(root: Path) -> _TrustedRootHandle:
+    """Return the fixed source target through held no-follow directory FDs only.
+
+    A failed attempt may leave empty fixed directories.  They are safe unpublished
+    residue and are intentionally never removed: POSIX has no inode-conditional
+    ``rmdir``, so deleting by name could remove an attacker's replacement entry.
+    """
     root_handle = _open_trusted_root(root)
     descriptors = list(root_handle.descriptors)
     names = list(root_handle.component_names)
-    created: list[_CreatedSourceDirectory] = []
     current = descriptors[-1]
     try:
         for component in _SOURCE_ROOT_RELATIVE.parts:
-            created_here = False
             try:
                 child = os.open(component, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
                 try:
                     os.mkdir(component, 0o700, dir_fd=current)
-                    created_here = True
                 except FileExistsError:
                     # A concurrent publisher won creation under this same held parent.
                     # Re-open it no-follow below and apply the normal identity checks.
@@ -499,19 +489,9 @@ def _open_or_create_source_root(
                     != (linked.st_dev, linked.st_ino)
                 ):
                     raise ValueError("fixed source directory must be a no-follow directory")
-                if created_here:
-                    created.append(
-                        _CreatedSourceDirectory(
-                            current,
-                            child,
-                            component,
-                            opened.st_dev,
-                            opened.st_ino,
-                        )
-                    )
-                    os.fsync(current)
             except BaseException:
                 raise
+            os.fsync(current)
             current = child
             _trusted_descendant_test_hook(component)
         result = _TrustedRootHandle(
@@ -520,68 +500,13 @@ def _open_or_create_source_root(
             tuple(names),
         )
         _assert_trusted_root(result)
-        return result, tuple(created)
-    except BaseException as exc:
-        primary: BaseException = (
-            ValueError("fixed source directory is unsafe or unavailable")
-            if isinstance(exc, OSError)
-            else exc
-        )
-        if primary is not exc:
-            primary.__cause__ = exc
-        partial = _TrustedRootHandle(
-            root_handle.root,
-            tuple(descriptors),
-            tuple(names),
-        )
-        try:
-            _cleanup_empty_created_source_directories(partial, created)
-        except BaseException as cleanup_error:
-            combined = ValueError("created source directory cleanup failed")
-            combined.primary_error = primary  # type: ignore[attr-defined]
-            combined.cleanup_error = cleanup_error  # type: ignore[attr-defined]
-            raise combined from cleanup_error
-        finally:
-            _close_descriptors(descriptors)
-        raise primary
-
-
-def _cleanup_empty_created_source_directories(
-    handle: _TrustedRootHandle, created: Sequence[_CreatedSourceDirectory]
-) -> None:
-    """Remove only still-empty directories created by this failed invocation."""
-    descriptor_set = frozenset(handle.descriptors)
-    for item in reversed(tuple(created)):
-        if item.parent_fd not in descriptor_set or item.child_fd not in descriptor_set:
-            raise ValueError("created directory cleanup capability is invalid")
-        try:
-            linked = os.stat(item.name, dir_fd=item.parent_fd, follow_symlinks=False)
-            opened = os.fstat(item.child_fd)
-            if (
-                not stat.S_ISDIR(linked.st_mode)
-                or not stat.S_ISDIR(opened.st_mode)
-                or (opened.st_dev, opened.st_ino) != (item.device, item.inode)
-                or (linked.st_dev, linked.st_ino) != (item.device, item.inode)
-            ):
-                continue
-            if os.listdir(item.child_fd):
-                continue
-            rebound = os.stat(
-                item.name, dir_fd=item.parent_fd, follow_symlinks=False
-            )
-            if (
-                not stat.S_ISDIR(rebound.st_mode)
-                or (rebound.st_dev, rebound.st_ino) != (item.device, item.inode)
-            ):
-                continue
-            os.rmdir(item.name, dir_fd=item.parent_fd)
-            os.fsync(item.parent_fd)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
-                continue
-            raise ValueError("created source directory cleanup failed") from exc
+        return result
+    except OSError as exc:
+        _close_descriptors(descriptors)
+        raise ValueError("fixed source directory is unsafe or unavailable") from exc
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
 
 
 def _canonical_inventory_exists(source_root: Path) -> bool:
@@ -866,6 +791,12 @@ def _published_inventory_matches(
         try:
             _source_status_test_hook("after_source_root_open")
             _assert_trusted_root(handle)
+            if not os.listdir(handle.descriptors[-1]):
+                _source_status_test_hook("after_empty_source_root_read")
+                _assert_trusted_root(handle)
+                if os.listdir(handle.descriptors[-1]):
+                    raise ValueError("empty source root changed while reading")
+                return False, None
             loaded = load_snapshot_store_from_fd(
                 handle.descriptors[-1], context.snapshot_inputs
             )
@@ -1026,10 +957,9 @@ def publish_inventory(
         )
     expected = inventory_bytes(context.inventory)
     try:
-        handle, created = _open_or_create_source_root(context.root)
+        handle = _open_or_create_source_root(context.root)
     except ValueError as exc:
         raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
-    completed = False
     try:
         try:
             outcome = publish_snapshot_store_from_fd(
@@ -1039,9 +969,7 @@ def publish_inventory(
                 lock_owner=lock_owner,
             )
         except LockHeld:
-            report = _converge_identical_locked_publish(handle, context, expected)
-            completed = True
-            return report
+            return _converge_identical_locked_publish(handle, context, expected)
         except PublishConflict as exc:
             raise FinalizationError("PUBLISH_CONFLICT", str(exc), (), 6) from exc
         except (PublishError, ValueError, TypeError, OSError) as exc:
@@ -1056,14 +984,10 @@ def publish_inventory(
         status: Literal["PUBLISHED", "EXISTING"] = (
             "PUBLISHED" if outcome.created else "EXISTING"
         )
-        report = PublishReport(
+        return PublishReport(
             status, outcome.receipt.inventory_sha256, outcome.receipt.snapshot_count
         )
-        completed = True
-        return report
     finally:
-        if not completed:
-            _cleanup_empty_created_source_directories(handle, created)
         _close_descriptors(handle.descriptors)
 
 
