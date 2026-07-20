@@ -1276,6 +1276,67 @@ class ExecutionRegistryTest(unittest.TestCase):
                     schema["$defs"]["timestamp"]["pattern"],
                     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$",
                 )
+                for definition_name in ("sha256", "gitHead", "timestamp"):
+                    self.assertEqual(
+                        schema["$defs"][definition_name]["type"], "string"
+                    )
+                self.assertEqual(binding["type"], "object")
+                self.assertEqual(
+                    binding["properties"]["path"],
+                    {
+                        "minLength": 1,
+                        "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$",
+                        "type": "string",
+                    },
+                )
+                self.assertEqual(
+                    schema["properties"]["schema_version"], {"const": 1}
+                )
+                self.assertEqual(
+                    schema["properties"]["run_id"],
+                    {"const": "historical_walkforward_500"},
+                )
+                self.assertEqual(schema["properties"]["critical_errors"], {"const": []})
+                for field_name in ("reviewed_query_ids", "snapshot_sha256s"):
+                    self.assertEqual(
+                        schema["properties"][field_name],
+                        {
+                            "items": {"$ref": "#/$defs/sha256"},
+                            "minItems": 1,
+                            "type": "array",
+                            "uniqueItems": True,
+                        },
+                    )
+                if label == "review":
+                    self.assertEqual(
+                        schema["properties"]["receipt_kind"],
+                        {"const": "SOURCE_REVIEW"},
+                    )
+                    self.assertEqual(
+                        schema["properties"]["decision"],
+                        {"enum": ["APPROVED", "REJECTED"]},
+                    )
+                else:
+                    self.assertEqual(
+                        schema["properties"]["receipt_kind"],
+                        {"const": "CLEAN_SOURCE_REPLAY"},
+                    )
+                    self.assertEqual(
+                        schema["properties"]["status"], {"const": "PASS"}
+                    )
+                    self.assertEqual(
+                        schema["properties"]["network_attempts"], {"const": 0}
+                    )
+                    self.assertEqual(
+                        schema["properties"]["execution_id"],
+                        {
+                            "pattern": (
+                                r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                            ),
+                            "type": "string",
+                        },
+                    )
 
                 if label == "review":
                     valid_payload = {
@@ -1312,10 +1373,30 @@ class ExecutionRegistryTest(unittest.TestCase):
                             ),
                         ),
                         (
+                            "schema_version is not fixed",
+                            lambda payload: payload.update(schema_version=2),
+                        ),
+                        (
+                            "run_id is not fixed",
+                            lambda payload: payload.update(run_id="other-run"),
+                        ),
+                        (
+                            "critical_errors is not fixed",
+                            lambda payload: payload.update(critical_errors=["error"]),
+                        ),
+                        (
+                            "decision is outside enum",
+                            lambda payload: payload.update(decision="PENDING"),
+                        ),
+                        (
                             "duplicate reviewed_query_ids",
                             lambda payload: payload.update(
                                 reviewed_query_ids=["a" * 64, "a" * 64]
                             ),
+                        ),
+                        (
+                            "empty reviewed_query_ids",
+                            lambda payload: payload.update(reviewed_query_ids=[]),
                         ),
                         (
                             "duplicate snapshot_sha256s",
@@ -1324,8 +1405,36 @@ class ExecutionRegistryTest(unittest.TestCase):
                             ),
                         ),
                         (
+                            "empty snapshot_sha256s",
+                            lambda payload: payload.update(snapshot_sha256s=[]),
+                        ),
+                        (
                             "invalid SHA-256",
                             lambda payload: payload.update(inventory_sha256="z" * 64),
+                        ),
+                        (
+                            "non-string SHA-256",
+                            lambda payload: payload.update(inventory_sha256=123),
+                        ),
+                        (
+                            "non-string Git head",
+                            lambda payload: payload.update(git_head=123),
+                        ),
+                        (
+                            "non-string timestamp",
+                            lambda payload: payload.update(occurred_at_utc=123),
+                        ),
+                        (
+                            "non-object binding",
+                            lambda payload: payload.update(query_ids_document=[]),
+                        ),
+                        (
+                            "empty binding path",
+                            lambda payload: payload["query_ids_document"].update(path=""),
+                        ),
+                        (
+                            "non-string binding path",
+                            lambda payload: payload["query_ids_document"].update(path=123),
                         ),
                         (
                             "unsafe binding path ../x",
@@ -1387,6 +1496,22 @@ class ExecutionRegistryTest(unittest.TestCase):
                             lambda payload: payload.update(receipt_kind="SOURCE_REVIEW"),
                         ),
                         (
+                            "schema_version is not fixed",
+                            lambda payload: payload.update(schema_version=2),
+                        ),
+                        (
+                            "run_id is not fixed",
+                            lambda payload: payload.update(run_id="other-run"),
+                        ),
+                        (
+                            "critical_errors is not fixed",
+                            lambda payload: payload.update(critical_errors=["error"]),
+                        ),
+                        (
+                            "status is not fixed",
+                            lambda payload: payload.update(status="FAIL"),
+                        ),
+                        (
                             "network_attempts=1",
                             lambda payload: payload.update(network_attempts=1),
                         ),
@@ -1397,18 +1522,42 @@ class ExecutionRegistryTest(unittest.TestCase):
                             ),
                         ),
                         (
+                            "empty reviewed_query_ids",
+                            lambda payload: payload.update(reviewed_query_ids=[]),
+                        ),
+                        (
                             "duplicate snapshot_sha256s",
                             lambda payload: payload.update(
                                 snapshot_sha256s=["d" * 64, "d" * 64]
                             ),
                         ),
                         (
+                            "empty snapshot_sha256s",
+                            lambda payload: payload.update(snapshot_sha256s=[]),
+                        ),
+                        (
                             "invalid SHA-256",
                             lambda payload: payload.update(inventory_sha256="z" * 64),
                         ),
                         (
+                            "non-string SHA-256",
+                            lambda payload: payload.update(inventory_sha256=123),
+                        ),
+                        (
+                            "non-string Git head",
+                            lambda payload: payload.update(git_head=123),
+                        ),
+                        (
+                            "non-string timestamp",
+                            lambda payload: payload.update(recorded_at_utc=123),
+                        ),
+                        (
                             "malformed UUID",
                             lambda payload: payload.update(execution_id="not-a-uuid"),
+                        ),
+                        (
+                            "non-string UUID",
+                            lambda payload: payload.update(execution_id=123),
                         ),
                         (
                             "non-v4 UUID",
@@ -1429,6 +1578,18 @@ class ExecutionRegistryTest(unittest.TestCase):
                             lambda payload: payload["run_spec"].update(
                                 path="run\\spec.json"
                             ),
+                        ),
+                        (
+                            "non-object binding",
+                            lambda payload: payload.update(run_spec=[]),
+                        ),
+                        (
+                            "empty binding path",
+                            lambda payload: payload["run_spec"].update(path=""),
+                        ),
+                        (
+                            "non-string binding path",
+                            lambda payload: payload["run_spec"].update(path=123),
                         ),
                         (
                             "extra property",
