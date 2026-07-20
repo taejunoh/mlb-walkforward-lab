@@ -251,6 +251,37 @@ def _checkpoint_path(checkpoint: AcquisitionCheckpoint) -> Path:
     return _CHECKPOINT_ROOT / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
 
 
+def _authority_bindings(
+    root: Path,
+    run_spec_path: Path,
+    contract_path: Path,
+    checkpoint: AcquisitionCheckpoint,
+    replay: object,
+) -> AuthorityBindings:
+    schedule = getattr(replay, "schedule_inventory")
+    games = getattr(replay, "game_inventory")
+    timezone = getattr(replay, "timezone_gate")
+    return AuthorityBindings(
+        run_spec=_binding(root, run_spec_path),
+        acquisition_contract=_binding(root, contract_path),
+        terminal_checkpoint=TerminalCheckpointBinding(
+            _checkpoint_path(checkpoint).as_posix(),
+            checkpoint.receipt_sha256,
+            checkpoint.sequence,
+            "REMAINING",
+        ),
+        schedule_inventory=_verified_binding(root, schedule.path, schedule.sha256),
+        game_evidence_inventory=_verified_binding(root, games.path, games.sha256),
+        timezone_gate=_verified_binding(
+            root, root / _TIMEZONE_SEAL, timezone.seal_sha256
+        ),
+    )
+
+
+def _authority_changed(message: str) -> FinalizationError:
+    return FinalizationError("AUTHORITY_CHANGED", message, (), 5)
+
+
 def _rebind_context_authorities(
     root: Path,
     run_spec_path: Path,
@@ -260,20 +291,70 @@ def _rebind_context_authorities(
     registry: ExecutionRegistryState,
     checkpoint: AcquisitionCheckpoint,
     inventory: SourceInventory,
+    *,
+    initial_run_spec_bytes: bytes,
+    initial_contract_bytes: bytes,
+    initial_membership: object,
+    initial_inventory_bytes: bytes,
+    initial_git_head: str,
 ) -> None:
-    # Bind the raw bytes and protected membership a second time, then re-load
-    # registry/checkpoint with their own immutable reader before returning.
-    _read_explicit_artifact(root, run_spec_path, "RunSpec")
-    _read_explicit_artifact(root, contract_path, "acquisition contract")
-    protected = verify_protected_raw_inventory(root, protected_path)
-    snapshot_protected_inventory_membership(root, protected)
-    if load_execution_registry(root, run_spec) != registry:
-        raise FinalizationError("AUTHORITY_CHANGED", "registry changed during context build", (), 5)
-    if load_source_verification_checkpoint(root, run_spec) != checkpoint:
-        raise FinalizationError("AUTHORITY_CHANGED", "checkpoint changed during context build", (), 5)
-    # Validation and canonical serialization must remain stable at the point
-    # caller-visible authority is handed out.
-    inventory_bytes(inventory)
+    """Re-authenticate all inputs and rebuild the candidate inventory."""
+    try:
+        _, final_run_spec_bytes = _read_explicit_artifact(root, run_spec_path, "RunSpec")
+        _, final_contract_bytes = _read_explicit_artifact(
+            root, contract_path, "acquisition contract"
+        )
+        _canonical_object(final_run_spec_bytes, "RunSpec")
+        _canonical_object(final_contract_bytes, "acquisition contract")
+        _load_static_contracts(run_spec_path, contract_path)
+    except FinalizationError:
+        raise
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise _authority_changed("static authority changed during context build") from exc
+    if final_run_spec_bytes != initial_run_spec_bytes:
+        raise _authority_changed("RunSpec changed during context build")
+    if final_contract_bytes != initial_contract_bytes:
+        raise _authority_changed("acquisition contract changed during context build")
+
+    try:
+        protected = verify_protected_raw_inventory(root, protected_path)
+        final_membership = snapshot_protected_inventory_membership(root, protected)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise _authority_changed("protected inventory changed during context build") from exc
+    if final_membership != initial_membership:
+        raise _authority_changed("protected membership changed during context build")
+
+    try:
+        final_registry = load_execution_registry(root, run_spec)
+        final_checkpoint = load_source_verification_checkpoint(root, run_spec)
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        raise _authority_changed("registry authority changed during context build") from exc
+    if final_registry != registry:
+        raise _authority_changed("registry changed during context build")
+    if final_checkpoint != checkpoint:
+        raise _authority_changed("checkpoint changed during context build")
+
+    try:
+        replay = load_snapshot_replay_inputs(
+            root, run_spec, acquisition_contract_path=contract_path
+        )
+        rebound = build_inventory(
+            SnapshotStoreInputs(
+                replay,
+                _authority_bindings(root, run_spec_path, contract_path, checkpoint, replay),
+                registry.phase,
+            )
+        )
+        final_inventory_bytes = inventory_bytes(rebound)
+        final_git_head = _git_head(root)
+    except FinalizationError:
+        raise
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise _authority_changed("source inventory authority changed during context build") from exc
+    if final_inventory_bytes != initial_inventory_bytes:
+        raise _authority_changed("source inventory changed during context build")
+    if final_git_head != initial_git_head:
+        raise _authority_changed("Git head changed during context build")
 
 
 def build_context(common_args: CommonArgs) -> FinalizationContext:
@@ -296,7 +377,7 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
         _load_static_contracts(run_spec_path, contract_path)
         run_spec = parse_run_spec(json.loads(run_spec_bytes))
         protected = verify_protected_raw_inventory(root, protected_path)
-        snapshot_protected_inventory_membership(root, protected)
+        membership = snapshot_protected_inventory_membership(root, protected)
     except FinalizationError:
         raise
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -328,30 +409,21 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
         replay = load_snapshot_replay_inputs(
             root, run_spec, acquisition_contract_path=contract_path
         )
-        timezone_path = root / _TIMEZONE_SEAL
-        bindings = AuthorityBindings(
-            run_spec=_binding(root, run_spec_path),
-            acquisition_contract=_binding(root, contract_path),
-            terminal_checkpoint=TerminalCheckpointBinding(
-                _checkpoint_path(checkpoint).as_posix(),
-                checkpoint.receipt_sha256,
-                checkpoint.sequence,
-                "REMAINING",
-            ),
-            schedule_inventory=_verified_binding(
-                root, replay.schedule_inventory.path, replay.schedule_inventory.sha256
-            ),
-            game_evidence_inventory=_verified_binding(
-                root, replay.game_inventory.path, replay.game_inventory.sha256
-            ),
-            timezone_gate=_verified_binding(root, timezone_path, replay.timezone_gate.seal_sha256),
+        bindings = _authority_bindings(
+            root, run_spec_path, contract_path, checkpoint, replay
         )
         inputs = SnapshotStoreInputs(replay, bindings, registry.phase)
         inventory = build_inventory(inputs)
         git_head = _git_head(root)
+        candidate_inventory_bytes = inventory_bytes(inventory)
         _rebind_context_authorities(
             root, run_spec_path, contract_path, protected_path, run_spec, registry,
             checkpoint, inventory,
+            initial_run_spec_bytes=run_spec_bytes,
+            initial_contract_bytes=contract_bytes,
+            initial_membership=membership,
+            initial_inventory_bytes=candidate_inventory_bytes,
+            initial_git_head=git_head,
         )
     except FinalizationError:
         raise

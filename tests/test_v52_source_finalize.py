@@ -4,9 +4,10 @@ import dataclasses
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
@@ -152,30 +153,142 @@ class ContextTests(unittest.TestCase):
             return AuthorityBinding(value.as_posix(), expected)
 
         with (
-            patch.object(orchestration, "verify_protected_raw_inventory", return_value={}),
-            patch.object(orchestration, "snapshot_protected_inventory_membership"),
-            patch.object(orchestration, "load_execution_registry", return_value=registry),
-            patch.object(orchestration, "load_source_verification_checkpoint", return_value=checkpoint),
-            patch.object(orchestration, "load_snapshot_replay_inputs", return_value=replay),
+            patch.object(orchestration, "_load_static_contracts") as static_contracts,
+            patch.object(orchestration, "verify_protected_raw_inventory", return_value={}) as protected,
+            patch.object(orchestration, "snapshot_protected_inventory_membership", return_value=()) as membership,
+            patch.object(orchestration, "load_execution_registry", return_value=registry) as load_registry,
+            patch.object(orchestration, "load_source_verification_checkpoint", return_value=checkpoint) as load_checkpoint,
+            patch.object(orchestration, "load_snapshot_replay_inputs", return_value=replay) as load_replay,
             patch.object(orchestration, "_binding", side_effect=bind),
             patch.object(orchestration, "_verified_binding", side_effect=verified),
             patch.object(orchestration, "build_inventory", return_value=inventory) as build,
+            patch.object(orchestration, "inventory_bytes", return_value=b"inventory\n"),
             patch.object(orchestration, "_git_head", return_value="3" * 40),
-            patch.object(orchestration, "_rebind_context_authorities") as rebind,
         ):
             context = orchestration.build_context(orchestration.CommonArgs(root=ROOT))
 
         self.assertEqual(context.registry, registry)
         self.assertIs(context.inventory, inventory)
         self.assertEqual(context.phase, "ACQUIRING")
-        self.assertEqual(len(order), 5)
-        self.assertEqual(order[-3:], [
+        expected_bindings = [
+            "bind:" + str(ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"),
+            "bind:" + str(ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"),
             "verified:audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json",
             "verified:audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json",
             "verified:" + str(ROOT / "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
+        ]
+        self.assertEqual(order, expected_bindings * 2)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            build.call_args_list[0].args[0].current_phase,
+            registry.phase,
+        )
+        self.assertEqual(
+            build.call_args_list[0].args[0].bindings.terminal_checkpoint,
+            orchestration.TerminalCheckpointBinding(
+                "audit/v5_2_qd/historical/execution/acquisition_checkpoints/00000007-"
+                + "c" * 64 + ".json",
+                "c" * 64,
+                7,
+                "REMAINING",
+            ),
+        )
+        self.assertEqual(build.call_args_list[1], build.call_args_list[0])
+        run_path = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+        contract_path = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
+        protected_path = ROOT / "audit/v5_1_bt/protected_raw_inventory.json"
+        self.assertEqual(static_contracts.call_args_list, [
+            call(run_path, contract_path), call(run_path, contract_path),
         ])
-        build.assert_called_once()
-        rebind.assert_called_once()
+        self.assertEqual(protected.call_args_list, [
+            call(ROOT, protected_path), call(ROOT, protected_path),
+        ])
+        self.assertEqual(membership.call_args_list, [call(ROOT, {}), call(ROOT, {})])
+        self.assertEqual(load_registry.call_args_list, [call(ROOT, context.run_spec)] * 2)
+        self.assertEqual(load_checkpoint.call_args_list, [call(ROOT, context.run_spec)] * 2)
+        self.assertEqual(load_replay.call_args_list, [
+            call(ROOT, context.run_spec, acquisition_contract_path=contract_path),
+            call(ROOT, context.run_spec, acquisition_contract_path=contract_path),
+        ])
+
+    def test_final_rebind_rejects_each_changed_authority(self) -> None:
+        registry = ExecutionRegistryState("ACQUIRING", 0, "a" * 64, "b" * 64)
+        changed_registry = ExecutionRegistryState("ACQUIRING", 1, "a" * 64, "b" * 64)
+        checkpoint = AcquisitionCheckpoint(
+            0, "c" * 64, None, "REMAINING", "2026-07-20T00:00:00.000000Z",
+            "d" * 40, "e" * 64, (), (), (), (), (), (), (), (), (), (),
+        )
+        changed_checkpoint = dataclasses.replace(checkpoint, sequence=1)
+        replay = SimpleNamespace(
+            schedule_inventory=SimpleNamespace(path=Path("schedule.json"), sha256="1" * 64),
+            game_inventory=SimpleNamespace(path=Path("games.json"), sha256="2" * 64),
+            timezone_gate=SimpleNamespace(seal_sha256="3" * 64),
+        )
+        for changed in (
+            "run_spec", "contract", "membership", "registry", "checkpoint", "inventory", "git",
+        ):
+            with self.subTest(changed=changed), ExitStack() as stack:
+                patchers = (
+                    patch.object(
+                    orchestration,
+                    "_read_explicit_artifact",
+                    side_effect=[
+                        ("run.json", b'{"a":1}\n' if changed != "run_spec" else b'{"a":2}\n'),
+                        ("contract.json", b'{"b":2}\n' if changed != "contract" else b'{"b":3}\n'),
+                    ],
+                    ),
+                    patch.object(orchestration, "_load_static_contracts"),
+                    patch.object(orchestration, "verify_protected_raw_inventory", return_value={}),
+                    patch.object(
+                    orchestration,
+                    "snapshot_protected_inventory_membership",
+                    return_value=() if changed != "membership" else (("changed",),),
+                    ),
+                    patch.object(
+                    orchestration,
+                    "load_execution_registry",
+                    return_value=registry if changed != "registry" else changed_registry,
+                    ),
+                    patch.object(
+                    orchestration,
+                    "load_source_verification_checkpoint",
+                    return_value=checkpoint if changed != "checkpoint" else changed_checkpoint,
+                    ),
+                    patch.object(orchestration, "load_snapshot_replay_inputs", return_value=replay),
+                    patch.object(orchestration, "_binding", return_value=AuthorityBinding("x", "4" * 64)),
+                    patch.object(orchestration, "_verified_binding", return_value=AuthorityBinding("y", "5" * 64)),
+                    patch.object(orchestration, "build_inventory", return_value=object()),
+                    patch.object(
+                    orchestration,
+                    "inventory_bytes",
+                    return_value=b"inventory\n" if changed != "inventory" else b"changed\n",
+                    ),
+                    patch.object(
+                    orchestration,
+                    "_git_head",
+                    return_value="f" * 40 if changed != "git" else "0" * 40,
+                    ),
+                )
+                for patcher in patchers:
+                    stack.enter_context(patcher)
+                with self.assertRaises(orchestration.FinalizationError) as raised:
+                    orchestration._rebind_context_authorities(
+                        ROOT,
+                        ROOT / "run.json",
+                        ROOT / "contract.json",
+                        ROOT / "protected.json",
+                        object(),
+                        registry,
+                        checkpoint,
+                        object(),
+                        initial_run_spec_bytes=b'{"a":1}\n',
+                        initial_contract_bytes=b'{"b":2}\n',
+                        initial_membership=(),
+                        initial_inventory_bytes=b"inventory\n",
+                        initial_git_head="f" * 40,
+                    )
+                self.assertEqual(raised.exception.error_code, "AUTHORITY_CHANGED")
+                self.assertEqual(raised.exception.exit_code, 5)
 
 
 if __name__ == "__main__":
