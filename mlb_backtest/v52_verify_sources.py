@@ -1293,6 +1293,7 @@ def load_snapshot_replay_inputs(
     loaders are consulted.  No network access, writes, cleanup, or directory
     scans are performed by this factory.
     """
+    raw_relative = _safe_raw_namespace(run_spec)
     graph = _load_terminal_query_graph(root, run_spec)
     static_batches = tuple(
         batch for batch in graph.query_batches if batch.stage == "STATIC_SCHEDULES"
@@ -1300,7 +1301,6 @@ def load_snapshot_replay_inputs(
     if len(static_batches) != 1:
         raise ValueError("source verification requires one STATIC_SCHEDULES batch")
 
-    raw_relative = _safe_raw_namespace(run_spec)
     evidence_root = root / raw_relative
     schedule = load_verified_schedule_anchor_inventory(
         root,

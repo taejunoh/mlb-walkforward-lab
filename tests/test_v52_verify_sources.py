@@ -888,12 +888,13 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
                 )
                 with patch.object(
                     verifier, "_load_terminal_query_graph", return_value=self.graph
-                ), self.assertRaises(ValueError):
+                ) as graph_loader, self.assertRaises(ValueError):
                     verifier.load_snapshot_replay_inputs(
                         self.root,
                         run_spec,
                         acquisition_contract_path=self.contract_path,
                     )
+                graph_loader.assert_not_called()
 
     def test_factory_propagates_second_load_authority_change(self) -> None:
         verifier = self.verifier
