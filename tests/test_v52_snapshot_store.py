@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import socket
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -403,6 +404,28 @@ class PublishTests(unittest.TestCase):
             return publish_snapshot_store(
                 root, inventory or self._inventory(), inputs or store_inputs(), lock_owner="publish-test"
             )
+
+    def test_fd_capability_reports_created_then_existing_without_closing_caller_fd(self):
+        from mlb_backtest.v52_snapshot_store import publish_snapshot_store_from_fd
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                with patched_store_replay():
+                    first = publish_snapshot_store_from_fd(
+                        fd, inventory, store_inputs(), lock_owner="fd-publish"
+                    )
+                    second = publish_snapshot_store_from_fd(
+                        fd, inventory, store_inputs(), lock_owner="fd-publish"
+                    )
+                self.assertTrue(first.created)
+                self.assertFalse(second.created)
+                self.assertEqual(first.receipt, second.receipt)
+                self.assertTrue(stat.S_ISDIR(os.fstat(fd).st_mode))
+            finally:
+                os.close(fd)
 
 
     def test_fresh_publish_is_content_addressed_and_removes_owned_lock(self):

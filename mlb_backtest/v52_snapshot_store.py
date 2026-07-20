@@ -113,6 +113,14 @@ class PublishReceipt:
 
 
 @dataclass(frozen=True)
+class PublishOutcome:
+    """Lock-scoped result for a caller-owned directory capability publication."""
+
+    receipt: PublishReceipt
+    created: bool
+
+
+@dataclass(frozen=True)
 class LoadedSnapshotStore:
     """A fully revalidated, immutable replay of a published snapshot store."""
 
@@ -694,6 +702,18 @@ def read_inventory(root: Path) -> SourceInventory:
         _close_directory(held)
 
 
+def read_inventory_from_fd(source_root_fd: int) -> SourceInventory:
+    """Read the committed inventory relative to a caller-owned directory FD."""
+    held = _duplicate_directory_capability(source_root_fd)
+    try:
+        _reject_unowned_lock(held)
+        _, _, inventory = _read_inventory_bindings(held)
+        _reject_unowned_lock(held)
+        return inventory
+    finally:
+        _close_directory(held)
+
+
 def load_snapshot_store(root: Path, inputs: SnapshotStoreInputs) -> LoadedSnapshotStore:
     """Read only an exactly replayable committed store; never repair its residue."""
     held = _open_readonly_root(root)
@@ -1066,12 +1086,46 @@ def publish_snapshot_store(
     """
     _validate_publish_arguments(root, inventory, inputs, lock_owner)
     root_dir = _open_root_directory(root)
+    try:
+        return _publish_snapshot_store_held(
+            root_dir, inventory, inputs, lock_owner=lock_owner, detect_committed=False
+        ).receipt
+    finally:
+        _close_directory(root_dir)
+
+
+def publish_snapshot_store_from_fd(
+    source_root_fd: int,
+    inventory: SourceInventory,
+    inputs: SnapshotStoreInputs,
+    *,
+    lock_owner: str,
+) -> PublishOutcome:
+    """Publish from a caller-owned source-root FD without reopening its pathname."""
+    _validate_publish_capability_arguments(source_root_fd, inventory, inputs, lock_owner)
+    root_dir = _duplicate_directory_capability(source_root_fd)
+    try:
+        return _publish_snapshot_store_held(
+            root_dir, inventory, inputs, lock_owner=lock_owner, detect_committed=True
+        )
+    finally:
+        _close_directory(root_dir)
+
+
+def _publish_snapshot_store_held(
+    root_dir: _HeldDirectory,
+    inventory: SourceInventory,
+    inputs: SnapshotStoreInputs,
+    *,
+    lock_owner: str,
+    detect_committed: bool,
+) -> PublishOutcome:
+    """Publish under a held directory capability; this function never opens a path."""
     seasons: dict[int, _HeldDirectory] = {}
     sources: dict[tuple[int, str], _HeldDirectory] = {}
     try:
         lock = _acquire_lock(root_dir, inputs.replay.run_id, lock_owner)
     except BaseException:
-        _close_directory(root_dir)
         raise
     primary_error: BaseException | None = None
     try:
@@ -1080,14 +1134,26 @@ def publish_snapshot_store(
         raw_inventory = inventory_bytes(inventory)
         inventory_sha256 = hashlib.sha256(raw_inventory).hexdigest()
 
+        if detect_committed and _canonical_inventory_exists_held(root_dir):
+            loaded = _load_snapshot_store_held(root_dir, inputs, owned_lock=lock)
+            if inventory_bytes(loaded.inventory) != raw_inventory:
+                raise PublishConflict("committed inventory bytes differ from requested publication")
+            return PublishOutcome(
+                PublishReceipt(inventory_sha256, len(inventory.snapshots)), False
+            )
+
         for row in inventory.snapshots:
             season = seasons.get(row.season)
             if season is None:
-                season = _open_or_create_directory(root_dir, str(row.season), root / str(row.season))
+                season = _open_or_create_directory(
+                    root_dir, str(row.season), root_dir.path / str(row.season)
+                )
                 seasons[row.season] = season
             parent = sources.get((row.season, row.source))
             if parent is None:
-                parent = _open_or_create_directory(season, row.source, root / str(row.season) / row.source)
+                parent = _open_or_create_directory(
+                    season, row.source, root_dir.path / str(row.season) / row.source
+                )
                 sources[(row.season, row.source)] = parent
             _publish_test_hook("after_directory_open_before_temp_publish")
             _rebind_tree(root_dir, seasons.values(), sources.values())
@@ -1110,7 +1176,7 @@ def publish_snapshot_store(
         _verify_committed_store(root_dir, sources, inventory, expected_snapshots, raw_inventory, checksum)
         _load_snapshot_store_held(root_dir, inputs, owned_lock=lock)
         _hook_and_rebind("before_lock_release", root_dir, seasons.values(), sources.values())
-        return PublishReceipt(inventory_sha256, len(inventory.snapshots))
+        return PublishOutcome(PublishReceipt(inventory_sha256, len(inventory.snapshots)), True)
     except BaseException as exc:
         primary_error = exc
         raise
@@ -1131,7 +1197,54 @@ def publish_snapshot_store(
                 _close_directory(directory)
             for directory in reversed(tuple(seasons.values())):
                 _close_directory(directory)
-            _close_directory(root_dir)
+
+
+def _duplicate_directory_capability(source_root_fd: int) -> _HeldDirectory:
+    if isinstance(source_root_fd, bool) or not isinstance(source_root_fd, int):
+        raise TypeError("snapshot store root FD must be an integer")
+    try:
+        supplied = os.fstat(source_root_fd)
+        if not stat.S_ISDIR(supplied.st_mode):
+            raise PublishError("snapshot store root FD must name a directory")
+        owned_fd = os.dup(source_root_fd)
+        opened = os.fstat(owned_fd)
+        if not _same_directory(supplied, opened):
+            raise PublishError("snapshot store root FD changed while duplicating")
+        return _HeldDirectory(
+            owned_fd,
+            None,
+            None,
+            Path("<snapshot-store-fd>"),
+            opened.st_dev,
+            opened.st_ino,
+            False,
+        )
+    except PublishError:
+        try:
+            os.close(owned_fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(owned_fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError("snapshot store root FD is unavailable") from exc
+
+
+def _canonical_inventory_exists_held(root: _HeldDirectory) -> bool:
+    """Return only a safe committed-inventory presence result under ``root``."""
+    try:
+        _rebind_directory(root)
+        details = os.stat("source_inventory.json", dir_fd=root.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PublishError("could not inspect committed inventory namespace") from exc
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise PublishError("committed inventory must be a regular single-link file")
+    return True
 
 
 def _validate_publish_arguments(
@@ -1147,6 +1260,20 @@ def _validate_publish_arguments(
         raise PublishError("snapshot store root is inaccessible") from exc
     if not stat.S_ISDIR(metadata.st_mode):
         raise PublishError("snapshot store root must be a directory")
+    _validate_publish_payload(inventory, inputs, lock_owner)
+
+
+def _validate_publish_capability_arguments(
+    source_root_fd: int, inventory: SourceInventory, inputs: SnapshotStoreInputs, lock_owner: str
+) -> None:
+    if isinstance(source_root_fd, bool) or not isinstance(source_root_fd, int):
+        raise TypeError("snapshot store root FD must be an integer")
+    _validate_publish_payload(inventory, inputs, lock_owner)
+
+
+def _validate_publish_payload(
+    inventory: SourceInventory, inputs: SnapshotStoreInputs, lock_owner: str
+) -> None:
     if not isinstance(inventory, SourceInventory) or not isinstance(inputs, SnapshotStoreInputs):
         raise TypeError("inventory and inputs must use snapshot-store types")
     if not _is_safe_identity(lock_owner):
@@ -1245,7 +1372,15 @@ def _open_or_create_directory(parent: _HeldDirectory, name: str, path: Path) -> 
             raise PublishError(f"store directory {name!r} changed while opening")
         os.fsync(fd)
         _fsync_held_directory(parent)
-        return _HeldDirectory(fd, parent, name, path, opened.st_dev, opened.st_ino)
+        return _HeldDirectory(
+            fd,
+            parent,
+            name,
+            path,
+            opened.st_dev,
+            opened.st_ino,
+            parent.path_bound,
+        )
     except PublishError:
         try:
             os.close(fd)
@@ -1642,7 +1777,9 @@ def _publish_test_hook(stage: str) -> None:
 __all__ = [
     "AuthorityBinding", "TerminalCheckpointBinding", "AuthorityBindings", "SnapshotStoreInputs",
     "SnapshotInventoryRow", "SourceSeasonInventory", "SourceInventory", "build_inventory",
-    "inventory_bytes", "parse_inventory", "PublishReceipt", "LoadedSnapshotStore",
+    "inventory_bytes", "parse_inventory", "PublishReceipt", "PublishOutcome", "LoadedSnapshotStore",
     "SnapshotStoreError", "PublishConflict", "LockHeld", "PublishError", "read_inventory",
+    "read_inventory_from_fd",
     "load_snapshot_store", "load_snapshot_store_from_fd", "publish_snapshot_store",
+    "publish_snapshot_store_from_fd",
 ]
