@@ -12,7 +12,12 @@ from unittest.mock import call, patch
 
 from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
-from mlb_backtest.v52_snapshot_store import AuthorityBinding, build_inventory, inventory_bytes
+from mlb_backtest.v52_snapshot_store import (
+    AuthorityBinding,
+    build_inventory,
+    inventory_bytes,
+    publish_snapshot_store,
+)
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
 from tests.v52_snapshot_store_fixture import patched_store_replay, store_inputs
 
@@ -199,6 +204,16 @@ class StatusAndPreflightTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
+    def _published_store(self, root: Path) -> None:
+        root.mkdir(parents=True)
+        with patched_store_replay():
+            publish_snapshot_store(
+                root,
+                self.inventory,
+                self.inputs,
+                lock_owner="status-test",
+            )
+
     def test_status_and_preflight_symbols_are_public(self) -> None:
         self.assertIn("read_status", orchestration.__all__)
         self.assertIn("run_preflight", orchestration.__all__)
@@ -223,30 +238,38 @@ class StatusAndPreflightTests(unittest.TestCase):
         self.assertNotIn("selected_replay_receipts", rendered)
 
     def test_status_requires_authenticated_published_inventory_for_later_gates(self) -> None:
-        with patch.object(
-            orchestration, "load_snapshot_store", return_value=SimpleNamespace(inventory=self.inventory)
-        ):
+        self._published_store(self.root / "data/v5_2_qd/historical/sources")
+        with patched_store_replay():
             report = orchestration.read_status(self.context)
+        self.assertTrue(report.publish_ready)
         self.assertTrue(report.review_ready)
         self.assertTrue(report.replay_ready)
         self.assertFalse(report.advance_ready)
 
     def test_status_rejects_different_authenticated_published_inventory(self) -> None:
-        published = dataclasses.replace(self.inventory, run_id="other-valid-run")
-        self.assertNotEqual(inventory_bytes(published), inventory_bytes(self.inventory))
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        self._published_store(source_root)
+        candidate = dataclasses.replace(self.inventory, run_id="other-valid-run")
+        context = dataclasses.replace(self.context, inventory=candidate)
+        self.assertNotEqual(inventory_bytes(self.inventory), inventory_bytes(candidate))
         before = tree_snapshot(self.root)
-        with patch.object(
-            orchestration,
-            "load_snapshot_store",
-            return_value=SimpleNamespace(inventory=published),
-        ):
-            report = orchestration.read_status(self.context)
+        with patched_store_replay():
+            report = orchestration.read_status(context)
         self.assertEqual(report.phase, "ACQUIRING")
-        self.assertTrue(report.publish_ready)
+        self.assertFalse(report.publish_ready)
         self.assertFalse(report.review_ready)
         self.assertFalse(report.replay_ready)
         self.assertFalse(report.advance_ready)
-        self.assertEqual(report.blockers, ())
+        mismatch = tuple(
+            blocker
+            for blocker in report.blockers
+            if blocker.code == "PUBLISHED_INVENTORY_MISMATCH"
+        )
+        self.assertEqual(len(mismatch), 1)
+        self.assertEqual(
+            mismatch[0].paths,
+            ("data/v5_2_qd/historical/sources",),
+        )
         rendered = dataclasses.asdict(report)
         self.assertNotIn("selected_review_receipts", rendered)
         self.assertNotIn("selected_replay_receipts", rendered)
@@ -264,6 +287,133 @@ class StatusAndPreflightTests(unittest.TestCase):
             {blocker.code for blocker in report.blockers},
         )
         self.assertEqual(tree_snapshot(self.root), before)
+
+    def test_status_rejects_existing_source_ancestor_symlink_without_external_read(self) -> None:
+        external_data = self.root / "external-data"
+        self._published_store(external_data / "v5_2_qd/historical/sources")
+        (self.root / "data").symlink_to(external_data, target_is_directory=True)
+        before = tree_snapshot(self.root)
+        before_fds = len(os.listdir("/dev/fd"))
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration,
+                "load_snapshot_store_from_fd",
+                side_effect=AssertionError("external store read"),
+                create=True,
+            ) as loader,
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertEqual(report.phase, "ACQUIRING")
+        self.assertEqual(
+            (report.publish_ready, report.review_ready, report.replay_ready, report.advance_ready),
+            (False, False, False, False),
+        )
+        self.assertIn(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            {blocker.code for blocker in report.blockers},
+        )
+        loader.assert_not_called()
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+        self.assertEqual(tree_snapshot(self.root), before)
+
+    def test_status_rejects_source_ancestor_swap_after_fd_open(self) -> None:
+        data = self.root / "data"
+        self._published_store(data / "v5_2_qd/historical/sources")
+        external_data = self.root / "external-data"
+        self._published_store(external_data / "v5_2_qd/historical/sources")
+        moved = self.root / "moved-data"
+        before_fds = len(os.listdir("/dev/fd"))
+
+        def swap(stage: str) -> None:
+            if stage == "after_source_root_open":
+                data.rename(moved)
+                data.symlink_to(external_data, target_is_directory=True)
+
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration,
+                "_source_status_test_hook",
+                side_effect=swap,
+                create=True,
+            ),
+            patch.object(
+                orchestration,
+                "load_snapshot_store_from_fd",
+                side_effect=AssertionError("external store read"),
+                create=True,
+            ) as loader,
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertEqual(
+            (report.publish_ready, report.review_ready, report.replay_ready, report.advance_ready),
+            (False, False, False, False),
+        )
+        self.assertIn(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            {blocker.code for blocker in report.blockers},
+        )
+        loader.assert_not_called()
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
+    def test_status_rejects_ancestor_swap_before_missing_descendant_open(self) -> None:
+        data = self.root / "data"
+        data.mkdir()
+        external_data = self.root / "external-data"
+        external_data.mkdir()
+        moved = self.root / "moved-data"
+        before_fds = len(os.listdir("/dev/fd"))
+
+        def swap(component: str) -> None:
+            if component == "data":
+                data.rename(moved)
+                data.symlink_to(external_data, target_is_directory=True)
+
+        with patch.object(
+            orchestration,
+            "_trusted_descendant_test_hook",
+            side_effect=swap,
+            create=True,
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertEqual(
+            (report.publish_ready, report.review_ready, report.replay_ready, report.advance_ready),
+            (False, False, False, False),
+        )
+        self.assertIn(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            {blocker.code for blocker in report.blockers},
+        )
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+
+    def test_status_rejects_ancestor_swap_after_capability_load(self) -> None:
+        data = self.root / "data"
+        self._published_store(data / "v5_2_qd/historical/sources")
+        external_data = self.root / "external-data"
+        self._published_store(external_data / "v5_2_qd/historical/sources")
+        moved = self.root / "moved-data"
+        before_fds = len(os.listdir("/dev/fd"))
+
+        def swap(stage: str) -> None:
+            if stage == "after_source_store_load":
+                data.rename(moved)
+                data.symlink_to(external_data, target_is_directory=True)
+
+        with (
+            patched_store_replay(),
+            patch.object(orchestration, "_source_status_test_hook", side_effect=swap),
+        ):
+            report = orchestration.read_status(self.context)
+        self.assertEqual(
+            (report.publish_ready, report.review_ready, report.replay_ready, report.advance_ready),
+            (False, False, False, False),
+        )
+        self.assertIn(
+            "PUBLISHED_INVENTORY_UNAUTHENTICATED",
+            {blocker.code for blocker in report.blockers},
+        )
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
     def test_status_blocks_partial_or_non_acquiring_context_without_mutation(self) -> None:
         partial = dataclasses.replace(

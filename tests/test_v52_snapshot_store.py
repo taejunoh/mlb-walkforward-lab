@@ -1355,6 +1355,126 @@ class LoaderTests(unittest.TestCase):
                 load_snapshot_store(root, inputs)
 
 
+class FdLoaderTests(unittest.TestCase):
+    """Capability-rooted loads never reopen the snapshot-store by pathname."""
+
+    @staticmethod
+    def _publish(root, inventory, inputs):
+        from mlb_backtest.v52_snapshot_store import publish_snapshot_store
+
+        with patched_store_replay():
+            publish_snapshot_store(root, inventory, inputs, lock_owner="fd-loader-test")
+
+    def test_fd_loader_returns_exact_store_and_preserves_caller_fd(self):
+        from mlb_backtest.v52_snapshot_store import (
+            build_inventory,
+            load_snapshot_store_from_fd,
+        )
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            descriptor = os.open(
+                root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            before = os.fstat(descriptor)
+            try:
+                loaded = load_snapshot_store_from_fd(descriptor, inputs)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+        self.assertEqual(loaded.inventory, inventory)
+        self.assertEqual(
+            (after.st_dev, after.st_ino),
+            (before.st_dev, before.st_ino),
+        )
+
+    def test_fd_loader_rejects_tampered_inventory(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            load_snapshot_store_from_fd,
+        )
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            (root / "source_inventory.json").write_bytes(b"{}\n")
+            descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                with self.assertRaises(PublishError):
+                    load_snapshot_store_from_fd(descriptor, inputs)
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def test_fd_loader_rejects_aliased_and_special_inventory_leaf(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            load_snapshot_store_from_fd,
+        )
+
+        for kind in ("symlink", "hardlink", "fifo"):
+            with self.subTest(kind=kind), patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                inputs = store_inputs()
+                inventory = build_inventory(inputs)
+                self._publish(root, inventory, inputs)
+                target = root / "source_inventory.json"
+                raw = target.read_bytes()
+                target.unlink()
+                external = root / f"{kind}-external"
+                external.write_bytes(raw)
+                if kind == "symlink":
+                    target.symlink_to(external)
+                elif kind == "hardlink":
+                    os.link(external, target)
+                else:
+                    os.mkfifo(target)
+                descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    with self.assertRaises(PublishError):
+                        load_snapshot_store_from_fd(descriptor, inputs)
+                    os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+
+    def test_fd_loader_never_uses_write_capabilities(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import (
+            build_inventory,
+            load_snapshot_store_from_fd,
+        )
+
+        with patched_store_replay(), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            inputs = store_inputs()
+            inventory = build_inventory(inputs)
+            self._publish(root, inventory, inputs)
+            descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                with (
+                    patch.object(store.os, "write", side_effect=AssertionError("write")) as write,
+                    patch.object(store.os, "mkdir", side_effect=AssertionError("mkdir")) as mkdir,
+                    patched_store_replay(),
+                ):
+                    loaded = load_snapshot_store_from_fd(descriptor, inputs)
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+        self.assertEqual(loaded.inventory, inventory)
+        write.assert_not_called()
+        mkdir.assert_not_called()
+
+
 class AttackTests(unittest.TestCase):
     """Filesystem adversary cases for authoritative snapshot-store names."""
 

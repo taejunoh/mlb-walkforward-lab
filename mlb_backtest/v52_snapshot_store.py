@@ -669,6 +669,7 @@ class _HeldDirectory:
     path: Path
     device: int
     inode: int
+    path_bound: bool = True
 
 
 @dataclass(frozen=True)
@@ -696,6 +697,48 @@ def read_inventory(root: Path) -> SourceInventory:
 def load_snapshot_store(root: Path, inputs: SnapshotStoreInputs) -> LoadedSnapshotStore:
     """Read only an exactly replayable committed store; never repair its residue."""
     held = _open_readonly_root(root)
+    try:
+        _reject_unowned_lock(held)
+        return _load_snapshot_store_held(held, inputs, owned_lock=None)
+    finally:
+        _close_directory(held)
+
+
+def load_snapshot_store_from_fd(
+    source_root_fd: int, inputs: SnapshotStoreInputs
+) -> LoadedSnapshotStore:
+    """Load relative to a caller-owned directory FD without closing that FD."""
+    if isinstance(source_root_fd, bool) or not isinstance(source_root_fd, int):
+        raise TypeError("snapshot store root FD must be an integer")
+    try:
+        supplied = os.fstat(source_root_fd)
+        if not stat.S_ISDIR(supplied.st_mode):
+            raise PublishError("snapshot store root FD must name a directory")
+        owned_fd = os.dup(source_root_fd)
+        opened = os.fstat(owned_fd)
+        if not _same_directory(supplied, opened):
+            raise PublishError("snapshot store root FD changed while duplicating")
+    except PublishError:
+        try:
+            os.close(owned_fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(owned_fd)
+        except (OSError, UnboundLocalError):
+            pass
+        raise PublishError("snapshot store root FD is unavailable") from exc
+    held = _HeldDirectory(
+        owned_fd,
+        None,
+        None,
+        Path("<snapshot-store-fd>"),
+        opened.st_dev,
+        opened.st_ino,
+        False,
+    )
     try:
         _reject_unowned_lock(held)
         return _load_snapshot_store_held(held, inputs, owned_lock=None)
@@ -859,7 +902,15 @@ def _open_existing_directory(parent: _HeldDirectory, name: str, path: Path) -> _
         named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
         if not _same_directory(named, opened):
             raise PublishError(f"store directory {name!r} cannot be safely opened")
-        return _HeldDirectory(fd, parent, name, path, opened.st_dev, opened.st_ino)
+        return _HeldDirectory(
+            fd,
+            parent,
+            name,
+            path,
+            opened.st_dev,
+            opened.st_ino,
+            parent.path_bound,
+        )
     except PublishError:
         try:
             os.close(fd)
@@ -1227,12 +1278,19 @@ def _rebind_directory(directory: _HeldDirectory) -> None:
         ):
             raise PublishError("held store directory identity changed")
         if directory.parent is None:
-            named = os.stat(directory.path, follow_symlinks=False)
+            named = (
+                os.stat(directory.path, follow_symlinks=False)
+                if directory.path_bound
+                else opened
+            )
         else:
             named = os.stat(directory.name, dir_fd=directory.parent.fd, follow_symlinks=False)
-        named_path = os.stat(directory.path, follow_symlinks=False)
-        if not _same_directory(named, opened) or not _same_directory(named_path, opened):
+        if not _same_directory(named, opened):
             raise PublishError("store directory pathname no longer binds held directory")
+        if directory.path_bound:
+            named_path = os.stat(directory.path, follow_symlinks=False)
+            if not _same_directory(named_path, opened):
+                raise PublishError("store directory pathname no longer binds held directory")
     except PublishError:
         raise
     except OSError as exc:
@@ -1586,5 +1644,5 @@ __all__ = [
     "SnapshotInventoryRow", "SourceSeasonInventory", "SourceInventory", "build_inventory",
     "inventory_bytes", "parse_inventory", "PublishReceipt", "LoadedSnapshotStore",
     "SnapshotStoreError", "PublishConflict", "LockHeld", "PublishError", "read_inventory",
-    "load_snapshot_store", "publish_snapshot_store",
+    "load_snapshot_store", "load_snapshot_store_from_fd", "publish_snapshot_store",
 ]

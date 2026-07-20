@@ -37,7 +37,7 @@ from .v52_snapshot_store import (
     TerminalCheckpointBinding,
     build_inventory,
     inventory_bytes,
-    load_snapshot_store,
+    load_snapshot_store_from_fd,
 )
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import load_snapshot_replay_inputs
@@ -48,6 +48,7 @@ _CONTRACT_DEFAULT = Path("protocols/v5_2_qd/historical_source_acquisition.json")
 _PROTECTED_DEFAULT = Path("audit/v5_1_bt/protected_raw_inventory.json")
 _CHECKPOINT_ROOT = Path("audit/v5_2_qd/historical/execution/acquisition_checkpoints")
 _TIMEZONE_SEAL = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json")
+_SOURCE_ROOT_RELATIVE = Path("data/v5_2_qd/historical/sources")
 
 
 @dataclass(frozen=True)
@@ -373,7 +374,70 @@ def _verified_binding(root: Path, value: Path, expected_sha256: str) -> Authorit
 
 
 def _source_root(root: Path) -> Path:
-    return root / "data/v5_2_qd/historical/sources"
+    return root / _SOURCE_ROOT_RELATIVE
+
+
+def _trusted_descendant_test_hook(component: str) -> None:
+    """Deterministic component-open race boundary for tests."""
+
+
+def _open_optional_trusted_descendant(
+    root: Path, relative: Path
+) -> _TrustedRootHandle | None:
+    """Open a fixed descendant through a held no-follow directory chain."""
+    if relative.is_absolute() or not relative.parts or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError("trusted descendant path must be canonical and relative")
+    root_handle = _open_trusted_root(root)
+    descriptors = list(root_handle.descriptors)
+    names = list(root_handle.component_names)
+    current = descriptors[-1]
+    try:
+        for component in relative.parts:
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                partial = _TrustedRootHandle(
+                    root_handle.root,
+                    tuple(descriptors),
+                    tuple(names),
+                )
+                _assert_trusted_root(partial)
+                _close_descriptors(descriptors)
+                return None
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("trusted descendant must use no-follow directories")
+            except BaseException:
+                os.close(child)
+                raise
+            descriptors.append(child)
+            names.append(component)
+            current = child
+            _trusted_descendant_test_hook(component)
+        return _TrustedRootHandle(
+            root_handle.root / relative,
+            tuple(descriptors),
+            tuple(names),
+        )
+    except OSError as exc:
+        _close_descriptors(descriptors)
+        raise ValueError("trusted descendant is unsafe or unavailable") from exc
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
+
+
+def _source_status_test_hook(stage: str) -> None:
+    """Deterministic source-root namespace race boundary for tests."""
 
 
 def _git_head(root: Path) -> str:
@@ -626,18 +690,35 @@ def _published_inventory_matches(
         return False, None
     source_root = _source_root(context.root)
     try:
-        loaded = load_snapshot_store(source_root, context.snapshot_inputs)
-        return inventory_bytes(loaded.inventory) == inventory_bytes(context.inventory), None
-    except (SnapshotStoreError, OSError, ValueError, TypeError):
-        try:
-            os.lstat(source_root)
-        except FileNotFoundError:
+        _source_status_test_hook("before_source_root_open")
+        handle = _open_optional_trusted_descendant(
+            context.root, _SOURCE_ROOT_RELATIVE
+        )
+        if handle is None:
             return False, None
+        try:
+            _source_status_test_hook("after_source_root_open")
+            _assert_trusted_root(handle)
+            loaded = load_snapshot_store_from_fd(
+                handle.descriptors[-1], context.snapshot_inputs
+            )
+            _source_status_test_hook("after_source_store_load")
+            _assert_trusted_root(handle)
+        finally:
+            _close_descriptors(handle.descriptors)
+    except (SnapshotStoreError, OSError, ValueError, TypeError):
         return False, Blocker(
             "PUBLISHED_INVENTORY_UNAUTHENTICATED",
             "published source inventory is unsafe or differs from the context",
             (source_root.relative_to(context.root).as_posix(),),
         )
+    if inventory_bytes(loaded.inventory) != inventory_bytes(context.inventory):
+        return False, Blocker(
+            "PUBLISHED_INVENTORY_MISMATCH",
+            "published source inventory differs from the candidate inventory",
+            (source_root.relative_to(context.root).as_posix(),),
+        )
+    return True, None
 
 
 def read_status(context: FinalizationContext) -> StatusReport:
