@@ -440,6 +440,81 @@ class AdvanceTests(unittest.TestCase):
                     orchestration.advance_sources_ready(context, request)
                 self.assertEqual(crossed_error.exception.error_code, "RECEIPT_SET_INVALID")
                 crossed_advance.assert_not_called()
+                markers[0].write_bytes(original_marker)
+                original_payload = json.loads(original_review)
+                selection = root / original_payload["query_ids_document"]["path"]
+                subset_document = selection.with_name("query_ids-subset.json")
+                subset_document.write_bytes(canonical_json_bytes({"query_ids": ["1" * 64]}) + b"\n")
+                subset_review = review.with_name("review-subset.json")
+                subset_payload = dict(original_payload)
+                subset_payload["reviewed_query_ids"] = ["1" * 64]
+                subset_payload["query_ids_document"] = {
+                    "path": subset_document.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(subset_document.read_bytes()).hexdigest(),
+                }
+                subset_payload["occurred_at_utc"] = "2026-07-21T00:00:00.000000Z"
+                subset_review.write_bytes(canonical_json_bytes(subset_payload) + b"\n")
+                subset_marker = markers[0].with_name("review-subset.commit.json")
+                subset_marker_payload = json.loads(original_marker)
+                subset_marker_payload["source_receipt"] = {
+                    "path": subset_review.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(subset_review.read_bytes()).hexdigest(),
+                }
+                subset_marker_payload["occurred_at_utc"] = "2026-07-21T00:00:01.000000Z"
+                subset_marker.write_bytes(canonical_json_bytes(subset_marker_payload) + b"\n")
+                subset_request = dataclasses.replace(request, review_receipts=(markers[0], subset_marker))
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as subset_advance,
+                    self.assertRaises(orchestration.FinalizationError) as subset_error,
+                ):
+                    orchestration.advance_sources_ready(context, subset_request)
+                self.assertEqual(subset_error.exception.error_code, "RECEIPT_SET_INVALID")
+                subset_advance.assert_not_called()
+                replay_one = fixture.source_receipt_from_marker(root, markers[1])
+                replay_two = fixture.source_receipt_from_marker(root, markers[2])
+                original_replay_two = replay_two.read_bytes()
+                duplicate_replay = json.loads(replay_two.read_bytes())
+                duplicate_replay["execution_id"] = json.loads(replay_one.read_bytes())["execution_id"]
+                replay_two.write_bytes(canonical_json_bytes(duplicate_replay) + b"\n")
+                fixture.rebind_source_marker(markers[2], replay_two)
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as uuid_advance,
+                    self.assertRaises(orchestration.FinalizationError) as uuid_error,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(uuid_error.exception.error_code, "RECEIPT_SET_INVALID")
+                uuid_advance.assert_not_called()
+                replay_two.write_bytes(original_replay_two)
+                fixture.rebind_source_marker(markers[2], replay_two)
+                stale_checkpoint = checkpoint_path.with_name("stale-checkpoint.json")
+                stale_checkpoint.write_bytes(b'{"stale":true}\n')
+                stale_request = dataclasses.replace(request, checkpoint=stale_checkpoint)
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as stale_advance,
+                    self.assertRaises(orchestration.FinalizationError) as stale_error,
+                ):
+                    orchestration.advance_sources_ready(context, stale_request)
+                self.assertEqual(stale_error.exception.error_code, "RECEIPT_SET_INVALID")
+                stale_advance.assert_not_called()
+                inventory_cross = json.loads(original_review)
+                inventory_cross["inventory_sha256"] = "0" * 64
+                review.write_bytes(canonical_json_bytes(inventory_cross) + b"\n")
+                fixture.rebind_source_marker(markers[0], review)
+                with (
+                    patch.object(orchestration, "read_status", return_value=status),
+                    patch.object(orchestration, "run_preflight", return_value=preflight),
+                    patch.object(orchestration.execution_registry, "advance_execution_phase") as inventory_advance,
+                    self.assertRaises(orchestration.FinalizationError) as inventory_error,
+                ):
+                    orchestration.advance_sources_ready(context, request)
+                self.assertEqual(inventory_error.exception.error_code, "RECEIPT_SET_INVALID")
+                inventory_advance.assert_not_called()
             finally:
                 fixture.tearDown()
 
