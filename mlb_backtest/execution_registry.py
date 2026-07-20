@@ -3977,8 +3977,9 @@ def advance_execution_phase(
         except ValueError as exc:
             try:
                 _verify_lock_binding(paths, lock_binding)
-            except ValueError as lock_exc:
-                raise exc from lock_exc
+                _verify_git_snapshot(paths.root, snapshot)
+            except ValueError as trust_exc:
+                raise exc from trust_exc
             _publish_quarantine_locked(
                 paths,
                 run_spec,

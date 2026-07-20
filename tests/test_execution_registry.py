@@ -5632,6 +5632,41 @@ class ExecutionRegistryTest(unittest.TestCase):
                     (review, replay_one, replay_two),
                 )
 
+    def test_late_tracked_schema_mutation_preserves_publish_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            schema_path = root / "schemas/v5_2_clean_source_replay_receipt.schema.json"
+            strict = schema_path.read_bytes()
+            hook_calls = 0
+
+            def replace_schema_once() -> None:
+                nonlocal hook_calls
+                hook_calls += 1
+                schema_path.write_bytes(strict)
+
+            with patch.object(
+                self.registry,
+                "_before_registry_publish",
+                side_effect=replace_schema_once,
+            ), self.assertRaisesRegex(ValueError, "bound Git file identity changed"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+            self.assertEqual(hook_calls, 1)
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                [],
+            )
+
     def test_unresolvable_source_receipt_schema_quarantines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
