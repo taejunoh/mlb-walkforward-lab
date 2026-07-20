@@ -146,6 +146,8 @@ _BOUND_EXECUTION_CODE = (
     "schemas/v5_2_timezone_review_receipt.schema.json",
     "schemas/v5_2_timezone_seal_receipt.schema.json",
     "schemas/v5_2_venue_timezones.schema.json",
+    "schemas/v5_2_source_review_receipt.schema.json",
+    "schemas/v5_2_clean_source_replay_receipt.schema.json",
 )
 ACQUISITION_STAGES: tuple[str, ...] = (
     "STATIC_SCHEDULES",

@@ -171,6 +171,8 @@ BOUND_SCHEMA_PATHS = (
     Path("schemas/v5_2_timezone_review_receipt.schema.json"),
     Path("schemas/v5_2_timezone_seal_receipt.schema.json"),
     Path("schemas/v5_2_venue_timezones.schema.json"),
+    Path("schemas/v5_2_source_review_receipt.schema.json"),
+    Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
 )
 BOUND_EXECUTION_CODE = (
     *ACQUISITION_EXECUTION_IMPORT_CLOSURE,
@@ -1190,6 +1192,61 @@ class ExecutionRegistryTest(unittest.TestCase):
             }
             <= set(self.registry._BOUND_EXECUTION_CODE)
         )
+
+    def test_source_evidence_receipt_schemas_are_closed_and_canonical(self) -> None:
+        cases = (
+            (
+                "review",
+                ROOT / "schemas/v5_2_source_review_receipt.schema.json",
+                {
+                    "schema_version",
+                    "receipt_kind",
+                    "run_id",
+                    "critical_errors",
+                    "reviewer_identity",
+                    "reviewer_role",
+                    "decision",
+                    "reviewed_query_ids",
+                    "query_ids_document",
+                    "inventory_sha256",
+                    "snapshot_sha256s",
+                    "run_spec",
+                    "acquisition_contract",
+                    "git_head",
+                    "occurred_at_utc",
+                },
+            ),
+            (
+                "replay",
+                ROOT / "schemas/v5_2_clean_source_replay_receipt.schema.json",
+                {
+                    "schema_version",
+                    "receipt_kind",
+                    "run_id",
+                    "critical_errors",
+                    "execution_id",
+                    "status",
+                    "network_attempts",
+                    "reviewed_query_ids",
+                    "inventory_sha256",
+                    "snapshot_sha256s",
+                    "run_spec",
+                    "acquisition_contract",
+                    "git_head",
+                    "recorded_at_utc",
+                },
+            ),
+        )
+        for label, schema_path, expected_keys in cases:
+            with self.subTest(schema=label):
+                schema = json.loads(schema_path.read_bytes())
+                jsonschema.Draft202012Validator.check_schema(schema)
+                self.assertEqual(
+                    schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
+                )
+                self.assertFalse(schema["additionalProperties"])
+                self.assertEqual(set(schema["properties"]), expected_keys)
+                self.assertEqual(set(schema["required"]), expected_keys)
 
     def test_remaining_checkpoint_schema_requires_fixed_four_batch_prefix_and_split_suffix(
         self,
