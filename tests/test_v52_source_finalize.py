@@ -49,6 +49,107 @@ def tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
 
 
 class _ContextBaseTests(unittest.TestCase):
+    def test_advance_request_and_report_are_frozen_public_contracts(self) -> None:
+        request = orchestration.AdvanceRequest(
+            (Path("review.commit.json"),),
+            (Path("replay-one.commit.json"), Path("replay-two.commit.json")),
+            Path("checkpoint.json"),
+            Path("source_inventory.json"),
+        )
+        report = orchestration.AdvanceReport("ADVANCED", "SOURCES_READY", "a" * 64)
+        self.assertTrue(dataclasses.is_dataclass(request))
+        self.assertTrue(dataclasses.is_dataclass(report))
+        self.assertTrue(request.__dataclass_params__.frozen)
+        self.assertTrue(report.__dataclass_params__.frozen)
+        self.assertIn("advance_sources_ready", orchestration.__all__)
+
+    def test_advance_uses_explicit_ordered_markers_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkpoint = orchestration.AcquisitionCheckpoint(
+                0, "c" * 64, None, "REMAINING", "2026-07-20T00:00:00.000000Z",
+                "e" * 40, "f" * 64, (), (), (), (), (), (), (), (), (), (),
+            )
+            checkpoint_path = root / orchestration._checkpoint_path(checkpoint)
+            inventory_path = root / "data/v5_2_qd/historical/sources/source_inventory.json"
+            checkpoint_path.parent.mkdir(parents=True)
+            inventory_path.parent.mkdir(parents=True)
+            checkpoint_path.write_bytes(b'{"checkpoint":true}\n')
+            inventory_path.write_bytes(b'{"inventory":true}\n')
+            markers: list[Path] = []
+            for relative, kind, number in (
+                ("audit/v5_2_qd/historical/acquisition/source_reviews/review.commit.json", "SOURCE_REVIEW", 1),
+                ("audit/v5_2_qd/historical/acquisition/source_replays/replay-one.commit.json", "CLEAN_SOURCE_REPLAY", 2),
+                ("audit/v5_2_qd/historical/acquisition/source_replays/replay-two.commit.json", "CLEAN_SOURCE_REPLAY", 3),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(canonical_json_bytes({
+                    "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+                    "committed_receipt_kind": kind,
+                    "source_receipt": {
+                        "path": relative.replace(".commit", ""),
+                        "sha256": str(number) * 64,
+                    },
+                }) + b"\n")
+                markers.append(path)
+            registry = ExecutionRegistryState("ACQUIRING", 1, "a" * 64, "b" * 64)
+            context = orchestration.FinalizationContext(
+                root, root / "run.json", root / "contract.json", root / "protected.json",
+                SimpleNamespace(run_id="run"), registry, checkpoint, object(), object(),
+                "ACQUIRING", "e" * 40, (),
+            )
+            status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+            preflight = orchestration.PreflightReport("ACQUIRING", "PASS", "b" * 64, 1, 0, ())
+            advanced = ExecutionRegistryState("SOURCES_READY", 2, "d" * 64, "b" * 64)
+            request = orchestration.AdvanceRequest(
+                (markers[0],), (markers[1], markers[2]), checkpoint_path, inventory_path
+            )
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(orchestration.execution_registry, "advance_execution_phase", return_value=advanced) as advance,
+            ):
+                report = orchestration.advance_sources_ready(context, request)
+            self.assertEqual(report, orchestration.AdvanceReport("ADVANCED", "SOURCES_READY", "d" * 64))
+            advance.assert_called_once_with(
+                root, context.run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                inventory_path=inventory_path, validation_receipts=tuple(markers),
+            )
+
+    def test_advance_marker_preinspection_rejects_unsafe_and_group_swapped_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            review = root / "audit/v5_2_qd/historical/acquisition/source_reviews/review.commit.json"
+            review.parent.mkdir(parents=True)
+            review.write_bytes(canonical_json_bytes({
+                "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+                "committed_receipt_kind": "SOURCE_REVIEW",
+                "source_receipt": {
+                    "path": "audit/v5_2_qd/historical/acquisition/source_reviews/review.json",
+                    "sha256": "a" * 64,
+                },
+            }) + b"\n")
+            with self.assertRaises(orchestration.FinalizationError) as swapped:
+                orchestration._read_source_commit_marker(
+                    root, review, expected_kind="CLEAN_SOURCE_REPLAY"
+                )
+            self.assertEqual(swapped.exception.exit_code, 4)
+            for kind in ("symlink", "hardlink", "fifo"):
+                with self.subTest(kind=kind):
+                    candidate = review.with_name(f"{kind}.commit.json")
+                    if kind == "symlink":
+                        candidate.symlink_to(review)
+                    elif kind == "hardlink":
+                        os.link(review, candidate)
+                    else:
+                        os.mkfifo(candidate)
+                    with self.assertRaises(orchestration.FinalizationError) as unsafe:
+                        orchestration._read_source_commit_marker(
+                            root, candidate, expected_kind="SOURCE_REVIEW"
+                        )
+                    self.assertEqual(unsafe.exception.exit_code, 5)
+
     def test_context_types_are_frozen_with_canonical_defaults(self) -> None:
         args = orchestration.CommonArgs()
         self.assertEqual(args.root, Path("."))

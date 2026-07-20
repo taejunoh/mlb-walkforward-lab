@@ -6806,6 +6806,159 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "amendment|binding|hash|dirty|worktree"):
                 self.registry.load_execution_registry(root, run_spec)
 
+    def test_sources_ready_allows_multiple_consistent_approved_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            review_marker, replay_one, replay_two = evidence
+            original_review = self.source_receipt_from_marker(root, review_marker)
+            review_payload = json.loads(original_review.read_bytes())
+            review_payload["occurred_at_utc"] = "2026-07-20T00:01:00.000000Z"
+            extra_review = self.write_artifact(
+                root,
+                "audit/v5_2_qd/historical/acquisition/source_reviews/review-extra.json",
+                review_payload,
+            )
+            marker_payload = json.loads(review_marker.read_bytes())
+            marker_payload["source_receipt"] = {
+                "path": extra_review.relative_to(root).as_posix(),
+                "sha256": _sha256(extra_review),
+            }
+            marker_payload["occurred_at_utc"] = "2026-07-20T00:01:01.000000Z"
+            extra_marker = self.write_artifact(
+                root,
+                "audit/v5_2_qd/historical/acquisition/source_reviews/receipt-extra.commit.json",
+                marker_payload,
+            )
+            state = self.registry.advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="ACQUIRING",
+                next_phase="SOURCES_READY",
+                inventory_path=inventory,
+                validation_receipts=(review_marker, extra_marker, replay_one, replay_two),
+            )
+            self.assertEqual(state.phase, "SOURCES_READY")
+
+    def test_sources_ready_exact_retry_returns_existing_without_new_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            arguments = {
+                "expected_phase": "ACQUIRING",
+                "next_phase": "SOURCES_READY",
+                "inventory_path": inventory,
+                "validation_receipts": evidence,
+            }
+            advanced = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            receipts = root / RECEIPTS_RELATIVE
+            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+            existing = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            self.assertEqual(existing, advanced)
+            self.assertEqual(
+                tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())),
+                before,
+            )
+
+    def test_sources_ready_retry_rejects_reordered_or_changed_evidence_without_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            arguments = {
+                "expected_phase": "ACQUIRING",
+                "next_phase": "SOURCES_READY",
+                "inventory_path": inventory,
+                "validation_receipts": evidence,
+            }
+            advanced = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            receipts = root / RECEIPTS_RELATIVE
+            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+            with self.assertRaisesRegex(ValueError, "retry evidence differs"):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    **{**arguments, "validation_receipts": (evidence[0], evidence[2], evidence[1])},
+                )
+            for changed in (evidence[:2], (*evidence, evidence[0])):
+                with self.subTest(changed=len(changed)), self.assertRaises(ValueError):
+                    self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        **{**arguments, "validation_receipts": changed},
+                    )
+            self.assertEqual(self.registry.load_execution_registry(root, run_spec), advanced)
+            self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
+            self.assertEqual(list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()), [])
+            inventory.write_bytes(inventory.read_bytes() + b" ")
+            with self.assertRaisesRegex(ValueError, "retry evidence differs|phase inventory"):
+                self.registry.advance_execution_phase(root, run_spec, **arguments)
+            self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
+            self.assertEqual(list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()), [])
+
+    def test_concurrent_identical_sources_ready_requests_converge_to_one_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            barrier = threading.Barrier(2)
+
+            def advance_once() -> object:
+                barrier.wait()
+                return self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(lambda _unused: advance_once(), range(2)))
+            self.assertEqual(outcomes[0], outcomes[1])
+            self.assertEqual(outcomes[0].phase, "SOURCES_READY")
+            self.assertEqual(
+                len([path for path in (root / RECEIPTS_RELATIVE).iterdir() if "SOURCES_READY" in path.name]),
+                1,
+            )
+
+    def test_concurrent_different_sources_ready_requests_leave_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            barrier = threading.Barrier(2)
+
+            def advance_once(receipts: tuple[Path, ...]) -> object:
+                barrier.wait()
+                try:
+                    return self.registry.advance_execution_phase(
+                        root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
+                        inventory_path=inventory, validation_receipts=receipts,
+                    )
+                except ValueError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(advance_once, (evidence, (evidence[0], evidence[2], evidence[1]))))
+            self.assertEqual(
+                sum(isinstance(item, self.registry.ExecutionRegistryState) for item in outcomes),
+                1,
+            )
+            self.assertEqual(sum(isinstance(item, ValueError) for item in outcomes), 1)
+            self.assertEqual(
+                len([path for path in (root / RECEIPTS_RELATIVE).iterdir() if "SOURCES_READY" in path.name]),
+                1,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

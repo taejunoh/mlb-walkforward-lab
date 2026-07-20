@@ -978,10 +978,10 @@ def _validate_sources_ready_evidence(
             replay_execution_ids.add(execution_id)
     if (
         reviews < 1
-        or len(marker_paths) != 3
-        or len(marker_hashes) != 3
-        or len(receipt_paths) != 3
-        or len(receipt_hashes) != 3
+        or len(marker_paths) != reviews + 2
+        or len(marker_hashes) != reviews + 2
+        or len(receipt_paths) != reviews + 2
+        or len(receipt_hashes) != reviews + 2
         or len(replay_paths) != 2
         or len(replay_hashes) != 2
         or len(replay_execution_ids) != 2
@@ -3976,6 +3976,62 @@ def advance_execution_phase(
         raise ValueError("execution transition fails closed until a phase validator exists")
     with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
         state, payloads = _load_locked(paths, run_spec, lock_binding)
+        # SOURCES_READY is the sole idempotent transition: an interrupted caller
+        # may retry only the exact immutable evidence set that sealed the head.
+        # Authenticate before branching so a retry can never become a second
+        # receipt, a timestamp refresh, or a quarantine side effect.
+        if state.phase == next_phase:
+            if not (
+                expected_phase == "ACQUIRING" and next_phase == "SOURCES_READY"
+            ):
+                raise ValueError(
+                    "execution transition replay or expected phase differs from "
+                    "authenticated head"
+                )
+            base = payloads[0]
+            snapshot = _capture_git_snapshot(paths.root, base)
+            inventory_snapshot = _capture_artifact(
+                paths.root, inventory_path, "phase inventory"
+            )
+            validation_snapshots = _artifact_snapshots(
+                paths.root, validation_receipts, "validation receipt"
+            )
+            current = payloads[-1]
+            expected_inventory = _validate_binding_value(
+                current["inventory"], "phase inventory"
+            )
+            expected_validations = current.get("validation_receipts")
+            if not isinstance(expected_validations, list) or any(
+                not isinstance(item, Mapping) for item in expected_validations
+            ):
+                raise ValueError("SOURCES_READY receipt validation bindings differ")
+            if (
+                inventory_snapshot.binding != dict(expected_inventory)
+                or [item.binding for item in validation_snapshots]
+                != [dict(item) for item in expected_validations]
+            ):
+                raise ValueError("SOURCES_READY retry evidence differs")
+            checkpoints, checkpoint_payloads, checkpoint_names = (
+                _load_checkpoints_locked(
+                    paths,
+                    run_spec,
+                    payloads,
+                    snapshot,
+                    lock_binding,
+                    verify_latest_progress=True,
+                )
+            )
+            checkpoint_head = _terminal_checkpoint_head(
+                paths, checkpoints, checkpoint_payloads, checkpoint_names
+            )
+            if current.get("acquisition_checkpoint_head") != checkpoint_head:
+                raise ValueError("SOURCES_READY retry checkpoint differs")
+            _verify_artifact_snapshot(paths.root, inventory_snapshot, "phase inventory")
+            _verify_artifact_snapshots(
+                paths.root, validation_snapshots, "validation receipt"
+            )
+            _verify_git_snapshot(paths.root, snapshot)
+            return state
         if state.phase != expected_phase:
             raise ValueError(
                 "execution transition replay or expected phase differs from "

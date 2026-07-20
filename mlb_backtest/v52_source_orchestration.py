@@ -168,6 +168,23 @@ class ReplayRequest:
 
 
 @dataclass(frozen=True)
+class AdvanceRequest:
+    """Explicit SOURCE_RECEIPT_COMMIT marker paths selected by the caller."""
+
+    review_receipts: tuple[Path, ...]
+    replay_receipts: tuple[Path, Path]
+    checkpoint: Path
+    inventory: Path
+
+
+@dataclass(frozen=True)
+class AdvanceReport:
+    status: Literal["ADVANCED", "EXISTING"]
+    phase: Literal["SOURCES_READY"]
+    receipt_sha256: str
+
+
+@dataclass(frozen=True)
 class ReceiptReport:
     path: Path
     sha256: str
@@ -1589,9 +1606,152 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
     )
 
 
+def _advance_input_error(message: str, paths: Sequence[str] = ()) -> FinalizationError:
+    return FinalizationError("ADVANCE_INVALID", message, paths, 4)
+
+
+def _read_source_commit_marker(
+    root: Path, path: Path, *, expected_kind: str
+) -> tuple[str, bytes, Mapping[str, object]]:
+    """Pre-inspect an explicitly selected marker; registry remains authoritative."""
+    try:
+        relative, raw = _read_explicit_artifact(
+            root, path, "source receipt commit marker", max_bytes=_MAX_QUERY_IDS_DOCUMENT_BYTES
+        )
+        marker = _canonical_object(raw, "source receipt commit marker")
+    except FinalizationError as exc:
+        if exc.error_code == "AUTHORITY_MALFORMED":
+            raise _advance_input_error("source receipt commit marker is malformed") from exc
+        raise
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    prefix = _SOURCE_REVIEW_PREFIX if expected_kind == "SOURCE_REVIEW" else _SOURCE_REPLAY_PREFIX
+    if (
+        not relative.startswith(prefix)
+        or marker.get("receipt_kind") != "SOURCE_RECEIPT_COMMIT"
+        or marker.get("committed_receipt_kind") != expected_kind
+    ):
+        raise _advance_input_error("source receipt commit marker group differs", (relative,))
+    source = marker.get("source_receipt")
+    if not isinstance(source, Mapping):
+        raise _advance_input_error("source receipt commit marker is malformed", (relative,))
+    source_path = source.get("path")
+    source_sha256 = source.get("sha256")
+    if (
+        not isinstance(source_path, str)
+        or not isinstance(source_sha256, str)
+        or not _SHA256.fullmatch(source_sha256)
+        or not source_path.startswith(prefix)
+    ):
+        raise _advance_input_error("source receipt commit marker is malformed", (relative,))
+    return relative, raw, marker
+
+
+def advance_sources_ready(
+    context: FinalizationContext, request: AdvanceRequest
+) -> AdvanceReport:
+    """Advance only an explicit, ordered source evidence set to SOURCES_READY."""
+    context = _require_mutable_context(
+        context, phase=frozenset({"ACQUIRING", "SOURCES_READY"})
+    )
+    if context.run_spec is None or context.registry is None or context.checkpoint is None:
+        raise FinalizationError("AUTHORITY_MISSING", "advance authority is missing", (), 3)
+    if len(request.review_receipts) < 1 or len(request.replay_receipts) != 2:
+        raise _advance_input_error("advance requires at least one review and exactly two replays")
+
+    selected = (*request.review_receipts, *request.replay_receipts)
+    records: list[tuple[str, bytes, Mapping[str, object]]] = []
+    for index, path in enumerate(selected):
+        records.append(
+            _read_source_commit_marker(
+                context.root,
+                path,
+                expected_kind=("SOURCE_REVIEW" if index < len(request.review_receipts) else "CLEAN_SOURCE_REPLAY"),
+            )
+        )
+    marker_paths = [item[0] for item in records]
+    if len(set(marker_paths)) != len(marker_paths):
+        raise _advance_input_error("source receipt commit marker is duplicated", marker_paths)
+    sources = [
+        (str(item[2]["source_receipt"]["path"]), str(item[2]["source_receipt"]["sha256"]))
+        for item in records
+    ]
+    if len({item[0] for item in sources}) != len(sources) or len({item[1] for item in sources}) != len(sources):
+        raise _advance_input_error("committed source receipt is duplicated", marker_paths)
+
+    expected_checkpoint = _checkpoint_path(context.checkpoint)
+    expected_inventory = _SOURCE_ROOT_RELATIVE / "source_inventory.json"
+    try:
+        checkpoint_relative, checkpoint_raw = _read_explicit_artifact(
+            context.root, request.checkpoint, "terminal acquisition checkpoint"
+        )
+        inventory_relative, inventory_raw = _read_explicit_artifact(
+            context.root, request.inventory, "source inventory"
+        )
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    if checkpoint_relative != expected_checkpoint.as_posix():
+        raise _advance_input_error("terminal acquisition checkpoint differs", (checkpoint_relative,))
+    if inventory_relative != expected_inventory.as_posix():
+        raise _advance_input_error("source inventory differs", (inventory_relative,))
+
+    if context.phase == "ACQUIRING":
+        status = read_status(context)
+        if not status.review_ready or not status.replay_ready:
+            raise _advance_input_error("published review and replay authority is not ready")
+        preflight = run_preflight(context)
+        if preflight.status != "PASS":
+            raise _advance_input_error("advance requires passing preflight")
+
+    # Rebind explicit caller paths immediately before the one registry call.
+    for path, (relative, raw, _marker) in zip(selected, records, strict=True):
+        try:
+            final_relative, final_raw = _read_explicit_artifact(
+                context.root, path, "source receipt commit marker", max_bytes=_MAX_QUERY_IDS_DOCUMENT_BYTES
+            )
+        except ValueError as exc:
+            raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+        if final_relative != relative or final_raw != raw:
+            raise FinalizationError("AUTHORITY_CHANGED", "source receipt marker changed", (relative,), 5)
+    try:
+        final_checkpoint_relative, final_checkpoint_raw = _read_explicit_artifact(
+            context.root, request.checkpoint, "terminal acquisition checkpoint"
+        )
+        final_inventory_relative, final_inventory_raw = _read_explicit_artifact(
+            context.root, request.inventory, "source inventory"
+        )
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    if (
+        final_checkpoint_relative != checkpoint_relative
+        or final_checkpoint_raw != checkpoint_raw
+        or final_inventory_relative != inventory_relative
+        or final_inventory_raw != inventory_raw
+    ):
+        raise FinalizationError("AUTHORITY_CHANGED", "advance authority changed", (), 5)
+    try:
+        state = execution_registry.advance_execution_phase(
+            context.root,
+            context.run_spec,
+            expected_phase="ACQUIRING",
+            next_phase="SOURCES_READY",
+            inventory_path=context.root / inventory_relative,
+            validation_receipts=tuple(context.root / relative for relative in marker_paths),
+        )
+    except ValueError as exc:
+        raise _advance_input_error("source evidence advance failed") from exc
+    if state.phase != "SOURCES_READY":
+        raise FinalizationError("POSTCONDITION_FAILED", "advance phase differs", (), 5)
+    return AdvanceReport(
+        "EXISTING" if context.registry.phase == "SOURCES_READY" else "ADVANCED",
+        "SOURCES_READY",
+        state.receipt_sha256,
+    )
+
+
 __all__ = [
-    "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
+    "AdvanceReport", "AdvanceRequest", "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
     "PreflightReport", "PublishReport", "ReceiptReport", "ReplayReport",
     "ReplayRequest", "ReviewReport", "ReviewRequest", "StatusReport", "build_context",
-    "publish_inventory", "read_status", "run_preflight", "write_replay", "write_review",
+    "advance_sources_ready", "publish_inventory", "read_status", "run_preflight", "write_replay", "write_review",
 ]
