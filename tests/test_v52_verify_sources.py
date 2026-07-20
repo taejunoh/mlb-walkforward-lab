@@ -1133,6 +1133,28 @@ class V52VerifySourcesTest(unittest.TestCase):
 
         loader.assert_called_once_with(root, bad.batch_id, read_only_progress=True)
 
+    def test_terminal_graph_rejects_unsafe_namespace_before_any_authority_read(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        root = Path("/sealed/repository")
+        for raw in ("", ".", "raw\\nested", "raw//nested", "raw/../nested"):
+            with self.subTest(raw=raw):
+                run_spec = SimpleNamespace(raw={"namespaces": {"raw": raw}})
+                with (
+                    patch.object(
+                        verifier, "load_source_verification_checkpoint"
+                    ) as checkpoint_loader,
+                    patch.object(verifier, "load_query_batch") as batch_loader,
+                    patch.object(verifier, "load_split_receipt") as receipt_loader,
+                    self.assertRaises(ValueError),
+                ):
+                    verifier._load_terminal_query_graph(root, run_spec)
+                checkpoint_loader.assert_not_called()
+                batch_loader.assert_not_called()
+                receipt_loader.assert_not_called()
+
     def test_statcast_root_requires_exact_stage_path_and_artifact_hash(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
 

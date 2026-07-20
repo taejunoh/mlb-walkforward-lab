@@ -1224,19 +1224,13 @@ def _load_terminal_query_graph(
     root: Path,
     run_spec: RunSpec,
 ) -> _TerminalQueryGraph:
+    raw_relative = _safe_raw_namespace(run_spec)
     checkpoint = load_source_verification_checkpoint(root, run_spec)
     statcast_root_batch = _load_statcast_root_batch(root, checkpoint)
     batches = tuple(
         load_query_batch(root, batch_id, read_only_progress=True)
         for batch_id in checkpoint.query_batch_ids
     )
-    namespaces = run_spec.raw.get("namespaces")
-    raw_namespace = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
-    if not isinstance(raw_namespace, str) or not raw_namespace:
-        raise ValueError("source verification raw namespace differs")
-    raw_relative = Path(raw_namespace)
-    if raw_relative.is_absolute() or ".." in raw_relative.parts:
-        raise ValueError("source verification raw namespace must be relative")
     evidence_root = root / raw_relative
     receipts = tuple(
         load_split_receipt(
