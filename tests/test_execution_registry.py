@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1247,6 +1248,207 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.assertFalse(schema["additionalProperties"])
                 self.assertEqual(set(schema["properties"]), expected_keys)
                 self.assertEqual(set(schema["required"]), expected_keys)
+
+                self.assertEqual(
+                    set(schema["$defs"]), {"binding", "gitHead", "sha256", "timestamp"}
+                )
+                binding = schema["$defs"]["binding"]
+                self.assertFalse(binding["additionalProperties"])
+                self.assertEqual(set(binding["properties"]), {"path", "sha256"})
+                self.assertEqual(set(binding["required"]), {"path", "sha256"})
+                self.assertEqual(
+                    binding["properties"]["path"]["pattern"],
+                    r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$",
+                )
+                self.assertEqual(
+                    binding["properties"]["sha256"],
+                    {"$ref": "#/$defs/sha256"},
+                )
+                self.assertEqual(
+                    schema["$defs"]["sha256"]["pattern"],
+                    r"^[0-9a-f]{64}$",
+                )
+                self.assertEqual(
+                    schema["$defs"]["gitHead"]["pattern"],
+                    r"^[0-9a-f]{40}$",
+                )
+                self.assertEqual(
+                    schema["$defs"]["timestamp"]["pattern"],
+                    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$",
+                )
+
+                if label == "review":
+                    valid_payload = {
+                        "schema_version": 1,
+                        "receipt_kind": "SOURCE_REVIEW",
+                        "run_id": "historical_walkforward_500",
+                        "critical_errors": [],
+                        "reviewer_identity": "independent-source-auditor",
+                        "reviewer_role": "independent-source-auditor",
+                        "decision": "APPROVED",
+                        "reviewed_query_ids": ["a" * 64, "b" * 64],
+                        "query_ids_document": {
+                            "path": "audit/query_ids.json",
+                            "sha256": "c" * 64,
+                        },
+                        "inventory_sha256": "d" * 64,
+                        "snapshot_sha256s": ["e" * 64, "f" * 64],
+                        "run_spec": {
+                            "path": "protocols/run_spec.json",
+                            "sha256": "1" * 64,
+                        },
+                        "acquisition_contract": {
+                            "path": "protocols/acquisition_contract.json",
+                            "sha256": "2" * 64,
+                        },
+                        "git_head": "3" * 40,
+                        "occurred_at_utc": "2026-07-20T12:34:56.123456Z",
+                    }
+                    mutations = (
+                        (
+                            "wrong receipt_kind",
+                            lambda payload: payload.update(
+                                receipt_kind="CLEAN_SOURCE_REPLAY"
+                            ),
+                        ),
+                        (
+                            "duplicate reviewed_query_ids",
+                            lambda payload: payload.update(
+                                reviewed_query_ids=["a" * 64, "a" * 64]
+                            ),
+                        ),
+                        (
+                            "duplicate snapshot_sha256s",
+                            lambda payload: payload.update(
+                                snapshot_sha256s=["e" * 64, "e" * 64]
+                            ),
+                        ),
+                        (
+                            "invalid SHA-256",
+                            lambda payload: payload.update(inventory_sha256="z" * 64),
+                        ),
+                        (
+                            "unsafe binding path ../x",
+                            lambda payload: payload["query_ids_document"].update(
+                                path="../x"
+                            ),
+                        ),
+                        (
+                            "unsafe absolute binding path",
+                            lambda payload: payload["query_ids_document"].update(
+                                path="/absolute"
+                            ),
+                        ),
+                        (
+                            "unsafe backslash binding path",
+                            lambda payload: payload["query_ids_document"].update(
+                                path="query\\ids.json"
+                            ),
+                        ),
+                        (
+                            "extra property",
+                            lambda payload: payload.update(unexpected=True),
+                        ),
+                        (
+                            "wrong reviewer identity",
+                            lambda payload: payload.update(reviewer_identity="other"),
+                        ),
+                        (
+                            "wrong reviewer role",
+                            lambda payload: payload.update(reviewer_role="other"),
+                        ),
+                    )
+                else:
+                    valid_payload = {
+                        "schema_version": 1,
+                        "receipt_kind": "CLEAN_SOURCE_REPLAY",
+                        "run_id": "historical_walkforward_500",
+                        "critical_errors": [],
+                        "execution_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "status": "PASS",
+                        "network_attempts": 0,
+                        "reviewed_query_ids": ["a" * 64, "b" * 64],
+                        "inventory_sha256": "c" * 64,
+                        "snapshot_sha256s": ["d" * 64, "e" * 64],
+                        "run_spec": {
+                            "path": "protocols/run_spec.json",
+                            "sha256": "1" * 64,
+                        },
+                        "acquisition_contract": {
+                            "path": "protocols/acquisition_contract.json",
+                            "sha256": "2" * 64,
+                        },
+                        "git_head": "3" * 40,
+                        "recorded_at_utc": "2026-07-20T12:34:56.123456Z",
+                    }
+                    mutations = (
+                        (
+                            "wrong receipt_kind",
+                            lambda payload: payload.update(receipt_kind="SOURCE_REVIEW"),
+                        ),
+                        (
+                            "network_attempts=1",
+                            lambda payload: payload.update(network_attempts=1),
+                        ),
+                        (
+                            "duplicate reviewed_query_ids",
+                            lambda payload: payload.update(
+                                reviewed_query_ids=["a" * 64, "a" * 64]
+                            ),
+                        ),
+                        (
+                            "duplicate snapshot_sha256s",
+                            lambda payload: payload.update(
+                                snapshot_sha256s=["d" * 64, "d" * 64]
+                            ),
+                        ),
+                        (
+                            "invalid SHA-256",
+                            lambda payload: payload.update(inventory_sha256="z" * 64),
+                        ),
+                        (
+                            "malformed UUID",
+                            lambda payload: payload.update(execution_id="not-a-uuid"),
+                        ),
+                        (
+                            "non-v4 UUID",
+                            lambda payload: payload.update(
+                                execution_id="123e4567-e89b-12d3-a456-426614174000"
+                            ),
+                        ),
+                        (
+                            "unsafe binding path ../x",
+                            lambda payload: payload["run_spec"].update(path="../x"),
+                        ),
+                        (
+                            "unsafe absolute binding path",
+                            lambda payload: payload["run_spec"].update(path="/absolute"),
+                        ),
+                        (
+                            "unsafe backslash binding path",
+                            lambda payload: payload["run_spec"].update(
+                                path="run\\spec.json"
+                            ),
+                        ),
+                        (
+                            "extra property",
+                            lambda payload: payload.update(unexpected=True),
+                        ),
+                    )
+
+                validator = jsonschema.Draft202012Validator(schema)
+                valid_contents = canonical_json_bytes(valid_payload) + b"\n"
+                canonical_payload = json.loads(valid_contents)
+                self.assertEqual(
+                    valid_contents, canonical_json_bytes(canonical_payload) + b"\n"
+                )
+                validator.validate(canonical_payload)
+                for mutation_label, mutate in mutations:
+                    with self.subTest(schema=label, mutation=mutation_label):
+                        candidate = copy.deepcopy(valid_payload)
+                        mutate(candidate)
+                        with self.assertRaises(jsonschema.ValidationError):
+                            validator.validate(candidate)
 
     def test_remaining_checkpoint_schema_requires_fixed_four_batch_prefix_and_split_suffix(
         self,
