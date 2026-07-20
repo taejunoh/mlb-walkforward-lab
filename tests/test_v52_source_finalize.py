@@ -4,6 +4,8 @@ import dataclasses
 import hashlib
 import os
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -527,6 +529,210 @@ class StatusAndPreflightTests(unittest.TestCase):
                 orchestration.run_preflight(self.context)
         self.assertEqual(raised.exception.error_code, "AUTHORITY_CHANGED")
         self.assertEqual(raised.exception.exit_code, 5)
+
+class PublishTests(StatusAndPreflightTests):
+    """Public publication uses the preflight authority and fixed source root."""
+
+    def _passing_preflight(self) -> orchestration.PreflightReport:
+        return orchestration.PreflightReport("ACQUIRING", "PASS", "0" * 64, 81, 0, ())
+
+    def test_publish_inventory_is_public_and_returns_a_report(self) -> None:
+        publish = orchestration.publish_inventory
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ):
+            report = publish(self.context, lock_owner="publish-service")
+        self.assertEqual(report.status, "PUBLISHED")
+        self.assertEqual(report.snapshot_count, 81)
+        self.assertEqual(
+            (self.root / "data/v5_2_qd/historical/sources/source_inventory.json").read_bytes(),
+            inventory_bytes(self.inventory),
+        )
+
+    def test_identical_retry_reports_existing_without_changing_inventory_inode(self) -> None:
+        source = self.root / "data/v5_2_qd/historical/sources/source_inventory.json"
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ):
+            first = orchestration.publish_inventory(self.context, lock_owner="publish-service")
+            before = (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes())
+            second = orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual(first.status, "PUBLISHED")
+        self.assertEqual(second.status, "EXISTING")
+        self.assertEqual(before, (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes()))
+
+    def test_terminal_checkpoint_and_preflight_block_publication_without_writing(self) -> None:
+        pending = dataclasses.replace(self.checkpoint, pending_query_ids=("1" * 64,))
+        blocked = dataclasses.replace(self.context, checkpoint=pending)
+        with self.assertRaises(orchestration.FinalizationError) as terminal:
+            orchestration.publish_inventory(blocked, lock_owner="publish-service")
+        self.assertEqual((terminal.exception.error_code, terminal.exception.exit_code), (
+            "TERMINAL_CHECKPOINT_REQUIRED", 4
+        ))
+        with patch.object(
+            orchestration,
+            "run_preflight",
+            return_value=orchestration.PreflightReport("ACQUIRING", "BLOCKED", None, 0, 0, ()),
+        ), self.assertRaises(orchestration.FinalizationError) as preflight:
+            orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual((preflight.exception.error_code, preflight.exception.exit_code), (
+            "PREFLIGHT_BLOCKED", 4
+        ))
+        self.assertFalse((self.root / "data").exists())
+
+    def test_failed_publish_cleans_only_empty_fixed_directories(self) -> None:
+        with patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), self.assertRaises(orchestration.FinalizationError) as raised:
+            orchestration.publish_inventory(self.context, lock_owner="unsafe owner")
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "PUBLISH_FAILED", 5
+        ))
+        self.assertFalse((self.root / "data").exists())
+
+    def test_postcondition_mismatch_is_a_stable_failure(self) -> None:
+        different = dataclasses.replace(self.inventory, run_id="different-run")
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), patch.object(
+            orchestration, "load_snapshot_store_from_fd", return_value=SimpleNamespace(inventory=different)
+        ), self.assertRaises(orchestration.FinalizationError) as raised:
+            orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "POSTCONDITION_FAILED", 5
+        ))
+
+    def test_unsafe_existing_inventory_and_stale_lock_fail_closed(self) -> None:
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        source_root.mkdir(parents=True)
+        external = self.root / "external.json"
+        external.write_bytes(b"external\n")
+        (source_root / "source_inventory.json").symlink_to(external)
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), self.assertRaises(orchestration.FinalizationError) as unsafe:
+            orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual((unsafe.exception.error_code, unsafe.exception.exit_code), (
+            "PUBLISH_FAILED", 5
+        ))
+        (source_root / "source_inventory.json").unlink()
+        (source_root / "source_inventory.json").write_bytes(b"not-an-inventory\n")
+        os.link(source_root / "source_inventory.json", source_root / "inventory-alias.json")
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), self.assertRaises(orchestration.FinalizationError) as hardlink:
+            orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual((hardlink.exception.error_code, hardlink.exception.exit_code), (
+            "PUBLISH_FAILED", 5
+        ))
+        (source_root / "inventory-alias.json").unlink()
+        (source_root / "source_inventory.json").unlink()
+        (source_root / ".snapshot-store.lock").write_bytes(b"other-owner\n")
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), patch.object(orchestration.time, "sleep", return_value=None), self.assertRaises(
+            orchestration.FinalizationError
+        ) as stale:
+            orchestration.publish_inventory(self.context, lock_owner="publish-service")
+        self.assertEqual((stale.exception.error_code, stale.exception.exit_code), (
+            "PUBLISH_CONFLICT", 6
+        ))
+
+    def test_concurrent_identical_publications_converge_to_published_and_existing(self) -> None:
+        import mlb_backtest.v52_snapshot_store as store
+
+        entered = threading.Event()
+        release = threading.Event()
+        reports: list[orchestration.PublishReport] = []
+        failures: list[BaseException] = []
+
+        def hold_before_release(stage: str) -> None:
+            if stage == "before_lock_release":
+                entered.set()
+                release.wait(timeout=3)
+
+        def publish() -> None:
+            try:
+                reports.append(
+                    orchestration.publish_inventory(self.context, lock_owner="concurrent")
+                )
+            except BaseException as exc:  # surfaced below in the parent test
+                failures.append(exc)
+
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), patch.object(store, "_publish_test_hook", side_effect=hold_before_release):
+            first = threading.Thread(target=publish)
+            second = threading.Thread(target=publish)
+            first.start()
+            self.assertTrue(entered.wait(timeout=3))
+            second.start()
+            time.sleep(0.04)
+            release.set()
+            first.join(timeout=10)
+            second.join(timeout=10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(sorted(report.status for report in reports), ["EXISTING", "PUBLISHED"])
+
+    def test_concurrent_different_publication_conflicts_without_changing_winner(self) -> None:
+        import mlb_backtest.v52_snapshot_store as store
+
+        bindings = dataclasses.replace(
+            self.inputs.bindings,
+            run_spec=AuthorityBinding(
+                self.inputs.bindings.run_spec.path, "9" * 64
+            ),
+        )
+        other_inputs = dataclasses.replace(self.inputs, bindings=bindings)
+        with patched_store_replay():
+            other_inventory = build_inventory(other_inputs)
+        other_context = dataclasses.replace(
+            self.context, snapshot_inputs=other_inputs, inventory=other_inventory
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        reports: list[orchestration.PublishReport] = []
+        failures: list[BaseException] = []
+
+        def hold_before_release(stage: str) -> None:
+            if stage == "before_lock_release":
+                entered.set()
+                release.wait(timeout=3)
+
+        def publish(context: orchestration.FinalizationContext) -> None:
+            try:
+                reports.append(
+                    orchestration.publish_inventory(context, lock_owner="concurrent")
+                )
+            except BaseException as exc:  # asserted below in the parent test
+                failures.append(exc)
+
+        source = self.root / "data/v5_2_qd/historical/sources/source_inventory.json"
+        with patched_store_replay(), patch.object(
+            orchestration, "run_preflight", return_value=self._passing_preflight()
+        ), patch.object(store, "_publish_test_hook", side_effect=hold_before_release):
+            winner = threading.Thread(target=publish, args=(self.context,))
+            loser = threading.Thread(target=publish, args=(other_context,))
+            winner.start()
+            self.assertTrue(entered.wait(timeout=3))
+            before = (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes())
+            loser.start()
+            time.sleep(0.04)
+            release.set()
+            winner.join(timeout=10)
+            loser.join(timeout=10)
+        self.assertFalse(winner.is_alive())
+        self.assertFalse(loser.is_alive())
+        self.assertEqual([report.status for report in reports], ["PUBLISHED"])
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], orchestration.FinalizationError)
+        error = failures[0]
+        assert isinstance(error, orchestration.FinalizationError)
+        self.assertEqual((error.error_code, error.exit_code), ("PUBLISH_CONFLICT", 6))
+        self.assertEqual(before, (source.stat().st_ino, source.stat().st_mtime_ns, source.read_bytes()))
+
 
 class ContextTests(_ContextBaseTests):
     def test_canonical_object_rejects_duplicate_and_noncanonical_json(self) -> None:

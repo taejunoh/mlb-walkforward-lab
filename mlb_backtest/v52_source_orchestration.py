@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,9 @@ from .v52_query_plan import _load_static_contracts
 from .v52_snapshot_store import (
     AuthorityBinding,
     AuthorityBindings,
+    LockHeld,
+    PublishConflict,
+    PublishError,
     SnapshotStoreError,
     SnapshotStoreInputs,
     SourceInventory,
@@ -38,6 +42,8 @@ from .v52_snapshot_store import (
     build_inventory,
     inventory_bytes,
     load_snapshot_store_from_fd,
+    publish_snapshot_store_from_fd,
+    read_inventory_from_fd,
 )
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import load_snapshot_replay_inputs
@@ -121,6 +127,13 @@ class PreflightReport:
     snapshot_count: int
     network_attempts: Literal[0]
     blockers: tuple[Blocker, ...]
+
+
+@dataclass(frozen=True)
+class PublishReport:
+    status: Literal["PUBLISHED", "EXISTING"]
+    inventory_sha256: str
+    snapshot_count: int
 
 
 class FinalizationError(Exception):
@@ -434,6 +447,102 @@ def _open_optional_trusted_descendant(
     except BaseException:
         _close_descriptors(descriptors)
         raise
+
+
+def _open_or_create_source_root(
+    root: Path,
+) -> tuple[_TrustedRootHandle, tuple[tuple[int, str], ...]]:
+    """Return the fixed source target through held no-follow directory FDs only."""
+    root_handle = _open_trusted_root(root)
+    descriptors = list(root_handle.descriptors)
+    names = list(root_handle.component_names)
+    created: list[tuple[int, str]] = []
+    current = descriptors[-1]
+    try:
+        for component in _SOURCE_ROOT_RELATIVE.parts:
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                try:
+                    parent_index = len(descriptors) - 1
+                    os.mkdir(component, 0o700, dir_fd=current)
+                    os.fsync(current)
+                    child = os.open(component, _directory_flags(), dir_fd=current)
+                    created.append((parent_index, component))
+                except OSError as exc:
+                    raise ValueError("could not safely create fixed source directory") from exc
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("fixed source directory must be a no-follow directory")
+            except BaseException:
+                os.close(child)
+                raise
+            descriptors.append(child)
+            names.append(component)
+            current = child
+            _trusted_descendant_test_hook(component)
+        result = _TrustedRootHandle(
+            root_handle.root / _SOURCE_ROOT_RELATIVE,
+            tuple(descriptors),
+            tuple(names),
+        )
+        _assert_trusted_root(result)
+        return result, tuple(created)
+    except OSError as exc:
+        _close_descriptors(descriptors)
+        raise ValueError("fixed source directory is unsafe or unavailable") from exc
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
+
+
+def _cleanup_empty_created_source_directories(
+    handle: _TrustedRootHandle, created: Sequence[tuple[int, str]]
+) -> None:
+    """Remove only still-empty directories created by this failed invocation."""
+    for parent_index, name in reversed(tuple(created)):
+        try:
+            parent = handle.descriptors[parent_index]
+            child = handle.descriptors[parent_index + 1]
+            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(linked.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                continue
+            os.rmdir(name, dir_fd=parent)
+            os.fsync(parent)
+        except OSError:
+            # Immutable residue is never removed: only empty directories are eligible.
+            continue
+
+
+def _canonical_inventory_exists(source_root: Path) -> bool:
+    """Strict path helper retained for diagnostics; publication uses the FD capability."""
+    try:
+        details = os.stat(
+            source_root / "source_inventory.json", follow_symlinks=False
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise FinalizationError(
+            "PATH_UNSAFE", "published inventory cannot be safely inspected", (), 5
+        ) from exc
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise FinalizationError(
+            "PATH_UNSAFE", "published inventory must be a regular single-link file", (), 5
+        )
+    return True
 
 
 def _source_status_test_hook(stage: str) -> None:
@@ -783,8 +892,125 @@ def run_preflight(context: FinalizationContext) -> PreflightReport:
     )
 
 
+def _load_published_inventory_from_handle(
+    handle: _TrustedRootHandle, context: FinalizationContext
+) -> SourceInventory:
+    if context.snapshot_inputs is None:
+        raise FinalizationError("AUTHORITY_MISSING", "snapshot inputs are missing", (), 3)
+    try:
+        _assert_trusted_root(handle)
+        loaded = load_snapshot_store_from_fd(
+            handle.descriptors[-1], context.snapshot_inputs
+        )
+        _assert_trusted_root(handle)
+        return loaded.inventory
+    except LockHeld:
+        raise
+    except SnapshotStoreError as exc:
+        raise FinalizationError(
+            "POSTCONDITION_FAILED", "published source inventory is unsafe", (), 5
+        ) from exc
+
+
+def _converge_identical_locked_publish(
+    handle: _TrustedRootHandle, context: FinalizationContext, expected: bytes
+) -> PublishReport:
+    """Wait briefly for a competing publisher, never writing while its lock exists."""
+    for _ in range(5):
+        try:
+            inventory = _load_published_inventory_from_handle(handle, context)
+        except LockHeld:
+            time.sleep(0.02)
+            continue
+        except FinalizationError as load_error:
+            try:
+                _assert_trusted_root(handle)
+                inventory = read_inventory_from_fd(handle.descriptors[-1])
+                _assert_trusted_root(handle)
+            except LockHeld:
+                time.sleep(0.02)
+                continue
+            except SnapshotStoreError:
+                raise load_error
+        actual = inventory_bytes(inventory)
+        if actual != expected:
+            raise FinalizationError(
+                "PUBLISH_CONFLICT", "competing publication differs from candidate", (), 6
+            )
+        return PublishReport(
+            "EXISTING", hashlib.sha256(actual).hexdigest(), len(inventory.snapshots)
+        )
+    raise FinalizationError(
+        "PUBLISH_CONFLICT", "source publication lock remains held", (), 6
+    )
+
+
+def publish_inventory(
+    context: FinalizationContext, *, lock_owner: str
+) -> PublishReport:
+    """Publish only the preflighted candidate to the fixed v5.2 source target."""
+    _require_mutable_context(context, phase="ACQUIRING")
+    if not _has_terminal_checkpoint(context.checkpoint):
+        raise FinalizationError(
+            "TERMINAL_CHECKPOINT_REQUIRED",
+            "publication requires a zero-pending, zero-quarantine REMAINING checkpoint",
+            (),
+            4,
+        )
+    preflight = run_preflight(context)
+    if (
+        preflight.status != "PASS"
+        or context.inventory is None
+        or context.snapshot_inputs is None
+    ):
+        raise FinalizationError(
+            "PREFLIGHT_BLOCKED", "publication requires a passing preflight", (), 4
+        )
+    expected = inventory_bytes(context.inventory)
+    try:
+        handle, created = _open_or_create_source_root(context.root)
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    completed = False
+    try:
+        try:
+            outcome = publish_snapshot_store_from_fd(
+                handle.descriptors[-1],
+                context.inventory,
+                context.snapshot_inputs,
+                lock_owner=lock_owner,
+            )
+        except LockHeld:
+            report = _converge_identical_locked_publish(handle, context, expected)
+            completed = True
+            return report
+        except PublishConflict as exc:
+            raise FinalizationError("PUBLISH_CONFLICT", str(exc), (), 6) from exc
+        except (PublishError, ValueError, TypeError, OSError) as exc:
+            raise FinalizationError("PUBLISH_FAILED", str(exc), (), 5) from exc
+
+        inventory = _load_published_inventory_from_handle(handle, context)
+        actual = inventory_bytes(inventory)
+        if actual != expected:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED", "published inventory bytes differ from candidate", (), 5
+            )
+        status: Literal["PUBLISHED", "EXISTING"] = (
+            "PUBLISHED" if outcome.created else "EXISTING"
+        )
+        report = PublishReport(
+            status, outcome.receipt.inventory_sha256, outcome.receipt.snapshot_count
+        )
+        completed = True
+        return report
+    finally:
+        if not completed:
+            _cleanup_empty_created_source_directories(handle, created)
+        _close_descriptors(handle.descriptors)
+
+
 __all__ = [
     "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
-    "PreflightReport", "StatusReport", "build_context", "read_status",
-    "run_preflight",
+    "PreflightReport", "PublishReport", "StatusReport", "build_context",
+    "publish_inventory", "read_status", "run_preflight",
 ]
