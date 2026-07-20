@@ -5,10 +5,12 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -19,6 +21,7 @@ from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
 from mlb_backtest.v52_snapshot_store import (
     AuthorityBinding,
+    LoadedSnapshotStore,
     build_inventory,
     inventory_bytes,
     publish_snapshot_store,
@@ -1426,6 +1429,346 @@ class ReviewTests(unittest.TestCase):
         failures = [item for item in outcomes if isinstance(item, orchestration.FinalizationError)]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].exit_code, 6)
+
+
+class ReplayTests(unittest.TestCase):
+    """Clean replay receipts are explicit, immutable, and network-free."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name).resolve()
+        self.inputs = store_inputs()
+        source_root = self.root / "data/v5_2_qd/historical/sources"
+        source_root.mkdir(parents=True)
+        with patched_store_replay():
+            self.inventory = build_inventory(self.inputs)
+            publish_snapshot_store(
+                source_root, self.inventory, self.inputs, lock_owner="replay-test"
+            )
+        self.registry = ExecutionRegistryState("ACQUIRING", 7, "a" * 64, "b" * 64)
+        self.checkpoint = AcquisitionCheckpoint(
+            9, "c" * 64, "d" * 64, "REMAINING",
+            "2026-07-20T00:00:00.000000Z", "e" * 40, "f" * 64,
+            (), (), (), (), (), (), (), (), (), (),
+        )
+        self.context = orchestration.FinalizationContext(
+            self.root,
+            self.root / "run.json",
+            self.root / "contract.json",
+            self.root / "protected.json",
+            SimpleNamespace(run_id="fixture-run"),
+            self.registry,
+            self.checkpoint,
+            self.inputs,
+            self.inventory,
+            "ACQUIRING",
+            "e" * 40,
+            (),
+        )
+        replay_root = self.root / "audit/v5_2_qd/historical/acquisition/source_replays"
+        self.first_path = replay_root / "first.json"
+        self.first_commit = replay_root / "first.commit.json"
+        self.second_path = replay_root / "second.json"
+        self.second_commit = replay_root / "second.commit.json"
+        self.request = orchestration.ReplayRequest(self.first_path, self.first_commit)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _write(self, request: object | None = None) -> object:
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING",
+            "PASS",
+            hashlib.sha256(inventory_bytes(self.inventory)).hexdigest(),
+            len(self.inventory.snapshots),
+            0,
+            (),
+        )
+        status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+        with (
+            patched_store_replay(),
+            patch.object(orchestration.execution_registry, "validate_source_receipt_schema"),
+            patch.object(orchestration, "read_status", return_value=status),
+            patch.object(orchestration, "run_preflight", return_value=preflight),
+            patch.object(
+                orchestration,
+                "_utc_now",
+                return_value="2026-07-20T00:00:00.000000Z",
+            ),
+        ):
+            return orchestration.write_replay(self.context, request or self.request)
+
+    def test_replay_emits_exact_payload_and_commit_marker(self) -> None:
+        report = self._write()
+        payload = json.loads(report.path.read_bytes())
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version", "receipt_kind", "run_id", "critical_errors",
+                "execution_id", "status", "network_attempts", "reviewed_query_ids",
+                "inventory_sha256", "snapshot_sha256s", "run_spec",
+                "acquisition_contract", "git_head", "recorded_at_utc",
+            },
+        )
+        self.assertEqual(payload["receipt_kind"], "CLEAN_SOURCE_REPLAY")
+        self.assertEqual(payload["network_attempts"], 0)
+        self.assertEqual(payload["reviewed_query_ids"], list(self.inventory.logical_query_ids))
+        self.assertEqual(report.receipt_kind, "CLEAN_SOURCE_REPLAY")
+        self.assertEqual(report.commit_path, self.first_commit)
+        marker = json.loads(report.commit_path.read_bytes())
+        self.assertEqual(set(marker), {
+            "schema_version", "receipt_kind", "committed_receipt_kind", "run_id",
+            "critical_errors", "source_receipt", "run_spec", "acquisition_contract",
+            "git_head", "occurred_at_utc",
+        })
+        self.assertEqual(marker["committed_receipt_kind"], "CLEAN_SOURCE_REPLAY")
+        self.assertEqual(marker["source_receipt"], {
+            "path": self.first_path.relative_to(self.root).as_posix(),
+            "sha256": report.sha256,
+        })
+
+    def test_two_replays_have_distinct_execution_ids_and_equal_projection(self) -> None:
+        first = self._write()
+        second = self._write(orchestration.ReplayRequest(self.second_path, self.second_commit))
+        first_payload = json.loads(first.path.read_bytes())
+        second_payload = json.loads(second.path.read_bytes())
+        self.assertNotEqual(first_payload["execution_id"], second_payload["execution_id"])
+        self.assertNotEqual(first.sha256, second.sha256)
+        self.assertEqual(first_payload["inventory_sha256"], second_payload["inventory_sha256"])
+        self.assertEqual(first_payload["network_attempts"], 0)
+        self.assertEqual(second_payload["network_attempts"], 0)
+
+    def test_replay_rejects_existing_or_unsafe_destinations_before_writing(self) -> None:
+        self.first_path.parent.mkdir(parents=True)
+        self.first_path.write_bytes(b'{"existing":true}\n')
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "RECEIPT_CONFLICT", 6
+        ))
+        same = orchestration.ReplayRequest(self.second_path, self.second_path)
+        with self.assertRaises(orchestration.FinalizationError) as unsafe:
+            self._write(same)
+        self.assertEqual((unsafe.exception.error_code, unsafe.exception.exit_code), (
+            "PATH_UNSAFE", 5
+        ))
+
+    def test_replay_requires_published_acquiring_authority(self) -> None:
+        blocked = orchestration.StatusReport("ACQUIRING", None, True, True, False, False, ())
+        with (
+            patched_store_replay(),
+            patch.object(orchestration, "read_status", return_value=blocked),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
+            orchestration.write_replay(self.context, self.request)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "PREFLIGHT_BLOCKED", 4
+        ))
+        self.assertFalse(self.first_path.exists())
+
+    def test_replay_commit_conflict_leaves_the_uncommitted_receipt(self) -> None:
+        self.first_commit.parent.mkdir(parents=True)
+        self.first_commit.write_bytes(b'{"existing":true}\n')
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "RECEIPT_CONFLICT", 6
+        ))
+        self.assertTrue(self.first_path.is_file())
+        self.assertEqual(self.first_commit.read_bytes(), b'{"existing":true}\n')
+
+    def test_replay_mismatch_leaves_no_receipt_or_marker(self) -> None:
+        with (
+            patch.object(orchestration, "read_status", return_value=orchestration.StatusReport(
+                "ACQUIRING", None, True, True, True, False, ()
+            )),
+            patch.object(orchestration, "run_preflight", return_value=orchestration.PreflightReport(
+                "ACQUIRING", "PASS", "x" * 64, len(self.inventory.snapshots), 0, ()
+            )),
+            patch.object(orchestration, "replay_verified_snapshots", return_value=()),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
+            orchestration.write_replay(self.context, self.request)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "REPLAY_MISMATCH", 5
+        ))
+        self.assertFalse(self.first_path.exists())
+        self.assertFalse(self.first_commit.exists())
+
+    def test_execution_id_is_uuid4_and_precedes_replay_loader(self) -> None:
+        order: list[str] = []
+        actual = orchestration.replay_verified_snapshots
+
+        def generated() -> str:
+            order.append("id")
+            return "12345678-1234-4abc-8def-123456789abc"
+
+        def replayed(inputs: object) -> object:
+            order.append("replay")
+            return actual(inputs)
+
+        with (
+            patch.object(orchestration, "_execution_id", side_effect=generated),
+            patch.object(orchestration, "replay_verified_snapshots", side_effect=replayed),
+        ):
+            report = self._write()
+        self.assertEqual(order[0], "id")
+        self.assertEqual(json.loads(report.path.read_bytes())["execution_id"],
+                         "12345678-1234-4abc-8def-123456789abc")
+        self.assertRegex(orchestration._execution_id(),
+                         r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+    def test_replay_uses_no_network_entry_point(self) -> None:
+        with (
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("network")),
+            patch.object(socket, "socket", side_effect=AssertionError("network")),
+        ):
+            self._write()
+
+    def test_replay_rebinds_receipt_inode_and_bytes_before_marker(self) -> None:
+        displaced = self.first_path.with_name("first.displaced.json")
+
+        def attack_before_marker(
+            _root: Path, *, schema_name: str, **_kwargs: object
+        ) -> None:
+            if schema_name != "v5_2_source_receipt_commit.schema.json":
+                return
+            self.first_path.rename(displaced)
+            self.first_path.write_bytes(b"attacker-replacement\n")
+
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING", "PASS", "x" * 64, len(self.inventory.snapshots), 0, ()
+        )
+        status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration.execution_registry,
+                "validate_source_receipt_schema",
+                side_effect=attack_before_marker,
+            ),
+            patch.object(orchestration, "read_status", return_value=status),
+            patch.object(orchestration, "run_preflight", return_value=preflight),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
+            orchestration.write_replay(self.context, self.request)
+        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
+            "POSTCONDITION_FAILED", 5
+        ))
+        self.assertFalse(self.first_commit.exists())
+        self.assertEqual(self.first_path.read_bytes(), b"attacker-replacement\n")
+        self.assertTrue(displaced.is_file())
+
+    def test_same_paths_allow_one_concurrent_writer(self) -> None:
+        outcomes: list[object] = []
+        gate = threading.Barrier(2)
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING",
+            "PASS",
+            hashlib.sha256(inventory_bytes(self.inventory)).hexdigest(),
+            len(self.inventory.snapshots),
+            0,
+            (),
+        )
+        status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+
+        def write_once() -> None:
+            gate.wait()
+            try:
+                outcomes.append(orchestration.write_replay(self.context, self.request))
+            except orchestration.FinalizationError as exc:
+                outcomes.append(exc)
+
+        with (
+            patched_store_replay(),
+            patch.object(orchestration.execution_registry, "validate_source_receipt_schema"),
+            patch.object(orchestration, "read_status", return_value=status),
+            patch.object(orchestration, "run_preflight", return_value=preflight),
+            patch.object(
+                orchestration,
+                "_utc_now",
+                return_value="2026-07-20T00:00:00.000000Z",
+            ),
+        ):
+            threads = [threading.Thread(target=write_once) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(sum(isinstance(item, orchestration.ReplayReport) for item in outcomes), 1)
+        failures = [item for item in outcomes if isinstance(item, orchestration.FinalizationError)]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].exit_code, 6)
+
+
+class ReplayGitIntegrationTests(unittest.TestCase):
+    def test_write_replay_uses_real_git_bound_schema_validator(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            root, run_spec = fixture.make_repo(Path(directory))
+            inputs = store_inputs()
+            with patched_store_replay():
+                inventory = dataclasses.replace(
+                    build_inventory(inputs), run_id=run_spec.run_id
+                )
+            registry = ExecutionRegistryState("ACQUIRING", 7, "a" * 64, "b" * 64)
+            checkpoint = AcquisitionCheckpoint(
+                9, "c" * 64, "d" * 64, "REMAINING",
+                "2026-07-20T00:00:00.000000Z", "e" * 40, "f" * 64,
+                (), (), (), (), (), (), (), (), (), (),
+            )
+            git_head = subprocess.run(
+                ("git", "rev-parse", "HEAD"), cwd=root, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            context = orchestration.FinalizationContext(
+                root,
+                root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                root / "protocols/v5_2_qd/historical_source_acquisition.json",
+                root / "audit/v5_1_bt/protected_raw_inventory.json",
+                run_spec,
+                registry,
+                checkpoint,
+                inputs,
+                inventory,
+                "ACQUIRING",
+                git_head,
+                (),
+            )
+            source_root = root / "data/v5_2_qd/historical/sources"
+            source_root.mkdir(parents=True)
+            request = orchestration.ReplayRequest(
+                root / "audit/v5_2_qd/historical/acquisition/source_replays/replay.json",
+                root / "audit/v5_2_qd/historical/acquisition/source_replays/replay.commit.json",
+            )
+            preflight = orchestration.PreflightReport(
+                "ACQUIRING", "PASS", hashlib.sha256(inventory_bytes(inventory)).hexdigest(),
+                len(inventory.snapshots), 0, (),
+            )
+            status = orchestration.StatusReport("ACQUIRING", None, True, True, True, False, ())
+            loaded = LoadedSnapshotStore(inventory, ())
+            validator = orchestration.execution_registry.validate_source_receipt_schema
+            with (
+                patch.object(orchestration, "read_status", return_value=status),
+                patch.object(orchestration, "run_preflight", return_value=preflight),
+                patch.object(orchestration, "load_snapshot_store_from_fd", return_value=loaded),
+                patch.object(orchestration, "replay_verified_snapshots", return_value=()),
+                patch.object(orchestration, "build_inventory", return_value=inventory),
+                patch.object(
+                    orchestration.execution_registry,
+                    "validate_source_receipt_schema", wraps=validator,
+                ) as validated,
+            ):
+                report = orchestration.write_replay(context, request)
+            self.assertEqual(report.path, request.write_receipt)
+            self.assertEqual(validated.call_count, 2)
+            self.assertEqual(validated.call_args_list[0].kwargs["schema_name"],
+                             "v5_2_clean_source_replay_receipt.schema.json")
+            self.assertEqual(validated.call_args_list[1].kwargs["schema_name"],
+                             "v5_2_source_receipt_commit.schema.json")
 
 
 class ReviewGitIntegrationTests(unittest.TestCase):

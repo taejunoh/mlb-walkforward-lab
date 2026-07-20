@@ -10,9 +10,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import execution_registry
+from . import v52_snapshot_store
 from .execution_registry import (
     AcquisitionCheckpoint,
     ExecutionRegistryState,
@@ -49,7 +52,11 @@ from .v52_snapshot_store import (
     read_inventory_from_fd,
 )
 from .v52_source_contracts import canonical_json_bytes
-from .v52_verify_sources import load_snapshot_replay_inputs
+from .v52_verify_sources import (
+    NormalizedSnapshot,
+    SnapshotReplayInputs,
+    load_snapshot_replay_inputs,
+)
 from . import v52_timezone_review
 
 
@@ -60,6 +67,7 @@ _CHECKPOINT_ROOT = Path("audit/v5_2_qd/historical/execution/acquisition_checkpoi
 _TIMEZONE_SEAL = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json")
 _SOURCE_ROOT_RELATIVE = Path("data/v5_2_qd/historical/sources")
 _SOURCE_REVIEW_PREFIX = "audit/v5_2_qd/historical/acquisition/source_reviews/"
+_SOURCE_REPLAY_PREFIX = "audit/v5_2_qd/historical/acquisition/source_replays/"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_QUERY_IDS_DOCUMENT_BYTES = 1024 * 1024
 
@@ -149,6 +157,12 @@ class ReviewRequest:
     reviewer_role: str
     decision: Literal["APPROVED", "REJECTED"]
     query_ids_file: Path
+    write_receipt: Path
+    write_commit: Path
+
+
+@dataclass(frozen=True)
+class ReplayRequest:
     write_receipt: Path
     write_commit: Path
 
@@ -1049,6 +1063,104 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _execution_id() -> str:
+    """Return a fresh canonical UUIDv4 without consulting the filesystem."""
+    raw = bytearray(secrets.token_bytes(16))
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def replay_verified_snapshots(
+    inputs: SnapshotReplayInputs,
+) -> tuple[NormalizedSnapshot, ...]:
+    """Late-bind the pure snapshot engine so isolated replay tests stay hermetic."""
+    return v52_snapshot_store.replay_verified_snapshots(inputs)
+
+
+def _validate_receipt_destination(
+    root: Path, path: Path, *, expected_prefix: str, label: str
+) -> str:
+    """Reject non-explicit destinations before replaying any source evidence."""
+    try:
+        relative = v52_timezone_review._relative(root, path, label)
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    lexical = relative.as_posix()
+    if (
+        not lexical.startswith(expected_prefix)
+        or len(relative.parts) <= len(Path(expected_prefix).parts) - 1
+        or relative.name in {"", ".", ".."}
+    ):
+        raise FinalizationError(
+            "PATH_UNSAFE", f"{label} is outside its namespace", (lexical,), 5
+        )
+    return lexical
+
+
+def _load_clean_replay_inventory(context: FinalizationContext) -> SourceInventory:
+    """Authenticate the published store and reproduce its six-engine projection."""
+    if context.snapshot_inputs is None:
+        raise FinalizationError("AUTHORITY_MISSING", "snapshot inputs are missing", (), 3)
+    try:
+        handle = _open_optional_trusted_descendant(context.root, _SOURCE_ROOT_RELATIVE)
+    except ValueError as exc:
+        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
+    if handle is None:
+        raise FinalizationError(
+            "REPLAY_MISMATCH", "published source inventory is unavailable", (), 5
+        )
+    try:
+        _assert_trusted_root(handle)
+        loaded = load_snapshot_store_from_fd(handle.descriptors[-1], context.snapshot_inputs)
+        _assert_trusted_root(handle)
+        replayed = replay_verified_snapshots(context.snapshot_inputs.replay)
+        rebuilt = build_inventory(context.snapshot_inputs)
+    except (LockHeld, SnapshotStoreError, OSError, TypeError, ValueError) as exc:
+        raise FinalizationError(
+            "REPLAY_MISMATCH", "clean replay projection differs", (), 5
+        ) from exc
+    finally:
+        _close_descriptors(handle.descriptors)
+    if (
+        replayed != loaded.snapshots
+        or inventory_bytes(rebuilt) != inventory_bytes(loaded.inventory)
+    ):
+        raise FinalizationError(
+            "REPLAY_MISMATCH", "clean replay projection differs", (), 5
+        )
+    return loaded.inventory
+
+
+def _clean_replay_payload(
+    context: FinalizationContext, inventory: SourceInventory, execution_id: str
+) -> dict[str, object]:
+    if (
+        context.run_spec is None
+        or context.snapshot_inputs is None
+        or context.git_head is None
+    ):
+        raise FinalizationError("AUTHORITY_MISSING", "replay authority is missing", (), 3)
+    return {
+        "schema_version": 1,
+        "receipt_kind": "CLEAN_SOURCE_REPLAY",
+        "run_id": context.run_spec.run_id,
+        "critical_errors": [],
+        "execution_id": execution_id,
+        "status": "PASS",
+        "network_attempts": 0,
+        "reviewed_query_ids": list(inventory.logical_query_ids),
+        "inventory_sha256": hashlib.sha256(inventory_bytes(inventory)).hexdigest(),
+        "snapshot_sha256s": list(inventory.snapshot_sha256s),
+        "run_spec": context.snapshot_inputs.bindings.run_spec.as_mapping(),
+        "acquisition_contract": (
+            context.snapshot_inputs.bindings.acquisition_contract.as_mapping()
+        ),
+        "git_head": context.git_head,
+        "recorded_at_utc": _utc_now(),
+    }
+
+
 def _load_query_ids_document(
     root: Path, path: Path
 ) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -1350,9 +1462,136 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
     )
 
 
+def write_replay(context: FinalizationContext, request: ReplayRequest) -> ReplayReport:
+    """Record one explicit, fully offline reproduction of the published sources."""
+    execution_id = _execution_id()
+    context = _require_mutable_context(context, phase="ACQUIRING")
+    receipt_path = _validate_receipt_destination(
+        context.root,
+        request.write_receipt,
+        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        label="source replay receipt",
+    )
+    commit_path = _validate_receipt_destination(
+        context.root,
+        request.write_commit,
+        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        label="source replay commit",
+    )
+    if receipt_path == commit_path:
+        raise FinalizationError(
+            "PATH_UNSAFE", "source receipt and commit marker must be distinct", (), 5
+        )
+    status = read_status(context)
+    if not status.replay_ready:
+        raise FinalizationError(
+            "PREFLIGHT_BLOCKED",
+            "replay requires an authenticated published inventory",
+            (),
+            4,
+        )
+    preflight = run_preflight(context)
+    if preflight.status != "PASS":
+        raise FinalizationError(
+            "PREFLIGHT_BLOCKED", "replay requires passing preflight", (), 4
+        )
+    inventory = _load_clean_replay_inventory(context)
+    payload = _clean_replay_payload(context, inventory, execution_id)
+
+    def rebind_dependencies() -> None:
+        if run_preflight(context) != preflight:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED", "preflight changed before publication", (), 5
+            )
+        rebound_inventory = _load_clean_replay_inventory(context)
+        if inventory_bytes(rebound_inventory) != inventory_bytes(inventory):
+            raise FinalizationError(
+                "POSTCONDITION_FAILED", "clean replay changed before publication", (), 5
+            )
+
+    receipt = _write_validated_receipt(
+        context.root,
+        request.write_receipt,
+        payload,
+        schema_name="v5_2_clean_source_replay_receipt.schema.json",
+        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        final_rebind=rebind_dependencies,
+    )
+    if context.run_spec is None or context.snapshot_inputs is None or context.git_head is None:
+        raise FinalizationError("AUTHORITY_MISSING", "replay authority is missing", (), 3)
+    marker_payload: dict[str, object] = {
+        "schema_version": 1,
+        "receipt_kind": "SOURCE_RECEIPT_COMMIT",
+        "committed_receipt_kind": "CLEAN_SOURCE_REPLAY",
+        "run_id": context.run_spec.run_id,
+        "critical_errors": [],
+        "source_receipt": {
+            "path": receipt.path.relative_to(context.root).as_posix(),
+            "sha256": receipt.sha256,
+        },
+        "run_spec": context.snapshot_inputs.bindings.run_spec.as_mapping(),
+        "acquisition_contract": (
+            context.snapshot_inputs.bindings.acquisition_contract.as_mapping()
+        ),
+        "git_head": context.git_head,
+        "occurred_at_utc": _utc_now(),
+    }
+
+    def rebind_marker_dependencies() -> None:
+        rebind_dependencies()
+        expected_binding = {
+            "path": receipt.path.relative_to(context.root).as_posix(),
+            "sha256": receipt.sha256,
+        }
+        if marker_payload["source_receipt"] != expected_binding:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt commit binding changed before publication",
+                (expected_binding["path"],),
+                5,
+            )
+        try:
+            v52_timezone_review._rebind_safe_snapshot(
+                context.root,
+                receipt.snapshot,
+                "committed source receipt",
+                max_bytes=len(receipt.snapshot.contents),
+            )
+        except ValueError as exc:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt changed before commit publication",
+                (expected_binding["path"],),
+                5,
+            ) from exc
+        if hashlib.sha256(receipt.snapshot.contents).hexdigest() != receipt.sha256:
+            raise FinalizationError(
+                "POSTCONDITION_FAILED",
+                "source receipt hash changed before commit publication",
+                (expected_binding["path"],),
+                5,
+            )
+
+    marker = _write_validated_receipt(
+        context.root,
+        request.write_commit,
+        marker_payload,
+        schema_name="v5_2_source_receipt_commit.schema.json",
+        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        pre_write_rebind=rebind_marker_dependencies,
+    )
+    return ReplayReport(
+        receipt.path,
+        receipt.sha256,
+        "CLEAN_SOURCE_REPLAY",
+        marker.path,
+        marker.sha256,
+    )
+
+
 __all__ = [
     "Blocker", "CommonArgs", "FinalizationContext", "FinalizationError",
     "PreflightReport", "PublishReport", "ReceiptReport", "ReplayReport",
-    "ReviewReport", "ReviewRequest", "StatusReport", "build_context",
-    "publish_inventory", "read_status", "run_preflight", "write_review",
+    "ReplayRequest", "ReviewReport", "ReviewRequest", "StatusReport", "build_context",
+    "publish_inventory", "read_status", "run_preflight", "write_replay", "write_review",
 ]
