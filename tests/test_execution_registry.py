@@ -5568,7 +5568,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                     }
                     marker.write_bytes(canonical_json_bytes(payload) + b"\n")
                 with self.assertRaisesRegex(
-                    ValueError, "artifact|source|evidence|alias|regular|unsafe"
+                    ValueError,
+                    "artifact|source|evidence|alias|regular|unsafe|validation receipt|path",
                 ):
                     self.registry.advance_execution_phase(
                         root,
