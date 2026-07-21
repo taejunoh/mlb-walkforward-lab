@@ -17,6 +17,7 @@ from typing import Any
 from .v52_source_orchestration import (
     AdvanceRequest,
     CommonArgs,
+    FinalizationContext,
     FinalizationError,
     ReplayRequest,
     ReviewRequest,
@@ -155,9 +156,33 @@ def _common_args(namespace: argparse.Namespace) -> CommonArgs:
     )
 
 
+def _validate_namespace(namespace: argparse.Namespace) -> None:
+    """Validate normalized argument relationships before any service call."""
+    if namespace.command != "advance":
+        return
+    review_receipts = tuple(namespace.review_receipt or ())
+    replay_receipts = tuple(namespace.replay_receipt or ())
+    if not review_receipts:
+        raise CliUsageError("advance requires at least one --review-receipt value")
+    if len(replay_receipts) != 2:
+        raise CliUsageError("advance requires exactly two --replay-receipt values")
+
+
+def _build_context(common: CommonArgs) -> FinalizationContext:
+    try:
+        return build_context(common)
+    except (OSError, ValueError) as exc:
+        raise FinalizationError(
+            "AUTHORITY_MALFORMED",
+            "finalization authority is unavailable or unsafe",
+            (str(common.root),),
+            3,
+        ) from exc
+
+
 def _dispatch(namespace: argparse.Namespace) -> tuple[object, str]:
     common = _common_args(namespace)
-    context = build_context(common)
+    context = _build_context(common)
     command = namespace.command
     if command == "status":
         report = read_status(context)
@@ -186,8 +211,6 @@ def _dispatch(namespace: argparse.Namespace) -> tuple[object, str]:
     if command == "advance":
         review_receipts = tuple(namespace.review_receipt or ())
         replay_receipts = tuple(namespace.replay_receipt or ())
-        if len(replay_receipts) != 2:
-            raise CliUsageError("advance requires exactly two --replay-receipt values")
         request = AdvanceRequest(
             review_receipts=review_receipts,
             replay_receipts=(replay_receipts[0], replay_receipts[1]),
@@ -257,6 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         namespace = parser.parse_args(raw)
         command = namespace.command
         machine = bool(namespace.json)
+        _validate_namespace(namespace)
         result, phase = _dispatch(namespace)
     except CliUsageError as exc:
         return _emit_failure(

@@ -164,6 +164,86 @@ class CliTests(unittest.TestCase):
             self.assertEqual(value["error_code"], "USAGE_ERROR")
             advance.assert_not_called()
 
+    def test_advance_multiplicity_precedes_context_construction(self) -> None:
+        missing = Path("does-not-exist")
+        argv = [
+            "advance",
+            "--root",
+            str(missing),
+            "--review-receipt",
+            "review.commit.json",
+            "--replay-receipt",
+            "only-one.commit.json",
+            "--checkpoint",
+            "checkpoint.json",
+            "--inventory",
+            "inventory.json",
+        ]
+        with patch.object(cli, "build_context") as build_context:
+            code, value, _ = self._run_json(argv)
+        self.assertEqual(code, 2)
+        self.assertEqual(value["error_code"], "USAGE_ERROR")
+        build_context.assert_not_called()
+
+    def test_context_construction_failures_are_stable_authority_errors(self) -> None:
+        for failure in (ValueError("invalid root"), PermissionError("denied")):
+            with self.subTest(failure=type(failure).__name__), patch.object(
+                cli, "build_context", side_effect=failure
+            ):
+                code, value, _ = self._run_json(
+                    ["status", "--root", "unavailable-root"]
+                )
+            self.assertEqual(code, 3)
+            self.assertEqual(value["error_code"], "AUTHORITY_MALFORMED")
+            self.assertEqual(
+                value["message"], "finalization authority is unavailable or unsafe"
+            )
+            self.assertEqual(value["paths"], ["unavailable-root"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            code, value, _ = self._run_json(
+                ["status", "--root", str(missing)]
+            )
+        self.assertEqual(code, 3)
+        self.assertEqual(value["error_code"], "AUTHORITY_MALFORMED")
+        self.assertEqual(value["paths"], [str(missing)])
+
+    def test_context_construction_human_error_has_no_traceback_or_exit_one(self) -> None:
+        with patch.object(
+            cli, "build_context", side_effect=PermissionError("denied")
+        ), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
+            "sys.stderr", new_callable=io.StringIO
+        ) as stderr:
+            code = cli.main(["status", "--root", "inaccessible", "--quiet"])
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("finalization authority is unavailable or unsafe", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_service_error_exit_codes_three_through_seven_are_preserved(self) -> None:
+        for exit_code in range(3, 8):
+            failure = orchestration.FinalizationError(
+                f"SERVICE_{exit_code}", f"failure {exit_code}", ("x",), exit_code
+            )
+            with self.subTest(exit_code=exit_code), patch.object(
+                cli, "build_context", side_effect=failure
+            ):
+                code, value, _ = self._run_json(["status"])
+            self.assertEqual(code, exit_code)
+            self.assertEqual(value["error_code"], f"SERVICE_{exit_code}")
+            self.assertEqual(value["paths"], ["x"])
+
+            with patch.object(
+                cli, "build_context", side_effect=failure
+            ), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as stderr:
+                human_code = cli.main(["status", "--quiet"])
+            self.assertEqual(human_code, exit_code)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), f"error: failure {exit_code}\n")
+
     def test_json_usage_service_and_keyboard_errors_have_stable_streams(self) -> None:
         code, value, output = self._run_json(["status", "--unknown"])
         self.assertEqual(code, 2)
