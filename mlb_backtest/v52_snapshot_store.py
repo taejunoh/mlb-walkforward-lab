@@ -22,6 +22,7 @@ from typing import Literal
 
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
+from .secure_fs import TrustedRoot, open_trusted_root
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import (
     SnapshotReplayInputs,
@@ -691,15 +692,12 @@ class _ReadBinding:
 
 def read_inventory(root: Path) -> SourceInventory:
     """Read and canonically parse the committed inventory without mutating the store."""
-    held = _open_readonly_root(root)
-    try:
-        _reject_unowned_lock(held)
-        _, _, inventory = _read_inventory_bindings(held)
+    with _open_path_capability(root) as trusted:
+        inventory = read_inventory_from_fd(trusted.root_fd)
         _load_test_hook("before_read_inventory_return")
-        _reject_unowned_lock(held)
+        _recheck_unowned_lock(trusted)
+        _assert_path_capability(trusted)
         return inventory
-    finally:
-        _close_directory(held)
 
 
 def read_inventory_from_fd(source_root_fd: int) -> SourceInventory:
@@ -716,12 +714,12 @@ def read_inventory_from_fd(source_root_fd: int) -> SourceInventory:
 
 def load_snapshot_store(root: Path, inputs: SnapshotStoreInputs) -> LoadedSnapshotStore:
     """Read only an exactly replayable committed store; never repair its residue."""
-    held = _open_readonly_root(root)
-    try:
-        _reject_unowned_lock(held)
-        return _load_snapshot_store_held(held, inputs, owned_lock=None)
-    finally:
-        _close_directory(held)
+    with _open_path_capability(root) as trusted:
+        result = load_snapshot_store_from_fd(trusted.root_fd, inputs)
+        _load_test_hook("before_path_load_return")
+        _recheck_unowned_lock(trusted)
+        _assert_path_capability(trusted)
+        return result
 
 
 def load_snapshot_store_from_fd(
@@ -863,6 +861,33 @@ def _open_readonly_root(root: Path) -> _HeldDirectory:
         except (OSError, UnboundLocalError):
             pass
         raise PublishError("could not safely open snapshot store root") from exc
+
+
+def _open_path_capability(root: Path) -> TrustedRoot:
+    """Open the public pathname boundary once and keep it bound through return."""
+    if not isinstance(root, Path):
+        raise TypeError("snapshot store root must be a pathlib.Path")
+    if not root.is_absolute():
+        raise ValueError("snapshot store root must be absolute")
+    try:
+        return open_trusted_root(root)
+    except (OSError, ValueError) as exc:
+        raise PublishError("could not safely open snapshot store root") from exc
+
+
+def _assert_path_capability(trusted: TrustedRoot) -> None:
+    try:
+        trusted.assert_bound()
+    except ValueError as exc:
+        raise PublishError("snapshot store root changed while operating") from exc
+
+
+def _recheck_unowned_lock(trusted: TrustedRoot) -> None:
+    held = _duplicate_directory_capability(trusted.root_fd)
+    try:
+        _reject_unowned_lock(held)
+    finally:
+        _close_directory(held)
 
 
 def _reject_unowned_lock(root: _HeldDirectory) -> None:
@@ -1085,13 +1110,21 @@ def publish_snapshot_store(
     safe, immutable residue which an identical retry can reuse.
     """
     _validate_publish_arguments(root, inventory, inputs, lock_owner)
-    root_dir = _open_root_directory(root)
-    try:
-        return _publish_snapshot_store_held(
-            root_dir, inventory, inputs, lock_owner=lock_owner, detect_committed=False
-        ).receipt
-    finally:
-        _close_directory(root_dir)
+    with _open_path_capability(root) as trusted:
+        root_dir = _duplicate_directory_capability(trusted.root_fd)
+        try:
+            result = _publish_snapshot_store_held(
+                root_dir,
+                inventory,
+                inputs,
+                lock_owner=lock_owner,
+                detect_committed=False,
+            ).receipt
+        finally:
+            _close_directory(root_dir)
+        _publish_test_hook("before_path_publish_return")
+        _assert_path_capability(trusted)
+        return result
 
 
 def publish_snapshot_store_from_fd(

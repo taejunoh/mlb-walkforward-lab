@@ -187,7 +187,7 @@ def render_evidence() -> tuple[bytes, bytes]:
     inputs = fixture.store_inputs()
     try:
         with TemporaryDirectory() as directory, fixture.patched_store_replay():
-            root = Path(directory)
+            root = Path(directory).resolve()
             inventory = store.build_inventory(inputs)
             receipt = store.publish_snapshot_store(
                 root, inventory, inputs, lock_owner="contract-evidence"

@@ -1549,6 +1549,123 @@ class AttackTests(unittest.TestCase):
                 root, inventory, store_inputs(), lock_owner="attack-test"
             )
 
+    def test_path_publish_rejects_regular_ancestor_swap_without_external_write(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "store"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            canary = replacement / "must-not-change"
+            canary.write_bytes(b"external\n")
+
+            def swap(stage):
+                if stage == "before_path_publish_return":
+                    os.rename(root, base / "moved-store")
+                    os.rename(replacement, root)
+
+            with patch.object(store, "_publish_test_hook", side_effect=swap):
+                with self.assertRaises(PublishError):
+                    self._publish(root, inventory)
+            self.assertEqual((root / "must-not-change").read_bytes(), b"external\n")
+
+    def test_path_read_rejects_symlink_ancestor_swap(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, read_inventory
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "store"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            canary = replacement / "must-not-change"
+            canary.write_bytes(b"external\n")
+            self._publish(root, inventory)
+
+            def swap(stage):
+                if stage == "before_read_inventory_return":
+                    os.rename(root, base / "moved-store")
+                    os.symlink(replacement, root)
+
+            with patch.object(store, "_load_test_hook", side_effect=swap):
+                with self.assertRaises(PublishError):
+                    read_inventory(root)
+            self.assertEqual(canary.read_bytes(), b"external\n")
+
+    def test_path_load_rejects_root_replacement_before_final_return(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import PublishError, load_snapshot_store
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "store"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            self._publish(root, inventory)
+
+            def swap(stage):
+                if stage == "before_path_load_return":
+                    os.rename(root, base / "moved-store")
+                    os.rename(replacement, root)
+
+            with patch.object(store, "_load_test_hook", side_effect=swap):
+                with self.assertRaises(PublishError):
+                    load_snapshot_store(root, store_inputs())
+
+    def test_path_load_rechecks_lock_created_at_return_boundary_without_fd_leak(self):
+        import mlb_backtest.v52_snapshot_store as store
+        from mlb_backtest.v52_snapshot_store import LockHeld, load_snapshot_store
+
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._publish(root, inventory)
+            lock = root / ".snapshot-store.lock"
+            fd_directory = Path("/dev/fd")
+            if not fd_directory.is_dir():
+                self.skipTest("platform does not expose /dev/fd")
+
+            def create_lock(stage):
+                if stage == "before_path_load_return":
+                    lock.write_bytes(b"arrived during load\n")
+
+            before = set(os.listdir(fd_directory))
+            with patched_store_replay(), patch.object(
+                store, "_load_test_hook", side_effect=create_lock
+            ):
+                with self.assertRaises(LockHeld):
+                    load_snapshot_store(root, store_inputs())
+            self.assertEqual(set(os.listdir(fd_directory)), before)
+            self.assertEqual(lock.read_bytes(), b"arrived during load\n")
+
+    def test_path_adapters_close_capability_fds_on_failures(self):
+        from mlb_backtest.v52_snapshot_store import LockHeld, PublishError, read_inventory
+
+        fd_directory = Path("/dev/fd")
+        if not fd_directory.is_dir():
+            self.skipTest("platform does not expose /dev/fd")
+        inventory = self._inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            before = set(os.listdir(fd_directory))
+            with self.assertRaises(PublishError):
+                read_inventory(root)
+            self.assertEqual(set(os.listdir(fd_directory)), before)
+
+            (root / ".snapshot-store.lock").write_bytes(b"foreign lock\n")
+            before = set(os.listdir(fd_directory))
+            with self.assertRaises(LockHeld):
+                self._publish(root, inventory)
+            self.assertEqual(set(os.listdir(fd_directory)), before)
+
     def test_publisher_rejects_special_authoritative_leaves_without_opening_or_mutating_them(self):
         """A FIFO must be refused by metadata, never opened for a blocking read."""
         import mlb_backtest.v52_snapshot_store as store
@@ -1713,7 +1830,7 @@ class AttackTests(unittest.TestCase):
         inventory = self._inventory()
         for mode in ("publisher", "loader"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir="/tmp", prefix="v52-") as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 self.assertTrue(root.is_absolute())
                 target = root / inventory.snapshots[0].relative_path
                 if mode == "publisher":
@@ -1763,6 +1880,18 @@ class AttackTests(unittest.TestCase):
                     swapped = False
                     outside_state = None
 
+                    def attacker_visible_state():
+                        return {
+                            relative: (path.read_bytes(), path.stat().st_ino)
+                            for path in outside.rglob("*")
+                            if path.is_file()
+                            for relative in (path.relative_to(outside),)
+                            if not (
+                                target_kind == "root"
+                                and relative.parts[0] == "moved-root"
+                            )
+                        }
+
                     def attack(stage):
                         nonlocal swapped, outside_state
                         if stage != "after_directory_open_before_temp_publish" or swapped:
@@ -1779,22 +1908,13 @@ class AttackTests(unittest.TestCase):
                             os.symlink(outside, target)
                         else:
                             target.mkdir()
-                        outside_state = {
-                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
-                            for path in outside.rglob("*") if path.is_file()
-                        }
+                        outside_state = attacker_visible_state()
 
                     with patch.object(store, "_publish_test_hook", side_effect=attack):
                         with self.assertRaises(PublishError):
                             self._publish(root, inventory)
                     self.assertTrue(swapped)
-                    self.assertEqual(
-                        {
-                            path.relative_to(outside): (path.read_bytes(), path.stat().st_ino)
-                            for path in outside.rglob("*") if path.is_file()
-                        },
-                        outside_state,
-                    )
+                    self.assertEqual(attacker_visible_state(), outside_state)
                     self.assertTrue(os.path.lexists({
                         "root": root,
                         "season": root / str(first.season),
@@ -2138,7 +2258,7 @@ class EvidenceTests(unittest.TestCase):
             inputs = store_inputs()
             inventory = store.build_inventory(inputs)
             receipt = store.publish_snapshot_store(
-                Path(directory), inventory, inputs, lock_owner="evidence-test"
+                Path(directory).resolve(), inventory, inputs, lock_owner="evidence-test"
             )
         self.assertEqual(value["run_id"], "fixture-run")
         self.assertEqual(value["inventory_sha256"], receipt.inventory_sha256)
@@ -2218,7 +2338,7 @@ class EvidenceTests(unittest.TestCase):
             urllib.request, "urlopen", side_effect=AssertionError("network")
         ), patch.object(socket, "socket", side_effect=AssertionError("network")):
             with tempfile.TemporaryDirectory() as directory:
-                output = Path(directory)
+                output = Path(directory).resolve()
                 generated_json, generated_markdown = writer.generate_to(output)
                 self.assertEqual(
                     generated_json,
