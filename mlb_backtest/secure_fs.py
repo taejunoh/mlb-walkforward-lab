@@ -146,7 +146,7 @@ def open_trusted_root(
         _secure_fs_test_hook("before_return_revalidation")
         trusted.assert_bound()
         if expected is not None and binding != expected:
-            raise ValueError("trusted root binding differs from expected")
+            raise ValueError("trusted root binding mismatch: differs from expected")
         return trusted
     except (OSError, ValueError) as exc:
         if trusted is not None:

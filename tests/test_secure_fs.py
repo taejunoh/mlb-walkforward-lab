@@ -1,3 +1,4 @@
+import builtins
 import os
 import tempfile
 import unittest
@@ -42,15 +43,50 @@ class TrustedRootTests(unittest.TestCase):
         canary = self.path / "canary"
         root.mkdir(parents=True)
         canary.mkdir()
+        canary_file = canary / "contents.bin"
+        canary_bytes = b"external canary contents"
+        canary_file.write_bytes(canary_bytes)
+        canary_identity = (canary_file.stat().st_dev, canary_file.stat().st_ino)
+        original_open = builtins.open
+        original_read = os.read
+        original_read_bytes = Path.read_bytes
+
+        def is_canary_path(value: object) -> bool:
+            try:
+                return os.path.realpath(value) == os.fspath(canary_file)
+            except TypeError:
+                return False
+
+        def guard_open(file: object, *args: object, **kwargs: object) -> object:
+            if is_canary_path(file):
+                raise AssertionError("external canary contents were opened")
+            return original_open(file, *args, **kwargs)
+
+        def guard_read(fd: int, size: int) -> bytes:
+            identity = (os.fstat(fd).st_dev, os.fstat(fd).st_ino)
+            if identity == canary_identity:
+                raise AssertionError("external canary contents were read")
+            return original_read(fd, size)
+
+        def guard_read_bytes(value: Path) -> bytes:
+            if is_canary_path(value):
+                raise AssertionError("external canary contents were read")
+            return original_read_bytes(value)
 
         def replace(stage: str, component: str | None = None) -> None:
             if stage == "after_component_open" and component == "parent":
                 parent.rename(self.path / "original-parent")
                 parent.symlink_to(canary, target_is_directory=True)
 
-        with patch.object(secure_fs, "_secure_fs_test_hook", side_effect=replace):
+        with (
+            patch.object(secure_fs, "_secure_fs_test_hook", side_effect=replace),
+            patch.object(secure_fs.os, "read", side_effect=guard_read),
+            patch.object(Path, "read_bytes", side_effect=guard_read_bytes),
+            patch.object(builtins, "open", side_effect=guard_open),
+        ):
             with self.assertRaisesRegex(ValueError, "unsafe"):
                 secure_fs.open_trusted_root(root)
+        self.assertEqual(canary_file.read_bytes(), canary_bytes)
 
     def test_expected_binding_rejects_replacement_between_operations(self):
         root = self.path / "root"
@@ -59,7 +95,7 @@ class TrustedRootTests(unittest.TestCase):
             binding = trusted.binding
         root.rename(self.path / "original")
         root.mkdir()
-        with self.assertRaisesRegex(ValueError, "differs from expected"):
+        with self.assertRaisesRegex(ValueError, "trusted root binding mismatch"):
             secure_fs.open_trusted_root(root, expected=binding)
 
     def test_close_is_idempotent_and_use_after_close_fails_closed(self):
@@ -103,7 +139,7 @@ class TrustedRootTests(unittest.TestCase):
         root.mkdir()
         before_failure = _fd_count()
         self.assertIsNotNone(before_failure)
-        with self.assertRaisesRegex(ValueError, "differs from expected"):
+        with self.assertRaisesRegex(ValueError, "trusted root binding mismatch"):
             secure_fs.open_trusted_root(root, expected=expected)
         self.assertEqual(_fd_count(), before_failure)
 
