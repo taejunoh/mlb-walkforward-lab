@@ -3,8 +3,10 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import inspect
+import io
 import json
 import os
+import ast
 import shutil
 import socket
 import subprocess
@@ -18,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+from mlb_backtest import v52_source_finalize as cli
 from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
 from mlb_backtest.v52_snapshot_store import (
@@ -32,6 +35,182 @@ from tests.v52_snapshot_store_fixture import patched_store_replay, store_inputs
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class CliTests(unittest.TestCase):
+    def _run_json(self, argv: list[str]) -> tuple[int, dict[str, object], str]:
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
+            "sys.stderr", new_callable=io.StringIO
+        ) as stderr:
+            code = cli.main([*argv, "--json"])
+        self.assertEqual(stderr.getvalue(), "")
+        value = json.loads(stdout.getvalue())
+        self.assertEqual(stdout.getvalue(), cli.canonical_json(value) + "\n")
+        return code, value, stdout.getvalue()
+
+    def test_help_lists_all_stages(self) -> None:
+        with self.assertRaises(SystemExit) as caught, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            cli.main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        for command in ("status", "preflight", "publish", "review", "replay", "advance"):
+            self.assertIn(command, stdout.getvalue())
+
+    def test_json_failure_is_one_canonical_stdout_object(self) -> None:
+        with patch.object(
+            cli,
+            "build_context",
+            side_effect=orchestration.FinalizationError("AUTHORITY_MISSING", "missing", ("x",), 3),
+        ), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            code = cli.main(["status", "--json"])
+        self.assertEqual(code, 3)
+        self.assertEqual(stderr.getvalue(), "")
+        value = json.loads(stdout.getvalue())
+        self.assertEqual(value["status"], "ERROR")
+        self.assertEqual(stdout.getvalue(), cli.canonical_json(value) + "\n")
+
+    def test_json_success_serializes_dataclass_paths(self) -> None:
+        report = orchestration.StatusReport("ACQUIRING", None, True, False, False, False, ())
+        context = orchestration.FinalizationContext.absent(Path("."), ())
+        with patch.object(cli, "build_context", return_value=context), patch.object(cli, "read_status", return_value=report), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(cli.main(["status", "--json"]), 0)
+        value = json.loads(stdout.getvalue())
+        self.assertEqual(value["status"], "OK")
+        self.assertEqual(value["phase"], "ACQUIRING")
+        self.assertEqual(stdout.getvalue(), cli.canonical_json(value) + "\n")
+
+    def test_parser_requires_write_commit_for_review_and_replay(self) -> None:
+        for command, extra in (("review", ["--reviewer-identity", "i", "--reviewer-role", "r", "--decision", "APPROVED", "--query-ids-file", "q", "--write-receipt", "r"]), ("replay", ["--write-receipt", "r"])):
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                code = cli.main([command, "--json", *extra])
+            self.assertEqual(code, 2)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(json.loads(stdout.getvalue())["status"], "ERROR")
+
+    def test_conflicting_single_value_option_is_usage_error(self) -> None:
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            code = cli.main(["status", "--json", "--root", "a", "--root", "b"])
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue())["error_code"], "USAGE_ERROR")
+
+    def test_common_defaults_and_arguments_follow_subcommand(self) -> None:
+        namespace = cli._parser().parse_args(
+            ["status", "--root", "r", "--run-spec", "s", "--acquisition-contract", "c", "--protected-inventory", "p"]
+        )
+        self.assertEqual(namespace.root, Path("r"))
+        self.assertEqual(namespace.run_spec, Path("s"))
+        self.assertEqual(namespace.acquisition_contract, Path("c"))
+        self.assertEqual(namespace.protected_inventory, Path("p"))
+        defaults = cli._parser().parse_args(["status"])
+        self.assertEqual(defaults.root, Path("."))
+        self.assertEqual(defaults.run_spec, cli.DEFAULT_RUN_SPEC)
+        self.assertEqual(defaults.acquisition_contract, cli.DEFAULT_CONTRACT)
+        self.assertEqual(defaults.protected_inventory, cli.DEFAULT_PROTECTED)
+
+    def test_each_subcommand_dispatches_public_service_request(self) -> None:
+        context = orchestration.FinalizationContext.absent(Path("."), ())
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "read_status", return_value=orchestration.StatusReport("ABSENT", None, False, False, False, False, ())
+        ) as status:
+            self.assertEqual(cli.main(["status", "--quiet"]), 0)
+            status.assert_called_once_with(context)
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "run_preflight", return_value=orchestration.PreflightReport("ABSENT", "BLOCKED", None, 0, 0, ())
+        ) as preflight:
+            self.assertEqual(cli.main(["preflight", "--quiet"]), 0)
+            preflight.assert_called_once_with(context)
+        publish_report = orchestration.PublishReport("PUBLISHED", "a" * 64, 1)
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "publish_inventory", return_value=publish_report
+        ) as publish:
+            self.assertEqual(cli.main(["publish", "--lock-owner", "owner", "--quiet"]), 0)
+            publish.assert_called_once_with(context, lock_owner="owner")
+        review_report = orchestration.ReviewReport(Path("review.json"), "a" * 64, "SOURCE_REVIEW", Path("review.commit.json"), "b" * 64)
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "write_review", return_value=review_report
+        ) as review:
+            self.assertEqual(cli.main(["review", "--reviewer-identity", "id", "--reviewer-role", "role", "--decision", "APPROVED", "--query-ids-file", "query.json", "--write-receipt", "review.json", "--write-commit", "review.commit.json", "--quiet"]), 0)
+            request = review.call_args.args[1]
+            self.assertEqual(request, orchestration.ReviewRequest("id", "role", "APPROVED", Path("query.json"), Path("review.json"), Path("review.commit.json")))
+        replay_report = orchestration.ReplayReport(Path("replay.json"), "a" * 64, "CLEAN_SOURCE_REPLAY", Path("replay.commit.json"), "b" * 64)
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "write_replay", return_value=replay_report
+        ) as replay:
+            self.assertEqual(cli.main(["replay", "--write-receipt", "replay.json", "--write-commit", "replay.commit.json", "--quiet"]), 0)
+            self.assertEqual(replay.call_args.args[1], orchestration.ReplayRequest(Path("replay.json"), Path("replay.commit.json")))
+        advance_report = orchestration.AdvanceReport("ADVANCED", "SOURCES_READY", "a" * 64)
+        with patch.object(cli, "build_context", return_value=context), patch.object(
+            cli, "advance_sources_ready", return_value=advance_report
+        ) as advance:
+            self.assertEqual(cli.main(["advance", "--review-receipt", "review.commit.json", "--replay-receipt", "replay-one.commit.json", "--replay-receipt", "replay-two.commit.json", "--checkpoint", "checkpoint.json", "--inventory", "inventory.json", "--quiet"]), 0)
+            self.assertEqual(advance.call_args.args[1], orchestration.AdvanceRequest((Path("review.commit.json"),), (Path("replay-one.commit.json"), Path("replay-two.commit.json")), Path("checkpoint.json"), Path("inventory.json")))
+
+    def test_all_single_value_options_allow_same_and_reject_conflict(self) -> None:
+        for option in cli._SINGLE_VALUE_OPTIONS:
+            cli._reject_conflicting_options([option, "same", option, "same"])
+            with self.assertRaises(cli.CliUsageError):
+                cli._reject_conflicting_options([option, "one", option, "two"])
+
+    def test_advance_requires_at_least_one_review_and_exactly_two_replays(self) -> None:
+        context = orchestration.FinalizationContext.absent(Path("."), ())
+        base = ["advance", "--checkpoint", "c", "--inventory", "i", "--review-receipt", "review.commit.json"]
+        for replay_values in (("one.commit.json",), ("one.commit.json", "two.commit.json", "three.commit.json")):
+            argv = [*base]
+            for value in replay_values:
+                argv.extend(("--replay-receipt", value))
+            with patch.object(cli, "build_context", return_value=context), patch.object(cli, "advance_sources_ready") as advance:
+                code, value, _ = self._run_json(argv)
+            self.assertEqual(code, 2)
+            self.assertEqual(value["error_code"], "USAGE_ERROR")
+            advance.assert_not_called()
+
+    def test_json_usage_service_and_keyboard_errors_have_stable_streams(self) -> None:
+        code, value, output = self._run_json(["status", "--unknown"])
+        self.assertEqual(code, 2)
+        self.assertEqual(value["status"], "ERROR")
+        self.assertEqual(output.count("\n"), 1)
+        error = orchestration.FinalizationError("AUTHORITY_MISSING", "missing", ("x",), 3)
+        with patch.object(cli, "build_context", side_effect=error):
+            code, value, _ = self._run_json(["status"])
+        self.assertEqual(code, 3)
+        self.assertEqual(value["paths"], ["x"])
+        with patch.object(cli, "build_context", side_effect=KeyboardInterrupt), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(cli.main(["status", "--json"]), 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_human_errors_use_stderr_and_quiet_suppresses_success_only(self) -> None:
+        with patch.object(cli, "build_context", side_effect=orchestration.FinalizationError("AUTHORITY_MISSING", "missing", ("x",), 3)), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(cli.main(["status", "--quiet"]), 3)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("error: missing", stderr.getvalue())
+        context = orchestration.FinalizationContext.absent(Path("."), ())
+        report = orchestration.StatusReport("ABSENT", None, False, False, False, False, ())
+        with patch.object(cli, "build_context", return_value=context), patch.object(cli, "read_status", return_value=report), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(cli.main(["status", "--quiet"]), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_recursive_json_safe_rendering_and_forbidden_imports(self) -> None:
+        payload = {"path": Path("x"), "nested": (Path("y"), orchestration.Blocker("C", "m"))}
+        rendered = cli.canonical_json(payload)
+        self.assertEqual(json.loads(rendered)["nested"][0], "y")
+        tree = ast.parse(inspect.getsource(cli))
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        imported |= {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if node.module
+        }
+        self.assertNotIn("v52_http", imported)
+        self.assertNotIn("v52_acquire", imported)
 
 
 def tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
