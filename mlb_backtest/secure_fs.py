@@ -416,6 +416,37 @@ def _write_all(descriptor: int, contents: bytes, label: str) -> None:
         offset += written
 
 
+def _revalidate_written_contents(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    contents: bytes,
+    label: str,
+) -> tuple[int, ...]:
+    opened_before = os.fstat(descriptor)
+    named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_regular_single_link(opened_before, label)
+    _require_regular_single_link(named_before, label)
+    identity = _regular_identity(opened_before)
+    if identity != _regular_identity(named_before) or opened_before.st_size != len(contents):
+        raise ValueError(f"unsafe regular file: {label}")
+
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    actual = _read_bounded(descriptor, len(contents), label)
+    opened_after = os.fstat(descriptor)
+    named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_regular_single_link(opened_after, label)
+    _require_regular_single_link(named_after, label)
+    final_identity = _regular_identity(opened_after)
+    if (
+        actual != contents
+        or final_identity != identity
+        or final_identity != _regular_identity(named_after)
+    ):
+        raise ValueError(f"unsafe regular file: {label}")
+    return final_identity
+
+
 def write_exclusive(
     root: TrustedRoot,
     relative: Path,
@@ -437,7 +468,7 @@ def write_exclusive(
             try:
                 descriptor = os.open(
                     parts[-1],
-                    _leaf_open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
+                    _leaf_open_flags(os.O_RDWR | os.O_CREAT | os.O_EXCL),
                     0o600,
                     dir_fd=parent_fd,
                 )
@@ -452,22 +483,17 @@ def write_exclusive(
                 final_rebind()
             root.assert_bound()
             _revalidate_parent_path(root, parts, parent_fd)
-            linked = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-            final = os.fstat(descriptor)
-            _require_regular_single_link(linked, label)
-            _require_regular_single_link(final, label)
-            identity = _regular_identity(final)
-            if identity != _regular_identity(linked):
-                raise ValueError(f"unsafe regular file: {label}")
+            _revalidate_written_contents(
+                parent_fd, parts[-1], descriptor, contents, label
+            )
             os.fsync(parent_fd)
             _secure_fs_test_hook("before_return_revalidation", relative.as_posix())
             root.assert_bound()
             _revalidate_parent_path(root, parts, parent_fd)
-            linked = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-            final = os.fstat(descriptor)
-            if _regular_identity(linked) != _regular_identity(final):
-                raise ValueError(f"unsafe regular file: {label}")
-            return RegularFileSnapshot(relative, contents, _regular_identity(final))
+            identity = _revalidate_written_contents(
+                parent_fd, parts[-1], descriptor, contents, label
+            )
+            return RegularFileSnapshot(relative, contents, identity)
     finally:
         if descriptor >= 0:
             try:
