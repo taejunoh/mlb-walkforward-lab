@@ -10,6 +10,7 @@ import ast
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -270,6 +271,91 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(["status", "--quiet"]), 0)
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_human_success_includes_every_result_field_for_all_commands(self) -> None:
+        cases = (
+            (
+                "status",
+                "ABSENT",
+                orchestration.StatusReport(
+                    "ABSENT", None, False, False, False, False,
+                    (orchestration.Blocker("B", "blocked", ("x",)),),
+                ),
+            ),
+            (
+                "preflight",
+                "ACQUIRING",
+                orchestration.PreflightReport(
+                    "ACQUIRING", "PASS", "a" * 64, 6, 0, ()
+                ),
+            ),
+            (
+                "publish",
+                "ACQUIRING",
+                orchestration.PublishReport("PUBLISHED", "b" * 64, 6),
+            ),
+            (
+                "review",
+                "ACQUIRING",
+                orchestration.ReviewReport(
+                    Path("review.json"), "c" * 64, "SOURCE_REVIEW",
+                    Path("review.commit.json"), "d" * 64,
+                ),
+            ),
+            (
+                "replay",
+                "ACQUIRING",
+                orchestration.ReplayReport(
+                    Path("replay.json"), "e" * 64, "CLEAN_SOURCE_REPLAY",
+                    Path("replay.commit.json"), "f" * 64,
+                ),
+            ),
+            (
+                "advance",
+                "SOURCES_READY",
+                orchestration.AdvanceReport("ADVANCED", "SOURCES_READY", "1" * 64),
+            ),
+        )
+        for command, phase, report in cases:
+            with self.subTest(command=command), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as stdout:
+                cli._emit_success(
+                    command, phase, report, machine=False, quiet=False
+                )
+            self.assertEqual(
+                stdout.getvalue(),
+                f"schema_version={cli.SCHEMA_VERSION} command={command} "
+                f"status=OK phase={phase} "
+                f"result={cli.canonical_json(report)}\n",
+            )
+
+    def test_unordered_json_containers_are_stable_across_hash_seeds(self) -> None:
+        script = (
+            "from pathlib import Path; "
+            "from mlb_backtest.v52_source_finalize import canonical_json; "
+            "value={'mixed': {Path('p'), 's', 7, "
+            "frozenset({('b', 2), ('a', 1)})}}; "
+            "print(canonical_json(value))"
+        )
+        outputs = []
+        for seed in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            environment = dict(os.environ)
+            environment["PYTHONHASHSEED"] = seed
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            outputs.append(completed.stdout)
+        self.assertEqual(len(set(outputs)), 1)
+        parsed = json.loads(outputs[0])
+        self.assertCountEqual(parsed["mixed"], ["p", "s", 7, [["a", 1], ["b", 2]]])
+        with self.assertRaises(ValueError):
+            cli.canonical_json({float("nan")})
 
     def test_recursive_json_safe_rendering_and_forbidden_imports(self) -> None:
         payload = {"path": Path("x"), "nested": (Path("y"), orchestration.Blocker("C", "m"))}

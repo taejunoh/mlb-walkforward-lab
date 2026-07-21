@@ -56,9 +56,22 @@ def _json_safe(value: Any) -> Any:
         return _json_safe(dataclasses.asdict(value))
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        normalized = [_json_safe(item) for item in value]
+        return sorted(normalized, key=_canonical_sort_key)
+    if isinstance(value, (tuple, list)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _canonical_sort_key(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 class CliUsageError(Exception):
@@ -240,7 +253,10 @@ def _emit_success(command: str, phase: str, result: object, *, machine: bool, qu
         }
         print(canonical_json(payload))
     elif not quiet:
-        print(f"{command}: OK phase={phase}")
+        print(
+            f"schema_version={SCHEMA_VERSION} command={command} "
+            f"status=OK phase={phase} result={canonical_json(result)}"
+        )
 
 
 def _emit_failure(
