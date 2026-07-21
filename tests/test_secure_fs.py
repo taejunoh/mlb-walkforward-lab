@@ -395,53 +395,34 @@ class SecureFilePrimitiveTests(unittest.TestCase):
         self.assertEqual((result.st_dev, result.st_ino), attacker_identity)
         self.assertEqual(target.read_bytes(), b"attacker")
 
-    def test_attacker_replacement_after_cleanup_auth_is_never_unlinked(self):
+    def test_attacker_replacement_before_return_revalidation_is_never_unlinked(self):
         target = self.root_path / "data.bin"
-        original_match = getattr(secure_fs, "_contents_match", None)
         original_unlink = os.unlink
         attacker_identity = None
 
-        def authenticate_then_replace(*args: object, **kwargs: object) -> bool:
+        def replace_before_return(stage: str, component: str | None = None) -> None:
             nonlocal attacker_identity
-            if original_match is None:
-                raise AssertionError("removed cleanup helper was unexpectedly called")
-            matched = original_match(*args, **kwargs)
-            self.assertTrue(matched)
-            original_unlink(target)
-            target.write_bytes(b"attacker-after-auth")
-            result = target.stat()
-            attacker_identity = (result.st_dev, result.st_ino)
-            return True
+            if stage == "before_return_revalidation":
+                original_unlink(target)
+                target.write_bytes(b"attacker-before-return")
+                result = target.stat()
+                attacker_identity = (result.st_dev, result.st_ino)
 
         with secure_fs.open_trusted_root(self.root_path) as root:
             before = _fd_count()
             with (
                 patch.object(
-                    secure_fs,
-                    "_contents_match",
-                    side_effect=authenticate_then_replace,
-                    create=True,
+                    secure_fs, "_secure_fs_test_hook", side_effect=replace_before_return
                 ),
                 patch.object(secure_fs.os, "unlink", wraps=original_unlink) as unlink,
             ):
-                with self.assertRaisesRegex(RuntimeError, "final rebind failed"):
-                    secure_fs.write_exclusive(
-                        root,
-                        Path("data.bin"),
-                        b"owned",
-                        "test",
-                        final_rebind=lambda: (_ for _ in ()).throw(
-                            RuntimeError("final rebind failed")
-                        ),
-                    )
+                with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                    secure_fs.write_exclusive(root, Path("data.bin"), b"owned", "test")
                 unlink.assert_not_called()
             self.assertEqual(_fd_count(), before)
-        if attacker_identity is None:
-            self.assertEqual(target.read_bytes(), b"owned")
-        else:
-            result = target.stat()
-            self.assertEqual((result.st_dev, result.st_ino), attacker_identity)
-            self.assertEqual(target.read_bytes(), b"attacker-after-auth")
+        result = target.stat()
+        self.assertEqual((result.st_dev, result.st_ino), attacker_identity)
+        self.assertEqual(target.read_bytes(), b"attacker-before-return")
 
     def test_final_rebind_failure_never_unlinks_and_preserves_complete_residue(self):
         target = self.root_path / "data.bin"
