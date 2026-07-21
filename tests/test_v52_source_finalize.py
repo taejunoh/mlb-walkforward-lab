@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.request
 import unittest
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +33,8 @@ from mlb_backtest.v52_snapshot_store import (
     publish_snapshot_store,
 )
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
-from tests.v52_snapshot_store_fixture import patched_store_replay, store_inputs
+from mlb_backtest.v52_verify_sources import snapshot_sort_key
+from tests.v52_snapshot_store_fixture import fake_81, patched_store_replay, store_inputs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -377,6 +379,213 @@ class CliTests(unittest.TestCase):
         }
         self.assertNotIn("v52_http", imported)
         self.assertNotIn("v52_acquire", imported)
+
+
+class FinalizationEndToEndTests(unittest.TestCase):
+    """The public services complete the staged source gate in a real Git repo."""
+
+    @staticmethod
+    def lexists_snapshot(path: Path) -> tuple[int, int, int, int] | None:
+        if not os.path.lexists(path):
+            return None
+        value = path.lstat()
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size)
+
+    def build_finalization_fixture(
+        self, parent: Path
+    ) -> tuple[Path, orchestration.CommonArgs, dict[str, Path], object, tuple[object, ...]]:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        fixture = ExecutionRegistryTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        root, run_spec = fixture.make_repo(parent, remaining_authority=True)
+        fixture.initialize(root, run_spec)
+        fixture.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+        fixture.install_terminal_checkpoint_stub(root)
+        checkpoint = orchestration.load_source_verification_checkpoint(root, run_spec)
+        checkpoint_path = root / orchestration._checkpoint_path(checkpoint)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_contents = canonical_json_bytes(
+            {"fixture": "terminal-checkpoint"}
+        ) + b"\n"
+        self.assertEqual(
+            hashlib.sha256(checkpoint_contents).hexdigest(), checkpoint.receipt_sha256
+        )
+        checkpoint_path.write_bytes(checkpoint_contents)
+
+        def authority(relative: str) -> tuple[Path, str]:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            contents = canonical_json_bytes({"fixture_authority": relative}) + b"\n"
+            path.write_bytes(contents)
+            return path, hashlib.sha256(contents).hexdigest()
+
+        schedule_path, schedule_sha256 = authority(
+            "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
+        )
+        game_path, game_sha256 = authority(
+            "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
+        )
+        _seal_path, seal_sha256 = authority(
+            "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"
+        )
+        inputs = store_inputs(current_phase="ACQUIRING")
+        def rebind_snapshot_run_id(snapshot: object) -> object:
+            payload = snapshot.as_mapping()  # type: ignore[attr-defined]
+            payload["run_id"] = run_spec.run_id
+            contents = canonical_json_bytes(payload) + b"\n"
+            return dataclasses.replace(
+                snapshot,
+                run_id=run_spec.run_id,
+                canonical_bytes=contents,
+                sha256=hashlib.sha256(contents).hexdigest(),
+            )
+
+        snapshots = tuple(
+            rebind_snapshot_run_id(snapshot)
+            for snapshot in inputs.replay.game_snapshots
+        )
+        all_snapshots = tuple(
+            sorted(
+                (rebind_snapshot_run_id(snapshot) for snapshot in fake_81()),
+                key=snapshot_sort_key,
+            )
+        )
+        replay = dataclasses.replace(
+            inputs.replay,
+            run_id=run_spec.run_id,
+            game_snapshots=snapshots,
+            schedule_inventory=dataclasses.replace(
+                inputs.replay.schedule_inventory,
+                path=schedule_path,
+                sha256=schedule_sha256,
+            ),
+            game_inventory=dataclasses.replace(
+                inputs.replay.game_inventory,
+                path=game_path,
+                sha256=game_sha256,
+            ),
+            timezone_gate=dataclasses.replace(
+                inputs.replay.timezone_gate,
+                seal_sha256=seal_sha256,
+            ),
+        )
+        receipts = root / "audit/v5_2_qd/historical/acquisition"
+        request_bundle = {
+            "query_document": receipts / "source_reviews/query_ids.json",
+            "review_receipt": receipts / "source_reviews/e2e-review.json",
+            "review_commit": receipts / "source_reviews/e2e-review.commit.json",
+            "replay_one_receipt": receipts / "source_replays/e2e-one.json",
+            "replay_one_commit": receipts / "source_replays/e2e-one.commit.json",
+            "replay_two_receipt": receipts / "source_replays/e2e-two.json",
+            "replay_two_commit": receipts / "source_replays/e2e-two.commit.json",
+            "checkpoint": checkpoint_path,
+            "inventory": root / "data/v5_2_qd/historical/sources/source_inventory.json",
+        }
+        return root, orchestration.CommonArgs(root=root), request_bundle, replay, all_snapshots
+
+    def run_finalization_sequence(
+        self,
+        root: Path,
+        common: orchestration.CommonArgs,
+        request_bundle: dict[str, Path],
+        replay: object,
+        snapshots: tuple[object, ...],
+    ) -> tuple[orchestration.StatusReport, orchestration.ReviewReport, tuple[orchestration.ReplayReport, orchestration.ReplayReport], orchestration.AdvanceReport, orchestration.StatusReport]:
+        with (
+            patch.object(orchestration, "load_snapshot_replay_inputs", return_value=replay),
+            patched_store_replay(),
+            patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=snapshots,
+            ),
+        ):
+            context = orchestration.build_context(common)
+            initial = orchestration.read_status(context)
+            self.assertEqual(initial.phase, "ACQUIRING")
+            self.assertEqual(orchestration.run_preflight(context).status, "PASS")
+            publication = orchestration.publish_inventory(context, lock_owner="e2e")
+            self.assertEqual(publication.status, "PUBLISHED")
+            self.assertEqual(publication.snapshot_count, 81)
+            self.assertEqual(request_bundle["inventory"].read_bytes(), inventory_bytes(context.inventory))
+            request_bundle["query_document"].parent.mkdir(parents=True, exist_ok=True)
+            request_bundle["query_document"].write_bytes(
+                canonical_json_bytes({"query_ids": [context.inventory.logical_query_ids[0]]})
+                + b"\n"
+            )
+            review = orchestration.write_review(
+                context,
+                orchestration.ReviewRequest(
+                    "independent-source-auditor",
+                    "independent-source-auditor",
+                    "APPROVED",
+                    request_bundle["query_document"],
+                    request_bundle["review_receipt"],
+                    request_bundle["review_commit"],
+                ),
+            )
+            replay_one = orchestration.write_replay(
+                context,
+                orchestration.ReplayRequest(
+                    request_bundle["replay_one_receipt"],
+                    request_bundle["replay_one_commit"],
+                ),
+            )
+            replay_two = orchestration.write_replay(
+                context,
+                orchestration.ReplayRequest(
+                    request_bundle["replay_two_receipt"],
+                    request_bundle["replay_two_commit"],
+                ),
+            )
+            published_inventory = json.loads(request_bundle["inventory"].read_bytes())
+            self.assertEqual(published_inventory["status"], "READY_CANDIDATE")
+            self.assertEqual(published_inventory["critical_errors"], [])
+            self.assertEqual(published_inventory["network_attempts"], 0)
+            self.assertTrue(published_inventory["source_gate_ready"])
+            advanced = orchestration.advance_sources_ready(
+                context,
+                orchestration.AdvanceRequest(
+                    (request_bundle["review_commit"],),
+                    (request_bundle["replay_one_commit"], request_bundle["replay_two_commit"]),
+                    request_bundle["checkpoint"],
+                    request_bundle["inventory"],
+                ),
+            )
+            fresh = orchestration.read_status(orchestration.build_context(common))
+        return initial, review, (replay_one, replay_two), advanced, fresh
+
+    def test_miniature_workflow_never_writes_real_historical_namespace(self) -> None:
+        real_sources = ROOT / "data/v5_2_qd/historical/sources"
+        before = self.lexists_snapshot(real_sources)
+        with tempfile.TemporaryDirectory() as directory:
+            root, common, request_bundle, replay, snapshots = self.build_finalization_fixture(
+                Path(directory)
+            )
+            initial, review, replays, advanced, fresh = self.run_finalization_sequence(
+                root, common, request_bundle, replay, snapshots
+            )
+            self.assertTrue(initial.publish_ready)
+            self.assertEqual(review.receipt_kind, "SOURCE_REVIEW")
+            self.assertEqual(json.loads(review.path.read_bytes())["decision"], "APPROVED")
+            execution_ids = [
+                json.loads(report.path.read_bytes())["execution_id"]
+                for report in replays
+            ]
+            self.assertEqual(len(set(execution_ids)), 2)
+            self.assertTrue(all(uuid.UUID(value).version == 4 for value in execution_ids))
+            self.assertTrue(all(json.loads(report.path.read_bytes())["network_attempts"] == 0 for report in replays))
+            for path in (
+                review.path,
+                review.commit_path,
+                *(item for report in replays for item in (report.path, report.commit_path)),
+            ):
+                self.assertEqual(path.read_bytes(), canonical_json_bytes(json.loads(path.read_bytes())) + b"\n")
+            self.assertEqual(advanced.phase, "SOURCES_READY")
+            self.assertEqual(fresh.phase, "SOURCES_READY")
+        self.assertEqual(self.lexists_snapshot(real_sources), before)
 
 
 def tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:

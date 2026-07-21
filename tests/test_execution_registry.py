@@ -137,7 +137,7 @@ SOURCE_INVENTORY_RELATIVE = Path(
 RECEIPTS_RELATIVE = Path(
     "audit/v5_2_qd/historical/execution/phase_receipts"
 )
-ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
+EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.execution_registry",
     "mlb_backtest.v52_acquire",
     "mlb_backtest.v52_game_evidence_inventory",
@@ -146,6 +146,7 @@ ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.v52_legacy_decision_inventory",
     "mlb_backtest.v52_query_plan",
     "mlb_backtest.v52_schedule_inventory",
+    "mlb_backtest.v52_source_finalize",
     "mlb_backtest.v52_source_contracts",
     "mlb_backtest.v52_source_orchestration",
     "mlb_backtest.v52_timezone_review",
@@ -153,11 +154,9 @@ ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES = (
 PASSIVE_IMPORT_CLOSURE_EXCLUSIONS = frozenset(
     {Path("mlb_backtest/__init__.py")}
 )
-ACQUISITION_EXECUTION_IMPORT_CLOSURE = tuple(
+EXECUTION_IMPORT_CLOSURE = tuple(
     sorted(
-        _repository_local_import_closure(
-            ROOT, ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES
-        )
+        _repository_local_import_closure(ROOT, EXECUTION_IMPORT_ROOT_MODULES)
         - PASSIVE_IMPORT_CLOSURE_EXCLUSIONS
     )
 )
@@ -173,12 +172,13 @@ BOUND_SCHEMA_PATHS = (
     Path("schemas/v5_2_timezone_review_receipt.schema.json"),
     Path("schemas/v5_2_timezone_seal_receipt.schema.json"),
     Path("schemas/v5_2_venue_timezones.schema.json"),
+    Path("schemas/v5_2_source_inventory.schema.json"),
     Path("schemas/v5_2_source_review_receipt.schema.json"),
     Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
     Path("schemas/v5_2_source_receipt_commit.schema.json"),
 )
 BOUND_EXECUTION_CODE = (
-    *ACQUISITION_EXECUTION_IMPORT_CLOSURE,
+    *EXECUTION_IMPORT_CLOSURE,
     *BOUND_PYTHON_EXTRAS,
     *BOUND_SCHEMA_PATHS,
 )
@@ -6561,6 +6561,23 @@ class ExecutionRegistryTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "execution code|dirty"):
                     self.initialize(root, run_spec)
 
+        finalization_authority = (
+            Path("mlb_backtest/v52_source_finalize.py"),
+            Path("mlb_backtest/v52_source_orchestration.py"),
+            Path("mlb_backtest/v52_verify_sources.py"),
+            Path("mlb_backtest/v52_snapshot_store.py"),
+            Path("schemas/v5_2_source_inventory.schema.json"),
+            Path("schemas/v5_2_source_review_receipt.schema.json"),
+            Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
+            Path("schemas/v5_2_source_receipt_commit.schema.json"),
+        )
+        for relative in finalization_authority:
+            with self.subTest(untracked_relative=relative), tempfile.TemporaryDirectory() as directory:
+                root, run_spec = self.make_repo(Path(directory))
+                _git(root, "rm", "--cached", "--", relative.as_posix())
+                with self.assertRaisesRegex(ValueError, "execution code|dirty"):
+                    self.initialize(root, run_spec)
+
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -6586,9 +6603,9 @@ class ExecutionRegistryTest(unittest.TestCase):
         required = {path.as_posix() for path in BOUND_EXECUTION_CODE}
         self.assertEqual(set(self.registry._BOUND_EXECUTION_CODE), required)
 
-    def test_bound_acquisition_import_closure_is_computed_and_exact(self) -> None:
+    def test_bound_execution_import_closure_is_computed_and_exact(self) -> None:
         computed = _repository_local_import_closure(
-            ROOT, ACQUISITION_EXECUTION_IMPORT_ROOT_MODULES
+            ROOT, EXECUTION_IMPORT_ROOT_MODULES
         )
         self.assertEqual(
             computed & PASSIVE_IMPORT_CLOSURE_EXCLUSIONS,
@@ -6600,7 +6617,6 @@ class ExecutionRegistryTest(unittest.TestCase):
         reachable = computed - PASSIVE_IMPORT_CLOSURE_EXCLUSIONS
         bound = {Path(path) for path in self.registry._BOUND_EXECUTION_CODE}
         bound_python = {path for path in bound if path.suffix == ".py"}
-        self.assertLessEqual(reachable, bound_python)
         self.assertEqual(
             bound_python - reachable,
             set(BOUND_PYTHON_EXTRAS),
