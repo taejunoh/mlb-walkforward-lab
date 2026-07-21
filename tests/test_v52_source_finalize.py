@@ -391,6 +391,48 @@ class FinalizationEndToEndTests(unittest.TestCase):
         value = path.lstat()
         return (value.st_dev, value.st_ino, value.st_mode, value.st_size)
 
+    @staticmethod
+    def source_tree_snapshot(path: Path) -> tuple[tuple[str, int, int, int, int, str | None], ...] | None:
+        if not os.path.lexists(path):
+            return None
+        snapshots: list[tuple[str, int, int, int, int, str | None]] = []
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            metadata = current.lstat()
+            relative = "." if current == path else current.relative_to(path).as_posix()
+            digest = (
+                hashlib.sha256(current.read_bytes()).hexdigest()
+                if current.is_file() and not current.is_symlink()
+                else None
+            )
+            snapshots.append(
+                (
+                    relative,
+                    metadata.st_mode,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    digest,
+                )
+            )
+            if current.is_dir() and not current.is_symlink():
+                pending.extend(current.iterdir())
+        return tuple(sorted(snapshots))
+
+    @staticmethod
+    def is_within(path: object, target: Path) -> bool:
+        if not isinstance(path, (str, bytes, os.PathLike)):
+            return False
+        candidate = Path(os.fsdecode(path))
+        if not candidate.is_absolute():
+            return False
+        try:
+            candidate.relative_to(target)
+        except ValueError:
+            return False
+        return True
+
     def build_finalization_fixture(
         self, parent: Path
     ) -> tuple[Path, orchestration.CommonArgs, dict[str, Path], object, tuple[object, ...]]:
@@ -560,13 +602,70 @@ class FinalizationEndToEndTests(unittest.TestCase):
     def test_miniature_workflow_never_writes_real_historical_namespace(self) -> None:
         real_sources = ROOT / "data/v5_2_qd/historical/sources"
         before = self.lexists_snapshot(real_sources)
+        before_tree = self.source_tree_snapshot(real_sources)
+        source_writes: list[tuple[str, str]] = []
+        network_calls: list[str] = []
+        original_open = os.open
+        original_mkdir = os.mkdir
+        original_unlink = os.unlink
+        original_rename = os.rename
+        original_replace = os.replace
+
+        def forbid_source_write(operation: str, path: object) -> None:
+            if self.is_within(path, real_sources):
+                source_writes.append((operation, os.fsdecode(path)))
+                raise AssertionError("production source namespace write attempted")
+
+        def guarded_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            if flags & (
+                os.O_WRONLY
+                | os.O_RDWR
+                | os.O_CREAT
+                | os.O_TRUNC
+                | os.O_APPEND
+            ):
+                forbid_source_write("open", path)
+            return original_open(path, flags, *args, **kwargs)
+
+        def guarded_mkdir(path: object, *args: object, **kwargs: object) -> None:
+            forbid_source_write("mkdir", path)
+            return original_mkdir(path, *args, **kwargs)
+
+        def guarded_unlink(path: object, *args: object, **kwargs: object) -> None:
+            forbid_source_write("unlink", path)
+            return original_unlink(path, *args, **kwargs)
+
+        def guarded_rename(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            forbid_source_write("rename-source", source)
+            forbid_source_write("rename-destination", destination)
+            return original_rename(source, destination, *args, **kwargs)
+
+        def guarded_replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            forbid_source_write("replace-source", source)
+            forbid_source_write("replace-destination", destination)
+            return original_replace(source, destination, *args, **kwargs)
+
+        def forbid_network(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            network_calls.append("network")
+            raise AssertionError("E2E network attempted")
         with tempfile.TemporaryDirectory() as directory:
             root, common, request_bundle, replay, snapshots = self.build_finalization_fixture(
                 Path(directory)
             )
-            initial, review, replays, advanced, fresh = self.run_finalization_sequence(
-                root, common, request_bundle, replay, snapshots
-            )
+            with (
+                patch.object(os, "open", side_effect=guarded_open),
+                patch.object(os, "mkdir", side_effect=guarded_mkdir),
+                patch.object(os, "unlink", side_effect=guarded_unlink),
+                patch.object(os, "rename", side_effect=guarded_rename),
+                patch.object(os, "replace", side_effect=guarded_replace),
+                patch.object(socket, "socket", side_effect=forbid_network),
+                patch.object(socket, "create_connection", side_effect=forbid_network),
+                patch.object(urllib.request, "urlopen", side_effect=forbid_network),
+            ):
+                initial, review, replays, advanced, fresh = self.run_finalization_sequence(
+                    root, common, request_bundle, replay, snapshots
+                )
             self.assertTrue(initial.publish_ready)
             self.assertEqual(review.receipt_kind, "SOURCE_REVIEW")
             self.assertEqual(json.loads(review.path.read_bytes())["decision"], "APPROVED")
@@ -586,6 +685,9 @@ class FinalizationEndToEndTests(unittest.TestCase):
             self.assertEqual(advanced.phase, "SOURCES_READY")
             self.assertEqual(fresh.phase, "SOURCES_READY")
         self.assertEqual(self.lexists_snapshot(real_sources), before)
+        self.assertEqual(self.source_tree_snapshot(real_sources), before_tree)
+        self.assertEqual(source_writes, [])
+        self.assertEqual(network_calls, [])
 
 
 def tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
