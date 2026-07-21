@@ -1,5 +1,6 @@
 import builtins
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,6 +147,196 @@ class TrustedRootTests(unittest.TestCase):
         ):
             secure_fs.open_trusted_root(root, expected=expected)
         self.assertEqual(_fd_count(), before_failure)
+
+
+class SecureFilePrimitiveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.path = Path(self.tempdir.name)
+        self.root_path = self.path / "root"
+        self.root_path.mkdir()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_snapshot_is_exactly_immutable_and_has_full_identity(self):
+        snapshot = secure_fs.RegularFileSnapshot(
+            Path("state.bin"), b"state", (1, 2, 3, 4, 5, 6, 7)
+        )
+        self.assertEqual(type(snapshot), secure_fs.RegularFileSnapshot)
+        self.assertEqual(
+            snapshot.identity, (1, 2, 3, 4, 5, 6, 7)
+        )
+        with self.assertRaises(AttributeError):
+            snapshot.contents = b"changed"
+
+    def test_rejects_unsafe_relative_paths(self):
+        invalid = (Path("/absolute"), Path(), Path("."), Path(".."), Path("a/../b"), Path("a\\b"))
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            for relative in invalid:
+                with self.subTest(relative=relative):
+                    with self.assertRaisesRegex(ValueError, "unsafe relative path"):
+                        secure_fs.read_regular_snapshot(root, relative, "test")
+                    with self.assertRaisesRegex(ValueError, "unsafe relative path"):
+                        with secure_fs.open_parent(root, relative, create=False):
+                            pass
+
+    def test_open_parent_creates_nested_directories_with_private_permissions(self):
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with secure_fs.open_parent(root, Path("one/two/file.bin"), create=True) as parent_fd:
+                self.assertTrue(stat_is_directory(os.fstat(parent_fd)))
+        created = self.root_path / "one" / "two"
+        self.assertEqual(created.stat().st_mode & 0o777, 0o700)
+
+    def test_read_rejects_aliases_and_special_files_without_blocking(self):
+        regular = self.root_path / "regular"
+        regular.write_bytes(b"regular")
+        (self.root_path / "symlink").symlink_to(regular)
+        os.link(regular, self.root_path / "hardlink")
+        os.mkfifo(self.root_path / "fifo")
+        (self.root_path / "directory").mkdir()
+        sock = socket.socket(socket.AF_UNIX)
+        socket_path = self.root_path / "socket"
+        try:
+            sock.bind(os.fspath(socket_path))
+            with secure_fs.open_trusted_root(self.root_path) as root:
+                for name in ("symlink", "hardlink", "fifo", "directory", "socket"):
+                    with self.subTest(name=name):
+                        with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                            secure_fs.read_regular_snapshot(root, Path(name), "test")
+        finally:
+            sock.close()
+
+    def test_read_is_bounded_and_handles_short_reads(self):
+        contents = b"abcdefgh"
+        (self.root_path / "data.bin").write_bytes(contents)
+        original_read = os.read
+
+        def short_read(fd: int, size: int) -> bytes:
+            return original_read(fd, min(size, 2))
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with patch.object(secure_fs.os, "read", side_effect=short_read):
+                snapshot = secure_fs.read_regular_snapshot(
+                    root, Path("data.bin"), "test", max_bytes=len(contents)
+                )
+            self.assertEqual(snapshot.contents, contents)
+            with self.assertRaisesRegex(ValueError, "file exceeds maximum size"):
+                secure_fs.read_regular_snapshot(root, Path("data.bin"), "test", max_bytes=3)
+
+    def test_missing_ok_only_suppresses_missing_leaf(self):
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            self.assertIsNone(
+                secure_fs.read_regular_snapshot(root, Path("missing"), "test", missing_ok=True)
+            )
+
+    def test_read_rejects_root_replacement_after_contents_are_read(self):
+        (self.root_path / "data.bin").write_bytes(b"data")
+        original_read = os.read
+        moved = self.path / "original-root"
+        swapped = False
+
+        def replace_root(fd: int, size: int) -> bytes:
+            nonlocal swapped
+            result = original_read(fd, size)
+            if not swapped:
+                swapped = True
+                self.root_path.rename(moved)
+                self.root_path.mkdir()
+            return result
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with patch.object(secure_fs.os, "read", side_effect=replace_root):
+                with self.assertRaisesRegex(ValueError, "unsafe trusted root binding"):
+                    secure_fs.read_regular_snapshot(root, Path("data.bin"), "test")
+
+    def test_rebind_requires_exact_contents_and_identity(self):
+        target = self.root_path / "data.bin"
+        target.write_bytes(b"one")
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            expected = secure_fs.read_regular_snapshot(root, Path("data.bin"), "test")
+            secure_fs.rebind_regular_snapshot(root, expected, "test")
+            target.write_bytes(b"two")
+            with self.assertRaisesRegex(ValueError, "regular file snapshot mismatch"):
+                secure_fs.rebind_regular_snapshot(root, expected, "test")
+
+    def test_write_is_exclusive_and_handles_short_writes(self):
+        original_write = os.write
+
+        def short_write(fd: int, data: bytes) -> int:
+            return original_write(fd, data[:2])
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with patch.object(secure_fs.os, "write", side_effect=short_write):
+                snapshot = secure_fs.write_exclusive(root, Path("nested/data.bin"), b"abcdef", "test")
+            self.assertEqual(snapshot.contents, b"abcdef")
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                secure_fs.write_exclusive(root, Path("nested/data.bin"), b"changed", "test")
+        self.assertEqual((self.root_path / "nested/data.bin").read_bytes(), b"abcdef")
+
+    def test_write_rejects_non_bytes(self):
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with self.assertRaisesRegex(TypeError, "contents must be bytes"):
+                secure_fs.write_exclusive(root, Path("data.bin"), bytearray(b"data"), "test")
+
+    def test_write_detects_parent_swap_after_file_fsync(self):
+        nested = self.root_path / "nested"
+        nested.mkdir()
+
+        def replace_parent(stage: str, component: str | None = None) -> None:
+            if stage == "after_file_fsync":
+                nested.rename(self.root_path / "original-nested")
+                nested.mkdir()
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with patch.object(secure_fs, "_secure_fs_test_hook", side_effect=replace_parent):
+                with self.assertRaisesRegex(ValueError, "unsafe parent binding"):
+                    secure_fs.write_exclusive(root, Path("nested/data.bin"), b"data", "test")
+        self.assertFalse((nested / "data.bin").exists())
+
+    def test_write_never_unlinks_an_attacker_replacement(self):
+        target = self.root_path / "data.bin"
+
+        def replace_leaf(stage: str, component: str | None = None) -> None:
+            if stage == "after_file_fsync":
+                target.unlink()
+                target.write_bytes(b"attacker")
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with patch.object(secure_fs, "_secure_fs_test_hook", side_effect=replace_leaf):
+                with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                    secure_fs.write_exclusive(root, Path("data.bin"), b"owned", "test")
+        self.assertEqual(target.read_bytes(), b"attacker")
+
+    def test_failed_write_cleans_up_only_its_owned_inode(self):
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            with self.assertRaisesRegex(RuntimeError, "final rebind failed"):
+                secure_fs.write_exclusive(
+                    root,
+                    Path("data.bin"),
+                    b"owned",
+                    "test",
+                    final_rebind=lambda: (_ for _ in ()).throw(RuntimeError("final rebind failed")),
+                )
+        self.assertFalse((self.root_path / "data.bin").exists())
+
+    @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
+    def test_all_file_primitive_success_and_fault_paths_close_descriptors(self):
+        before = _fd_count()
+        self.assertIsNotNone(before)
+        (self.root_path / "read.bin").write_bytes(b"read")
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            secure_fs.read_regular_snapshot(root, Path("read.bin"), "test")
+            secure_fs.write_exclusive(root, Path("write.bin"), b"write", "test")
+            with self.assertRaises(FileExistsError):
+                secure_fs.write_exclusive(root, Path("write.bin"), b"write", "test")
+            with self.assertRaises(ValueError):
+                secure_fs.read_regular_snapshot(root, Path("absent"), "test")
+        self.assertEqual(_fd_count(), before)
+
+
+def stat_is_directory(result: os.stat_result) -> bool:
+    return bool(result.st_mode & 0o040000)
 
 
 if __name__ == "__main__":

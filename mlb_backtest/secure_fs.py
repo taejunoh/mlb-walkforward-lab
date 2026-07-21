@@ -2,8 +2,10 @@
 
 import os
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterator
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,15 @@ class RootBinding:
     path: Path
     component_names: tuple[str, ...]
     component_identities: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class RegularFileSnapshot:
+    """The exact regular-file state observed through a trusted root."""
+
+    relative: Path
+    contents: bytes
+    identity: tuple[int, ...]
 
 
 _CONSTRUCTOR_TOKEN = object()
@@ -185,3 +196,325 @@ def _identity(result: os.stat_result) -> tuple[int, int]:
 def _require_directory(result: os.stat_result) -> None:
     if not stat.S_ISDIR(result.st_mode):
         raise ValueError("unsafe trusted root binding")
+
+
+def _validate_relative(relative: Path) -> tuple[str, ...]:
+    if not isinstance(relative, Path):
+        raise ValueError("unsafe relative path")
+    parts = relative.parts
+    if (
+        relative.is_absolute()
+        or not parts
+        or any(not part or part in (".", "..") or "\\" in part for part in parts)
+    ):
+        raise ValueError("unsafe relative path")
+    return parts
+
+
+def _regular_identity(result: os.stat_result) -> tuple[int, ...]:
+    return (
+        result.st_dev,
+        result.st_ino,
+        result.st_mode,
+        result.st_nlink,
+        result.st_size,
+        result.st_mtime_ns,
+        result.st_ctime_ns,
+    )
+
+
+def _require_regular_single_link(result: os.stat_result, label: str) -> None:
+    if not stat.S_ISREG(result.st_mode) or result.st_nlink != 1:
+        raise ValueError(f"unsafe regular file: {label}")
+
+
+def _leaf_open_flags(access: int) -> int:
+    required_names = ("O_NOFOLLOW", "O_CLOEXEC")
+    required_flags = tuple(getattr(os, name, 0) for name in required_names)
+    if not all(required_flags):
+        raise ValueError("trusted root filesystem support is unavailable")
+    return access | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _close_all(descriptors: list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _checked_child(parent_fd: int, name: str) -> int:
+    descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _require_directory(opened)
+        _require_directory(named)
+        if _identity(opened) != _identity(named):
+            raise ValueError("unsafe parent binding")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_parent_chain(descriptors: list[int], names: tuple[str, ...]) -> None:
+    try:
+        for index, name in enumerate(names):
+            opened = os.fstat(descriptors[index + 1])
+            named = os.stat(name, dir_fd=descriptors[index], follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or _identity(opened) != _identity(named)
+            ):
+                raise ValueError("unsafe parent binding")
+    except OSError as exc:
+        raise ValueError("unsafe parent binding") from exc
+
+
+def _revalidate_parent_path(root: TrustedRoot, parts: tuple[str, ...], parent_fd: int) -> None:
+    """Ensure the held parent is still the directory named below ``root``."""
+    descriptors = [root.dup_root_fd()]
+    try:
+        for name in parts[:-1]:
+            descriptors.append(_checked_child(descriptors[-1], name))
+        if _identity(os.fstat(descriptors[-1])) != _identity(os.fstat(parent_fd)):
+            raise ValueError("unsafe parent binding")
+    finally:
+        _close_all(descriptors)
+
+
+@contextmanager
+def open_parent(root: TrustedRoot, relative: Path, *, create: bool) -> Iterator[int]:
+    """Hold the parent directory of a validated relative leaf name."""
+    parts = _validate_relative(relative)
+    root.assert_bound()
+    descriptors = [root.dup_root_fd()]
+    parent_names = parts[:-1]
+    try:
+        for name in parent_names:
+            try:
+                child = _checked_child(descriptors[-1], name)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(name, 0o700, dir_fd=descriptors[-1])
+                child = _checked_child(descriptors[-1], name)
+                os.fsync(descriptors[-1])
+                os.fsync(child)
+            descriptors.append(child)
+        _assert_parent_chain(descriptors, parent_names)
+        yield descriptors[-1]
+        _assert_parent_chain(descriptors, parent_names)
+        root.assert_bound()
+    finally:
+        _close_all(descriptors)
+
+
+def _read_bounded(descriptor: int, max_bytes: int | None, label: str) -> bytes:
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("file exceeds maximum size")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if max_bytes is None:
+            amount = 64 * 1024
+        else:
+            if total > max_bytes:
+                raise ValueError("file exceeds maximum size")
+            amount = min(64 * 1024, max_bytes + 1 - total)
+            if amount == 0:
+                break
+        chunk = os.read(descriptor, amount)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise ValueError("file exceeds maximum size")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def read_regular_snapshot(
+    root: TrustedRoot,
+    relative: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+    missing_ok: bool = False,
+) -> RegularFileSnapshot | None:
+    """Read one regular, unaliased file and bind its exact observed state."""
+    parts = _validate_relative(relative)
+    root.assert_bound()
+    descriptor = -1
+    try:
+        with open_parent(root, relative, create=False) as parent_fd:
+            try:
+                named_before = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raise
+            _require_regular_single_link(named_before, label)
+            if max_bytes is not None and named_before.st_size > max_bytes:
+                raise ValueError("file exceeds maximum size")
+            descriptor = os.open(
+                parts[-1],
+                _leaf_open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)),
+                dir_fd=parent_fd,
+            )
+            opened_before = os.fstat(descriptor)
+            _require_regular_single_link(opened_before, label)
+            if _regular_identity(opened_before) != _regular_identity(named_before):
+                raise ValueError(f"unsafe regular file: {label}")
+            contents = _read_bounded(descriptor, max_bytes, label)
+            opened_after = os.fstat(descriptor)
+            named_after = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            _require_regular_single_link(opened_after, label)
+            _require_regular_single_link(named_after, label)
+            identity = _regular_identity(opened_after)
+            if identity != _regular_identity(named_after) or identity != _regular_identity(opened_before):
+                raise ValueError(f"unsafe regular file: {label}")
+        root.assert_bound()
+        return RegularFileSnapshot(relative, contents, identity)
+    except FileNotFoundError:
+        root.assert_bound()
+        if missing_ok:
+            return None
+        raise ValueError(f"unsafe regular file: {label}") from None
+    except OSError as exc:
+        raise ValueError(f"unsafe regular file: {label}") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def rebind_regular_snapshot(
+    root: TrustedRoot,
+    expected: RegularFileSnapshot,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> None:
+    """Require that a previously observed file remains exactly unchanged."""
+    if type(expected) is not RegularFileSnapshot:
+        raise ValueError("regular file snapshot mismatch")
+    actual = read_regular_snapshot(root, expected.relative, label, max_bytes=max_bytes)
+    if actual != expected:
+        raise ValueError("regular file snapshot mismatch")
+
+
+def _write_all(descriptor: int, contents: bytes, label: str) -> None:
+    offset = 0
+    while offset < len(contents):
+        written = os.write(descriptor, contents[offset:])
+        if written <= 0:
+            raise ValueError(f"unsafe regular file: {label}")
+        offset += written
+
+
+def _contents_match(parent_fd: int, name: str, expected: bytes, identity: tuple[int, ...]) -> bool:
+    descriptor = -1
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _regular_identity(named) != identity:
+            return False
+        descriptor = os.open(name, _leaf_open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        return _regular_identity(opened) == identity and _read_bounded(descriptor, len(expected), "cleanup") == expected
+    except (OSError, ValueError):
+        return False
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _unlink_owned(parent_fd: int, name: str, contents: bytes, descriptor: int) -> None:
+    try:
+        identity = _regular_identity(os.fstat(descriptor))
+        if _contents_match(parent_fd, name, contents, identity):
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    except OSError:
+        pass
+
+
+def _unlink_owned_through_root(
+    root: TrustedRoot, relative: Path, contents: bytes, descriptor: int
+) -> None:
+    """Clean up only a still-reachable name that still denotes our inode."""
+    try:
+        with open_parent(root, relative, create=False) as parent_fd:
+            _unlink_owned(parent_fd, relative.parts[-1], contents, descriptor)
+    except (OSError, ValueError, RuntimeError):
+        pass
+
+
+def write_exclusive(
+    root: TrustedRoot,
+    relative: Path,
+    contents: bytes,
+    label: str,
+    *,
+    final_rebind: Callable[[], None] | None = None,
+) -> RegularFileSnapshot:
+    """Create, durably write, and bind a new private regular file."""
+    if type(contents) is not bytes:
+        raise TypeError("contents must be bytes")
+    parts = _validate_relative(relative)
+    root.assert_bound()
+    descriptor = -1
+    parent_fd = -1
+    try:
+        with open_parent(root, relative, create=True) as held_parent:
+            parent_fd = held_parent
+            try:
+                descriptor = os.open(
+                    parts[-1],
+                    _leaf_open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError as exc:
+                raise FileExistsError(f"{label} already exists") from exc
+            opened = os.fstat(descriptor)
+            _require_regular_single_link(opened, label)
+            _write_all(descriptor, contents, label)
+            os.fsync(descriptor)
+            _secure_fs_test_hook("after_file_fsync", relative.as_posix())
+            if final_rebind is not None:
+                final_rebind()
+            root.assert_bound()
+            _revalidate_parent_path(root, parts, parent_fd)
+            linked = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            final = os.fstat(descriptor)
+            _require_regular_single_link(linked, label)
+            _require_regular_single_link(final, label)
+            identity = _regular_identity(final)
+            if identity != _regular_identity(linked):
+                raise ValueError(f"unsafe regular file: {label}")
+            os.fsync(parent_fd)
+            _secure_fs_test_hook("before_return_revalidation", relative.as_posix())
+            root.assert_bound()
+            _revalidate_parent_path(root, parts, parent_fd)
+            linked = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            final = os.fstat(descriptor)
+            if _regular_identity(linked) != _regular_identity(final):
+                raise ValueError(f"unsafe regular file: {label}")
+            return RegularFileSnapshot(relative, contents, _regular_identity(final))
+    except BaseException:
+        if descriptor >= 0:
+            _unlink_owned_through_root(root, relative, contents, descriptor)
+        raise
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
