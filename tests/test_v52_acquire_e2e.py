@@ -181,14 +181,19 @@ def _acquire(
 
 class V52AcquirePublicE2ETest(unittest.TestCase):
     def setUp(self) -> None:
-        from mlb_backtest import v52_query_plan
+        from mlb_backtest import execution_registry, v52_query_plan
 
         # The complete 44-file runtime closure has dedicated registry coverage.
         # Keep this multi-checkpoint integration fixture bounded while retaining
         # the real Git snapshot, receipt, and replay implementation.
+        self.bound_schema_paths = tuple(
+            relative
+            for relative in execution_registry._BOUND_EXECUTION_CODE
+            if Path(relative).parent == Path("schemas")
+        )
         closure = patch(
             "mlb_backtest.execution_registry._BOUND_EXECUTION_CODE",
-            ("mlb_backtest/execution_registry.py",),
+            ("mlb_backtest/execution_registry.py", *self.bound_schema_paths),
         )
         closure.start()
         self.addCleanup(closure.stop)
@@ -254,6 +259,23 @@ class V52AcquirePublicE2ETest(unittest.TestCase):
             )
 
         self.memoized_batch_loader = memoized_batch_loader
+
+    def test_bounded_runtime_closure_keeps_current_schema_bindings(self) -> None:
+        from mlb_backtest import execution_registry
+
+        self.assertEqual(len(self.bound_schema_paths), 14)
+        self.assertEqual(
+            execution_registry._BOUND_EXECUTION_CODE,
+            ("mlb_backtest/execution_registry.py", *self.bound_schema_paths),
+        )
+        self.assertTrue(
+            {
+                "schemas/v5_2_clean_source_replay_receipt.schema.json",
+                "schemas/v5_2_source_receipt_commit.schema.json",
+                "schemas/v5_2_source_review_receipt.schema.json",
+            }
+            <= set(self.bound_schema_paths)
+        )
 
     def test_real_public_flow_stops_for_manual_gate_then_reaches_terminal_replay(
         self,
