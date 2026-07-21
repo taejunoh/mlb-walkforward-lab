@@ -2,13 +2,54 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver one local command that acquires result-free current MLB evidence, scores today's complete pregame candidates with the frozen v5.1 card, and writes independent Verified and Preliminary Top 3 reports.
+**Goal:** Deliver one local command that acquires result-free current MLB evidence, scores today's complete pregame candidates with the frozen v5.1 card, writes a Preliminary Top 3 report, and keeps the reserved Verified population empty until an official-starter source is separately approved.
 
 **Architecture:** Add a new experimental-live path instead of routing through the historical stage pipeline. Keep source observation, D-1 history, participant adaptation, scoring/ranking, and rendering in focused modules; reuse audited pure parsers and scoring math only where their historical assumptions do not leak into live provenance.
 
 **Tech Stack:** Python 3.11 standard library, existing `mlb_backtest` modules, JSON/JSON Schema, `unittest`, Ruff, SHA-256, MLB Stats API, Baseball Savant CSV.
 
 **Governing design:** `docs/superpowers/specs/2026-07-21-v5-1-experimental-live-top3-design.md`
+
+---
+
+## Binding implementation amendment (2026-07-21)
+
+This section supersedes any older example below that conflicts with it. A task
+must not be implemented from a conflicting example until the worker has applied
+these rules to its tests and interfaces.
+
+1. The current Stats API path can produce `PRELIMINARY`, `UNSCORED`, or
+   `EXCLUDED` only. `verified_top3` validates as an empty array. Agreement
+   between schedule `probablePitcher` and a boxscore pitcher-array entry remains
+   `PROBABLE_CONSISTENT`; a conflict is `UNSCORED/STARTER_CONFLICT`.
+2. Deterministic D-1 history lives in a cache namespace/catalog separate from
+   append-only current-day observations. History, career BF, and authenticated
+   venue coordinates/time zones are complete before the live slate is fetched.
+3. Every current-day fetch has a canonical unique observation ID in its query
+   identity. Its canonical receipt binds requested/final URL, source-specific
+   allowed final host, status/selected headers, response-completion time,
+   payload SHA, manifest SHA, durable-write completion time, receipt path, and
+   receipt SHA. Changed repeat observations never collide with `RawStore`
+   history identities.
+4. After participant acquisition, re-fetch each game's schedule immediately
+   before classification. Identity, target date, venue, accepted pregame status,
+   and scheduled start must match. Classification time is the maximum relevant
+   response-completion or durable-write time, and must precede that scheduled
+   start. No caller-supplied slate observation time is authoritative.
+5. Only an explicit accepted-pregame status allowlist is eligible; every unknown
+   or non-pregame state fails closed. Missing venue evidence fails the affected
+   game closed rather than neutral-filling travel/time-zone features.
+6. The feature adapter accepts exact total career BF through D-1 and overwrites
+   the starter sample-size field once. It never adds that total to current-season
+   BF. The frozen card's component-weight mapping must equal the scoring module's
+   frozen constants before scoring.
+7. `SourceBinding` paths are validated repository-relative POSIX strings, not
+   `Path` objects. Observation fetchers and byte-returning adapters are distinct
+   protocols. `parse_live_schedule(raw, requested_date)` validates coverage.
+8. The final canonical payload binds exact command inputs, Eastern and UTC
+   execution times, history cutoff/cache authority, all source payload/manifest/
+   receipt digests, and a content hash. Every Top 3 array contains zero through
+   three rows and is never padded.
 
 ---
 
@@ -56,6 +97,19 @@ class LiveTop3ContractTests(unittest.TestCase):
         payload["unscored_games"][0]["rank"] = 1
         with self.assertRaisesRegex(ValueError, "unscored"):
             live_top3_contracts.validate_run_payload(payload)
+
+    def test_source_binding_is_json_safe_and_binds_receipt(self):
+        binding = valid_source_binding()
+        encoded = live_top3_contracts.canonical_json_bytes(asdict(binding))
+        self.assertIn(binding.receipt_sha256.encode("ascii"), encoded)
+        self.assertIsInstance(binding.payload_relative, str)
+        self.assertIsInstance(binding.receipt_relative, str)
+
+    def test_verified_population_is_reserved(self):
+        payload = valid_run_payload()
+        payload["verified_top3"] = [valid_ranked_row(state="VERIFIED", rank=1)]
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            live_top3_contracts.validate_run_payload(rehash(payload))
 ```
 
 - [ ] **Step 2: Run RED**
@@ -76,8 +130,9 @@ Define these public interfaces:
 MODEL_LABEL = "v5.1-EXPERIMENTAL-LIVE"
 CANDIDATE_STATES = frozenset({"VERIFIED", "PRELIMINARY", "UNSCORED", "EXCLUDED"})
 REQUIRED_RUN_KEYS = frozenset({
-    "schema_version", "model_label", "target_date", "observed_at_utc",
-    "history_cutoff_date", "model_card_sha256", "source_bindings",
+    "schema_version", "model_label", "target_date", "command_inputs",
+    "executed_at_eastern", "executed_at_utc", "history_cutoff_date",
+    "cache_authority", "model_card_sha256", "source_bindings",
     "verified_top3", "preliminary_top3", "unscored_games",
     "excluded_games", "warnings", "content_sha256",
 })
@@ -88,17 +143,21 @@ class IntegrityError(ValueError):
 @dataclass(frozen=True)
 class SourceBinding:
     source: str
-    url: str
+    observation_id: str
+    requested_url: str
     final_url: str
-    observed_at_utc: str
+    response_completed_at_utc: str
+    durable_at_utc: str
     http_status: int
     content_type: str | None
     etag: str | None
     last_modified: str | None
-    sha256: str
+    payload_sha256: str
     byte_length: int
-    payload_relative: Path
+    payload_relative: str
     manifest_sha256: str
+    receipt_relative: str
+    receipt_sha256: str
 
 @dataclass(frozen=True)
 class LiveHistoryBundle:
@@ -107,7 +166,31 @@ class LiveHistoryBundle:
     feature_history: object
     league_era_by_asof: Mapping[str, Mapping[str, object]]
     team_code_by_name: Mapping[str, str]
+    venue_references: Mapping[int, Mapping[str, object]]
+    cache_authority: Mapping[str, object]
     source_bindings: tuple[SourceBinding, ...]
+
+@dataclass(frozen=True)
+class ExecutionTimes:
+    executed_at_eastern: str
+    executed_at_utc: str
+
+    @classmethod
+    def capture(cls, clock: Callable[[], datetime]) -> "ExecutionTimes":
+        instant = require_aware_utc(clock())
+        return cls(
+            executed_at_eastern=canonical_eastern(
+                instant.astimezone(ZoneInfo("America/New_York"))
+            ),
+            executed_at_utc=canonical_utc(instant),
+        )
+
+@dataclass(frozen=True)
+class FinalGameObservation:
+    game_pk: int
+    target_date: str
+    projected_game: Mapping[str, object]
+    source_binding: SourceBinding
 
 def canonical_json_bytes(value: object) -> bytes:
     try:
@@ -143,8 +226,16 @@ def validate_run_payload(value: object) -> dict[str, object]:
         raise ValueError("run payload identity differs")
     validate_target_date(safe["target_date"])
     validate_target_date(safe["history_cutoff_date"])
-    _validate_utc(safe["observed_at_utc"], "observed_at_utc")
+    _validate_command_inputs(safe["command_inputs"], safe["target_date"])
+    _validate_eastern(safe["executed_at_eastern"], "executed_at_eastern")
+    _validate_utc(safe["executed_at_utc"], "executed_at_utc")
+    _validate_cache_authority(
+        safe["cache_authority"], safe["history_cutoff_date"]
+    )
     _validate_sha(safe["model_card_sha256"], "model_card_sha256")
+    _validate_source_bindings(safe["source_bindings"])
+    if safe["verified_top3"] != []:
+        raise ValueError("verified_top3 is reserved in the MVP")
     _validate_ranked(safe["verified_top3"], "VERIFIED")
     _validate_ranked(safe["preliminary_top3"], "PRELIMINARY")
     _validate_unranked(safe["unscored_games"], "UNSCORED")
@@ -155,7 +246,7 @@ def validate_run_payload(value: object) -> dict[str, object]:
     return safe
 ```
 
-Implement the named private validators in the same module. They enforce canonical UTC, 64-character lowercase hashes, independent ranks `1..N`, at most three ranked rows, no duplicated `gamePk` across populations, no probability/rank on unscored rows, exact state-to-array agreement, and recomputation of `content_sha256` with that field omitted.
+Implement the named private validators in the same module. They enforce canonical UTC and Eastern offsets, 64-character lowercase hashes, repository-relative normalized POSIX strings, exact source-binding and receipt fields, an empty reserved Verified population, Preliminary ranks `1..N`, at most three ranked rows, no duplicated `gamePk` across populations, no probability/rank on unscored rows, exact state-to-array agreement, cache cutoff/authority agreement, and recomputation of `content_sha256` with that field omitted.
 
 - [ ] **Step 4: Add the JSON Schema and cross-check tests**
 
@@ -163,12 +254,33 @@ The schema must set `additionalProperties: false` at every object boundary and r
 
 ```json
 [
-  "schema_version", "model_label", "target_date", "observed_at_utc",
-  "history_cutoff_date", "model_card_sha256", "source_bindings",
+  "schema_version", "model_label", "target_date", "command_inputs",
+  "executed_at_eastern", "executed_at_utc", "history_cutoff_date",
+  "cache_authority", "model_card_sha256", "source_bindings",
   "verified_top3", "preliminary_top3", "unscored_games",
   "excluded_games", "warnings", "content_sha256"
 ]
 ```
+
+Nested objects are exact as well:
+
+- `command_inputs`: `{date: canonical date, model_card: normalized POSIX string}`.
+- `cache_authority`: `{namespace: "experimental_daily/history_cache",
+  cutoff_date: canonical date, catalog_sha256: lowercase SHA-256}`.
+- Each `source_bindings` item is the exact JSON projection of `SourceBinding`
+  above; no `Path`, bytes, or extra HTTP headers are admitted.
+- A ranked Preliminary row has exactly `game_pk`, `target_date`, `away_team`,
+  `home_team`, `predicted_winner`, `pick_probability`,
+  `pick_probability_display`, `state`, `rank`, `data_completeness`,
+  `starter_edge_abs`, `starter_provenance`, `lineup_provenance`,
+  `scheduled_start_utc`, `observation_boundary_utc`, `reason_codes`,
+  `model_card_sha256`, `feature_sha256`, and `source_binding_sha256s`.
+- An Unscored or Excluded row has exactly `game_pk`, `target_date`,
+  `away_team`, `home_team`, `state`, `scheduled_start_utc`, `reason_codes`, and
+  `source_binding_sha256s`; probability, rank, and feature digest are forbidden.
+- `reason_codes` and `source_binding_sha256s` are sorted unique arrays. Teams
+  and predicted winner are nonempty strings, probability/completeness are finite
+  in `[0,1]`, `rank` is a positive integer, and state matches its population.
 
 Test `jsonschema.validate()` against one valid fixture and mutations for an unknown field, missing digest, ranked unscored row, and more than three selected rows.
 
@@ -230,6 +342,7 @@ class FrozenLiveCard:
     file_sha256: str
     normalization: Mapping[str, object]
     slot_weights: Mapping[int, float]
+    component_weights: Mapping[str, float]
     alpha: float
     beta: float
 
@@ -244,13 +357,19 @@ def load_frozen_live_card(path: str | Path) -> FrozenLiveCard:
     validate_normalization(payload.get("normalization"))
     calibration = payload.get("calibration")
     slot_payload = payload.get("slot_weights")
+    component_payload = payload.get("component_weights")
     if not isinstance(calibration, Mapping) or set(calibration) != {"alpha", "beta"}:
         raise ValueError("frozen calibration differs")
     if not isinstance(slot_payload, Mapping):
         raise ValueError("frozen slot weights differ")
+    if not isinstance(component_payload, Mapping):
+        raise ValueError("frozen component weights differ")
     slots = {int(key): float(value) for key, value in slot_payload.items()}
     if set(slots) != set(range(1, 10)) or not math.isclose(sum(slots.values()), 1.0):
         raise ValueError("frozen slot weights differ")
+    components = {str(key): float(value) for key, value in component_payload.items()}
+    if components != SCORING_WEIGHTS:
+        raise ValueError("frozen component weights differ from scoring constants")
     alpha, beta = float(calibration["alpha"]), float(calibration["beta"])
     if not math.isfinite(alpha) or not math.isfinite(beta) or beta <= 0:
         raise ValueError("frozen calibration differs")
@@ -259,12 +378,16 @@ def load_frozen_live_card(path: str | Path) -> FrozenLiveCard:
         file_sha256=digest,
         normalization=MappingProxyType(dict(payload["normalization"])),
         slot_weights=MappingProxyType(slots),
+        component_weights=MappingProxyType(components),
         alpha=alpha,
         beta=beta,
     )
 ```
 
 Do not call `config.load_config()` or `pipeline._load_model_card()`: both bind the historical 2025 window and stage layout.
+Import `mlb_backtest.scoring.WEIGHTS` as `SCORING_WEIGHTS`; do not duplicate the
+mapping in the live module. Tests mutate each card component weight and monkeypatch
+the scoring mapping to prove the equality gate runs before any score.
 
 - [ ] **Step 4: Run regression parity**
 
@@ -289,6 +412,8 @@ git commit -m "feat: authenticate frozen live model card"
 - Create: `tests/fixtures/live_top3/schedule_partial.json`
 - Create: `tests/fixtures/live_top3/boxscore_complete.json`
 - Create: `tests/fixtures/live_top3/boxscore_partial.json`
+- Create: `tests/fixtures/live_top3/boxscore_pregame_empty_pitchers.json`
+- Create: `tests/fixtures/live_top3/boxscore_poststart_appearance_order.json`
 
 - [ ] **Step 1: Write failing parser and receipt tests**
 
@@ -296,6 +421,7 @@ git commit -m "feat: authenticate frozen live model card"
 class LiveSourceTests(unittest.TestCase):
     def test_http_observation_binds_status_final_url_and_selected_headers(self):
         observed = fetch_live_http(
+            "stats_api",
             "https://statsapi.mlb.com/api/v1/schedule?sportId=1",
             opener=fake_opener(
                 status=200,
@@ -310,7 +436,9 @@ class LiveSourceTests(unittest.TestCase):
         self.assertEqual(observed.body, b"{}")
 
     def test_projection_strips_scores_winners_and_linescore(self):
-        games = parse_live_schedule(SCHEDULE_COMPLETE.read_bytes())
+        games = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )
         forbidden = {"away_score", "home_score", "away_is_winner", "home_is_winner"}
         self.assertFalse(forbidden & set(games[0]))
 
@@ -342,14 +470,25 @@ class LiveHttpObservation:
     requested_url: str
     final_url: str
     started_at_utc: str
-    observed_at_utc: str
+    response_completed_at_utc: str
     http_status: int
     content_type: str | None
     etag: str | None
     last_modified: str | None
     body: bytes
 
+class ObservationFetcher(Protocol):
+    def __call__(
+        self, source: Literal["stats_api", "savant"], url: str, *, max_bytes: int
+    ) -> LiveHttpObservation: ...
+
+ALLOWED_FINAL_HOSTS = MappingProxyType({
+    "stats_api": frozenset({"statsapi.mlb.com"}),
+    "savant": frozenset({"baseballsavant.mlb.com"}),
+})
+
 def fetch_live_http(
+    source: Literal["stats_api", "savant"],
     url: str,
     *,
     timeout: float = 90,
@@ -357,15 +496,20 @@ def fetch_live_http(
     opener: Callable[..., object] = urlopen,
     clock: Callable[[], datetime] = utc_now,
 ) -> LiveHttpObservation:
+    if source not in ALLOWED_FINAL_HOSTS:
+        raise ValueError("unsupported live source")
     started = clock()
     response = opener(Request(url, headers={"User-Agent": "mlb-experimental-live/1.0"}), timeout=timeout)
     with response:
+        final_url = canonical_http_url(response.geturl())
+        if urlsplit(final_url).hostname not in ALLOWED_FINAL_HOSTS[source]:
+            raise ValueError("live source final host differs")
         body = read_bounded_response(response, max_bytes=max_bytes)
         return LiveHttpObservation(
-            requested_url=url,
-            final_url=response.geturl(),
+            requested_url=canonical_http_url(url),
+            final_url=final_url,
             started_at_utc=canonical_utc(started),
-            observed_at_utc=canonical_utc(clock()),
+            response_completed_at_utc=canonical_utc(clock()),
             http_status=int(response.status),
             content_type=response.headers.get("Content-Type"),
             etag=response.headers.get("ETag"),
@@ -374,10 +518,13 @@ def fetch_live_http(
         )
 ```
 
-`read_bounded_response()` uses the existing bounded-read rules: reject non-HTTP(S) redirects, non-200 status, invalid/oversized `Content-Length`, non-bytes chunks, incomplete bodies, and bodies exceeding `max_bytes`.
+`read_bounded_response()` uses the existing bounded-read rules: reject non-HTTP(S) redirects, non-200 status, invalid/oversized `Content-Length`, non-bytes chunks, incomplete bodies, and bodies exceeding `max_bytes`. `fetch_live_http()` also receives the logical source and rejects a final host outside that source's exact allowlist (Stats API and Savant are separate); the receipt retains both requested and final canonical URLs.
 
 ```python
-def parse_live_schedule(raw: bytes) -> tuple[dict[str, object], ...]:
+def parse_live_schedule(
+    raw: bytes, *, requested_date: str
+) -> tuple[dict[str, object], ...]:
+    requested_date = validate_target_date(requested_date)
     parsed = parse_schedule(raw)
     allowed = (
         "game_pk", "official_date", "game_type", "scheduled_start_utc", "status",
@@ -387,14 +534,16 @@ def parse_live_schedule(raw: bytes) -> tuple[dict[str, object], ...]:
         "venue_id", "venue_name", "doubleheader_marker",
         "away_lineup", "home_lineup",
     )
-    return tuple({field: game[field] for field in allowed} for game in parsed)
+    projected = tuple({field: game[field] for field in allowed} for game in parsed)
+    validate_schedule_coverage(projected, requested_date=requested_date)
+    return projected
 ```
 
-Reject duplicate/conflicting `gamePk`, a schedule date different from the requested date, non-regular games in the result, and any normalized game whose start is not canonical UTC.
+Reject duplicate/conflicting `gamePk`, a schedule date different from the requested date, non-regular games in the result, and any normalized game whose start is not canonical UTC. The exact accepted detailed-state allowlist is `frozenset({"Scheduled", "Pre-Game"})`. Unknown, warmup, started, delayed beyond the scheduled start, suspended, game-over, final, canceled, and postponed variants are fail-closed and never scoreable.
 
 - [ ] **Step 4: Implement a pregame-only boxscore parser**
 
-Define `PregameParticipants` with game ID, two optional observed starter IDs, ordered lineups, completeness, and reason codes. Parse only `teams.{away,home}.team.id`, `pitchers[0]`, and player `battingOrder/person.id`. Do not parse or retain runs, winners, innings, plays, or target-game performance. A starter is `ANNOUNCED_LOCAL_OBSERVATION` only when the saved boxscore starter and saved schedule probable ID agree; a mismatch remains scoreable only under an explicit Preliminary reason.
+Define `PregameParticipants` with game ID, two optional pitcher-list IDs, ordered lineups, completeness, and reason codes. Parse only `teams.{away,home}.team.id`, the bounded pitcher list, and player `battingOrder/person.id`. Do not parse or retain runs, winners, innings, plays, or target-game performance. Pitcher-list position is not an announced-starter field. Agreement with schedule `probablePitcher` becomes `PROBABLE_CONSISTENT`; any contemporaneous mismatch becomes `STARTER_CONFLICT` and is unscoreable. Empty pregame pitcher arrays, a lineup-posted pregame state, and post-start appearance order have separate real fixtures so appearance order can never be promoted to pregame evidence.
 
 - [ ] **Step 5: Add immutable observation storage**
 
@@ -402,49 +551,66 @@ Define `PregameParticipants` with game ID, two optional observed starter IDs, or
 def observe_live_slate(
     root: Path,
     target_date: str,
-    observed_at_utc: str,
     *,
-    fetcher: Callable[[str], LiveHttpObservation] = fetch_live_http,
+    fetcher: ObservationFetcher = fetch_live_http,
+    observation_id_factory: Callable[[], str] = new_observation_id,
 ) -> LiveSlateObservation:
-    raw_store = RawStore(root / "data/experimental_daily/raw")
+    raw_store = RawStore(root / "data/experimental_daily/live_observations")
     schedule_request = schedule_url(target_date, target_date)
-    schedule_http = fetcher(schedule_request)
+    schedule_http = fetcher("stats_api", schedule_request, max_bytes=MAX_JSON_BYTES)
+    schedule_observation_id = observation_id_factory()
     schedule_artifact = raw_store.put(
         "mlb_live_schedule",
-        {"target_date": target_date, "url": schedule_request},
+        {
+            "observation_id": schedule_observation_id,
+            "target_date": target_date,
+            "url": schedule_request,
+        },
         schedule_http.body,
     )
     schedule_raw = schedule_artifact.payload_path.read_bytes()
-    games = parse_live_schedule(schedule_raw)
-    bindings = [_binding_from_observation(schedule_artifact, schedule_http)]
+    games = parse_live_schedule(schedule_raw, requested_date=target_date)
+    bindings = [
+        _persist_receipt_and_bind(
+            root, schedule_observation_id, schedule_artifact, schedule_http
+        )
+    ]
     participants = {}
     for game in games:
         game_pk = int(game["game_pk"])
         request = boxscore_url(game_pk)
-        http = fetcher(request)
+        http = fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES)
+        observation_id = observation_id_factory()
         artifact = raw_store.put(
             "mlb_live_boxscore",
-            {"game_pk": game_pk, "url": request},
+            {
+                "observation_id": observation_id,
+                "game_pk": game_pk,
+                "url": request,
+            },
             http.body,
         )
         participants[game_pk] = parse_pregame_boxscore(
             artifact.payload_path.read_bytes(), game_pk=game_pk
         )
-        bindings.append(_binding_from_observation(artifact, http))
+        bindings.append(
+            _persist_receipt_and_bind(root, observation_id, artifact, http)
+        )
     return LiveSlateObservation(
         target_date=target_date,
-        observed_at_utc=observed_at_utc,
         games=games,
         participants=MappingProxyType(participants),
         source_bindings=tuple(bindings),
     )
 ```
 
-Define frozen `LiveSlateObservation` and `PregameParticipants` dataclasses in this module. `_binding_from_observation()` computes both payload and manifest SHA-256, requires repository-relative paths, and copies only the selected HTTP fields into `SourceBinding`. It also writes a canonical observation receipt under `audit/experimental_daily/http/` so a verified cached artifact retains its original HTTP authority. Repeated runs append observations and never replace previous raw bytes or receipts.
+Define frozen `LiveSlateObservation` and `PregameParticipants` dataclasses in this module. `_persist_receipt_and_bind()` uses `secure_fs.write_exclusive()`, fsync/rebind verification, JSON-safe POSIX relative paths, and a durable-completion clock. The receipt binds observation ID, requested/final URL, source-specific host admission, status/selected headers, response completion, payload SHA, manifest SHA, and durable receipt completion; `SourceBinding` additionally binds receipt path and receipt SHA. Repeated runs append observations and never replace previous raw bytes or receipts. Live catalog verification is source-scoped and cannot invalidate or authorize the separate deterministic history cache.
+
+Add `observe_final_game_schedule()` using a new observation ID and the same receipt contract. It re-fetches the target date immediately before one game's classification and returns only if game identity, official date, venue, accepted pregame status, and scheduled start exactly match the saved slate; otherwise it returns an explicit fail-closed disposition.
 
 - [ ] **Step 6: Test start revision and stale-current-day behavior**
 
-Fixtures must prove a changed scheduled start creates a new observation identity; a failed current-day fetch raises and never falls back to an older schedule or boxscore.
+Fixtures must prove a changed scheduled start creates a new observation identity; a failed current-day fetch raises and never falls back to an older schedule or boxscore. Also prove two changed bytes under otherwise identical current queries create two valid observation identities without making deterministic history catalog verification ambiguous.
 
 - [ ] **Step 7: Run GREEN and commit**
 
@@ -461,6 +627,8 @@ git commit -m "feat: capture live pregame observations"
 **Files:**
 - Create: `mlb_backtest/live_history.py`
 - Create: `tests/test_live_history.py`
+- Modify: `mlb_backtest/prepare.py`
+- Modify: `tests/test_prepare.py`
 - Read only: `mlb_backtest/career_bf.py`
 - Regression test: `tests/test_career_bf.py`
 
@@ -512,10 +680,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_live_history -v
 3. call `monthly_ranges(opening_date, cutoff)` and `fetch_monthly()` rather than historical `regular_season_ranges()`;
 4. load verified Statcast manifests into one `StatcastData` with complete non-overlapping coverage;
 5. derive the exact 30-team name/code map from current-season schedule and Statcast evidence;
-6. build result-free schedule history using played `gamePk` and dates proven by D-1 Statcast, never target-day status/results;
-7. fetch/load cumulative league ERA for the one D-1 as-of date;
-8. construct `FeatureHistory` using the frozen slot weights; and
-9. call `assert_feature_dates(target_date, every_bound_source_date)` before returning.
+6. fetch, receipt, cache, and validate coordinates and IANA time zones for every distinct historical venue before schedule-history construction;
+7. build result-free schedule history using played `gamePk`, authenticated venue references, and dates proven by D-1 Statcast, never target-day status/results;
+8. fetch/load cumulative league ERA for the one D-1 as-of date;
+9. construct `FeatureHistory` using the frozen slot weights; and
+10. call `assert_feature_dates(target_date, every_bound_source_date)` before returning.
 
 Use exact public signature:
 
@@ -525,12 +694,12 @@ def build_live_history(
     target_date: str,
     card: FrozenLiveCard,
     *,
-    fetcher: Callable[[str], LiveHttpObservation] = fetch_live_http,
+    fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> LiveHistoryBundle:
     target = date.fromisoformat(validate_target_date(target_date))
     cutoff = target - timedelta(days=1)
-    raw_root = root / "data/experimental_daily/raw"
+    raw_root = root / "data/experimental_daily/history_cache"
     store = RawStore(raw_root)
     schedule, schedule_bindings = _load_or_fetch_schedule_history(
         store, target.year, cutoff, fetcher=fetcher
@@ -540,15 +709,17 @@ def build_live_history(
         store, opening, cutoff, fetcher=fetcher, sleeper=sleeper
     )
     team_map = derive_team_code_map(schedule, statcast, target.year).mapping
+    venue_refs, venue_bindings = _load_or_fetch_venue_references(
+        store, schedule, fetcher=fetcher
+    )
     schedule_build = _build_result_free_live_schedule_history(
-        schedule, statcast, team_map, opening, cutoff
+        schedule, statcast, team_map, venue_refs, opening, cutoff
     )
     era, era_bindings = _load_or_fetch_league_era(
         store, opening, cutoff, fetcher=fetcher, sleeper=sleeper
     )
-    history = build_pregame_history(
-        statcast, {"game_pk": 1, "official_date": target_date},
-        card.slot_weights, schedule_build
+    history = build_feature_history(
+        statcast, card.slot_weights, schedule_build
     )
     assert_feature_dates(target_date, _bound_source_dates(history, cutoff))
     return LiveHistoryBundle(
@@ -557,11 +728,21 @@ def build_live_history(
         feature_history=history,
         league_era_by_asof=MappingProxyType(era),
         team_code_by_name=MappingProxyType(dict(team_map)),
-        source_bindings=tuple(schedule_bindings + statcast_bindings + era_bindings),
+        venue_references=MappingProxyType(dict(venue_refs)),
+        cache_authority=_authenticated_history_catalog(store, cutoff),
+        source_bindings=tuple(
+            schedule_bindings + statcast_bindings + venue_bindings + era_bindings
+        ),
     )
 ```
 
-Implement each named private helper in `live_history.py`; each returns only verified objects plus exact `SourceBinding` values and refuses overlapping or incomplete coverage. When calling existing `fetch_monthly()` or `fetch_league_era_records()`, supply a recording adapter that returns `LiveHttpObservation.body`, persists the observation receipt, and later pairs each returned raw artifact with that exact observation. A cache hit must reload and authenticate the persisted HTTP receipt; it must not invent metadata.
+Implement each named private helper in `live_history.py`; each returns only verified objects plus exact `SourceBinding` values and refuses overlapping or incomplete coverage. Use the Task 3 `ObservationFetcher` protocol and a separate stateful `RecordingByteFetcher` adapter whose callable boundary matches the existing `fetch_monthly(..., fetcher=Callable[..., bytes])`, including `max_bytes`. The adapter selects `stats_api` or `savant` explicitly, persists the observation, and pairs it with the exact returned bytes. A cache hit must reload and authenticate the persisted HTTP receipt; it must not invent metadata. Deterministic history queries omit live observation IDs and are verified only against the history catalog.
+
+Mechanically extract target-independent `build_feature_history(statcast_data,
+slot_weights, schedule_build)` in `prepare.py`. Existing
+`build_pregame_history()` keeps all current target-game validation, then delegates
+to the new helper so historical behavior is unchanged. The live path calls only
+the target-independent helper and never constructs a fake target-date game.
 
 - [ ] **Step 4: Add D-1 career-BF evidence for observed starters**
 
@@ -579,28 +760,28 @@ def load_live_career_bf(
     target_date: str,
     pitcher_ids: Iterable[int],
     *,
-    fetcher: Callable[[str], LiveHttpObservation] = fetch_live_http,
+    fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> tuple[Mapping[int, int], tuple[SourceBinding, ...]]:
     target = date.fromisoformat(validate_target_date(target_date))
     cutoff = (target - timedelta(days=1)).isoformat()
-    store = RawStore(root / "data/experimental_daily/raw")
+    store = RawStore(root / "data/experimental_daily/history_cache")
     values, bindings = {}, []
     for pitcher_id in sorted(set(pitcher_ids)):
         request = live_career_bf_url(pitcher_id, cutoff)
         artifact, http = _fetch_and_store_with_retries(
             store, "mlb_live_career_bf",
             {"pitcher_id": pitcher_id, "as_of": cutoff, "url": request},
-            request, fetcher=fetcher, sleeper=sleeper,
+            request, source="stats_api", fetcher=fetcher, sleeper=sleeper,
         )
         values[pitcher_id] = parse_prior_career_bf(
             artifact.payload_path, pitcher_id
         )
-        bindings.append(_binding_from_observation(artifact, http))
+        bindings.append(_history_binding_from_observation(artifact, http))
     return MappingProxyType(values), tuple(bindings)
 ```
 
-Store the exact response and use its total career BF as the final starter sample size; do not add it to current-season BF and double count. Reject any `as_of >= target_date`. The CLI calls this function only after observing today's known announced/probable pitcher IDs.
+Store the exact response and use its total career BF as the final starter sample size; do not add it to current-season BF and double count. Reject any `as_of >= target_date`. The CLI calls this function only after observing today's known probable pitcher IDs.
 
 - [ ] **Step 5: Test cache integrity and source failure**
 
@@ -632,19 +813,20 @@ Add a characterization test that loads the existing feature fixture, calls `buil
 
 ```python
 class LiveFeatureTests(unittest.TestCase):
-    def test_announced_participants_build_eligible_live_raw_row(self):
+    def test_consistent_probable_participants_build_preliminary_raw_row(self):
         raw = build_live_raw_game_features(
-            live_game(announced=True), history(), team_map(), era(), career_bf()
+            live_game(starter_state="PROBABLE_CONSISTENT"),
+            history(), team_map(), era(), career_bf()
         )
         self.assertTrue(raw["eligible"])
-        self.assertEqual(raw["starter_provenance"], "ANNOUNCED_LOCAL_OBSERVATION")
+        self.assertEqual(raw["starter_provenance"], "PROBABLE_CONSISTENT")
 
-    def test_probable_starters_preserve_preliminary_provenance(self):
-        raw = build_live_raw_game_features(
-            live_game(announced=False), history(), team_map(), era(), career_bf()
-        )
-        self.assertTrue(raw["eligible"])
-        self.assertEqual(raw["starter_provenance"], "PROBABLE_LOCAL_OBSERVATION")
+    def test_starter_conflict_is_unscoreable(self):
+        with self.assertRaisesRegex(ValueError, "STARTER_CONFLICT"):
+            build_live_raw_game_features(
+                live_game(starter_state="STARTER_CONFLICT"),
+                history(), team_map(), era(), career_bf()
+            )
 
     def test_partial_lineup_is_unscoreable(self):
         with self.assertRaisesRegex(ValueError, "nine.*lineup"):
@@ -697,7 +879,7 @@ Extract `_base_raw_result()` and `_build_side_components()` mechanically from th
 
 - [ ] **Step 5: Implement the live adapter**
 
-`build_live_raw_game_features()` validates complete ordered lineups, pregame status, start identity, current live provenance, 30-team map, D-1 history, and exact D-1 career BF. It then calls the shared component helper. It must never write `RECONSTRUCTED_ACTUAL_STARTER` or infer a starter from target-game Statcast.
+`build_live_raw_game_features()` validates complete ordered lineups, the exact pregame-status allowlist, final start/venue identity, `PROBABLE_CONSISTENT` provenance, 30-team map, D-1 history, authenticated target venue evidence, and exact D-1 career BF totals. Its public signature includes `career_bf_total_by_pitcher: Mapping[int, int]`. Immediately before component scoring it replaces each starter sample-size field with that total exactly once; it neither leaves the current loaded Statcast count in place nor adds the total to it. It then calls the shared component helper. It must never write `RECONSTRUCTED_ACTUAL_STARTER`, claim `ANNOUNCED`, or infer a starter from target-game Statcast.
 
 - [ ] **Step 6: Run parity, leakage, and GREEN tests**
 
@@ -724,29 +906,28 @@ git commit -m "feat: build live result-free features"
 
 ```python
 class LiveTop3ServiceTests(unittest.TestCase):
-    def test_four_verified_candidates_select_exact_top_three(self):
+    def test_four_preliminary_candidates_select_exact_top_three(self):
         result = build_live_top3_run(
-            slate=four_verified(), history=history(), card=frozen_card(),
+            slate=four_preliminary(), final_schedule_observer=matching_final_observer,
+            history=history(), card=frozen_card(),
             career_bf_by_pitcher=career_bf(), career_bf_bindings=(),
-            observed_at_utc="2026-07-21T16:00:00Z",
+            command_inputs=command_inputs(), execution_times=execution_times(),
         )
-        self.assertEqual([row["game_pk"] for row in result["verified_top3"]], [4, 2, 3])
-        self.assertEqual([row["rank"] for row in result["verified_top3"]], [1, 2, 3])
+        self.assertEqual(result["verified_top3"], [])
+        self.assertEqual([row["game_pk"] for row in result["preliminary_top3"]], [4, 2, 3])
+        self.assertEqual([row["rank"] for row in result["preliminary_top3"]], [1, 2, 3])
 
-    def test_populations_never_compete(self):
-        result = build_live_top3_run(
-            slate=mixed_states(), history=history(), card=frozen_card(),
-            career_bf_by_pitcher=career_bf(), career_bf_bindings=(),
-            observed_at_utc="2026-07-21T16:00:00Z",
-        )
-        self.assertEqual(result["verified_top3"][0]["game_pk"], VERIFIED_LOW_P)
-        self.assertEqual(result["preliminary_top3"][0]["game_pk"], PRELIMINARY_HIGH_P)
+    def test_starter_conflict_is_unscored_and_verified_is_reserved(self):
+        result = build_service_fixture(starter_conflict())
+        self.assertEqual(result["verified_top3"], [])
+        self.assertIn("STARTER_CONFLICT", result["unscored_games"][0]["reason_codes"])
 
     def test_missing_lineup_is_unscored_without_probability(self):
         row = build_live_top3_run(
-            slate=missing_lineup(), history=history(), card=frozen_card(),
+            slate=missing_lineup(), final_schedule_observer=matching_final_observer,
+            history=history(), card=frozen_card(),
             career_bf_by_pitcher=career_bf(), career_bf_bindings=(),
-            observed_at_utc="2026-07-21T16:00:00Z",
+            command_inputs=command_inputs(), execution_times=execution_times(),
         )["unscored_games"][0]
         self.assertNotIn("pick_probability", row)
         self.assertNotIn("rank", row)
@@ -766,23 +947,25 @@ Use this public boundary:
 def build_live_top3_run(
     *,
     slate: LiveSlateObservation,
+    final_schedule_observer: Callable[[int, str], FinalGameObservation],
     history: LiveHistoryBundle,
     card: FrozenLiveCard,
     career_bf_by_pitcher: Mapping[int, int],
     career_bf_bindings: tuple[SourceBinding, ...],
-    observed_at_utc: str,
+    command_inputs: Mapping[str, object],
+    execution_times: ExecutionTimes,
 ) -> dict[str, object]:
     """Return one validated, content-hashed experimental run payload."""
 ```
 
 Classification order is:
 
-1. started/final/canceled/postponed or date mismatch -> `EXCLUDED`;
-2. incomplete lineup, missing starter, invalid history, or feature failure -> `UNSCORED`;
-3. complete lineups plus two locally announced observed starters -> `VERIFIED`;
-4. complete lineups plus one or two explicit probable starters -> `PRELIMINARY`.
+1. date mismatch, non-allowlisted status, final-schedule identity/venue/start mismatch, or any relevant response/durable receipt time at or after scheduled start -> `EXCLUDED`;
+2. incomplete lineup, missing starter, `STARTER_CONFLICT`, missing target venue evidence, invalid history, or feature failure -> `UNSCORED`;
+3. complete ordered lineups plus two `PROBABLE_CONSISTENT` starters -> `PRELIMINARY`;
+4. `VERIFIED` is never assigned in this MVP.
 
-Each row retains deterministic reason codes. A start-time revision invalidates an older participant observation for that game.
+Each row retains deterministic reason codes. Inside the per-game classification loop, the service calls `final_schedule_observer(game_pk, target_date)` immediately before evaluating that game. It derives the per-game observation boundary as the maximum schedule, boxscore, final-schedule, and durable receipt timestamp. It refuses a caller-supplied observation time. A start, venue, identity, or status revision invalidates the older participant observation for that game.
 
 - [ ] **Step 4: Reuse frozen scoring math and implement live ranking tuple**
 
@@ -802,7 +985,7 @@ Do not call historical `rank_daily()` because its second key is legacy confidenc
 
 - [ ] **Step 5: Bind row and source digests**
 
-Each scoreable row binds the exact model-card digest, raw-feature digest, current observation digests, D-1 history digests, participant provenance, observation time, and scheduled-start identity. The run payload's `content_sha256` is computed over the canonical payload with that field omitted, then inserted and revalidated.
+Each scoreable row binds the exact model-card digest, raw-feature digest, current payload/manifest/receipt digests, D-1 history/cache authority, participant provenance, derived observation-completion boundary, and scheduled-start identity. The run payload binds exact command inputs plus Eastern/UTC execution times. Its `content_sha256` is computed over the canonical payload with that field omitted, then inserted and revalidated.
 
 - [ ] **Step 6: Run GREEN and commit**
 
@@ -854,7 +1037,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_daily_top3 -v
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m mlb_backtest.daily_top3")
     parser.add_argument("--root", type=Path, default=Path("."))
-    parser.add_argument("--date", type=canonical_date, default=None)
+    parser.add_argument("--date", type=validate_target_date, default=None)
     parser.add_argument(
         "--model-card",
         type=Path,
@@ -879,29 +1062,37 @@ The command orchestration boundary is:
 def run_daily_top3(
     root: Path,
     target_date: str,
-    observed_at_utc: str,
     model_card_path: Path,
     *,
-    fetcher: Callable[[str], LiveHttpObservation] = fetch_live_http,
+    fetcher: ObservationFetcher = fetch_live_http,
+    utc_clock: Callable[[], datetime] = utc_now,
 ) -> tuple[dict[str, object], Path, Path]:
+    execution_times = ExecutionTimes.capture(utc_clock)
     card = load_frozen_live_card(model_card_path)
-    slate = observe_live_slate(
-        root, target_date, observed_at_utc, fetcher=fetcher
-    )
     history = build_live_history(
         root, target_date, card, fetcher=fetcher
     )
+    slate = observe_live_slate(root, target_date, fetcher=fetcher)
     pitcher_ids = known_observed_pitcher_ids(slate)
     career_bf, career_bindings = load_live_career_bf(
         root, target_date, pitcher_ids, fetcher=fetcher
     )
     payload = build_live_top3_run(
         slate=slate,
+        final_schedule_observer=lambda game_pk, requested_date: (
+            observe_final_game_schedule(
+                root, game_pk, requested_date, fetcher=fetcher
+            )
+        ),
         history=history,
         card=card,
         career_bf_by_pitcher=career_bf,
         career_bf_bindings=career_bindings,
-        observed_at_utc=observed_at_utc,
+        command_inputs={
+            "date": target_date,
+            "model_card": model_card_path.as_posix(),
+        },
+        execution_times=execution_times,
     )
     json_path, markdown_path = persist_live_top3_report(root, payload)
     return payload, json_path, markdown_path
@@ -909,7 +1100,7 @@ def run_daily_top3(
 
 - [ ] **Step 4: Implement append-only run reports**
 
-Use a run filename composed of canonical observation UTC plus the run content digest. Write canonical JSON first with `secure_fs.write_exclusive()`, rebind it, render Markdown only from the validated JSON payload, and write the Markdown under the same run ID. Never write `latest`, overwrite an earlier report, or delete failure residue.
+Use a run filename composed of the payload's canonical `executed_at_utc` plus the run content digest. Write canonical JSON first with `secure_fs.write_exclusive()`, rebind it, render Markdown only from the validated JSON payload, and write the Markdown under the same run ID. Never write `latest`, overwrite an earlier report, or delete failure residue.
 
 Use these exact boundaries:
 
@@ -922,7 +1113,8 @@ def render_live_top3_markdown(payload: Mapping[str, object]) -> bytes:
         "**RESEARCH ONLY — NON-OFFICIAL SAMPLE — PROFITABILITY NOT VALIDATED**",
         "",
         f"Target date: `{safe['target_date']}`",
-        f"Observed: `{safe['observed_at_utc']}`",
+        f"Executed (ET): `{safe['executed_at_eastern']}`",
+        f"Executed (UTC): `{safe['executed_at_utc']}`",
         "",
     ]
     lines.extend(_render_population("Verified Top 3", safe["verified_top3"]))
@@ -934,7 +1126,7 @@ def persist_live_top3_report(
     root: Path, payload: Mapping[str, object]
 ) -> tuple[Path, Path]:
     safe = validate_run_payload(payload)
-    stamp = safe["observed_at_utc"].replace(":", "").replace("-", "")
+    stamp = safe["executed_at_utc"].replace(":", "").replace("-", "")
     run_id = f"{stamp}-{safe['content_sha256'][:16]}"
     relative = Path("reports/experimental_daily") / safe["target_date"]
     json_relative = relative / f"{run_id}.json"
@@ -978,16 +1170,16 @@ git commit -m "feat: add one-command daily top3 report"
 
 - [ ] **Step 1: Write a failing sealed-fixture E2E test**
 
-The fixture represents at least six games: four Verified, one Preliminary, one partial-lineup Unscored, plus one already-started Excluded. The fake fetcher must serve schedule, per-game boxscore, D-1 schedule history, Statcast chunks, league ERA, and career BF.
+The fixture represents at least six games: four Preliminary, one starter-conflict Unscored, one partial-lineup Unscored, plus one already-started Excluded. The fake fetcher must serve D-1 schedule history, venue metadata, Statcast chunks, league ERA, current schedule, per-game boxscore, career BF, and immediate final schedule revalidation.
 
 ```python
 def test_fixture_e2e_is_outcome_isolated_and_deterministic(self):
     first = run_daily_top3_fixture(self.root / "one")
     second = run_daily_top3_fixture(self.root / "two")
     self.assertEqual(canonical_without_paths(first), canonical_without_paths(second))
-    self.assertEqual(len(first["verified_top3"]), 3)
-    self.assertEqual(len(first["preliminary_top3"]), 1)
-    self.assertEqual(len(first["unscored_games"]), 1)
+    self.assertEqual(first["verified_top3"], [])
+    self.assertEqual(len(first["preliminary_top3"]), 3)
+    self.assertEqual(len(first["unscored_games"]), 2)
     self.assert_no_fields(first, {"score", "winner", "outcome", "odds", "market"})
 ```
 
@@ -1001,7 +1193,7 @@ Expected RED must be an integration wiring gap, not a malformed fixture.
 
 - [ ] **Step 3: Add tamper and failure-matrix tests**
 
-Cover card tamper, raw cache tamper, manifest tamper, target-day Statcast poison, incomplete current schedule response, boxscore start revision, missing starter, partial lineup, no scheduled games, transient D-1 cache reuse, forbidden stale current-day reuse, and output conflict.
+Cover card/component-weight tamper, history raw/manifest/receipt tamper, target-day Statcast poison, missing/invalid venue metadata, incomplete current schedule response, source-host redirect escape, changed append-only observations, boxscore start revision, immediate final-refetch identity/status/start conflict, response or durable receipt at/after start, empty pregame pitcher arrays, post-start pitcher appearance order, `STARTER_CONFLICT`, missing starter, partial lineup, unknown status, no scheduled games, exact career-BF overwrite without double-count, transient D-1 cache reuse, forbidden stale current-day reuse, JSON-safe binding paths, and output conflict.
 
 - [ ] **Step 4: Run the focused release gate**
 
@@ -1055,7 +1247,7 @@ cd "/Users/taejunoh/Documents/MLB Analysis/.worktrees/mlb-v5-1-backtest"
 PYTHONDONTWRITEBYTECODE=1 python3 -m mlb_backtest.daily_top3
 ```
 
-Explain first-run bootstrap, later incremental verification, the three candidate states, why fewer than three rows is valid, exit codes, artifact locations, how to rerun after lineups are posted, and all research-only limitations.
+Explain first-run bootstrap, later incremental verification, reserved/empty Verified, Preliminary, Unscored, and Excluded dispositions, why fewer than three rows is valid, exit codes, artifact locations, how to rerun after lineups are posted, and all research-only limitations.
 
 - [ ] **Step 2: Run independent spec review**
 
@@ -1067,13 +1259,13 @@ Review network bounds, raw-store writes, cache selection, target-day leakage, mu
 
 - [ ] **Step 4: Run the first real same-day smoke command**
 
-After focused and regression gates pass, execute the one command for the current Eastern date. Network use is allowed only in this step. Preserve the exact raw receipts and report even if the valid result has zero Verified rows.
+After focused and regression gates pass, execute the one command for the current Eastern date. Network use is allowed only in this step. Preserve the exact raw receipts and report; the MVP's Verified array must be empty.
 
 - [ ] **Step 5: Inspect and record the live result**
 
-Validate the JSON against `schemas/experimental_daily_top3.schema.json`, recompute every SHA-256, confirm all game starts were future at observation or explicitly excluded, confirm no target-date event rows, and compare Markdown rows to JSON.
+Validate the JSON against `schemas/experimental_daily_top3.schema.json`, recompute every SHA-256, confirm every scored game's response and durable receipt times preceded the finally revalidated start (otherwise it was explicitly excluded), confirm no target-date event rows, and compare Markdown rows to JSON.
 
-Write `implementation_record.md` with commit, command, observation time, source counts, selected counts, test commands/results, review verdicts, limitations, and exact report paths.
+Write `implementation_record.md` with commit, command, Eastern/UTC execution times, per-source receipt bounds, source counts, selected counts, test commands/results, review verdicts, limitations, and exact report paths.
 
 - [ ] **Step 6: Commit documentation and implementation record**
 

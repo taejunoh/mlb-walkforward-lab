@@ -27,8 +27,10 @@ The default target date is the current date in `America/New_York`. An explicit
 same-day operation. The command prints the classified Top 3 rows and the exact
 paths of its Markdown and JSON outputs.
 
-The first run may bootstrap the 2026 result-free history cache. Later runs
-verify the cache and acquire only missing or changed observations.
+The first run may bootstrap the 2026 result-free history cache. That bootstrap
+must finish before any current-day observation is used. Later runs verify the
+cache and acquire only missing history before taking a fresh, append-only live
+observation.
 
 ## 3. Isolation and labels
 
@@ -59,8 +61,9 @@ historical `mlb_backtest.pipeline` stage CLI.
 ```text
 daily_top3 CLI
   -> frozen-card validator
-  -> current schedule and participant snapshot service
-  -> D-1 result-free history cache
+  -> D-1 result-free history and venue cache
+  -> current schedule and participant observation service
+  -> immediate final schedule revalidation
   -> live feature adapter
   -> existing component scoring, probability, and ranking math
   -> candidate classifier
@@ -75,16 +78,21 @@ Component boundaries:
    weights, `alpha`, and `beta` from the existing audited v5.1 model card. It
    authenticates the expected model version and digest without applying the
    historical 2025 date-window configuration.
-3. The live source service stores the exact response bytes, URL/query,
-   observation time, selected HTTP metadata, SHA-256, and parse result for the
-   target-date schedule and participant observations.
-4. The history service creates a result-free current-season view ending at D-1.
+3. The history service creates a result-free current-season view ending at D-1,
+   including authenticated venue coordinates and time zones needed by schedule
+   features.
+4. The live source service stores each current-day response as a distinct
+   append-only observation. Its receipt binds the observation ID, requested and
+   final URL, response-completion time, durable-write completion time, selected
+   HTTP metadata, payload SHA-256, manifest SHA-256, and receipt SHA-256.
    It may reuse existing generic URL builders, parsers, raw-store primitives,
    feature history, and as-of assertions, but not historical actual-starter
    reconstruction.
-5. The live feature adapter preserves announced versus probable starter
-   provenance and observed lineup provenance while calling shared pure feature
-   calculations. Existing v5.1 historical behavior remains unchanged.
+5. The live feature adapter preserves probable-starter and observed-lineup
+   provenance while calling shared pure feature calculations. Schedule
+   `probablePitcher` agreement with a boxscore pitcher list is still probable;
+   it is not independent evidence of an announced starter. Existing v5.1
+   historical behavior remains unchanged.
 6. Existing scoring and deterministic ranking math is reused after a valid raw
    live feature row exists.
 7. The output service writes a new, run-specific report and never overwrites an
@@ -118,24 +126,26 @@ states; a weaker state never changes a stronger state's rank.
 
 ### 6.1 `VERIFIED`
 
-A candidate is `VERIFIED` only when:
-
-- the observation was stored before the scheduled start;
-- both announced starting pitchers are present;
-- each team has exactly nine distinct, ordered announced starting hitters;
-- required D-1 history and source receipts pass validation; and
-- the scheduled-start identity used for classification still matches the
-  current observation.
-
-Here, `VERIFIED` means verified from the saved local pregame observation. It
-does not mean `TIMESTAMP_VERIFIED_T45`, independently certified, or admitted to
-the formal prospective sample.
+`VERIFIED` is reserved in the MVP and `verified_top3` is therefore empty. A
+future candidate may enter this state only after a separately approved,
+contractually documented pregame source proves the official starting role for
+both pitchers. Schedule `probablePitcher`, boxscore pitcher-array position, or
+agreement between those two fields is insufficient. This reserved state does
+not mean `TIMESTAMP_VERIFIED_T45` and cannot be admitted to the formal
+prospective sample without a separate protocol.
 
 ### 6.2 `PRELIMINARY`
 
 A candidate is `PRELIMINARY` only when every input required for a truthful score
-exists, but one or both starter identities remain explicitly probable rather
-than announced.
+exists, both schedule probable-pitcher identities are present and consistent
+with the contemporaneous participant observation, and each team has exactly
+nine distinct ordered pregame hitters. Both starter identities remain
+explicitly probable rather than announced.
+
+The schedule, participant, and final schedule-revalidation receipts relevant to
+the game must all complete durable storage before its then-current scheduled
+start. Classification uses the maximum of their response-completion and
+durable-write completion times, never a caller-supplied slate timestamp.
 
 The output preserves the exact preliminary reasons. Preliminary candidates are
 ranked only against other preliminary candidates. Observation relative to the
@@ -145,21 +155,26 @@ experimental state; this command does not claim formal T-45 admission.
 ### 6.3 `UNSCORED`
 
 A game is `UNSCORED` when a starter, an ordered nine-player lineup, critical
-history, or another required scoring input is unavailable or invalid. The
-output records reason codes but does not assign a probability or rank.
+history, venue/time-zone evidence, or another required scoring input is
+unavailable or invalid. A schedule/participant starter conflict is always
+`UNSCORED/STARTER_CONFLICT`; it is never scored as Preliminary. The output
+records reason codes but does not assign a probability or rank.
 
 The MVP does not fabricate lineup positions, reuse a previous game's lineup,
 or neutral-fill missing participants. A future `SHADOW` rank requires a
 separately approved deterministic projection source and policy.
 
-Games already in progress, final, canceled, or postponed at observation time
-are outside all Top 3 populations and receive an explicit disposition.
+Only a narrow, fixture-tested allowlist of pregame status codes is eligible.
+Unknown states and games already in progress, warmup, delayed after their start,
+final, canceled, postponed, or suspended are outside all Top 3 populations and
+receive an explicit disposition.
 
 ## 7. Ranking and output
 
 The command produces independent `verified_top3` and `preliminary_top3` arrays,
 plus `unscored_games` and excluded-game dispositions. A Top 3 array may contain
-zero, one, or two rows; it is never padded.
+zero through three rows; it is never padded. Under the current MVP,
+`verified_top3` contains zero rows by contract.
 
 Each scoreable population uses unrounded values and the frozen order:
 
@@ -183,15 +198,23 @@ view of that JSON authority.
 
 One invocation performs these steps in order:
 
-1. resolve and validate the Eastern target date and observed local system time;
+1. resolve and validate the Eastern target date and execution times;
 2. load and authenticate the frozen v5.1 model card;
-3. verify the existing experimental cache;
-4. acquire missing current-season D-1 source history;
-5. save today's schedule and participant observations with receipts;
-6. build only result-free, as-of-safe live features;
-7. classify every scheduled game;
-8. score and rank the verified and preliminary populations independently;
-9. create new JSON and Markdown reports; and
+3. verify the deterministic history cache in its separate namespace;
+4. acquire and authenticate missing current-season D-1 history and venue
+   metadata;
+5. acquire today's schedule and per-game participant observations last, using
+   unique append-only observation IDs and durable receipts;
+6. acquire exact through-D-1 career BF for the now-known probable starters, then
+   immediately re-fetch each game's schedule and require unchanged identity,
+   venue, pregame status, and scheduled start;
+7. build only result-free, as-of-safe live features, replacing each starter's
+   career BF with the exact through-D-1 total exactly once;
+8. classify using the latest relevant receipt time and then score and rank the
+   Preliminary population; the Verified population remains reserved;
+9. create new JSON and Markdown reports binding command inputs, Eastern and UTC
+   execution times, cache cutoff/authority, payload/manifest/receipt digests,
+   and source-specific final-host authority; and
 10. print the Top 3 rows, warnings, unscored count, and output paths.
 
 Re-running the command never replaces a prior report. A new observation creates
@@ -232,18 +255,24 @@ Required automated coverage:
 3. schedule parsing applies an explicit duplicate-identity contract and rejects
    conflicting game identity;
 4. D-1 cutoff rejects target-date performance evidence;
-5. announced, probable, missing, post-start, and changed-start participant cases map
-   to the exact candidate state;
+5. consistent probable, conflicting, missing, post-start, unknown-status, and
+   changed-start participant cases map to the exact candidate state, while the
+   MVP Verified population stays empty;
 6. missing or partial lineup and missing starter never receive a score;
 7. at least four scoreable games reproduce existing scoring math and select the
    deterministic top three;
-8. verified and preliminary populations never compete with each other;
+8. Verified remains reserved and preliminary rows never enter it without a
+   contractually documented official-starter source;
 9. no array is padded and no unscored row gains probability or rank;
 10. network and parse failures cannot use stale current-day observations;
 11. JSON schema, Markdown projection, content hashes, and exit codes are stable;
 12. imports and produced fields prove outcome, score, odds, and market isolation;
-13. repeat runs preserve earlier reports and bind their own observations; and
-14. writes remain inside the experimental namespaces.
+13. repeat runs preserve earlier reports and bind their own observation IDs,
+   payloads, manifests, and receipts;
+14. venue absence fails the affected game closed and career BF is neither
+   omitted nor double-counted;
+15. card component weights equal the scoring constants before scoring; and
+16. writes remain inside the experimental namespaces.
 
 The MVP becomes locally usable before hardening Task 14 when:
 
@@ -255,8 +284,9 @@ The MVP becomes locally usable before hardening Task 14 when:
 - valid JSON and Markdown reports are produced and manually inspected.
 
 If the live slate lacks enough complete pregame inputs, the smoke run may
-legitimately produce fewer than three verified or preliminary rows. That is a
-valid operational result, not a reason to invent candidates.
+legitimately produce fewer than three preliminary rows; the reserved Verified
+array remains empty. That is a valid operational result, not a reason to invent
+candidates.
 
 ## 11. Parallel work policy
 
