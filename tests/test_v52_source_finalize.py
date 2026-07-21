@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import hashlib
 import inspect
 import io
@@ -433,6 +434,21 @@ class FinalizationEndToEndTests(unittest.TestCase):
             return False
         return True
 
+    @staticmethod
+    def directory_fd_path(descriptor: int) -> Path | None:
+        getpath = getattr(fcntl, "F_GETPATH", None)
+        if getpath is not None:
+            try:
+                value = fcntl.fcntl(descriptor, getpath, b"\0" * 1024)
+                if isinstance(value, bytes):
+                    return Path(value.split(b"\0", 1)[0].decode())
+            except OSError:
+                pass
+        try:
+            return Path(os.readlink(f"/dev/fd/{descriptor}"))
+        except OSError:
+            return None
+
     def build_finalization_fixture(
         self, parent: Path
     ) -> tuple[Path, orchestration.CommonArgs, dict[str, Path], object, tuple[object, ...]]:
@@ -611,9 +627,26 @@ class FinalizationEndToEndTests(unittest.TestCase):
         original_rename = os.rename
         original_replace = os.replace
 
-        def forbid_source_write(operation: str, path: object) -> None:
-            if self.is_within(path, real_sources):
-                source_writes.append((operation, os.fsdecode(path)))
+        def forbid_source_write(
+            operation: str,
+            path: object,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            if not isinstance(path, (str, bytes, os.PathLike)):
+                return
+            candidate = Path(os.fsdecode(path))
+            if not candidate.is_absolute():
+                if dir_fd is None:
+                    candidate = (Path.cwd() / candidate).resolve(strict=False)
+                else:
+                    base = self.directory_fd_path(dir_fd)
+                    if base is None:
+                        source_writes.append((operation, f"<unresolved-fd:{dir_fd}>"))
+                        raise AssertionError("production source namespace write target unresolved")
+                    candidate = (base / candidate).resolve(strict=False)
+            if self.is_within(candidate, real_sources):
+                source_writes.append((operation, os.fspath(candidate)))
                 raise AssertionError("production source namespace write attempted")
 
         def guarded_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
@@ -624,25 +657,33 @@ class FinalizationEndToEndTests(unittest.TestCase):
                 | os.O_TRUNC
                 | os.O_APPEND
             ):
-                forbid_source_write("open", path)
+                forbid_source_write("open", path, dir_fd=kwargs.get("dir_fd"))
             return original_open(path, flags, *args, **kwargs)
 
         def guarded_mkdir(path: object, *args: object, **kwargs: object) -> None:
-            forbid_source_write("mkdir", path)
+            forbid_source_write("mkdir", path, dir_fd=kwargs.get("dir_fd"))
             return original_mkdir(path, *args, **kwargs)
 
         def guarded_unlink(path: object, *args: object, **kwargs: object) -> None:
-            forbid_source_write("unlink", path)
+            forbid_source_write("unlink", path, dir_fd=kwargs.get("dir_fd"))
             return original_unlink(path, *args, **kwargs)
 
         def guarded_rename(source: object, destination: object, *args: object, **kwargs: object) -> None:
-            forbid_source_write("rename-source", source)
-            forbid_source_write("rename-destination", destination)
+            forbid_source_write(
+                "rename-source", source, dir_fd=kwargs.get("src_dir_fd")
+            )
+            forbid_source_write(
+                "rename-destination", destination, dir_fd=kwargs.get("dst_dir_fd")
+            )
             return original_rename(source, destination, *args, **kwargs)
 
         def guarded_replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
-            forbid_source_write("replace-source", source)
-            forbid_source_write("replace-destination", destination)
+            forbid_source_write(
+                "replace-source", source, dir_fd=kwargs.get("src_dir_fd")
+            )
+            forbid_source_write(
+                "replace-destination", destination, dir_fd=kwargs.get("dst_dir_fd")
+            )
             return original_replace(source, destination, *args, **kwargs)
 
         def forbid_network(*args: object, **kwargs: object) -> object:
@@ -663,6 +704,59 @@ class FinalizationEndToEndTests(unittest.TestCase):
                 patch.object(socket, "create_connection", side_effect=forbid_network),
                 patch.object(urllib.request, "urlopen", side_effect=forbid_network),
             ):
+                anchor = real_sources
+                while not os.path.lexists(anchor):
+                    anchor = anchor.parent
+                relative_sources = real_sources.relative_to(anchor).as_posix()
+                descriptor = os.open(
+                    anchor,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    for operation in (
+                        lambda: os.open(
+                            f"{relative_sources}/adversarial-open.json",
+                            os.O_WRONLY | os.O_CREAT,
+                            0o600,
+                            dir_fd=descriptor,
+                        ),
+                        lambda: os.mkdir(
+                            f"{relative_sources}/adversarial-directory", dir_fd=descriptor
+                        ),
+                        lambda: os.unlink(
+                            f"{relative_sources}/adversarial-unlink.json", dir_fd=descriptor
+                        ),
+                        lambda: os.rename(
+                            f"{relative_sources}/adversarial-source.json",
+                            root / "adversarial-safe-destination.json",
+                            src_dir_fd=descriptor,
+                            dst_dir_fd=descriptor,
+                        ),
+                        lambda: os.rename(
+                            root / "adversarial-safe-source.json",
+                            f"{relative_sources}/adversarial-destination.json",
+                            src_dir_fd=descriptor,
+                            dst_dir_fd=descriptor,
+                        ),
+                        lambda: os.replace(
+                            f"{relative_sources}/adversarial-replace-source.json",
+                            root / "adversarial-safe-replace-destination.json",
+                            src_dir_fd=descriptor,
+                            dst_dir_fd=descriptor,
+                        ),
+                        lambda: os.replace(
+                            root / "adversarial-safe-replace-source.json",
+                            f"{relative_sources}/adversarial-replace-destination.json",
+                            src_dir_fd=descriptor,
+                            dst_dir_fd=descriptor,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(AssertionError, "production source"):
+                            operation()
+                finally:
+                    os.close(descriptor)
+                self.assertEqual(len(source_writes), 7)
+                source_writes.clear()
                 initial, review, replays, advanced, fresh = self.run_finalization_sequence(
                     root, common, request_bundle, replay, snapshots
                 )
