@@ -95,7 +95,9 @@ class TrustedRootTests(unittest.TestCase):
             binding = trusted.binding
         root.rename(self.path / "original")
         root.mkdir()
-        with self.assertRaisesRegex(ValueError, "trusted root binding mismatch"):
+        with self.assertRaisesRegex(
+            ValueError, "trusted root binding mismatch: differs from expected"
+        ):
             secure_fs.open_trusted_root(root, expected=binding)
 
     def test_close_is_idempotent_and_use_after_close_fails_closed(self):
@@ -139,7 +141,9 @@ class TrustedRootTests(unittest.TestCase):
         root.mkdir()
         before_failure = _fd_count()
         self.assertIsNotNone(before_failure)
-        with self.assertRaisesRegex(ValueError, "trusted root binding mismatch"):
+        with self.assertRaisesRegex(
+            ValueError, "trusted root binding mismatch: differs from expected"
+        ):
             secure_fs.open_trusted_root(root, expected=expected)
         self.assertEqual(_fd_count(), before_failure)
 
