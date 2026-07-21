@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import json
 import math
 import os
 import re
-import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -17,6 +15,15 @@ from pathlib import Path
 from types import MappingProxyType
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .secure_fs import (
+    RegularFileSnapshot as _SafeSnapshot,
+    TrustedRoot,
+    open_parent as open_trusted_parent,
+    open_trusted_root,
+    read_regular_snapshot,
+    rebind_regular_snapshot,
+    write_exclusive,
+)
 from .v52_evidence import V52EvidenceStore, logical_query_id
 from .v52_query_plan import load_query_batch
 from .v52_source_contracts import QUERY_SIDECAR_KEYS, canonical_json_bytes
@@ -53,13 +60,6 @@ _MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 _MAX_MAPPING_BYTES = 8 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_AUTHORITY_BYTES = 64 * 1024 * 1024
-
-
-@dataclass(frozen=True)
-class _SafeSnapshot:
-    relative: Path
-    contents: bytes
-    identity: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -618,38 +618,26 @@ def _mapping_from_candidate(
     }
 
 
-def _relative(root: Path, path: Path, label: str) -> Path:
-    root = Path(os.path.abspath(root))
+def _relative_from_trusted(root: TrustedRoot, path: Path, label: str) -> Path:
+    root_path = root.path
     candidate = Path(path)
     if candidate.is_absolute():
         try:
-            candidate = candidate.relative_to(root)
+            candidate = candidate.relative_to(root_path)
         except ValueError as exc:
             raise ValueError(f"{label} path must stay under root") from exc
-    if not candidate.parts or any(part in {"", ".", ".."} for part in candidate.parts):
+    if (
+        not candidate.parts
+        or any(part in {"", ".", ".."} or "\\" in part for part in candidate.parts)
+    ):
         raise ValueError(f"{label} path must stay under root")
     return candidate
 
 
-def _trusted_root(root: Path) -> Path:
-    supplied = Path(os.path.abspath(os.fspath(root)))
-    try:
-        final = supplied.lstat()
-    except OSError as exc:
-        raise ValueError("timezone root is unavailable") from exc
-    if stat.S_ISLNK(final.st_mode):
-        raise ValueError("timezone root final component cannot be a symlink")
-    if not stat.S_ISDIR(final.st_mode):
-        raise ValueError("timezone root must be a directory")
-    try:
-        canonical = supplied.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError("timezone root is unavailable") from exc
-    return canonical
-
-
-def _acquisition_audit_relative(root: Path, path: Path, label: str) -> Path:
-    relative = _relative(root, path, label)
+def _acquisition_audit_relative(
+    root: TrustedRoot, path: Path, label: str
+) -> Path:
+    relative = _relative_from_trusted(root, path, label)
     prefix = _ACQUISITION_AUDIT.parts
     if relative.parts[: len(prefix)] != prefix or len(relative.parts) <= len(prefix):
         raise ValueError(
@@ -658,75 +646,107 @@ def _acquisition_audit_relative(root: Path, path: Path, label: str) -> Path:
     return relative
 
 
-def _directory_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
+def _read_safe_snapshot_from_trusted(
+    root: TrustedRoot,
+    path: Path,
+    label: str,
+    *,
+    missing_ok: bool = False,
+    max_bytes: int | None = None,
+) -> _SafeSnapshot | None:
+    relative = _relative_from_trusted(root, path, label)
+    return read_regular_snapshot(
+        root, relative, label, missing_ok=missing_ok, max_bytes=max_bytes
     )
 
 
-def _open_root(root: Path) -> int:
-    try:
-        absolute = root.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(f"invalid timezone root: {root}") from exc
-    current = os.open(os.sep, _directory_flags())
-    try:
-        for component in absolute.parts[1:]:
-            child = os.open(component, _directory_flags(), dir_fd=current)
-            opened = os.fstat(child)
-            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(linked.st_mode)
-                or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-            ):
-                os.close(child)
-                raise ValueError("timezone root directory identity differs")
-            os.close(current)
-            current = child
-        return current
-    except BaseException:
-        os.close(current)
-        raise
+def _read_safe_from_trusted(
+    root: TrustedRoot, path: Path, label: str
+) -> tuple[Path, bytes]:
+    snapshot = _read_safe_snapshot_from_trusted(root, path, label)
+    if snapshot is None:
+        raise ValueError(f"{label} is missing")
+    return snapshot.relative, snapshot.contents
 
 
-def _open_parent(root: Path, relative: Path, *, create: bool) -> tuple[int, list[int]]:
-    descriptors = [_open_root(root)]
-    current = descriptors[0]
+def _rebind_safe_snapshot_from_trusted(
+    root: TrustedRoot,
+    expected: _SafeSnapshot,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> None:
     try:
-        for component in relative.parent.parts:
-            try:
-                child = os.open(component, _directory_flags(), dir_fd=current)
-            except FileNotFoundError:
-                if not create:
-                    raise ValueError("timezone artifact parent is missing")
-                os.mkdir(component, 0o700, dir_fd=current)
-                os.fsync(current)
-                child = os.open(component, _directory_flags(), dir_fd=current)
-            except OSError as exc:
-                raise ValueError("timezone artifact ancestors must be no-follow directories") from exc
-            opened = os.fstat(child)
-            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(linked.st_mode)
-                or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-            ):
-                os.close(child)
-                raise ValueError("timezone artifact ancestor identity differs")
-            descriptors.append(child)
-            current = child
-        return current, descriptors
-    except BaseException:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
-        raise
+        rebind_regular_snapshot(root, expected, label, max_bytes=max_bytes)
+    except ValueError as exc:
+        raise ValueError(f"{label} identity or bytes changed") from exc
+
+
+def _write_safe_from_trusted(
+    root: TrustedRoot,
+    path: Path,
+    contents: bytes,
+    label: str,
+    *,
+    final_rebind: Callable[[], None] | None = None,
+    after_parent_fsync: Callable[[], None] | None = None,
+) -> tuple[Path, _SafeSnapshot]:
+    relative = _relative_from_trusted(root, path, label)
+    def rebind() -> None:
+        if final_rebind is not None:
+            final_rebind()
+        if after_parent_fsync is not None:
+            after_parent_fsync()
+        if final_rebind is not None:
+            final_rebind()
+
+    snapshot = write_exclusive(
+        root, relative, contents, label, final_rebind=rebind
+    )
+    root.assert_bound()
+    return root.path / relative, snapshot
+
+
+def _reconcile_or_write_from_trusted(
+    root: TrustedRoot,
+    path: Path,
+    contents: bytes,
+    label: str,
+    *,
+    final_rebind: Callable[[], None] | None = None,
+    after_parent_fsync: Callable[[], None] | None = None,
+) -> tuple[Path, _SafeSnapshot]:
+    existing = _read_safe_snapshot_from_trusted(
+        root, path, label, missing_ok=True
+    )
+    if existing is not None:
+        if existing.contents != contents:
+            raise RuntimeError(f"immutable {label} differs")
+        if final_rebind is not None:
+            final_rebind()
+        if after_parent_fsync is not None:
+            after_parent_fsync()
+        _rebind_safe_snapshot_from_trusted(root, existing, label)
+        if final_rebind is not None:
+            final_rebind()
+        root.assert_bound()
+        return root.path / existing.relative, existing
+    published, snapshot = _write_safe_from_trusted(
+        root,
+        path,
+        contents,
+        label,
+        final_rebind=final_rebind,
+        after_parent_fsync=after_parent_fsync,
+    )
+    if snapshot.contents != contents:
+        raise AssertionError(f"{label} created snapshot contents differ")
+    _rebind_safe_snapshot_from_trusted(root, snapshot, label)
+    return published, snapshot
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return the historical pure regular-file identity projection."""
     return (
         metadata.st_dev,
         metadata.st_ino,
@@ -738,6 +758,22 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _relative(root: Path, path: Path, label: str) -> Path:
+    """Legacy Path adapter; timezone public operations use trusted helpers."""
+    with open_trusted_root(root) as trusted:
+        return _relative_from_trusted(trusted, path, label)
+
+
+def _open_parent(
+    root: Path, relative: Path, *, create: bool
+) -> tuple[int, list[int]]:
+    """Legacy Path adapter returning one caller-owned parent descriptor."""
+    with open_trusted_root(root) as trusted:
+        with open_trusted_parent(trusted, relative, create=create) as parent:
+            duplicate = os.dup(parent)
+    return duplicate, [duplicate]
+
+
 def _read_safe_snapshot(
     root: Path,
     path: Path,
@@ -746,67 +782,14 @@ def _read_safe_snapshot(
     missing_ok: bool = False,
     max_bytes: int | None = None,
 ) -> _SafeSnapshot | None:
-    relative = _relative(root, path, label)
-    try:
-        parent, descriptors = _open_parent(root, relative, create=False)
-    except ValueError:
-        if missing_ok:
-            return None
-        raise
-    descriptor = -1
-    try:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+    with open_trusted_root(root) as trusted:
+        return _read_safe_snapshot_from_trusted(
+            trusted,
+            path,
+            label,
+            missing_ok=missing_ok,
+            max_bytes=max_bytes,
         )
-        try:
-            descriptor = os.open(relative.name, flags, dir_fd=parent)
-        except FileNotFoundError:
-            if missing_ok:
-                return None
-            raise ValueError(f"{label} is missing") from None
-        except OSError as exc:
-            raise ValueError(f"{label} must be a no-follow regular file") from exc
-        before = os.fstat(descriptor)
-        linked = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or _file_identity(before) != _file_identity(linked)
-        ):
-            raise ValueError(f"{label} must be an unaliased regular file")
-        if max_bytes is not None and before.st_size > max_bytes:
-            raise ValueError(f"{label} exceeds its bounded read limit")
-        chunks = []
-        total = 0
-        while chunk := os.read(descriptor, 64 * 1024):
-            total += len(chunk)
-            if max_bytes is not None and total > max_bytes:
-                raise ValueError(f"{label} exceeds its bounded read limit")
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-        rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-        if _file_identity(before) != _file_identity(after) or _file_identity(after) != _file_identity(rebound):
-            raise ValueError(f"{label} identity changed while reading")
-        return _SafeSnapshot(
-            relative=relative,
-            contents=b"".join(chunks),
-            identity=_file_identity(after),
-        )
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        for item in reversed(descriptors):
-            os.close(item)
-
-
-def _read_safe(root: Path, path: Path, label: str) -> tuple[Path, bytes]:
-    snapshot = _read_safe_snapshot(root, path, label)
-    if snapshot is None:
-        raise ValueError(f"{label} is missing")
-    return snapshot.relative, snapshot.contents
 
 
 def _rebind_safe_snapshot(
@@ -816,14 +799,10 @@ def _rebind_safe_snapshot(
     *,
     max_bytes: int | None = None,
 ) -> None:
-    current = _read_safe_snapshot(
-        root,
-        expected.relative,
-        label,
-        max_bytes=max_bytes,
-    )
-    if current != expected:
-        raise ValueError(f"{label} identity or bytes changed")
+    with open_trusted_root(root) as trusted:
+        _rebind_safe_snapshot_from_trusted(
+            trusted, expected, label, max_bytes=max_bytes
+        )
 
 
 def _write_safe(
@@ -835,115 +814,15 @@ def _write_safe(
     final_rebind: Callable[[], None] | None = None,
     after_parent_fsync: Callable[[], None] | None = None,
 ) -> tuple[Path, _SafeSnapshot]:
-    root = _trusted_root(root)
-    relative = _relative(root, path, label)
-    parent, descriptors = _open_parent(root, relative, create=True)
-    descriptor = -1
-    created = False
-    created_identity: tuple[int, int] | None = None
-    try:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+    with open_trusted_root(root) as trusted:
+        return _write_safe_from_trusted(
+            trusted,
+            path,
+            contents,
+            label,
+            final_rebind=final_rebind,
+            after_parent_fsync=after_parent_fsync,
         )
-        descriptor = os.open(relative.name, flags, 0o600, dir_fd=parent)
-        created = True
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-            raise ValueError(f"{label} must be an unaliased regular file")
-        created_identity = (opened.st_dev, opened.st_ino)
-        view = memoryview(contents)
-        written = 0
-        while written < len(view):
-            count = os.write(descriptor, view[written:])
-            if count <= 0:
-                raise OSError(errno.EIO, "zero-byte timezone artifact write")
-            written += count
-        os.fsync(descriptor)
-        final = os.fstat(descriptor)
-        linked = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-        if (
-            final.st_size != len(contents)
-            or final.st_nlink != 1
-            or _file_identity(final) != _file_identity(linked)
-        ):
-            raise ValueError(f"{label} identity differs after write")
-        if final_rebind is not None:
-            final_rebind()
-        os.fsync(parent)
-        if after_parent_fsync is not None:
-            after_parent_fsync()
-        if final_rebind is not None:
-            final_rebind()
-        published_metadata = os.fstat(descriptor)
-        rebound = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-        if _file_identity(published_metadata) != _file_identity(rebound):
-            raise ValueError(f"{label} identity changed before publication")
-        snapshot = _SafeSnapshot(
-            relative=relative,
-            contents=contents,
-            identity=_file_identity(published_metadata),
-        )
-        os.close(descriptor)
-        descriptor = -1
-        return Path(os.path.abspath(root)) / relative, snapshot
-    except BaseException:
-        if created and descriptor >= 0 and created_identity is not None:
-            try:
-                linked = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
-                opened = os.fstat(descriptor)
-                if (
-                    (linked.st_dev, linked.st_ino) == created_identity
-                    and (opened.st_dev, opened.st_ino) == created_identity
-                ):
-                    os.unlink(relative.name, dir_fd=parent)
-                    os.fsync(parent)
-            except OSError:
-                pass
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        for item in reversed(descriptors):
-            os.close(item)
-
-
-def _reconcile_or_write(
-    root: Path,
-    path: Path,
-    contents: bytes,
-    label: str,
-    *,
-    final_rebind: Callable[[], None] | None = None,
-    after_parent_fsync: Callable[[], None] | None = None,
-) -> tuple[Path, _SafeSnapshot]:
-    existing = _read_safe_snapshot(root, path, label, missing_ok=True)
-    if existing is not None:
-        if existing.contents != contents:
-            raise RuntimeError(f"immutable {label} differs")
-        if final_rebind is not None:
-            final_rebind()
-        if after_parent_fsync is not None:
-            after_parent_fsync()
-        _rebind_safe_snapshot(root, existing, label)
-        if final_rebind is not None:
-            final_rebind()
-        return Path(os.path.abspath(root)) / existing.relative, existing
-    published, snapshot = _write_safe(
-        root,
-        path,
-        contents,
-        label,
-        final_rebind=final_rebind,
-        after_parent_fsync=after_parent_fsync,
-    )
-    if snapshot.contents != contents:
-        raise AssertionError(f"{label} created snapshot contents differ")
-    _rebind_safe_snapshot(root, snapshot, label)
-    return published, snapshot
 
 
 def _utc_now() -> str:
@@ -960,7 +839,30 @@ def write_timezone_review_receipt(
     review_scope: Sequence[int] | None = None,
     decision: str,
 ) -> Path:
-    root = _trusted_root(root)
+    with open_trusted_root(root) as trusted:
+        result = _write_timezone_review_receipt(
+            trusted,
+            candidate_path=candidate_path,
+            output=output,
+            reviewer_identity=reviewer_identity,
+            reviewer_role=reviewer_role,
+            review_scope=review_scope,
+            decision=decision,
+        )
+        trusted.assert_bound()
+        return result
+
+
+def _write_timezone_review_receipt(
+    root: TrustedRoot,
+    *,
+    candidate_path: Path,
+    output: Path,
+    reviewer_identity: str,
+    reviewer_role: str,
+    review_scope: Sequence[int] | None = None,
+    decision: str,
+) -> Path:
     if reviewer_role not in _ROLES:
         raise ValueError("timezone reviewer role differs")
     identity = _text(reviewer_identity, "reviewer identity")
@@ -972,7 +874,7 @@ def write_timezone_review_receipt(
     output_relative = _acquisition_audit_relative(
         root, output, "timezone review receipt"
     )
-    candidate_snapshot = _read_safe_snapshot(
+    candidate_snapshot = _read_safe_snapshot_from_trusted(
         root, candidate_relative, "timezone candidate"
     )
     if candidate_snapshot is None:
@@ -995,16 +897,23 @@ def write_timezone_review_receipt(
         "reviewer_role": reviewer_role,
         "schema_version": 1,
     }
-    path, _ = _write_safe(
+    path, output_snapshot = _write_safe_from_trusted(
         root,
         output_relative,
         _canonical_file_bytes(receipt),
         "timezone review receipt",
-        final_rebind=lambda: _rebind_safe_snapshot(
+        final_rebind=lambda: _rebind_safe_snapshot_from_trusted(
             root, candidate_snapshot, "timezone candidate"
         ),
-        after_parent_fsync=_before_review_final_rebind,
     )
+    _before_review_final_rebind()
+    _rebind_safe_snapshot_from_trusted(
+        root, candidate_snapshot, "timezone candidate"
+    )
+    _rebind_safe_snapshot_from_trusted(
+        root, output_snapshot, "timezone review receipt"
+    )
+    root.assert_bound()
     return path
 
 
@@ -1054,8 +963,29 @@ def seal_timezone_mapping(
     output: Path,
     receipt_output: Path,
 ) -> tuple[Path, Path]:
-    root = _trusted_root(root)
-    output_relative = _relative(root, output, "timezone mapping output")
+    with open_trusted_root(root) as trusted:
+        result = _seal_timezone_mapping(
+            trusted,
+            candidate_path=candidate_path,
+            review_receipt_paths=review_receipt_paths,
+            output=output,
+            receipt_output=receipt_output,
+        )
+        trusted.assert_bound()
+        return result
+
+
+def _seal_timezone_mapping(
+    root: TrustedRoot,
+    *,
+    candidate_path: Path,
+    review_receipt_paths: Sequence[Path],
+    output: Path,
+    receipt_output: Path,
+) -> tuple[Path, Path]:
+    output_relative = _relative_from_trusted(
+        root, output, "timezone mapping output"
+    )
     if output_relative != _PRODUCTION_MAPPING:
         raise ValueError("timezone mapping output must use the production logical path")
     candidate_path = _acquisition_audit_relative(
@@ -1064,7 +994,7 @@ def seal_timezone_mapping(
     receipt_output = _acquisition_audit_relative(
         root, receipt_output, "timezone mapping seal receipt"
     )
-    candidate_snapshot = _read_safe_snapshot(
+    candidate_snapshot = _read_safe_snapshot_from_trusted(
         root, candidate_path, "timezone candidate"
     )
     if candidate_snapshot is None:
@@ -1095,7 +1025,7 @@ def seal_timezone_mapping(
         review_path = _acquisition_audit_relative(
             root, path, "timezone review receipt"
         )
-        review_snapshot = _read_safe_snapshot(
+        review_snapshot = _read_safe_snapshot_from_trusted(
             root, review_path, "timezone review receipt"
         )
         if review_snapshot is None:
@@ -1129,7 +1059,7 @@ def seal_timezone_mapping(
         raise ValueError("timezone reviewer identity values must be distinct")
     review_bindings.sort(key=lambda item: item["reviewer_role"])
     mapping_contents = _canonical_file_bytes(mapping)
-    existing_seal = _read_safe_snapshot(
+    existing_seal = _read_safe_snapshot_from_trusted(
         root, receipt_output, "timezone mapping seal receipt", missing_ok=True
     )
     occurred_at = _utc_now()
@@ -1159,11 +1089,15 @@ def seal_timezone_mapping(
     }
     seal_contents = _canonical_file_bytes(seal)
     def rebind_inputs() -> None:
-        _rebind_safe_snapshot(root, candidate_snapshot, "timezone candidate")
+        _rebind_safe_snapshot_from_trusted(
+            root, candidate_snapshot, "timezone candidate"
+        )
         for snapshot in review_snapshots:
-            _rebind_safe_snapshot(root, snapshot, "timezone review receipt")
+            _rebind_safe_snapshot_from_trusted(
+                root, snapshot, "timezone review receipt"
+            )
 
-    mapping_path, mapping_snapshot = _reconcile_or_write(
+    mapping_path, mapping_snapshot = _reconcile_or_write_from_trusted(
         root,
         output_relative,
         mapping_contents,
@@ -1174,16 +1108,23 @@ def seal_timezone_mapping(
 
     def rebind_seal_inputs() -> None:
         rebind_inputs()
-        _rebind_safe_snapshot(root, mapping_snapshot, "timezone mapping")
+        _rebind_safe_snapshot_from_trusted(
+            root, mapping_snapshot, "timezone mapping"
+        )
 
-    seal_path, _ = _reconcile_or_write(
+    seal_path, seal_snapshot = _reconcile_or_write_from_trusted(
         root,
         receipt_output,
         seal_contents,
         "timezone mapping seal receipt",
         final_rebind=rebind_seal_inputs,
-        after_parent_fsync=_before_seal_final_rebind,
     )
+    _before_seal_final_rebind()
+    rebind_seal_inputs()
+    _rebind_safe_snapshot_from_trusted(
+        root, seal_snapshot, "timezone mapping seal receipt"
+    )
+    root.assert_bound()
     return mapping_path, seal_path
 
 
@@ -1193,7 +1134,20 @@ def build_timezone_candidate(
     evidence_root: Path,
     batch_ids: Sequence[str],
 ) -> Mapping[str, object]:
-    root = _trusted_root(root)
+    with open_trusted_root(root) as trusted:
+        result = _build_timezone_candidate(
+            trusted, evidence_root=evidence_root, batch_ids=batch_ids
+        )
+        trusted.assert_bound()
+        return result
+
+
+def _build_timezone_candidate(
+    root: TrustedRoot,
+    *,
+    evidence_root: Path,
+    batch_ids: Sequence[str],
+) -> Mapping[str, object]:
     if (
         isinstance(batch_ids, (str, bytes))
         or not isinstance(batch_ids, Sequence)
@@ -1209,7 +1163,9 @@ def build_timezone_candidate(
     contributing_batch_ids: set[str] = set()
     binding: tuple[str, str] | None = None
     for batch_id in batch_ids:
-        batch = load_query_batch(root, batch_id)
+        root.assert_bound()
+        batch = load_query_batch(root.path, batch_id)
+        root.assert_bound()
         for query in batch.queries:
             query_id = logical_query_id(query)
             kind: str | None = None
@@ -1255,7 +1211,9 @@ def build_timezone_candidate(
                 raise ValueError("candidate query population contains a duplicate")
             seen_queries.add(query_id)
             try:
+                root.assert_bound()
                 verified = store.read_verified_success(query)
+                root.assert_bound()
             except (FileNotFoundError, RuntimeError, ValueError) as exc:
                 raise ValueError(
                     f"candidate expected query {query_id} is missing or unpublished"
@@ -1307,13 +1265,15 @@ def build_timezone_candidate(
         )
     if binding is None:
         raise AssertionError("unreachable candidate provenance binding")
-    return _project_timezone_candidate(
+    candidate = _project_timezone_candidate(
         schedule_sidecars,
         venue_sidecars,
         query_batch_ids=sorted(contributing_batch_ids),
         run_spec_sha256=binding[0],
         acquisition_contract_sha256=binding[1],
     )
+    root.assert_bound()
+    return candidate
 
 
 def _validate_replayed_candidate_rows(
@@ -1345,14 +1305,29 @@ def publish_timezone_candidate(
     batch_ids: Sequence[str],
 ) -> Path:
     """Publish or reconcile the one canonical timezone-review candidate."""
-    root = _trusted_root(root)
-    candidate = build_timezone_candidate(
-        root=root,
+    with open_trusted_root(root) as trusted:
+        result = _publish_timezone_candidate(
+            trusted,
+            evidence_root=evidence_root,
+            batch_ids=batch_ids,
+        )
+        trusted.assert_bound()
+        return result
+
+
+def _publish_timezone_candidate(
+    root: TrustedRoot,
+    *,
+    evidence_root: Path,
+    batch_ids: Sequence[str],
+) -> Path:
+    candidate = _build_timezone_candidate(
+        root,
         evidence_root=evidence_root,
         batch_ids=batch_ids,
     )
     contents = _canonical_file_bytes(candidate)
-    existing = _read_safe_snapshot(
+    existing = _read_safe_snapshot_from_trusted(
         root,
         _CANDIDATE_PATH,
         "timezone candidate",
@@ -1372,57 +1347,63 @@ def publish_timezone_candidate(
         if stored_projection != candidate_projection:
             raise ValueError("timezone candidate differs from current source authority")
         _validate_replayed_candidate_rows(stored, candidate)
-        _before_timezone_candidate_final_rebind()
-        rebound = build_timezone_candidate(
-            root=root,
+        rebound = _build_timezone_candidate(
+            root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
         )
         if rebound != candidate:
             raise ValueError("timezone candidate authority changed during replay")
-        _rebind_safe_snapshot(
+        _before_timezone_candidate_final_rebind()
+        final = _build_timezone_candidate(
             root,
-            existing,
-            "timezone candidate",
-            max_bytes=_MAX_CANDIDATE_BYTES,
-        )
-        final = build_timezone_candidate(
-            root=root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
         )
         if final != candidate:
             raise ValueError("timezone candidate authority changed during final rebind")
-        return root / _CANDIDATE_PATH
+        _rebind_safe_snapshot_from_trusted(
+            root,
+            existing,
+            "timezone candidate",
+            max_bytes=_MAX_CANDIDATE_BYTES,
+        )
+        root.assert_bound()
+        return root.path / _CANDIDATE_PATH
 
     def rebind() -> None:
-        _before_timezone_candidate_final_rebind()
-        current = build_timezone_candidate(
-            root=root,
+        current = _build_timezone_candidate(
+            root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
         )
         if current != candidate:
             raise ValueError("timezone candidate authority changed before publication")
 
-    path, _ = _reconcile_or_write(
+    path, snapshot = _reconcile_or_write_from_trusted(
         root,
         _CANDIDATE_PATH,
         contents,
         "timezone candidate",
         final_rebind=rebind,
     )
+    _before_timezone_candidate_final_rebind()
+    rebind()
+    _rebind_safe_snapshot_from_trusted(
+        root, snapshot, "timezone candidate", max_bytes=_MAX_CANDIDATE_BYTES
+    )
+    root.assert_bound()
     return path
 
 
 def _required_snapshot(
-    root: Path,
+    root: TrustedRoot,
     relative: Path,
     label: str,
     *,
     max_bytes: int,
 ) -> _SafeSnapshot:
-    snapshot = _read_safe_snapshot(
+    snapshot = _read_safe_snapshot_from_trusted(
         root,
         relative,
         label,
@@ -1434,7 +1415,7 @@ def _required_snapshot(
 
 
 def _current_timezone_authority(
-    root: Path,
+    root: TrustedRoot,
     *,
     read_only_progress: bool = False,
 ) -> _CurrentTimezoneAuthority:
@@ -1483,7 +1464,9 @@ def _current_timezone_authority(
     ):
         raise ValueError("timezone gate RunSpec raw namespace differs")
 
-    inventory_contents = _read_inventory_contents(root)
+    root.assert_bound()
+    inventory_contents = _read_inventory_contents(root.path)
+    root.assert_bound()
     inventory_record = _json_object(
         inventory_contents,
         "schedule anchor inventory",
@@ -1495,15 +1478,17 @@ def _current_timezone_authority(
     static_batch_id = _sha256_text(
         static_binding.get("batch_id"), "timezone gate static batch ID"
     )
-    evidence_root = root / raw_relative
+    evidence_root = root.path / raw_relative
+    root.assert_bound()
     verified_inventory = load_verified_schedule_anchor_inventory(
-        root,
+        root.path,
         run_spec,
-        acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
+        acquisition_contract_path=root.path / _ACQUISITION_CONTRACT_PATH,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
     )
+    root.assert_bound()
     inventory_snapshot = _required_snapshot(
         root,
         _SCHEDULE_INVENTORY_PATH,
@@ -1520,19 +1505,23 @@ def _current_timezone_authority(
         "timezone gate STATIC_SCHEDULES batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
+    root.assert_bound()
     static_batch = load_query_batch(
-        root,
+        root.path,
         static_batch_id,
         read_only_progress=read_only_progress,
     )
+    root.assert_bound()
+    root.assert_bound()
     reference_expected = build_schedule_reference_batch(
-        root,
-        root / _RUN_SPEC_PATH,
-        acquisition_contract_path=root / _ACQUISITION_CONTRACT_PATH,
+        root.path,
+        root.path / _RUN_SPEC_PATH,
+        acquisition_contract_path=root.path / _ACQUISITION_CONTRACT_PATH,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
     )
+    root.assert_bound()
     reference_batch_snapshot = _required_snapshot(
         root,
         _ACQUISITION_AUDIT
@@ -1541,11 +1530,13 @@ def _current_timezone_authority(
         "timezone gate REFERENCE_INPUTS batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
+    root.assert_bound()
     reference_batch = load_query_batch(
-        root,
+        root.path,
         reference_expected.batch_id,
         read_only_progress=read_only_progress,
     )
+    root.assert_bound()
     if reference_batch != reference_expected:
         raise ValueError("timezone gate REFERENCE_INPUTS authority differs")
     if (
@@ -1614,7 +1605,9 @@ def _current_timezone_authority(
             and query.endpoint.startswith(_VENUE_ENDPOINT_PREFIX)
         ):
             continue
+        root.assert_bound()
         verified = store.read_verified_success(query)
+        root.assert_bound()
         if verified.registered_query != query or verified.raw_bytes is None:
             raise ValueError("timezone gate venue verified SUCCESS differs")
         recomputed = recompute_venue_query_sidecar(verified.raw_bytes, query)
@@ -1650,6 +1643,7 @@ def _current_timezone_authority(
         "venue_sidecar_sha256s": venue_sidecar_sha256s,
         "venues": [venues[venue_id] for venue_id in sorted(venues)],
     }
+    root.assert_bound()
     return _CurrentTimezoneAuthority(
         source_projection=source_projection,
         run_spec_sha256=run_sha,
@@ -1699,12 +1693,38 @@ def _seal_object(contents: bytes) -> dict[str, object]:
     return value
 
 
+def _rebind_timezone_authority(
+    root: TrustedRoot,
+    authority: _CurrentTimezoneAuthority,
+) -> None:
+    for snapshot in authority.snapshots:
+        _rebind_safe_snapshot_from_trusted(
+            root,
+            snapshot,
+            "timezone source authority",
+            max_bytes=_MAX_AUTHORITY_BYTES,
+        )
+    root.assert_bound()
+
+
 def load_verified_timezone_gate(
     root: Path,
     *,
     read_only_progress: bool = False,
 ) -> VerifiedTimezoneGate:
-    root = _trusted_root(root)
+    with open_trusted_root(root) as trusted:
+        result = _load_verified_timezone_gate(
+            trusted, read_only_progress=read_only_progress
+        )
+        trusted.assert_bound()
+        return result
+
+
+def _load_verified_timezone_gate(
+    root: TrustedRoot,
+    *,
+    read_only_progress: bool = False,
+) -> VerifiedTimezoneGate:
     fixed_snapshots = (
         _required_snapshot(
             root,
@@ -1753,6 +1773,7 @@ def load_verified_timezone_gate(
         root,
         read_only_progress=read_only_progress,
     )
+    _rebind_timezone_authority(root, authority)
     candidate_projection = {
         key: value for key, value in candidate.items() if key != "timezone_rows"
     }
@@ -1829,6 +1850,9 @@ def load_verified_timezone_gate(
         root,
         read_only_progress=read_only_progress,
     )
+    _rebind_timezone_authority(root, authority)
+    _rebind_timezone_authority(root, rebound_authority)
+    root.assert_bound()
     if (
         rebound_authority.source_projection != authority.source_projection
         or rebound_authority.run_spec_sha256 != authority.run_spec_sha256
@@ -1859,17 +1883,16 @@ def load_verified_timezone_gate(
             "timezone mapping seal receipt",
             _MAX_RECEIPT_BYTES,
         ),
-        *(
-            (snapshot, "timezone source authority", _MAX_AUTHORITY_BYTES)
-            for snapshot in rebound_authority.snapshots
-        ),
     ):
-        _rebind_safe_snapshot(
+        _rebind_safe_snapshot_from_trusted(
             root,
             snapshot,
             label,
             max_bytes=max_bytes,
         )
+    _rebind_timezone_authority(root, authority)
+    _rebind_timezone_authority(root, rebound_authority)
+    root.assert_bound()
 
     frozen_candidate = _deep_freeze(candidate)
     frozen_mapping = _deep_freeze(mapping)
@@ -1882,6 +1905,7 @@ def load_verified_timezone_gate(
         or not isinstance(frozen_seal, Mapping)
     ):
         raise AssertionError("verified timezone gate must deep-freeze to mappings")
+    root.assert_bound()
     return VerifiedTimezoneGate(
         candidate=frozen_candidate,
         mapping=frozen_mapping,
@@ -1932,10 +1956,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     seal_parser.add_argument("--receipt-output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.command == "candidate":
-        output = _acquisition_audit_relative(
-            arguments.root, arguments.output, "timezone candidate"
-        )
-        if output != _CANDIDATE_PATH:
+        if arguments.output != _CANDIDATE_PATH:
             raise ValueError("timezone candidate output must be the canonical path")
         publish_timezone_candidate(
             root=arguments.root,

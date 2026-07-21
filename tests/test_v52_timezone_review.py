@@ -44,6 +44,13 @@ PROVENANCE = {
 }
 
 
+def _fd_count() -> int | None:
+    descriptor_directory = Path("/dev/fd")
+    if not descriptor_directory.is_dir():
+        return None
+    return len(list(descriptor_directory.iterdir()))
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(
         value,
@@ -668,7 +675,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     decision="APPROVED",
                 )
 
-    def test_review_writer_cleans_up_partial_write_and_fsync_failure(self) -> None:
+    def test_review_writer_preserves_partial_write_and_fsync_residue(self) -> None:
         from mlb_backtest.v52_timezone_review import (
             write_timezone_review_receipt,
         )
@@ -693,7 +700,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         raise OSError("injected partial write failure")
 
                     context = patch(
-                        "mlb_backtest.v52_timezone_review.os.write",
+                        "mlb_backtest.secure_fs.os.write",
                         side_effect=fail_write,
                     )
                 else:
@@ -706,7 +713,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         original_fsync(descriptor)
 
                     context = patch(
-                        "mlb_backtest.v52_timezone_review.os.fsync",
+                        "mlb_backtest.secure_fs.os.fsync",
                         side_effect=fail_file_fsync,
                     )
                 with context, self.assertRaises(OSError):
@@ -719,7 +726,17 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         review_scope=[31, 99],
                         decision="APPROVED",
                     )
-                self.assertFalse((root / output).exists())
+                self.assertTrue((root / output).exists())
+                with self.assertRaises(FileExistsError):
+                    write_timezone_review_receipt(
+                        root,
+                        candidate_path=candidate,
+                        output=output,
+                        reviewer_identity="reviewer-a",
+                        reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
+                        review_scope=[31, 99],
+                        decision="APPROVED",
+                    )
 
     def test_review_writer_rejects_partial_scope_traversal_symlink_and_hardlink(self):
         from mlb_backtest.v52_timezone_review import write_timezone_review_receipt
@@ -1503,6 +1520,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
 
     def test_write_safe_parent_fsync_failure_preserves_replacement(self) -> None:
         import mlb_backtest.v52_timezone_review as timezone_review
+        from mlb_backtest import secure_fs
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1524,8 +1542,8 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 original_fsync(descriptor)
 
             with (
-                patch.object(timezone_review.os, "fsync", side_effect=fail_parent_fsync),
-                self.assertRaises(OSError),
+                patch.object(secure_fs.os, "fsync", side_effect=fail_parent_fsync),
+                self.assertRaises((OSError, ValueError)),
             ):
                 timezone_review._write_safe(
                     root, relative, b"created\n", "replacement test"
@@ -1601,7 +1619,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 candidate, reviews = _reviewed_candidate_fixture(root)
                 mapping = root / "config/v5_2_qd/venue_timezones.json"
                 seal = root / AUDIT_NAMESPACE / "seal.json"
-                original_write_safe = timezone_review._write_safe
+                original_write_safe = timezone_review._write_safe_from_trusted
 
                 def write_then_change(*args, **kwargs):
                     result = original_write_safe(*args, **kwargs)
@@ -1619,7 +1637,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 with (
                     patch.object(
                         timezone_review,
-                        "_write_safe",
+                        "_write_safe_from_trusted",
                         side_effect=write_then_change,
                     ),
                     self.assertRaises((ValueError, RuntimeError)),
@@ -1666,7 +1684,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                     reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
                     decision="APPROVED",
                 )
-            self.assertFalse((root / review_output).exists())
+            self.assertTrue((root / review_output).exists())
 
         for label, target_index in (("candidate", None), ("review-0", 0), ("review-1", 1)):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -1699,7 +1717,7 @@ class V52TimezoneReviewTest(unittest.TestCase):
                         output=Path("config/v5_2_qd/venue_timezones.json"),
                         receipt_output=seal_output,
                     )
-                self.assertFalse((root / seal_output).exists())
+                self.assertTrue((root / seal_output).exists())
 
     def test_verified_gate_loads_only_fixed_current_authority_and_deep_freezes(self):
         from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
@@ -1830,6 +1848,46 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 ):
                     timezone_review.load_verified_timezone_gate(root)
 
+    def test_verified_gate_rebinds_after_first_authority_replay(self):
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _fixed_verified_gate_fixture(root)
+            target = root / "protocols/v5_2_qd/historical_walkforward_500.json"
+            original = timezone_review._current_timezone_authority
+            calls = 0
+
+            def replay_then_replace(
+                replay_root,
+                *,
+                read_only_progress: bool = False,
+            ):
+                nonlocal calls
+                authority = original(
+                    replay_root,
+                    read_only_progress=read_only_progress,
+                )
+                calls += 1
+                if calls == 1:
+                    replacement = target.with_suffix(".replacement")
+                    replacement.write_bytes(target.read_bytes())
+                    os.replace(replacement, target)
+                return authority
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_current_timezone_authority",
+                    side_effect=replay_then_replace,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "authority|identity|changed|rebind",
+                ),
+            ):
+                timezone_review.load_verified_timezone_gate(root)
+
     def test_cli_help_lists_all_offline_subcommands(self) -> None:
         from mlb_backtest.v52_timezone_review import main
 
@@ -1838,6 +1896,316 @@ class V52TimezoneReviewTest(unittest.TestCase):
             main(["--help"])
         for command in ("candidate", "review", "seal"):
             self.assertIn(command, output.getvalue())
+
+    def test_public_operations_reject_bound_root_ancestor_swaps(self) -> None:
+        """Every public path operation keeps its one root capability bound."""
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "root"
+            root.mkdir()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            held = base / "held"
+            canary = base / "canary"
+            canary.mkdir()
+            marker = canary / "marker"
+            marker.write_bytes(b"canary\n")
+            baseline = _fd_count()
+            original_load = timezone_review.load_query_batch
+            swapped = False
+
+            def load_then_replace(*args, **kwargs):
+                nonlocal swapped
+                result = original_load(*args, **kwargs)
+                if not swapped:
+                    swapped = True
+                    root.rename(held)
+                    root.mkdir()
+                return result
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "load_query_batch",
+                    side_effect=load_then_replace,
+                ),
+                self.assertRaisesRegex(ValueError, "root|unsafe"),
+            ):
+                timezone_review.publish_timezone_candidate(
+                    root=root,
+                    evidence_root=held / "evidence",
+                    batch_ids=[batch.batch_id for batch in batches],
+                )
+            self.assertEqual(marker.read_bytes(), b"canary\n")
+            self.assertFalse((root / FIXED_CANDIDATE).exists())
+            if baseline is not None:
+                self.assertEqual(_fd_count(), baseline)
+
+    def test_public_operations_reject_complementary_ancestor_swaps(self) -> None:
+        """Complete candidate/review/seal x directory/symlink attack coverage."""
+        import mlb_backtest.v52_timezone_review as timezone_review
+        from mlb_backtest import secure_fs
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "root"
+            root.mkdir()
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            batches, _, _ = _sealed_candidate_fixture(root, evidence_root)
+            held = base / "held"
+            canary = base / "canary"
+            canary.mkdir()
+            marker = canary / "marker"
+            marker.write_bytes(b"candidate-canary\n")
+            baseline = _fd_count()
+            original_load = timezone_review.load_query_batch
+            swapped = False
+
+            def load_then_symlink(*args, **kwargs):
+                nonlocal swapped
+                result = original_load(*args, **kwargs)
+                if not swapped:
+                    swapped = True
+                    root.rename(held)
+                    root.symlink_to(canary, target_is_directory=True)
+                return result
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "load_query_batch",
+                    side_effect=load_then_symlink,
+                ),
+                self.assertRaisesRegex(ValueError, "root|unsafe"),
+            ):
+                timezone_review.publish_timezone_candidate(
+                    root=root,
+                    evidence_root=held / "evidence",
+                    batch_ids=[batch.batch_id for batch in batches],
+                )
+            self.assertEqual(marker.read_bytes(), b"candidate-canary\n")
+            self.assertFalse((canary / FIXED_CANDIDATE).exists())
+            if baseline is not None:
+                self.assertEqual(_fd_count(), baseline)
+
+        for operation in ("review", "seal"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                root = base / "root"
+                root.mkdir()
+                candidate, reviews = _reviewed_candidate_fixture(root)
+                held = base / "held"
+                attacker = base / "attacker"
+                output = AUDIT_NAMESPACE / f"directory-{operation}.json"
+                baseline = _fd_count()
+
+                def install_attacker() -> None:
+                    root.rename(held)
+                    root.mkdir()
+                    attacker_marker = root / "marker"
+                    attacker_marker.write_bytes(b"attacker\n")
+                    root.rename(attacker)
+                    attacker.rename(root)
+
+                if operation == "review":
+
+                    def replace_root(
+                        stage: str, component: str | None = None
+                    ) -> None:
+                        if (
+                            stage == "after_file_fsync"
+                            and component == output.as_posix()
+                        ):
+                            install_attacker()
+
+                    context = patch.object(
+                        secure_fs,
+                        "_secure_fs_test_hook",
+                        side_effect=replace_root,
+                    )
+                else:
+                    context = patch.object(
+                        timezone_review,
+                        "_after_mapping_publish_before_seal",
+                        side_effect=install_attacker,
+                    )
+                with (
+                    context,
+                    self.assertRaisesRegex(
+                        ValueError, "root|unsafe|identity|changed"
+                    ),
+                ):
+                    if operation == "review":
+                        timezone_review.write_timezone_review_receipt(
+                            root,
+                            candidate_path=candidate,
+                            output=output,
+                            reviewer_identity="reviewer-c",
+                            reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
+                            decision="APPROVED",
+                        )
+                    else:
+                        timezone_review.seal_timezone_mapping(
+                            root,
+                            candidate_path=candidate,
+                            review_receipt_paths=reviews,
+                            output=Path("config/v5_2_qd/venue_timezones.json"),
+                            receipt_output=output,
+                        )
+                self.assertEqual((root / "marker").read_bytes(), b"attacker\n")
+                self.assertFalse((root / output).exists())
+                if operation == "review":
+                    self.assertTrue((held / output).is_file())
+                else:
+                    self.assertTrue(
+                        (held / "config/v5_2_qd/venue_timezones.json").is_file()
+                    )
+                if baseline is not None:
+                    self.assertEqual(_fd_count(), baseline)
+
+    def test_verified_gate_detects_transient_root_swap_at_path_boundary(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "root"
+            root.mkdir()
+            _fixed_verified_gate_fixture(root)
+            target = root / "protocols/v5_2_qd/historical_walkforward_500.json"
+            held = base / "held"
+            canary = base / "canary"
+            canary.mkdir()
+            marker = canary / "marker"
+            marker.write_bytes(b"transient-canary\n")
+            original = timezone_review._current_timezone_authority
+            calls = 0
+            baseline = _fd_count()
+
+            def replay_then_transient_swap(
+                replay_root,
+                *,
+                read_only_progress: bool = False,
+            ):
+                nonlocal calls
+                authority = original(
+                    replay_root,
+                    read_only_progress=read_only_progress,
+                )
+                calls += 1
+                if calls == 2:
+                    root.rename(held)
+                    root.symlink_to(canary, target_is_directory=True)
+                    root.unlink()
+                    held.rename(root)
+                    replacement = target.with_suffix(".replacement")
+                    replacement.write_bytes(target.read_bytes())
+                    os.replace(replacement, target)
+                return authority
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_current_timezone_authority",
+                    side_effect=replay_then_transient_swap,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "authority|identity|changed|rebind",
+                ),
+            ):
+                timezone_review.load_verified_timezone_gate(root)
+            self.assertEqual(marker.read_bytes(), b"transient-canary\n")
+            if baseline is not None:
+                self.assertEqual(_fd_count(), baseline)
+
+    def test_review_and_seal_reject_symlink_ancestor_swaps(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+        from mlb_backtest import secure_fs
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "root"
+            root.mkdir()
+            candidate, _ = _reviewed_candidate_fixture(root)
+            held = base / "held"
+            canary = base / "canary"
+            canary.mkdir()
+            marker = canary / "marker"
+            marker.write_bytes(b"canary\n")
+            output = AUDIT_NAMESPACE / "ancestor-review.json"
+            baseline = _fd_count()
+
+            def replace_root(stage: str, component: str | None = None) -> None:
+                if stage == "after_file_fsync" and component == output.as_posix():
+                    root.rename(held)
+                    root.symlink_to(canary, target_is_directory=True)
+
+            with (
+                patch.object(
+                    secure_fs,
+                    "_secure_fs_test_hook",
+                    side_effect=replace_root,
+                ),
+                self.assertRaisesRegex(ValueError, "root|unsafe|identity|changed"),
+            ):
+                timezone_review.write_timezone_review_receipt(
+                    root,
+                    candidate_path=candidate,
+                    output=output,
+                    reviewer_identity="reviewer-c",
+                    reviewer_role="TIMEZONE_SEMANTIC_REVIEW",
+                    decision="APPROVED",
+                )
+            self.assertEqual(marker.read_bytes(), b"canary\n")
+            self.assertFalse((canary / output).exists())
+            self.assertTrue((held / output).is_file())
+            if baseline is not None:
+                self.assertEqual(_fd_count(), baseline)
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "root"
+            root.mkdir()
+            candidate, reviews = _reviewed_candidate_fixture(root)
+            held = base / "held"
+            canary = base / "canary"
+            canary.mkdir()
+            marker = canary / "marker"
+            marker.write_bytes(b"canary\n")
+            baseline = _fd_count()
+
+            def replace_after_mapping() -> None:
+                root.rename(held)
+                root.symlink_to(canary, target_is_directory=True)
+
+            with (
+                patch.object(
+                    timezone_review,
+                    "_after_mapping_publish_before_seal",
+                    side_effect=replace_after_mapping,
+                ),
+                self.assertRaisesRegex(ValueError, "root|unsafe|identity|changed"),
+            ):
+                timezone_review.seal_timezone_mapping(
+                    root,
+                    candidate_path=candidate,
+                    review_receipt_paths=reviews,
+                    output=Path("config/v5_2_qd/venue_timezones.json"),
+                    receipt_output=AUDIT_NAMESPACE / "ancestor-seal.json",
+                )
+            self.assertEqual(marker.read_bytes(), b"canary\n")
+            self.assertFalse(
+                (canary / "config/v5_2_qd/venue_timezones.json").exists()
+            )
+            self.assertTrue(
+                (held / "config/v5_2_qd/venue_timezones.json").is_file()
+            )
+            if baseline is not None:
+                self.assertEqual(_fd_count(), baseline)
 
 
 if __name__ == "__main__":
