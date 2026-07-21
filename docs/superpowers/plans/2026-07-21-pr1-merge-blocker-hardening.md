@@ -78,9 +78,9 @@ git commit -m "feat: add trusted root filesystem capability"
 - Modify: `mlb_backtest/secure_fs.py`
 - Modify: `tests/test_secure_fs.py`
 
-- [ ] **Step 1: Write failing path, read, write, and cleanup tests**
+- [ ] **Step 1: Write failing path, read, write, and residue tests**
 
-Reject absolute, empty, `.`, `..`, and backslash paths; symlink, hard-link, FIFO, socket, and directory reads; ancestor swaps before/after reads; short writes; and attacker replacement during cleanup. Snapshot `/dev/fd` around every fault test when available.
+Reject absolute, empty, `.`, `..`, and backslash paths; symlink, hard-link, FIFO, socket, and directory reads; ancestor swaps before/after reads; short writes; and attacker replacement after publication. Snapshot `/dev/fd` around every fault test when available. Once `O_EXCL` publishes the leaf name, every later failure must close descriptors without calling `unlink`: preserve partial and complete owned residue, preserve attacker replacements byte-for-byte and inode-for-inode, and require retries to conflict with `FileExistsError`.
 
 ```python
 def test_write_never_unlinks_attacker_replacement(self):
@@ -110,7 +110,7 @@ Expected: missing helpers or an unsafe case does not raise.
 
 Add exact immutable fields `RegularFileSnapshot(relative: Path, contents: bytes, identity: tuple[int, ...])`. Add these exact functions: `open_parent(root: TrustedRoot, relative: Path, *, create: bool) -> Iterator[int]`; `read_regular_snapshot(root, relative, label, *, max_bytes=None, missing_ok=False) -> RegularFileSnapshot | None`; `rebind_regular_snapshot(root, expected, label, *, max_bytes=None) -> None`; and `write_exclusive(root, relative, contents, label, *, final_rebind=None) -> RegularFileSnapshot`.
 
-Reads require a one-link regular file and identical pre/post identity. Writes use `O_EXCL | O_NOFOLLOW`, handle short writes, fsync file and parent, and unlink only the inode created by the current attempt.
+Reads require a one-link regular file and identical pre/post identity. Writes use `O_EXCL | O_NOFOLLOW`, handle short writes, and fsync file and parent. After the exclusive create succeeds, failures never unlink the published name. Partial or complete owned output remains as uncommitted residue and retries fail with `FileExistsError`; this avoids the authenticate-then-unlink TOCTOU entirely.
 
 - [ ] **Step 4: Run GREEN and commit**
 
@@ -213,7 +213,7 @@ git commit -m "fix: bind timezone review writes to trusted root"
 - Modify: `tests/test_secure_fs.py`
 - Modify: `tests/test_execution_registry.py`
 
-- [ ] **Step 1: Add RED tests** for root swap while locked, fake repository substitution before Git, `/dev/fd` unavailability, captured `pass_fds`, final receipt rebind, and FD cleanup.
+- [ ] **Step 1: Add RED tests** for root swap while locked, fake repository substitution before Git, `/dev/fd` unavailability, captured `pass_fds`, final receipt rebind, residue preservation, and FD cleanup. Any registry name already published with `O_EXCL` remains on later failure; cleanup must never unlink it, and a retry must conflict.
 
 ```python
 @contextmanager
@@ -392,17 +392,17 @@ git commit -m "fix: authenticate snapshot store at source gate"
 - Modify: `mlb_backtest/execution_registry.py:4046-4350`
 - Modify: `tests/test_execution_registry.py`
 
-- [ ] **Step 1: Add tampered-retry and post-link race RED tests.** After a real seal, alter one blob and retry identical arguments; it must not return `EXISTING`. Mutate a blob from `_after_registry_publish`; the new receipt must be removed and phase remain `ACQUIRING`.
+- [ ] **Step 1: Add tampered-retry and post-link race RED tests.** After a real seal, alter one blob and retry identical arguments; it must not return `EXISTING`. Mutate a blob from `_after_registry_publish`; the phase remains `ACQUIRING`, but any receipt name already published with `O_EXCL` is preserved as uncommitted residue and retry conflicts. Never authenticate and then unlink a public receipt name.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_exact_retry_rejects_tampered_snapshot_blob \
-  tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_post_link_blob_race_cleans_new_phase_receipt -v
+  tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_post_link_blob_race_preserves_new_phase_receipt_residue -v
 ```
 
-Expected: retry returns existing or the race leaves a phase receipt.
+Expected: retry returns existing or the race is accepted instead of failing closed while preserving the published residue.
 
 - [ ] **Step 3: Wire one verifier through every authority boundary.** Call it after checkpoint load, inside `verify_source_evidence_and_checkpoint()` before/after link and final rebind, and in the already-`SOURCES_READY` branch before `created=False`.
 
@@ -416,7 +416,7 @@ except ValueError as exc:
     ) from exc
 ```
 
-- [ ] **Step 4: Add the atomic counterpart.** The same post-link mutation raises `atomic source gate evidence failed`, creates no quarantine or partial receipt, and remains `ACQUIRING`.
+- [ ] **Step 4: Add the atomic counterpart.** The same post-link mutation raises `atomic source gate evidence failed` and remains `ACQUIRING`. If no public name was created, the operation stays nonmutating; if an `O_EXCL` receipt name was already published, it remains as uncommitted residue and is never unlinked.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -424,7 +424,7 @@ except ValueError as exc:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_exact_retry_returns_existing_without_new_receipt \
   tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_exact_retry_rejects_tampered_snapshot_blob \
-  tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_post_link_blob_race_cleans_new_phase_receipt \
+  tests.test_execution_registry.ExecutionRegistryTest.test_sources_ready_post_link_blob_race_preserves_new_phase_receipt_residue \
   tests.test_execution_registry.ExecutionRegistryTest.test_atomic_sources_ready_post_link_blob_race_is_nonmutating -v
 ruff check mlb_backtest/execution_registry.py tests/test_execution_registry.py
 git diff --check

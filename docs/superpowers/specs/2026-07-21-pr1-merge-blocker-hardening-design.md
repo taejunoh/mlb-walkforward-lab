@@ -82,7 +82,16 @@ domain module and exposes the following internal infrastructure:
   creates descendants relative to the held root;
 - narrowly scoped regular-file snapshot and exclusive-write helpers that
   enforce one-link regular files, before/after identity, bounded reads, fsync,
-  and authenticated cleanup.
+  and fail-closed residue preservation.
+
+An `O_EXCL` create publishes a name before later validation and durability
+steps finish. If any subsequent step fails, the writer closes every descriptor
+but never unlinks that public name: an authenticate-then-unlink sequence has an
+unavoidable TOCTOU window in which an attacker can replace the authenticated
+inode before `unlink`. The owned partial or complete file therefore remains as
+uncommitted residue, a retry conflicts with `FileExistsError`, and an attacker
+replacement remains unchanged. Registry receipt publication and every later
+execution-registry cleanup path use the same residue-preservation rule.
 
 Content addressing, receipt schemas, snapshot-store lock semantics, and other
 domain policy remain in their current modules. The shared module owns only
