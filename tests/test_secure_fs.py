@@ -281,11 +281,12 @@ class SecureFilePrimitiveTests(unittest.TestCase):
 
     def test_write_detects_parent_swap_after_file_fsync(self):
         nested = self.root_path / "nested"
+        original_nested = self.root_path / "original-nested"
         nested.mkdir()
 
         def replace_parent(stage: str, component: str | None = None) -> None:
             if stage == "after_file_fsync":
-                nested.rename(self.root_path / "original-nested")
+                nested.rename(original_nested)
                 nested.mkdir()
 
         with secure_fs.open_trusted_root(self.root_path) as root:
@@ -293,32 +294,140 @@ class SecureFilePrimitiveTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unsafe parent binding"):
                     secure_fs.write_exclusive(root, Path("nested/data.bin"), b"data", "test")
         self.assertFalse((nested / "data.bin").exists())
+        self.assertEqual((original_nested / "data.bin").read_bytes(), b"data")
 
-    def test_write_never_unlinks_an_attacker_replacement(self):
+    def test_after_file_fsync_replacement_keeps_exact_attacker_inode_and_bytes(self):
         target = self.root_path / "data.bin"
+        attacker_identity = None
 
         def replace_leaf(stage: str, component: str | None = None) -> None:
+            nonlocal attacker_identity
             if stage == "after_file_fsync":
                 target.unlink()
                 target.write_bytes(b"attacker")
+                result = target.stat()
+                attacker_identity = (result.st_dev, result.st_ino)
 
         with secure_fs.open_trusted_root(self.root_path) as root:
+            before = _fd_count()
             with patch.object(secure_fs, "_secure_fs_test_hook", side_effect=replace_leaf):
                 with self.assertRaisesRegex(ValueError, "unsafe regular file"):
                     secure_fs.write_exclusive(root, Path("data.bin"), b"owned", "test")
+            self.assertEqual(_fd_count(), before)
+        result = target.stat()
+        self.assertEqual((result.st_dev, result.st_ino), attacker_identity)
         self.assertEqual(target.read_bytes(), b"attacker")
 
-    def test_failed_write_cleans_up_only_its_owned_inode(self):
+    def test_attacker_replacement_after_cleanup_auth_is_never_unlinked(self):
+        target = self.root_path / "data.bin"
+        original_match = getattr(secure_fs, "_contents_match", None)
+        original_unlink = os.unlink
+        attacker_identity = None
+
+        def authenticate_then_replace(*args: object, **kwargs: object) -> bool:
+            nonlocal attacker_identity
+            if original_match is None:
+                raise AssertionError("removed cleanup helper was unexpectedly called")
+            matched = original_match(*args, **kwargs)
+            self.assertTrue(matched)
+            original_unlink(target)
+            target.write_bytes(b"attacker-after-auth")
+            result = target.stat()
+            attacker_identity = (result.st_dev, result.st_ino)
+            return True
+
         with secure_fs.open_trusted_root(self.root_path) as root:
-            with self.assertRaisesRegex(RuntimeError, "final rebind failed"):
-                secure_fs.write_exclusive(
-                    root,
-                    Path("data.bin"),
-                    b"owned",
-                    "test",
-                    final_rebind=lambda: (_ for _ in ()).throw(RuntimeError("final rebind failed")),
-                )
-        self.assertFalse((self.root_path / "data.bin").exists())
+            before = _fd_count()
+            with (
+                patch.object(
+                    secure_fs,
+                    "_contents_match",
+                    side_effect=authenticate_then_replace,
+                    create=True,
+                ),
+                patch.object(secure_fs.os, "unlink", wraps=original_unlink) as unlink,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "final rebind failed"):
+                    secure_fs.write_exclusive(
+                        root,
+                        Path("data.bin"),
+                        b"owned",
+                        "test",
+                        final_rebind=lambda: (_ for _ in ()).throw(
+                            RuntimeError("final rebind failed")
+                        ),
+                    )
+                unlink.assert_not_called()
+            self.assertEqual(_fd_count(), before)
+        if attacker_identity is None:
+            self.assertEqual(target.read_bytes(), b"owned")
+        else:
+            result = target.stat()
+            self.assertEqual((result.st_dev, result.st_ino), attacker_identity)
+            self.assertEqual(target.read_bytes(), b"attacker-after-auth")
+
+    def test_final_rebind_failure_never_unlinks_and_preserves_complete_residue(self):
+        target = self.root_path / "data.bin"
+        original_unlink = os.unlink
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            before = _fd_count()
+            with patch.object(secure_fs.os, "unlink", wraps=original_unlink) as unlink:
+                with self.assertRaisesRegex(RuntimeError, "final rebind failed"):
+                    secure_fs.write_exclusive(
+                        root,
+                        Path("data.bin"),
+                        b"owned",
+                        "test",
+                        final_rebind=lambda: (_ for _ in ()).throw(
+                            RuntimeError("final rebind failed")
+                        ),
+                    )
+                unlink.assert_not_called()
+            self.assertEqual(_fd_count(), before)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                secure_fs.write_exclusive(root, Path("data.bin"), b"retry", "test")
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_short_write_error_preserves_partial_residue_and_retry_conflicts(self):
+        target = self.root_path / "data.bin"
+        original_write = os.write
+        calls = 0
+
+        def fail_after_short_write(fd: int, data: bytes) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original_write(fd, data[:3])
+            raise OSError("injected write failure")
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            before = _fd_count()
+            with patch.object(secure_fs.os, "write", side_effect=fail_after_short_write):
+                with self.assertRaisesRegex(OSError, "injected write failure"):
+                    secure_fs.write_exclusive(root, Path("data.bin"), b"abcdef", "test")
+            self.assertEqual(_fd_count(), before)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                secure_fs.write_exclusive(root, Path("data.bin"), b"retry", "test")
+        self.assertEqual(target.read_bytes(), b"abc")
+
+    def test_parent_fsync_failure_preserves_complete_residue(self):
+        target = self.root_path / "data.bin"
+        original_fsync = os.fsync
+
+        def fail_parent_fsync(fd: int) -> None:
+            if stat_is_directory(os.fstat(fd)):
+                raise OSError("injected parent fsync failure")
+            original_fsync(fd)
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            before = _fd_count()
+            with patch.object(secure_fs.os, "fsync", side_effect=fail_parent_fsync):
+                with self.assertRaisesRegex(OSError, "injected parent fsync failure"):
+                    secure_fs.write_exclusive(root, Path("data.bin"), b"complete", "test")
+            self.assertEqual(_fd_count(), before)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                secure_fs.write_exclusive(root, Path("data.bin"), b"retry", "test")
+        self.assertEqual(target.read_bytes(), b"complete")
 
     @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
     def test_all_file_primitive_success_and_fault_paths_close_descriptors(self):

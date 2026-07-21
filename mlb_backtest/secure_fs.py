@@ -416,46 +416,6 @@ def _write_all(descriptor: int, contents: bytes, label: str) -> None:
         offset += written
 
 
-def _contents_match(parent_fd: int, name: str, expected: bytes, identity: tuple[int, ...]) -> bool:
-    descriptor = -1
-    try:
-        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if _regular_identity(named) != identity:
-            return False
-        descriptor = os.open(name, _leaf_open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), dir_fd=parent_fd)
-        opened = os.fstat(descriptor)
-        return _regular_identity(opened) == identity and _read_bounded(descriptor, len(expected), "cleanup") == expected
-    except (OSError, ValueError):
-        return False
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-def _unlink_owned(parent_fd: int, name: str, contents: bytes, descriptor: int) -> None:
-    try:
-        identity = _regular_identity(os.fstat(descriptor))
-        if _contents_match(parent_fd, name, contents, identity):
-            os.unlink(name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-    except OSError:
-        pass
-
-
-def _unlink_owned_through_root(
-    root: TrustedRoot, relative: Path, contents: bytes, descriptor: int
-) -> None:
-    """Clean up only a still-reachable name that still denotes our inode."""
-    try:
-        with open_parent(root, relative, create=False) as parent_fd:
-            _unlink_owned(parent_fd, relative.parts[-1], contents, descriptor)
-    except (OSError, ValueError, RuntimeError):
-        pass
-
-
 def write_exclusive(
     root: TrustedRoot,
     relative: Path,
@@ -508,10 +468,6 @@ def write_exclusive(
             if _regular_identity(linked) != _regular_identity(final):
                 raise ValueError(f"unsafe regular file: {label}")
             return RegularFileSnapshot(relative, contents, _regular_identity(final))
-    except BaseException:
-        if descriptor >= 0:
-            _unlink_owned_through_root(root, relative, contents, descriptor)
-        raise
     finally:
         if descriptor >= 0:
             try:
