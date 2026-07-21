@@ -327,6 +327,9 @@ class ExecutionRegistryTest(unittest.TestCase):
         self, parent: Path, *, remaining_authority: bool = False
     ) -> tuple[Path, object]:
         root = (parent / "repo").resolve()
+        fixture_bound_paths = tuple(
+            dict.fromkeys((*BOUND_EXECUTION_CODE, *BOUND_SCHEMA_PATHS))
+        )
         for relative in (
             RUN_SPEC_RELATIVE,
             DESIGN_RELATIVE,
@@ -336,7 +339,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             ACQUISITION_SCHEMA_RELATIVE,
             BASELINE_RELATIVE,
             PROTECTED_RELATIVE,
-            *BOUND_EXECUTION_CODE,
+            *fixture_bound_paths,
         ):
             (root / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / RUN_SPEC_RELATIVE, root / RUN_SPEC_RELATIVE)
@@ -349,7 +352,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         shutil.copy2(ROOT / BASELINE_RELATIVE, root / BASELINE_RELATIVE)
         shutil.copy2(ROOT / PROTECTED_RELATIVE, root / PROTECTED_RELATIVE)
-        for relative in BOUND_EXECUTION_CODE:
+        for relative in fixture_bound_paths:
             shutil.copy2(ROOT / relative, root / relative)
         if remaining_authority:
             from mlb_backtest.manifest import RawStore
@@ -422,6 +425,20 @@ class ExecutionRegistryTest(unittest.TestCase):
         _git(root, "add", *contract_paths)
         _git(root, "commit", "-qm", "fixture contract")
         return root, load_run_spec(root / RUN_SPEC_RELATIVE)
+
+    def test_make_repo_owns_bound_schemas_when_execution_tuple_is_stale(self) -> None:
+        without_schemas = tuple(
+            relative
+            for relative in BOUND_EXECUTION_CODE
+            if relative not in BOUND_SCHEMA_PATHS
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            f"{__name__}.BOUND_EXECUTION_CODE", without_schemas
+        ):
+            root, _run_spec = self.make_repo(Path(directory))
+            for relative in BOUND_SCHEMA_PATHS:
+                with self.subTest(schema=relative):
+                    self.assertTrue((root / relative).is_file())
 
     def initialize(self, root: Path, run_spec: object):
         return self.registry.initialize_execution_registry(
