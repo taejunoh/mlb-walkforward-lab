@@ -10,7 +10,11 @@ from unittest.mock import patch
 
 import jsonschema
 
-from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
+from mlb_backtest.v52_evidence import (
+    LogicalQuery,
+    V52EvidenceStore,
+    logical_query_id,
+)
 import mlb_backtest.v52_duplicate_gamepk_disposition as disposition_module
 from mlb_backtest.v52_duplicate_gamepk_disposition import (
     DISPOSITION_ENDPOINT,
@@ -18,6 +22,7 @@ from mlb_backtest.v52_duplicate_gamepk_disposition import (
     NORMALIZED_GAMES_SHA256,
     SELECTED_RAW_GAME_OBJECT_SHA256S_SHA256,
     build_duplicate_disposition_authority,
+    publish_duplicate_gamepk_disposition,
     project_schedule_occurrences,
 )
 
@@ -131,6 +136,30 @@ def _authenticated_filtered_view(payload: dict[str, object]) -> dict[str, object
     date["totalGames"] -= 1
     filtered["totalGames"] -= 1
     return filtered
+
+
+def _superseding_namespace_paths() -> tuple[Path, ...]:
+    return tuple(
+        ROOT / relative
+        for relative in (
+            "data/v5_2_qd/historical_superseding_565534/raw",
+            "data/v5_2_qd/historical_superseding_565534/sources",
+            "audit/v5_2_qd/historical_superseding_565534",
+            "reports/v5_2_qd/historical_superseding_565534",
+        )
+    )
+
+
+class _RecordingDispositionStore(V52EvidenceStore):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.publish_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def publish_derived_disposition(
+        self, *args: object, **kwargs: object
+    ) -> object:
+        self.publish_calls.append((args, kwargs))
+        raise AssertionError("parser mismatch must prevent publication")
 
 
 def _mutate_565534_predicate(
@@ -287,14 +316,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
             acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
-        forbidden_namespaces = tuple(
-            ROOT / relative
-            for relative in (
-                "data/v5_2_qd/historical_superseding_565534",
-                "audit/v5_2_qd/historical_superseding_565534",
-                "reports/v5_2_qd/historical_superseding_565534",
-            )
-        )
+        forbidden_namespaces = _superseding_namespace_paths()
         self.assertTrue(all(not path.exists() for path in forbidden_namespaces))
         actual_parse_schedule = disposition_module.parse_schedule
 
@@ -305,6 +327,27 @@ class V52ScheduleSourceTest(unittest.TestCase):
             ValueError, "unchanged parse_schedule"
         ):
             project_schedule_occurrences(authority)
+        self.assertTrue(all(not path.exists() for path in forbidden_namespaces))
+
+    def test_2019_publication_wrapper_blocks_reordered_parser_before_store_call(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        store = _RecordingDispositionStore(authority.evidence_root)
+        forbidden_namespaces = _superseding_namespace_paths()
+        self.assertTrue(all(not path.exists() for path in forbidden_namespaces))
+        actual_parse_schedule = disposition_module.parse_schedule
+
+        def reorder(value: bytes) -> list[dict]:
+            return list(reversed(actual_parse_schedule(value)))
+
+        with patch.object(disposition_module, "parse_schedule", side_effect=reorder), self.assertRaisesRegex(
+            ValueError, "unchanged parse_schedule"
+        ):
+            publish_duplicate_gamepk_disposition(store, authority)
+        self.assertEqual(store.publish_calls, [])
         self.assertTrue(all(not path.exists() for path in forbidden_namespaces))
 
     def test_2019_projection_deep_freezes_nested_normalized_games(self) -> None:
