@@ -350,6 +350,42 @@ class V52ScheduleSourceTest(unittest.TestCase):
         self.assertEqual(store.publish_calls, [])
         self.assertTrue(all(not path.exists() for path in forbidden_namespaces))
 
+    def test_2019_publication_rejects_changed_raw_at_final_authenticated_read(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        raw = json.loads((ROOT / authority.old_raw_relative).read_bytes())
+        ignored_copy = raw["dates"][4]["games"][14]
+        self.assertEqual(ignored_copy["gamePk"], 565221)
+        ignored_copy["calendarEventID"] = "tampered-ignored-copy"
+        tampered_raw = json.dumps(
+            raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        store = _RecordingDispositionStore(authority.evidence_root)
+        original_read = disposition_module._read_regular_single_link
+        raw_read_count = 0
+
+        def alternate_raw_read(
+            root: Path, relative: Path, label: str
+        ) -> bytes:
+            nonlocal raw_read_count
+            if relative == disposition_module.OLD_RAW_RELATIVE:
+                raw_read_count += 1
+                if raw_read_count == 2:
+                    return tampered_raw
+            return original_read(root, relative, label)
+
+        with patch.object(
+            disposition_module,
+            "_read_regular_single_link",
+            side_effect=alternate_raw_read,
+        ), self.assertRaisesRegex(ValueError, "sha256 differs"):
+            publish_duplicate_gamepk_disposition(store, authority)
+        self.assertEqual(raw_read_count, 2)
+        self.assertEqual(store.publish_calls, [])
+
     def test_2019_projection_deep_freezes_nested_normalized_games(self) -> None:
         authority = build_duplicate_disposition_authority(
             ROOT,

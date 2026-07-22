@@ -110,12 +110,9 @@ class DuplicateGamePkDispositionAuthority:
     _snapshots: tuple[_FileSnapshot, ...]
 
     def _read_old_payload(self) -> dict[str, object]:
-        snapshots = _authenticate_old_evidence(self.repository_root)
-        if snapshots[0:3] != self._snapshots:
+        snapshots, raw = _authenticate_old_evidence(self.repository_root)
+        if snapshots != self._snapshots:
             raise ValueError("old 565534 authority changed during disposition")
-        raw = _read_regular_single_link(
-            self.repository_root, OLD_RAW_RELATIVE, "old quarantined raw"
-        )
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -176,22 +173,56 @@ def _read_regular_single_link(root: Path, relative: Path, label: str) -> bytes:
         os.close(descriptor)
 
 
-def _snapshot(root: Path, relative: Path, expected_sha256: str, byte_count: int | None, label: str) -> _FileSnapshot:
+def _snapshot(
+    root: Path,
+    relative: Path,
+    expected_sha256: str,
+    byte_count: int | None,
+    label: str,
+) -> tuple[_FileSnapshot, bytes]:
     contents = _read_regular_single_link(root, relative, label)
     node = (root / relative).lstat()
     if hashlib.sha256(contents).hexdigest() != expected_sha256:
         raise ValueError(f"{label} sha256 differs")
     if byte_count is not None and len(contents) != byte_count:
         raise ValueError(f"{label} byte count differs")
-    return _FileSnapshot(relative, expected_sha256, byte_count, (node.st_dev, node.st_ino))
+    return (
+        _FileSnapshot(
+            relative,
+            expected_sha256,
+            byte_count,
+            (node.st_dev, node.st_ino),
+        ),
+        contents,
+    )
 
 
-def _authenticate_old_evidence(root: Path) -> tuple[_FileSnapshot, ...]:
-    registration = _snapshot(root, OLD_REGISTRATION_RELATIVE, OLD_REGISTRATION_SHA256, None, "old query registration")
-    quarantine = _snapshot(root, OLD_QUARANTINE_RELATIVE, OLD_QUARANTINE_SHA256, None, "old quarantine receipt")
-    raw = _snapshot(root, OLD_RAW_RELATIVE, OLD_RAW_SHA256, OLD_RAW_BYTE_COUNT, "old quarantined raw")
-    registration_payload = json.loads(_read_regular_single_link(root, OLD_REGISTRATION_RELATIVE, "old query registration"))
-    quarantine_payload = json.loads(_read_regular_single_link(root, OLD_QUARANTINE_RELATIVE, "old quarantine receipt"))
+def _authenticate_old_evidence(
+    root: Path,
+) -> tuple[tuple[_FileSnapshot, ...], bytes]:
+    registration, registration_bytes = _snapshot(
+        root,
+        OLD_REGISTRATION_RELATIVE,
+        OLD_REGISTRATION_SHA256,
+        None,
+        "old query registration",
+    )
+    quarantine, quarantine_bytes = _snapshot(
+        root,
+        OLD_QUARANTINE_RELATIVE,
+        OLD_QUARANTINE_SHA256,
+        None,
+        "old quarantine receipt",
+    )
+    raw, raw_bytes = _snapshot(
+        root,
+        OLD_RAW_RELATIVE,
+        OLD_RAW_SHA256,
+        OLD_RAW_BYTE_COUNT,
+        "old quarantined raw",
+    )
+    registration_payload = json.loads(registration_bytes)
+    quarantine_payload = json.loads(quarantine_bytes)
     if (
         registration_payload.get("source") != "mlb_schedule_game_feed"
         or registration_payload.get("grain") != "season_schedule_and_game"
@@ -202,7 +233,7 @@ def _authenticate_old_evidence(root: Path) -> tuple[_FileSnapshot, ...]:
         or quarantine_payload.get("byte_count") != OLD_RAW_BYTE_COUNT
     ):
         raise ValueError("old 565534 evidence binding differs")
-    return registration, quarantine, raw
+    return (registration, quarantine, raw), raw_bytes
 
 
 def _requested_range() -> Mapping[str, object]:
@@ -242,7 +273,7 @@ def build_duplicate_disposition_authority(
         raise ValueError("superseding contract omits the 565534 disposition endpoint")
     if context.contract.get("supersedes") != dict(OLD_BINDINGS):
         raise ValueError("superseding contract old bindings differ")
-    snapshots = _authenticate_old_evidence(root)
+    snapshots, _ = _authenticate_old_evidence(root)
     query = LogicalQuery(
         source="mlb_schedule_game_feed",
         grain="season_schedule_and_game",
