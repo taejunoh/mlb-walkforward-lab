@@ -11,9 +11,10 @@ from dataclasses import dataclass, field as dataclass_field
 from datetime import date, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Protocol, Sequence
 
 from .manifest import RawStore, _safe_leaf_bytes
+from .statcast import StatcastData
 from .sources import (
     OUT_OF_RANGE_UNPLAYED_STATUSES,
     parse_schedule,
@@ -21,9 +22,16 @@ from .sources import (
     validate_schedule_query_coverage,
 )
 
-
 _EVIDENCE_TOKEN = object()
 PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
+
+
+class FeatureHistoryResult(Protocol):
+    """Runtime-resolvable interface returned by history preparation helpers."""
+
+    pitches: tuple[Mapping[str, object], ...]
+    plate_appearances: tuple[Mapping[str, object], ...]
+    schedule_history: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -1321,20 +1329,26 @@ def schedule_history_rows(
     )
 
 
-def build_pregame_history(
-    statcast_data: object,
-    target_game: Mapping[str, object],
+def _deep_freeze_history_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _deep_freeze_history_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_history_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze_history_value(item) for item in value)
+    return value
+
+
+def build_feature_history(
+    statcast_data: StatcastData,
     slot_weights: Mapping[int, float],
     schedule_build: ScheduleHistoryBuild,
-):
-    """Construct one full-source FeatureHistory for strict as-of indexed queries."""
-    from .feature_engine import FeatureHistory
-    from .statcast import StatcastData
+) -> FeatureHistoryResult:
+    """Construct a full-source FeatureHistory from authenticated history evidence."""
+    from .feature_engine import FeatureHistory, ScheduleHistory
 
-    if not isinstance(target_game, Mapping):
-        raise ValueError("target_game must be a mapping")
-    _positive_id(target_game.get("game_pk"), "target game_pk")
-    _canonical_day(target_game.get("official_date"), "target official_date")
     if not isinstance(schedule_build, ScheduleHistoryBuild):
         raise ValueError("schedule_build must be a ScheduleHistoryBuild")
     if not isinstance(statcast_data, StatcastData):
@@ -1354,16 +1368,69 @@ def build_pregame_history(
                 )
                 if field in row
             }
-    history = FeatureHistory(
+
+    class ImmutableScheduleHistory(ScheduleHistory):
+        def __getattribute__(self, name: str) -> object:
+            if name == "__dict__":
+                values = object.__getattribute__(self, "__dict__")
+                if values.get("_history_frozen", False):
+                    return MappingProxyType(values)
+            return super().__getattribute__(name)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if self.__dict__.get("_history_frozen", False):
+                raise TypeError("schedule history is immutable")
+            super().__setattr__(name, value)
+
+    frozen_schedule = ImmutableScheduleHistory(
+        schedule_build.rows,
+        coverage_start=schedule_build.coverage_start,
+        coverage_end=schedule_build.coverage_end,
+        coverage_complete=schedule_build.coverage_complete,
+    )
+    for name, value in tuple(vars(frozen_schedule).items()):
+        object.__setattr__(
+            frozen_schedule, name, _deep_freeze_history_value(value)
+        )
+    object.__setattr__(frozen_schedule, "_history_frozen", True)
+
+    class ImmutableFeatureHistory(FeatureHistory):
+        def __getattribute__(self, name: str) -> object:
+            if name == "__dict__":
+                values = object.__getattribute__(self, "__dict__")
+                if values.get("_history_frozen", False):
+                    return MappingProxyType(values)
+            return super().__getattribute__(name)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if self.__dict__.get("_history_frozen", False):
+                raise TypeError("feature history is immutable")
+            super().__setattr__(name, value)
+
+    history = ImmutableFeatureHistory(
         statcast_data,
         slot_weights=slot_weights,
-        schedule_history=schedule_build.rows,
-        schedule_coverage_start=schedule_build.coverage_start,
-        schedule_coverage_end=schedule_build.coverage_end,
-        schedule_coverage_complete=schedule_build.coverage_complete,
+        schedule_history=frozen_schedule,
         venue_by_name=venue_by_name,
     )
+    for name, value in tuple(vars(history).items()):
+        object.__setattr__(history, name, _deep_freeze_history_value(value))
+    object.__setattr__(history, "_history_frozen", True)
     return history
+
+
+def build_pregame_history(
+    statcast_data: StatcastData,
+    target_game: Mapping[str, object],
+    slot_weights: Mapping[int, float],
+    schedule_build: ScheduleHistoryBuild,
+) -> FeatureHistoryResult:
+    """Construct one full-source FeatureHistory for strict as-of indexed queries."""
+    if not isinstance(target_game, Mapping):
+        raise ValueError("target_game must be a mapping")
+    _positive_id(target_game.get("game_pk"), "target game_pk")
+    _canonical_day(target_game.get("official_date"), "target official_date")
+    return build_feature_history(statcast_data, slot_weights, schedule_build)
 
 
 __all__ = [
@@ -1376,6 +1443,7 @@ __all__ = [
     "_aggregate_training_slot_rows",
     "assert_pregame_history",
     "build_actual_participants",
+    "build_feature_history",
     "build_source_manifest_index",
     "build_pregame_history",
     "derive_team_code_map",

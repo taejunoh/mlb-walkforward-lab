@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import get_type_hints
 from unittest import mock
 
 from mlb_backtest.features.offense import derive_slot_weights
@@ -20,6 +21,7 @@ from mlb_backtest.prepare import (
     _validate_played_schedule_season,
     assert_pregame_history,
     build_actual_participants,
+    build_feature_history,
     build_pregame_history,
     build_source_manifest_index,
     derive_team_code_map,
@@ -42,6 +44,14 @@ STATCAST = ROOT / "tests" / "fixtures" / "statcast_mini.csv"
 
 
 class PrepareBoundaryTest(unittest.TestCase):
+    def test_feature_history_helper_type_hints_resolve_at_runtime(self):
+        feature_hints = get_type_hints(build_feature_history)
+        pregame_hints = get_type_hints(build_pregame_history)
+        self.assertIs(feature_hints["statcast_data"], StatcastData)
+        self.assertIs(pregame_hints["statcast_data"], StatcastData)
+        self.assertIn("return", feature_hints)
+        self.assertIn("return", pregame_hints)
+
     def test_same_day_and_target_game_history_is_rejected(self):
         parsed = parse_statcast(STATCAST)
         target = {"game_pk": 2001, "official_date": "2024-04-03"}
@@ -962,6 +972,43 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertIn(1002, history.pitch_game_pks)
         self.assertIn(1002, history.pa_game_pks)
         self.assertTrue(history.schedule_history.coverage_complete)
+
+    def test_build_feature_history_does_not_require_a_target_game(self):
+        parsed = parse_statcast(STATCAST)
+        source = StatcastData(
+            tuple(dict(row, outs_recorded=0) for row in parsed.pitches),
+            tuple(dict(row, outs_recorded=0) for row in parsed.plate_appearances),
+        )
+        schedule_build = ScheduleHistoryBuild(
+            rows=(
+                {
+                    "game_pk": 1001,
+                    "official_date": "2024-04-01",
+                    "team_codes": ["AWY", "HOM"],
+                    "home_team_code": "HOM",
+                    "venue_name": "Park",
+                    "innings": 9,
+                },
+            ),
+            coverage_start="2024-04-01",
+            coverage_end="2024-04-02",
+            coverage_complete=True,
+            source_manifest_sha256="c" * 64,
+            expected_game_pks=(1001,),
+        )
+        history = build_feature_history(
+            source, {slot: 1 / 9 for slot in range(1, 10)}, schedule_build
+        )
+        historical = build_pregame_history(
+            source,
+            {"game_pk": 9999, "official_date": "2024-04-03"},
+            {slot: 1 / 9 for slot in range(1, 10)},
+            schedule_build,
+        )
+        self.assertEqual(history.pitch_game_pks, {1001, 1002})
+        self.assertEqual(history.pitches, historical.pitches)
+        self.assertEqual(history.plate_appearances, historical.plate_appearances)
+        self.assertEqual(history.schedule_history.rows, historical.schedule_history.rows)
 
 
 if __name__ == "__main__":
