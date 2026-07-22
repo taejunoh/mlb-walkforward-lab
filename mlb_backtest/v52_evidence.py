@@ -2770,6 +2770,31 @@ class V52EvidenceStore:
         if self.load_success(query, authority=authority) is not None:
             raise RuntimeError("query success is already published and terminal")
 
+    def _admit_derived_authority(
+        self, query: LogicalQuery, *, authority: object | None = None
+    ) -> None:
+        """Reject an unauthenticated derived disposition before any I/O cleanup."""
+        if query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
+            from .v52_duplicate_gamepk_disposition import (
+                DuplicateGamePkDispositionAuthority,
+            )
+
+            if not isinstance(authority, DuplicateGamePkDispositionAuthority):
+                raise TypeError(
+                    "schedule disposition requires its authenticated authority"
+                )
+            if authority.query != query or authority.evidence_root != self.root:
+                raise ValueError("schedule disposition authority binding differs")
+            rebound = authority.reauthenticate()
+            if (
+                not isinstance(rebound, DuplicateGamePkDispositionAuthority)
+                or rebound.query != query
+                or rebound.evidence_root != self.root
+            ):
+                raise ValueError("schedule disposition authority rebind differs")
+        elif query.endpoint == _DERIVED_ENDPOINT and authority is not None:
+            raise ValueError("preseason disposition must not receive an authority")
+
     def acquire_query(self, query: LogicalQuery) -> ContextManager[QueryLease]:
         return self._acquire_query_context(query)
 
@@ -5070,6 +5095,7 @@ class V52EvidenceStore:
         *,
         authority: object | None = None,
     ) -> PublishedEvidence:
+        self._admit_derived_authority(query, authority=authority)
         self._require_lease(query)
         if self._recover_pending_before_mutation(query, authority=authority) is not None:
             raise RuntimeError(
@@ -5102,6 +5128,15 @@ class V52EvidenceStore:
                         "derived disposition cannot own attempts or reservations"
                     )
                 self._ensure_empty_inventory(objects_fd, "query object")
+                sidecar_existed_before_publication = (
+                    _read_regular_snapshot_at(
+                        sidecars_fd,
+                        sidecar_name,
+                        "derived disposition sidecar",
+                        missing_ok=True,
+                    )
+                    is not None
+                )
                 self._ensure_content_slot(
                     sidecars_fd,
                     sidecar_name,
@@ -5205,10 +5240,24 @@ class V52EvidenceStore:
                             "derived disposition sidecar",
                             missing_ok=True,
                         )
-                        if (
+                        is_schedule_disposition = (
+                            query.endpoint
+                            == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+                        )
+                        should_cleanup = (
                             current_sidecar is not None
-                            and current_sidecar != sidecar_snapshot
-                        ):
+                            and (
+                                (
+                                    is_schedule_disposition
+                                    and not sidecar_existed_before_publication
+                                )
+                                or (
+                                    not is_schedule_disposition
+                                    and current_sidecar != sidecar_snapshot
+                                )
+                            )
+                        )
+                        if should_cleanup:
                             _cleanup_created_file(
                                 sidecars_fd,
                                 sidecar_descriptor,
@@ -5289,6 +5338,7 @@ class V52EvidenceStore:
         lock_descriptor: int | None = None,
         inspection: Callable[[VerifiedEvidenceRead], None] | None = None,
     ) -> VerifiedEvidenceRead | None:
+        self._admit_derived_authority(query, authority=authority)
         try:
             query_id, descriptors = self._query_fds(query, create=False)
         except FileNotFoundError:
@@ -5773,6 +5823,7 @@ class V52EvidenceStore:
     def read_verified_query_progress(
         self, query: LogicalQuery, *, authority: object | None = None
     ) -> VerifiedQueryProgress:
+        self._admit_derived_authority(query, authority=authority)
         query_id = logical_query_id(query)
         descriptors: list[int] = []
         for _ in range(2):

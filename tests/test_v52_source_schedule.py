@@ -370,13 +370,85 @@ class V52ScheduleSourceTest(unittest.TestCase):
             with patch.object(
                 disposition_module.DuplicateGamePkDispositionAuthority,
                 "reauthenticate",
-                side_effect=[isolated, isolated, ValueError("authority changed")],
+                side_effect=[
+                    isolated,
+                    isolated,
+                    isolated,
+                    isolated,
+                    ValueError("authority changed"),
+                ],
             ), self.assertRaisesRegex(ValueError, "authority changed"):
                 publish_duplicate_gamepk_disposition(store, isolated)
             folder = store.root / "queries" / isolated.query.source / logical_query_id(isolated.query)
             self.assertFalse((folder / "success.json").exists())
             self.assertEqual(list((folder / "attempts").iterdir()), [])
             self.assertEqual(list((folder / "objects").iterdir()), [])
+            self.assertEqual(list((folder / "sidecars").iterdir()), [])
+
+    def test_schedule_authority_admission_precedes_recovery_and_cleanup(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(Path(td).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            semantics = recompute_query_sidecar(
+                authority.query, b"", authority=authority
+            )
+            cross_bound = dataclasses.replace(
+                isolated, evidence_root=store.root.parent / "other-root"
+            )
+
+            for supplied in (None, cross_bound):
+                with self.subTest(operation="publish", authority=supplied):
+                    with patch.object(
+                        store,
+                        "_recover_pending_before_mutation",
+                        wraps=store._recover_pending_before_mutation,
+                    ) as recovery:
+                        with store.acquire_query(isolated.query):
+                            with self.assertRaises((TypeError, ValueError)):
+                                store.publish_derived_disposition(
+                                    isolated.query,
+                                    semantics,
+                                    authority=supplied,
+                                )
+                    recovery.assert_not_called()
+
+            with patch.object(
+                disposition_module.DuplicateGamePkDispositionAuthority,
+                "reauthenticate",
+                return_value=isolated,
+            ):
+                published = publish_duplicate_gamepk_disposition(store, isolated)
+            self.assertTrue(published.success_receipt_path.exists())
+
+            for supplied in (None, cross_bound):
+                with self.subTest(operation="read", authority=supplied):
+                    with patch.object(
+                        store,
+                        "_finish_failure_cleanup_before_read",
+                        wraps=store._finish_failure_cleanup_before_read,
+                    ) as cleanup:
+                        with self.assertRaises((TypeError, ValueError)):
+                            store.read_verified_success(
+                                isolated.query, authority=supplied
+                            )
+                    cleanup.assert_not_called()
+
+                with self.subTest(operation="progress", authority=supplied):
+                    with patch.object(
+                        store,
+                        "_finish_failure_cleanup_tombstones",
+                        wraps=store._finish_failure_cleanup_tombstones,
+                    ) as cleanup:
+                        with self.assertRaises((TypeError, ValueError)):
+                            store.read_verified_query_progress(
+                                isolated.query, authority=supplied
+                            )
+                    cleanup.assert_not_called()
 
     def test_565534_exact_pair_retains_only_resumed_record_and_binds_disposition(self) -> None:
         from mlb_backtest.source_parsers.schedule import parse_schedule
