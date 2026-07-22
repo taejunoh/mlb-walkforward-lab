@@ -1,0 +1,20 @@
+{
+  "ordinary_pair_count_after_special_suppression": 41,
+  "representatives": [
+    {
+      "game_pk": 565221,
+      "positions": [[4, 14], [62, 4]],
+      "reconciliation": "Postponed_to_Final"
+    },
+    {
+      "game_pk": 567288,
+      "positions": [[62, 7], [63, 0]],
+      "reconciliation": "Final_to_Final_earlier_start_selected"
+    },
+    {
+      "game_pk": 567304,
+      "positions": [[98, 14], [182, 15]],
+      "reconciliation": "Postponed_to_Cancelled"
+    }
+  ]
+}
