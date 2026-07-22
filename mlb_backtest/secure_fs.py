@@ -223,6 +223,29 @@ def _regular_identity(result: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _regular_content_identity(result: os.stat_result) -> tuple[int, ...]:
+    return _regular_identity(result)[:-1]
+
+
+class _CtimeStabilizationBudget:
+    def __init__(self) -> None:
+        self._transition: frozenset[int] | None = None
+
+    def consume(self, ctimes: set[int], label: str) -> None:
+        transition = frozenset(ctimes)
+        if len(transition) < 2:
+            return
+        if len(transition) != 2 or self._transition is not None:
+            raise ValueError(f"unsafe regular file: {label}")
+        self._transition = transition
+
+    def covers(self, before_ctime: int, after_ctime: int) -> bool:
+        return self._transition is not None and {
+            before_ctime,
+            after_ctime,
+        } <= self._transition
+
+
 def _require_regular_single_link(result: os.stat_result, label: str) -> None:
     if not stat.S_ISREG(result.st_mode) or result.st_nlink != 1:
         raise ValueError(f"unsafe regular file: {label}")
@@ -337,10 +360,69 @@ def _read_bounded(descriptor: int, max_bytes: int | None, label: str) -> bytes:
     return b"".join(chunks)
 
 
-def read_regular_snapshot(
+def _read_stable_regular_contents(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    named_before: os.stat_result,
+    label: str,
+    *,
+    max_bytes: int | None,
+    ctime_budget: _CtimeStabilizationBudget,
+    expected_contents: bytes | None = None,
+) -> tuple[bytes, tuple[int, ...]]:
+    first_contents: bytes | None = None
+    for attempt in range(2):
+        if attempt:
+            named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        opened_before = os.fstat(descriptor)
+        _require_regular_single_link(opened_before, label)
+        _require_regular_single_link(named_before, label)
+        content_identity = _regular_content_identity(opened_before)
+        if content_identity != _regular_content_identity(named_before):
+            raise ValueError(f"unsafe regular file: {label}")
+        if max_bytes is not None and opened_before.st_size > max_bytes:
+            raise ValueError("file exceeds maximum size")
+        if expected_contents is not None and opened_before.st_size != len(
+            expected_contents
+        ):
+            raise ValueError(f"unsafe regular file: {label}")
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        contents = _read_bounded(descriptor, max_bytes, label)
+        opened_after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _require_regular_single_link(opened_after, label)
+        _require_regular_single_link(named_after, label)
+        if any(
+            _regular_content_identity(result) != content_identity
+            for result in (opened_after, named_after)
+        ):
+            raise ValueError(f"unsafe regular file: {label}")
+        if expected_contents is not None and contents != expected_contents:
+            raise ValueError(f"unsafe regular file: {label}")
+        if first_contents is not None and contents != first_contents:
+            raise ValueError(f"unsafe regular file: {label}")
+
+        identity = _regular_identity(opened_after)
+        identities = {
+            _regular_identity(result)
+            for result in (named_before, opened_before, opened_after, named_after)
+        }
+        if len(identities) == 1:
+            return contents, identity
+        if attempt:
+            raise ValueError(f"unsafe regular file: {label}")
+        ctime_budget.consume({result[-1] for result in identities}, label)
+        first_contents = contents
+    raise ValueError(f"unsafe regular file: {label}")
+
+
+def _read_regular_snapshot(
     root: TrustedRoot,
     relative: Path,
     label: str,
+    ctime_budget: _CtimeStabilizationBudget,
     *,
     max_bytes: int | None = None,
     missing_ok: bool = False,
@@ -363,18 +445,15 @@ def read_regular_snapshot(
                 _leaf_open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)),
                 dir_fd=parent_fd,
             )
-            opened_before = os.fstat(descriptor)
-            _require_regular_single_link(opened_before, label)
-            if _regular_identity(opened_before) != _regular_identity(named_before):
-                raise ValueError(f"unsafe regular file: {label}")
-            contents = _read_bounded(descriptor, max_bytes, label)
-            opened_after = os.fstat(descriptor)
-            named_after = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-            _require_regular_single_link(opened_after, label)
-            _require_regular_single_link(named_after, label)
-            identity = _regular_identity(opened_after)
-            if identity != _regular_identity(named_after) or identity != _regular_identity(opened_before):
-                raise ValueError(f"unsafe regular file: {label}")
+            contents, identity = _read_stable_regular_contents(
+                parent_fd,
+                parts[-1],
+                descriptor,
+                named_before,
+                label,
+                max_bytes=max_bytes,
+                ctime_budget=ctime_budget,
+            )
         root.assert_bound()
         return RegularFileSnapshot(relative, contents, identity)
     except FileNotFoundError:
@@ -392,6 +471,25 @@ def read_regular_snapshot(
                 pass
 
 
+def read_regular_snapshot(
+    root: TrustedRoot,
+    relative: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+    missing_ok: bool = False,
+) -> RegularFileSnapshot | None:
+    """Read one regular, unaliased file and bind its exact observed state."""
+    return _read_regular_snapshot(
+        root,
+        relative,
+        label,
+        _CtimeStabilizationBudget(),
+        max_bytes=max_bytes,
+        missing_ok=missing_ok,
+    )
+
+
 def rebind_regular_snapshot(
     root: TrustedRoot,
     expected: RegularFileSnapshot,
@@ -402,8 +500,32 @@ def rebind_regular_snapshot(
     """Require that a previously observed file remains exactly unchanged."""
     if type(expected) is not RegularFileSnapshot:
         raise ValueError("regular file snapshot mismatch")
-    actual = read_regular_snapshot(root, expected.relative, label, max_bytes=max_bytes)
-    if actual != expected:
+    ctime_budget = _CtimeStabilizationBudget()
+    actual = _read_regular_snapshot(
+        root,
+        expected.relative,
+        label,
+        ctime_budget,
+        max_bytes=max_bytes,
+    )
+    if actual == expected:
+        return
+    if (
+        actual is None
+        or actual.contents != expected.contents
+        or actual.identity[:-1] != expected.identity[:-1]
+    ):
+        raise ValueError("regular file snapshot mismatch")
+    if not ctime_budget.covers(expected.identity[-1], actual.identity[-1]):
+        ctime_budget.consume({expected.identity[-1], actual.identity[-1]}, label)
+    stable = _read_regular_snapshot(
+        root,
+        expected.relative,
+        label,
+        ctime_budget,
+        max_bytes=max_bytes,
+    )
+    if stable != actual:
         raise ValueError("regular file snapshot mismatch")
 
 
@@ -422,29 +544,20 @@ def _revalidate_written_contents(
     descriptor: int,
     contents: bytes,
     label: str,
+    ctime_budget: _CtimeStabilizationBudget,
 ) -> tuple[int, ...]:
-    opened_before = os.fstat(descriptor)
     named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    _require_regular_single_link(opened_before, label)
-    _require_regular_single_link(named_before, label)
-    identity = _regular_identity(opened_before)
-    if identity != _regular_identity(named_before) or opened_before.st_size != len(contents):
-        raise ValueError(f"unsafe regular file: {label}")
-
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    actual = _read_bounded(descriptor, len(contents), label)
-    opened_after = os.fstat(descriptor)
-    named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    _require_regular_single_link(opened_after, label)
-    _require_regular_single_link(named_after, label)
-    final_identity = _regular_identity(opened_after)
-    if (
-        actual != contents
-        or final_identity != identity
-        or final_identity != _regular_identity(named_after)
-    ):
-        raise ValueError(f"unsafe regular file: {label}")
-    return final_identity
+    _, identity = _read_stable_regular_contents(
+        parent_fd,
+        name,
+        descriptor,
+        named_before,
+        label,
+        max_bytes=len(contents),
+        ctime_budget=ctime_budget,
+        expected_contents=contents,
+    )
+    return identity
 
 
 def write_exclusive(
@@ -481,17 +594,28 @@ def write_exclusive(
             _secure_fs_test_hook("after_file_fsync", relative.as_posix())
             if final_rebind is not None:
                 final_rebind()
+            ctime_budget = _CtimeStabilizationBudget()
             root.assert_bound()
             _revalidate_parent_path(root, parts, parent_fd)
             _revalidate_written_contents(
-                parent_fd, parts[-1], descriptor, contents, label
+                parent_fd,
+                parts[-1],
+                descriptor,
+                contents,
+                label,
+                ctime_budget,
             )
             os.fsync(parent_fd)
             _secure_fs_test_hook("before_return_revalidation", relative.as_posix())
             root.assert_bound()
             _revalidate_parent_path(root, parts, parent_fd)
             identity = _revalidate_written_contents(
-                parent_fd, parts[-1], descriptor, contents, label
+                parent_fd,
+                parts[-1],
+                descriptor,
+                contents,
+                label,
+                ctime_budget,
             )
             return RegularFileSnapshot(relative, contents, identity)
     finally:

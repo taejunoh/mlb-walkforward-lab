@@ -302,11 +302,13 @@ class SecureFilePrimitiveTests(unittest.TestCase):
         with secure_fs.open_trusted_root(self.root_path) as root:
             expected = secure_fs.read_regular_snapshot(root, Path("data.bin"), "test")
             secure_fs.rebind_regular_snapshot(root, expected, "test")
+            before = target.stat()
             target.write_bytes(b"two")
-            before = _fd_count()
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            before_fds = _fd_count()
             with self.assertRaisesRegex(ValueError, "regular file snapshot mismatch"):
                 secure_fs.rebind_regular_snapshot(root, expected, "test")
-            self.assertEqual(_fd_count(), before)
+            self.assertEqual(_fd_count(), before_fds)
 
     def test_write_is_exclusive_and_handles_short_writes(self):
         original_write = os.write
@@ -323,6 +325,175 @@ class SecureFilePrimitiveTests(unittest.TestCase):
                 secure_fs.write_exclusive(root, Path("nested/data.bin"), b"changed", "test")
             self.assertEqual(_fd_count(), before)
         self.assertEqual((self.root_path / "nested/data.bin").read_bytes(), b"abcdef")
+
+    def test_write_retries_one_ctime_only_drift_and_adopts_stable_identity(self):
+        target = self.root_path / "data.bin"
+        original_read = os.read
+        reads = 0
+
+        def change_ctime_once(descriptor: int, amount: int) -> bytes:
+            nonlocal reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                reads += 1
+                if reads == 1:
+                    os.chmod(target, 0o600)
+            return chunk
+
+        with secure_fs.open_trusted_root(self.root_path) as root, patch.object(
+            secure_fs.os, "read", side_effect=change_ctime_once
+        ):
+            snapshot = secure_fs.write_exclusive(
+                root, Path("data.bin"), b"owned", "test"
+            )
+
+        self.assertEqual(reads, 3)
+        self.assertEqual(snapshot.identity[-1], target.stat().st_ctime_ns)
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_write_rejects_second_ctime_drift_during_bounded_retry(self):
+        target = self.root_path / "data.bin"
+        original_read = os.read
+        reads = 0
+
+        def change_ctime_twice(descriptor: int, amount: int) -> bytes:
+            nonlocal reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                reads += 1
+                os.chmod(target, 0o600)
+            return chunk
+
+        with secure_fs.open_trusted_root(self.root_path) as root, patch.object(
+            secure_fs.os, "read", side_effect=change_ctime_twice
+        ):
+            with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                secure_fs.write_exclusive(
+                    root, Path("data.bin"), b"owned", "test"
+                )
+
+        self.assertEqual(reads, 2)
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_write_rejects_three_ctimes_observed_in_one_validation(self):
+        target = self.root_path / "data.bin"
+        original_read = os.read
+        original_stat = os.stat
+        nonempty_reads = 0
+        leaf_stats = 0
+
+        def change_ctime_after_read(descriptor: int, amount: int) -> bytes:
+            nonlocal nonempty_reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                nonempty_reads += 1
+                if nonempty_reads == 1:
+                    os.chmod(target, 0o600)
+            return chunk
+
+        def change_ctime_before_named_after(path, *args, **kwargs):
+            nonlocal leaf_stats
+            if path == "data.bin" and kwargs.get("dir_fd") is not None:
+                leaf_stats += 1
+                if leaf_stats == 2:
+                    os.chmod(target, 0o600)
+            return original_stat(path, *args, **kwargs)
+
+        with (
+            secure_fs.open_trusted_root(self.root_path) as root,
+            patch.object(secure_fs.os, "read", side_effect=change_ctime_after_read),
+            patch.object(
+                secure_fs.os, "stat", side_effect=change_ctime_before_named_after
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                secure_fs.write_exclusive(
+                    root, Path("data.bin"), b"owned", "test"
+                )
+
+        self.assertEqual(nonempty_reads, 1)
+        self.assertEqual(leaf_stats, 2)
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_write_rejects_ctime_drift_in_each_validation_pass(self):
+        target = self.root_path / "data.bin"
+        original_read = os.read
+        nonempty_reads = 0
+
+        def change_ctime_in_each_pass(descriptor: int, amount: int) -> bytes:
+            nonlocal nonempty_reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                nonempty_reads += 1
+                if nonempty_reads in {1, 3}:
+                    os.chmod(target, 0o600)
+            return chunk
+
+        with secure_fs.open_trusted_root(self.root_path) as root, patch.object(
+            secure_fs.os, "read", side_effect=change_ctime_in_each_pass
+        ):
+            with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+                secure_fs.write_exclusive(
+                    root, Path("data.bin"), b"owned", "test"
+                )
+
+        self.assertEqual(nonempty_reads, 3)
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_rebind_stabilizes_one_same_mode_ctime_change_during_full_read(self):
+        target = self.root_path / "data.bin"
+        original_read = os.read
+        nonempty_reads = 0
+
+        def change_ctime_on_rebind(descriptor: int, amount: int) -> bytes:
+            nonlocal nonempty_reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                nonempty_reads += 1
+                if nonempty_reads == 3:
+                    os.chmod(target, 0o600)
+            return chunk
+
+        with secure_fs.open_trusted_root(self.root_path) as root, patch.object(
+            secure_fs.os, "read", side_effect=change_ctime_on_rebind
+        ):
+            snapshot = secure_fs.write_exclusive(
+                root, Path("data.bin"), b"owned", "test"
+            )
+            secure_fs.rebind_regular_snapshot(root, snapshot, "test")
+
+        self.assertGreaterEqual(nonempty_reads, 4)
+        self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_rebind_rejects_preexisting_and_in_read_ctime_drifts(self):
+        target = self.root_path / "data.bin"
+        target.write_bytes(b"owned")
+        target.chmod(0o600)
+        original_read = os.read
+        nonempty_reads = 0
+
+        def change_ctime_during_rebind(descriptor: int, amount: int) -> bytes:
+            nonlocal nonempty_reads
+            chunk = original_read(descriptor, amount)
+            if chunk:
+                nonempty_reads += 1
+                if nonempty_reads == 1:
+                    os.chmod(target, 0o600)
+            return chunk
+
+        with secure_fs.open_trusted_root(self.root_path) as root:
+            expected = secure_fs.read_regular_snapshot(
+                root, Path("data.bin"), "test"
+            )
+            os.chmod(target, 0o600)
+            with patch.object(
+                secure_fs.os, "read", side_effect=change_ctime_during_rebind
+            ):
+                with self.assertRaises(ValueError):
+                    secure_fs.rebind_regular_snapshot(root, expected, "test")
+
+        self.assertGreaterEqual(nonempty_reads, 1)
+        self.assertEqual(target.read_bytes(), b"owned")
 
     def test_write_rejects_non_bytes(self):
         with secure_fs.open_trusted_root(self.root_path) as root:
