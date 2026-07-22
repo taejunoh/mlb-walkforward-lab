@@ -19,6 +19,7 @@ from mlb_backtest.v52_evidence import (
 )
 from mlb_backtest.v52_source_contracts import recompute_query_sidecar
 import mlb_backtest.v52_duplicate_gamepk_disposition as disposition_module
+import mlb_backtest.v52_evidence as evidence_module
 from mlb_backtest.v52_duplicate_gamepk_disposition import (
     DISPOSITION_ENDPOINT,
     EXPECTED_OCCURRENCE_COUNTS,
@@ -384,6 +385,70 @@ class V52ScheduleSourceTest(unittest.TestCase):
             self.assertEqual(list((folder / "attempts").iterdir()), [])
             self.assertEqual(list((folder / "objects").iterdir()), [])
             self.assertEqual(list((folder / "sidecars").iterdir()), [])
+
+    def test_schedule_sidecar_cleanup_never_deletes_competing_exact_writer(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(Path(td).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            original_write_once = evidence_module._write_once_at
+            competing_sidecar: tuple[str, bytes] | None = None
+            competing_create_result: bool | None = None
+            raced_writer_result: bool | None = None
+
+            def competing_writer(
+                parent_fd: int, name: str, contents: bytes, label: str
+            ) -> bool:
+                nonlocal competing_create_result, competing_sidecar, raced_writer_result
+                if label == "derived disposition sidecar":
+                    self.assertIsNone(competing_sidecar)
+                    competing_create_result = original_write_once(
+                        parent_fd, name, contents, label
+                    )
+                    self.assertTrue(competing_create_result)
+                    competing_sidecar = (name, contents)
+                    raced_writer_result = original_write_once(
+                        parent_fd, name, contents, label
+                    )
+                    return raced_writer_result
+                return original_write_once(parent_fd, name, contents, label)
+
+            with (
+                patch.object(
+                    disposition_module.DuplicateGamePkDispositionAuthority,
+                    "reauthenticate",
+                    side_effect=[
+                        isolated,
+                        isolated,
+                        isolated,
+                        isolated,
+                        ValueError("authority changed"),
+                    ],
+                ),
+                patch.object(
+                    evidence_module,
+                    "_write_once_at",
+                    side_effect=competing_writer,
+                ),
+                self.assertRaisesRegex(ValueError, "authority changed"),
+            ):
+                publish_duplicate_gamepk_disposition(store, isolated)
+            self.assertIsNotNone(competing_sidecar)
+            self.assertTrue(competing_create_result)
+            self.assertFalse(raced_writer_result)
+            folder = (
+                store.root
+                / "queries"
+                / isolated.query.source
+                / logical_query_id(isolated.query)
+            )
+            self.assertFalse((folder / "success.json").exists())
+            name, contents = competing_sidecar
+            self.assertEqual((folder / "sidecars" / name).read_bytes(), contents)
 
     def test_schedule_authority_admission_precedes_recovery_and_cleanup(self) -> None:
         authority = build_duplicate_disposition_authority(

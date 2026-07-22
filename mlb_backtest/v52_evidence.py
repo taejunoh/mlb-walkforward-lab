@@ -761,12 +761,12 @@ def _write_once_at(
     name: str,
     contents: bytes,
     label: str,
-) -> None:
+) -> bool:
     existing = _read_regular_at(parent_fd, name, label, missing_ok=True)
     if existing is not None:
         if existing != contents:
             raise RuntimeError(f"immutable {label} differs")
-        return
+        return False
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -807,6 +807,7 @@ def _write_once_at(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    return created
 
 
 def _validate_owned_content_link_at(
@@ -5128,22 +5129,13 @@ class V52EvidenceStore:
                         "derived disposition cannot own attempts or reservations"
                     )
                 self._ensure_empty_inventory(objects_fd, "query object")
-                sidecar_existed_before_publication = (
-                    _read_regular_snapshot_at(
-                        sidecars_fd,
-                        sidecar_name,
-                        "derived disposition sidecar",
-                        missing_ok=True,
-                    )
-                    is not None
-                )
                 self._ensure_content_slot(
                     sidecars_fd,
                     sidecar_name,
                     sidecar_contents,
                     "query sidecar",
                 )
-                _write_once_at(
+                sidecar_created_by_this_call = _write_once_at(
                     sidecars_fd,
                     sidecar_name,
                     sidecar_contents,
@@ -5249,7 +5241,7 @@ class V52EvidenceStore:
                             and (
                                 (
                                     is_schedule_disposition
-                                    and not sidecar_existed_before_publication
+                                    and sidecar_created_by_this_call
                                 )
                                 or (
                                     not is_schedule_disposition
