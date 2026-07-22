@@ -884,7 +884,8 @@ class LiveTop3ServiceTests(unittest.TestCase):
             [row["game_pk"] for row in result["preliminary_top3"]], [1]
         )
         self.assertEqual(
-            result["unscored_games"][0]["reason_codes"], ["STARTER_CONFLICT"]
+            result["unscored_games"][0]["reason_codes"],
+            ["STARTER_CONFLICT"],
         )
         self.assertEqual(scorer.call_count, 1)
 
@@ -912,7 +913,40 @@ class LiveTop3ServiceTests(unittest.TestCase):
             [row["game_pk"] for row in result["preliminary_top3"]], [901]
         )
         self.assertEqual(
-            result["unscored_games"][0]["reason_codes"], ["STARTER_CONFLICT"]
+            result["unscored_games"][0]["reason_codes"],
+            ["PROBABLE_PITCHER_CHANGED"],
+        )
+        self.assertEqual(scorer.call_count, 1)
+
+    def test_real_builder_unscored_on_probable_pitcher_name_change_before_scoring(self):
+        games = (
+            _game(901, start="2025-05-01T19:00:00Z"),
+            _game(902, start="2025-05-01T20:00:00Z"),
+        )
+        by_pk = {int(game["game_pk"]): game for game in games}
+
+        def observe(game_pk, _target_date):
+            changes = (
+                {"away_probable_pitcher_name": "Replacement Pitcher"}
+                if game_pk == 902
+                else {}
+            )
+            return _final(by_pk[game_pk], game_pk, **changes)
+
+        scorer = mock.Mock(side_effect=_scorer({901: 1.0, 902: 2.0}))
+        result = _build(
+            _slate(games),
+            observe,
+            feature_builder=real_build_live_raw_game_features,
+            scorer=scorer,
+        )
+
+        self.assertEqual(
+            [row["game_pk"] for row in result["preliminary_top3"]], [901]
+        )
+        self.assertEqual(
+            result["unscored_games"][0]["reason_codes"],
+            ["PROBABLE_PITCHER_CHANGED"],
         )
         self.assertEqual(scorer.call_count, 1)
 

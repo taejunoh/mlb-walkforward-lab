@@ -323,6 +323,16 @@ def _final_mismatch_reasons(
         reasons.add("SCHEDULED_START_CHANGED")
     if projected.get("status") not in ACCEPTED_PREGAME_STATUSES:
         reasons.add("PREGAME_STATUS_NOT_ACCEPTED")
+    if any(
+        saved.get(field) != projected.get(field)
+        for field in (
+            "away_probable_pitcher_id",
+            "away_probable_pitcher_name",
+            "home_probable_pitcher_id",
+            "home_probable_pitcher_name",
+        )
+    ):
+        reasons.add("PROBABLE_PITCHER_CHANGED")
     return reasons
 
 
@@ -634,15 +644,26 @@ def build_live_top3_run(
     ) in observed_games:
         game_pk = int(game["game_pk"])
         if exclusion_reasons:
-            excluded.append(
-                _unranked_row(
-                    game,
-                    slate.target_date,
-                    "EXCLUDED",
-                    exclusion_reasons,
-                    relevant,
+            if exclusion_reasons == {"PROBABLE_PITCHER_CHANGED"}:
+                unscored.append(
+                    _unranked_row(
+                        game,
+                        slate.target_date,
+                        "UNSCORED",
+                        exclusion_reasons,
+                        relevant,
+                    )
                 )
-            )
+            else:
+                excluded.append(
+                    _unranked_row(
+                        game,
+                        slate.target_date,
+                        "EXCLUDED",
+                        exclusion_reasons,
+                        relevant,
+                    )
+                )
             continue
 
         if not isinstance(participant, PregameParticipants):

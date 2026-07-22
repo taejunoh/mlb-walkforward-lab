@@ -2,6 +2,7 @@ import hashlib
 import json
 import multiprocessing
 import queue
+import stat
 import tempfile
 import threading
 import time
@@ -12,7 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from mlb_backtest import live_sources, secure_fs
+from mlb_backtest import live_history, live_sources, secure_fs
+from mlb_backtest.secure_fs import open_trusted_root
 from mlb_backtest.live_sources import (
     ACCEPTED_PREGAME_STATUSES,
     FinalGameScheduleDisposition,
@@ -26,7 +28,6 @@ from mlb_backtest.live_sources import (
     parse_pregame_boxscore,
 )
 from mlb_backtest.live_top3_contracts import FinalGameObservation, SourceBinding
-from mlb_backtest.manifest import RawStore
 from mlb_backtest.sources import schedule_url
 
 
@@ -115,7 +116,6 @@ def _persist_direct(
     }
     return live_sources._persist_observation(
         Path(root),
-        RawStore(Path(root) / "data/experimental_daily/live_observations"),
         raw_source="mlb_live_schedule",
         source="stats_api",
         binding_role="LIVE_SCHEDULE",
@@ -139,7 +139,6 @@ def _persist_final_direct(root, *, observation_id="schedule-direct"):
     }
     return live_sources._persist_observation(
         Path(root),
-        RawStore(Path(root) / "data/experimental_daily/live_observations"),
         raw_source="mlb_live_final_schedule",
         source="stats_api",
         binding_role="FINAL_SCHEDULE",
@@ -457,6 +456,307 @@ class LiveSourceTests(unittest.TestCase):
             self.assertEqual(stable.game_pk, 777001)
             self.assertEqual(stable.source_binding.binding_role, "FINAL_SCHEDULE")
 
+    def test_final_schedule_refetch_fails_closed_on_probable_pitcher_name_revision(self):
+        saved = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        revised_body = SCHEDULE_COMPLETE.read_bytes().replace(
+            b"Away Pitcher", b"Replacement Pitcher"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = observe_final_game_schedule(
+                Path(temporary),
+                "2026-07-21",
+                saved,
+                fetcher=lambda _source, url, *, max_bytes: _http(url, revised_body),
+                observation_id_factory=lambda: "final-probable-name-revised",
+                durable_clock=lambda: datetime(
+                    2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc
+                ),
+            )
+        self.assertIsInstance(result, FinalGameScheduleDisposition)
+        self.assertEqual(result.reason_codes, ("PROBABLE_PITCHER_CHANGED",))
+
+    def test_expected_root_binding_rejects_replaced_root_before_fetch(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            with open_trusted_root(root) as trusted:
+                expected = trusted.binding
+            root.rename(base / "moved-root")
+            replacement.rename(root)
+
+            with self.assertRaisesRegex(ValueError, "binding"):
+                observe_live_slate(
+                    root,
+                    "2026-07-21",
+                    expected_root_binding=expected,
+                    fetcher=lambda *_args, **_kwargs: self.fail(
+                        "replaced root must fail before fetch"
+                    ),
+                )
+            self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_live_observers_reject_root_swap_during_fetch_before_outside_write(self):
+        saved = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        for observer_name in ("slate", "final"):
+            with self.subTest(observer=observer_name), tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                moved = base / "moved-root"
+                outside = base / "outside"
+                root.mkdir()
+                outside.mkdir()
+                with open_trusted_root(root) as trusted:
+                    expected = trusted.binding
+                swapped = False
+
+                def fetcher(_source, url, *, max_bytes):
+                    nonlocal swapped
+                    if not swapped:
+                        swapped = True
+                        root.rename(moved)
+                        root.symlink_to(outside, target_is_directory=True)
+                    return _http(url, SCHEDULE_COMPLETE.read_bytes())
+
+                with self.assertRaises(ValueError):
+                    if observer_name == "slate":
+                        observe_live_slate(
+                            root,
+                            "2026-07-21",
+                            expected_root_binding=expected,
+                            fetcher=fetcher,
+                        )
+                    else:
+                        observe_final_game_schedule(
+                            root,
+                            "2026-07-21",
+                            saved,
+                            expected_root_binding=expected,
+                            fetcher=fetcher,
+                        )
+                self.assertTrue(swapped)
+                self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_live_observers_reject_root_swap_during_root_open_before_fetch(self):
+        saved = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        for observer_name in ("slate", "final"):
+            with self.subTest(observer=observer_name), tempfile.TemporaryDirectory(
+                dir=Path.cwd()
+            ) as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                moved = base / "moved-root"
+                outside = base / "outside"
+                root.mkdir()
+                outside.mkdir()
+                swapped = False
+
+                def swap(stage, observed_root):
+                    nonlocal swapped
+                    if stage == "after_existing_root_lstat" and not swapped:
+                        swapped = True
+                        observed_root.rename(moved)
+                        observed_root.symlink_to(outside, target_is_directory=True)
+
+                with patch.object(
+                    live_sources, "_live_root_test_hook", side_effect=swap
+                ):
+                    with self.assertRaises(ValueError):
+                        if observer_name == "slate":
+                            observe_live_slate(
+                                root,
+                                "2026-07-21",
+                                fetcher=lambda *_args, **_kwargs: self.fail(
+                                    "swapped root must fail before fetch"
+                                ),
+                            )
+                        else:
+                            observe_final_game_schedule(
+                                root,
+                                "2026-07-21",
+                                saved,
+                                fetcher=lambda *_args, **_kwargs: self.fail(
+                                    "swapped root must fail before fetch"
+                                ),
+                            )
+                self.assertTrue(swapped)
+                self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_final_observer_rejects_root_swap_during_final_parse(self):
+        saved = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        original_parse = live_sources.parse_live_schedule
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            swapped = False
+
+            def swap_then_parse(raw, *, requested_date):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    root.rename(moved)
+                    root.symlink_to(outside, target_is_directory=True)
+                return original_parse(raw, requested_date=requested_date)
+
+            with patch.object(
+                live_sources, "parse_live_schedule", side_effect=swap_then_parse
+            ):
+                with self.assertRaises(ValueError):
+                    observe_final_game_schedule(
+                        root,
+                        "2026-07-21",
+                        saved,
+                        fetcher=lambda _source, url, *, max_bytes: _http(
+                            url, SCHEDULE_COMPLETE.read_bytes()
+                        ),
+                        observation_id_factory=lambda: "final-parse-root-swap",
+                        durable_clock=lambda: datetime(
+                            2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc
+                        ),
+                    )
+            self.assertTrue(swapped)
+            self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_root_revalidation_preserves_original_parse_exception(self):
+        saved = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+
+            def swap_then_fail(*_args, **_kwargs):
+                root.rename(moved)
+                root.symlink_to(outside, target_is_directory=True)
+                raise RuntimeError("final parse sentinel")
+
+            with patch.object(
+                live_sources, "parse_live_schedule", side_effect=swap_then_fail
+            ):
+                with self.assertRaisesRegex(RuntimeError, "final parse sentinel"):
+                    observe_final_game_schedule(
+                        root,
+                        "2026-07-21",
+                        saved,
+                        fetcher=lambda _source, url, *, max_bytes: _http(
+                            url, SCHEDULE_COMPLETE.read_bytes()
+                        ),
+                        observation_id_factory=lambda: "final-parse-error-swap",
+                        durable_clock=lambda: datetime(
+                            2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc
+                        ),
+                    )
+            self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_slate_observer_revalidates_root_after_result_construction(self):
+        original_slate = live_sources.LiveSlateObservation
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            swapped = False
+
+            def swap_then_construct(*args, **kwargs):
+                nonlocal swapped
+                swapped = True
+                root.rename(moved)
+                root.symlink_to(outside, target_is_directory=True)
+                return original_slate(*args, **kwargs)
+
+            with patch.object(
+                live_sources,
+                "LiveSlateObservation",
+                side_effect=swap_then_construct,
+            ):
+                with self.assertRaises(ValueError):
+                    observe_live_slate(
+                        root,
+                        "2026-07-21",
+                        fetcher=lambda _source, url, *, max_bytes: _http(
+                            url,
+                            BOX_COMPLETE.read_bytes()
+                            if "/boxscore" in url
+                            else SCHEDULE_COMPLETE.read_bytes(),
+                        ),
+                        observation_id_factory=iter(
+                            ("slate-return-swap", "box-return-swap")
+                        ).__next__,
+                        durable_clock=lambda: datetime(
+                            2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc
+                        ),
+                    )
+            self.assertTrue(swapped)
+            self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_normalize_live_root_path_maps_only_top_level_platform_symlink(self):
+        symlink_stat = type("Stat", (), {"st_mode": stat.S_IFLNK})()
+        directory_stat = type("Stat", (), {"st_mode": stat.S_IFDIR})()
+
+        def fake_lstat(path):
+            return symlink_stat if Path(path) == Path("/var") else directory_stat
+
+        with (
+            patch.object(live_sources.os, "lstat", side_effect=fake_lstat),
+            patch.object(live_sources.os, "readlink", return_value="/private/var"),
+        ):
+            normalized = live_sources.normalize_live_root_path(
+                Path("/var/folders/live-root")
+            )
+        self.assertEqual(normalized, Path("/private/var/folders/live-root"))
+
+    def test_normalize_live_root_path_rejects_arbitrary_top_level_symlink(self):
+        symlink_stat = type("Stat", (), {"st_mode": stat.S_IFLNK})()
+        directory_stat = type("Stat", (), {"st_mode": stat.S_IFDIR})()
+
+        def fake_lstat(path):
+            return symlink_stat if Path(path) == Path("/redirect") else directory_stat
+
+        with (
+            patch.object(live_sources.os, "lstat", side_effect=fake_lstat),
+            patch.object(live_sources.os, "readlink", return_value="/srv/data"),
+        ):
+            with self.assertRaisesRegex(ValueError, "ancestry"):
+                live_sources.normalize_live_root_path(
+                    Path("/redirect/folders/live-root")
+                )
+
+    def test_normalize_live_root_path_leaves_nested_symlink_for_strict_rejection(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            outside = base / "outside"
+            outside.mkdir()
+            nested = base / "nested"
+            nested.symlink_to(outside, target_is_directory=True)
+            requested = nested / "live-root"
+
+            normalized = live_sources.normalize_live_root_path(requested)
+
+            self.assertEqual(normalized, requested.absolute())
+            with self.assertRaises(ValueError):
+                open_trusted_root(normalized)
+
     def test_invalid_final_schedule_is_preserved_and_returns_explicit_disposition(self):
         saved = parse_live_schedule(
             SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
@@ -575,7 +875,7 @@ class LiveSourceTests(unittest.TestCase):
                 )
             )
             with patch.object(
-                RawStore,
+                live_history._CapabilityRawStore,
                 "put_unique_query",
                 side_effect=AssertionError("conflict reached RawStore"),
             ):
@@ -597,7 +897,7 @@ class LiveSourceTests(unittest.TestCase):
             )
 
     def test_global_claim_precedes_raw_publication_and_rejects_cross_role_id(self):
-        original_put = RawStore.put_unique_query
+        original_put = live_history._CapabilityRawStore.put_unique_query
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
 
@@ -609,11 +909,15 @@ class LiveSourceTests(unittest.TestCase):
                 self.assertTrue(claim.is_file())
                 return original_put(store, source, query, payload)
 
-            with patch.object(RawStore, "put_unique_query", new=assert_claim_first):
+            with patch.object(
+                live_history._CapabilityRawStore,
+                "put_unique_query",
+                new=assert_claim_first,
+            ):
                 _persist_direct(temporary, observation_id="shared-id")
 
             with patch.object(
-                RawStore,
+                live_history._CapabilityRawStore,
                 "put_unique_query",
                 side_effect=AssertionError("cross-role conflict reached RawStore"),
             ):
@@ -652,7 +956,7 @@ class LiveSourceTests(unittest.TestCase):
             )
 
     def test_concurrent_same_id_calls_are_globally_serialized(self):
-        original_put = RawStore.put_unique_query
+        original_put = live_history._CapabilityRawStore.put_unique_query
         active = 0
         maximum_active = 0
         state_lock = threading.Lock()
@@ -670,7 +974,11 @@ class LiveSourceTests(unittest.TestCase):
                     active -= 1
 
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(RawStore, "put_unique_query", new=tracked_put):
+            with patch.object(
+                live_history._CapabilityRawStore,
+                "put_unique_query",
+                new=tracked_put,
+            ):
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     results = tuple(
                         executor.map(
@@ -842,7 +1150,7 @@ class LiveSourceTests(unittest.TestCase):
                 {"retrieved_at_utc": "2020-01-01T00:00:00+00:00"}
             ),
         }
-        original_put = RawStore.put_unique_query
+        original_put = live_history._CapabilityRawStore.put_unique_query
         for label, mutate in mutations.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
 
@@ -860,7 +1168,11 @@ class LiveSourceTests(unittest.TestCase):
                     return artifact
 
                 before = _fd_count()
-                with patch.object(RawStore, "put_unique_query", new=corrupt):
+                with patch.object(
+                    live_history._CapabilityRawStore,
+                    "put_unique_query",
+                    new=corrupt,
+                ):
                     with self.assertRaises((ValueError, RuntimeError)):
                         _persist_direct(temporary, observation_id=f"manifest-{label}")
                 self.assertEqual(_fd_count(), before)
@@ -876,7 +1188,11 @@ class LiveSourceTests(unittest.TestCase):
                 ).write_bytes(f"{hashlib.sha256(content).hexdigest()}\n".encode())
                 return artifact
 
-            with patch.object(RawStore, "put_unique_query", new=noncanonical):
+            with patch.object(
+                live_history._CapabilityRawStore,
+                "put_unique_query",
+                new=noncanonical,
+            ):
                 with self.assertRaisesRegex((ValueError, RuntimeError), "manifest"):
                     _persist_direct(temporary, observation_id="manifest-noncanonical")
 
@@ -889,7 +1205,11 @@ class LiveSourceTests(unittest.TestCase):
                 ).write_bytes(b"0" * 64 + b"\n")
                 return artifact
 
-            with patch.object(RawStore, "put_unique_query", new=bad_seal):
+            with patch.object(
+                live_history._CapabilityRawStore,
+                "put_unique_query",
+                new=bad_seal,
+            ):
                 with self.assertRaisesRegex((ValueError, RuntimeError), "seal"):
                     _persist_direct(temporary, observation_id="manifest-seal")
 
@@ -904,7 +1224,11 @@ class LiveSourceTests(unittest.TestCase):
                     ),
                 )
 
-            with patch.object(RawStore, "put_unique_query", new=bad_name):
+            with patch.object(
+                live_history._CapabilityRawStore,
+                "put_unique_query",
+                new=bad_name,
+            ):
                 with self.assertRaisesRegex(ValueError, "manifest path"):
                     _persist_direct(temporary, observation_id="manifest-name")
 

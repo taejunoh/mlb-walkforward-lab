@@ -28,10 +28,10 @@ from .live_top3_contracts import (
     canonical_json_bytes,
     validate_target_date,
 )
-from .manifest import RawStore
 from .models import RawArtifact
 from .secure_fs import (
     RegularFileSnapshot,
+    RootBinding,
     TrustedRoot,
     open_trusted_root,
     open_parent,
@@ -50,6 +50,7 @@ MAX_JSON_BYTES = 64 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_PITCHER_LIST = 30
 _LOCK_OPEN_ATTEMPTS = 16
+_LAYOUT_OPEN_ATTEMPTS = 16
 _OBSERVATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CANONICAL_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _RAW_MANIFEST_KEYS = frozenset(
@@ -64,6 +65,11 @@ _RAW_MANIFEST_KEYS = frozenset(
 )
 _CLAIM_THREAD_LOCKS_GUARD = threading.Lock()
 _CLAIM_THREAD_LOCKS: dict[tuple[str, str], tuple[threading.Lock, int]] = {}
+_LIVE_LAYOUT_DIRECTORIES = (
+    Path("data/experimental_daily/live_observations"),
+    Path("audit/experimental_daily/live_observation_claims"),
+    Path("audit/experimental_daily/live_receipts"),
+)
 
 ALLOWED_FINAL_HOSTS = MappingProxyType(
     {
@@ -92,6 +98,110 @@ _LIVE_SCHEDULE_FIELDS = (
     "away_lineup",
     "home_lineup",
 )
+
+
+def _live_root_test_hook(stage: str, root: Path) -> None:
+    """No-op seam for deterministic root-swap tests."""
+
+
+def normalize_live_root_path(root: Path) -> Path:
+    """Normalize only a platform-provided top-level symlink such as ``/var``."""
+    lexical = Path(os.path.abspath(root))
+    if len(lexical.parts) <= 1:
+        return lexical
+    top = Path(lexical.anchor) / lexical.parts[1]
+    top_stat = os.lstat(top)
+    if not stat.S_ISLNK(top_stat.st_mode):
+        return lexical
+    if top != Path("/var"):
+        raise ValueError("live root ancestry must contain only directories")
+    target = Path(os.readlink(top))
+    resolved_top = target if target.is_absolute() else top.parent / target
+    if resolved_top != Path("/private/var"):
+        raise ValueError("live root ancestry must contain only directories")
+    resolved_stat = os.lstat(resolved_top)
+    if not stat.S_ISDIR(resolved_stat.st_mode) or stat.S_ISLNK(resolved_stat.st_mode):
+        raise ValueError("live root ancestry must contain only directories")
+    return resolved_top.joinpath(*lexical.parts[2:])
+
+
+def _prepare_live_layout_trusted(trusted: TrustedRoot) -> None:
+    """Create the fixed live directories exclusively below a held root fd."""
+    try:
+        for directory in _LIVE_LAYOUT_DIRECTORIES:
+            for _attempt in range(_LAYOUT_OPEN_ATTEMPTS):
+                try:
+                    with open_parent(
+                        trusted, directory / ".live-layout-anchor", create=True
+                    ) as descriptor:
+                        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                            raise ValueError(
+                                "live layout component must be a directory"
+                            )
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise ValueError("live layout could not be prepared")
+            trusted.assert_bound()
+    except OSError as exc:
+        raise ValueError("live layout contains an unsafe component") from exc
+
+
+@contextmanager
+def _live_root_session(root: Path, expected_root_binding: RootBinding | None):
+    """Hold one verified root capability for a complete live observation call."""
+    lexical = normalize_live_root_path(Path(root))
+    if expected_root_binding is None:
+        missing: list[str] = []
+        cursor = lexical
+        while True:
+            try:
+                current = os.lstat(cursor)
+            except FileNotFoundError:
+                if cursor == cursor.parent:
+                    raise ValueError("live root has no trusted ancestor") from None
+                missing.append(cursor.name)
+                cursor = cursor.parent
+                continue
+            if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+                raise ValueError("live root ancestry must contain only directories")
+            break
+        _live_root_test_hook("after_existing_root_lstat", lexical)
+        with open_trusted_root(cursor) as trusted:
+            if missing:
+                with open_parent(
+                    trusted,
+                    Path(*reversed(missing)) / ".live-root-anchor",
+                    create=True,
+                ):
+                    pass
+            trusted.assert_bound()
+    with open_trusted_root(
+        lexical, expected=expected_root_binding
+    ) as trusted:
+        _prepare_live_layout_trusted(trusted)
+        try:
+            yield trusted
+        except BaseException:
+            try:
+                trusted.assert_bound()
+            except BaseException:
+                pass
+            raise
+        else:
+            trusted.assert_bound()
+
+
+def _capability_raw_store(root: Path, trusted: TrustedRoot) -> object:
+    """Reuse the fd-only immutable store with the live-observation namespace."""
+    # Import lazily: live_history imports this module for fetch primitives.
+    from .live_history import _CapabilityRawStore
+
+    store = _CapabilityRawStore(root, trusted)
+    store._relative_root = Path("data/experimental_daily/live_observations")
+    store.root = root / store._relative_root
+    return store
 
 
 class ObservationFetcher(Protocol):
@@ -844,8 +954,8 @@ def _acquire_observation_claim(
 
 def _persist_observation(
     root: Path,
-    raw_store: RawStore,
     *,
+    trusted: TrustedRoot | None = None,
     raw_source: str,
     source: Literal["stats_api", "savant"],
     binding_role: str,
@@ -855,18 +965,29 @@ def _persist_observation(
     http: LiveHttpObservation,
     durable_clock: Callable[[], datetime],
 ) -> PersistedObservation:
+    if trusted is None:
+        with _live_root_session(root, None) as held_root:
+            return _persist_observation(
+                held_root.path,
+                trusted=held_root,
+                raw_source=raw_source,
+                source=source,
+                binding_role=binding_role,
+                game_pks=game_pks,
+                observation_id=observation_id,
+                query=query,
+                http=http,
+                durable_clock=durable_clock,
+            )
     observation_id = _validate_observation_id(observation_id)
-    root = Path(root).resolve(strict=True)
+    trusted.assert_bound()
+    root = trusted.path
     normalized_query = _normalize_query(query)
     if (
         normalized_query.get("observation_id") != observation_id
         or normalized_query.get("url") != http.requested_url
     ):
         raise ValueError("raw observation query identity differs")
-    expected_raw_root = root / "data/experimental_daily/live_observations"
-    if Path(raw_store.root).resolve(strict=False) != expected_raw_root:
-        raise ValueError("raw observation store root differs")
-    raw_store.root = expected_raw_root
     receipt_relative = (
         Path("audit/experimental_daily/live_receipts") / f"{observation_id}.json"
     )
@@ -881,20 +1002,15 @@ def _persist_observation(
         query_identity_json=query_identity_json,
         http=http,
     )
-    claim_directory = root / "audit/experimental_daily/live_observation_claims"
-    claim_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if claim_directory.is_symlink() or not claim_directory.is_dir():
-        raise ValueError("unsafe live observation claim directory")
-
-    with open_trusted_root(root) as trusted:
-        with _observation_claim_lock(trusted, observation_id):
+    raw_store = _capability_raw_store(root, trusted)
+    with _observation_claim_lock(trusted, observation_id):
             claim_relative, claim_snapshot = _acquire_observation_claim(
                 trusted,
                 observation_id=observation_id,
                 claim_bytes=claim_bytes,
             )
             claim_sha256 = hashlib.sha256(claim_snapshot.contents).hexdigest()
-            artifact = raw_store.put_unique_query(
+            artifact = raw_store.put_unique_query(  # type: ignore[attr-defined]
                 raw_source, normalized_query, http.body
             )
             payload_relative, manifest_relative, seal_relative = (
@@ -1069,86 +1185,84 @@ def observe_live_slate(
     fetcher: ObservationFetcher = fetch_live_http,
     observation_id_factory: Callable[[], str] = new_observation_id,
     durable_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    expected_root_binding: RootBinding | None = None,
 ) -> LiveSlateObservation:
     target_date = validate_target_date(target_date)
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    root = root.resolve(strict=True)
-    raw_store = RawStore(root / "data/experimental_daily/live_observations")
-    request = schedule_url(target_date, target_date)
-    http = _validate_http_observation(
-        fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
-        source="stats_api",
-        requested_url=request,
-    )
-    schedule_id = _validate_observation_id(observation_id_factory())
-    schedule_query = {
-        "observation_id": schedule_id,
-        "target_date": target_date,
-        "url": request,
-    }
-    schedule_persisted = _persist_observation(
-        root,
-        raw_store,
-        raw_source="mlb_live_schedule",
-        source="stats_api",
-        binding_role="LIVE_SCHEDULE",
-        game_pks=(),
-        observation_id=schedule_id,
-        query=schedule_query,
-        http=http,
-        durable_clock=durable_clock,
-    )
-    games = parse_live_schedule(
-        schedule_persisted.payload_bytes, requested_date=target_date
-    )
-    schedule_persisted = _rescope_persisted_observation(
-        schedule_persisted,
-        tuple(sorted(int(game["game_pk"]) for game in games)),
-    )
-    schedule_binding = schedule_persisted.source_binding
-    for game in games:
-        if game["status"] in ACCEPTED_PREGAME_STATUSES:
-            _require_pregame_boundary(schedule_binding, game)
-    bindings = [schedule_binding]
-    participants: dict[int, PregameParticipants] = {}
-    for game in games:
-        if game["status"] not in ACCEPTED_PREGAME_STATUSES:
-            continue
-        game_pk = int(game["game_pk"])
-        request = boxscore_url(game_pk)
+    with _live_root_session(root, expected_root_binding) as trusted:
+        request = schedule_url(target_date, target_date)
         http = _validate_http_observation(
             fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
             source="stats_api",
             requested_url=request,
         )
-        observation_id = _validate_observation_id(observation_id_factory())
-        query = {
-            "game_pk": game_pk,
-            "observation_id": observation_id,
+        schedule_id = _validate_observation_id(observation_id_factory())
+        schedule_query = {
+            "observation_id": schedule_id,
             "target_date": target_date,
             "url": request,
         }
-        persisted = _persist_observation(
-            root,
-            raw_store,
-            raw_source="mlb_live_boxscore",
+        schedule_persisted = _persist_observation(
+            trusted.path,
+            trusted=trusted,
+            raw_source="mlb_live_schedule",
             source="stats_api",
-            binding_role="LIVE_PARTICIPANTS",
-            game_pks=(game_pk,),
-            observation_id=observation_id,
-            query=query,
+            binding_role="LIVE_SCHEDULE",
+            game_pks=(),
+            observation_id=schedule_id,
+            query=schedule_query,
             http=http,
             durable_clock=durable_clock,
         )
-        _require_pregame_boundary(persisted.source_binding, game)
-        parsed = compare_probable_pitchers(
-            game,
-            parse_pregame_boxscore(persisted.payload_bytes, game_pk=game_pk),
+        games = parse_live_schedule(
+            schedule_persisted.payload_bytes, requested_date=target_date
         )
-        participants[game_pk] = parsed
-        bindings.append(persisted.source_binding)
-    return LiveSlateObservation(target_date, games, participants, tuple(bindings))
+        schedule_persisted = _rescope_persisted_observation(
+            schedule_persisted,
+            tuple(sorted(int(game["game_pk"]) for game in games)),
+        )
+        schedule_binding = schedule_persisted.source_binding
+        for game in games:
+            if game["status"] in ACCEPTED_PREGAME_STATUSES:
+                _require_pregame_boundary(schedule_binding, game)
+        bindings = [schedule_binding]
+        participants: dict[int, PregameParticipants] = {}
+        for game in games:
+            if game["status"] not in ACCEPTED_PREGAME_STATUSES:
+                continue
+            game_pk = int(game["game_pk"])
+            request = boxscore_url(game_pk)
+            http = _validate_http_observation(
+                fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
+                source="stats_api",
+                requested_url=request,
+            )
+            observation_id = _validate_observation_id(observation_id_factory())
+            query = {
+                "game_pk": game_pk,
+                "observation_id": observation_id,
+                "target_date": target_date,
+                "url": request,
+            }
+            persisted = _persist_observation(
+                trusted.path,
+                trusted=trusted,
+                raw_source="mlb_live_boxscore",
+                source="stats_api",
+                binding_role="LIVE_PARTICIPANTS",
+                game_pks=(game_pk,),
+                observation_id=observation_id,
+                query=query,
+                http=http,
+                durable_clock=durable_clock,
+            )
+            _require_pregame_boundary(persisted.source_binding, game)
+            parsed = compare_probable_pitchers(
+                game,
+                parse_pregame_boxscore(persisted.payload_bytes, game_pk=game_pk),
+            )
+            participants[game_pk] = parsed
+            bindings.append(persisted.source_binding)
+        return LiveSlateObservation(target_date, games, participants, tuple(bindings))
 
 
 def _final_mismatch_reasons(
@@ -1176,6 +1290,16 @@ def _final_mismatch_reasons(
         reasons.append("PREGAME_STATUS_NOT_ACCEPTED")
     if saved.get("scheduled_start_utc") != current.get("scheduled_start_utc"):
         reasons.append("SCHEDULED_START_CHANGED")
+    if any(
+        saved.get(field) != current.get(field)
+        for field in (
+            "away_probable_pitcher_id",
+            "away_probable_pitcher_name",
+            "home_probable_pitcher_id",
+            "home_probable_pitcher_name",
+        )
+    ):
+        reasons.append("PROBABLE_PITCHER_CHANGED")
     return tuple(reasons)
 
 
@@ -1209,74 +1333,78 @@ def observe_final_game_schedule(
     fetcher: ObservationFetcher = fetch_live_http,
     observation_id_factory: Callable[[], str] = new_observation_id,
     durable_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    expected_root_binding: RootBinding | None = None,
 ) -> FinalGameObservation | FinalGameScheduleDisposition:
     target_date = validate_target_date(target_date)
     game_pk = _positive_int(saved_game.get("game_pk"), "game_pk")
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    root = root.resolve(strict=True)
-    request = schedule_url(target_date, target_date)
-    http = _validate_http_observation(
-        fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
-        source="stats_api",
-        requested_url=request,
-    )
-    observation_id = _validate_observation_id(observation_id_factory())
-    query = {
-        "game_pk": game_pk,
-        "observation_id": observation_id,
-        "target_date": target_date,
-        "url": request,
-    }
-    raw_store = RawStore(root / "data/experimental_daily/live_observations")
-    persisted = _persist_observation(
-        root,
-        raw_store,
-        raw_source="mlb_live_final_schedule",
-        source="stats_api",
-        binding_role="FINAL_SCHEDULE",
-        game_pks=(game_pk,),
-        observation_id=observation_id,
-        query=query,
-        http=http,
-        durable_clock=durable_clock,
-    )
-    binding = persisted.source_binding
-    try:
-        games = parse_live_schedule(persisted.payload_bytes, requested_date=target_date)
-    except ValueError:
-        return FinalGameScheduleDisposition(
-            game_pk,
-            target_date,
-            "UNSCORED",
-            _invalid_final_schedule_reasons(
-                persisted.payload_bytes,
-                game_pk=game_pk,
-                target_date=target_date,
-            ),
-            binding,
+    with _live_root_session(root, expected_root_binding) as trusted:
+        request = schedule_url(target_date, target_date)
+        http = _validate_http_observation(
+            fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
+            source="stats_api",
+            requested_url=request,
         )
-    current = next((game for game in games if game["game_pk"] == game_pk), None)
-    if current is None:
-        return FinalGameScheduleDisposition(
-            game_pk, target_date, "UNSCORED", ("GAME_MISSING_AT_FINAL_CHECK",), binding
+        observation_id = _validate_observation_id(observation_id_factory())
+        query = {
+            "game_pk": game_pk,
+            "observation_id": observation_id,
+            "target_date": target_date,
+            "url": request,
+        }
+        persisted = _persist_observation(
+            trusted.path,
+            trusted=trusted,
+            raw_source="mlb_live_final_schedule",
+            source="stats_api",
+            binding_role="FINAL_SCHEDULE",
+            game_pks=(game_pk,),
+            observation_id=observation_id,
+            query=query,
+            http=http,
+            durable_clock=durable_clock,
         )
-    try:
-        _require_pregame_boundary(binding, current)
-    except ValueError:
-        return FinalGameScheduleDisposition(
-            game_pk,
-            target_date,
-            "UNSCORED",
-            ("OBSERVATION_NOT_PREGAME",),
-            binding,
-        )
-    reasons = _final_mismatch_reasons(saved_game, current)
-    if reasons:
-        return FinalGameScheduleDisposition(
-            game_pk, target_date, "UNSCORED", reasons, binding
-        )
-    return FinalGameObservation(game_pk, target_date, current, binding)
+        binding = persisted.source_binding
+        try:
+            games = parse_live_schedule(
+                persisted.payload_bytes, requested_date=target_date
+            )
+        except ValueError:
+            return FinalGameScheduleDisposition(
+                game_pk,
+                target_date,
+                "UNSCORED",
+                _invalid_final_schedule_reasons(
+                    persisted.payload_bytes,
+                    game_pk=game_pk,
+                    target_date=target_date,
+                ),
+                binding,
+            )
+        current = next((game for game in games if game["game_pk"] == game_pk), None)
+        if current is None:
+            return FinalGameScheduleDisposition(
+                game_pk,
+                target_date,
+                "UNSCORED",
+                ("GAME_MISSING_AT_FINAL_CHECK",),
+                binding,
+            )
+        try:
+            _require_pregame_boundary(binding, current)
+        except ValueError:
+            return FinalGameScheduleDisposition(
+                game_pk,
+                target_date,
+                "UNSCORED",
+                ("OBSERVATION_NOT_PREGAME",),
+                binding,
+            )
+        reasons = _final_mismatch_reasons(saved_game, current)
+        if reasons:
+            return FinalGameScheduleDisposition(
+                game_pk, target_date, "UNSCORED", reasons, binding
+            )
+        return FinalGameObservation(game_pk, target_date, current, binding)
 
 
 __all__ = [
@@ -1289,10 +1417,12 @@ __all__ = [
     "ObservationFetcher",
     "PersistedObservation",
     "PregameParticipants",
+    "RootBinding",
     "boxscore_url",
     "compare_probable_pitchers",
     "fetch_live_http",
     "new_observation_id",
+    "normalize_live_root_path",
     "observe_final_game_schedule",
     "observe_live_slate",
     "parse_live_schedule",
