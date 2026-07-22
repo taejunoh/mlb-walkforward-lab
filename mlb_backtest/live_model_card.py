@@ -103,9 +103,10 @@ def _calibration(value: object) -> tuple[float, float]:
     return alpha, beta
 
 
-def load_frozen_live_card(path: str | Path) -> FrozenLiveCard:
-    """Load the one admitted v5.1 card without applying its historical windows."""
-    raw = Path(path).read_bytes()
+def load_frozen_live_card_bytes(raw: bytes) -> FrozenLiveCard:
+    """Authenticate and parse the exact supplied v5.1 model-card bytes."""
+    if type(raw) is not bytes:
+        raise ValueError("frozen model card bytes differ")
     digest = hashlib.sha256(raw).hexdigest()
     if digest != EXPECTED_MODEL_CARD_SHA256:
         raise ValueError("frozen model card digest differs")
@@ -128,3 +129,8 @@ def load_frozen_live_card(path: str | Path) -> FrozenLiveCard:
         alpha=alpha,
         beta=beta,
     )
+
+
+def load_frozen_live_card(path: str | Path) -> FrozenLiveCard:
+    """Load the one admitted v5.1 card without applying its historical windows."""
+    return load_frozen_live_card_bytes(Path(path).read_bytes())

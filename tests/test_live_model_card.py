@@ -66,6 +66,22 @@ class LiveModelCardTests(unittest.TestCase):
         self.assertGreater(card.beta, 0.0)
         self.assertEqual(card.normalization["starter"]["fip"]["direction"], -1)
 
+    def test_public_bytes_loader_matches_path_loader_and_rejects_invalid_bytes(self):
+        from mlb_backtest.live_model_card import (
+            load_frozen_live_card,
+            load_frozen_live_card_bytes,
+        )
+
+        raw = CARD.read_bytes()
+        self.assertEqual(load_frozen_live_card_bytes(raw), load_frozen_live_card(CARD))
+
+        for invalid in (b"", b"not-json", raw + b"\n"):
+            with self.subTest(invalid=invalid[:16]):
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    load_frozen_live_card_bytes(invalid)
+        with self.assertRaisesRegex(ValueError, "bytes"):
+            load_frozen_live_card_bytes(bytearray(raw))
+
     def test_rejects_one_byte_tampering_before_projection(self):
         from mlb_backtest.live_model_card import load_frozen_live_card
 
