@@ -32,6 +32,10 @@ SUPERSEDING_DESIGN_PATH = Path(
 SUPERSEDING_PLAN_PATH = Path(
     "docs/superpowers/plans/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
 )
+SOURCE_ADDENDUM_PATH = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
 SUPERSEDING_RUN_SPEC_PATH = Path(
     "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
 )
@@ -332,7 +336,18 @@ class V52SupersedingAcquisitionContractTest(unittest.TestCase):
                     "path": SUPERSEDING_RUN_SPEC_PATH.as_posix(),
                     "sha256": _sha256(ROOT / SUPERSEDING_RUN_SPEC_PATH),
                 },
+                "ephemeral_parse_schedule_equivalence_addendum": {
+                    "path": SOURCE_ADDENDUM_PATH.as_posix(),
+                    "sha256": "b6dbc409dc51e03ed1ff7d95a850fb6be87d4ada7b6a37cc34f38efb51281825",
+                    "git_blob_id": "1eb934c37aaf88a9b2f6732e432bb3b9bfb7f06a",
+                },
             },
+        )
+
+    def test_superseding_565534_contract_has_the_approved_canonical_sha256(self):
+        self.assertEqual(
+            _sha256(SUPERSEDING_CONTRACT_PATH),
+            "3ddf83fdec9a328f5005fe8f62f4f680f4ef81516acd1aef2f90845b11c11d58",
         )
         self.assertEqual(
             self.contract["canonical_roots"],

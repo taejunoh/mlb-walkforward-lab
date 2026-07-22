@@ -65,6 +65,10 @@ _SOURCE_IMPLEMENTATION_PLAN_RELATIVE = Path(
     "docs/superpowers/plans/"
     "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
 )
+_SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
 _GAME_EVIDENCE_INVENTORY_RELATIVE = Path(
@@ -154,6 +158,7 @@ class _AuthorityBranch:
     design_relative: Path
     plan_relative: Path
     amendment_relative: Path | None
+    addendum_relative: Path | None
     schema_index: int
 
 
@@ -164,6 +169,7 @@ _AUTHORITY_BRANCHES = (
         _APPROVED_DESIGN_RELATIVE,
         _IMPLEMENTATION_PLAN_RELATIVE,
         _PLAN_A_AMENDMENT_RELATIVE,
+        None,
         0,
     ),
     _AuthorityBranch(
@@ -172,6 +178,7 @@ _AUTHORITY_BRANCHES = (
         _SOURCE_APPROVED_DESIGN_RELATIVE,
         _SOURCE_IMPLEMENTATION_PLAN_RELATIVE,
         None,
+        _SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE,
         1,
     ),
 )
@@ -1091,19 +1098,48 @@ def _load_static_contracts(
     _verify_implementation_plan_git_blob(
         root, branch.plan_relative, plan_binding, plan_contents
     )
-    if branch.amendment_relative is None:
-        if set(bindings) != {
-            "approved_design",
-            "implementation_plan",
-            "run_spec",
-        } or contract.get("supersedes") != _SOURCE_SUPERSEDES:
-            raise ValueError("superseding acquisition authority differs")
-    else:
+    if branch.addendum_relative is None:
+        if branch.amendment_relative is None:
+            raise AssertionError("default authority amendment path is missing")
         _verify_repository_binding(
             root,
             bindings.get("plan_a_amendment"),
             expected_path=branch.amendment_relative,
             label="Plan A amendment",
+        )
+    else:
+        if set(bindings) != {
+            "approved_design",
+            "ephemeral_parse_schedule_equivalence_addendum",
+            "implementation_plan",
+            "run_spec",
+        } or contract.get("supersedes") != _SOURCE_SUPERSEDES:
+            raise ValueError("superseding acquisition authority differs")
+        addendum_binding = bindings.get(
+            "ephemeral_parse_schedule_equivalence_addendum"
+        )
+        addendum_contents = _verify_repository_binding(
+            root,
+            addendum_binding,
+            expected_path=branch.addendum_relative,
+            label="ephemeral parse schedule equivalence addendum",
+            extra_keys=frozenset({"git_blob_id"}),
+        )
+        if not isinstance(addendum_binding, dict):
+            raise AssertionError("validated addendum binding must be an object")
+        _verify_head_blob(
+            root,
+            branch.addendum_relative,
+            addendum_contents,
+            "ephemeral parse schedule equivalence addendum",
+            expected_blob=addendum_binding.get("git_blob_id"),
+        )
+        _verify_repository_binding(
+            root,
+            addendum_binding,
+            expected_path=branch.addendum_relative,
+            label="ephemeral parse schedule equivalence addendum",
+            extra_keys=frozenset({"git_blob_id"}),
         )
     _verify_frozen_acquisition_schema(
         root,

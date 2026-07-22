@@ -38,6 +38,10 @@ SOURCE_CONTRACT = (
     ROOT
     / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
 )
+SOURCE_ADDENDUM = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
 RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
 CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 
@@ -69,6 +73,7 @@ _STATCAST_AUTHORITY_FILES = (
         "docs/superpowers/plans/"
         "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
     ),
+    SOURCE_ADDENDUM,
 )
 
 
@@ -434,6 +439,64 @@ def _split_batches(root: Path):
 
 
 class V52QueryPlanTest(unittest.TestCase):
+    def test_source_authority_rejects_dirty_ephemeral_equivalence_addendum(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            (root / SOURCE_ADDENDUM).write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "addendum.*hash|binding"):
+                query_plan._load_static_contracts(
+                    root / SOURCE_RUN_SPEC.relative_to(ROOT),
+                    root / SOURCE_CONTRACT.relative_to(ROOT),
+                )
+
+    def test_source_authority_rejects_wrong_addendum_git_blob(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            contract_path = root / SOURCE_CONTRACT.relative_to(ROOT)
+            contract = json.loads(contract_path.read_bytes())
+            contract["bindings"][
+                "ephemeral_parse_schedule_equivalence_addendum"
+            ]["git_blob_id"] = "0" * 40
+            contract_path.write_bytes(_canonical_json_bytes(contract))
+            with self.assertRaisesRegex(ValueError, "addendum.*Git blob"):
+                query_plan._load_static_contracts(
+                    root / SOURCE_RUN_SPEC.relative_to(ROOT), contract_path
+                )
+
+    def test_source_authority_rechecks_addendum_after_git_blob_verification(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            original = query_plan._verify_head_blob
+
+            def replace_after_blob(
+                repository_root, relative, contents, label, **kwargs
+            ):
+                result = original(
+                    repository_root, relative, contents, label, **kwargs
+                )
+                if relative == SOURCE_ADDENDUM:
+                    (root / SOURCE_ADDENDUM).write_text(
+                        "tampered\\n", encoding="utf-8"
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan, "_verify_head_blob", side_effect=replace_after_blob
+                ),
+                self.assertRaisesRegex(ValueError, "addendum.*hash|binding"),
+            ):
+                query_plan._load_static_contracts(
+                    root / SOURCE_RUN_SPEC.relative_to(ROOT),
+                    root / SOURCE_CONTRACT.relative_to(ROOT),
+                )
+
     def test_static_contract_context_selects_exact_old_and_source_authorities(self):
         import mlb_backtest.v52_query_plan as query_plan
 

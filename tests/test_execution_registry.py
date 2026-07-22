@@ -142,6 +142,10 @@ SOURCE_PLAN_RELATIVE = Path(
     "docs/superpowers/plans/"
     "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
 )
+SOURCE_ADDENDUM_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
 SOURCE_EXECUTION_RELATIVE = Path(
     "audit/v5_2_qd/historical_superseding_565534/execution"
 )
@@ -459,6 +463,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     SOURCE_CONTRACT_RELATIVE,
                     SOURCE_DESIGN_RELATIVE,
                     SOURCE_PLAN_RELATIVE,
+                    SOURCE_ADDENDUM_RELATIVE,
                     ACQUISITION_SCHEMA_RELATIVE,
                     BASELINE_RELATIVE,
                     PROTECTED_RELATIVE,
@@ -477,6 +482,76 @@ class ExecutionRegistryTest(unittest.TestCase):
         _git(root, "add", ".")
         _git(root, "commit", "-qm", "source authority fixture")
         return root, load_source_run_spec(root / SOURCE_RUN_SPEC_RELATIVE)
+
+    def test_source_git_snapshot_binds_ephemeral_equivalence_addendum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            evidence = self.registry._initial_evidence(
+                root,
+                authority,
+                root / SOURCE_DESIGN_RELATIVE,
+                root / SOURCE_PLAN_RELATIVE,
+                root / SOURCE_CONTRACT_RELATIVE,
+            )
+            self.assertIn(
+                SOURCE_ADDENDUM_RELATIVE.as_posix(),
+                self.registry._git_bound_paths(root, evidence),
+            )
+
+    def test_source_common_bindings_reject_dirty_ephemeral_equivalence_addendum(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            evidence = self.registry._initial_evidence(
+                root,
+                authority,
+                root / SOURCE_DESIGN_RELATIVE,
+                root / SOURCE_PLAN_RELATIVE,
+                root / SOURCE_CONTRACT_RELATIVE,
+            )
+            (root / SOURCE_ADDENDUM_RELATIVE).write_text(
+                "tampered\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "addendum.*hash|binding"):
+                self.registry._validate_common_bindings(root, evidence, authority)
+
+    def test_source_git_snapshot_rejects_wrong_addendum_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            evidence = self.registry._initial_evidence(
+                root,
+                authority,
+                root / SOURCE_DESIGN_RELATIVE,
+                root / SOURCE_PLAN_RELATIVE,
+                root / SOURCE_CONTRACT_RELATIVE,
+            )
+            contract_path = root / SOURCE_CONTRACT_RELATIVE
+            contract = json.loads(contract_path.read_bytes())
+            contract["bindings"][
+                "ephemeral_parse_schedule_equivalence_addendum"
+            ]["git_blob_id"] = "0" * 40
+            contract_path.write_bytes(canonical_json_bytes(contract) + b"\n")
+            with self.assertRaisesRegex(ValueError, "addendum.*Git blob"):
+                self.registry._git_bound_paths(root, evidence)
+
+    def test_source_git_snapshot_final_rebind_rejects_addendum_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            evidence = self.registry._initial_evidence(
+                root,
+                authority,
+                root / SOURCE_DESIGN_RELATIVE,
+                root / SOURCE_PLAN_RELATIVE,
+                root / SOURCE_CONTRACT_RELATIVE,
+            )
+            snapshot = self.registry._capture_git_snapshot(root, evidence)
+            replacement = root / "replacement.md"
+            replacement.write_text("tampered\n", encoding="utf-8")
+            os.replace(replacement, root / SOURCE_ADDENDUM_RELATIVE)
+            with self.assertRaisesRegex(ValueError, "bound Git evidence"):
+                self.registry._verify_git_snapshot(root, snapshot)
+
 
     def test_source_authority_uses_its_audit_registry_and_terminal_phases(
         self,

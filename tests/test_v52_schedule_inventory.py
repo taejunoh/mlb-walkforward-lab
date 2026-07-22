@@ -36,6 +36,10 @@ SOURCE_RUN_SPEC_PATH = (
 SOURCE_CONTRACT_PATH = (
     ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
 )
+SOURCE_ADDENDUM_PATH = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
 _SOURCE_AUTHORITY_FILES = (
     RUN_SPEC_PATH.relative_to(ROOT),
     CONTRACT_PATH.relative_to(ROOT),
@@ -62,6 +66,7 @@ _SOURCE_AUTHORITY_FILES = (
         "docs/superpowers/plans/"
         "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
     ),
+    SOURCE_ADDENDUM_PATH,
 )
 
 
@@ -235,6 +240,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
                     static_batch_id="0" * 64,
                     evidence_root=wrong_root,
                 )
+            (root / SOURCE_ADDENDUM_PATH).write_text("tampered\n", encoding="utf-8")
             source_raw = (
                 root / "data/v5_2_qd/historical_superseding_565534/raw"
             )
@@ -243,7 +249,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
                     "mlb_backtest.v52_schedule_inventory.load_query_batch",
                     side_effect=AssertionError("query-batch I/O reached"),
                 ) as loader,
-                self.assertRaisesRegex(ValueError, "Task 6"),
+                self.assertRaisesRegex(ValueError, "addendum.*hash|binding"),
             ):
                 build_schedule_anchor_inventory(
                     root,
@@ -258,7 +264,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
                     "mlb_backtest.v52_schedule_inventory.build_schedule_anchor_inventory",
                     side_effect=AssertionError("inventory build reached"),
                 ) as builder,
-                self.assertRaisesRegex(ValueError, "Task 6"),
+                self.assertRaisesRegex(ValueError, "addendum.*hash|binding"),
             ):
                 publish_schedule_anchor_inventory(
                     root,
@@ -273,7 +279,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
                     "mlb_backtest.v52_schedule_inventory._read_inventory_contents",
                     side_effect=AssertionError("inventory read reached"),
                 ) as inventory_reader,
-                self.assertRaisesRegex(ValueError, "Task 6"),
+                self.assertRaisesRegex(ValueError, "addendum.*hash|binding"),
             ):
                 load_verified_schedule_anchor_inventory(
                     root,

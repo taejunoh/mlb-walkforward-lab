@@ -1096,9 +1096,9 @@ def _require_bound_execution_code_clean(root: Path) -> None:
         _require_tracked_clean(root, relative, "bound execution code")
 
 
-def _plan_a_amendment_binding(
+def _supplemental_authority_binding(
     root: Path, evidence: Mapping[str, object]
-) -> Mapping[str, object] | None:
+) -> Mapping[str, object]:
     contract_binding = _validate_binding_value(
         evidence["acquisition_contract"], "acquisition contract"
     )
@@ -1113,16 +1113,22 @@ def _plan_a_amendment_binding(
     bindings = contract.get("bindings")
     if not isinstance(bindings, Mapping):
         raise ValueError("acquisition contract bindings differ")
-    amendment = bindings.get("plan_a_amendment")
-    if (
-        amendment is None
-        and contract.get("run_id")
-        == "historical_walkforward_500_superseding_565534"
-    ):
-        return None
-    if not isinstance(amendment, Mapping):
-        raise ValueError("Plan A amendment binding is missing")
-    return _artifact_binding(root, amendment, "Plan A amendment")
+    if contract.get("run_id") == "historical_walkforward_500":
+        amendment = bindings.get("plan_a_amendment")
+        if not isinstance(amendment, Mapping):
+            raise ValueError("Plan A amendment binding is missing")
+        return _artifact_binding(root, amendment, "Plan A amendment")
+    if contract.get("run_id") == "historical_walkforward_500_superseding_565534":
+        addendum = bindings.get("ephemeral_parse_schedule_equivalence_addendum")
+        if not isinstance(addendum, Mapping):
+            raise ValueError("ephemeral parse schedule equivalence addendum binding is missing")
+        return _artifact_binding(
+            root,
+            addendum,
+            "ephemeral parse schedule equivalence addendum",
+            plan=True,
+        )
+    raise ValueError("acquisition contract authority differs")
 
 
 def _git_bound_paths(root: Path, evidence: Mapping[str, object]) -> tuple[str, ...]:
@@ -1144,9 +1150,8 @@ def _git_bound_paths(root: Path, evidence: Mapping[str, object]) -> tuple[str, .
         paths.append(
             str(_validate_binding_value(lineage[key], key)["path"])
         )
-    amendment = _plan_a_amendment_binding(root, evidence)
-    if amendment is not None:
-        paths.append(str(amendment["path"]))
+    supplemental = _supplemental_authority_binding(root, evidence)
+    paths.append(str(supplemental["path"]))
     return tuple(dict.fromkeys(paths))
 
 
@@ -1167,9 +1172,8 @@ def _capture_git_snapshot(
             evidence[key], key, plan=key == "implementation_plan"
         )
         expected_bindings[str(binding["path"])] = binding
-    amendment = _plan_a_amendment_binding(root, evidence)
-    if amendment is not None:
-        expected_bindings[str(amendment["path"])] = amendment
+    supplemental = _supplemental_authority_binding(root, evidence)
+    expected_bindings[str(supplemental["path"])] = supplemental
     lineage = _exact_object(
         evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
     )
@@ -1190,7 +1194,7 @@ def _capture_git_snapshot(
             and "git_blob_id" in expected
             and captured.blob_id != expected["git_blob_id"]
         ):
-            raise ValueError("implementation plan Git blob binding differs")
+            raise ValueError("bound Git blob binding differs")
         files.append(captured)
     if _git(root, "rev-parse", "HEAD") != head:
         raise ValueError("Git HEAD changed during trusted snapshot")
@@ -1661,7 +1665,7 @@ def _validate_common_bindings(
         or bindings.get("implementation_plan") != expected_plan
     ):
         raise ValueError("execution receipt differs from acquisition contract bindings")
-    _plan_a_amendment_binding(root, payload)
+    _supplemental_authority_binding(root, payload)
     lineage = _exact_object(payload["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage")
     protection = contract.get("legacy_protection")
     if not isinstance(protection, Mapping):
