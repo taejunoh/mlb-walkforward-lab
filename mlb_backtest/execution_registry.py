@@ -17,7 +17,7 @@ from typing import Iterator, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 from mlb_backtest.diagnostics import canonical_json_bytes
-from mlb_backtest.protocols import RunSpec
+from mlb_backtest.protocols import RunSpec, SourceRunSpec
 
 
 PHASES: tuple[str, ...] = (
@@ -31,6 +31,40 @@ PHASES: tuple[str, ...] = (
     "SAMPLE_500_SEALED",
     "VERIFIED",
 )
+SOURCE_ONLY_PHASES: tuple[str, ...] = (
+    "DESIGN_ACCEPTED",
+    "ACQUIRING",
+    "SOURCES_READY",
+)
+Authority = RunSpec | SourceRunSpec
+
+
+def _require_checkpoint_run_spec(authority: Authority) -> RunSpec:
+    if not isinstance(authority, RunSpec):
+        raise ValueError(
+            "SourceRunSpec checkpoint authority is unavailable before Task 6"
+        )
+    return authority
+
+
+def _authority_phases(authority: Authority) -> tuple[str, ...]:
+    return SOURCE_ONLY_PHASES if isinstance(authority, SourceRunSpec) else PHASES
+
+
+def _source_inventory_path(authority: Authority) -> str:
+    if isinstance(authority, RunSpec):
+        return _SOURCE_INVENTORY_PATH
+    return (
+        _authority_namespace(authority, "sources") / "source_inventory.json"
+    ).as_posix()
+
+
+def _acquisition_prefix(authority: Authority, child: str) -> str:
+    if isinstance(authority, RunSpec):
+        return f"audit/v5_2_qd/historical/acquisition/{child}/"
+    return (
+        _authority_namespace(authority, "audit") / "acquisition" / child
+    ).as_posix() + "/"
 
 
 def _checkpoint_progress_is_read_only(
@@ -143,6 +177,7 @@ _BOUND_EXECUTION_CODE = (
     "mlb_backtest/v52_timezone_review.py",
     "mlb_backtest/v52_verify_sources.py",
     "mlb_backtest/verify_v52_design.py",
+    "schemas/v5_2_acquisition_contract.schema.json",
     "schemas/v5_2_acquisition_checkpoint.schema.json",
     "schemas/v5_2_clean_source_replay_receipt.schema.json",
     "schemas/v5_2_execution_receipt.schema.json",
@@ -385,12 +420,32 @@ def _root_path(root: Path) -> Path:
     return supplied
 
 
-def _paths(root: Path, run_spec: RunSpec) -> _RegistryPaths:
+def _authority_namespace(authority: Authority, key: str) -> Path:
+    namespaces = authority.raw.get("namespaces")
+    value = namespaces.get(key) if isinstance(namespaces, Mapping) else None
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"execution registry {key} namespace differs")
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != value
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError(f"execution registry {key} namespace differs")
+    return relative
+
+
+def _paths(root: Path, run_spec: Authority) -> _RegistryPaths:
     root_path = _root_path(root)
-    namespaces = run_spec.raw.get("namespaces")
-    if not isinstance(namespaces, Mapping) or namespaces.get("audit") != "audit/v5_2_qd/historical":
-        raise ValueError("execution registry requires the frozen historical audit namespace")
-    execution = Path("audit/v5_2_qd/historical/execution")
+    audit = _authority_namespace(run_spec, "audit")
+    expected_audit = (
+        Path("audit/v5_2_qd/historical_superseding_565534")
+        if isinstance(run_spec, SourceRunSpec)
+        else Path("audit/v5_2_qd/historical")
+    )
+    if audit != expected_audit:
+        raise ValueError("execution registry requires the frozen audit namespace")
+    execution = audit / "execution"
     return _RegistryPaths(
         root=root_path,
         execution_relative=execution,
@@ -743,6 +798,7 @@ def _uncommitted_source_receipt_payload(
     run_spec: Mapping[str, object],
     acquisition_contract: Mapping[str, object],
     trusted_git: _GitSnapshot,
+    authority: Authority,
 ) -> tuple[str, tuple[str, ...], str | None, tuple[_ArtifactSnapshot, ...]]:
     payload = _canonical_object(contents, "source evidence receipt")
     schema_name = (
@@ -768,16 +824,18 @@ def _uncommitted_source_receipt_payload(
         raise ValueError("source evidence receipt protocol binding differs")
     kind = payload["receipt_kind"]
     queries = _sorted_string_list(payload["reviewed_query_ids"], "reviewed query IDs")
+    review_prefix = _acquisition_prefix(authority, "source_reviews")
+    replay_prefix = _acquisition_prefix(authority, "source_replays")
     if kind == "SOURCE_REVIEW":
         if (
-            not path.startswith(_SOURCE_REVIEW_PREFIX)
+            not path.startswith(review_prefix)
             or payload["decision"] != "APPROVED"
         ):
             raise ValueError("independent source review is not approved")
         document_binding = _validate_binding_value(
             payload["query_ids_document"], "review query IDs document"
         )
-        if not str(document_binding["path"]).startswith(_SOURCE_REVIEW_PREFIX):
+        if not str(document_binding["path"]).startswith(review_prefix):
             raise ValueError("review query ID document is outside review namespace")
         document = _capture_artifact(
             root,
@@ -800,7 +858,7 @@ def _uncommitted_source_receipt_payload(
         return kind, queries, None, (schema_snapshot, document)
     if kind == "CLEAN_SOURCE_REPLAY":
         if (
-            not path.startswith(_SOURCE_REPLAY_PREFIX)
+            not path.startswith(replay_prefix)
         ):
             raise ValueError("clean source replay is outside replay namespace")
         execution_id = payload["execution_id"]
@@ -830,6 +888,7 @@ def _source_receipt_payload(
     run_spec: Mapping[str, object],
     acquisition_contract: Mapping[str, object],
     trusted_git: _GitSnapshot,
+    authority: Authority,
 ) -> tuple[
     str,
     tuple[str, ...],
@@ -848,9 +907,9 @@ def _source_receipt_payload(
     )
     committed_kind = marker["committed_receipt_kind"]
     expected_prefix = (
-        _SOURCE_REVIEW_PREFIX
+        _acquisition_prefix(authority, "source_reviews")
         if committed_kind == "SOURCE_REVIEW"
-        else _SOURCE_REPLAY_PREFIX
+        else _acquisition_prefix(authority, "source_replays")
     )
     if not path.startswith(expected_prefix):
         raise ValueError("source receipt commit marker is outside its namespace")
@@ -884,6 +943,7 @@ def _source_receipt_payload(
             run_spec=run_spec,
             acquisition_contract=acquisition_contract,
             trusted_git=trusted_git,
+            authority=authority,
         )
     )
     if kind != committed_kind:
@@ -907,8 +967,9 @@ def _validate_sources_ready_evidence(
     root: Path,
     base: Mapping[str, object],
     trusted_git: _GitSnapshot,
+    authority: Authority,
 ) -> tuple[_ArtifactSnapshot, ...]:
-    if inventory.path != _SOURCE_INVENTORY_PATH:
+    if inventory.path != _source_inventory_path(authority):
         raise ValueError("SOURCES_READY requires the canonical source inventory")
     snapshots, inventory_query_ids = _source_inventory_payload(
         inventory.contents, run_id=run_id
@@ -950,6 +1011,7 @@ def _validate_sources_ready_evidence(
             run_spec=run_spec,
             acquisition_contract=acquisition_contract,
             trusted_git=trusted_git,
+            authority=authority,
         )
         if artifact.path in marker_paths or artifact.sha256 in marker_hashes:
             raise ValueError("source receipt commit marker is duplicated")
@@ -1036,7 +1098,7 @@ def _require_bound_execution_code_clean(root: Path) -> None:
 
 def _plan_a_amendment_binding(
     root: Path, evidence: Mapping[str, object]
-) -> Mapping[str, object]:
+) -> Mapping[str, object] | None:
     contract_binding = _validate_binding_value(
         evidence["acquisition_contract"], "acquisition contract"
     )
@@ -1052,6 +1114,12 @@ def _plan_a_amendment_binding(
     if not isinstance(bindings, Mapping):
         raise ValueError("acquisition contract bindings differ")
     amendment = bindings.get("plan_a_amendment")
+    if (
+        amendment is None
+        and contract.get("run_id")
+        == "historical_walkforward_500_superseding_565534"
+    ):
+        return None
     if not isinstance(amendment, Mapping):
         raise ValueError("Plan A amendment binding is missing")
     return _artifact_binding(root, amendment, "Plan A amendment")
@@ -1076,7 +1144,9 @@ def _git_bound_paths(root: Path, evidence: Mapping[str, object]) -> tuple[str, .
         paths.append(
             str(_validate_binding_value(lineage[key], key)["path"])
         )
-    paths.append(str(_plan_a_amendment_binding(root, evidence)["path"]))
+    amendment = _plan_a_amendment_binding(root, evidence)
+    if amendment is not None:
+        paths.append(str(amendment["path"]))
     return tuple(dict.fromkeys(paths))
 
 
@@ -1098,7 +1168,8 @@ def _capture_git_snapshot(
         )
         expected_bindings[str(binding["path"])] = binding
     amendment = _plan_a_amendment_binding(root, evidence)
-    expected_bindings[str(amendment["path"])] = amendment
+    if amendment is not None:
+        expected_bindings[str(amendment["path"])] = amendment
     lineage = _exact_object(
         evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage"
     )
@@ -1557,7 +1628,11 @@ def _artifact_binding(root: Path, raw: object, label: str, *, plan: bool = False
     return binding
 
 
-def _validate_common_bindings(root: Path, payload: Mapping[str, object], run_spec: RunSpec) -> None:
+def _validate_common_bindings(
+    root: Path, payload: Mapping[str, object], run_spec: Authority
+) -> None:
+    from mlb_backtest.v52_query_plan import _load_static_contracts
+
     run_binding = _artifact_binding(root, payload["run_spec"], "run spec")
     _, run_bytes = _read_path(root, root / str(run_binding["path"]), "run spec")
     if canonical_json_bytes(run_spec.raw) + b"\n" != run_bytes:
@@ -1565,6 +1640,12 @@ def _validate_common_bindings(root: Path, payload: Mapping[str, object], run_spe
     _artifact_binding(root, payload["approved_design"], "approved design")
     _artifact_binding(root, payload["implementation_plan"], "implementation plan", plan=True)
     contract_binding = _artifact_binding(root, payload["acquisition_contract"], "acquisition contract")
+    context = _load_static_contracts(
+        root / str(run_binding["path"]),
+        root / str(contract_binding["path"]),
+    )
+    if context.authority.raw != run_spec.raw:
+        raise ValueError("caller RunSpec differs from authenticated authority")
     contract = _canonical_object(
         _read_path(root, root / str(contract_binding["path"]), "acquisition contract")[1],
         "acquisition contract",
@@ -1630,6 +1711,7 @@ def _validate_phase_evidence(
     root: Path,
     run_id: str,
     trusted_git: _GitSnapshot,
+    authority: Authority,
 ) -> tuple[_ArtifactSnapshot, ...]:
     if phase in {"DESIGN_ACCEPTED", "ACQUIRING"}:
         lineage = _exact_object(
@@ -1651,6 +1733,7 @@ def _validate_phase_evidence(
             root=root,
             base=base,
             trusted_git=trusted_git,
+            authority=authority,
         )
     raise ValueError(f"execution phase {phase} has no implemented evidence validator")
 
@@ -1704,7 +1787,9 @@ def _snapshots_from_bindings(
     return tuple(snapshots)
 
 
-def _validate_receipt_name_chain(names: Sequence[str]) -> None:
+def _validate_receipt_name_chain(
+    names: Sequence[str], phases: Sequence[str] = PHASES
+) -> None:
     if not names:
         raise FileNotFoundError("execution registry has no phase receipts")
     for expected_sequence, name in enumerate(names):
@@ -1717,19 +1802,25 @@ def _validate_receipt_name_chain(names: Sequence[str]) -> None:
         phase = match.group("phase")
         if (
             sequence != expected_sequence
-            or sequence >= len(PHASES)
-            or phase != PHASES[sequence]
+            or sequence >= len(phases)
+            or phase != phases[sequence]
         ):
             raise _ReceiptMembershipError(
                 "execution registry chain has a gap, fork, replay, or rollback anchor"
             )
 
 
-def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, filename_sequence: int) -> Mapping[str, object]:
+def _receipt_payload(
+    contents: bytes,
+    expected_sha: str,
+    filename_phase: str,
+    filename_sequence: int,
+    authority: Authority,
+) -> Mapping[str, object]:
     if _sha256_bytes(contents) != expected_sha:
         raise ValueError("execution receipt filename hash differs")
     payload = _canonical_object(contents, "execution receipt")
-    _validate_success_receipt(payload)
+    _validate_success_receipt(payload, authority)
     if (
         payload.get("schema_version") != 1
         or payload.get("receipt_kind") != "PHASE_TRANSITION"
@@ -1742,8 +1833,12 @@ def _receipt_payload(contents: bytes, expected_sha: str, filename_phase: str, fi
     return payload
 
 
-def _validate_success_receipt(payload: object) -> Mapping[str, object]:
+def _validate_success_receipt(
+    payload: object, authority: Authority | None = None
+) -> Mapping[str, object]:
     receipt = _exact_object(payload, _SUCCESS_KEYS, "execution receipt")
+    phases = _authority_phases(authority) if authority is not None else PHASES
+    run_id = authority.run_id if authority is not None else "historical_walkforward_500"
     sequence = receipt.get("sequence")
     phase = receipt.get("phase")
     prior = receipt.get("prior_receipt_sha256")
@@ -1751,10 +1846,10 @@ def _validate_success_receipt(payload: object) -> Mapping[str, object]:
     if (
         receipt.get("schema_version") != 1
         or receipt.get("receipt_kind") != "PHASE_TRANSITION"
-        or receipt.get("run_id") != "historical_walkforward_500"
+        or receipt.get("run_id") != run_id
         or type(sequence) is not int
-        or not 0 <= sequence < len(PHASES)
-        or phase != PHASES[sequence]
+        or not 0 <= sequence < len(phases)
+        or phase != phases[sequence]
         or (sequence == 0 and prior is not None)
         or (
             sequence > 0
@@ -1793,8 +1888,13 @@ def _validate_success_receipt(payload: object) -> Mapping[str, object]:
         )
         head_sequence = head.get("sequence")
         head_sha = head.get("sha256")
+        execution = (
+            _authority_namespace(authority, "audit") / "execution"
+            if authority is not None
+            else Path("audit/v5_2_qd/historical/execution")
+        )
         expected_path = (
-            "audit/v5_2_qd/historical/execution/acquisition_checkpoints/"
+            (execution / "acquisition_checkpoints").as_posix() + "/"
             f"{head_sequence:08d}-{head_sha}.json"
         ) if type(head_sequence) is int else ""
         if (
@@ -1819,7 +1919,9 @@ def _validate_success_receipt(payload: object) -> Mapping[str, object]:
     return receipt
 
 
-def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
+def _validate_quarantine_receipt(
+    payload: object, authority: Authority | None = None
+) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError("quarantine receipt keys differ")
     keys = frozenset(payload)
@@ -1827,14 +1929,16 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
         raise ValueError("quarantine receipt keys differ")
     receipt = payload
     automatic = keys == _AUTOMATIC_QUARANTINE_KEYS
+    phases = _authority_phases(authority) if authority is not None else PHASES
+    run_id = authority.run_id if authority is not None else "historical_walkforward_500"
     git_head = receipt.get("git_head")
     current_hash = receipt.get("current_receipt_sha256")
     if (
         receipt.get("schema_version") != 1
         or receipt.get("receipt_kind") != "QUARANTINED_TRANSITION"
-        or receipt.get("run_id") != "historical_walkforward_500"
-        or receipt.get("current_phase") not in PHASES
-        or receipt.get("attempted_phase") not in PHASES
+        or receipt.get("run_id") != run_id
+        or receipt.get("current_phase") not in phases
+        or receipt.get("attempted_phase") not in phases
         or (
             automatic
             and (
@@ -1870,11 +1974,12 @@ def _validate_quarantine_receipt(payload: object) -> Mapping[str, object]:
 
 def _validate_quarantine_locked(
     paths: _RegistryPaths,
-    run_spec: RunSpec,
+    run_spec: Authority,
     payloads: Sequence[Mapping[str, object]],
     phase_receipt_sha: Mapping[str, str],
     lock_binding: _RegistryLockBinding,
 ) -> None:
+    phases = _authority_phases(run_spec)
     quarantine_relative = _execution_child(paths, paths.quarantine_relative)
     quarantine_fd, descriptors = _open_directory_at(
         lock_binding.execution_descriptor, quarantine_relative
@@ -1895,18 +2000,18 @@ def _validate_quarantine_locked(
         if _sha256_bytes(contents) != match.group("sha"):
             raise ValueError("quarantine receipt filename hash differs")
         payload = _canonical_object(contents, "quarantine receipt")
-        _validate_quarantine_receipt(payload)
+        _validate_quarantine_receipt(payload, run_spec)
         current_phase = payload.get("current_phase")
         attempted = payload.get("attempted_phase")
         if (
             payload.get("schema_version") != 1
             or payload.get("receipt_kind") != "QUARANTINED_TRANSITION"
             or payload.get("run_id") != run_spec.run_id
-            or current_phase not in PHASES
-            or attempted not in PHASES
-            or PHASES.index(str(attempted)) != PHASES.index(str(current_phase)) + 1
+            or current_phase not in phases
+            or attempted not in phases
+            or phases.index(str(attempted)) != phases.index(str(current_phase)) + 1
             or match.group("phase") != attempted
-            or int(match.group("sequence")) != PHASES.index(str(attempted))
+            or int(match.group("sequence")) != phases.index(str(attempted))
             or payload.get("current_receipt_sha256")
             != phase_receipt_sha.get(str(current_phase))
         ):
@@ -1940,7 +2045,7 @@ def _validate_quarantine_locked(
 
 def _load_locked(
     paths: _RegistryPaths,
-    run_spec: RunSpec,
+    run_spec: Authority,
     lock_binding: _RegistryLockBinding,
     *,
     read_only_progress: bool = False,
@@ -1955,7 +2060,8 @@ def _load_locked(
         names = sorted(os.listdir(receipt_fd))
     finally:
         _close_directories(descriptors)
-    _validate_receipt_name_chain(names)
+    phases = _authority_phases(run_spec)
+    _validate_receipt_name_chain(names, phases)
     payloads: list[Mapping[str, object]] = []
     phase_receipt_sha: dict[str, str] = {}
     prior_sha: str | None = None
@@ -1973,7 +2079,9 @@ def _load_locked(
             receipts_relative / name,
             "execution receipt",
         )
-        payload = _receipt_payload(contents, receipt_sha, phase, sequence)
+        payload = _receipt_payload(
+            contents, receipt_sha, phase, sequence, run_spec
+        )
         if payload.get("run_id") != run_spec.run_id or payload.get("prior_receipt_sha256") != prior_sha:
             raise ValueError("execution registry prior hash or run identity differs")
         git_head = payload.get("git_head")
@@ -2014,6 +2122,7 @@ def _load_locked(
             root=paths.root,
             run_id=run_spec.run_id,
             trusted_git=trusted_git,
+            authority=run_spec,
         )
         payloads.append(payload)
         phase_receipt_sha[phase] = receipt_sha
@@ -2069,7 +2178,15 @@ def _load_locked(
     )
 
 
-def _initial_evidence(root: Path, run_spec: RunSpec, design_path: Path, plan_path: Path, acquisition_contract_path: Path) -> dict[str, object]:
+def _initial_evidence(
+    root: Path,
+    run_spec: Authority,
+    design_path: Path,
+    plan_path: Path,
+    acquisition_contract_path: Path,
+) -> dict[str, object]:
+    from mlb_backtest.v52_query_plan import _load_static_contracts
+
     _require_bound_execution_code_clean(root)
     contract_binding = _binding(root, acquisition_contract_path, "acquisition contract")
     _require_tracked_clean(root, contract_binding["path"], "acquisition contract")
@@ -2078,17 +2195,27 @@ def _initial_evidence(root: Path, run_spec: RunSpec, design_path: Path, plan_pat
     protection = contract.get("legacy_protection")
     if not isinstance(bindings, Mapping) or not isinstance(protection, Mapping):
         raise ValueError("acquisition contract evidence is incomplete")
-    design = _binding(root, design_path, "approved design")
-    plan = _binding(root, plan_path, "implementation plan")
     run_binding_raw = bindings.get("run_spec")
     if not isinstance(run_binding_raw, Mapping) or not isinstance(run_binding_raw.get("path"), str):
         raise ValueError("acquisition contract RunSpec binding differs")
+    context = _load_static_contracts(
+        root / str(run_binding_raw["path"]), acquisition_contract_path
+    )
+    if context.authority.raw != run_spec.raw:
+        raise ValueError("caller RunSpec differs from acquisition contract")
+    design_binding_raw = bindings.get("approved_design")
+    plan_contract = bindings.get("implementation_plan")
+    if not isinstance(design_binding_raw, Mapping) or not isinstance(plan_contract, Mapping):
+        raise ValueError("design or implementation plan binding differs")
+    if _relative_path(root, design_path, "approved design").as_posix() != design_binding_raw.get("path"):
+        raise ValueError("approved design path differs from authenticated authority")
+    if _relative_path(root, plan_path, "implementation plan").as_posix() != plan_contract.get("path"):
+        raise ValueError("implementation plan path differs from authenticated authority")
+    design = _binding(root, design_path, "approved design")
+    plan = _binding(root, plan_path, "implementation plan")
     run_binding = _binding(root, root / str(run_binding_raw["path"]), "run spec")
     if canonical_json_bytes(run_spec.raw) + b"\n" != _read_path(root, root / run_binding["path"], "run spec")[1]:
         raise ValueError("caller RunSpec differs from acquisition contract")
-    plan_contract = bindings.get("implementation_plan")
-    if not isinstance(plan_contract, Mapping):
-        raise ValueError("implementation plan binding differs")
     plan_with_blob = {**plan, "git_blob_id": plan_contract.get("git_blob_id")}
     lineage = {
         "baseline_inventory": _binding(root, root / str(protection.get("baseline_inventory_path")), "Task0 baseline inventory"),
@@ -2106,14 +2233,18 @@ def _initial_evidence(root: Path, run_spec: RunSpec, design_path: Path, plan_pat
     return evidence
 
 
-def _success_contents(payload: Mapping[str, object]) -> tuple[bytes, str]:
-    _validate_success_receipt(payload)
+def _success_contents(
+    payload: Mapping[str, object], authority: Authority | None = None
+) -> tuple[bytes, str]:
+    _validate_success_receipt(payload, authority)
     contents = canonical_json_bytes(payload) + b"\n"
     return contents, _sha256_bytes(contents)
 
 
-def _success_receipt_name(payload: Mapping[str, object]) -> str:
-    _, digest = _success_contents(payload)
+def _success_receipt_name(
+    payload: Mapping[str, object], authority: Authority | None = None
+) -> str:
+    _, digest = _success_contents(payload, authority)
     return f"{int(payload['sequence']):06d}-{payload['phase']}-{digest}.json"
 
 
@@ -2162,7 +2293,7 @@ def _publish_locked(
 
 def _publish_quarantine_locked(
     paths: _RegistryPaths,
-    run_spec: RunSpec,
+    run_spec: Authority,
     state: ExecutionRegistryState,
     base: Mapping[str, object],
     attempted_phase: str,
@@ -2191,7 +2322,7 @@ def _publish_quarantine_locked(
         payload["error_classification"] = error_classification
     elif inventory is not None or error_classification is not None:
         raise ValueError("automatic quarantine evidence is incomplete")
-    _validate_quarantine_receipt(payload)
+    _validate_quarantine_receipt(payload, run_spec)
     contents = canonical_json_bytes(payload) + b"\n"
     digest = _sha256_bytes(contents)
     relative = (
@@ -2240,15 +2371,20 @@ def _checkpoint_binding_list(
     return tuple(result)
 
 
-def _validate_checkpoint_payload(payload: object) -> Mapping[str, object]:
+def _validate_checkpoint_payload(
+    payload: object, run_spec: RunSpec | None = None
+) -> Mapping[str, object]:
     receipt = _exact_object(payload, _CHECKPOINT_KEYS, "acquisition checkpoint")
+    if run_spec is not None:
+        _require_checkpoint_run_spec(run_spec)
+    run_id = run_spec.run_id if run_spec is not None else "historical_walkforward_500"
     sequence = receipt.get("sequence")
     prior = receipt.get("prior_checkpoint_sha256")
     stage = receipt.get("stage")
     if (
         receipt.get("schema_version") != 1
         or receipt.get("receipt_kind") != "ACQUISITION_CHECKPOINT"
-        or receipt.get("run_id") != "historical_walkforward_500"
+        or receipt.get("run_id") != run_id
         or receipt.get("execution_phase") != "ACQUIRING"
         or type(sequence) is not int
         or sequence < 0
@@ -2415,6 +2551,7 @@ def _checkpoint_artifact_binding(root: Path, relative: Path, label: str) -> dict
 
 
 def _checkpoint_evidence_root(paths: _RegistryPaths, run_spec: RunSpec) -> Path:
+    _require_checkpoint_run_spec(run_spec)
     namespaces = run_spec.raw.get("namespaces")
     raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
     if not isinstance(raw, str) or not raw:
@@ -2539,6 +2676,7 @@ def _checkpoint_stage_authority(
     contract_binding: Mapping[str, object],
     read_only_progress: bool = False,
 ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
+    _require_checkpoint_run_spec(run_spec)
     from mlb_backtest.v52_query_plan import (
         build_legacy_partition_batch,
         build_participant_derived_batch,
@@ -2793,6 +2931,7 @@ def _checkpoint_current_semantic(
     split_receipt_paths: Sequence[Path],
     read_only_progress: bool = False,
 ) -> dict[str, object]:
+    _require_checkpoint_run_spec(run_spec)
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
     from mlb_backtest.v52_query_plan import (
         load_query_batch,
@@ -3106,6 +3245,7 @@ def _checkpoint_artifacts_and_population(
     *,
     read_only_progress: bool = False,
 ) -> set[str]:
+    _require_checkpoint_run_spec(run_spec)
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
     from mlb_backtest.v52_query_plan import load_query_batch, load_split_receipt
 
@@ -3524,6 +3664,7 @@ def _load_checkpoints_locked(
     tuple[Mapping[str, object], ...],
     tuple[str, ...],
 ]:
+    _require_checkpoint_run_spec(run_spec)
     checkpoint_child = _execution_child(paths, paths.checkpoints_relative)
     try:
         checkpoint_fd, descriptors = _open_directory_at(
@@ -3553,7 +3694,7 @@ def _load_checkpoints_locked(
         if _sha256_bytes(contents) != receipt_sha:
             raise ValueError("acquisition checkpoint filename hash differs")
         payload = _validate_checkpoint_payload(
-            _canonical_object(contents, "acquisition checkpoint")
+            _canonical_object(contents, "acquisition checkpoint"), run_spec
         )
         if (
             payload["sequence"] != expected_sequence
@@ -3656,13 +3797,14 @@ def _terminal_checkpoint_head(
 
 def initialize_execution_registry(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: Authority,
     *,
     design_path: Path,
     plan_path: Path,
     acquisition_contract_path: Path,
 ) -> ExecutionRegistryState:
     paths = _paths(root, run_spec)
+    phases = _authority_phases(run_spec)
     evidence = _initial_evidence(paths.root, run_spec, design_path, plan_path, acquisition_contract_path)
     _ensure_registry_directories(paths)
     with _registry_lock(paths, create=True, exclusive=True) as lock_binding:
@@ -3678,7 +3820,7 @@ def initialize_execution_registry(
             state, payloads = _load_locked(paths, run_spec, lock_binding)
             expected = {key: evidence[key] for key in evidence}
             actual = {key: payloads[0][key] for key in evidence}
-            if state.phase not in PHASES or actual != expected:
+            if state.phase not in phases or actual != expected:
                 raise ValueError("execution registry is already initialized and differs")
             return state
         protected = _exact_object(evidence["task0_lineage"], _LINEAGE_KEYS, "Task0 lineage")["protected_inventory"]
@@ -3704,7 +3846,7 @@ def initialize_execution_registry(
             "inventory": protected,
             "validation_receipts": [],
         }
-        contents, digest = _success_contents(payload)
+        contents, digest = _success_contents(payload, run_spec)
         relative = paths.receipts_relative / f"000000-DESIGN_ACCEPTED-{digest}.json"
         _publish_locked(
             paths,
@@ -3719,7 +3861,7 @@ def initialize_execution_registry(
         return ExecutionRegistryState("DESIGN_ACCEPTED", 0, digest, str(protected["sha256"]))
 
 
-def load_execution_registry(root: Path, run_spec: RunSpec) -> ExecutionRegistryState:
+def load_execution_registry(root: Path, run_spec: Authority) -> ExecutionRegistryState:
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, _ = _load_locked(paths, run_spec, lock_binding)
@@ -3737,6 +3879,7 @@ def load_latest_acquisition_checkpoint(
     completion receipt binds it. Gaps, forks, and deletion during this read fail
     closed.
     """
+    _require_checkpoint_run_spec(run_spec)
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, registry_payloads = _load_locked(
@@ -3765,6 +3908,7 @@ def _load_read_only_terminal_acquisition_checkpoint(
     allowed_phases: frozenset[str],
     phase_error: str,
 ) -> AcquisitionCheckpoint:
+    _require_checkpoint_run_spec(run_spec)
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, registry_payloads = _load_locked(
@@ -3794,6 +3938,7 @@ def load_source_verification_checkpoint(
     run_spec: RunSpec,
 ) -> AcquisitionCheckpoint:
     """Read-only authentication of terminal acquisition evidence for Task 8."""
+    _require_checkpoint_run_spec(run_spec)
     return _load_read_only_terminal_acquisition_checkpoint(
         root,
         run_spec,
@@ -3807,6 +3952,7 @@ def load_terminal_acquisition_checkpoint(
     run_spec: RunSpec,
 ) -> AcquisitionCheckpoint:
     """Read-only authentication of the frozen SOURCES_READY checkpoint head."""
+    _require_checkpoint_run_spec(run_spec)
     return _load_read_only_terminal_acquisition_checkpoint(
         root,
         run_spec,
@@ -3829,6 +3975,7 @@ def validate_sources_ready_evidence_set(
     caller order under the registry's shared lock without publishing a phase
     receipt, creating quarantine evidence, or repairing any state.
     """
+    _require_checkpoint_run_spec(run_spec)
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
         state, payloads = _load_locked(
@@ -3853,6 +4000,7 @@ def validate_sources_ready_evidence_set(
             root=paths.root,
             base=base,
             trusted_git=snapshot,
+            authority=run_spec,
         )
         checkpoints, checkpoint_payloads, checkpoint_names = (
             _load_checkpoints_locked(
@@ -3898,6 +4046,7 @@ def publish_acquisition_checkpoint(
     stage_evidence_receipts: Sequence[Path] = (),
     split_receipt_paths: Sequence[Path] = (),
 ) -> AcquisitionCheckpoint:
+    _require_checkpoint_run_spec(run_spec)
     for values, label in (
         (completed_query_ids, "completed query IDs"),
         (pending_query_ids, "pending query IDs"),
@@ -4009,7 +4158,7 @@ def publish_acquisition_checkpoint(
             "prior_checkpoint_sha256": authenticated_prior,
             "recorded_at_utc": _utc_now(),
         }
-        _validate_checkpoint_payload(payload)
+        _validate_checkpoint_payload(payload, run_spec)
         _validate_checkpoint_progression(previous_payload, payload)
         contents = canonical_json_bytes(payload) + b"\n"
         digest = _sha256_bytes(contents)
@@ -4045,7 +4194,7 @@ def publish_acquisition_checkpoint(
 
 def _advance_execution_phase(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: Authority,
     *,
     expected_phase: str,
     next_phase: str,
@@ -4055,9 +4204,18 @@ def _advance_execution_phase(
     atomic_source_gate: bool = False,
     return_transition_result: bool = False,
 ) -> ExecutionRegistryState | ExecutionPhaseAdvance:
-    paths = _paths(root, run_spec)
-    if expected_phase not in PHASES or next_phase not in PHASES or PHASES.index(next_phase) != PHASES.index(expected_phase) + 1:
+    phases = _authority_phases(run_spec)
+    if (
+        expected_phase not in phases
+        or next_phase not in phases
+        or phases.index(next_phase) != phases.index(expected_phase) + 1
+    ):
         raise ValueError("execution transition must use the immediate next phase")
+    if next_phase == "SOURCES_READY":
+        # Task 6 will extend checkpoint authority to SourceRunSpec. Until then,
+        # reject before path construction, evidence snapshots, or publication.
+        _require_checkpoint_run_spec(run_spec)
+    paths = _paths(root, run_spec)
     if next_phase not in {"ACQUIRING", "SOURCES_READY"}:
         raise ValueError("execution transition fails closed until a phase validator exists")
 
@@ -4170,6 +4328,7 @@ def _advance_execution_phase(
                 root=paths.root,
                 run_id=run_spec.run_id,
                 trusted_git=snapshot,
+                authority=run_spec,
             )
             checkpoint_head: Mapping[str, object] | None = None
             if next_phase == "SOURCES_READY":
@@ -4258,7 +4417,7 @@ def _advance_execution_phase(
                 "inventory": inventory,
                 "validation_receipts": validations,
             }
-            contents, digest = _success_contents(payload)
+            contents, digest = _success_contents(payload, run_spec)
         except ValueError as exc:
             if atomic_source_gate and next_phase == "SOURCES_READY":
                 raise ValueError("atomic source gate evidence failed") from exc
@@ -4311,7 +4470,7 @@ def _advance_execution_phase(
                     *((checkpoint_snapshot,) if checkpoint_snapshot else ()),
                 ),
                 expected_receipt_names=(
-                    *(_success_receipt_name(item) for item in payloads),
+                    *(_success_receipt_name(item, run_spec) for item in payloads),
                     relative.name,
                 ),
                 state_verifier=verify_source_evidence_and_checkpoint,
@@ -4352,7 +4511,7 @@ def _advance_execution_phase(
 
 def advance_execution_phase(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: Authority,
     *,
     expected_phase: str,
     next_phase: str,
@@ -4377,6 +4536,7 @@ def advance_sources_ready_phase(
     expected_checkpoint_path: Path,
 ) -> ExecutionPhaseAdvance:
     """Atomically bind explicit source evidence and checkpoint to SOURCES_READY."""
+    _require_checkpoint_run_spec(run_spec)
     result = _advance_execution_phase(
         root,
         run_spec,
@@ -4394,22 +4554,32 @@ def advance_sources_ready_phase(
 
 def quarantine_execution_transition(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: Authority,
     *,
     attempted_phase: str,
     validation_receipts: Sequence[Path],
 ) -> Path:
+    phases = _authority_phases(run_spec)
+    if attempted_phase not in phases:
+        raise ValueError(
+            "quarantine attempted phase must be the immediate next phase"
+        )
     paths = _paths(root, run_spec)
     with _registry_lock(paths, create=False, exclusive=True) as lock_binding:
+        state, payloads = _load_locked(paths, run_spec, lock_binding)
+        if (
+            state.sequence + 1 >= len(phases)
+            or attempted_phase != phases[state.sequence + 1]
+        ):
+            raise ValueError(
+                "quarantine attempted phase must be the immediate next phase"
+            )
         validation_snapshots = _artifact_snapshots(
             paths.root, validation_receipts, "validation receipt"
         )
         validations = [snapshot.binding for snapshot in validation_snapshots]
         if not validations:
             raise ValueError("quarantine transition requires validation evidence")
-        state, payloads = _load_locked(paths, run_spec, lock_binding)
-        if state.sequence + 1 >= len(PHASES) or attempted_phase != PHASES[state.sequence + 1]:
-            raise ValueError("quarantine attempted phase must be the immediate next phase")
         snapshot = _capture_git_snapshot(paths.root, payloads[0])
         return _publish_quarantine_locked(
             paths,

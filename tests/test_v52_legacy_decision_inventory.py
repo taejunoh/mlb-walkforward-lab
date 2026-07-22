@@ -123,7 +123,7 @@ def _legacy_decision_repository(
     contract_path.write_bytes(_canonical_json(contract))
     schema_path = root / CONTRACT_SCHEMA_PATH
     schema = json.loads(schema_path.read_bytes())
-    schema["const"] = contract
+    schema["oneOf"][0]["const"] = contract
     schema_path.write_bytes(_canonical_json(schema))
     decision_schema_path = root / DECISION_SCHEMA_PATH
     decision_schema_path.parent.mkdir(parents=True, exist_ok=True)

@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import urlencode
 
+from .diagnostics import deep_freeze
+from .protocols import (
+    RunSpec,
+    SourceRunSpec,
+    parse_run_spec,
+    parse_source_run_spec,
+)
 from .v52_evidence import (
     LogicalQuery,
     V52EvidenceStore,
@@ -35,6 +42,12 @@ _RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 _ACQUISITION_CONTRACT_RELATIVE = Path(
     "protocols/v5_2_qd/historical_source_acquisition.json"
 )
+_SOURCE_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+_SOURCE_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
 _APPROVED_DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -43,6 +56,14 @@ _IMPLEMENTATION_PLAN_RELATIVE = Path(
 )
 _PLAN_A_AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+)
+_SOURCE_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+)
+_SOURCE_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
 )
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
@@ -107,6 +128,66 @@ class _StaticQueryInputs:
     statcast_parser_version: str
     run_spec_sha256: str
     acquisition_contract_sha256: str
+
+
+@dataclass(frozen=True)
+class SourceAuthorityContext:
+    repository_root: Path
+    authority: RunSpec | SourceRunSpec
+    authority_path: Path
+    authority_sha256: str
+    acquisition_contract_path: Path
+    acquisition_contract_sha256: str
+    contract: Mapping[str, object]
+    run_id: str
+    raw_root: Path
+    sources_root: Path
+    acquisition_audit_root: Path
+    execution_audit_root: Path
+    report_root: Path
+
+
+@dataclass(frozen=True)
+class _AuthorityBranch:
+    authority_relative: Path
+    contract_relative: Path
+    design_relative: Path
+    plan_relative: Path
+    amendment_relative: Path | None
+    schema_index: int
+
+
+_AUTHORITY_BRANCHES = (
+    _AuthorityBranch(
+        _RUN_SPEC_RELATIVE,
+        _ACQUISITION_CONTRACT_RELATIVE,
+        _APPROVED_DESIGN_RELATIVE,
+        _IMPLEMENTATION_PLAN_RELATIVE,
+        _PLAN_A_AMENDMENT_RELATIVE,
+        0,
+    ),
+    _AuthorityBranch(
+        _SOURCE_RUN_SPEC_RELATIVE,
+        _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        _SOURCE_APPROVED_DESIGN_RELATIVE,
+        _SOURCE_IMPLEMENTATION_PLAN_RELATIVE,
+        None,
+        1,
+    ),
+)
+
+
+_SOURCE_SUPERSEDES = {
+    "run_id": "historical_walkforward_500",
+    "run_spec_sha256": "d622bff184f0bdade22848d4b76fc43bdf9ac88c7a51513dee4a7d5f51bd1492",
+    "acquisition_contract_sha256": "cef89a1d4191ef83eb0fc2b0f4bdd191aeb8ba53cbb1bc6df73199604f23a9d9",
+    "static_batch_id": "069fd746f9c7ecb1267b7ae44f8d44a1aeb3575a92c64482dacbc5b61d8f0571",
+    "static_batch_sha256": "a6a2ac816620797b21e5bcf297fb92453f1143ed0d3d4c01effbf15c531ca39a",
+    "checkpoint_sha256": "00b8b6eae2c0ba8de17f6ed1c05f0c9ddfb98e967e9b7ef0284581cc98b5ad06",
+    "query_id": "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
+    "quarantine_receipt_sha256": "a2f26dd297fc2f0de084c857e6deb575973f147e8c9712a724d82308a9a693f8",
+    "raw_sha256": "6eeedd3877eeef18dae400dba8920dcde0cc79b3ab76b08316385868e89df1e0",
+}
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -626,14 +707,36 @@ def _load_json_object(
     )
 
 
-def _repository_root(run_spec_path: Path) -> Path:
-    absolute = Path(os.path.abspath(os.fspath(run_spec_path)))
-    if absolute.parts[-len(_RUN_SPEC_RELATIVE.parts) :] != _RUN_SPEC_RELATIVE.parts:
-        raise ValueError("RunSpec path differs from the repository contract")
-    root = absolute
-    for _ in _RUN_SPEC_RELATIVE.parts:
-        root = root.parent
-    return root
+def _authority_branch(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> tuple[Path, _AuthorityBranch]:
+    supplied_run = Path(run_spec_path)
+    supplied_contract = Path(acquisition_contract_path)
+    for supplied, label in (
+        (supplied_run, "RunSpec"),
+        (supplied_contract, "acquisition contract"),
+    ):
+        text = os.fspath(supplied)
+        if (
+            not supplied.is_absolute()
+            or "\\" in text
+            or any(part in {"", ".", ".."} for part in supplied.parts)
+            or Path(os.path.abspath(text)) != supplied
+        ):
+            raise ValueError(f"{label} path differs from the repository contract")
+    for branch in _AUTHORITY_BRANCHES:
+        if (
+            supplied_run.parts[-len(branch.authority_relative.parts) :]
+            != branch.authority_relative.parts
+        ):
+            continue
+        root = supplied_run
+        for _ in branch.authority_relative.parts:
+            root = root.parent
+        if supplied_contract != root / branch.contract_relative:
+            raise ValueError("RunSpec/acquisition contract pair differs")
+        return root, branch
+    raise ValueError("RunSpec path differs from the repository contract")
 
 
 def _read_repository_file(root: Path, relative: Path, label: str) -> bytes:
@@ -763,18 +866,26 @@ def _verify_head_blob(
 
 
 def _verify_implementation_plan_git_blob(
-    root: Path, raw: dict[str, object], contents: bytes
+    root: Path,
+    relative: Path,
+    raw: dict[str, object],
+    contents: bytes,
 ) -> None:
     _verify_head_blob(
         root,
-        _IMPLEMENTATION_PLAN_RELATIVE,
+        relative,
         contents,
         "implementation plan",
         expected_blob=raw.get("git_blob_id"),
     )
 
 
-def _verify_frozen_acquisition_schema(root: Path, contract: dict[str, object]) -> None:
+def _verify_frozen_acquisition_schema(
+    root: Path,
+    contract: dict[str, object],
+    *,
+    schema_index: int,
+) -> None:
     contents = _read_repository_file(
         root,
         _ACQUISITION_SCHEMA_RELATIVE,
@@ -785,22 +896,24 @@ def _verify_frozen_acquisition_schema(root: Path, contract: dict[str, object]) -
         "acquisition contract schema",
         canonical=True,
     )
-    required = schema.get("required")
-    properties = schema.get("properties")
+    variants = schema.get("oneOf")
     if (
-        set(schema)
-        != {
-            "$schema",
-            "additionalProperties",
-            "const",
-            "properties",
-            "required",
-            "type",
-        }
+        set(schema) != {"$schema", "oneOf"}
         or schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
-        or schema.get("additionalProperties") is not False
-        or schema.get("type") != "object"
-        or _canonical_json_bytes(schema.get("const")) != _canonical_json_bytes(contract)
+        or not isinstance(variants, list)
+        or len(variants) != len(_AUTHORITY_BRANCHES)
+        or not 0 <= schema_index < len(variants)
+        or not all(isinstance(item, dict) for item in variants)
+    ):
+        raise ValueError("acquisition contract differs from its frozen schema")
+    selected = variants[schema_index]
+    required = selected.get("required")
+    properties = selected.get("properties")
+    if (
+        selected.get("additionalProperties") is not False
+        or selected.get("type") != "object"
+        or _canonical_json_bytes(selected.get("const"))
+        != _canonical_json_bytes(contract)
         or not isinstance(required, list)
         or set(required) != set(contract)
         or len(required) != len(contract)
@@ -816,11 +929,213 @@ def _verify_frozen_acquisition_schema(root: Path, contract: dict[str, object]) -
     )
 
 
+def _namespace_relative(value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"{label} namespace path differs")
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.as_posix() != value
+    ):
+        raise ValueError(f"{label} namespace path differs")
+    return relative
+
+
+def _validate_namespace_ancestors(
+    root: Path, relative: Path, label: str
+) -> tuple[int, int] | None:
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for index, component in enumerate(relative.parts):
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ValueError(
+                    f"{label} namespace ancestors must be no-follow directories"
+                ) from exc
+            descriptors.append(child)
+            opened = os.fstat(child)
+            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (linked.st_dev, linked.st_ino)
+            ):
+                raise ValueError(f"{label} namespace directory identity differs")
+            current = child
+            if index == len(relative.parts) - 1:
+                return opened.st_dev, opened.st_ino
+        raise AssertionError("nonempty namespace path was not traversed")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return (
+        left == right
+        or left.parts[: len(right.parts)] == right.parts
+        or right.parts[: len(left.parts)] == left.parts
+    )
+
+
+def _context_roots(
+    root: Path,
+    authority: RunSpec | SourceRunSpec,
+    contract: Mapping[str, object],
+) -> tuple[Path, Path, Path, Path, Path]:
+    namespaces = authority.raw.get("namespaces")
+    canonical_roots = contract.get("canonical_roots")
+    if not isinstance(namespaces, Mapping) or not isinstance(
+        canonical_roots, Mapping
+    ):
+        raise ValueError("authority namespace bindings differ")
+    raw_relative = _namespace_relative(namespaces.get("raw"), "raw")
+    audit_relative = _namespace_relative(namespaces.get("audit"), "audit")
+    report_relative = _namespace_relative(namespaces.get("reports"), "reports")
+    sources_relative = _namespace_relative(
+        namespaces.get("sources", (raw_relative.parent / "sources").as_posix()),
+        "sources",
+    )
+    acquisition_relative = audit_relative / "acquisition"
+    execution_relative = audit_relative / "execution"
+    expected_contract_roots = {
+        "raw": raw_relative.as_posix(),
+        "sources": sources_relative.as_posix(),
+        "acquisition_audit": acquisition_relative.as_posix(),
+        "execution_audit": execution_relative.as_posix(),
+    }
+    if dict(canonical_roots) != expected_contract_roots:
+        raise ValueError("acquisition contract canonical roots differ")
+    relatives = (
+        raw_relative,
+        sources_relative,
+        acquisition_relative,
+        execution_relative,
+        report_relative,
+    )
+    for index, left in enumerate(relatives):
+        for right in relatives[index + 1 :]:
+            if _paths_overlap(left, right):
+                raise ValueError("authority namespace roots overlap")
+    identities = [
+        _validate_namespace_ancestors(root, relative, relative.as_posix())
+        for relative in relatives
+    ]
+    present = [identity for identity in identities if identity is not None]
+    if len(present) != len(set(present)):
+        raise ValueError("authority namespace roots alias")
+    return tuple(root / relative for relative in relatives)  # type: ignore[return-value]
+
+
+def _load_static_contracts(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> SourceAuthorityContext:
+    run_spec_path = Path(run_spec_path)
+    acquisition_contract_path = Path(acquisition_contract_path)
+    root, branch = _authority_branch(run_spec_path, acquisition_contract_path)
+    run_spec_contents = _read_repository_file(root, branch.authority_relative, "RunSpec")
+    run_raw = _parse_json_object(run_spec_contents, "RunSpec", canonical=True)
+    authority = (
+        parse_run_spec(run_raw)
+        if branch.schema_index == 0
+        else parse_source_run_spec(run_raw)
+    )
+    run_sha = _sha256_bytes(run_spec_contents)
+    contract_contents = _read_repository_file(
+        root,
+        branch.contract_relative,
+        "acquisition contract",
+    )
+    contract = _parse_json_object(
+        contract_contents,
+        "acquisition contract",
+        canonical=True,
+    )
+    contract_sha = _sha256_bytes(contract_contents)
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, dict):
+        raise AssertionError("validated acquisition contract bindings must be an object")
+    verified_run_spec = _verify_repository_binding(
+        root,
+        bindings.get("run_spec"),
+        expected_path=branch.authority_relative,
+        label="RunSpec",
+    )
+    if verified_run_spec != run_spec_contents:
+        raise ValueError("acquisition contract RunSpec binding differs")
+    _verify_repository_binding(
+        root,
+        bindings.get("approved_design"),
+        expected_path=branch.design_relative,
+        label="approved design",
+    )
+    plan_binding = bindings.get("implementation_plan")
+    plan_contents = _verify_repository_binding(
+        root,
+        plan_binding,
+        expected_path=branch.plan_relative,
+        label="implementation plan",
+        digest_key="working_tree_sha256",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    if not isinstance(plan_binding, dict):
+        raise AssertionError("validated implementation plan binding must be an object")
+    _verify_implementation_plan_git_blob(
+        root, branch.plan_relative, plan_binding, plan_contents
+    )
+    if branch.amendment_relative is None:
+        if set(bindings) != {
+            "approved_design",
+            "implementation_plan",
+            "run_spec",
+        } or contract.get("supersedes") != _SOURCE_SUPERSEDES:
+            raise ValueError("superseding acquisition authority differs")
+    else:
+        _verify_repository_binding(
+            root,
+            bindings.get("plan_a_amendment"),
+            expected_path=branch.amendment_relative,
+            label="Plan A amendment",
+        )
+    _verify_frozen_acquisition_schema(
+        root,
+        contract,
+        schema_index=branch.schema_index,
+    )
+    raw_root, sources_root, acquisition_root, execution_root, report_root = (
+        _context_roots(root, authority, contract)
+    )
+    return SourceAuthorityContext(
+        repository_root=root,
+        authority=authority,
+        authority_path=root / branch.authority_relative,
+        authority_sha256=run_sha,
+        acquisition_contract_path=root / branch.contract_relative,
+        acquisition_contract_sha256=contract_sha,
+        contract=deep_freeze(contract),
+        run_id=authority.run_id,
+        raw_root=raw_root,
+        sources_root=sources_root,
+        acquisition_audit_root=acquisition_root,
+        execution_audit_root=execution_root,
+        report_root=report_root,
+    )
+
+
 def _validate_run_bound_acquisition_contract(
     root: Path,
     run_spec_contents: bytes,
     contract_contents: bytes,
 ) -> tuple[dict[str, object], str, dict[str, object], str]:
+    """Existing old-authority content binding used by downstream validators."""
     run_spec = _parse_json_object(run_spec_contents, "RunSpec")
     run_sha = _sha256_bytes(run_spec_contents)
     contract = _parse_json_object(
@@ -834,58 +1149,14 @@ def _validate_run_bound_acquisition_contract(
     bindings = contract.get("bindings")
     if not isinstance(bindings, dict):
         raise ValueError("acquisition contract bindings must be an object")
-    verified_run_spec = _verify_repository_binding(
+    verified = _verify_repository_binding(
         root,
         bindings.get("run_spec"),
         expected_path=_RUN_SPEC_RELATIVE,
         label="RunSpec",
     )
-    if verified_run_spec != run_spec_contents:
+    if verified != run_spec_contents:
         raise ValueError("acquisition contract RunSpec binding differs")
-    return run_spec, run_sha, contract, contract_sha
-
-
-def _load_static_contracts(
-    run_spec_path: Path, acquisition_contract_path: Path
-) -> tuple[dict[str, object], str, dict[str, object], str]:
-    run_spec_path = Path(run_spec_path)
-    acquisition_contract_path = Path(acquisition_contract_path)
-    root = _repository_root(run_spec_path)
-    run_spec, run_sha, contract, contract_sha = (
-        _validate_run_bound_acquisition_contract(
-            root,
-            run_spec_path.read_bytes(),
-            acquisition_contract_path.read_bytes(),
-        )
-    )
-    bindings = contract["bindings"]
-    if not isinstance(bindings, dict):
-        raise AssertionError("validated acquisition contract bindings must be an object")
-    _verify_repository_binding(
-        root,
-        bindings.get("approved_design"),
-        expected_path=_APPROVED_DESIGN_RELATIVE,
-        label="approved design",
-    )
-    plan_binding = bindings.get("implementation_plan")
-    plan_contents = _verify_repository_binding(
-        root,
-        plan_binding,
-        expected_path=_IMPLEMENTATION_PLAN_RELATIVE,
-        label="implementation plan",
-        digest_key="working_tree_sha256",
-        extra_keys=frozenset({"git_blob_id"}),
-    )
-    if not isinstance(plan_binding, dict):
-        raise AssertionError("validated implementation plan binding must be an object")
-    _verify_implementation_plan_git_blob(root, plan_binding, plan_contents)
-    _verify_repository_binding(
-        root,
-        bindings.get("plan_a_amendment"),
-        expected_path=_PLAN_A_AMENDMENT_RELATIVE,
-        label="Plan A amendment",
-    )
-    _verify_frozen_acquisition_schema(root, contract)
     return run_spec, run_sha, contract, contract_sha
 
 
@@ -928,12 +1199,16 @@ def _logical_query(
     )
 
 
-def _source_contract(contract: Mapping[str, object], name: str) -> dict[str, object]:
+def _source_contract(
+    contract: Mapping[str, object], name: str
+) -> Mapping[str, object]:
     sources = contract.get("sources")
-    if not isinstance(sources, list):
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
         raise ValueError("acquisition contract sources must be a list")
     matches = [
-        item for item in sources if isinstance(item, dict) and item.get("name") == name
+        item
+        for item in sources
+        if isinstance(item, Mapping) and item.get("name") == name
     ]
     if len(matches) != 1:
         raise ValueError(f"acquisition contract must define {name} exactly once")
@@ -969,24 +1244,36 @@ def _validated_static_query_inputs(
     run_spec_path: Path,
     acquisition_contract_path: Path,
 ) -> _StaticQueryInputs:
-    run_spec, run_sha, contract, contract_sha = _load_static_contracts(
+    context = _load_static_contracts(
         run_spec_path, acquisition_contract_path
     )
+    run_spec = context.authority.raw
+    run_sha = context.authority_sha256
+    contract = context.contract
+    contract_sha = context.acquisition_contract_sha256
     bindings = contract.get("bindings")
-    if not isinstance(bindings, dict):
+    if not isinstance(bindings, Mapping):
         raise ValueError("acquisition contract bindings must be an object")
     run_binding = bindings.get("run_spec")
-    if not isinstance(run_binding, dict) or run_binding.get("sha256") != run_sha:
+    if not isinstance(run_binding, Mapping) or run_binding.get("sha256") != run_sha:
         raise ValueError("acquisition contract RunSpec binding differs")
     forbidden = contract.get("forbidden_years")
     years = contract.get("required_years")
     if (
-        years != list(range(2018, 2025))
-        or not isinstance(forbidden, list)
+        not isinstance(years, Sequence)
+        or isinstance(years, (str, bytes))
+        or tuple(years) != tuple(range(2018, 2025))
+        or not isinstance(forbidden, Sequence)
+        or isinstance(forbidden, (str, bytes))
         or 2025 not in forbidden
     ):
         raise ValueError("acquisition contract year scope differs")
-    if 2025 not in run_spec.get("forbidden_target_years", []):
+    forbidden_authority_years = (
+        run_spec.get("forbidden_target_years", [])
+        if isinstance(context.authority, RunSpec)
+        else run_spec.get("forbidden_source_years", [])
+    )
+    if 2025 not in forbidden_authority_years:
         raise ValueError("RunSpec must forbid 2025")
 
     schedule_contract = _source_contract(contract, "mlb_schedule_game_feed")
@@ -996,9 +1283,13 @@ def _validated_static_query_inputs(
     if _STATCAST_ENDPOINT not in statcast_contract.get("endpoints", []):
         raise ValueError("official Statcast endpoint differs")
     boundaries = contract.get("season_boundaries")
-    if not isinstance(boundaries, list):
+    if not isinstance(boundaries, Sequence) or isinstance(boundaries, (str, bytes)):
         raise ValueError("season boundaries must be a list")
-    by_year = {item.get("year"): item for item in boundaries if isinstance(item, dict)}
+    by_year = {
+        item.get("year"): item
+        for item in boundaries
+        if isinstance(item, Mapping)
+    }
     if set(by_year) != set(years):
         raise ValueError("season boundary years differ")
 
@@ -1537,7 +1828,10 @@ def build_schedule_reference_batch(
 ) -> QueryBatch:
     repository_root = Path(os.path.abspath(os.fspath(repository_root)))
     run_spec_path = Path(os.path.abspath(os.fspath(run_spec_path)))
-    if _repository_root(run_spec_path) != repository_root:
+    authority_root, _ = _authority_branch(
+        run_spec_path, acquisition_contract_path
+    )
+    if authority_root != repository_root:
         raise ValueError("reference RunSpec path differs from repository root")
     from .protocols import load_run_spec
     from .v52_schedule_inventory import load_verified_schedule_anchor_inventory
@@ -2951,7 +3245,7 @@ def _verify_split_evidence_root(
         _ACQUISITION_CONTRACT_RELATIVE,
         "split acquisition contract",
     )
-    _, run_spec_sha256, _, contract_sha256 = (
+    run_spec, run_spec_sha256, _, contract_sha256 = (
         _validate_run_bound_acquisition_contract(
             repository_root,
             contents,
@@ -2963,9 +3257,8 @@ def _verify_split_evidence_root(
             raise ValueError("split parent RunSpec hash binding differs")
         if contract_sha256 != parent.acquisition_contract_sha256:
             raise ValueError("split parent acquisition contract hash binding differs")
-    run_spec = _parse_json_object(contents, "split RunSpec")
     namespaces = run_spec.get("namespaces")
-    raw = namespaces.get("raw") if isinstance(namespaces, dict) else None
+    raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
     if not isinstance(raw, str):
         raise ValueError("split RunSpec raw namespace binding differs")
     raw_path = Path(raw)

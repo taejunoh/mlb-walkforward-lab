@@ -23,12 +23,21 @@ from mlb_backtest.v52_evidence import (
     logical_query_id,
 )
 from mlb_backtest.statcast import statcast_url
+from mlb_backtest.protocols import RunSpec, SourceRunSpec
 from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
+SOURCE_RUN_SPEC = (
+    ROOT
+    / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+SOURCE_CONTRACT = (
+    ROOT
+    / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
 RUN_SHA = hashlib.sha256(RUN_SPEC.read_bytes()).hexdigest()
 CONTRACT_SHA = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 
@@ -48,6 +57,18 @@ _STATCAST_AUTHORITY_FILES = (
         "2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
     ),
     Path("schemas/v5_2_acquisition_contract.schema.json"),
+    Path("protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"),
+    Path(
+        "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+    ),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+    ),
+    Path(
+        "docs/superpowers/plans/"
+        "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+    ),
 )
 
 
@@ -413,6 +434,118 @@ def _split_batches(root: Path):
 
 
 class V52QueryPlanTest(unittest.TestCase):
+    def test_static_contract_context_selects_exact_old_and_source_authorities(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            old = query_plan._load_static_contracts(
+                root / RUN_SPEC.relative_to(ROOT),
+                root / CONTRACT.relative_to(ROOT),
+            )
+            source = query_plan._load_static_contracts(
+                root / SOURCE_RUN_SPEC.relative_to(ROOT),
+                root / SOURCE_CONTRACT.relative_to(ROOT),
+            )
+
+        self.assertIsInstance(old.authority, RunSpec)
+        self.assertIsInstance(source.authority, SourceRunSpec)
+        self.assertEqual(old.run_id, "historical_walkforward_500")
+        self.assertEqual(
+            source.run_id, "historical_walkforward_500_superseding_565534"
+        )
+        self.assertEqual(old.raw_root, root / "data/v5_2_qd/historical/raw")
+        self.assertEqual(
+            source.raw_root,
+            root / "data/v5_2_qd/historical_superseding_565534/raw",
+        )
+        self.assertEqual(
+            source.sources_root,
+            root / "data/v5_2_qd/historical_superseding_565534/sources",
+        )
+        self.assertEqual(
+            source.acquisition_audit_root,
+            root / "audit/v5_2_qd/historical_superseding_565534/acquisition",
+        )
+        self.assertEqual(
+            source.execution_audit_root,
+            root / "audit/v5_2_qd/historical_superseding_565534/execution",
+        )
+        self.assertEqual(
+            source.report_root,
+            root / "reports/v5_2_qd/historical_superseding_565534",
+        )
+
+    def test_static_contract_context_rejects_old_source_cross_pairs(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            pairs = (
+                (
+                    root / RUN_SPEC.relative_to(ROOT),
+                    root / SOURCE_CONTRACT.relative_to(ROOT),
+                ),
+                (
+                    root / SOURCE_RUN_SPEC.relative_to(ROOT),
+                    root / CONTRACT.relative_to(ROOT),
+                ),
+            )
+            for run_spec_path, contract_path in pairs:
+                with self.subTest(run_spec=run_spec_path.name), self.assertRaisesRegex(
+                    ValueError, "pair|path|contract"
+                ):
+                    query_plan._load_static_contracts(run_spec_path, contract_path)
+
+    def test_static_contract_context_rejects_path_alias_and_escape_attacks(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = _statcast_authority_fixture(base)
+            source_run = root / SOURCE_RUN_SPEC.relative_to(ROOT)
+            source_contract = root / SOURCE_CONTRACT.relative_to(ROOT)
+            attacks = (
+                root
+                / "protocols/v5_2_qd/../v5_2_qd/"
+                / SOURCE_RUN_SPEC.name,
+                Path(str(source_run).replace("/protocols/", "\\protocols\\", 1)),
+                base / "outside/historical_walkforward_500_superseding_565534.json",
+            )
+            for attack in attacks:
+                with self.subTest(attack=attack), self.assertRaises(ValueError):
+                    query_plan._load_static_contracts(attack, source_contract)
+
+            saved = source_run.with_suffix(".saved")
+            source_run.rename(saved)
+            source_run.symlink_to(saved)
+            with self.assertRaisesRegex(ValueError, "no-follow|regular|alias"):
+                query_plan._load_static_contracts(source_run, source_contract)
+            source_run.unlink()
+            os.link(saved, source_run)
+            with self.assertRaisesRegex(ValueError, "unalias|alias|regular"):
+                query_plan._load_static_contracts(source_run, source_contract)
+
+    def test_static_contract_context_rejects_namespace_symlink_and_nondirectory(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        for attack in ("symlink", "file"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root = _statcast_authority_fixture(base)
+                data = root / "data"
+                if attack == "symlink":
+                    outside = base / "outside"
+                    outside.mkdir()
+                    data.symlink_to(outside, target_is_directory=True)
+                else:
+                    data.write_text("not a directory\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "namespace|directory|no-follow"):
+                    query_plan._load_static_contracts(
+                        root / SOURCE_RUN_SPEC.relative_to(ROOT),
+                        root / SOURCE_CONTRACT.relative_to(ROOT),
+                    )
+
     def test_statcast_root_builder_exposes_private_transform_and_public_authority_api(
         self,
     ):
@@ -842,14 +975,15 @@ class V52QueryPlanTest(unittest.TestCase):
     def test_static_batch_rehashes_the_bound_plan_a_amendment(self):
         from mlb_backtest.v52_query_plan import build_static_batch
 
-        contract = json.loads(CONTRACT.read_bytes())
-        contract["bindings"]["plan_a_amendment"]["sha256"] = "0" * 64
-        contents = _canonical_json_bytes(contract)
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            forged_contract = Path(directory) / "acquisition-contract.json"
-            forged_contract.write_bytes(contents)
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            run_spec = root / RUN_SPEC.relative_to(ROOT)
+            forged_contract = root / CONTRACT.relative_to(ROOT)
+            contract = json.loads(forged_contract.read_bytes())
+            contract["bindings"]["plan_a_amendment"]["sha256"] = "0" * 64
+            forged_contract.write_bytes(_canonical_json_bytes(contract))
             with self.assertRaisesRegex(ValueError, "amendment.*hash|binding"):
-                build_static_batch(RUN_SPEC, forged_contract)
+                build_static_batch(run_spec, forged_contract)
 
     def test_static_batch_rehashes_the_bound_design_and_plan(self):
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -869,16 +1003,17 @@ class V52QueryPlanTest(unittest.TestCase):
                 "implementation plan|Git|binding",
             ),
         )
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            for index, (binding, key, forged, error) in enumerate(cases):
+        for binding, key, forged, error in cases:
+            with tempfile.TemporaryDirectory() as directory:
                 with self.subTest(binding=binding, key=key):
-                    contract = json.loads(CONTRACT.read_bytes())
+                    root = _statcast_authority_fixture(Path(directory))
+                    run_spec = root / RUN_SPEC.relative_to(ROOT)
+                    forged_contract = root / CONTRACT.relative_to(ROOT)
+                    contract = json.loads(forged_contract.read_bytes())
                     contract["bindings"][binding][key] = forged
-                    contents = _canonical_json_bytes(contract)
-                    forged_contract = Path(directory) / f"contract-{index}.json"
-                    forged_contract.write_bytes(contents)
+                    forged_contract.write_bytes(_canonical_json_bytes(contract))
                     with self.assertRaisesRegex(ValueError, error):
-                        build_static_batch(RUN_SPEC, forged_contract)
+                        build_static_batch(run_spec, forged_contract)
 
     def test_static_batch_rejects_noncanonical_acquisition_contract(self):
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -893,11 +1028,13 @@ class V52QueryPlanTest(unittest.TestCase):
             ).encode("utf-8")
             + b"\n"
         )
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            noncanonical_contract = Path(directory) / "acquisition-contract.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            run_spec = root / RUN_SPEC.relative_to(ROOT)
+            noncanonical_contract = root / CONTRACT.relative_to(ROOT)
             noncanonical_contract.write_bytes(pretty)
             with self.assertRaisesRegex(ValueError, "canonical JSON"):
-                build_static_batch(RUN_SPEC, noncanonical_contract)
+                build_static_batch(run_spec, noncanonical_contract)
 
     def test_static_batch_requires_the_frozen_acquisition_contract_schema(self):
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -939,15 +1076,17 @@ class V52QueryPlanTest(unittest.TestCase):
             ("float schema version", mutate_schema_version_to_equal_float),
             ("float split limit", mutate_split_limit_to_equal_float),
         )
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            for index, (label, mutate) in enumerate(cases):
+        for label, mutate in cases:
+            with tempfile.TemporaryDirectory() as directory:
                 with self.subTest(label=label):
-                    contract = json.loads(CONTRACT.read_bytes())
+                    root = _statcast_authority_fixture(Path(directory))
+                    run_spec = root / RUN_SPEC.relative_to(ROOT)
+                    forged_contract = root / CONTRACT.relative_to(ROOT)
+                    contract = json.loads(forged_contract.read_bytes())
                     mutate(contract)
-                    forged_contract = Path(directory) / f"contract-{index}.json"
                     forged_contract.write_bytes(_canonical_json_bytes(contract))
                     with self.assertRaisesRegex(ValueError, "schema|frozen|contract"):
-                        build_static_batch(RUN_SPEC, forged_contract)
+                        build_static_batch(run_spec, forged_contract)
 
     def test_static_batch_ignores_poisoned_git_repository_environment(self):
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -965,29 +1104,21 @@ class V52QueryPlanTest(unittest.TestCase):
         self.assertTrue(batch.queries)
 
     def test_static_batch_rejects_an_uncommitted_matching_schema(self):
-        from mlb_backtest import v52_query_plan as query_plan
+        from mlb_backtest.v52_query_plan import build_static_batch
 
-        contract = json.loads(CONTRACT.read_bytes())
-        contract["response_byte_limits"]["statcast"] = 1
-        schema_path = ROOT / "schemas/v5_2_acquisition_contract.schema.json"
-        schema = json.loads(schema_path.read_bytes())
-        schema["const"] = contract
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            temporary = Path(directory)
-            forged_contract = temporary / "contract.json"
-            forged_schema = temporary / "schema.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = _statcast_authority_fixture(Path(directory))
+            run_spec = root / RUN_SPEC.relative_to(ROOT)
+            forged_contract = root / CONTRACT.relative_to(ROOT)
+            forged_schema = root / "schemas/v5_2_acquisition_contract.schema.json"
+            contract = json.loads(forged_contract.read_bytes())
+            contract["response_byte_limits"]["statcast"] = 1
+            schema = json.loads(forged_schema.read_bytes())
+            schema["oneOf"][0]["const"] = contract
             forged_contract.write_bytes(_canonical_json_bytes(contract))
             forged_schema.write_bytes(_canonical_json_bytes(schema))
-            relative_schema = forged_schema.relative_to(ROOT)
-            with (
-                mock.patch.object(
-                    query_plan,
-                    "_ACQUISITION_SCHEMA_RELATIVE",
-                    relative_schema,
-                ),
-                self.assertRaisesRegex(ValueError, "schema.*Git|blob|committed"),
-            ):
-                query_plan.build_static_batch(RUN_SPEC, forged_contract)
+            with self.assertRaisesRegex(ValueError, "schema.*Git|blob|committed"):
+                build_static_batch(run_spec, forged_contract)
 
     def test_bisect_children_bind_parent_and_cover_without_gap_or_overlap(self):
         from mlb_backtest.v52_query_plan import bisect_statcast_query
@@ -3344,7 +3475,9 @@ class V52QueryPlanTest(unittest.TestCase):
             forged_run_spec = json.loads(authenticated_run_spec)
             forged_run_spec["label"] = "forged split RunSpec"
             run_spec_path.write_bytes(_canonical_json_bytes(forged_run_spec))
-            with self.assertRaisesRegex(ValueError, "RunSpec hash binding"):
+            with self.assertRaisesRegex(
+                ValueError, "RunSpec hash binding|historical run|frozen values"
+            ):
                 query_plan.publish_split_receipt(
                     repository_root,
                     evidence_root=evidence_root,

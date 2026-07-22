@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import typing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -24,7 +25,12 @@ import jsonschema
 from jsonschema import FormatChecker
 
 from mlb_backtest.diagnostics import canonical_json_bytes
-from mlb_backtest.protocols import load_run_spec
+from mlb_backtest.protocols import (
+    RunSpec,
+    SourceRunSpec,
+    load_run_spec,
+    load_source_run_spec,
+)
 
 
 FORMAT_CHECKER = FormatChecker()
@@ -122,6 +128,23 @@ AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
 CONTRACT_RELATIVE = Path("protocols/v5_2_qd/historical_source_acquisition.json")
+SOURCE_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+SOURCE_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+SOURCE_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+)
+SOURCE_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+)
+SOURCE_EXECUTION_RELATIVE = Path(
+    "audit/v5_2_qd/historical_superseding_565534/execution"
+)
 ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
@@ -287,6 +310,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         from mlb_backtest import execution_registry
 
         self.registry = execution_registry
+        self.old_run_spec = load_run_spec(ROOT / RUN_SPEC_RELATIVE)
 
     def test_public_source_receipt_validator_requires_clean_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -417,7 +441,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             acquisition_schema = json.loads(
                 (root / ACQUISITION_SCHEMA_RELATIVE).read_bytes()
             )
-            acquisition_schema["const"] = template
+            acquisition_schema["oneOf"][0]["const"] = template
             (root / ACQUISITION_SCHEMA_RELATIVE).write_bytes(
                 canonical_json_bytes(acquisition_schema) + b"\n"
             )
@@ -425,6 +449,273 @@ class ExecutionRegistryTest(unittest.TestCase):
         _git(root, "add", *contract_paths)
         _git(root, "commit", "-qm", "fixture contract")
         return root, load_run_spec(root / RUN_SPEC_RELATIVE)
+
+    def make_source_repo(self, parent: Path) -> tuple[Path, SourceRunSpec]:
+        root = (parent / "source-repo").resolve()
+        fixture_paths = tuple(
+            dict.fromkeys(
+                (
+                    SOURCE_RUN_SPEC_RELATIVE,
+                    SOURCE_CONTRACT_RELATIVE,
+                    SOURCE_DESIGN_RELATIVE,
+                    SOURCE_PLAN_RELATIVE,
+                    ACQUISITION_SCHEMA_RELATIVE,
+                    BASELINE_RELATIVE,
+                    PROTECTED_RELATIVE,
+                    *BOUND_EXECUTION_CODE,
+                    *BOUND_SCHEMA_PATHS,
+                )
+            )
+        )
+        for relative in fixture_paths:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+        _git(root, "init", "-q")
+        _git(root, "config", "user.email", "source-registry@example.test")
+        _git(root, "config", "user.name", "Source Registry Test")
+        _git(root, "add", ".")
+        _git(root, "commit", "-qm", "source authority fixture")
+        return root, load_source_run_spec(root / SOURCE_RUN_SPEC_RELATIVE)
+
+    def test_source_authority_uses_its_audit_registry_and_terminal_phases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            state = self.registry.initialize_execution_registry(
+                root,
+                authority,
+                design_path=root / SOURCE_DESIGN_RELATIVE,
+                plan_path=root / SOURCE_PLAN_RELATIVE,
+                acquisition_contract_path=root / SOURCE_CONTRACT_RELATIVE,
+            )
+            self.assertEqual(state.phase, "DESIGN_ACCEPTED")
+            self.assertTrue(
+                any(
+                    (root / SOURCE_EXECUTION_RELATIVE / "phase_receipts").iterdir()
+                )
+            )
+            self.assertFalse(
+                (root / "audit/v5_2_qd/historical/execution").exists()
+            )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, authority), state
+            )
+            acquiring = self.registry.advance_execution_phase(
+                root,
+                authority,
+                expected_phase="DESIGN_ACCEPTED",
+                next_phase="ACQUIRING",
+                inventory_path=root / PROTECTED_RELATIVE,
+                validation_receipts=(),
+            )
+            self.assertEqual(acquiring.phase, "ACQUIRING")
+            with self.assertRaisesRegex(ValueError, "immediate next|validator"):
+                self.registry.advance_execution_phase(
+                    root,
+                    authority,
+                    expected_phase="SOURCES_READY",
+                    next_phase="OOF_SEALED",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
+
+    def test_source_receipt_validators_reject_downstream_phase_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            self.registry.initialize_execution_registry(
+                root,
+                authority,
+                design_path=root / SOURCE_DESIGN_RELATIVE,
+                plan_path=root / SOURCE_PLAN_RELATIVE,
+                acquisition_contract_path=root / SOURCE_CONTRACT_RELATIVE,
+            )
+            receipt_path = next(
+                (root / SOURCE_EXECUTION_RELATIVE / "phase_receipts").iterdir()
+            )
+            success = json.loads(receipt_path.read_bytes())
+            success.update({"sequence": 3, "phase": "OOF_SEALED"})
+            with self.assertRaisesRegex(ValueError, "receipt schema"):
+                self.registry._validate_success_receipt(success, authority)
+            quarantine = {
+                "schema_version": 1,
+                "receipt_kind": "QUARANTINED_TRANSITION",
+                "run_id": authority.run_id,
+                "attempted_phase": "OOF_SEALED",
+                "current_phase": "SOURCES_READY",
+                "current_receipt_sha256": "a" * 64,
+                "recorded_at_utc": "2026-07-21T00:00:00.000000Z",
+                "git_head": "b" * 40,
+                "run_spec": success["run_spec"],
+                "validation_receipts": [success["run_spec"]],
+            }
+            with self.assertRaisesRegex(ValueError, "receipt schema"):
+                self.registry._validate_quarantine_receipt(
+                    quarantine, authority
+                )
+
+    def test_source_run_registry_stops_at_sources_ready_and_rejects_later_phase_receipts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            state = self.registry.initialize_execution_registry(
+                root,
+                authority,
+                design_path=root / SOURCE_DESIGN_RELATIVE,
+                plan_path=root / SOURCE_PLAN_RELATIVE,
+                acquisition_contract_path=root / SOURCE_CONTRACT_RELATIVE,
+            )
+            self.assertEqual(
+                self.registry.load_execution_registry(root, authority), state
+            )
+            state = self.registry.advance_execution_phase(
+                root,
+                authority,
+                expected_phase="DESIGN_ACCEPTED",
+                next_phase="ACQUIRING",
+                inventory_path=root / PROTECTED_RELATIVE,
+                validation_receipts=(),
+            )
+            self.assertEqual(state.phase, "ACQUIRING")
+
+            quarantine_evidence = self.write_artifact(
+                root,
+                "source-quarantine-evidence.json",
+                {"status": "REJECTED"},
+            )
+            quarantine = self.registry.quarantine_execution_transition(
+                root,
+                authority,
+                attempted_phase="SOURCES_READY",
+                validation_receipts=(quarantine_evidence,),
+            )
+            self.assertTrue(quarantine.is_file())
+            self.assertEqual(
+                self.registry.load_execution_registry(root, authority).phase,
+                "ACQUIRING",
+            )
+
+            receipt_root = root / SOURCE_EXECUTION_RELATIVE / "phase_receipts"
+            quarantine_root = root / SOURCE_EXECUTION_RELATIVE / "quarantine"
+            before_receipts = sorted(path.name for path in receipt_root.iterdir())
+            before_quarantine = sorted(
+                path.name for path in quarantine_root.iterdir()
+            )
+            missing = root / "must-not-be-snapshotted.json"
+            with self.assertRaisesRegex(ValueError, "immediate next"):
+                self.registry.advance_execution_phase(
+                    root,
+                    authority,
+                    expected_phase="SOURCES_READY",
+                    next_phase="OOF_SEALED",
+                    inventory_path=missing,
+                    validation_receipts=(missing,),
+                )
+            with self.assertRaisesRegex(ValueError, "immediate next"):
+                self.registry.quarantine_execution_transition(
+                    root,
+                    authority,
+                    attempted_phase="OOF_SEALED",
+                    validation_receipts=(missing,),
+                )
+            self.assertEqual(
+                sorted(path.name for path in receipt_root.iterdir()),
+                before_receipts,
+            )
+            self.assertEqual(
+                sorted(path.name for path in quarantine_root.iterdir()),
+                before_quarantine,
+            )
+
+    def test_source_checkpoint_apis_reject_before_task6_without_path_access(
+        self,
+    ) -> None:
+        checkpoint_apis = (
+            self.registry.load_latest_acquisition_checkpoint,
+            self.registry.load_source_verification_checkpoint,
+            self.registry.load_terminal_acquisition_checkpoint,
+            self.registry.validate_sources_ready_evidence_set,
+            self.registry.publish_acquisition_checkpoint,
+            self.registry.advance_sources_ready_phase,
+        )
+        for api in checkpoint_apis:
+            with self.subTest(annotation=api.__name__):
+                self.assertIs(
+                    typing.get_type_hints(api)["run_spec"],
+                    RunSpec,
+                )
+        self.assertEqual(
+            typing.get_type_hints(self.registry.advance_execution_phase)[
+                "run_spec"
+            ],
+            self.registry.Authority,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, authority = self.make_source_repo(Path(directory))
+            missing = root / "must-not-be-read.json"
+            calls = (
+                lambda: self.registry.load_latest_acquisition_checkpoint(
+                    root, authority
+                ),
+                lambda: self.registry.load_source_verification_checkpoint(
+                    root, authority
+                ),
+                lambda: self.registry.load_terminal_acquisition_checkpoint(
+                    root, authority
+                ),
+                lambda: self.registry.validate_sources_ready_evidence_set(
+                    root,
+                    authority,
+                    inventory_path=missing,
+                    checkpoint_path=missing,
+                    validation_receipts=(missing,),
+                ),
+                lambda: self.registry.publish_acquisition_checkpoint(
+                    root,
+                    authority,
+                    expected_prior_checkpoint_sha256=None,
+                    stage="STATIC_SCHEDULES",
+                    query_batch_ids=(),
+                    completed_query_ids=(),
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                ),
+                lambda: self.registry.advance_sources_ready_phase(
+                    root,
+                    authority,
+                    inventory_path=missing,
+                    validation_receipts=(missing,),
+                    expected_checkpoint_path=missing,
+                ),
+                lambda: self.registry.advance_execution_phase(
+                    root,
+                    authority,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=missing,
+                    validation_receipts=(missing,),
+                ),
+            )
+            execution_root = root / SOURCE_EXECUTION_RELATIVE
+            self.assertFalse(execution_root.exists())
+            with patch.object(
+                self.registry,
+                "_paths",
+                side_effect=AssertionError("checkpoint API touched paths"),
+            ):
+                for call in calls:
+                    with self.subTest(runtime=call):
+                        with self.assertRaisesRegex(
+                            ValueError, "SourceRunSpec.*before Task 6"
+                        ):
+                            call()
+            self.assertFalse(execution_root.exists())
 
     def test_make_repo_owns_bound_schemas_when_execution_tuple_is_stale(self) -> None:
         without_schemas = tuple(
@@ -2108,7 +2399,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(
                 self.registry.load_terminal_acquisition_checkpoint(
                     Path("/sealed"),
-                    SimpleNamespace(),
+                    self.old_run_spec,
                 ),
                 checkpoints[-1],
             )
@@ -2134,7 +2425,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires SOURCES_READY"):
                 self.registry.load_terminal_acquisition_checkpoint(
                     Path("/sealed"),
-                    SimpleNamespace(),
+                    self.old_run_spec,
                 )
 
     def test_source_verification_loader_accepts_only_terminal_active_or_ready(
@@ -2264,7 +2555,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     loaded = (
                         self.registry.load_source_verification_checkpoint(
                             root,
-                            SimpleNamespace(),
+                            self.old_run_spec,
                         )
                     )
                     self.assertIs(loaded, checkpoint)
@@ -2378,7 +2669,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ):
                     self.registry.load_source_verification_checkpoint(
                         root,
-                        SimpleNamespace(),
+                        self.old_run_spec,
                     )
 
     def test_source_verification_loader_never_cleans_owned_failure_state(
@@ -2508,7 +2799,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             ):
                 self.registry.load_source_verification_checkpoint(
                     root,
-                    SimpleNamespace(),
+                    self.old_run_spec,
                 )
 
             self.assertTrue(
@@ -2577,7 +2868,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         ):
             self.assertIsNone(
                 self.registry.load_latest_acquisition_checkpoint(
-                    Path("/active"), SimpleNamespace()
+                    Path("/active"), self.old_run_spec
                 )
             )
             self.assertFalse(
@@ -2659,7 +2950,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ):
                     self.assertIsNone(
                         self.registry.load_latest_acquisition_checkpoint(
-                            Path("/sealed"), SimpleNamespace()
+                            Path("/sealed"), self.old_run_spec
                         )
                     )
 
