@@ -21,7 +21,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .clock import assert_feature_dates
 from .live_model_card import FrozenLiveCard
-from .live_sources import MAX_JSON_BYTES, ObservationFetcher, fetch_live_http
+from .live_sources import (
+    MAX_JSON_BYTES,
+    ObservationFetcher,
+    fetch_live_http,
+    normalize_live_root_path,
+)
 from .live_top3_contracts import (
     LiveHistoryBundle,
     LiveHttpObservation,
@@ -37,13 +42,16 @@ from .source_parsers.pitching import parse_prior_career_bf
 from .sources import MLB_BASE, parse_schedule, schedule_url, validate_schedule_query_coverage
 from .statcast import (
     MAX_STATCAST_BYTES,
+    STATCAST_ROW_CAP,
     StatcastData,
     derive_outs_recorded,
     fetch_monthly,
+    is_statcast_row_capped_manifest,
     monthly_ranges,
     parse_statcast,
 )
 from .secure_fs import (
+    RootBinding,
     TrustedRoot,
     open_parent,
     open_trusted_root,
@@ -59,6 +67,10 @@ _STATCAST_SOURCE = "baseball_savant_statcast"
 _VENUE_SOURCE = "mlb_live_history_venue"
 _ERA_SOURCE = "mlb_live_history_era"
 _CAREER_SOURCE = "mlb_live_career_bf"
+_SCHEDULE_ATTEMPT_SOURCE = "mlb_schedule_attempt"
+_STATCAST_ATTEMPT_SOURCE = "baseball_savant_statcast_attempt"
+_PLAYED_TERMINAL_STATUSES = frozenset({"Final", "Completed Early"})
+_UNPLAYED_TERMINAL_STATUSES = frozenset({"Postponed", "Canceled", "Cancelled"})
 _RETRY_DELAYS = (1, 2, 4, 8, 16)
 _LOCK_OPEN_ATTEMPTS = 16
 _HISTORY_LAYOUT_DIRECTORIES = (
@@ -95,44 +107,49 @@ def _history_root_test_hook(stage: str, root: Path) -> None:
 
 
 @contextmanager
-def _history_root_session(root: Path):
+def _history_root_session(
+    root: Path, expected_root_binding: RootBinding | None = None
+):
     """Yield one root capability kept alive for the complete public call."""
-    lexical = Path(os.path.abspath(root))
-    if len(lexical.parts) > 1:
-        top = Path(lexical.anchor) / lexical.parts[1]
-        top_stat = os.lstat(top)
-        if stat.S_ISLNK(top_stat.st_mode):
-            resolved_top = top.resolve(strict=True)
-            if not resolved_top.is_dir():
+    lexical = normalize_live_root_path(Path(root))
+    if expected_root_binding is None:
+        missing: list[str] = []
+        cursor = lexical
+        while True:
+            try:
+                current = os.lstat(cursor)
+            except FileNotFoundError:
+                if cursor == cursor.parent:
+                    raise ValueError("history root has no trusted ancestor") from None
+                missing.append(cursor.name)
+                cursor = cursor.parent
+                continue
+            if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
                 raise ValueError("history root ancestry must contain only directories")
-            lexical = resolved_top.joinpath(*lexical.parts[2:])
-    missing: list[str] = []
-    cursor = lexical
-    while True:
-        try:
-            current = os.lstat(cursor)
-        except FileNotFoundError:
-            if cursor == cursor.parent:
-                raise ValueError("history root has no trusted ancestor") from None
-            missing.append(cursor.name)
-            cursor = cursor.parent
-            continue
-        if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
-            raise ValueError("history root ancestry must contain only directories")
-        break
-    _history_root_test_hook("after_existing_root_lstat", lexical)
-    with open_trusted_root(cursor) as trusted:
-        if missing:
-            relative = Path(*reversed(missing)) / ".history-root-anchor"
-            with open_parent(trusted, relative, create=True):
-                pass
-        trusted.assert_bound()
-    absolute = cursor.joinpath(*reversed(missing))
-    with open_trusted_root(absolute) as trusted:
+            break
+        _history_root_test_hook("after_existing_root_lstat", lexical)
+        with open_trusted_root(cursor) as trusted:
+            if missing:
+                relative = Path(*reversed(missing)) / ".history-root-anchor"
+                with open_parent(trusted, relative, create=True):
+                    pass
+            trusted.assert_bound()
+    with open_trusted_root(
+        lexical, expected=expected_root_binding
+    ) as trusted:
         _prepare_history_layout_trusted(trusted)
         token = _ACTIVE_HISTORY_ROOT.set(trusted)
         try:
-            yield absolute, trusted
+            try:
+                yield lexical, trusted
+            except BaseException:
+                try:
+                    trusted.assert_bound()
+                except BaseException:
+                    pass
+                raise
+            else:
+                trusted.assert_bound()
         finally:
             _ACTIVE_HISTORY_ROOT.reset(token)
 
@@ -1233,42 +1250,419 @@ def _schedule_query(year: int, cutoff: date) -> dict[str, object]:
     }
 
 
+def _d1_schedule_coverage(
+    games: Iterable[Mapping[str, object]], cutoff: date
+) -> dict[str, object]:
+    """Return the authenticated terminal game set required from Savant at D-1."""
+    games = tuple(games)
+    played: set[int] = set()
+    unplayed: list[dict[str, object]] = []
+    incomplete: list[dict[str, object]] = []
+    for game in games:
+        if game.get("official_date") != cutoff.isoformat():
+            continue
+        game_pk = game.get("game_pk")
+        status = game.get("status")
+        if type(game_pk) is not int or game_pk <= 0 or not isinstance(status, str):
+            raise ValueError("D-1 schedule coverage differs")
+        if status in _PLAYED_TERMINAL_STATUSES:
+            played.add(game_pk)
+        elif status in _UNPLAYED_TERMINAL_STATUSES:
+            unplayed.append({"game_pk": game_pk, "status": status})
+        else:
+            incomplete.append({"game_pk": game_pk, "status": status})
+    if incomplete:
+        raise ValueError("D-1 schedule is incomplete")
+    unplayed.sort(key=lambda row: int(row["game_pk"]))
+    played_games = [
+        {
+            "game_pk": int(game["game_pk"]),
+            "doubleheader_marker": game.get("doubleheader_marker"),
+        }
+        for game in games
+        if game.get("official_date") == cutoff.isoformat()
+        and game.get("status") in _PLAYED_TERMINAL_STATUSES
+    ]
+    played_games.sort(key=lambda row: int(row["game_pk"]))
+    for row in unplayed:
+        source = next(
+            game for game in games if game.get("game_pk") == row["game_pk"]
+        )
+        row["doubleheader_marker"] = source.get("doubleheader_marker")
+    evidence = {
+        "cutoff_date": cutoff.isoformat(),
+        "played_game_pks": sorted(played),
+        "played_terminal_games": played_games,
+        "unplayed_terminal_games": unplayed,
+    }
+    return {
+        **evidence,
+        "coverage_sha256": hashlib.sha256(
+            canonical_json_bytes(evidence)
+        ).hexdigest(),
+    }
+
+
+def _parse_authoritative_history_schedule(
+    payload: bytes, start: str, cutoff: date
+) -> tuple[dict[str, object], ...]:
+    """Project validated raw schedule evidence onto the history date range."""
+    validate_schedule_query_coverage(payload, start, cutoff.isoformat())
+    authoritative = []
+    for raw_game in parse_schedule(payload):
+        game = dict(raw_game)
+        official_date = date.fromisoformat(str(game["official_date"]))
+        if official_date > cutoff:
+            if game.get("status") not in _UNPLAYED_TERMINAL_STATUSES:
+                raise ValueError("same-day leakage detected")
+            continue
+        authoritative.append(game)
+    return tuple(authoritative)
+
+
+def _persist_history_attempt(
+    store: RawStore,
+    *,
+    raw_source: str,
+    binding_role: str,
+    query: Mapping[str, object],
+    http: LiveHttpObservation,
+    outcome: str,
+    game_pks: tuple[int, ...] = (),
+) -> None:
+    attempt_query = {
+        **dict(query),
+        "attempt_outcome": outcome,
+        "attempt_payload_sha256": hashlib.sha256(http.body).hexdigest(),
+    }
+    root = _store_history_root(store)
+
+    def attempt_fetcher(_source, _url, *, max_bytes):
+        return http
+
+    _store_history_observation(
+        root,
+        store,
+        raw_source=raw_source,
+        source="savant" if binding_role == "HISTORY_STATCAST" else "stats_api",
+        binding_role=binding_role,
+        query=attempt_query,
+        game_pks=game_pks,
+        fetcher=attempt_fetcher,
+        max_bytes=(
+            MAX_STATCAST_BYTES
+            if binding_role == "HISTORY_STATCAST"
+            else MAX_JSON_BYTES
+        ),
+        sleeper=lambda _delay: None,
+    )
+
+
 def _load_or_fetch_schedule_history(
     store: RawStore, year: int, cutoff: date, *, fetcher: ObservationFetcher
-) -> tuple[tuple[dict[str, object], ...], list[SourceBinding]]:
+) -> tuple[
+    tuple[dict[str, object], ...],
+    list[SourceBinding],
+    dict[str, object],
+    LiveHttpObservation | None,
+]:
     root = _store_history_root(store)
-    query = _schedule_query(year, cutoff)
+    base_query = _schedule_query(year, cutoff)
+    candidates: list[
+        tuple[str, str, dict[str, object], dict[str, object]]
+    ] = []
+    for row in _verified_artifacts(store):
+        manifest = row["manifest"]
+        candidate_query = manifest.get("query")
+        if manifest.get("source") != _SCHEDULE_SOURCE or not isinstance(
+            candidate_query, dict
+        ):
+            continue
+        if any(
+            candidate_query.get(key) != value
+            for key, value in base_query.items()
+        ):
+            continue
+        try:
+            candidate_games = _parse_authoritative_history_schedule(
+                bytes(row["payload_bytes"]),
+                str(base_query["start"]),
+                cutoff,
+            )
+            candidate_coverage = _d1_schedule_coverage(
+                candidate_games, cutoff
+            )
+            reconciled_coverage = _statcast_coverage(
+                candidate_coverage,
+                candidate_coverage["played_game_pks"],
+            )
+        except ValueError:
+            continue
+        if (
+            candidate_query.get("coverage_sha256")
+            != reconciled_coverage["coverage_sha256"]
+            or candidate_query.get("schedule_coverage_sha256")
+            != candidate_coverage["coverage_sha256"]
+            or candidate_query.get("coverage_game_pks")
+            != candidate_coverage["played_game_pks"]
+            or candidate_query.get("revision_sha256")
+            != manifest["sha256"]
+        ):
+            continue
+        receipt_path = _receipt_path(
+            root, _observation_id("HISTORY_SCHEDULE", candidate_query)
+        )
+        receipt_prefix = _read_receipt_prefix(root, receipt_path)
+        if receipt_prefix[0] is None:
+            continue
+        candidate_binding = _binding_from_receipt(root, receipt_path)
+        if (
+            candidate_binding.binding_role != "HISTORY_SCHEDULE"
+            or candidate_binding.query_identity_json
+            != _query_json(candidate_query)
+            or candidate_binding.manifest_sha256 != row["manifest_sha256"]
+            or candidate_binding.payload_sha256 != manifest["sha256"]
+            or candidate_binding.game_pks
+        ):
+            raise ValueError("history schedule COMPLETE revision differs")
+        candidates.append(
+            (
+                str(manifest["retrieved_at_utc"]),
+                str(row["manifest_sha256"]),
+                dict(candidate_query),
+                candidate_coverage,
+            )
+        )
+    if candidates:
+        _retrieved, _manifest_sha, query, coverage = max(candidates)
+    else:
+        http = _fetch_with_retry(
+            "stats_api",
+            str(base_query["url"]),
+            fetcher,
+            MAX_JSON_BYTES,
+            time.sleep,
+        )
+        try:
+            fetched_games = _parse_authoritative_history_schedule(
+                http.body,
+                str(base_query["start"]),
+                cutoff,
+            )
+            coverage = _d1_schedule_coverage(fetched_games, cutoff)
+        except ValueError:
+            _persist_history_attempt(
+                store,
+                raw_source=_SCHEDULE_ATTEMPT_SOURCE,
+                binding_role="HISTORY_SCHEDULE",
+                query=base_query,
+                http=http,
+                outcome="D1_SCHEDULE_INCOMPLETE",
+            )
+            raise
+        _persist_history_attempt(
+            store,
+            raw_source=_SCHEDULE_ATTEMPT_SOURCE,
+            binding_role="HISTORY_SCHEDULE",
+            query=base_query,
+            http=http,
+            outcome="D1_SCHEDULE_TERMINAL_CANDIDATE",
+            game_pks=tuple(coverage["played_game_pks"]),
+        )
+        if not fetched_games:
+            raise ValueError("history schedule contains no regular-season games")
+        return fetched_games, [], coverage, http
     payload, _binding = _store_history_observation(
         root, store, raw_source=_SCHEDULE_SOURCE, source="stats_api",
-        binding_role="HISTORY_SCHEDULE", query=query, game_pks=(), fetcher=fetcher,
+        binding_role="HISTORY_SCHEDULE", query=query,
+        game_pks=(),
+        fetcher=fetcher,
     )
-    validate_schedule_query_coverage(payload, str(query["start"]), str(query["end"]))
-    games = tuple(dict(row) for row in parse_schedule(payload))
+    games = _parse_authoritative_history_schedule(
+        payload, str(query["start"]), cutoff
+    )
     if not games:
         raise ValueError("history schedule contains no regular-season games")
-    if any(date.fromisoformat(str(row["official_date"])) > cutoff for row in games):
-        raise ValueError("same-day leakage detected")
-    return games, [_binding]
+    coverage = _d1_schedule_coverage(games, cutoff)
+    if _binding.game_pks:
+        raise ValueError("history schedule coverage binding differs")
+    return games, [_binding], coverage, None
+
+
+def _promote_reconciled_schedule_history(
+    store: RawStore,
+    year: int,
+    cutoff: date,
+    coverage: Mapping[str, object],
+    reconciled_coverage: Mapping[str, object],
+    http: LiveHttpObservation,
+) -> SourceBinding:
+    """Publish a schedule revision only after exact Statcast reconciliation."""
+    _require_statcast_d1_game_pks(
+        reconciled_coverage["statcast_game_pks"], coverage
+    )
+    expected = _statcast_coverage(
+        coverage, reconciled_coverage["statcast_game_pks"]
+    )
+    if expected["coverage_sha256"] != reconciled_coverage["coverage_sha256"]:
+        raise ValueError("reconciled D-1 coverage differs")
+    query = {
+        **_schedule_query(year, cutoff),
+        "schedule_coverage_sha256": coverage["coverage_sha256"],
+        "coverage_sha256": reconciled_coverage["coverage_sha256"],
+        "coverage_game_pks": reconciled_coverage["statcast_game_pks"],
+        "revision_sha256": hashlib.sha256(http.body).hexdigest(),
+    }
+
+    def admitted_fetcher(_source, _url, *, max_bytes):
+        return http
+
+    root = _store_history_root(store)
+    payload, binding = _store_history_observation(
+        root,
+        store,
+        raw_source=_SCHEDULE_SOURCE,
+        source="stats_api",
+        binding_role="HISTORY_SCHEDULE",
+        query=query,
+        game_pks=(),
+        fetcher=admitted_fetcher,
+    )
+    promoted_games = _parse_authoritative_history_schedule(
+        payload, str(query["start"]), cutoff
+    )
+    promoted_coverage = _d1_schedule_coverage(promoted_games, cutoff)
+    if (
+        promoted_coverage["coverage_sha256"] != coverage["coverage_sha256"]
+        or binding.game_pks
+    ):
+        raise ValueError("promoted history schedule coverage differs")
+    return binding
 
 
 class _RecordingByteFetcher:
-    def __init__(self, target: date, fetcher: ObservationFetcher):
+    def __init__(
+        self,
+        target: date,
+        fetcher: ObservationFetcher,
+        store: RawStore,
+        coverage: Mapping[str, object],
+    ):
         self.target = target
         self.fetcher = fetcher
+        self.store = store
+        self.coverage = coverage
         self.observations: dict[str, LiveHttpObservation] = {}
 
     def __call__(self, url: str, *, max_bytes: int) -> bytes:
         http = _http_for("savant", url, self.fetcher, max_bytes)
-        parsed = parse_statcast(http.body)
-        if any(date.fromisoformat(str(row["game_date"])) >= self.target for row in parsed.pitches):
+        cutoff = self.target - timedelta(days=1)
+        try:
+            parsed = parse_statcast(http.body)
+        except ValueError:
+            _persist_history_attempt(
+                self.store,
+                raw_source=_STATCAST_ATTEMPT_SOURCE,
+                binding_role="HISTORY_STATCAST",
+                query={
+                    "url": url,
+                    "as_of_date": cutoff.isoformat(),
+                    "schedule_coverage_sha256": self.coverage["coverage_sha256"],
+                },
+                http=http,
+                outcome="STATCAST_MALFORMED",
+            )
+            raise
+        actual_game_pks = {
+            int(row["game_pk"])
+            for row in parsed.pitches
+            if row["game_date"] == cutoff.isoformat()
+        }
+        expected_game_pks = set(self.coverage["played_game_pks"])
+        checks_cutoff = cutoff.isoformat() in url
+        row_capped = (
+            sum(bool(line.strip()) for line in http.body.splitlines()) - 1
+            >= STATCAST_ROW_CAP
+        )
+        same_day_leakage = any(
+            date.fromisoformat(str(row["game_date"])) >= self.target
+            for row in parsed.pitches
+        )
+        outcome = (
+            "SAME_DAY_LEAKAGE"
+            if same_day_leakage
+            else (
+                "STATCAST_ROW_CAP_SPLIT_REQUIRED"
+                if row_capped
+                else (
+                    "COMPLETE_CANDIDATE"
+                    if not checks_cutoff or actual_game_pks == expected_game_pks
+                    else "STATCAST_D1_COVERAGE_DIFFERS"
+                )
+            )
+        )
+        _persist_history_attempt(
+            self.store,
+            raw_source=_STATCAST_ATTEMPT_SOURCE,
+            binding_role="HISTORY_STATCAST",
+            query={
+                "url": url,
+                "as_of_date": cutoff.isoformat(),
+                "schedule_coverage_sha256": self.coverage["coverage_sha256"],
+            },
+            http=http,
+            outcome=outcome,
+            game_pks=tuple(sorted(actual_game_pks)),
+        )
+        if same_day_leakage:
             raise ValueError("same-day leakage detected")
+        if checks_cutoff and not row_capped:
+            try:
+                _require_statcast_d1_game_pks(actual_game_pks, self.coverage)
+            except ValueError:
+                # A terminal played game with zero Savant rows is incomplete;
+                # there is intentionally no zero-pitch exception.
+                raise
         self.observations[url] = http
         return http.body
 
 
-def _statcast_query_with_asof(query: Mapping[str, object], cutoff: date) -> dict[str, object]:
+def _statcast_coverage(
+    schedule_coverage: Mapping[str, object],
+    actual_game_pks: Iterable[int],
+) -> dict[str, object]:
+    actual = sorted(set(actual_game_pks))
+    evidence = {
+        "cutoff_date": schedule_coverage["cutoff_date"],
+        "played_terminal_games": schedule_coverage["played_terminal_games"],
+        "unplayed_terminal_games": schedule_coverage["unplayed_terminal_games"],
+        "statcast_game_pks": actual,
+    }
+    return {
+        "played_game_pks": list(schedule_coverage["played_game_pks"]),
+        "statcast_game_pks": actual,
+        "coverage_sha256": hashlib.sha256(
+            canonical_json_bytes(evidence)
+        ).hexdigest(),
+    }
+
+
+def _require_statcast_d1_game_pks(
+    actual_game_pks: Iterable[int], coverage: Mapping[str, object]
+) -> None:
+    if set(actual_game_pks) != set(coverage["played_game_pks"]):
+        raise ValueError("Statcast D-1 coverage differs")
+
+
+def _statcast_query_with_asof(
+    query: Mapping[str, object],
+    cutoff: date,
+    coverage: Mapping[str, object],
+) -> dict[str, object]:
     result = dict(query)
     result["as_of_date"] = cutoff.isoformat()
+    result["coverage_sha256"] = coverage["coverage_sha256"]
+    result["coverage_game_pks"] = coverage["statcast_game_pks"]
     return result
 
 
@@ -1278,13 +1672,14 @@ def _persist_statcast_binding(
     cutoff: date,
     recorder: _RecordingByteFetcher,
     sleeper: Callable[[float], None],
+    coverage: Mapping[str, object],
 ) -> SourceBinding:
     query = row["manifest"]["query"]
-    receipt_query = _statcast_query_with_asof(query, cutoff)
+    receipt_query = _statcast_query_with_asof(query, cutoff, coverage)
     observation_id = _observation_id("HISTORY_STATCAST", receipt_query)
     with _receipt_publication_lock(root, observation_id):
         return _persist_statcast_binding_locked(
-            root, row, cutoff, recorder, sleeper
+            root, row, cutoff, recorder, sleeper, coverage
         )
 
 
@@ -1294,15 +1689,16 @@ def _persist_statcast_binding_locked(
     cutoff: date,
     recorder: _RecordingByteFetcher,
     sleeper: Callable[[float], None],
+    coverage: Mapping[str, object],
 ) -> SourceBinding:
     """Bind a cached Statcast artifact to this cutoff using persisted HTTP metadata."""
     query = row["manifest"]["query"]
-    receipt_query = _statcast_query_with_asof(query, cutoff)
+    receipt_query = _statcast_query_with_asof(query, cutoff, coverage)
     receipt_path = _receipt_path(root, _observation_id("HISTORY_STATCAST", receipt_query))
     prefix = _read_receipt_prefix(root, receipt_path)
     if prefix[0] is not None:
         binding = _binding_from_receipt_locked(root, receipt_path)
-        _validate_statcast_binding(root, binding, row, receipt_query)
+        _validate_statcast_binding(root, binding, row, receipt_query, coverage)
         return binding
     observed = recorder.observations.get(str(query["url"]))
     if observed is None:
@@ -1360,7 +1756,7 @@ def _persist_statcast_binding_locked(
     }
     _complete_receipt_prefix_locked(root, receipt_path, receipt)
     binding = _binding_from_receipt_locked(root, receipt_path)
-    _validate_statcast_binding(root, binding, row, receipt_query)
+    _validate_statcast_binding(root, binding, row, receipt_query, coverage)
     return binding
 
 
@@ -1369,6 +1765,7 @@ def _validate_statcast_binding(
     binding: SourceBinding,
     row: Mapping[str, object],
     receipt_query: Mapping[str, object],
+    coverage: Mapping[str, object],
 ) -> None:
     payload_path = Path(row["payload_path"])
     payload = bytes(row["payload_bytes"])
@@ -1377,6 +1774,8 @@ def _validate_statcast_binding(
         binding.source != "savant"
         or binding.binding_role != "HISTORY_STATCAST"
         or binding.game_pks
+        or receipt_query.get("coverage_game_pks")
+        != coverage["statcast_game_pks"]
         or binding.observation_id != expected_observation_id
         or binding.query_identity_json != _query_json(receipt_query)
         or binding.requested_url != row["manifest"]["query"]["url"]
@@ -1391,7 +1790,8 @@ def _validate_statcast_binding(
 def _load_or_fetch_statcast(
     store: RawStore, opening: date, cutoff: date, *, fetcher: ObservationFetcher,
     sleeper: Callable[[float], None],
-) -> tuple[StatcastData, list[SourceBinding]]:
+    coverage: Mapping[str, object],
+) -> tuple[StatcastData, list[SourceBinding], dict[str, object]]:
     if opening > cutoff:
         raise ValueError("season opening date follows D-1 cutoff")
     target = cutoff + timedelta(days=1)
@@ -1406,7 +1806,7 @@ def _load_or_fetch_statcast(
         json.dumps(row["manifest"]["query"], sort_keys=True, separators=(",", ":")): row["manifest"]["sha256"]
         for row in catalog if row["manifest"].get("source") == _STATCAST_SOURCE
     }
-    recorder = _RecordingByteFetcher(target, fetcher)
+    recorder = _RecordingByteFetcher(target, fetcher, store, coverage)
     expected_days = {
         opening + timedelta(days=index)
         for index in range((cutoff - opening).days + 1)
@@ -1416,6 +1816,8 @@ def _load_or_fetch_statcast(
         manifest = row["manifest"]
         query = manifest.get("query")
         if manifest.get("source") != _STATCAST_SOURCE or not isinstance(query, dict):
+            continue
+        if is_statcast_row_capped_manifest(manifest):
             continue
         try:
             first, last = date.fromisoformat(query["start"]), date.fromisoformat(query["end"])
@@ -1452,6 +1854,8 @@ def _load_or_fetch_statcast(
         query = manifest.get("query")
         if manifest.get("source") != _STATCAST_SOURCE or not isinstance(query, dict):
             continue
+        if is_statcast_row_capped_manifest(manifest):
+            continue
         if set(query) != {"start", "end", "game_type", "url"} or query.get("game_type") != "R":
             continue
         first, last = date.fromisoformat(query["start"]), date.fromisoformat(query["end"])
@@ -1477,14 +1881,23 @@ def _load_or_fetch_statcast(
         if any(date.fromisoformat(str(item["game_date"])) >= target for item in parsed.pitches):
             raise ValueError("same-day leakage detected")
         pitches.extend(parsed.pitches)
+    actual_cutoff_game_pks = {
+        int(row["game_pk"])
+        for row in pitches
+        if row["game_date"] == cutoff.isoformat()
+    }
+    _require_statcast_d1_game_pks(actual_cutoff_game_pks, coverage)
+    final_coverage = _statcast_coverage(coverage, actual_cutoff_game_pks)
     bindings = [
-        _persist_statcast_binding(root, row, cutoff, recorder, sleeper)
+        _persist_statcast_binding(
+            root, row, cutoff, recorder, sleeper, final_coverage
+        )
         for row in sorted(selected, key=lambda value: str(value["manifest"]["query"]["start"]))
     ]
     parsed_all = StatcastData(tuple(pitches), tuple())
     by_game = {int(game_pk): game for game_pk, game in _schedule_games_by_pk_from_statcast(pitches).items()}
     del by_game  # Explicitly retain all raw rows; schedule validation happens below.
-    return parsed_all, bindings
+    return parsed_all, bindings, final_coverage
 
 
 def _schedule_games_by_pk_from_statcast(pitches: Iterable[Mapping[str, object]]) -> dict[int, str]:
@@ -1630,8 +2043,11 @@ def build_live_history(
     root: Path, target_date: str, card: FrozenLiveCard, *,
     fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
+    expected_root_binding: RootBinding | None = None,
 ) -> LiveHistoryBundle:
-    with _history_root_session(Path(root)) as (bound_root, trusted):
+    with _history_root_session(
+        Path(root), expected_root_binding
+    ) as (bound_root, trusted):
         return _build_live_history_bound(
             bound_root,
             trusted,
@@ -1656,9 +2072,45 @@ def _build_live_history_bound(
         raise ValueError("card must be a FrozenLiveCard")
     cutoff = target - timedelta(days=1)
     store = _CapabilityRawStore(root, trusted)
-    schedule, schedule_bindings = _load_or_fetch_schedule_history(store, target.year, cutoff, fetcher=fetcher)
+    (
+        schedule,
+        schedule_bindings,
+        d1_coverage,
+        provisional_schedule_http,
+    ) = _load_or_fetch_schedule_history(
+        store, target.year, cutoff, fetcher=fetcher
+    )
     opening = min(date.fromisoformat(str(row["official_date"])) for row in schedule)
-    raw_statcast, statcast_bindings = _load_or_fetch_statcast(store, opening, cutoff, fetcher=fetcher, sleeper=sleeper)
+    raw_statcast, statcast_bindings, reconciled_coverage = _load_or_fetch_statcast(
+        store,
+        opening,
+        cutoff,
+        fetcher=fetcher,
+        sleeper=sleeper,
+        coverage=d1_coverage,
+    )
+    if schedule_bindings:
+        schedule_identity = json.loads(
+            schedule_bindings[0].query_identity_json
+        )
+        if (
+            schedule_identity.get("coverage_sha256")
+            != reconciled_coverage["coverage_sha256"]
+        ):
+            raise ValueError("history schedule/Statcast coverage differs")
+    else:
+        if provisional_schedule_http is None:
+            raise RuntimeError("provisional history schedule evidence is missing")
+        schedule_bindings = [
+            _promote_reconciled_schedule_history(
+                store,
+                target.year,
+                cutoff,
+                d1_coverage,
+                reconciled_coverage,
+                provisional_schedule_http,
+            )
+        ]
     # The Statcast data is date-safe before any schedule/result construction.
     assert_feature_dates(target_date, (str(row["game_date"]) for row in raw_statcast.pitches))
     team_map = derive_team_code_map(schedule, raw_statcast, target.year).mapping
@@ -1711,8 +2163,11 @@ def load_live_career_bf(
     root: Path, target_date: str, pitcher_ids: Iterable[int], *,
     fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
+    expected_root_binding: RootBinding | None = None,
 ) -> tuple[Mapping[int, int], tuple[SourceBinding, ...]]:
-    with _history_root_session(Path(root)) as (bound_root, trusted):
+    with _history_root_session(
+        Path(root), expected_root_binding
+    ) as (bound_root, trusted):
         return _load_live_career_bf_bound(
             bound_root,
             trusted,

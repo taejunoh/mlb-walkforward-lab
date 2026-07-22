@@ -20,9 +20,13 @@ from mlb_backtest.live_history import (
     load_live_career_bf,
 )
 from mlb_backtest import live_history
+from mlb_backtest.live_features import prepare_live_feature_history
 from mlb_backtest.live_model_card import FrozenLiveCard
+from mlb_backtest.live_sources import normalize_live_root_path
 from mlb_backtest.live_top3_contracts import LiveHttpObservation
 from mlb_backtest.manifest import RawStore
+from mlb_backtest.secure_fs import open_trusted_root
+from mlb_backtest.statcast import STATCAST_ROW_CAP, statcast_url
 
 
 def _career_payload() -> bytes:
@@ -133,6 +137,64 @@ def _history_statcast(days=("2026-07-20",), *, poison_target_day=False) -> bytes
     if poison_target_day:
         row = dict(template)
         row.update({"game_date": "2026-07-21", "game_pk": "999999", "home_team": "H00", "away_team": "A00"})
+        writer.writerow(row)
+    return output.getvalue().encode()
+
+
+def _schedule_status(body: bytes, game_index: int, status: str) -> bytes:
+    payload = json.loads(body)
+    games = [
+        game
+        for day in payload["dates"]
+        for game in day["games"]
+    ]
+    games[game_index]["status"]["detailedState"] = status
+    return json.dumps(payload).encode()
+
+
+def _schedule_with_moved_postponed_game(
+    body: bytes, *, moved_game_pks: tuple[int, ...]
+) -> bytes:
+    payload = json.loads(body)
+    for index, moved_game_pk in enumerate(moved_game_pks):
+        moved = json.loads(
+            json.dumps(payload["dates"][0]["games"][index])
+        )
+        moved["gamePk"] = moved_game_pk
+        moved["officialDate"] = "2026-07-21"
+        moved["gameDate"] = "2026-07-21T19:00:00Z"
+        moved["status"]["detailedState"] = "Postponed"
+        moved.pop("linescore", None)
+        for side in ("away", "home"):
+            moved["teams"][side].pop("score", None)
+            moved["teams"][side].pop("isWinner", None)
+        payload["dates"][0]["games"].append(moved)
+    return json.dumps(payload).encode()
+
+
+def _statcast_without_game(body: bytes, game_pk: int) -> bytes:
+    stream = io.StringIO(body.decode())
+    reader = csv.DictReader(stream)
+    rows = [row for row in reader if int(row["game_pk"]) != game_pk]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=reader.fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode()
+
+
+def _statcast_with_unique_game_rows(game_day: str, row_count: int) -> bytes:
+    stream = io.StringIO(_history_statcast((game_day,)).decode())
+    reader = csv.DictReader(stream)
+    template = next(reader)
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output, fieldnames=reader.fieldnames, lineterminator="\n"
+    )
+    writer.writeheader()
+    for index in range(row_count):
+        row = dict(template)
+        row["game_pk"] = str(1_000_000 + index)
         writer.writerow(row)
     return output.getvalue().encode()
 
@@ -312,6 +374,765 @@ class LiveHistoryTests(unittest.TestCase):
                 self.assertTrue(swapped)
                 self.assertEqual(tuple(outside.iterdir()), outside_before)
 
+    def test_expected_binding_rejects_replacement_before_history_layout_or_fetch(self):
+        for api_name in ("career", "history"):
+            with self.subTest(api_name=api_name), tempfile.TemporaryDirectory(
+                dir=Path.cwd()
+            ) as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                moved = base / "moved-root"
+                replacement = base / "replacement"
+                root.mkdir()
+                replacement.mkdir()
+                with open_trusted_root(root) as trusted:
+                    expected = trusted.binding
+                root.rename(moved)
+                replacement.rename(root)
+
+                with self.assertRaises(ValueError):
+                    if api_name == "career":
+                        load_live_career_bf(
+                            root,
+                            "2026-07-21",
+                            [10],
+                            expected_root_binding=expected,
+                            fetcher=lambda *_args, **_kwargs: self.fail(
+                                "replacement root must fail before fetch"
+                            ),
+                        )
+                    else:
+                        build_live_history(
+                            root,
+                            "2026-07-21",
+                            _card(),
+                            expected_root_binding=expected,
+                            fetcher=lambda *_args, **_kwargs: self.fail(
+                                "replacement root must fail before fetch"
+                            ),
+                            sleeper=lambda _delay: None,
+                        )
+                self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_expected_binding_rejects_replacement_during_history_fetch_prewrite(self):
+        for api_name in ("career", "history"):
+            with self.subTest(api_name=api_name), tempfile.TemporaryDirectory(
+                dir=Path.cwd()
+            ) as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                moved = base / "moved-root"
+                replacement = base / "replacement"
+                root.mkdir()
+                replacement.mkdir()
+                with open_trusted_root(root) as trusted:
+                    expected = trusted.binding
+                swapped = False
+                history_fetcher = _history_fetcher()
+
+                def fetcher(source, url, *, max_bytes):
+                    nonlocal swapped
+                    if not swapped:
+                        swapped = True
+                        root.rename(moved)
+                        replacement.rename(root)
+                    if api_name == "career":
+                        return _http(url, _career_payload())
+                    return history_fetcher(source, url, max_bytes=max_bytes)
+
+                with self.assertRaises(ValueError):
+                    if api_name == "career":
+                        load_live_career_bf(
+                            root,
+                            "2026-07-21",
+                            [10],
+                            expected_root_binding=expected,
+                            fetcher=fetcher,
+                        )
+                    else:
+                        build_live_history(
+                            root,
+                            "2026-07-21",
+                            _card(),
+                            expected_root_binding=expected,
+                            fetcher=fetcher,
+                            sleeper=lambda _delay: None,
+                        )
+                self.assertTrue(swapped)
+                self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_history_root_revalidation_preserves_original_body_exception(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            with open_trusted_root(root) as trusted:
+                expected = trusted.binding
+
+            def swap_then_fail(*_args, **_kwargs):
+                root.rename(moved)
+                replacement.rename(root)
+                raise RuntimeError("history fetch sentinel")
+
+            with self.assertRaisesRegex(RuntimeError, "history fetch sentinel"):
+                load_live_career_bf(
+                    root,
+                    "2026-07-21",
+                    [10],
+                    expected_root_binding=expected,
+                    fetcher=swap_then_fail,
+                )
+            self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_history_session_rejects_root_rename_after_bound_result_construction(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            replacement = base / "replacement"
+            root.mkdir()
+            replacement.mkdir()
+            with open_trusted_root(root) as trusted:
+                expected = trusted.binding
+
+            def swap_then_return(*_args, **_kwargs):
+                root.rename(moved)
+                replacement.rename(root)
+                return {}, ()
+
+            with mock.patch.object(
+                live_history,
+                "_load_live_career_bf_bound",
+                side_effect=swap_then_return,
+            ):
+                with self.assertRaises(ValueError):
+                    load_live_career_bf(
+                        root,
+                        "2026-07-21",
+                        [10],
+                        expected_root_binding=expected,
+                    )
+            self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_expected_binding_accepts_normalized_default_temporary_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            normalized = normalize_live_root_path(root)
+            with open_trusted_root(normalized) as trusted:
+                expected = trusted.binding
+            values, bindings = load_live_career_bf(
+                root,
+                "2026-07-21",
+                [10],
+                expected_root_binding=expected,
+                fetcher=lambda _source, url, *, max_bytes: _http(
+                    url, _career_payload()
+                ),
+            )
+        self.assertEqual(values, {10: 123})
+        self.assertEqual(bindings[0].binding_role, "CAREER_BF")
+
+    def test_d1_coverage_policy_handles_complete_doubleheader_and_unplayed_games(self):
+        cutoff = date.fromisoformat("2026-07-20")
+        games = [
+            {
+                "game_pk": 1,
+                "official_date": cutoff.isoformat(),
+                "status": "Final",
+                "doubleheader_marker": "GAME1",
+            },
+            {
+                "game_pk": 2,
+                "official_date": cutoff.isoformat(),
+                "status": "Completed Early",
+                "doubleheader_marker": "GAME2",
+            },
+            {
+                "game_pk": 3,
+                "official_date": cutoff.isoformat(),
+                "status": "Postponed",
+                "doubleheader_marker": None,
+            },
+            {
+                "game_pk": 4,
+                "official_date": cutoff.isoformat(),
+                "status": "Cancelled",
+                "doubleheader_marker": None,
+            },
+            {
+                "game_pk": 5,
+                "official_date": cutoff.isoformat(),
+                "status": "Canceled",
+                "doubleheader_marker": None,
+            },
+        ]
+
+        coverage = live_history._d1_schedule_coverage(games, cutoff)
+
+        self.assertEqual(coverage["played_game_pks"], [1, 2])
+        self.assertEqual(
+            coverage["unplayed_terminal_games"],
+            [
+                {
+                    "game_pk": 3,
+                    "status": "Postponed",
+                    "doubleheader_marker": None,
+                },
+                {
+                    "game_pk": 4,
+                    "status": "Cancelled",
+                    "doubleheader_marker": None,
+                },
+                {
+                    "game_pk": 5,
+                    "status": "Canceled",
+                    "doubleheader_marker": None,
+                },
+            ],
+        )
+        self.assertEqual(len(coverage["coverage_sha256"]), 64)
+
+    def test_d1_coverage_rejects_west_coast_game_still_in_progress(self):
+        for status in ("In Progress", "Delayed", "Suspended"):
+            with self.subTest(status=status), self.assertRaisesRegex(
+                ValueError, "D-1 schedule is incomplete"
+            ):
+                live_history._d1_schedule_coverage(
+                    [
+                        {
+                            "game_pk": 1,
+                            "official_date": "2026-07-20",
+                            "status": status,
+                        }
+                    ],
+                    date.fromisoformat("2026-07-20"),
+                )
+
+    def test_statcast_d1_coverage_rejects_missing_zero_pitch_and_unexpected_games(self):
+        coverage = {"played_game_pks": [1, 2]}
+        for actual in ({1}, {1, 2, 3}, set()):
+            with self.subTest(actual=actual), self.assertRaisesRegex(
+                ValueError, "Statcast D-1 coverage differs"
+            ):
+                live_history._require_statcast_d1_game_pks(actual, coverage)
+
+    def test_capped_cutoff_parent_is_recorded_then_split_before_d1_coverage(self):
+        opening = date.fromisoformat("2026-07-01")
+        cutoff = date.fromisoformat("2026-07-20")
+        capped = _statcast_with_unique_game_rows("2026-07-19", STATCAST_ROW_CAP)
+        self.assertEqual(
+            len(live_history.parse_statcast(capped).pitches), STATCAST_ROW_CAP
+        )
+        expected_game_pks = [
+            900000 + (cutoff.toordinal() % 1000) * 100 + index
+            for index in range(15)
+        ]
+        coverage = live_history._d1_schedule_coverage(
+            [
+                {
+                    "game_pk": game_pk,
+                    "official_date": cutoff.isoformat(),
+                    "status": "Final",
+                    "doubleheader_marker": None,
+                }
+                for game_pk in expected_game_pks
+            ],
+            cutoff,
+        )
+        calls = []
+
+        def fetcher(source, url, *, max_bytes):
+            self.assertEqual(source, "savant")
+            query = parse_qs(urlsplit(url).query)
+            requested = (
+                query["game_date_gt"][0],
+                query["game_date_lt"][0],
+            )
+            calls.append(requested)
+            if requested == ("2026-07-01", "2026-07-20"):
+                return _http(url, capped)
+            if requested == ("2026-07-01", "2026-07-10"):
+                return _http(url, _history_statcast(("2026-07-01",)))
+            if requested == ("2026-07-11", "2026-07-20"):
+                return _http(url, _history_statcast(("2026-07-20",)))
+            self.fail(f"unexpected Statcast range {requested}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with live_history._history_root_session(root) as (bound_root, trusted):
+                store = live_history._CapabilityRawStore(bound_root, trusted)
+                parsed, bindings, reconciled = live_history._load_or_fetch_statcast(
+                    store,
+                    opening,
+                    cutoff,
+                    fetcher=fetcher,
+                    sleeper=lambda _delay: None,
+                    coverage=coverage,
+                )
+            attempt_manifests = [
+                json.loads(path.read_text())
+                for path in (
+                    root
+                    / "data/experimental_daily/history_cache"
+                    / "baseball_savant_statcast_attempt"
+                ).glob("*.manifest.json")
+            ]
+
+        self.assertEqual(
+            calls,
+            [
+                ("2026-07-01", "2026-07-20"),
+                ("2026-07-01", "2026-07-10"),
+                ("2026-07-11", "2026-07-20"),
+            ],
+        )
+        self.assertEqual(len(bindings), 2)
+        self.assertEqual(
+            reconciled["statcast_game_pks"], expected_game_pks
+        )
+        self.assertEqual(
+            {
+                int(row["game_pk"])
+                for row in parsed.pitches
+                if row["game_date"] == cutoff.isoformat()
+            },
+            set(expected_game_pks),
+        )
+        capped_attempts = [
+            manifest
+            for manifest in attempt_manifests
+            if manifest["sha256"] == hashlib.sha256(capped).hexdigest()
+        ]
+        self.assertEqual(len(capped_attempts), 1)
+        self.assertEqual(capped_attempts[0]["row_count"], STATCAST_ROW_CAP + 1)
+        self.assertEqual(
+            capped_attempts[0]["query"]["attempt_outcome"],
+            "STATCAST_ROW_CAP_SPLIT_REQUIRED",
+        )
+
+    def _assert_preexisting_capped_canonical_parent_is_split_and_never_bound(
+        self, data_row_count
+    ):
+        opening = date.fromisoformat("2026-07-01")
+        cutoff = date.fromisoformat("2026-07-20")
+        capped = _statcast_with_unique_game_rows("2026-07-19", data_row_count)
+        expected_game_pks = [
+            900000 + (cutoff.toordinal() % 1000) * 100 + index
+            for index in range(15)
+        ]
+        coverage = live_history._d1_schedule_coverage(
+            [
+                {
+                    "game_pk": game_pk,
+                    "official_date": cutoff.isoformat(),
+                    "status": "Final",
+                    "doubleheader_marker": None,
+                }
+                for game_pk in expected_game_pks
+            ],
+            cutoff,
+        )
+        calls = []
+
+        def fetcher(source, url, *, max_bytes):
+            self.assertEqual(source, "savant")
+            query = parse_qs(urlsplit(url).query)
+            requested = (
+                query["game_date_gt"][0],
+                query["game_date_lt"][0],
+            )
+            calls.append(requested)
+            if requested == ("2026-07-01", "2026-07-10"):
+                return _http(url, _history_statcast(("2026-07-01",)))
+            if requested == ("2026-07-11", "2026-07-20"):
+                return _http(url, _history_statcast(("2026-07-20",)))
+            self.fail(f"capped canonical parent must not refetch {requested}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with live_history._history_root_session(root) as (bound_root, trusted):
+                store = live_history._CapabilityRawStore(bound_root, trusted)
+                capped_artifact = store.put_unique_query(
+                    live_history._STATCAST_SOURCE,
+                    {
+                        "start": opening.isoformat(),
+                        "end": cutoff.isoformat(),
+                        "game_type": "R",
+                        "url": statcast_url(
+                            opening.isoformat(), cutoff.isoformat()
+                        ),
+                    },
+                    capped,
+                )
+                parsed, bindings, reconciled = live_history._load_or_fetch_statcast(
+                    store,
+                    opening,
+                    cutoff,
+                    fetcher=fetcher,
+                    sleeper=lambda _delay: None,
+                    coverage=coverage,
+                )
+                self.assertTrue(capped_artifact.data_path.is_file())
+                self.assertEqual(capped_artifact.row_count, data_row_count + 1)
+
+        self.assertEqual(
+            calls,
+            [
+                ("2026-07-01", "2026-07-10"),
+                ("2026-07-11", "2026-07-20"),
+            ],
+        )
+        self.assertEqual(len(bindings), 2)
+        self.assertNotIn(
+            capped_artifact.sha256,
+            {binding.payload_sha256 for binding in bindings},
+        )
+        self.assertEqual(
+            reconciled["statcast_game_pks"], expected_game_pks
+        )
+        self.assertEqual(
+            {
+                int(row["game_pk"])
+                for row in parsed.pitches
+                if row["game_date"] == cutoff.isoformat()
+            },
+            set(expected_game_pks),
+        )
+
+    def test_preexisting_exact_cap_canonical_parent_is_split_and_never_bound(self):
+        self._assert_preexisting_capped_canonical_parent_is_split_and_never_bound(
+            STATCAST_ROW_CAP
+        )
+
+    def test_preexisting_over_cap_canonical_parent_is_split_and_never_bound(self):
+        self._assert_preexisting_capped_canonical_parent_is_split_and_never_bound(
+            STATCAST_ROW_CAP + 1
+        )
+
+    def test_final_statcast_union_still_requires_exact_d1_coverage(self):
+        cutoff = date.fromisoformat("2026-07-20")
+        expected_game_pks = [
+            900000 + (cutoff.toordinal() % 1000) * 100 + index
+            for index in range(15)
+        ]
+        coverage = live_history._d1_schedule_coverage(
+            [
+                {
+                    "game_pk": game_pk,
+                    "official_date": cutoff.isoformat(),
+                    "status": "Final",
+                    "doubleheader_marker": None,
+                }
+                for game_pk in expected_game_pks
+            ],
+            cutoff,
+        )
+        incomplete = _statcast_without_game(
+            _history_statcast(), expected_game_pks[0]
+        )
+
+        class PassThroughRecorder:
+            def __init__(self, target, fetcher, store, schedule_coverage):
+                self.target = target
+                self.fetcher = fetcher
+                self.observations = {}
+
+            def __call__(self, url, *, max_bytes):
+                observed = live_history._http_for(
+                    "savant", url, self.fetcher, max_bytes
+                )
+                self.observations[url] = observed
+                return observed.body
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            live_history, "_RecordingByteFetcher", PassThroughRecorder
+        ):
+            root = Path(temporary)
+            with live_history._history_root_session(root) as (bound_root, trusted):
+                store = live_history._CapabilityRawStore(bound_root, trusted)
+                with self.assertRaisesRegex(
+                    ValueError, "Statcast D-1 coverage differs"
+                ):
+                    live_history._load_or_fetch_statcast(
+                        store,
+                        cutoff,
+                        cutoff,
+                        fetcher=lambda source, url, *, max_bytes: _http(
+                            url, incomplete
+                        ),
+                        sleeper=lambda _delay: None,
+                        coverage=coverage,
+                    )
+
+    def test_incomplete_schedule_retry_promotes_only_later_complete_revision(self):
+        schedule_in_progress = _schedule_status(
+            _history_schedule(), 0, "In Progress"
+        )
+        complete = _history_fetcher()
+        incomplete_attempts = 0
+
+        def fetcher(source, url, *, max_bytes):
+            nonlocal incomplete_attempts
+            if "/schedule?" in url and incomplete_attempts < 2:
+                incomplete_attempts += 1
+                return _http(url, schedule_in_progress)
+            return complete(source, url, max_bytes=max_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for _attempt in range(2):
+                with self.assertRaisesRegex(
+                    ValueError, "D-1 schedule is incomplete"
+                ):
+                    build_live_history(
+                        root,
+                        "2026-07-21",
+                        _card(),
+                        fetcher=fetcher,
+                        sleeper=lambda _delay: None,
+                    )
+            self.assertFalse(
+                any(
+                    path.name == "mlb_schedule"
+                    for path in (
+                        root / "data/experimental_daily/history_cache"
+                    ).iterdir()
+                )
+            )
+            attempt_receipts = [
+                path
+                for path in (
+                    root / "audit/experimental_daily/history_receipts"
+                ).glob("history-history_schedule-*.json")
+                if not path.name.endswith((".claim.json", ".completion.json"))
+                and "attempt_outcome" in path.read_text()
+            ]
+            self.assertEqual(len(attempt_receipts), 1)
+            self.assertTrue(
+                attempt_receipts[0].with_suffix(".completion.json").is_file()
+            )
+            self.assertTrue(
+                attempt_receipts[0].with_suffix(".completion.sha256").is_file()
+            )
+
+            completed = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=complete,
+                sleeper=lambda _delay: None,
+            )
+            offline = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "complete revision must be reusable offline"
+                ),
+                sleeper=lambda _delay: None,
+            )
+        self.assertEqual(completed.source_bindings, offline.source_bindings)
+
+    def test_partial_statcast_retry_requires_exact_d1_game_coverage(self):
+        complete = _history_fetcher()
+        missing_game_pk = 900000 + (
+            date.fromisoformat("2026-07-20").toordinal() % 1000
+        ) * 100
+        first_statcast = True
+
+        def fetcher(source, url, *, max_bytes):
+            nonlocal first_statcast
+            observed = complete(source, url, max_bytes=max_bytes)
+            if source == "savant" and first_statcast:
+                first_statcast = False
+                return _http(
+                    url,
+                    _statcast_without_game(observed.body, missing_game_pk),
+                )
+            return observed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "Statcast D-1 coverage differs"):
+                build_live_history(
+                    root,
+                    "2026-07-21",
+                    _card(),
+                    fetcher=fetcher,
+                    sleeper=lambda _delay: None,
+                )
+
+            completed = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=complete,
+                sleeper=lambda _delay: None,
+            )
+            offline = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "complete Statcast revision must be reusable offline"
+                ),
+                sleeper=lambda _delay: None,
+            )
+            statcast_bindings = [
+                binding
+                for binding in completed.source_bindings
+                if binding.binding_role == "HISTORY_STATCAST"
+            ]
+        self.assertEqual(completed.source_bindings, offline.source_bindings)
+        self.assertTrue(statcast_bindings)
+        for binding in statcast_bindings:
+            identity = json.loads(binding.query_identity_json)
+            self.assertEqual(len(identity["coverage_sha256"]), 64)
+            self.assertIn(missing_game_pk, identity["coverage_game_pks"])
+            self.assertEqual(binding.game_pks, ())
+
+    def test_partial_terminal_schedule_is_not_authoritative_before_statcast_reconciliation(self):
+        complete = _history_fetcher()
+        partial_schedule = json.loads(_history_schedule())
+        partial_schedule["dates"][0]["games"].pop()
+        partial_schedule_body = json.dumps(partial_schedule).encode()
+        schedule_calls = 0
+
+        def fetcher(source, url, *, max_bytes):
+            nonlocal schedule_calls
+            if "/schedule?" in url:
+                schedule_calls += 1
+                if schedule_calls == 1:
+                    return _http(url, partial_schedule_body)
+            return complete(source, url, max_bytes=max_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "Statcast D-1 coverage differs"):
+                build_live_history(
+                    root,
+                    "2026-07-21",
+                    _card(),
+                    fetcher=fetcher,
+                    sleeper=lambda _delay: None,
+                )
+            self.assertEqual(schedule_calls, 1)
+            self.assertFalse(
+                (root / "data/experimental_daily/history_cache/mlb_schedule").exists()
+            )
+            self.assertFalse(
+                (
+                    root
+                    / "data/experimental_daily/history_cache/baseball_savant_statcast"
+                ).exists()
+            )
+
+            completed = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=fetcher,
+                sleeper=lambda _delay: None,
+            )
+            self.assertEqual(schedule_calls, 2)
+            offline = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "only the reconciled complete pair may be reused offline"
+                ),
+                sleeper=lambda _delay: None,
+            )
+            schedule_identity = json.loads(
+                next(
+                    binding.query_identity_json
+                    for binding in completed.source_bindings
+                    if binding.binding_role == "HISTORY_SCHEDULE"
+                )
+            )
+            statcast_identities = [
+                json.loads(binding.query_identity_json)
+                for binding in completed.source_bindings
+                if binding.binding_role == "HISTORY_STATCAST"
+            ]
+        self.assertEqual(completed.source_bindings, offline.source_bindings)
+        self.assertTrue(statcast_identities)
+        self.assertTrue(
+            all(
+                identity["coverage_sha256"]
+                == schedule_identity["coverage_sha256"]
+                for identity in statcast_identities
+            )
+        )
+
+    def test_moved_postponed_game_is_raw_evidence_but_not_authoritative_history(self):
+        moved_game_pks = (990001, 990002)
+        schedule = _schedule_with_moved_postponed_game(
+            _history_schedule(), moved_game_pks=moved_game_pks
+        )
+        complete = _history_fetcher()
+        schedule_calls = 0
+
+        def fetcher(source, url, *, max_bytes):
+            nonlocal schedule_calls
+            if "/schedule?" in url:
+                schedule_calls += 1
+                return _http(url, schedule)
+            return complete(source, url, max_bytes=max_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "mlb_backtest.live_history._build_result_free_live_schedule_history",
+            wraps=live_history._build_result_free_live_schedule_history,
+        ) as builder:
+            root = Path(temporary)
+            completed = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=fetcher,
+                sleeper=lambda _delay: None,
+            )
+            authoritative_schedule = tuple(builder.call_args.args[0])
+            self.assertTrue(
+                set(moved_game_pks).isdisjoint(
+                    int(game["game_pk"]) for game in authoritative_schedule
+                )
+            )
+            schedule_binding = next(
+                binding
+                for binding in completed.source_bindings
+                if binding.binding_role == "HISTORY_SCHEDULE"
+            )
+            self.assertEqual(
+                (root / schedule_binding.payload_relative).read_bytes(), schedule
+            )
+            schedule_identity = json.loads(schedule_binding.query_identity_json)
+            self.assertTrue(
+                set(moved_game_pks).isdisjoint(
+                    schedule_identity["coverage_game_pks"]
+                )
+            )
+            prepared = prepare_live_feature_history(
+                completed, target_game_pks=moved_game_pks
+            )
+            self.assertEqual(prepared.target_game_pks, set(moved_game_pks))
+
+            offline = build_live_history(
+                root,
+                "2026-07-21",
+                _card(),
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "filtered authoritative history must be reusable offline"
+                ),
+                sleeper=lambda _delay: None,
+            )
+        self.assertEqual(schedule_calls, 1)
+        self.assertEqual(completed.source_bindings, offline.source_bindings)
+
     def test_every_valid_receipt_prefix_resumes_by_publishing_only_missing_suffix(self):
         for prefix_length in range(6):
             with self.subTest(prefix_length=prefix_length), tempfile.TemporaryDirectory() as temporary:
@@ -346,14 +1167,14 @@ class LiveHistoryTests(unittest.TestCase):
         for prefix_length in range(6):
             with self.subTest(prefix_length=prefix_length), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                build_live_history(
+                bundle = build_live_history(
                     root, "2026-07-21", _card(),
                     fetcher=_history_fetcher(), sleeper=lambda _delay: None,
                 )
-                directory = root / "audit/experimental_daily/history_receipts"
-                receipt = next(
-                    path for path in directory.glob("history-history_statcast-*.json")
-                    if not path.name.endswith((".claim.json", ".completion.json"))
+                receipt = root / next(
+                    binding.receipt_relative
+                    for binding in bundle.source_bindings
+                    if binding.binding_role == "HISTORY_STATCAST"
                 )
                 paths = self._receipt_prefix_paths(receipt)
                 preserved = {path: path.read_bytes() for path in paths[:prefix_length]}
@@ -1118,14 +1939,8 @@ class LiveHistoryTests(unittest.TestCase):
     def test_cache_rejects_well_formed_receipt_metadata_tampering(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            build_live_history(root, "2026-07-21", _card(), fetcher=_history_fetcher(), sleeper=lambda _delay: None)
-            receipt_path = next(
-                path
-                for path in (
-                    root / "audit/experimental_daily/history_receipts"
-                ).glob("history-*.json")
-                if not path.name.endswith((".claim.json", ".completion.json"))
-            )
+            bundle = build_live_history(root, "2026-07-21", _card(), fetcher=_history_fetcher(), sleeper=lambda _delay: None)
+            receipt_path = root / bundle.source_bindings[0].receipt_relative
             receipt = json.loads(receipt_path.read_text())
             receipt["etag"] = '"forged"'
             forged = live_history.canonical_json_bytes(receipt)
@@ -1173,7 +1988,7 @@ class LiveHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = build_live_history(root, "2026-07-21", _card(), fetcher=_history_fetcher(), sleeper=lambda _delay: None)
-            receipt_path = next(path for path in (root / "audit/experimental_daily/history_receipts").glob("history-*.json") if not path.name.endswith((".claim.json", ".completion.json")))
+            receipt_path = root / bundle.source_bindings[0].receipt_relative
             receipt = json.loads(receipt_path.read_text())
             completion = json.loads(receipt_path.with_suffix(".completion.json").read_text())
             receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()

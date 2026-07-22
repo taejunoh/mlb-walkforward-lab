@@ -42,7 +42,7 @@ def is_statcast_row_capped_manifest(manifest: Mapping[str, object]) -> bool:
     return (
         isinstance(row_count, int)
         and not isinstance(row_count, bool)
-        and row_count == STATCAST_ROW_CAP + 1
+        and row_count >= STATCAST_ROW_CAP + 1
     )
 
 
