@@ -548,12 +548,21 @@ def _k_minus_bb(
 
 
 def _starter_component(
-    history: FeatureHistory, pitcher_id: int, target: date, league_era: float
+    history: FeatureHistory,
+    pitcher_id: int,
+    target: date,
+    league_era: float,
+    *,
+    career_bf_total: int | None = None,
 ) -> dict:
     pitcher_pas = history.rows_before(
         history.pa_by_pitcher.get(pitcher_id, ()), target
     )
-    career_bf = len(pitcher_pas)
+    if career_bf_total is not None and (
+        type(career_bf_total) is not int or career_bf_total < 0
+    ):
+        raise ValueError("career_bf_total must be a nonnegative integer")
+    career_bf = len(pitcher_pas) if career_bf_total is None else career_bf_total
     season = [
         r
         for r in pitcher_pas
@@ -1180,6 +1189,222 @@ def _assert_history(game: Mapping[str, object], history: FeatureHistory) -> None
         assert_pregame_history(game, (row,) if row is not None else ())
 
 
+def _base_raw_result(
+    game: Mapping[str, object],
+    target: date,
+    *,
+    starter_ids: Mapping[str, int],
+    starter_provenance: str,
+    lineup_provenance: str,
+) -> dict[str, object]:
+    return {
+        "game_pk": game.get("game_pk"),
+        "official_date": target.isoformat(),
+        "eligible": True,
+        "reasons": [],
+        "lineup_provenance": lineup_provenance,
+        "starter_provenance": starter_provenance,
+        "away_probable_starter_mismatch": bool(
+            game.get("away_probable_starter_mismatch")
+            or game.get("away_probable_pitcher_id") != starter_ids["away"]
+        ),
+        "home_probable_starter_mismatch": bool(
+            game.get("home_probable_starter_mismatch")
+            or game.get("home_probable_pitcher_id") != starter_ids["home"]
+        ),
+    }
+
+
+def _component_provenance(
+    game: Mapping[str, object],
+    history: FeatureHistory,
+    target: date,
+    league_era_provenance: Mapping[str, object],
+) -> dict[str, object]:
+    raw_source_dates = [
+        _day(row["game_date"], "game_date")
+        for row in (history.max_pitch_row, history.max_pa_row)
+        if row is not None
+    ]
+    schedule_input_max = history.schedule_history.input_max_date
+    schedule_used_max = history.schedule_history.max_before(target)
+    provenance: dict[str, object] = {
+        "max_history_date": _max_history_date(history, target),
+        "raw_source_max_date": (
+            max(raw_source_dates).isoformat() if raw_source_dates else None
+        ),
+        "statcast_target_excluded": True,
+        "history_validation": "PASSED_AS_OF",
+        "statcast_coverage_complete": history.statcast_coverage_complete,
+        "schedule_input_max_date": (
+            schedule_input_max.isoformat() if schedule_input_max is not None else None
+        ),
+        "schedule_used_max_date": (
+            schedule_used_max.isoformat() if schedule_used_max is not None else None
+        ),
+        "target_schedule_present": history.schedule_history.has_game(
+            int(game["game_pk"]), target
+        ),
+        "future_schedule_present": history.schedule_history.has_future(target),
+        "schedule_coverage_start": (
+            history.schedule_history.coverage_start.isoformat()
+            if history.schedule_history.coverage_start is not None
+            else None
+        ),
+        "schedule_coverage_end": (
+            history.schedule_history.coverage_end.isoformat()
+            if history.schedule_history.coverage_end is not None
+            else None
+        ),
+        "schedule_coverage_complete": history.schedule_history.coverage_complete,
+        "league_era": dict(league_era_provenance),
+    }
+    return provenance
+
+
+def _ineligible_provenance(
+    game: Mapping[str, object],
+    history: FeatureHistory,
+    target: date | None,
+    *,
+    target_identity_valid: bool,
+    history_validation: str,
+    league_era_provenance: Mapping[str, object] | None,
+) -> dict[str, object]:
+    raw_source_dates = [
+        _day(row["game_date"], "game_date")
+        for row in (history.max_pitch_row, history.max_pa_row)
+        if row is not None
+    ]
+    schedule_input_max = history.schedule_history.input_max_date
+    schedule_used_max = (
+        history.schedule_history.max_before(target) if target is not None else None
+    )
+    provenance: dict[str, object] = {
+        "max_history_date": _max_history_date(history, target),
+        "raw_source_max_date": (
+            max(raw_source_dates).isoformat() if raw_source_dates else None
+        ),
+        "statcast_target_excluded": target_identity_valid,
+        "history_validation": history_validation,
+        "statcast_coverage_complete": history.statcast_coverage_complete,
+        "schedule_input_max_date": (
+            schedule_input_max.isoformat() if schedule_input_max is not None else None
+        ),
+        "schedule_used_max_date": (
+            schedule_used_max.isoformat() if schedule_used_max is not None else None
+        ),
+        "target_schedule_present": (
+            history.schedule_history.has_game(int(game["game_pk"]), target)
+            if target_identity_valid
+            else False
+        ),
+        "future_schedule_present": (
+            history.schedule_history.has_future(target) if target is not None else False
+        ),
+        "schedule_coverage_start": (
+            history.schedule_history.coverage_start.isoformat()
+            if history.schedule_history.coverage_start is not None
+            else None
+        ),
+        "schedule_coverage_end": (
+            history.schedule_history.coverage_end.isoformat()
+            if history.schedule_history.coverage_end is not None
+            else None
+        ),
+        "schedule_coverage_complete": history.schedule_history.coverage_complete,
+    }
+    if league_era_provenance is not None:
+        provenance["league_era"] = dict(league_era_provenance)
+    return provenance
+
+
+def _build_side_components(
+    game: Mapping[str, object],
+    side: str,
+    starter_id: int,
+    opponent_hand: str | None,
+    history: FeatureHistory,
+    team_code_by_name: Mapping[str, str],
+    resolved_league_era: float,
+    target: date,
+    *,
+    career_bf_total: int | None,
+) -> dict[str, object]:
+    name = str(game[f"{side}_team"])
+    if name not in team_code_by_name:
+        raise ValueError(f"team mapping missing {name}")
+    code = team_code_by_name[name]
+    return {
+        "team_code": code,
+        "starter": _starter_component(
+            history,
+            starter_id,
+            target,
+            resolved_league_era,
+            career_bf_total=career_bf_total,
+        ),
+        "offense": _offense_component(
+            history, game[f"{side}_lineup"], opponent_hand, target
+        ),
+        "bullpen": _bullpen_component(history, code, target),
+        "schedule": _schedule_component(game, history, code, target),
+        "environment": _metric(50.0, 0, 0.0, flags=["environment_unavailable"]),
+        "defense": _metric(50.0, 0, 0.0, flags=["defense_unavailable"]),
+    }
+
+
+def _build_raw_components(
+    game: Mapping[str, object],
+    history: FeatureHistory,
+    team_code_by_name: Mapping[str, str],
+    resolved_league_era: float,
+    *,
+    starter_ids: Mapping[str, int],
+    starter_provenance: str,
+    lineup_provenance: str,
+    league_era_provenance: Mapping[str, object],
+    career_bf_total_by_pitcher: Mapping[int, int] | None = None,
+) -> dict[str, object]:
+    """Build participant-neutral raw components after eligibility and as-of checks."""
+    target = _day(game["official_date"], "official_date")
+    result = _base_raw_result(
+        game,
+        target,
+        starter_ids=starter_ids,
+        starter_provenance=starter_provenance,
+        lineup_provenance=lineup_provenance,
+    )
+    hands: dict[str, str | None] = {}
+    for side in ("home", "away"):
+        pitcher_id = starter_ids[side]
+        pitcher_rows = history.rows_before(
+            history.pitches_by_pitcher.get(pitcher_id, ()), target
+        )
+        hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else None
+    for side, opponent in (("home", "away"), ("away", "home")):
+        pitcher_id = starter_ids[side]
+        result[side] = _build_side_components(
+            game,
+            side,
+            pitcher_id,
+            hands[opponent],
+            history,
+            team_code_by_name,
+            resolved_league_era,
+            target,
+            career_bf_total=(
+                career_bf_total_by_pitcher[pitcher_id]
+                if career_bf_total_by_pitcher is not None
+                else None
+            ),
+        )
+    result["provenance"] = _component_provenance(
+        game, history, target, league_era_provenance
+    )
+    return result
+
+
 def build_raw_game_features(
     game: Mapping[str, object],
     history: FeatureHistory,
@@ -1245,85 +1470,31 @@ def build_raw_game_features(
             != game.get("home_actual_starter_id")
         ),
     }
-    raw_source_dates = [
-        _day(row["game_date"], "game_date")
-        for row in (history.max_pitch_row, history.max_pa_row)
-        if row is not None
-    ]
-    raw_source_max_date = max(raw_source_dates).isoformat() if raw_source_dates else None
-    max_history_date = _max_history_date(history, target)
-    schedule_input_max = history.schedule_history.input_max_date
-    schedule_used_max = (
-        history.schedule_history.max_before(target) if target is not None else None
-    )
-    provenance = {
-        "max_history_date": max_history_date,
-        "raw_source_max_date": raw_source_max_date,
-        "statcast_target_excluded": target_identity_valid,
-        "history_validation": history_validation,
-        "statcast_coverage_complete": history.statcast_coverage_complete,
-        "schedule_input_max_date": (
-            schedule_input_max.isoformat() if schedule_input_max is not None else None
-        ),
-        "schedule_used_max_date": (
-            schedule_used_max.isoformat() if schedule_used_max is not None else None
-        ),
-        "target_schedule_present": (
-            history.schedule_history.has_game(int(game["game_pk"]), target)
-            if target_identity_valid
-            else False
-        ),
-        "future_schedule_present": (
-            history.schedule_history.has_future(target) if target is not None else False
-        ),
-        "schedule_coverage_start": (
-            history.schedule_history.coverage_start.isoformat()
-            if history.schedule_history.coverage_start is not None
-            else None
-        ),
-        "schedule_coverage_end": (
-            history.schedule_history.coverage_end.isoformat()
-            if history.schedule_history.coverage_end is not None
-            else None
-        ),
-        "schedule_coverage_complete": history.schedule_history.coverage_complete,
-    }
-    if league_era_provenance is not None:
-        provenance["league_era"] = league_era_provenance
     if reasons:
-        result["provenance"] = provenance
+        result["provenance"] = _ineligible_provenance(
+            game,
+            history,
+            target,
+            target_identity_valid=target_identity_valid,
+            history_validation=history_validation,
+            league_era_provenance=league_era_provenance,
+        )
         return result
     assert target is not None and resolved_league_era is not None
-    hands = {}
-    for side in ("home", "away"):
-        pid = int(game[f"{side}_actual_starter_id"])
-        pitcher_rows = history.rows_before(
-            history.pitches_by_pitcher.get(pid, ()), target
-        )
-        hands[side] = str(pitcher_rows[-1]["p_throws"]) if pitcher_rows else None
-    for side, opponent in (("home", "away"), ("away", "home")):
-        name = str(game[f"{side}_team"])
-        if name not in team_code_by_name:
-            raise ValueError(f"team mapping missing {name}")
-        code = team_code_by_name[name]
-        result[side] = {
-            "team_code": code,
-            "starter": _starter_component(
-                history,
-                int(game[f"{side}_actual_starter_id"]),
-                target,
-                resolved_league_era,
-            ),
-            "offense": _offense_component(
-                history, game[f"{side}_lineup"], hands[opponent], target
-            ),
-            "bullpen": _bullpen_component(history, code, target),
-            "schedule": _schedule_component(game, history, code, target),
-            "environment": _metric(50.0, 0, 0.0, flags=["environment_unavailable"]),
-            "defense": _metric(50.0, 0, 0.0, flags=["defense_unavailable"]),
-        }
-    result["provenance"] = provenance
-    return result
+    assert league_era_provenance is not None
+    return _build_raw_components(
+        game,
+        history,
+        team_code_by_name,
+        resolved_league_era,
+        starter_ids={
+            side: int(game[f"{side}_actual_starter_id"])
+            for side in ("home", "away")
+        },
+        starter_provenance="RECONSTRUCTED_ACTUAL_STARTER",
+        lineup_provenance="RECONSTRUCTED_FINAL_LINEUP",
+        league_era_provenance=league_era_provenance,
+    )
 
 
 __all__ = [

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import time
@@ -137,6 +138,44 @@ def build(target, history, team_map=None, league_era=None):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_historical_full_raw_output_characterization(self):
+        rows = [
+            pa(1, "2025-04-01", 10, 201, "strikeout", xwoba=0.1, outs=1),
+            pa(
+                1,
+                "2025-04-01",
+                20,
+                101,
+                "field_out",
+                hand="L",
+                xwoba=0.2,
+                outs=1,
+                top="Bot",
+                at_bat=2,
+            ),
+        ]
+        history = FeatureHistory(
+            data(rows), slot_weights={slot: 1 / 9 for slot in range(1, 10)}
+        )
+
+        raw = build(game(), history)
+        canonical = json.dumps(
+            raw,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        self.assertEqual(len(canonical), 11_330)
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(),
+            "ca27525af187969fe01ecfed740ce8c07e0ebde30143efb0aa24208d450ba6a6",
+        )
+        self.assertEqual(raw["reasons"], [])
+        self.assertEqual(raw["lineup_provenance"], "RECONSTRUCTED_FINAL_LINEUP")
+        self.assertEqual(raw["starter_provenance"], "RECONSTRUCTED_ACTUAL_STARTER")
+
     def test_representative_month_builds_one_history_without_full_pitch_prefix_scans(self):
         rows = [
             pa(1, "2025-04-01", 10, 201, "strikeout", xwoba=0.1, outs=1),
