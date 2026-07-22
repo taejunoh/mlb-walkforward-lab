@@ -9,6 +9,8 @@ import math
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -25,7 +27,8 @@ from .secure_fs import (
     write_exclusive,
 )
 from .v52_evidence import V52EvidenceStore, logical_query_id
-from .v52_query_plan import load_query_batch
+from .protocols import SourceRunSpec
+from .v52_query_plan import SourceAuthorityContext, _load_static_contracts, load_query_batch
 from .v52_source_contracts import QUERY_SIDECAR_KEYS, canonical_json_bytes
 
 
@@ -60,6 +63,9 @@ _MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 _MAX_MAPPING_BYTES = 8 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_AUTHORITY_BYTES = 64 * 1024 * 1024
+_ACTIVE_ACQUISITION_AUDIT: ContextVar[Path] = ContextVar(
+    "v52_timezone_acquisition_audit", default=_ACQUISITION_AUDIT
+)
 
 
 @dataclass(frozen=True)
@@ -638,7 +644,7 @@ def _acquisition_audit_relative(
     root: TrustedRoot, path: Path, label: str
 ) -> Path:
     relative = _relative_from_trusted(root, path, label)
-    prefix = _ACQUISITION_AUDIT.parts
+    prefix = _ACTIVE_ACQUISITION_AUDIT.get().parts
     if relative.parts[: len(prefix)] != prefix or len(relative.parts) <= len(prefix):
         raise ValueError(
             f"{label} must stay in the acquisition audit namespace"
@@ -829,6 +835,35 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _explicit_authority_context(
+    root: Path,
+    run_spec_path: Path | None,
+    acquisition_contract_path: Path | None,
+) -> SourceAuthorityContext | None:
+    if run_spec_path is None and acquisition_contract_path is None:
+        return None
+    if run_spec_path is None or acquisition_contract_path is None:
+        raise ValueError("run spec and acquisition contract must be supplied together")
+    context = _load_static_contracts(run_spec_path, acquisition_contract_path)
+    canonical_root = Path(os.path.abspath(os.fspath(root)))
+    if context.repository_root != canonical_root:
+        raise ValueError("timezone authority repository root differs")
+    return context
+
+
+@contextmanager
+def _authority_scope(context: SourceAuthorityContext | None):
+    if context is None:
+        yield
+        return
+    relative = context.acquisition_audit_root.relative_to(context.repository_root)
+    token = _ACTIVE_ACQUISITION_AUDIT.set(relative)
+    try:
+        yield
+    finally:
+        _ACTIVE_ACQUISITION_AUDIT.reset(token)
+
+
 def write_timezone_review_receipt(
     root: Path,
     *,
@@ -838,8 +873,17 @@ def write_timezone_review_receipt(
     reviewer_role: str,
     review_scope: Sequence[int] | None = None,
     decision: str,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> Path:
-    with open_trusted_root(root) as trusted:
+    context = _explicit_authority_context(
+        root, run_spec_path, acquisition_contract_path
+    )
+    if context is not None and isinstance(context.authority, SourceRunSpec):
+        raise ValueError(
+            "superseding timezone review checkpoints are not enabled before Task 6"
+        )
+    with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _write_timezone_review_receipt(
             trusted,
             candidate_path=candidate_path,
@@ -962,8 +1006,17 @@ def seal_timezone_mapping(
     review_receipt_paths: Sequence[Path],
     output: Path,
     receipt_output: Path,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> tuple[Path, Path]:
-    with open_trusted_root(root) as trusted:
+    context = _explicit_authority_context(
+        root, run_spec_path, acquisition_contract_path
+    )
+    if context is not None and isinstance(context.authority, SourceRunSpec):
+        raise ValueError(
+            "superseding timezone seal checkpoints are not enabled before Task 6"
+        )
+    with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _seal_timezone_mapping(
             trusted,
             candidate_path=candidate_path,
@@ -1133,8 +1186,20 @@ def build_timezone_candidate(
     root: Path,
     evidence_root: Path,
     batch_ids: Sequence[str],
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> Mapping[str, object]:
-    with open_trusted_root(root) as trusted:
+    context = _explicit_authority_context(
+        root, run_spec_path, acquisition_contract_path
+    )
+    if context is not None:
+        if Path(os.path.abspath(os.fspath(evidence_root))) != context.raw_root:
+            raise ValueError("timezone evidence root differs from authority")
+        if isinstance(context.authority, SourceRunSpec):
+            raise ValueError(
+                "superseding query-batch checkpoints are not enabled before Task 6"
+            )
+    with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _build_timezone_candidate(
             trusted, evidence_root=evidence_root, batch_ids=batch_ids
         )
@@ -1303,9 +1368,21 @@ def publish_timezone_candidate(
     root: Path,
     evidence_root: Path,
     batch_ids: Sequence[str],
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> Path:
     """Publish or reconcile the one canonical timezone-review candidate."""
-    with open_trusted_root(root) as trusted:
+    context = _explicit_authority_context(
+        root, run_spec_path, acquisition_contract_path
+    )
+    if context is not None:
+        if Path(os.path.abspath(os.fspath(evidence_root))) != context.raw_root:
+            raise ValueError("timezone evidence root differs from authority")
+        if isinstance(context.authority, SourceRunSpec):
+            raise ValueError(
+                "superseding query-batch checkpoints are not enabled before Task 6"
+            )
+    with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _publish_timezone_candidate(
             trusted,
             evidence_root=evidence_root,
@@ -1711,8 +1788,17 @@ def load_verified_timezone_gate(
     root: Path,
     *,
     read_only_progress: bool = False,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> VerifiedTimezoneGate:
-    with open_trusted_root(root) as trusted:
+    context = _explicit_authority_context(
+        root, run_spec_path, acquisition_contract_path
+    )
+    if context is not None and isinstance(context.authority, SourceRunSpec):
+        raise ValueError(
+            "superseding query-batch checkpoints are not enabled before Task 6"
+        )
+    with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _load_verified_timezone_gate(
             trusted, read_only_progress=read_only_progress
         )

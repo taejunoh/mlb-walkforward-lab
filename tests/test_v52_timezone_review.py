@@ -447,6 +447,102 @@ def _fixed_verified_gate_fixture(
 
 
 class V52TimezoneReviewTest(unittest.TestCase):
+    def test_superseding_review_and_seal_stop_before_any_candidate_io(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source_audit = (
+            ROOT / "audit/v5_2_qd/historical_superseding_565534/acquisition"
+        )
+        with (
+            patch.object(
+                timezone_review,
+                "open_trusted_root",
+                side_effect=AssertionError("trusted-root I/O reached"),
+            ) as root_io,
+            self.assertRaisesRegex(ValueError, "Task 6"),
+        ):
+            timezone_review.write_timezone_review_receipt(
+                ROOT,
+                candidate_path=source_audit / "venue_timezone_candidate.json",
+                output=source_audit / "timezone_reviews/coverage.json",
+                reviewer_identity="reviewer",
+                reviewer_role="TIMEZONE_COVERAGE_REVIEW",
+                decision="APPROVED",
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        root_io.assert_not_called()
+        with (
+            patch.object(
+                timezone_review,
+                "open_trusted_root",
+                side_effect=AssertionError("trusted-root I/O reached"),
+            ) as root_io,
+            self.assertRaisesRegex(ValueError, "Task 6"),
+        ):
+            timezone_review.seal_timezone_mapping(
+                ROOT,
+                candidate_path=source_audit / "venue_timezone_candidate.json",
+                review_receipt_paths=(
+                    source_audit / "timezone_reviews/coverage.json",
+                    source_audit / "timezone_reviews/semantic.json",
+                ),
+                output=ROOT / "config/v5_2_qd/venue_timezones.json",
+                receipt_output=source_audit / "venue_timezone_seal.json",
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        root_io.assert_not_called()
+
+    def test_superseding_candidate_paths_fail_before_query_batch_io(self) -> None:
+        from mlb_backtest.v52_timezone_review import build_timezone_candidate
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source_raw = ROOT / "data/v5_2_qd/historical_superseding_565534/raw"
+        with self.assertRaisesRegex(ValueError, "evidence root"):
+            build_timezone_candidate(
+                root=ROOT,
+                evidence_root=ROOT / "data/v5_2_qd/historical/raw",
+                batch_ids=("0" * 64,),
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        with self.assertRaisesRegex(ValueError, "Task 6"):
+            build_timezone_candidate(
+                root=ROOT,
+                evidence_root=source_raw,
+                batch_ids=("0" * 64,),
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        with self.assertRaises(ValueError):
+            build_timezone_candidate(
+                root=ROOT,
+                evidence_root=source_raw,
+                batch_ids=("0" * 64,),
+                run_spec_path=source_run,
+                acquisition_contract_path=CONTRACT,
+            )
+
     def test_public_candidate_builder_requires_verified_sealed_batches(self) -> None:
         from mlb_backtest.v52_timezone_review import build_timezone_candidate
 

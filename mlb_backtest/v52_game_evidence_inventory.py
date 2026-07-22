@@ -15,13 +15,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
-from .protocols import RunSpec, parse_run_spec
+from .protocols import RunSpec, SourceRunSpec, parse_run_spec
 from .v52_evidence import (
     V52EvidenceStore,
     VerifiedEvidenceRead,
     logical_query_id,
 )
 from .v52_query_plan import (
+    SourceAuthorityContext,
+    _context_roots,
+    _load_static_contracts,
+    _read_repository_file,
+    _validate_run_bound_acquisition_contract,
     QueryBatch,
     build_schedule_reference_batch,
     load_query_batch,
@@ -130,6 +135,92 @@ class _ArtifactToken:
 class _Authority:
     payload: dict[str, object]
     snapshots: tuple[_BoundSnapshot, ...]
+    context: SourceAuthorityContext
+
+
+def _authority_context(
+    root: Path,
+    run_spec_path: Path | None,
+    acquisition_contract_path: Path | None,
+) -> SourceAuthorityContext:
+    """Authenticate the exact authority pair before replay/checkpoint I/O."""
+    supplied_run = Path(run_spec_path) if run_spec_path is not None else root / _RUN_SPEC_RELATIVE
+    supplied_contract = (
+        Path(acquisition_contract_path)
+        if acquisition_contract_path is not None
+        else root / _ACQUISITION_CONTRACT_RELATIVE
+    )
+    for supplied, label in ((supplied_run, "RunSpec"), (supplied_contract, "acquisition contract")):
+        text = os.fspath(supplied)
+        if (
+            not supplied.is_absolute()
+            or "\\" in text
+            or any(part in {"", ".", ".."} for part in supplied.parts)
+            or Path(os.path.abspath(text)) != supplied
+        ):
+            raise ValueError(f"{label} path differs from the repository contract")
+        try:
+            supplied.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} path must stay under the repository root") from exc
+    try:
+        context = _load_static_contracts(supplied_run, supplied_contract)
+    except ValueError:
+        # Historical unit fixtures predate the design/plan files authenticated
+        # by the full static loader. Preserve their old default behavior while
+        # retaining strict static authentication for explicit authority paths.
+        if run_spec_path is not None or acquisition_contract_path is not None:
+            raise
+        run_contents = _read_repository_file(
+            root, _RUN_SPEC_RELATIVE, "game evidence RunSpec"
+        )
+        contract_contents = _read_repository_file(
+            root,
+            _ACQUISITION_CONTRACT_RELATIVE,
+            "game evidence acquisition contract",
+        )
+        run_raw, run_sha, contract, contract_sha = (
+            _validate_run_bound_acquisition_contract(
+                root, run_contents, contract_contents
+            )
+        )
+        authority = parse_run_spec(run_raw)
+        if authority.run_id != _RUN_ID or contract.get("run_id") != _RUN_ID:
+            raise ValueError("game evidence legacy authority run_id differs")
+        roots = _context_roots(root, authority, contract)
+        context = SourceAuthorityContext(
+            repository_root=root,
+            authority=authority,
+            authority_path=supplied_run,
+            authority_sha256=run_sha,
+            acquisition_contract_path=supplied_contract,
+            acquisition_contract_sha256=contract_sha,
+            contract=contract,
+            run_id=authority.run_id,
+            raw_root=roots[0],
+            sources_root=roots[1],
+            acquisition_audit_root=roots[2],
+            execution_audit_root=roots[3],
+            report_root=roots[4],
+        )
+    if context.repository_root != root:
+        raise ValueError("authority pair repository root differs")
+    return context
+
+
+def _timezone_authority_relatives(
+    context: SourceAuthorityContext,
+) -> tuple[Path, Path, Path, Path, Path]:
+    acquisition = context.acquisition_audit_root.relative_to(
+        context.repository_root
+    )
+    return (
+        acquisition / "venue_timezone_candidate.json",
+        acquisition / "timezone_reviews/coverage.json",
+        acquisition / "timezone_reviews/semantic.json",
+        _MAPPING_RELATIVE,
+        acquisition / "venue_timezone_seal.json",
+    )
 
 
 def _before_game_inventory_final_rebind() -> None:
@@ -537,11 +628,15 @@ def _raw_namespace(run_spec: RunSpec) -> Path:
     return relative
 
 
-def _batch_binding(batch: QueryBatch, snapshot: object) -> dict[str, object]:
+def _batch_binding(
+    batch: QueryBatch,
+    snapshot: object,
+    batch_root_relative: Path = _BATCH_ROOT,
+) -> dict[str, object]:
     contents = getattr(snapshot, "contents")
     return {
         "batch_id": batch.batch_id,
-        "path": (_BATCH_ROOT / f"{batch.batch_id}.json").as_posix(),
+        "path": (batch_root_relative / f"{batch.batch_id}.json").as_posix(),
         "sha256": _sha256(contents),
         "stage": batch.stage,
     }
@@ -736,23 +831,42 @@ def _build_current_authority(
     root: Path,
     *,
     read_only_progress: bool = False,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> _Authority:
-    run_snapshot = _required_snapshot(root, _RUN_SPEC_RELATIVE, "game evidence RunSpec")
+    context = _authority_context(root, run_spec_path, acquisition_contract_path)
+    # Query-batch/checkpoint machinery remains RunSpec-only until Task 6.  The
+    # static pair above is authenticated before this deliberate rejection.
+    if isinstance(context.authority, SourceRunSpec):
+        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
+    authority_relative = context.authority_path.relative_to(root)
+    contract_relative = context.acquisition_contract_path.relative_to(root)
+    acquisition_relative = context.acquisition_audit_root.relative_to(root)
+    schedule_inventory_relative = acquisition_relative / "schedule_anchor_inventory.json"
+    batch_root_relative = acquisition_relative / "query_batches"
+    (
+        candidate_relative,
+        coverage_review_relative,
+        semantic_review_relative,
+        mapping_relative,
+        seal_relative,
+    ) = _timezone_authority_relatives(context)
+    run_snapshot = _required_snapshot(root, authority_relative, "game evidence RunSpec")
     contract_snapshot = _required_snapshot(
         root,
-        _ACQUISITION_CONTRACT_RELATIVE,
+        contract_relative,
         "game evidence acquisition contract",
     )
     run_spec = parse_run_spec(
         _json_object(run_snapshot.contents, "game evidence RunSpec")
     )
-    if run_spec.run_id != _RUN_ID:
+    if run_spec.run_id != context.run_id:
         raise ValueError("game evidence RunSpec run_id differs")
     evidence_root = root / _raw_namespace(run_spec)
 
     schedule_snapshot = _required_snapshot(
         root,
-        _SCHEDULE_INVENTORY_RELATIVE,
+        schedule_inventory_relative,
         "game evidence schedule inventory",
     )
     schedule_record = _json_object(
@@ -770,7 +884,7 @@ def _build_current_authority(
     verified_schedule = load_verified_schedule_anchor_inventory(
         root,
         run_spec,
-        acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+        acquisition_contract_path=context.acquisition_contract_path,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
@@ -785,8 +899,8 @@ def _build_current_authority(
     )
     reference_expected = build_schedule_reference_batch(
         root,
-        root / _RUN_SPEC_RELATIVE,
-        acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+        context.authority_path,
+        acquisition_contract_path=context.acquisition_contract_path,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
@@ -805,12 +919,12 @@ def _build_current_authority(
         raise ValueError("game evidence query batch authority differs")
     static_batch_snapshot = _required_snapshot(
         root,
-        _BATCH_ROOT / f"{static_batch.batch_id}.json",
+        batch_root_relative / f"{static_batch.batch_id}.json",
         "game evidence STATIC_SCHEDULES batch",
     )
     reference_batch_snapshot = _required_snapshot(
         root,
-        _BATCH_ROOT / f"{reference_batch.batch_id}.json",
+        batch_root_relative / f"{reference_batch.batch_id}.json",
         "game evidence REFERENCE_INPUTS batch",
     )
 
@@ -821,11 +935,11 @@ def _build_current_authority(
     timezone_snapshots = tuple(
         _required_snapshot(root, relative, label)
         for relative, label in (
-            (_CANDIDATE_RELATIVE, "game evidence timezone candidate"),
-            (_COVERAGE_REVIEW_RELATIVE, "game evidence timezone coverage review"),
-            (_SEMANTIC_REVIEW_RELATIVE, "game evidence timezone semantic review"),
-            (_MAPPING_RELATIVE, "game evidence timezone mapping"),
-            (_SEAL_RELATIVE, "game evidence timezone seal"),
+            (candidate_relative, "game evidence timezone candidate"),
+            (coverage_review_relative, "game evidence timezone coverage review"),
+            (semantic_review_relative, "game evidence timezone semantic review"),
+            (mapping_relative, "game evidence timezone mapping"),
+            (seal_relative, "game evidence timezone seal"),
         )
     )
     if (
@@ -925,7 +1039,7 @@ def _build_current_authority(
     starter_ids = {starter for row in played for starter in row["actual_starter_ids"]}
     payload = {
         "acquisition_contract": _binding(
-            _ACQUISITION_CONTRACT_RELATIVE, contract_snapshot.contents
+            contract_relative, contract_snapshot.contents
         ),
         "artifact_kind": "GAME_EVIDENCE_INVENTORY",
         "counts": {
@@ -937,37 +1051,37 @@ def _build_current_authority(
         },
         "games": games,
         "query_batches": [
-            _batch_binding(static_batch, static_batch_snapshot),
-            _batch_binding(reference_batch, reference_batch_snapshot),
+            _batch_binding(static_batch, static_batch_snapshot, batch_root_relative),
+            _batch_binding(reference_batch, reference_batch_snapshot, batch_root_relative),
         ],
-        "run_id": _RUN_ID,
-        "run_spec": _binding(_RUN_SPEC_RELATIVE, run_snapshot.contents),
+        "run_id": context.run_id,
+        "run_spec": _binding(authority_relative, run_snapshot.contents),
         "schedule_inventory": _binding(
-            _SCHEDULE_INVENTORY_RELATIVE, schedule_snapshot.contents
+            schedule_inventory_relative, schedule_snapshot.contents
         ),
         "schema_version": 1,
         "source_query_sidecar_sha256s": game_snapshot["source_query_sidecar_sha256s"],
         "timezone_gate": {
             "candidate": {
-                "path": _CANDIDATE_RELATIVE.as_posix(),
+                "path": candidate_relative.as_posix(),
                 "sha256": timezone_gate.candidate_sha256,
             },
             "mapping": {
-                "path": _MAPPING_RELATIVE.as_posix(),
+                "path": mapping_relative.as_posix(),
                 "sha256": timezone_gate.mapping_sha256,
             },
             "reviews": [
                 {
-                    "path": _COVERAGE_REVIEW_RELATIVE.as_posix(),
+                    "path": coverage_review_relative.as_posix(),
                     "sha256": timezone_gate.review_sha256s[0],
                 },
                 {
-                    "path": _SEMANTIC_REVIEW_RELATIVE.as_posix(),
+                    "path": semantic_review_relative.as_posix(),
                     "sha256": timezone_gate.review_sha256s[1],
                 },
             ],
             "seal": {
-                "path": _SEAL_RELATIVE.as_posix(),
+                "path": seal_relative.as_posix(),
                 "sha256": timezone_gate.seal_sha256,
             },
         },
@@ -1018,6 +1132,7 @@ def _build_current_authority(
             ),
             *evidence_snapshots,
         ),
+        context=context,
     )
 
 
@@ -1035,6 +1150,7 @@ def _rebind_authority(root: Path, authority: _Authority) -> None:
 
 def _read_inventory_at(
     parent: int,
+    inventory_name: str = _INVENTORY_RELATIVE.name,
 ) -> tuple[bytes, tuple[int, ...]] | None:
     flags = (
         os.O_RDONLY
@@ -1043,7 +1159,7 @@ def _read_inventory_at(
         | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        descriptor = os.open(_INVENTORY_RELATIVE.name, flags, dir_fd=parent)
+        descriptor = os.open(inventory_name, flags, dir_fd=parent)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -1052,7 +1168,7 @@ def _read_inventory_at(
         ) from exc
     try:
         before = os.fstat(descriptor)
-        linked = os.stat(_INVENTORY_RELATIVE.name, dir_fd=parent, follow_symlinks=False)
+        linked = os.stat(inventory_name, dir_fd=parent, follow_symlinks=False)
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
@@ -1074,7 +1190,7 @@ def _read_inventory_at(
             chunks.append(chunk)
         after = os.fstat(descriptor)
         rebound = os.stat(
-            _INVENTORY_RELATIVE.name, dir_fd=parent, follow_symlinks=False
+            inventory_name, dir_fd=parent, follow_symlinks=False
         )
         if (
             _file_identity(before) != _file_identity(after)
@@ -1090,26 +1206,27 @@ def _read_inventory_at(
 def _remove_owned_inventory(
     root: Path,
     created_identity: tuple[int, ...],
+    inventory_relative: Path = _INVENTORY_RELATIVE,
 ) -> None:
     try:
-        parent, descriptors = _open_parent(root, _INVENTORY_RELATIVE, create=False)
+        parent, descriptors = _open_parent(root, inventory_relative, create=False)
     except BaseException:
         return
     locked = False
     try:
         fcntl.flock(parent, fcntl.LOCK_EX)
         locked = True
-        current = _read_inventory_at(parent)
+        current = _read_inventory_at(parent, inventory_relative.name)
         if current is None or current[1] != created_identity:
             return
         linked = os.stat(
-            _INVENTORY_RELATIVE.name,
+            inventory_relative.name,
             dir_fd=parent,
             follow_symlinks=False,
         )
         if _file_identity(linked) != created_identity:
             return
-        os.unlink(_INVENTORY_RELATIVE.name, dir_fd=parent)
+        os.unlink(inventory_relative.name, dir_fd=parent)
         os.fsync(parent)
     except BaseException:
         return
@@ -1130,9 +1247,10 @@ def _reconcile_inventory_publication(
     root: Path,
     contents: bytes,
     final_rebind,
+    inventory_relative: Path = _INVENTORY_RELATIVE,
 ) -> None:
-    parent, descriptors = _open_parent(root, _INVENTORY_RELATIVE, create=True)
-    temp_name = f".{_INVENTORY_RELATIVE.name}.{secrets.token_hex(16)}.tmp"
+    parent, descriptors = _open_parent(root, inventory_relative, create=True)
+    temp_name = f".{inventory_relative.name}.{secrets.token_hex(16)}.tmp"
     temp_descriptor = -1
     locked = False
     linked_by_this_call = False
@@ -1164,7 +1282,7 @@ def _reconcile_inventory_publication(
         final_rebind()
         fcntl.flock(parent, fcntl.LOCK_EX)
         locked = True
-        existing = _read_inventory_at(parent)
+        existing = _read_inventory_at(parent, inventory_relative.name)
         if existing is not None:
             if existing[0] != contents:
                 raise RuntimeError(
@@ -1174,13 +1292,13 @@ def _reconcile_inventory_publication(
             try:
                 os.link(
                     temp_name,
-                    _INVENTORY_RELATIVE.name,
+                    inventory_relative.name,
                     src_dir_fd=parent,
                     dst_dir_fd=parent,
                     follow_symlinks=False,
                 )
             except FileExistsError:
-                raced = _read_inventory_at(parent)
+                raced = _read_inventory_at(parent, inventory_relative.name)
                 if raced is None or raced[0] != contents:
                     raise RuntimeError(
                         "concurrent immutable game evidence inventory differs"
@@ -1194,7 +1312,7 @@ def _reconcile_inventory_publication(
             os.unlink(temp_name, dir_fd=parent)
             temp_name = ""
             os.fsync(parent)
-        final = _read_inventory_at(parent)
+        final = _read_inventory_at(parent, inventory_relative.name)
         if final is None or final[0] != contents:
             raise ValueError("atomic game evidence inventory publication differs")
         if linked_by_this_call:
@@ -1216,38 +1334,93 @@ def _reconcile_inventory_publication(
         final_rebind()
     except BaseException:
         if created_final_identity is not None:
-            _remove_owned_inventory(root, created_final_identity)
+            _remove_owned_inventory(root, created_final_identity, inventory_relative)
         raise
 
 
-def publish_game_evidence_inventory(root: Path) -> VerifiedGameEvidenceInventory:
+def build_game_evidence_inventory(
+    root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
+) -> Mapping[str, object]:
+    """Build the deterministic game inventory without publishing it."""
     root = _trusted_game_root(root)
-    authority = _build_current_authority(root)
+    authority = _build_current_authority(
+        root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    return authority.payload
+
+
+def publish_game_evidence_inventory(
+    root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
+) -> VerifiedGameEvidenceInventory:
+    root = _trusted_game_root(root)
+    authority_kwargs = (
+        {}
+        if run_spec_path is None and acquisition_contract_path is None
+        else {
+            "run_spec_path": run_spec_path,
+            "acquisition_contract_path": acquisition_contract_path,
+        }
+    )
+    authority = _build_current_authority(root, **authority_kwargs)
+    inventory_relative = (
+        authority.context.acquisition_audit_root.relative_to(root)
+        / "game_evidence_inventory.json"
+    )
     contents = _canonical_file_bytes(authority.payload)
     if len(contents) > _MAX_ARTIFACT_BYTES:
         raise ValueError("game evidence inventory exceeds its byte-size limit")
 
     def rebind() -> None:
-        current = _build_current_authority(root)
+        current = _build_current_authority(root, **authority_kwargs)
         if current.payload != authority.payload:
             raise ValueError("game participant authority changed before publication")
         _rebind_authority(root, authority)
 
-    _reconcile_inventory_publication(root, contents, rebind)
-    return load_verified_game_evidence_inventory(root)
+    _reconcile_inventory_publication(root, contents, rebind, inventory_relative)
+    return load_verified_game_evidence_inventory(
+        root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
 
 
 def load_verified_game_evidence_inventory(
     root: Path,
     *,
     read_only_progress: bool = False,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> VerifiedGameEvidenceInventory:
     root = _trusted_game_root(root)
-    snapshot = _required_snapshot(root, _INVENTORY_RELATIVE, "game evidence inventory")
+    authority_kwargs = (
+        {}
+        if run_spec_path is None and acquisition_contract_path is None
+        else {
+            "run_spec_path": run_spec_path,
+            "acquisition_contract_path": acquisition_contract_path,
+        }
+    )
+    context = _authority_context(root, run_spec_path, acquisition_contract_path)
+    if isinstance(context.authority, SourceRunSpec):
+        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(root)
+        / "game_evidence_inventory.json"
+    )
+    snapshot = _required_snapshot(root, inventory_relative, "game evidence inventory")
     stored = _json_object(snapshot.contents, "game evidence inventory")
     authority = _build_current_authority(
         root,
         read_only_progress=read_only_progress,
+        **authority_kwargs,
     )
     if stored != authority.payload:
         raise ValueError(
@@ -1257,6 +1430,7 @@ def load_verified_game_evidence_inventory(
     rebound = _build_current_authority(
         root,
         read_only_progress=read_only_progress,
+        **authority_kwargs,
     )
     if rebound.payload != authority.payload:
         raise ValueError("game participant authority changed during verified load")
@@ -1274,13 +1448,14 @@ def load_verified_game_evidence_inventory(
         )
     return VerifiedGameEvidenceInventory(
         payload=frozen,
-        path=root / _INVENTORY_RELATIVE,
+        path=root / inventory_relative,
         sha256=_sha256(snapshot.contents),
     )
 
 
 __all__ = [
     "VerifiedGameEvidenceInventory",
+    "build_game_evidence_inventory",
     "load_verified_game_evidence_inventory",
     "publish_game_evidence_inventory",
     "validate_game_evidence_snapshot",

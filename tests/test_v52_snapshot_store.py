@@ -836,6 +836,29 @@ class PublishTests(unittest.TestCase):
 class LoaderTests(unittest.TestCase):
     """Read-only consumers must replay exactly the published snapshot store."""
 
+    def test_path_adapters_reject_unexpected_root_before_filesystem_io(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            load_snapshot_store,
+            publish_snapshot_store,
+            read_inventory,
+        )
+
+        supplied = Path("/definitely-not-the-authorized-store")
+        expected = Path("/different-authorized-store")
+        with self.assertRaises(PublishError):
+            read_inventory(supplied, expected_root=expected)
+        with self.assertRaises(PublishError):
+            load_snapshot_store(supplied, object(), expected_root=expected)  # type: ignore[arg-type]
+        with self.assertRaises(PublishError):
+            publish_snapshot_store(
+                supplied,
+                object(),
+                object(),
+                lock_owner="guard-test",
+                expected_root=expected,
+            )  # type: ignore[arg-type]
+
     def _publish(self, root, inventory, inputs):
         from mlb_backtest.v52_snapshot_store import publish_snapshot_store
 

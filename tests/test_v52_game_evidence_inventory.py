@@ -3,6 +3,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -191,6 +194,112 @@ def _query_directory(evidence_root: Path, query) -> Path:
 
 
 class V52GameEvidenceInventoryTest(unittest.TestCase):
+    def test_timezone_adapter_derives_superseding_acquisition_paths(self) -> None:
+        import mlb_backtest.v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.v52_query_plan import _load_static_contracts
+
+        context = _load_static_contracts(
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json",
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json",
+        )
+        paths = inventory_module._timezone_authority_relatives(context)
+        acquisition = Path(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition"
+        )
+        self.assertEqual(
+            paths,
+            (
+                acquisition / "venue_timezone_candidate.json",
+                acquisition / "timezone_reviews/coverage.json",
+                acquisition / "timezone_reviews/semantic.json",
+                Path("config/v5_2_qd/venue_timezones.json"),
+                acquisition / "venue_timezone_seal.json",
+            ),
+        )
+
+    def test_default_authority_rejects_external_symlink_without_fallback(self) -> None:
+        import mlb_backtest.v52_game_evidence_inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "repo"
+            protocol = root / "protocols/v5_2_qd"
+            protocol.mkdir(parents=True)
+            external = base / "external-run.json"
+            external.write_bytes(
+                (ROOT / "protocols/v5_2_qd/historical_walkforward_500.json").read_bytes()
+            )
+            (protocol / "historical_walkforward_500.json").symlink_to(external)
+            (protocol / "historical_source_acquisition.json").write_bytes(
+                (
+                    ROOT
+                    / "protocols/v5_2_qd/historical_source_acquisition.json"
+                ).read_bytes()
+            )
+            with self.assertRaises(ValueError):
+                inventory_module._authority_context(root, None, None)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires POSIX")
+    def test_default_authority_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "repo"
+            protocol = root / "protocols/v5_2_qd"
+            protocol.mkdir(parents=True)
+            os.mkfifo(protocol / "historical_walkforward_500.json")
+            (protocol / "historical_source_acquisition.json").write_bytes(
+                (
+                    ROOT
+                    / "protocols/v5_2_qd/historical_source_acquisition.json"
+                ).read_bytes()
+            )
+            script = (
+                "from pathlib import Path; "
+                "from mlb_backtest.v52_game_evidence_inventory import _authority_context; "
+                f"_authority_context(Path({str(root)!r}), None, None)"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+
+    def test_superseding_pair_stops_before_query_batch_replay(self) -> None:
+        from mlb_backtest.v52_game_evidence_inventory import (
+            build_game_evidence_inventory,
+        )
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        with self.assertRaisesRegex(TypeError, "Task 6"):
+            build_game_evidence_inventory(
+                ROOT,
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        with self.assertRaises(ValueError):
+            build_game_evidence_inventory(
+                ROOT,
+                run_spec_path=source_run,
+                acquisition_contract_path=ROOT
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+            )
+
     @staticmethod
     def _tree_byte_inode_snapshot(
         root: Path,

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import ContextManager, Literal, TypeVar
 from urllib.parse import urlparse
 
-from .protocols import RunSpec, load_run_spec
+from .protocols import RunSpec, SourceRunSpec, load_run_spec, load_source_run_spec
 from .v52_evidence import (
     AttemptBudgetSnapshot,
     AttemptCapture,
@@ -683,7 +683,7 @@ class TrustIntegrityError(ValueError):
 @dataclass(frozen=True)
 class _AcquisitionRequest:
     root: Path
-    run_spec: RunSpec
+    run_spec: RunSpec | SourceRunSpec
     years: range
     mode: str
     resume: bool
@@ -693,6 +693,7 @@ class _AcquisitionRequest:
     reserve_bytes: int
     plan_only: bool
     fetcher: Callable[..., AttemptCapture] = fetch_attempt
+    acquisition_contract_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -904,8 +905,8 @@ def _validate_request_contract(
         root = trusted_legacy_repository_root(request.root)
     except (OSError, RuntimeError, ValueError) as exc:
         raise TrustIntegrityError("repository root trust failed") from exc
-    if not isinstance(request.run_spec, RunSpec):
-        raise TrustIntegrityError("run_spec must be a RunSpec")
+    if not isinstance(request.run_spec, (RunSpec, SourceRunSpec)):
+        raise TrustIntegrityError("run_spec must be an authenticated source authority")
     if request.years != _EXPECTED_YEARS:
         raise TrustIntegrityError("years must be the exact 2018:2024 range")
     if request.mode != "hybrid":
@@ -922,14 +923,42 @@ def _validate_request_contract(
     ):
         raise TrustIntegrityError("free-space reserve is below 20 GiB")
 
+    supplied_contract = (
+        root / _ACQUISITION_CONTRACT_RELATIVE
+        if request.acquisition_contract_path is None
+        else request.acquisition_contract_path
+    )
+    if isinstance(request.run_spec, SourceRunSpec):
+        from .v52_query_plan import _load_static_contracts
+
+        try:
+            context = _load_static_contracts(
+                root
+                / "protocols/v5_2_qd/"
+                "historical_walkforward_500_superseding_565534.json",
+                supplied_contract,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise TrustIntegrityError("source authority authentication failed") from exc
+        if context.repository_root != root or context.authority != request.run_spec:
+            raise TrustIntegrityError("source authority object differs")
+        _require_exact_path(
+            root, request.legacy_root, _LEGACY_ROOT_RELATIVE, "legacy root"
+        )
+        _require_exact_path(
+            root,
+            request.protected_inventory_path,
+            _PROTECTED_INVENTORY_RELATIVE,
+            "protected inventory",
+        )
+        raise TrustIntegrityError(
+            "superseding source checkpoints are not enabled before Task 6"
+        )
     run_path = _require_exact_path(
         root, root / _RUN_SPEC_RELATIVE, _RUN_SPEC_RELATIVE, "run spec"
     )
     contract_path = _require_exact_path(
-        root,
-        root / _ACQUISITION_CONTRACT_RELATIVE,
-        _ACQUISITION_CONTRACT_RELATIVE,
-        "acquisition contract",
+        root, supplied_contract, _ACQUISITION_CONTRACT_RELATIVE, "acquisition contract"
     )
     _require_exact_path(root, request.legacy_root, _LEGACY_ROOT_RELATIVE, "legacy root")
     _require_exact_path(
@@ -3483,7 +3512,7 @@ _REAL_OPS = _AcquireOps(
 
 def acquire_sources(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     *,
     years: range,
     mode: str,
@@ -3494,6 +3523,7 @@ def acquire_sources(
     reserve_bytes: int = _MINIMUM_RESERVE_BYTES,
     fetcher: Callable[..., AttemptCapture] = fetch_attempt,
     plan_only: bool = False,
+    acquisition_contract_path: Path | None = None,
 ) -> AcquisitionSummary:
     if not callable(fetcher):
         raise TypeError("fetcher must be callable")
@@ -3509,6 +3539,7 @@ def acquire_sources(
         reserve_bytes=reserve_bytes,
         plan_only=plan_only,
         fetcher=fetcher,
+        acquisition_contract_path=acquisition_contract_path,
     )
     return _run_acquisition(request, _REAL_OPS)
 
@@ -3533,6 +3564,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m mlb_backtest.v52_acquire")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run-spec", type=Path, required=True)
+    parser.add_argument("--acquisition-contract", type=Path)
     parser.add_argument("--years", type=_parse_years, required=True)
     parser.add_argument("--mode", choices=("hybrid",), required=True)
     parser.add_argument("--legacy-root", type=Path, required=True)
@@ -3551,8 +3583,13 @@ def _parser() -> argparse.ArgumentParser:
 def _cli_exact_run_spec(root: Path, supplied: Path) -> Path:
     canonical_root = Path(os.path.abspath(os.fspath(root)))
     candidate = _absolute_supplied(supplied, canonical_root)
-    expected = canonical_root / _RUN_SPEC_RELATIVE
-    if candidate != expected:
+    permitted = {
+        canonical_root / _RUN_SPEC_RELATIVE,
+        canonical_root
+        / "protocols/v5_2_qd/"
+        "historical_walkforward_500_superseding_565534.json",
+    }
+    if candidate not in permitted:
         raise TrustIntegrityError("run spec path differs from the frozen contract")
     try:
         linked = candidate.lstat()
@@ -3570,7 +3607,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run_spec_path = _cli_exact_run_spec(args.root, args.run_spec)
         try:
-            run_spec = load_run_spec(run_spec_path)
+            run_spec = (
+                load_source_run_spec(run_spec_path)
+                if run_spec_path.name.endswith("_superseding_565534.json")
+                else load_run_spec(run_spec_path)
+            )
         except (OSError, ValueError) as exc:
             raise TrustIntegrityError("run spec trust failed") from exc
         summary = acquire_sources(
@@ -3584,6 +3625,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             protected_inventory_path=args.protected_inventory,
             reserve_bytes=args.reserve_bytes,
             plan_only=args.plan_only,
+            acquisition_contract_path=(
+                args.acquisition_contract
+                if args.acquisition_contract is not None
+                else args.root / _ACQUISITION_CONTRACT_RELATIVE
+            ),
         )
     except KeyboardInterrupt:
         return 130

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -29,7 +30,7 @@ from .v52_timezone_review import (
     load_verified_timezone_gate,
     validate_timezone_mapping,
 )
-from .protocols import RunSpec
+from .protocols import RunSpec, SourceRunSpec
 
 from .v52_evidence import (
     LogicalQuery,
@@ -40,7 +41,11 @@ from .v52_evidence import (
 )
 from .v52_query_plan import (
     QueryBatch,
+    SourceAuthorityContext,
     SplitReceipt,
+    _SOURCE_RUN_SPEC_RELATIVE,
+    _RUN_SPEC_RELATIVE,
+    _load_static_contracts,
     _make_batch,
     bisect_statcast_query,
     load_query_batch,
@@ -1275,9 +1280,37 @@ def _safe_raw_namespace(run_spec: RunSpec) -> Path:
     return raw_path
 
 
+def _authenticate_authority_paths(
+    root: Path,
+    run_spec: RunSpec | SourceRunSpec,
+    acquisition_contract_path: Path,
+) -> SourceAuthorityContext:
+    """Authenticate the exact authority pair before touching checkpoints.
+
+    The superseding source authority is intentionally parsed here, but remains
+    unusable for replay: checkpoint APIs are still RunSpec-only until Task 6.
+    Keeping this authentication boundary ahead of the terminal graph load makes
+    cross-pair and outside-path attempts fail before any checkpoint I/O.
+    """
+    root = Path(os.path.abspath(os.fspath(root)))
+    if isinstance(run_spec, RunSpec):
+        authority_relative = _RUN_SPEC_RELATIVE
+    elif isinstance(run_spec, SourceRunSpec):
+        authority_relative = _SOURCE_RUN_SPEC_RELATIVE
+    else:
+        raise TypeError("run_spec must be a RunSpec or SourceRunSpec")
+    context = _load_static_contracts(
+        root / authority_relative,
+        Path(acquisition_contract_path),
+    )
+    if context.repository_root != root or context.authority != run_spec:
+        raise ValueError("authority object differs from authenticated repository bytes")
+    return context
+
+
 def load_snapshot_replay_inputs(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     *,
     acquisition_contract_path: Path,
 ) -> SnapshotReplayInputs:
@@ -1287,7 +1320,28 @@ def load_snapshot_replay_inputs(
     loaders are consulted.  No network access, writes, cleanup, or directory
     scans are performed by this factory.
     """
-    raw_relative = _safe_raw_namespace(run_spec)
+    # Unit callers historically supplied lightweight RunSpec-shaped doubles;
+    # retain that seam while authenticating all real protocol authorities.
+    context: SourceAuthorityContext | None = None
+    if isinstance(run_spec, (RunSpec, SourceRunSpec)):
+        context = _authenticate_authority_paths(
+            root, run_spec, acquisition_contract_path
+        )
+        if isinstance(run_spec, SourceRunSpec):
+            raise ValueError(
+                "SourceRunSpec checkpoint authority is unavailable before Task 6"
+            )
+        authenticated_contract_path = context.acquisition_contract_path
+        authenticated_root = context.repository_root
+        evidence_root = context.raw_root
+    else:
+        authenticated_contract_path = acquisition_contract_path
+        authenticated_root = root
+        raw_relative = _safe_raw_namespace(run_spec)  # type: ignore[arg-type]
+        evidence_root = Path(root) / raw_relative
+
+    if context is not None:
+        raw_relative = _safe_raw_namespace(run_spec)  # type: ignore[arg-type]
     graph = _load_terminal_query_graph(root, run_spec)
     static_batches = tuple(
         batch for batch in graph.query_batches if batch.stage == "STATIC_SCHEDULES"
@@ -1295,17 +1349,16 @@ def load_snapshot_replay_inputs(
     if len(static_batches) != 1:
         raise ValueError("source verification requires one STATIC_SCHEDULES batch")
 
-    evidence_root = root / raw_relative
     schedule = load_verified_schedule_anchor_inventory(
-        root,
+        authenticated_root,
         run_spec,
-        acquisition_contract_path=acquisition_contract_path,
+        acquisition_contract_path=authenticated_contract_path,
         static_batch_id=static_batches[0].batch_id,
         evidence_root=evidence_root,
         read_only_progress=True,
     )
-    timezone = load_verified_timezone_gate(root, read_only_progress=True)
-    games = load_verified_game_evidence_inventory(root, read_only_progress=True)
+    timezone = load_verified_timezone_gate(authenticated_root, read_only_progress=True)
+    games = load_verified_game_evidence_inventory(authenticated_root, read_only_progress=True)
     store = V52EvidenceStore.open_read_only(evidence_root)
     records = tuple(_recompute_verified_query_records(store, graph.completed_queries))
     game_snapshots = tuple(

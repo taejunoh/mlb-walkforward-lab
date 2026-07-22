@@ -30,7 +30,9 @@ from .v52_legacy import (
 )
 from .v52_query_plan import (
     _load_query_batch,
+    _load_static_contracts,
     QueryBatch,
+    SourceAuthorityContext,
     build_legacy_partition_batch_from_catalog,
     build_statcast_root_batch,
 )
@@ -101,6 +103,43 @@ class _Authority:
     root: Path
     payload: Mapping[str, object]
     identities: tuple[tuple[str, tuple[int, ...]], ...]
+    context: SourceAuthorityContext
+
+
+def _authority_context(
+    root: Path,
+    run_spec_path: Path | None,
+    acquisition_contract_path: Path | None,
+) -> SourceAuthorityContext:
+    """Authenticate the exact authority pair before touching replay artifacts."""
+    supplied_run = Path(run_spec_path) if run_spec_path is not None else root / _RUN_SPEC_RELATIVE
+    supplied_contract = (
+        Path(acquisition_contract_path)
+        if acquisition_contract_path is not None
+        else root / _ACQUISITION_CONTRACT_RELATIVE
+    )
+    for supplied, label in ((supplied_run, "RunSpec"), (supplied_contract, "acquisition contract")):
+        text = os.fspath(supplied)
+        if (
+            not supplied.is_absolute()
+            or "\\" in text
+            or any(part in {"", ".", ".."} for part in supplied.parts)
+            or Path(os.path.abspath(text)) != supplied
+        ):
+            raise ValueError(f"{label} path differs from the repository contract")
+        try:
+            supplied.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} path must stay under the repository root") from exc
+    context = _load_static_contracts(supplied_run, supplied_contract)
+    if context.repository_root != root:
+        raise ValueError("authority pair repository root differs")
+    # Query-batch/checkpoint replay has no SourceRunSpec authority until Task 6.
+    from .protocols import SourceRunSpec
+
+    if isinstance(context.authority, SourceRunSpec):
+        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
+    return context
 
 
 def _before_legacy_decision_inventory_authority_rebind() -> None:
@@ -385,10 +424,22 @@ def _authority_identities(
     return tuple(sorted(result))
 
 
-def _assemble(repository_root: Path) -> _Authority:
+def _assemble(
+    repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
+    context: SourceAuthorityContext | None = None,
+) -> _Authority:
     root = _trusted_root(repository_root)
-    run_spec, run_snapshot = _json_snapshot(root, _RUN_SPEC_RELATIVE)
-    contract, contract_snapshot = _json_snapshot(root, _ACQUISITION_CONTRACT_RELATIVE)
+    if context is None:
+        context = _authority_context(root, run_spec_path, acquisition_contract_path)
+    elif context.repository_root != root:
+        raise ValueError("authority pair repository root differs")
+    run_relative = context.authority_path.relative_to(root)
+    contract_relative = context.acquisition_contract_path.relative_to(root)
+    run_spec, run_snapshot = _json_snapshot(root, run_relative)
+    contract, contract_snapshot = _json_snapshot(root, contract_relative)
     schema, schema_snapshot = _json_snapshot(root, _SCHEMA_RELATIVE)
     if hashlib.sha256(schema_snapshot.contents).hexdigest() != _EXPECTED_SCHEMA_SHA256:
         raise ValueError("legacy decision inventory schema authority differs")
@@ -396,7 +447,7 @@ def _assemble(repository_root: Path) -> _Authority:
         Draft202012Validator.check_schema(schema)
     except Exception as exc:
         raise ValueError("legacy decision inventory schema is invalid") from exc
-    if run_spec.get("run_id") != _RUN_ID or contract.get("run_id") != _RUN_ID:
+    if run_spec.get("run_id") != context.run_id or contract.get("run_id") != context.run_id:
         raise ValueError("run authority differs")
     legacy = contract.get("legacy_protection")
     if not isinstance(legacy, Mapping):
@@ -427,7 +478,8 @@ def _assemble(repository_root: Path) -> _Authority:
     )
     if root_batch != root_expected or len(root_batch.queries) != 46:
         raise ValueError("Statcast root batch authority differs")
-    root_batch_relative = _QUERY_BATCH_ROOT / f"{root_batch.batch_id}.json"
+    batch_root_relative = context.acquisition_audit_root.relative_to(root) / "query_batches"
+    root_batch_relative = batch_root_relative / f"{root_batch.batch_id}.json"
     root_batch_snapshot = _snapshot(root, root / root_batch_relative)
 
     preview = preview_legacy_decisions(
@@ -438,13 +490,13 @@ def _assemble(repository_root: Path) -> _Authority:
     payload = {
         "schema_version": 1,
         "receipt_kind": "LEGACY_DECISION_INVENTORY",
-        "run_id": _RUN_ID,
+        "run_id": context.run_id,
         "run_spec": {
-            "path": _RUN_SPEC_RELATIVE.as_posix(),
+            "path": run_relative.as_posix(),
             "sha256": hashlib.sha256(run_snapshot.contents).hexdigest(),
         },
         "acquisition_contract": {
-            "path": _ACQUISITION_CONTRACT_RELATIVE.as_posix(),
+            "path": contract_relative.as_posix(),
             "sha256": hashlib.sha256(contract_snapshot.contents).hexdigest(),
         },
         "protected_inventory": {
@@ -465,25 +517,32 @@ def _assemble(repository_root: Path) -> _Authority:
         root,
         catalog,
         (
-            (_RUN_SPEC_RELATIVE, run_snapshot),
-            (_ACQUISITION_CONTRACT_RELATIVE, contract_snapshot),
+            (run_relative, run_snapshot),
+            (contract_relative, contract_snapshot),
             (_SCHEMA_RELATIVE, schema_snapshot),
             (_PROTECTED_INVENTORY_RELATIVE, protected_snapshot),
             (root_batch_relative, root_batch_snapshot),
         ),
     )
-    return _Authority(root, _validate_payload(payload, schema), identities)
+    return _Authority(root, _validate_payload(payload, schema), identities, context)
 
 
 def build_legacy_decision_inventory(
     repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> Mapping[str, object]:
-    authority = _assemble(repository_root)
+    authority = _assemble(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
     return _validate_authority_payload(authority)
 
 
 def _rebind_authority(initial: _Authority) -> _Authority:
-    rebound = _assemble(initial.root)
+    rebound = _assemble(initial.root, context=initial.context)
     if rebound.payload != initial.payload or rebound.identities != initial.identities:
         raise RuntimeError("legacy decision authority changed during verification")
     return rebound
@@ -526,11 +585,16 @@ def _directory_flags() -> int:
     )
 
 
-def _open_inventory_parent(root: Path, *, create: bool) -> tuple[list[int], int]:
+def _open_inventory_parent(
+    root: Path,
+    *,
+    create: bool,
+    inventory_relative: Path = _LEGACY_DECISION_INVENTORY_RELATIVE,
+) -> tuple[list[int], int]:
     descriptors = [os.open(root, _directory_flags())]
     try:
         current = descriptors[0]
-        for component in _LEGACY_DECISION_INVENTORY_RELATIVE.parent.parts:
+        for component in inventory_relative.parent.parts:
             if create:
                 try:
                     os.mkdir(component, 0o755, dir_fd=current)
@@ -557,6 +621,7 @@ def _open_inventory_parent(root: Path, *, create: bool) -> tuple[list[int], int]
 
 def _read_final_at(
     parent_fd: int,
+    inventory_name: str = _LEGACY_DECISION_INVENTORY_RELATIVE.name,
 ) -> tuple[bytes, tuple[int, int, int, int]] | None:
     flags = (
         os.O_RDONLY
@@ -566,7 +631,7 @@ def _read_final_at(
     )
     try:
         descriptor = os.open(
-            _LEGACY_DECISION_INVENTORY_RELATIVE.name,
+            inventory_name,
             flags,
             dir_fd=parent_fd,
         )
@@ -595,7 +660,7 @@ def _read_final_at(
                 raise ValueError("legacy decision inventory exceeds its read limit")
             chunks.append(chunk)
         linked = os.stat(
-            _LEGACY_DECISION_INVENTORY_RELATIVE.name,
+            inventory_name,
             dir_fd=parent_fd,
             follow_symlinks=False,
         )
@@ -618,17 +683,22 @@ def _read_final_at(
 
 
 def _remove_owned_final(
-    root: Path, contents: bytes, identity: tuple[int, int, int, int]
+    root: Path,
+    contents: bytes,
+    identity: tuple[int, int, int, int],
+    inventory_relative: Path = _LEGACY_DECISION_INVENTORY_RELATIVE,
 ) -> None:
-    descriptors, parent_fd = _open_inventory_parent(root, create=False)
+    descriptors, parent_fd = _open_inventory_parent(
+        root, create=False, inventory_relative=inventory_relative
+    )
     locked = False
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_EX)
         locked = True
-        current = _read_final_at(parent_fd)
+        current = _read_final_at(parent_fd, inventory_relative.name)
         if current is None or current != (contents, identity):
             return
-        os.unlink(_LEGACY_DECISION_INVENTORY_RELATIVE.name, dir_fd=parent_fd)
+        os.unlink(inventory_relative.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
         if locked:
@@ -639,18 +709,32 @@ def _remove_owned_final(
 
 def publish_legacy_decision_inventory(
     repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> VerifiedLegacyDecisionInventory:
-    assembled = _assemble(repository_root)
+    assembled = _assemble(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
     initial = _Authority(
         assembled.root,
         _validate_authority_payload(assembled),
         assembled.identities,
+        assembled.context,
     )
     counts = initial.payload["counts"]
     if not isinstance(counts, Mapping) or counts["fatal_integrity_count"]:
         raise RuntimeError("fatal legacy integrity decisions cannot be published")
     contents = _canonical_file(initial.payload)
-    descriptors, parent_fd = _open_inventory_parent(initial.root, create=True)
+    inventory_relative = (
+        initial.context.acquisition_audit_root.relative_to(initial.root)
+        / "legacy_decision_inventory.json"
+    )
+    descriptors, parent_fd = _open_inventory_parent(
+        initial.root, create=True, inventory_relative=inventory_relative
+    )
     temp_name: str | None = None
     temp_fd = -1
     locked = False
@@ -660,12 +744,12 @@ def publish_legacy_decision_inventory(
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_EX)
         locked = True
-        existing = _read_final_at(parent_fd)
+        existing = _read_final_at(parent_fd, inventory_relative.name)
         if existing is not None and existing[0] != contents:
             raise RuntimeError("immutable legacy decision inventory differs")
         if existing is None:
             temp_name = (
-                f".{_LEGACY_DECISION_INVENTORY_RELATIVE.name}."
+                f".{inventory_relative.name}."
                 f"{secrets.token_hex(16)}.tmp"
             )
             flags = (
@@ -699,13 +783,13 @@ def publish_legacy_decision_inventory(
                 assert temp_name is not None
                 os.link(
                     temp_name,
-                    _LEGACY_DECISION_INVENTORY_RELATIVE.name,
+                    inventory_relative.name,
                     src_dir_fd=parent_fd,
                     dst_dir_fd=parent_fd,
                     follow_symlinks=False,
                 )
             except FileExistsError:
-                raced = _read_final_at(parent_fd)
+                raced = _read_final_at(parent_fd, inventory_relative.name)
                 if raced is None or raced[0] != contents:
                     raise RuntimeError(
                         "concurrent immutable legacy decision inventory differs"
@@ -714,7 +798,7 @@ def publish_legacy_decision_inventory(
                 os.unlink(temp_name, dir_fd=parent_fd)
                 temp_name = None
                 os.fsync(parent_fd)
-        final_record = _read_final_at(parent_fd)
+        final_record = _read_final_at(parent_fd, inventory_relative.name)
         if final_record is None or final_record[0] != contents:
             raise ValueError("legacy decision inventory publication differs")
         expected_identity = final_record[1]
@@ -726,15 +810,14 @@ def publish_legacy_decision_inventory(
             rebound_payload = _validate_authority_payload(rebound)
             if rebound_payload != initial.payload:
                 raise ValueError("legacy decision authority payload changed")
-            authority = _Authority(rebound.root, rebound_payload, rebound.identities)
+            authority = _Authority(
+                rebound.root, rebound_payload, rebound.identities, rebound.context
+            )
         except BaseException:
             if created_identity is not None:
-                owned = _read_final_at(parent_fd)
+                owned = _read_final_at(parent_fd, inventory_relative.name)
                 if owned == (contents, created_identity):
-                    os.unlink(
-                        _LEGACY_DECISION_INVENTORY_RELATIVE.name,
-                        dir_fd=parent_fd,
-                    )
+                    os.unlink(inventory_relative.name, dir_fd=parent_fd)
                     os.fsync(parent_fd)
             raise
     finally:
@@ -751,7 +834,7 @@ def publish_legacy_decision_inventory(
         for descriptor in reversed(descriptors):
             os.close(descriptor)
 
-    final = authority.root / _LEGACY_DECISION_INVENTORY_RELATIVE
+    final = authority.root / inventory_relative
     try:
         post = _rebind_authority(authority)
         post_payload = _validate_authority_payload(post)
@@ -766,30 +849,48 @@ def publish_legacy_decision_inventory(
         ):
             raise ValueError("legacy decision inventory final identity differs")
         _rebind(authority.root, final, final_snapshot)
-        verified_authority = _Authority(post.root, post_payload, post.identities)
+        verified_authority = _Authority(
+            post.root, post_payload, post.identities, post.context
+        )
         return _verified(verified_authority, final, contents)
     except BaseException:
         if created_identity is not None:
-            _remove_owned_final(authority.root, contents, created_identity)
+            _remove_owned_final(
+                authority.root, contents, created_identity, inventory_relative
+            )
         raise
 
 
 def load_verified_legacy_decision_inventory(
     repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> VerifiedLegacyDecisionInventory:
-    assembled = _assemble(repository_root)
+    assembled = _assemble(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
     initial = _Authority(
         assembled.root,
         _validate_authority_payload(assembled),
         assembled.identities,
+        assembled.context,
     )
-    final = initial.root / _LEGACY_DECISION_INVENTORY_RELATIVE
+    inventory_relative = (
+        initial.context.acquisition_audit_root.relative_to(initial.root)
+        / "legacy_decision_inventory.json"
+    )
+    final = initial.root / inventory_relative
     try:
-        descriptors, parent_fd = _open_inventory_parent(initial.root, create=False)
+        descriptors, parent_fd = _open_inventory_parent(
+            initial.root, create=False, inventory_relative=inventory_relative
+        )
     except FileNotFoundError as exc:
         raise ValueError("legacy decision inventory is missing") from exc
     try:
-        stored_record = _read_final_at(parent_fd)
+        stored_record = _read_final_at(parent_fd, inventory_relative.name)
         if stored_record is None:
             raise ValueError("legacy decision inventory is missing")
         contents, identity = stored_record
@@ -807,7 +908,7 @@ def load_verified_legacy_decision_inventory(
         rebound_payload = _validate_authority_payload(rebound)
         if rebound_payload != initial.payload:
             raise ValueError("legacy decision authority changed during load")
-        final_record = _read_final_at(parent_fd)
+        final_record = _read_final_at(parent_fd, inventory_relative.name)
         if final_record != (contents, identity):
             raise ValueError("legacy decision inventory changed during load")
     finally:
@@ -822,7 +923,9 @@ def load_verified_legacy_decision_inventory(
     ):
         raise ValueError("legacy decision inventory final identity differs")
     _rebind(initial.root, final, snapshot)
-    authority = _Authority(rebound.root, rebound_payload, rebound.identities)
+    authority = _Authority(
+        rebound.root, rebound_payload, rebound.identities, rebound.context
+    )
     return _verified(authority, final, contents)
 
 

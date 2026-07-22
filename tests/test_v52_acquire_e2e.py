@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from mlb_backtest.protocols import load_run_spec
+from mlb_backtest.protocols import load_run_spec, load_source_run_spec
 from mlb_backtest.v52_evidence import AttemptCapture, LogicalQuery
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
 from tests.test_v52_legacy_decision_inventory import (
@@ -263,11 +263,50 @@ class V52AcquirePublicE2ETest(unittest.TestCase):
     def test_bounded_runtime_closure_keeps_current_schema_bindings(self) -> None:
         from mlb_backtest import execution_registry
 
-        self.assertEqual(len(self.bound_schema_paths), 14)
+        self.assertEqual(len(self.bound_schema_paths), 15)
         self.assertEqual(
             execution_registry._BOUND_EXECUTION_CODE,
             ("mlb_backtest/execution_registry.py", *self.bound_schema_paths),
         )
+
+    def test_superseding_pair_authenticates_then_stops_before_checkpoint_io(self) -> None:
+        from mlb_backtest.v52_acquire import TrustIntegrityError, acquire_sources
+
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        kwargs = {
+            "years": range(2018, 2025),
+            "mode": "hybrid",
+            "resume": False,
+            "stop_after": None,
+            "legacy_root": ROOT / LEGACY_ROOT,
+            "protected_inventory_path": ROOT / INVENTORY_PATH,
+            "plan_only": True,
+        }
+        with self.assertRaisesRegex(TrustIntegrityError, "Task 6"):
+            acquire_sources(
+                ROOT,
+                source_run,
+                acquisition_contract_path=source_contract_path,
+                **kwargs,
+            )
+        with self.assertRaises(TrustIntegrityError):
+            acquire_sources(
+                ROOT,
+                source_run,
+                acquisition_contract_path=ROOT
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+                **kwargs,
+            )
         self.assertTrue(
             {
                 "schemas/v5_2_clean_source_replay_receipt.schema.json",

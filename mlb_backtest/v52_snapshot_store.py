@@ -690,8 +690,23 @@ class _ReadBinding:
     nlink: int
 
 
-def read_inventory(root: Path) -> SourceInventory:
+def validate_expected_root(root: Path, expected_root: Path | None) -> None:
+    """Check a caller's path expectation before any filesystem operation."""
+    if expected_root is None:
+        return
+    if not isinstance(expected_root, Path):
+        raise TypeError("expected snapshot store root must be a pathlib.Path")
+    if not isinstance(root, Path):
+        raise TypeError("snapshot store root must be a pathlib.Path")
+    if root != expected_root:
+        raise PublishError("snapshot store root differs from expected authority root")
+
+
+def read_inventory(
+    root: Path, *, expected_root: Path | None = None
+) -> SourceInventory:
     """Read and canonically parse the committed inventory without mutating the store."""
+    validate_expected_root(root, expected_root)
     with _open_path_capability(root) as trusted:
         inventory = read_inventory_from_fd(trusted.root_fd)
         _load_test_hook("before_read_inventory_return")
@@ -712,8 +727,14 @@ def read_inventory_from_fd(source_root_fd: int) -> SourceInventory:
         _close_directory(held)
 
 
-def load_snapshot_store(root: Path, inputs: SnapshotStoreInputs) -> LoadedSnapshotStore:
+def load_snapshot_store(
+    root: Path,
+    inputs: SnapshotStoreInputs,
+    *,
+    expected_root: Path | None = None,
+) -> LoadedSnapshotStore:
     """Read only an exactly replayable committed store; never repair its residue."""
+    validate_expected_root(root, expected_root)
     with _open_path_capability(root) as trusted:
         result = load_snapshot_store_from_fd(trusted.root_fd, inputs)
         _load_test_hook("before_path_load_return")
@@ -1103,12 +1124,14 @@ def publish_snapshot_store(
     inputs: SnapshotStoreInputs,
     *,
     lock_owner: str,
+    expected_root: Path | None = None,
 ) -> PublishReceipt:
     """Atomically expose a content-addressed snapshot set without replacing any file.
 
     ``source_inventory.json`` is deliberately linked last: everything before it is
     safe, immutable residue which an identical retry can reuse.
     """
+    validate_expected_root(root, expected_root)
     _validate_publish_arguments(root, inventory, inputs, lock_owner)
     with _open_path_capability(root) as trusted:
         root_dir = _duplicate_directory_capability(trusted.root_fd)
@@ -1815,4 +1838,5 @@ __all__ = [
     "read_inventory_from_fd",
     "load_snapshot_store", "load_snapshot_store_from_fd", "publish_snapshot_store",
     "publish_snapshot_store_from_fd",
+    "validate_expected_root",
 ]

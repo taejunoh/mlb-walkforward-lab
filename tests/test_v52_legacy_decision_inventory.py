@@ -154,6 +154,35 @@ def _statcast_root_batch_path(root: Path) -> Path:
 
 
 class V52LegacyDecisionInventoryTest(unittest.TestCase):
+    def test_superseding_pair_stops_before_query_batch_replay(self) -> None:
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            build_legacy_decision_inventory,
+        )
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        with self.assertRaisesRegex(TypeError, "Task 6"):
+            build_legacy_decision_inventory(
+                ROOT,
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+        with self.assertRaises(ValueError):
+            build_legacy_decision_inventory(
+                ROOT,
+                run_spec_path=source_run,
+                acquisition_contract_path=ROOT
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+            )
+
     def test_public_api_schema_and_verified_record_are_closed(self) -> None:
         spec = importlib.util.find_spec(
             "mlb_backtest.v52_legacy_decision_inventory"

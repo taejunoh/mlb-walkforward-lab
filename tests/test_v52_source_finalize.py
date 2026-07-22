@@ -42,6 +42,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def test_superseding_cli_authority_stops_before_checkpoint_services(self) -> None:
+        from mlb_backtest.v52_source_orchestration import (
+            CommonArgs,
+            FinalizationError,
+            build_context,
+        )
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        with self.assertRaises(FinalizationError) as raised:
+            build_context(
+                CommonArgs(
+                    root=ROOT,
+                    run_spec=source_run,
+                    acquisition_contract=source_contract,
+                    protected_inventory=ROOT
+                    / "audit/v5_1_bt/protected_raw_inventory.json",
+                )
+            )
+        self.assertEqual(
+            raised.exception.error_code, "CHECKPOINT_AUTHORITY_UNAVAILABLE"
+        )
+        self.assertIn("Task 6", raised.exception.message)
+
     def _run_json(self, argv: list[str]) -> tuple[int, dict[str, object], str]:
         with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
             "sys.stderr", new_callable=io.StringIO
@@ -1604,6 +1636,84 @@ class StatusAndPreflightTests(unittest.TestCase):
                 lock_owner="status-test",
             )
 
+    def _superseding_namespace(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            repository_root=self.root,
+            sources_root=self.root
+            / "data/v5_2_qd/historical_superseding_565534/sources",
+            acquisition_audit_root=self.root
+            / "audit/v5_2_qd/historical_superseding_565534/acquisition",
+            execution_audit_root=self.root
+            / "audit/v5_2_qd/historical_superseding_565534/execution",
+        )
+
+    def test_superseding_review_replay_and_advance_reject_old_paths_before_io(self) -> None:
+        context = dataclasses.replace(
+            self.context, authority_context=self._superseding_namespace()
+        )
+        old_review = self.root / "audit/v5_2_qd/historical/acquisition/source_reviews"
+        old_replay = self.root / "audit/v5_2_qd/historical/acquisition/source_replays"
+        with (
+            patch.object(
+                orchestration,
+                "read_status",
+                side_effect=AssertionError("source store I/O reached"),
+            ),
+            self.assertRaises(orchestration.FinalizationError) as review_error,
+        ):
+            orchestration.write_review(
+                context,
+                orchestration.ReviewRequest(
+                    "independent-source-auditor",
+                    "independent-source-auditor",
+                    "APPROVED",
+                    old_review / "ids.json",
+                    old_review / "review.json",
+                    old_review / "review.commit.json",
+                ),
+            )
+        self.assertEqual(review_error.exception.error_code, "PATH_UNSAFE")
+        with (
+            patch.object(
+                orchestration,
+                "read_status",
+                side_effect=AssertionError("source store I/O reached"),
+            ),
+            self.assertRaises(orchestration.FinalizationError) as replay_error,
+        ):
+            orchestration.write_replay(
+                context,
+                orchestration.ReplayRequest(
+                    old_replay / "replay.json",
+                    old_replay / "replay.commit.json",
+                ),
+            )
+        self.assertEqual(replay_error.exception.error_code, "PATH_UNSAFE")
+        with (
+            patch.object(
+                orchestration,
+                "_read_explicit_artifact",
+                side_effect=AssertionError("advance artifact I/O reached"),
+            ),
+            self.assertRaises(orchestration.FinalizationError) as advance_error,
+        ):
+            orchestration.advance_sources_ready(
+                context,
+                orchestration.AdvanceRequest(
+                    (old_review / "review.commit.json",),
+                    (
+                        old_replay / "first.commit.json",
+                        old_replay / "second.commit.json",
+                    ),
+                    self.root
+                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints/"
+                    f"{self.checkpoint.sequence:08d}-{self.checkpoint.receipt_sha256}.json",
+                    self.root
+                    / "data/v5_2_qd/historical/sources/source_inventory.json",
+                ),
+            )
+        self.assertEqual(advance_error.exception.error_code, "PATH_UNSAFE")
+
     def test_status_and_preflight_symbols_are_public(self) -> None:
         self.assertIn("read_status", orchestration.__all__)
         self.assertIn("run_preflight", orchestration.__all__)
@@ -1937,6 +2047,37 @@ class PublishTests(StatusAndPreflightTests):
         self.assertEqual(
             (self.root / "data/v5_2_qd/historical/sources/source_inventory.json").read_bytes(),
             inventory_bytes(self.inventory),
+        )
+
+    def test_publish_uses_context_sources_root_and_snapshot_adapter(self) -> None:
+        authority = self._superseding_namespace()
+        context = dataclasses.replace(
+            self.context, authority_context=authority
+        )
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration,
+                "run_preflight",
+                return_value=self._passing_preflight(),
+            ),
+            patch.object(
+                orchestration.v52_snapshot_store,
+                "validate_expected_root",
+                wraps=orchestration.v52_snapshot_store.validate_expected_root,
+            ) as root_adapter,
+        ):
+            orchestration.publish_inventory(context, lock_owner="source-adapter-test")
+        expected = authority.sources_root / "source_inventory.json"
+        self.assertTrue(expected.is_file())
+        self.assertFalse(
+            (
+                self.root
+                / "data/v5_2_qd/historical/sources/source_inventory.json"
+            ).exists()
+        )
+        root_adapter.assert_called_with(
+            authority.sources_root, authority.sources_root
         )
 
     def test_identical_retry_reports_existing_without_changing_inventory_inode(self) -> None:

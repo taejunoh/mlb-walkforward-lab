@@ -5,6 +5,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -15,7 +17,7 @@ from unittest.mock import patch
 import jsonschema
 from jsonschema import Draft202012Validator, FormatChecker
 
-from mlb_backtest.protocols import load_run_spec
+from mlb_backtest.protocols import load_run_spec, load_source_run_spec
 from mlb_backtest.v52_evidence import AttemptCapture, V52EvidenceStore
 from mlb_backtest.v52_query_plan import build_static_batch, publish_query_batch
 from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
@@ -27,6 +29,39 @@ CONTRACT_PATH = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 SCHEMA_PATH = ROOT / "schemas/v5_2_schedule_anchor_inventory.schema.json"
 INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
+)
+SOURCE_RUN_SPEC_PATH = (
+    ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+SOURCE_CONTRACT_PATH = (
+    ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+_SOURCE_AUTHORITY_FILES = (
+    RUN_SPEC_PATH.relative_to(ROOT),
+    CONTRACT_PATH.relative_to(ROOT),
+    SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+    SOURCE_CONTRACT_PATH.relative_to(ROOT),
+    Path("schemas/v5_2_acquisition_contract.schema.json"),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
+    ),
+    Path(
+        "docs/superpowers/plans/"
+        "2026-07-13-mlb-v5-2-hybrid-acquisition.md"
+    ),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+    ),
+    Path(
+        "docs/superpowers/specs/"
+        "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+    ),
+    Path(
+        "docs/superpowers/plans/"
+        "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+    ),
 )
 
 
@@ -160,6 +195,104 @@ def _kwargs(fixture: _Fixture) -> dict[str, object]:
 
 
 class V52ScheduleInventoryTest(unittest.TestCase):
+    def test_source_authority_rejects_wrong_raw_root_and_cross_pair_before_evidence(self) -> None:
+        from mlb_backtest.v52_schedule_inventory import (
+            build_schedule_anchor_inventory,
+            load_verified_schedule_anchor_inventory,
+            publish_schedule_anchor_inventory,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve() / "repo"
+            for relative in _SOURCE_AUTHORITY_FILES:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "schedule@example.test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Schedule Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "authority"], cwd=root, check=True
+            )
+            source_run_path = root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT)
+            source_contract_path = root / SOURCE_CONTRACT_PATH.relative_to(ROOT)
+            source_run = load_source_run_spec(source_run_path)
+            wrong_root = root / "data/v5_2_qd/historical/raw"
+            with self.assertRaisesRegex(ValueError, "evidence root"):
+                build_schedule_anchor_inventory(
+                    root,
+                    source_run,
+                    acquisition_contract_path=source_contract_path,
+                    static_batch_id="0" * 64,
+                    evidence_root=wrong_root,
+                )
+            source_raw = (
+                root / "data/v5_2_qd/historical_superseding_565534/raw"
+            )
+            with (
+                patch(
+                    "mlb_backtest.v52_schedule_inventory.load_query_batch",
+                    side_effect=AssertionError("query-batch I/O reached"),
+                ) as loader,
+                self.assertRaisesRegex(ValueError, "Task 6"),
+            ):
+                build_schedule_anchor_inventory(
+                    root,
+                    source_run,
+                    acquisition_contract_path=source_contract_path,
+                    static_batch_id="0" * 64,
+                    evidence_root=source_raw,
+                )
+            loader.assert_not_called()
+            with (
+                patch(
+                    "mlb_backtest.v52_schedule_inventory.build_schedule_anchor_inventory",
+                    side_effect=AssertionError("inventory build reached"),
+                ) as builder,
+                self.assertRaisesRegex(ValueError, "Task 6"),
+            ):
+                publish_schedule_anchor_inventory(
+                    root,
+                    source_run,
+                    acquisition_contract_path=source_contract_path,
+                    static_batch_id="0" * 64,
+                    evidence_root=source_raw,
+                )
+            builder.assert_not_called()
+            with (
+                patch(
+                    "mlb_backtest.v52_schedule_inventory._read_inventory_contents",
+                    side_effect=AssertionError("inventory read reached"),
+                ) as inventory_reader,
+                self.assertRaisesRegex(ValueError, "Task 6"),
+            ):
+                load_verified_schedule_anchor_inventory(
+                    root,
+                    source_run,
+                    acquisition_contract_path=source_contract_path,
+                    static_batch_id="0" * 64,
+                    evidence_root=source_raw,
+                )
+            inventory_reader.assert_not_called()
+            with self.assertRaises(ValueError):
+                build_schedule_anchor_inventory(
+                    root,
+                    source_run,
+                    acquisition_contract_path=root
+                    / "protocols/v5_2_qd/historical_source_acquisition.json",
+                    static_batch_id="0" * 64,
+                    evidence_root=source_raw,
+                )
+
     def test_build_publish_load_are_deterministic_frozen_and_schema_valid(self) -> None:
         from mlb_backtest.v52_schedule_inventory import (
             VerifiedScheduleAnchorInventory,

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from .protocols import RunSpec, parse_run_spec
+from .protocols import RunSpec, SourceRunSpec, parse_run_spec
 from .v52_evidence import (
     LogicalQuery,
     V52EvidenceStore,
@@ -24,6 +24,8 @@ from .v52_evidence import (
 from .v52_query_plan import (
     _ACQUISITION_CONTRACT_RELATIVE,
     _RUN_SPEC_RELATIVE,
+    _SOURCE_RUN_SPEC_RELATIVE,
+    _load_static_contracts,
     _read_repository_file,
     _validate_run_bound_acquisition_contract,
     load_query_batch,
@@ -101,6 +103,17 @@ class VerifiedScheduleAnchorInventory:
     sha256: str
 
 
+@dataclass(frozen=True)
+class _ScheduleAuthority:
+    authority_path: Path
+    acquisition_contract_path: Path
+    authority_sha256: str
+    acquisition_contract_sha256: str
+    run_id: str
+    raw_root: Path
+    acquisition_audit_root: Path
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -162,43 +175,80 @@ def _repository_relative(root: Path, path: Path, label: str) -> Path:
 
 def _authenticate(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     acquisition_contract_path: Path,
     evidence_root: Path,
-) -> tuple[str, str, str]:
-    if not isinstance(run_spec, RunSpec):
-        raise TypeError("run_spec must be a RunSpec")
+) -> _ScheduleAuthority:
     root = _absolute(root)
-    run_contents = _read_repository_file(root, _RUN_SPEC_RELATIVE, "schedule inventory RunSpec")
-    contract_contents = _read_repository_file(
-        root,
-        _ACQUISITION_CONTRACT_RELATIVE,
-        "schedule inventory acquisition contract",
+    if isinstance(run_spec, RunSpec):
+        run_contents = _read_repository_file(
+            root, _RUN_SPEC_RELATIVE, "schedule inventory RunSpec"
+        )
+        contract_contents = _read_repository_file(
+            root,
+            _ACQUISITION_CONTRACT_RELATIVE,
+            "schedule inventory acquisition contract",
+        )
+        if _absolute(acquisition_contract_path) != root / _ACQUISITION_CONTRACT_RELATIVE:
+            raise ValueError(
+                "acquisition contract path differs from the repository contract"
+            )
+        parsed_run, run_sha, _, contract_sha = (
+            _validate_run_bound_acquisition_contract(
+                root, run_contents, contract_contents
+            )
+        )
+        if parse_run_spec(parsed_run) != run_spec or run_spec.run_id != _RUN_ID:
+            raise ValueError(
+                "RunSpec object differs from authenticated repository bytes"
+            )
+        namespaces = run_spec.raw.get("namespaces")
+        raw_namespace = (
+            namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+        )
+        if not isinstance(raw_namespace, str):
+            raise ValueError("RunSpec raw namespace binding differs")
+        raw_relative = Path(raw_namespace)
+        if (
+            raw_relative.is_absolute()
+            or not raw_relative.parts
+            or any(part in {"", ".", ".."} for part in raw_relative.parts)
+        ):
+            raise ValueError("RunSpec raw namespace binding differs")
+        raw_root = root / raw_relative
+        if _absolute(evidence_root) != raw_root:
+            raise ValueError("evidence root differs from the RunSpec raw namespace")
+        return _ScheduleAuthority(
+            authority_path=root / _RUN_SPEC_RELATIVE,
+            acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+            authority_sha256=run_sha,
+            acquisition_contract_sha256=contract_sha,
+            run_id=_RUN_ID,
+            raw_root=raw_root,
+            acquisition_audit_root=root / _INVENTORY_RELATIVE.parent,
+        )
+    run_relative = (
+        _SOURCE_RUN_SPEC_RELATIVE
+        if isinstance(run_spec, SourceRunSpec)
+        else _RUN_SPEC_RELATIVE
     )
-    expected_contract = root / _ACQUISITION_CONTRACT_RELATIVE
-    if _absolute(acquisition_contract_path) != expected_contract:
-        raise ValueError("acquisition contract path differs from the repository contract")
-    parsed_run, run_sha, _, contract_sha = _validate_run_bound_acquisition_contract(
-        root,
-        run_contents,
-        contract_contents,
+    context = _load_static_contracts(
+        root / run_relative,
+        acquisition_contract_path,
     )
-    if parse_run_spec(parsed_run) != run_spec or run_spec.run_id != _RUN_ID:
+    if context.repository_root != root or context.authority != run_spec:
         raise ValueError("RunSpec object differs from authenticated repository bytes")
-    namespaces = run_spec.raw.get("namespaces")
-    raw_namespace = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
-    if not isinstance(raw_namespace, str):
-        raise ValueError("RunSpec raw namespace binding differs")
-    raw_relative = Path(raw_namespace)
-    if (
-        raw_relative.is_absolute()
-        or not raw_relative.parts
-        or any(part in {"", ".", ".."} for part in raw_relative.parts)
-    ):
-        raise ValueError("RunSpec raw namespace binding differs")
-    if _absolute(evidence_root) != root / raw_relative:
+    if _absolute(evidence_root) != context.raw_root:
         raise ValueError("evidence root differs from the RunSpec raw namespace")
-    return run_sha, contract_sha, raw_relative.as_posix()
+    return _ScheduleAuthority(
+        authority_path=context.authority_path,
+        acquisition_contract_path=context.acquisition_contract_path,
+        authority_sha256=context.authority_sha256,
+        acquisition_contract_sha256=context.acquisition_contract_sha256,
+        run_id=context.run_id,
+        raw_root=context.raw_root,
+        acquisition_audit_root=context.acquisition_audit_root,
+    )
 
 
 def _file_binding(root: Path, relative: Path, label: str) -> dict[str, object]:
@@ -259,13 +309,15 @@ def _validate_binding(value: object, label: str) -> None:
         raise ValueError(f"{label} binding differs")
 
 
-def _validate_payload(payload: object) -> dict[str, object]:
+def _validate_payload(
+    payload: object, *, run_id: str = _RUN_ID
+) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _TOP_LEVEL_KEYS:
         raise ValueError("schedule inventory top-level keys differ")
     if (
         payload.get("artifact_kind") != _ARTIFACT_KIND
         or payload.get("schema_version") != 1
-        or payload.get("run_id") != _RUN_ID
+        or payload.get("run_id") != run_id
     ):
         raise ValueError("schedule inventory identity differs")
     _validate_binding(payload["run_spec"], "RunSpec")
@@ -351,7 +403,7 @@ def _validate_payload(payload: object) -> dict[str, object]:
 
 def build_schedule_anchor_inventory(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     *,
     acquisition_contract_path: Path,
     static_batch_id: str,
@@ -359,9 +411,16 @@ def build_schedule_anchor_inventory(
     read_only_progress: bool = False,
 ) -> Mapping[str, object]:
     root = _absolute(root)
-    run_sha, contract_sha, evidence_relative = _authenticate(
+    context = _authenticate(
         root, run_spec, acquisition_contract_path, evidence_root
     )
+    evidence_relative = context.raw_root.relative_to(root).as_posix()
+    if isinstance(run_spec, SourceRunSpec):
+        raise ValueError(
+            "superseding query-batch checkpoints are not enabled before Task 6"
+        )
+    run_sha = context.authority_sha256
+    contract_sha = context.acquisition_contract_sha256
     if not isinstance(static_batch_id, str) or _SHA256.fullmatch(static_batch_id) is None:
         raise ValueError("static_batch_id must be a SHA-256")
     batch = load_query_batch(
@@ -425,10 +484,13 @@ def build_schedule_anchor_inventory(
     )
     venue_ids = sorted({int(anchor["venue_id"]) for anchor in all_anchors})
     played_count = sum(anchor["played"] is True for anchor in all_anchors)
-    batch_relative = _BATCH_RELATIVE / f"{batch.batch_id}.json"
+    acquisition_relative = context.acquisition_audit_root.relative_to(root)
+    batch_relative = acquisition_relative / "query_batches" / f"{batch.batch_id}.json"
     payload: dict[str, object] = {
         "acquisition_contract": _file_binding(
-            root, _ACQUISITION_CONTRACT_RELATIVE, "schedule acquisition contract"
+            root,
+            context.acquisition_contract_path.relative_to(root),
+            "schedule acquisition contract",
         ),
         "anchors": all_anchors,
         "artifact_kind": _ARTIFACT_KIND,
@@ -438,8 +500,10 @@ def build_schedule_anchor_inventory(
             "season_count": 7,
             "unplayed_game_count": len(all_anchors) - played_count,
         },
-        "run_id": _RUN_ID,
-        "run_spec": _file_binding(root, _RUN_SPEC_RELATIVE, "schedule RunSpec"),
+        "run_id": context.run_id,
+        "run_spec": _file_binding(
+            root, context.authority_path.relative_to(root), "schedule RunSpec"
+        ),
         "schema_version": 1,
         "season_sources": season_sources,
         "static_batch": {
@@ -449,7 +513,7 @@ def build_schedule_anchor_inventory(
         "team_ids": team_ids,
         "venue_ids": venue_ids,
     }
-    return _validate_payload(payload)
+    return _validate_payload(payload, run_id=context.run_id)
 
 
 def _directory_flags() -> int:
@@ -457,12 +521,12 @@ def _directory_flags() -> int:
 
 
 def _open_inventory_parent(
-    root: Path, *, create: bool
+    root: Path, inventory_relative: Path, *, create: bool
 ) -> tuple[list[int], int]:
     descriptors = [os.open(root, _directory_flags())]
     try:
         current = descriptors[0]
-        for component in _INVENTORY_RELATIVE.parent.parts:
+        for component in inventory_relative.parent.parts:
             if create:
                 try:
                     os.mkdir(component, 0o755, dir_fd=current)
@@ -487,10 +551,12 @@ def _open_inventory_parent(
         raise
 
 
-def _read_final(parent_fd: int) -> tuple[bytes, tuple[int, int, int, int]] | None:
+def _read_final(
+    parent_fd: int, inventory_name: str
+) -> tuple[bytes, tuple[int, int, int, int]] | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        descriptor = os.open(_INVENTORY_RELATIVE.name, flags, dir_fd=parent_fd)
+        descriptor = os.open(inventory_name, flags, dir_fd=parent_fd)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -511,7 +577,7 @@ def _read_final(parent_fd: int) -> tuple[bytes, tuple[int, int, int, int]] | Non
             if total > _MAX_INVENTORY_BYTES:
                 raise ValueError("schedule inventory exceeds its bounded read limit")
             chunks.append(chunk)
-        linked = os.stat(_INVENTORY_RELATIVE.name, dir_fd=parent_fd, follow_symlinks=False)
+        linked = os.stat(inventory_name, dir_fd=parent_fd, follow_symlinks=False)
         identity = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_nlink)
         if identity != (linked.st_dev, linked.st_ino, linked.st_size, linked.st_nlink):
             raise ValueError("schedule inventory identity changed during read")
@@ -532,13 +598,17 @@ def _after_schedule_inventory_verified_load() -> None:
     """Deterministic final-inode rebind test hook; production does nothing."""
 
 
-def _read_inventory_contents(root: Path) -> bytes:
+def _read_inventory_contents(
+    root: Path, inventory_relative: Path = _INVENTORY_RELATIVE
+) -> bytes:
     try:
-        descriptors, parent_fd = _open_inventory_parent(root, create=False)
+        descriptors, parent_fd = _open_inventory_parent(
+            root, inventory_relative, create=False
+        )
     except FileNotFoundError as exc:
         raise ValueError("schedule anchor inventory is missing") from exc
     try:
-        value = _read_final(parent_fd)
+        value = _read_final(parent_fd, inventory_relative.name)
         if value is None:
             raise ValueError("schedule anchor inventory is missing")
         return value[0]
@@ -549,13 +619,24 @@ def _read_inventory_contents(root: Path) -> bytes:
 
 def publish_schedule_anchor_inventory(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     *,
     acquisition_contract_path: Path,
     static_batch_id: str,
     evidence_root: Path,
 ) -> VerifiedScheduleAnchorInventory:
     root = _absolute(root)
+    context = _authenticate(
+        root, run_spec, acquisition_contract_path, evidence_root
+    )
+    if isinstance(run_spec, SourceRunSpec):
+        raise ValueError(
+            "superseding query-batch checkpoints are not enabled before Task 6"
+        )
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(root)
+        / "schedule_anchor_inventory.json"
+    )
     payload = build_schedule_anchor_inventory(
         root,
         run_spec,
@@ -564,7 +645,9 @@ def publish_schedule_anchor_inventory(
         evidence_root=evidence_root,
     )
     contents = _canonical_file_bytes(payload)
-    descriptors, parent_fd = _open_inventory_parent(root, create=True)
+    descriptors, parent_fd = _open_inventory_parent(
+        root, inventory_relative, create=True
+    )
     temp_name: str | None = None
     temp_fd = -1
     verified_result: VerifiedScheduleAnchorInventory | None = None
@@ -572,13 +655,13 @@ def publish_schedule_anchor_inventory(
     expected_final_identity: tuple[int, int, int, int] | None = None
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_EX)
-        existing = _read_final(parent_fd)
+        existing = _read_final(parent_fd, inventory_relative.name)
         if existing is not None:
             if existing[0] != contents:
                 raise RuntimeError("immutable schedule inventory differs")
             expected_final_identity = existing[1]
         else:
-            temp_name = f".{_INVENTORY_RELATIVE.name}.{secrets.token_hex(16)}.tmp"
+            temp_name = f".{inventory_relative.name}.{secrets.token_hex(16)}.tmp"
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
             temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
             view = memoryview(contents)
@@ -605,16 +688,16 @@ def publish_schedule_anchor_inventory(
                 )
             _after_schedule_inventory_rebind()
             try:
-                os.link(temp_name, _INVENTORY_RELATIVE.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+                os.link(temp_name, inventory_relative.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
             except FileExistsError:
-                raced = _read_final(parent_fd)
+                raced = _read_final(parent_fd, inventory_relative.name)
                 if raced is None or raced[0] != contents:
                     raise RuntimeError("concurrent schedule inventory differs") from None
             else:
                 os.unlink(temp_name, dir_fd=parent_fd)
                 temp_name = None
                 os.fsync(parent_fd)
-            final = _read_final(parent_fd)
+            final = _read_final(parent_fd, inventory_relative.name)
             if final is None or final[0] != contents:
                 raise ValueError("schedule inventory publication did not bind final bytes")
             expected_final_identity = final[1]
@@ -629,7 +712,7 @@ def publish_schedule_anchor_inventory(
                 evidence_root=evidence_root,
             )
             _after_schedule_inventory_verified_load()
-            rebound_final = _read_final(parent_fd)
+            rebound_final = _read_final(parent_fd, inventory_relative.name)
             if (
                 rebound_final is None
                 or rebound_final[0] != contents
@@ -640,13 +723,13 @@ def publish_schedule_anchor_inventory(
                 )
         except BaseException:
             if created_final_identity is not None:
-                owned = _read_final(parent_fd)
+                owned = _read_final(parent_fd, inventory_relative.name)
                 if (
                     owned is not None
                     and owned[0] == contents
                     and owned[1] == created_final_identity
                 ):
-                    os.unlink(_INVENTORY_RELATIVE.name, dir_fd=parent_fd)
+                    os.unlink(inventory_relative.name, dir_fd=parent_fd)
                     os.fsync(parent_fd)
             raise
     finally:
@@ -670,7 +753,7 @@ def publish_schedule_anchor_inventory(
 
 def load_verified_schedule_anchor_inventory(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     *,
     acquisition_contract_path: Path,
     static_batch_id: str,
@@ -678,14 +761,25 @@ def load_verified_schedule_anchor_inventory(
     read_only_progress: bool = False,
 ) -> VerifiedScheduleAnchorInventory:
     root = _absolute(root)
-    contents = _read_inventory_contents(root)
+    context = _authenticate(
+        root, run_spec, acquisition_contract_path, evidence_root
+    )
+    if isinstance(run_spec, SourceRunSpec):
+        raise ValueError(
+            "superseding query-batch checkpoints are not enabled before Task 6"
+        )
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(root)
+        / "schedule_anchor_inventory.json"
+    )
+    contents = _read_inventory_contents(root, inventory_relative)
     try:
         payload = json.loads(contents)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("schedule inventory must be UTF-8 JSON") from exc
     if contents != _canonical_file_bytes(payload):
         raise ValueError("schedule inventory must be canonical JSON with one newline")
-    validated = _validate_payload(payload)
+    validated = _validate_payload(payload, run_id=context.run_id)
     current = build_schedule_anchor_inventory(
         root,
         run_spec,
@@ -696,7 +790,7 @@ def load_verified_schedule_anchor_inventory(
     )
     if validated != current:
         raise ValueError("schedule inventory differs from current verified evidence")
-    rebound = _read_inventory_contents(root)
+    rebound = _read_inventory_contents(root, inventory_relative)
     if rebound != contents:
         raise ValueError("schedule inventory bytes changed during verified load")
     frozen = _deep_freeze(validated)
@@ -704,7 +798,7 @@ def load_verified_schedule_anchor_inventory(
         raise AssertionError("verified schedule inventory must freeze to a mapping")
     return VerifiedScheduleAnchorInventory(
         payload=frozen,
-        path=root / _INVENTORY_RELATIVE,
+        path=root / inventory_relative,
         sha256=_sha256_bytes(contents),
     )
 

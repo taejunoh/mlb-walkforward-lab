@@ -29,12 +29,12 @@ from .execution_registry import (
     load_execution_registry,
     load_source_verification_checkpoint,
 )
-from .protocols import RunSpec, parse_run_spec
+from .protocols import RunSpec, SourceRunSpec, parse_run_spec
 from .v52_protected_inventory import (
     snapshot_protected_inventory_membership,
     verify_protected_raw_inventory,
 )
-from .v52_query_plan import _load_static_contracts
+from .v52_query_plan import SourceAuthorityContext, _load_static_contracts
 from .v52_snapshot_store import (
     AuthorityBinding,
     AuthorityBindings,
@@ -93,7 +93,7 @@ class FinalizationContext:
     run_spec_path: Path
     acquisition_contract_path: Path
     protected_inventory_path: Path
-    run_spec: RunSpec | None
+    run_spec: RunSpec | SourceRunSpec | None
     registry: ExecutionRegistryState | None
     checkpoint: AcquisitionCheckpoint | None
     snapshot_inputs: SnapshotStoreInputs | None
@@ -101,6 +101,7 @@ class FinalizationContext:
     phase: str
     git_head: str | None
     blockers: tuple[Blocker, ...]
+    authority_context: SourceAuthorityContext | None = None
 
     @classmethod
     def absent(
@@ -471,8 +472,55 @@ def _verified_binding(root: Path, value: Path, expected_sha256: str) -> Authorit
     return binding
 
 
-def _source_root(root: Path) -> Path:
-    return root / _SOURCE_ROOT_RELATIVE
+def _sources_relative(
+    authority: SourceAuthorityContext | None,
+) -> Path:
+    if authority is None:
+        return _SOURCE_ROOT_RELATIVE
+    return authority.sources_root.relative_to(authority.repository_root)
+
+
+def _acquisition_relative(
+    authority: SourceAuthorityContext | None,
+) -> Path:
+    if authority is None:
+        return Path("audit/v5_2_qd/historical/acquisition")
+    return authority.acquisition_audit_root.relative_to(authority.repository_root)
+
+
+def _execution_relative(
+    authority: SourceAuthorityContext | None,
+) -> Path:
+    if authority is None:
+        return Path("audit/v5_2_qd/historical/execution")
+    return authority.execution_audit_root.relative_to(authority.repository_root)
+
+
+def _source_root(context: FinalizationContext) -> Path:
+    return context.root / _sources_relative(context.authority_context)
+
+
+def _validated_source_root(context: FinalizationContext) -> tuple[Path, Path]:
+    source_root = _source_root(context)
+    expected = (
+        context.authority_context.sources_root
+        if context.authority_context is not None
+        else context.root / _SOURCE_ROOT_RELATIVE
+    )
+    v52_snapshot_store.validate_expected_root(source_root, expected)
+    return source_root, source_root.relative_to(context.root)
+
+
+def _review_prefix(context: FinalizationContext) -> str:
+    return (
+        _acquisition_relative(context.authority_context) / "source_reviews"
+    ).as_posix() + "/"
+
+
+def _replay_prefix(context: FinalizationContext) -> str:
+    return (
+        _acquisition_relative(context.authority_context) / "source_replays"
+    ).as_posix() + "/"
 
 
 def _trusted_descendant_test_hook(component: str) -> None:
@@ -534,19 +582,27 @@ def _open_optional_trusted_descendant(
         raise
 
 
-def _open_or_create_source_root(root: Path) -> _TrustedRootHandle:
+def _open_or_create_source_root(
+    context: FinalizationContext | Path,
+) -> _TrustedRootHandle:
     """Return the fixed source target through held no-follow directory FDs only.
 
     A failed attempt may leave empty fixed directories.  They are safe unpublished
     residue and are intentionally never removed: POSIX has no inode-conditional
     ``rmdir``, so deleting by name could remove an attacker's replacement entry.
     """
-    root_handle = _open_trusted_root(root)
+    if isinstance(context, FinalizationContext):
+        source_relative = _sources_relative(context.authority_context)
+        repository_root = context.root
+    else:
+        source_relative = _SOURCE_ROOT_RELATIVE
+        repository_root = Path(context)
+    root_handle = _open_trusted_root(repository_root)
     descriptors = list(root_handle.descriptors)
     names = list(root_handle.component_names)
     current = descriptors[-1]
     try:
-        for component in _SOURCE_ROOT_RELATIVE.parts:
+        for component in source_relative.parts:
             try:
                 child = os.open(component, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
@@ -580,7 +636,7 @@ def _open_or_create_source_root(root: Path) -> _TrustedRootHandle:
             current = child
             _trusted_descendant_test_hook(component)
         result = _TrustedRootHandle(
-            root_handle.root / _SOURCE_ROOT_RELATIVE,
+            root_handle.root / source_relative,
             tuple(descriptors),
             tuple(names),
         )
@@ -630,8 +686,14 @@ def _git_head(root: Path) -> str:
         raise FinalizationError("AUTHORITY_MISSING", "Git head is unavailable", (), 3) from exc
 
 
-def _checkpoint_path(checkpoint: AcquisitionCheckpoint) -> Path:
-    return _CHECKPOINT_ROOT / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+def _checkpoint_path(
+    checkpoint: AcquisitionCheckpoint,
+    authority: SourceAuthorityContext | None = None,
+) -> Path:
+    root = _CHECKPOINT_ROOT if authority is None else (
+        _execution_relative(authority) / "acquisition_checkpoints"
+    )
+    return root / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
 
 
 def _authority_bindings(
@@ -640,6 +702,7 @@ def _authority_bindings(
     contract_path: Path,
     checkpoint: AcquisitionCheckpoint,
     replay: object,
+    authority: SourceAuthorityContext | None = None,
 ) -> AuthorityBindings:
     schedule = getattr(replay, "schedule_inventory")
     games = getattr(replay, "game_inventory")
@@ -648,7 +711,7 @@ def _authority_bindings(
         run_spec=_binding(root, run_spec_path),
         acquisition_contract=_binding(root, contract_path),
         terminal_checkpoint=TerminalCheckpointBinding(
-            _checkpoint_path(checkpoint).as_posix(),
+            _checkpoint_path(checkpoint, authority).as_posix(),
             checkpoint.receipt_sha256,
             checkpoint.sequence,
             "REMAINING",
@@ -656,7 +719,15 @@ def _authority_bindings(
         schedule_inventory=_verified_binding(root, schedule.path, schedule.sha256),
         game_evidence_inventory=_verified_binding(root, games.path, games.sha256),
         timezone_gate=_verified_binding(
-            root, root / _TIMEZONE_SEAL, timezone.seal_sha256
+            root,
+            root
+            / (
+                _TIMEZONE_SEAL
+                if authority is None
+                else _acquisition_relative(authority)
+                / "venue_timezone_seal.json"
+            ),
+            timezone.seal_sha256,
         ),
     )
 
@@ -680,6 +751,7 @@ def _rebind_context_authorities(
     initial_membership: object,
     initial_inventory_bytes: bytes,
     initial_git_head: str,
+    authority_context: SourceAuthorityContext | None = None,
 ) -> None:
     """Re-authenticate all inputs and rebuild the candidate inventory."""
     try:
@@ -726,7 +798,14 @@ def _rebind_context_authorities(
         rebound = build_inventory(
             SnapshotStoreInputs(
                 replay,
-                _authority_bindings(root, run_spec_path, contract_path, checkpoint, replay),
+                _authority_bindings(
+                    root,
+                    run_spec_path,
+                    contract_path,
+                    checkpoint,
+                    replay,
+                    authority_context,
+                ),
                 registry.phase,
             )
         )
@@ -763,8 +842,21 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
         )
         _canonical_object(run_spec_bytes, "RunSpec")
         _canonical_object(contract_bytes, "acquisition contract")
-        _load_static_contracts(run_spec_path, contract_path)
-        run_spec = parse_run_spec(json.loads(run_spec_bytes))
+        authority_context = _load_static_contracts(run_spec_path, contract_path)
+        if isinstance(authority_context, SourceAuthorityContext):
+            if authority_context.repository_root != root:
+                raise ValueError("source authority repository root differs")
+            run_spec = authority_context.authority
+        else:
+            # Preserve the established unit seam for a mocked static loader.
+            run_spec = parse_run_spec(json.loads(run_spec_bytes))
+        if isinstance(run_spec, SourceRunSpec):
+            raise FinalizationError(
+                "CHECKPOINT_AUTHORITY_UNAVAILABLE",
+                "superseding source checkpoints are not enabled before Task 6",
+                (str(run_spec_path), str(contract_path)),
+                3,
+            )
         protected = verify_protected_raw_inventory(root, protected_path)
         membership = snapshot_protected_inventory_membership(root, protected)
     except FinalizationError:
@@ -779,6 +871,9 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
             root, run_spec_path, contract_path, protected_path, run_spec, None, None,
             None, None, "ABSENT", None,
             (Blocker("REGISTRY_ABSENT", "execution registry is absent"),),
+            authority_context
+            if isinstance(authority_context, SourceAuthorityContext)
+            else None,
         )
     except (OSError, ValueError) as exc:
         raise FinalizationError("AUTHORITY_MALFORMED", str(exc), (), 3) from exc
@@ -790,6 +885,9 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
             root, run_spec_path, contract_path, protected_path, run_spec, registry, None,
             None, None, registry.phase, None,
             (Blocker("CHECKPOINT_UNAVAILABLE", "terminal checkpoint is unavailable"),),
+            authority_context
+            if isinstance(authority_context, SourceAuthorityContext)
+            else None,
         )
     except (OSError, ValueError) as exc:
         raise FinalizationError("AUTHORITY_MALFORMED", str(exc), (), 3) from exc
@@ -799,7 +897,14 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
             root, run_spec, acquisition_contract_path=contract_path
         )
         bindings = _authority_bindings(
-            root, run_spec_path, contract_path, checkpoint, replay
+            root,
+            run_spec_path,
+            contract_path,
+            checkpoint,
+            replay,
+            authority_context
+            if isinstance(authority_context, SourceAuthorityContext)
+            else None,
         )
         inputs = SnapshotStoreInputs(replay, bindings, registry.phase)
         inventory = build_inventory(inputs)
@@ -813,6 +918,11 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
             initial_membership=membership,
             initial_inventory_bytes=candidate_inventory_bytes,
             initial_git_head=git_head,
+            authority_context=(
+                authority_context
+                if isinstance(authority_context, SourceAuthorityContext)
+                else None
+            ),
         )
     except FinalizationError:
         raise
@@ -821,6 +931,9 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
     return FinalizationContext(
         root, run_spec_path, contract_path, protected_path, run_spec, registry,
         checkpoint, inputs, inventory, registry.phase, git_head, (),
+        authority_context
+        if isinstance(authority_context, SourceAuthorityContext)
+        else None,
     )
 
 
@@ -865,11 +978,11 @@ def _published_inventory_matches(
     """Authenticate the already-published inventory without repairing it."""
     if context.inventory is None or context.snapshot_inputs is None:
         return False, None
-    source_root = _source_root(context.root)
+    source_root, source_relative = _validated_source_root(context)
     try:
         _source_status_test_hook("before_source_root_open")
         handle = _open_optional_trusted_descendant(
-            context.root, _SOURCE_ROOT_RELATIVE
+            context.root, source_relative
         )
         if handle is None:
             return False, None
@@ -934,8 +1047,20 @@ def _rebuild_context_inventory(context: FinalizationContext) -> SourceInventory:
             protected_inventory=context.protected_inventory_path,
         )
     )
-    before = (context.root, context.phase, context.registry, context.checkpoint)
-    after = (rebound.root, rebound.phase, rebound.registry, rebound.checkpoint)
+    before = (
+        context.root,
+        context.phase,
+        context.registry,
+        context.checkpoint,
+        context.authority_context,
+    )
+    after = (
+        rebound.root,
+        rebound.phase,
+        rebound.registry,
+        rebound.checkpoint,
+        rebound.authority_context,
+    )
     if before != after or rebound.inventory is None:
         raise FinalizationError(
             "AUTHORITY_CHANGED", "finalization authority changed", (), 5
@@ -1042,7 +1167,8 @@ def publish_inventory(
         )
     expected = inventory_bytes(context.inventory)
     try:
-        handle = _open_or_create_source_root(context.root)
+        _validated_source_root(context)
+        handle = _open_or_create_source_root(context)
     except ValueError as exc:
         raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
     try:
@@ -1120,7 +1246,8 @@ def _load_clean_replay_inventory(context: FinalizationContext) -> SourceInventor
     if context.snapshot_inputs is None:
         raise FinalizationError("AUTHORITY_MISSING", "snapshot inputs are missing", (), 3)
     try:
-        handle = _open_optional_trusted_descendant(context.root, _SOURCE_ROOT_RELATIVE)
+        _, source_relative = _validated_source_root(context)
+        handle = _open_optional_trusted_descendant(context.root, source_relative)
     except ValueError as exc:
         raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
     if handle is None:
@@ -1179,7 +1306,10 @@ def _clean_replay_payload(
 
 
 def _load_query_ids_document(
-    root: Path, path: Path
+    root: Path,
+    path: Path,
+    *,
+    expected_prefix: str = _SOURCE_REVIEW_PREFIX,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Load one explicit, canonical selection from the review namespace."""
     try:
@@ -1194,7 +1324,7 @@ def _load_query_ids_document(
         raise FinalizationError(
             "QUERY_IDS_INVALID", "review query ID document is invalid", (), 3
         ) from exc
-    if not relative.startswith(_SOURCE_REVIEW_PREFIX):
+    if not relative.startswith(expected_prefix):
         raise FinalizationError(
             "QUERY_IDS_INVALID",
             "review query ID document is outside review namespace",
@@ -1309,6 +1439,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
     selection is supported.
     """
     context = _require_mutable_context(context, phase="ACQUIRING")
+    review_prefix = _review_prefix(context)
     if (
         request.reviewer_identity != "independent-source-auditor"
         or request.reviewer_role != "independent-source-auditor"
@@ -1318,15 +1449,28 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         )
     if request.decision not in {"APPROVED", "REJECTED"}:
         raise FinalizationError("REVIEWER_INVALID", "review decision differs", (), 3)
-    try:
-        receipt_relative = v52_timezone_review._relative(
-            context.root, request.write_receipt, "source review receipt"
+    receipt_relative = _validate_receipt_destination(
+        context.root,
+        request.write_receipt,
+        expected_prefix=review_prefix,
+        label="source review receipt",
+    )
+    commit_relative = _validate_receipt_destination(
+        context.root,
+        request.write_commit,
+        expected_prefix=review_prefix,
+        label="source review commit",
+    )
+    query_document_relative = _relative_under_root(
+        context.root, request.query_ids_file, "review query IDs"
+    )[0]
+    if not query_document_relative.startswith(review_prefix):
+        raise FinalizationError(
+            "QUERY_IDS_INVALID",
+            "review query ID document is outside review namespace",
+            (query_document_relative,),
+            3,
         )
-        commit_relative = v52_timezone_review._relative(
-            context.root, request.write_commit, "source review commit"
-        )
-    except ValueError as exc:
-        raise FinalizationError("PATH_UNSAFE", str(exc), (), 5) from exc
     if receipt_relative == commit_relative:
         raise FinalizationError(
             "PATH_UNSAFE", "source receipt and commit marker must be distinct", (), 5
@@ -1339,7 +1483,11 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
     preflight = run_preflight(context)
     if preflight.status != "PASS":
         raise FinalizationError("PREFLIGHT_BLOCKED", "review requires passing preflight", (), 4)
-    query_ids, document = _load_query_ids_document(context.root, request.query_ids_file)
+    query_ids, document = _load_query_ids_document(
+        context.root,
+        request.query_ids_file,
+        expected_prefix=review_prefix,
+    )
     if context.inventory is None or context.snapshot_inputs is None or context.run_spec is None or context.git_head is None:
         raise FinalizationError("AUTHORITY_MISSING", "review authority is missing", (), 3)
     if not set(query_ids).issubset(context.inventory.logical_query_ids):
@@ -1367,7 +1515,9 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
     # Re-read the explicit selection after calculating the payload, then do a
     # second read-only preflight before making the receipt visible.
     rebound_ids, rebound_document = _load_query_ids_document(
-        context.root, request.query_ids_file
+        context.root,
+        request.query_ids_file,
+        expected_prefix=review_prefix,
     )
     if rebound_ids != query_ids or rebound_document != document:
         raise FinalizationError(
@@ -1380,7 +1530,9 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
     def rebind_dependencies() -> None:
         try:
             final_ids, final_document = _load_query_ids_document(
-                context.root, request.query_ids_file
+                context.root,
+                request.query_ids_file,
+                expected_prefix=review_prefix,
             )
         except FinalizationError as exc:
             raise FinalizationError(
@@ -1406,7 +1558,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         request.write_receipt,
         payload,
         schema_name="v5_2_source_review_receipt.schema.json",
-        expected_prefix=_SOURCE_REVIEW_PREFIX,
+        expected_prefix=review_prefix,
         final_rebind=rebind_dependencies,
     )
     marker_payload: dict[str, object] = {
@@ -1467,7 +1619,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         request.write_commit,
         marker_payload,
         schema_name="v5_2_source_receipt_commit.schema.json",
-        expected_prefix=_SOURCE_REVIEW_PREFIX,
+        expected_prefix=review_prefix,
         pre_write_rebind=rebind_marker_dependencies,
     )
     return ReceiptReport(
@@ -1483,16 +1635,17 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
     """Record one explicit, fully offline reproduction of the published sources."""
     execution_id = _execution_id()
     context = _require_mutable_context(context, phase="ACQUIRING")
+    replay_prefix = _replay_prefix(context)
     receipt_path = _validate_receipt_destination(
         context.root,
         request.write_receipt,
-        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        expected_prefix=replay_prefix,
         label="source replay receipt",
     )
     commit_path = _validate_receipt_destination(
         context.root,
         request.write_commit,
-        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        expected_prefix=replay_prefix,
         label="source replay commit",
     )
     if receipt_path == commit_path:
@@ -1531,7 +1684,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         request.write_receipt,
         payload,
         schema_name="v5_2_clean_source_replay_receipt.schema.json",
-        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        expected_prefix=replay_prefix,
         final_rebind=rebind_dependencies,
     )
     if context.run_spec is None or context.snapshot_inputs is None or context.git_head is None:
@@ -1594,7 +1747,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         request.write_commit,
         marker_payload,
         schema_name="v5_2_source_receipt_commit.schema.json",
-        expected_prefix=_SOURCE_REPLAY_PREFIX,
+        expected_prefix=replay_prefix,
         pre_write_rebind=rebind_marker_dependencies,
     )
     return ReplayReport(
@@ -1619,11 +1772,61 @@ def advance_sources_ready(
     )
     if context.run_spec is None or context.registry is None or context.checkpoint is None:
         raise FinalizationError("AUTHORITY_MISSING", "advance authority is missing", (), 3)
+    if isinstance(context.run_spec, SourceRunSpec):
+        raise FinalizationError(
+            "CHECKPOINT_AUTHORITY_UNAVAILABLE",
+            "superseding source checkpoints are not enabled before Task 6",
+            (),
+            3,
+        )
     if len(request.review_receipts) < 1 or len(request.replay_receipts) != 2:
         raise _advance_input_error("advance requires at least one review and exactly two replays")
 
     selected = (*request.review_receipts, *request.replay_receipts)
     try:
+        marker_candidates = [
+            _relative_under_root(
+                context.root, path, "source receipt commit marker"
+            )[0]
+            for path in selected
+        ]
+        review_prefix = _review_prefix(context)
+        replay_prefix = _replay_prefix(context)
+        if any(
+            not path.startswith(review_prefix)
+            for path in marker_candidates[: len(request.review_receipts)]
+        ) or any(
+            not path.startswith(replay_prefix)
+            for path in marker_candidates[len(request.review_receipts) :]
+        ):
+            raise FinalizationError(
+                "PATH_UNSAFE",
+                "source receipt commit marker is outside its namespace",
+                marker_candidates,
+                5,
+            )
+        checkpoint_candidate = _relative_under_root(
+            context.root, request.checkpoint, "terminal acquisition checkpoint"
+        )[0]
+        expected_checkpoint = _checkpoint_path(
+            context.checkpoint, context.authority_context
+        ).as_posix()
+        inventory_candidate = _relative_under_root(
+            context.root, request.inventory, "source inventory"
+        )[0]
+        expected_inventory = (
+            _sources_relative(context.authority_context) / "source_inventory.json"
+        ).as_posix()
+        if checkpoint_candidate != expected_checkpoint:
+            raise _advance_input_error(
+                "terminal checkpoint path differs from authority",
+                (checkpoint_candidate,),
+            )
+        if inventory_candidate != expected_inventory:
+            raise _advance_input_error(
+                "source inventory path differs from authority",
+                (inventory_candidate,),
+            )
         marker_paths = [
             _read_explicit_artifact(
                 context.root,

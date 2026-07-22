@@ -912,6 +912,35 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
 
 
 class V52VerifySourcesTest(unittest.TestCase):
+    def test_superseding_pair_stops_before_checkpoint_replay(self) -> None:
+        from mlb_backtest.protocols import load_source_run_spec
+        from mlb_backtest.v52_verify_sources import load_snapshot_replay_inputs
+
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        with self.assertRaisesRegex(ValueError, "Task 6"):
+            load_snapshot_replay_inputs(
+                ROOT,
+                source_run,
+                acquisition_contract_path=source_contract_path,
+            )
+        with self.assertRaises(ValueError):
+            load_snapshot_replay_inputs(
+                ROOT,
+                source_run,
+                acquisition_contract_path=ROOT
+                / "protocols/v5_2_qd/historical_source_acquisition.json",
+            )
+
     def test_completed_query_graph_classifies_root_and_split_leaves(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
 
