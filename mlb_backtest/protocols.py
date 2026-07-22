@@ -222,6 +222,21 @@ RUN_REQUIRED_KEYS = frozenset(
         "model_card_status",
     }
 )
+SOURCE_RUN_REQUIRED_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "model_version",
+        "label",
+        "authority_scope",
+        "required_source_years",
+        "forbidden_source_years",
+        "source_requirements",
+        "parser_policy",
+        "namespaces",
+        "downstream_authority",
+    }
+)
 FOLD_REQUIRED_KEYS = frozenset(
     {
         "fold_id",
@@ -629,6 +644,22 @@ class RunSpec:
 
 
 @dataclass(frozen=True)
+class SourceRunSpec:
+    schema_version: int
+    run_id: str
+    model_version: str
+    label: str
+    authority_scope: str
+    required_source_years: tuple[int, ...]
+    forbidden_source_years: tuple[int, ...]
+    source_requirements: Mapping[str, object]
+    parser_policy: Mapping[str, object]
+    namespaces: Mapping[str, object]
+    downstream_authority: Mapping[str, object]
+    raw: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class ProspectiveSpec:
     run_id: str
     first_permitted_date: date
@@ -971,6 +1002,38 @@ def parse_run_spec(raw: object) -> RunSpec:
 
 def load_run_spec(path: Path) -> RunSpec:
     return parse_run_spec(json.loads(path.read_text(encoding="utf-8")))
+
+
+def parse_source_run_spec(raw: object) -> SourceRunSpec:
+    obj = require_exact_keys(raw, SOURCE_RUN_REQUIRED_KEYS, "source_run")
+    try:
+        _validate_literal(
+            obj,
+            expected_superseding_source_run(),
+            "source_run",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "superseding source run differs from frozen values"
+        ) from exc
+    return SourceRunSpec(
+        schema_version=obj["schema_version"],
+        run_id=obj["run_id"],
+        model_version=obj["model_version"],
+        label=obj["label"],
+        authority_scope=obj["authority_scope"],
+        required_source_years=tuple(obj["required_source_years"]),
+        forbidden_source_years=tuple(obj["forbidden_source_years"]),
+        source_requirements=deep_freeze(obj["source_requirements"]),
+        parser_policy=deep_freeze(obj["parser_policy"]),
+        namespaces=deep_freeze(obj["namespaces"]),
+        downstream_authority=deep_freeze(obj["downstream_authority"]),
+        raw=deep_freeze(obj),
+    )
+
+
+def load_source_run_spec(path: Path) -> SourceRunSpec:
+    return parse_source_run_spec(json.loads(path.read_text(encoding="utf-8")))
 
 
 def _build_prospective_literal() -> dict[str, object]:
@@ -5999,6 +6062,42 @@ def expected_historical_run() -> dict[str, object]:
     }
 
 
+def expected_superseding_source_run() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": "historical_walkforward_500_superseding_565534",
+        "model_version": "v5.2-QD",
+        "label": "Historical source acquisition superseding duplicate gamePk 565534",
+        "authority_scope": "SOURCE_ONLY_THROUGH_SOURCES_READY",
+        "required_source_years": [2018, 2019, 2020, 2021, 2022, 2023, 2024],
+        "forbidden_source_years": [2025],
+        "source_requirements": {
+            "minimum": list(MINIMUM_SOURCE_NAMES),
+            "optional": list(OPTIONAL_SOURCE_NAMES),
+        },
+        "parser_policy": {
+            "existing_source_parser_version": "v5.2.1",
+            "schedule_duplicate_disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+        },
+        "namespaces": {
+            "raw": "data/v5_2_qd/historical_superseding_565534/raw",
+            "sources": "data/v5_2_qd/historical_superseding_565534/sources",
+            "audit": "audit/v5_2_qd/historical_superseding_565534",
+            "reports": "reports/v5_2_qd/historical_superseding_565534",
+        },
+        "downstream_authority": {
+            "features": False,
+            "locks": False,
+            "outcomes": False,
+            "oof": False,
+            "model_cards": False,
+            "targets": False,
+            "selections": False,
+            "reports_500": False,
+        },
+    }
+
+
 def validate_run(run: RunSpec) -> None:
     if (
         not isinstance(run.run_id, str)
@@ -6471,6 +6570,33 @@ def prospective_schema(raw: Mapping[str, object]) -> dict[str, object]:
     return schema
 
 
+def historical_authority_schema() -> dict[str, object]:
+    historical_raw = expected_historical_run()
+    historical = const_schema(historical_raw, RUN_REQUIRED_KEYS)
+    historical.pop("$schema")
+    historical["properties"]["folds"] = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/fold"},
+    }
+    definitions = {
+        "fold": {
+            "type": "object",
+            "required": sorted(FOLD_REQUIRED_KEYS),
+            "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)},
+            "additionalProperties": False,
+        }
+    }
+    historical["$defs"] = definitions
+    source_raw = expected_superseding_source_run()
+    source = _closed_shape_schema(source_raw)
+    source["const"] = source_raw
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": definitions,
+        "oneOf": [historical, source],
+    }
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(value) + b"\n")
@@ -6479,23 +6605,31 @@ def write_json(path: Path, value: object) -> None:
 def write_historical_contract(root: Path) -> None:
     raw = expected_historical_run()
     parse_run_spec(raw)
-    schema = const_schema(raw, RUN_REQUIRED_KEYS)
-    schema["properties"]["folds"] = {
-        "type": "array",
-        "items": {"$ref": "#/$defs/fold"},
-    }
-    schema["$defs"] = {
-        "fold": {
-            "type": "object",
-            "required": sorted(FOLD_REQUIRED_KEYS),
-            "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)},
-            "additionalProperties": False,
-        }
-    }
+    schema = historical_authority_schema()
     _publish_bundle(
         (
             (
                 root / "protocols/v5_2_qd/historical_walkforward_500.json",
+                canonical_json_bytes(raw) + b"\n",
+            ),
+            (
+                root / "schemas/v5_2_run_spec.schema.json",
+                canonical_json_bytes(schema) + b"\n",
+            ),
+        ),
+        root=root,
+    )
+
+
+def write_superseding_source_authority(root: Path) -> None:
+    raw = expected_superseding_source_run()
+    parse_source_run_spec(raw)
+    schema = historical_authority_schema()
+    _publish_bundle(
+        (
+            (
+                root
+                / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
                 canonical_json_bytes(raw) + b"\n",
             ),
             (

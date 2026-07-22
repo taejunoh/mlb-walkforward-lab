@@ -12,6 +12,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 SCHEMA_PATH = ROOT / "schemas/v5_2_acquisition_contract.schema.json"
+SUPERSEDING_CONTRACT_PATH = (
+    ROOT
+    / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
 DESIGN_PATH = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -22,6 +26,15 @@ AMENDMENT_PATH = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
 RUN_SPEC_PATH = Path("protocols/v5_2_qd/historical_walkforward_500.json")
+SUPERSEDING_DESIGN_PATH = Path(
+    "docs/superpowers/specs/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+)
+SUPERSEDING_PLAN_PATH = Path(
+    "docs/superpowers/plans/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+)
+SUPERSEDING_RUN_SPEC_PATH = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
 BASELINE_INVENTORY_PATH = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RAW_INVENTORY_PATH = Path("audit/v5_1_bt/protected_raw_inventory.json")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -89,6 +102,7 @@ class V52AcquisitionContractTest(unittest.TestCase):
         self.assertTrue(SCHEMA_PATH.is_file(), "acquisition contract schema is missing")
         self.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.old_schema = self.schema["oneOf"][0] if "oneOf" in self.schema else self.schema
 
     def test_contract_and_schema_use_canonical_json_bytes(self) -> None:
         for path in (CONTRACT_PATH, SCHEMA_PATH):
@@ -262,17 +276,104 @@ class V52AcquisitionContractTest(unittest.TestCase):
         )
 
     def test_contract_rejects_unknown_keys_and_contains_no_generated_query_ids(self) -> None:
-        self.assertEqual(self.schema["const"], self.contract)
-        _assert_schema_closes_instance(self, self.contract, self.schema, "contract")
+        self.assertEqual(self.old_schema["const"], self.contract)
+        _assert_schema_closes_instance(self, self.contract, self.old_schema, "contract")
         unexpected = copy.deepcopy(self.contract)
         unexpected["unexpected"] = True
-        self.assertNotEqual(self.schema["const"], unexpected)
+        self.assertNotEqual(self.old_schema["const"], unexpected)
         nested = copy.deepcopy(self.contract)
         nested["bindings"]["approved_design"]["unexpected"] = True
-        self.assertNotEqual(self.schema["const"], nested)
+        self.assertNotEqual(self.old_schema["const"], nested)
         self.assertFalse(
             any("query_id" in key for key in _walk_key_names(self.contract)),
             "contract must be hashed before generated query IDs exist",
+        )
+
+
+class V52SupersedingAcquisitionContractTest(unittest.TestCase):
+    OLD = {
+        "run_id": "historical_walkforward_500",
+        "run_spec_sha256": "d622bff184f0bdade22848d4b76fc43bdf9ac88c7a51513dee4a7d5f51bd1492",
+        "acquisition_contract_sha256": "cef89a1d4191ef83eb0fc2b0f4bdd191aeb8ba53cbb1bc6df73199604f23a9d9",
+        "static_batch_id": "069fd746f9c7ecb1267b7ae44f8d44a1aeb3575a92c64482dacbc5b61d8f0571",
+        "static_batch_sha256": "a6a2ac816620797b21e5bcf297fb92453f1143ed0d3d4c01effbf15c531ca39a",
+        "checkpoint_sha256": "00b8b6eae2c0ba8de17f6ed1c05f0c9ddfb98e967e9b7ef0284581cc98b5ad06",
+        "query_id": "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
+        "quarantine_receipt_sha256": "a2f26dd297fc2f0de084c857e6deb575973f147e8c9712a724d82308a9a693f8",
+        "raw_sha256": "6eeedd3877eeef18dae400dba8920dcde0cc79b3ab76b08316385868e89df1e0",
+    }
+
+    def setUp(self) -> None:
+        self.assertTrue(SUPERSEDING_CONTRACT_PATH.is_file())
+        self.assertTrue((ROOT / SUPERSEDING_RUN_SPEC_PATH).is_file())
+        self.contract = json.loads(SUPERSEDING_CONTRACT_PATH.read_bytes())
+        self.schema = json.loads(SCHEMA_PATH.read_bytes())
+
+    def test_superseding_565534_contract_binds_design_plan_run_and_exact_supersedes(self):
+        self.assertEqual(self.contract["schema_version"], 2)
+        self.assertEqual(
+            self.contract["run_id"], "historical_walkforward_500_superseding_565534"
+        )
+        self.assertEqual(set(self.contract), set(json.loads(CONTRACT_PATH.read_bytes())) | {"supersedes"})
+        self.assertEqual(self.contract["supersedes"], self.OLD)
+        self.assertEqual(
+            self.contract["bindings"],
+            {
+                "approved_design": {
+                    "path": SUPERSEDING_DESIGN_PATH.as_posix(),
+                    "sha256": _sha256(ROOT / SUPERSEDING_DESIGN_PATH),
+                },
+                "implementation_plan": {
+                    "git_blob_id": _git_blob(SUPERSEDING_PLAN_PATH),
+                    "path": SUPERSEDING_PLAN_PATH.as_posix(),
+                    "working_tree_sha256": _sha256(ROOT / SUPERSEDING_PLAN_PATH),
+                },
+                "run_spec": {
+                    "path": SUPERSEDING_RUN_SPEC_PATH.as_posix(),
+                    "sha256": _sha256(ROOT / SUPERSEDING_RUN_SPEC_PATH),
+                },
+            },
+        )
+        self.assertEqual(
+            self.contract["canonical_roots"],
+            {
+                "acquisition_audit": "audit/v5_2_qd/historical_superseding_565534/acquisition",
+                "execution_audit": "audit/v5_2_qd/historical_superseding_565534/execution",
+                "raw": "data/v5_2_qd/historical_superseding_565534/raw",
+                "sources": "data/v5_2_qd/historical_superseding_565534/sources",
+            },
+        )
+
+    def test_superseding_565534_retains_v521_existing_parser_versions(self):
+        old = json.loads(CONTRACT_PATH.read_bytes())
+        old_sources = {source["name"]: source for source in old["sources"]}
+        new_sources = {source["name"]: source for source in self.contract["sources"]}
+        self.assertEqual(set(new_sources), set(old_sources))
+        for name, old_source in old_sources.items():
+            self.assertEqual(new_sources[name]["parser_version"], old_source["parser_version"])
+            self.assertEqual(new_sources[name]["grain"], old_source["grain"])
+            if name == "mlb_schedule_game_feed":
+                self.assertEqual(
+                    new_sources[name]["endpoints"],
+                    old_source["endpoints"]
+                    + ["disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"],
+                )
+            else:
+                self.assertEqual(new_sources[name], old_source)
+
+    def test_acquisition_schema_has_two_exact_closed_branches(self):
+        self.assertEqual(len(self.schema["oneOf"]), 2)
+        old = json.loads(CONTRACT_PATH.read_bytes())
+        for branch, instance in zip(
+            self.schema["oneOf"], (old, self.contract), strict=True
+        ):
+            self.assertEqual(branch["const"], instance)
+            _assert_schema_closes_instance(self, instance, branch, "contract")
+
+    def test_old_default_authorities_keep_authoritative_sha256s(self):
+        self.assertEqual(_sha256(ROOT / RUN_SPEC_PATH), self.OLD["run_spec_sha256"])
+        self.assertEqual(
+            _sha256(CONTRACT_PATH), self.OLD["acquisition_contract_sha256"]
         )
 
 

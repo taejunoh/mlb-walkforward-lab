@@ -68,6 +68,10 @@ V52_CONFIG = ROOT / "config/v5_2_qd.json"
 V52_SCHEMA = ROOT / "schemas/v5_2_qd.schema.json"
 CHANGE_CONTRACT = ROOT / "protocols/v5_2_qd/change_contract.json"
 HISTORICAL_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+SOURCE_HISTORICAL_SPEC = (
+    ROOT
+    / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
 RUN_SCHEMA = ROOT / "schemas/v5_2_run_spec.schema.json"
 PROSPECTIVE_SPEC = ROOT / "protocols/v5_2_qd/prospective_2026.json"
 PROSPECTIVE_SCHEMA = ROOT / "schemas/v5_2_prospective.schema.json"
@@ -4541,6 +4545,10 @@ class ProtocolBundlePathSecurityTest(unittest.TestCase):
 
 
 class HistoricalRunSpecTest(unittest.TestCase):
+    @staticmethod
+    def _old_schema_branch(schema):
+        return schema["oneOf"][0] if "oneOf" in schema else schema
+
     def test_exact_folds_and_oof_sequences(self):
         run = load_run_spec(HISTORICAL_SPEC)
         self.assertEqual(run.target_count, 500)
@@ -4574,10 +4582,11 @@ class HistoricalRunSpecTest(unittest.TestCase):
             )
 
     def test_run_and_fold_schema_keys_mirror_strict_parser(self):
-        schema = json.loads(RUN_SCHEMA.read_text())
+        document = json.loads(RUN_SCHEMA.read_text())
+        schema = self._old_schema_branch(document)
         self.assertEqual(set(schema["required"]), RUN_REQUIRED_KEYS)
         self.assertEqual(set(schema["properties"]), RUN_REQUIRED_KEYS)
-        fold_schema = schema["$defs"]["fold"]
+        fold_schema = document.get("$defs", schema.get("$defs"))["fold"]
         self.assertEqual(set(fold_schema["required"]), FOLD_REQUIRED_KEYS)
         self.assertEqual(set(fold_schema["properties"]), FOLD_REQUIRED_KEYS)
         self.assertFalse(schema["additionalProperties"])
@@ -4609,7 +4618,7 @@ class HistoricalRunSpecTest(unittest.TestCase):
 
     def test_schema_const_and_parser_reject_every_frozen_change(self):
         raw = json.loads(HISTORICAL_SPEC.read_text())
-        schema = json.loads(RUN_SCHEMA.read_text())
+        schema = self._old_schema_branch(json.loads(RUN_SCHEMA.read_text()))
         self.assertEqual(schema["const"], raw)
         changed = copy.deepcopy(raw)
         changed["selection"]["graded_target"] = 499
@@ -4638,6 +4647,95 @@ class HistoricalRunSpecTest(unittest.TestCase):
                     first_bytes,
                     canonical_json_bytes(json.loads(first_bytes)) + b"\n",
                 )
+
+    def test_source_run_spec_is_a_closed_source_only_authority_not_old_run_spec(self):
+        self.assertTrue(
+            hasattr(protocols, "expected_superseding_source_run"),
+            "separate SourceRunSpec API is missing",
+        )
+        expected = protocols.expected_superseding_source_run()
+        self.assertEqual(set(expected), protocols.SOURCE_RUN_REQUIRED_KEYS)
+        source = protocols.parse_source_run_spec(expected)
+        self.assertIsInstance(source, protocols.SourceRunSpec)
+        self.assertEqual(source.run_id, "historical_walkforward_500_superseding_565534")
+        self.assertEqual(source.authority_scope, "SOURCE_ONLY_THROUGH_SOURCES_READY")
+        self.assertEqual(source.required_source_years, tuple(range(2018, 2025)))
+        self.assertEqual(source.forbidden_source_years, (2025,))
+        forbidden_fragments = (
+            "fold",
+            "target_count",
+            "selection",
+            "model_card",
+            "features",
+            "locked",
+            "outcomes",
+            "oof",
+            "reports_500",
+        )
+        self.assertFalse(
+            any(fragment in key for key in source.raw for fragment in forbidden_fragments)
+        )
+        with self.assertRaises(ValueError):
+            parse_run_spec(expected)
+
+    def test_superseding_565534_run_spec_is_source_only_and_namespace_disjoint(self):
+        self.assertTrue(SOURCE_HISTORICAL_SPEC.is_file())
+        source = protocols.load_source_run_spec(SOURCE_HISTORICAL_SPEC)
+        old = load_run_spec(HISTORICAL_SPEC)
+        self.assertEqual(source.raw, deep_freeze(protocols.expected_superseding_source_run()))
+        self.assertEqual(
+            set(source.raw["namespaces"]), {"raw", "sources", "audit", "reports"}
+        )
+        self.assertTrue(all(value is False for value in source.downstream_authority.values()))
+        old_roots = tuple(str(value) for value in old.raw["namespaces"].values())
+        new_roots = tuple(str(value) for value in source.raw["namespaces"].values())
+        self.assertTrue(
+            all(
+                not (left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/"))
+                for left in old_roots
+                for right in new_roots
+            )
+        )
+
+    def test_combined_run_schema_writer_preserves_both_exact_branches(self):
+        schema = protocols.historical_authority_schema()
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(len(schema["oneOf"]), 2)
+        old_raw = expected_historical_run()
+        source_raw = protocols.expected_superseding_source_run()
+        self.assertEqual(schema["oneOf"][0]["const"], old_raw)
+        self.assertEqual(schema["oneOf"][1]["const"], source_raw)
+        for raw, branch in zip((old_raw, source_raw), schema["oneOf"], strict=True):
+            self.assertEqual(set(branch["required"]), set(raw))
+            self.assertEqual(set(branch["properties"]), set(raw))
+            self.assertFalse(branch["additionalProperties"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_path = root / "protocols/v5_2_qd/historical_walkforward_500.json"
+            old_path.parent.mkdir(parents=True)
+            old_path.write_bytes(b"sealed-old-authority\n")
+            protocols.write_superseding_source_authority(root)
+            self.assertEqual(
+                (root / "schemas/v5_2_run_spec.schema.json").read_bytes(),
+                canonical_json_bytes(schema) + b"\n",
+            )
+            self.assertEqual(
+                json.loads(
+                    (
+                        root
+                        / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+                    ).read_bytes()
+                ),
+                source_raw,
+            )
+            self.assertEqual(old_path.read_bytes(), b"sealed-old-authority\n")
+            source_path = (
+                root
+                / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+            )
+            sealed_source = source_path.read_bytes()
+            write_historical_contract(root)
+            self.assertEqual(source_path.read_bytes(), sealed_source)
 
     def test_parser_rejects_unknown_missing_and_type_confusion(self):
         raw = json.loads(HISTORICAL_SPEC.read_text())

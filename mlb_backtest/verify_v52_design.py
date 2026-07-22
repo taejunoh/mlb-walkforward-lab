@@ -32,8 +32,6 @@ from mlb_backtest.preflight import (
     render_preflight_markdown,
 )
 from mlb_backtest.protocols import (
-    FOLD_REQUIRED_KEYS,
-    RUN_REQUIRED_KEYS,
     V52_REQUIRED_KEYS,
     CURRENT_APPROVED_DESIGN_COMMIT,
     CURRENT_APPROVED_DESIGN_SHA256,
@@ -42,12 +40,15 @@ from mlb_backtest.protocols import (
     V52Config,
     const_schema,
     expected_historical_run,
+    expected_superseding_source_run,
     expected_prospective_spec,
     expected_v52_config,
     load_prospective_spec,
     load_run_spec,
+    load_source_run_spec,
     load_v52_config,
     parse_change_contract,
+    historical_authority_schema,
     prospective_schema,
 )
 from mlb_backtest.notebook_artifact import execute_notebook_cells, notebook_sources
@@ -924,28 +925,30 @@ def verify_contract_schemas(
     v52_raw = expected_v52_config()
     historical_raw = expected_historical_run()
     prospective_raw = expected_prospective_spec()
-    historical_schema = const_schema(historical_raw, RUN_REQUIRED_KEYS)
-    historical_schema["properties"]["folds"] = {
-        "type": "array",
-        "items": {"$ref": "#/$defs/fold"},
-    }
-    historical_schema["$defs"] = {
-        "fold": {
-            "type": "object",
-            "required": sorted(FOLD_REQUIRED_KEYS),
-            "properties": {key: {} for key in sorted(FOLD_REQUIRED_KEYS)},
-            "additionalProperties": False,
-        }
-    }
+    parsed_old_authority = load_run_spec(
+        require_regular_file(
+            root,
+            "protocols/v5_2_qd/historical_walkforward_500.json",
+        )
+    )
+    parsed_source_authority = load_source_run_spec(
+        require_regular_file(
+            root,
+            "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+        )
+    )
     documents = {
         "schemas/v5_2_qd.schema.json": const_schema(v52_raw, V52_REQUIRED_KEYS),
-        "schemas/v5_2_run_spec.schema.json": historical_schema,
+        "schemas/v5_2_run_spec.schema.json": historical_authority_schema(),
         "schemas/v5_2_prospective.schema.json": prospective_schema(prospective_raw),
         "schemas/v5_2_preflight.schema.json": preflight_schema_document(),
     }
     if (
         config.raw != deep_freeze(v52_raw)
         or historical.raw != deep_freeze(historical_raw)
+        or parsed_old_authority.raw != deep_freeze(historical_raw)
+        or parsed_source_authority.raw
+        != deep_freeze(expected_superseding_source_run())
         or prospective.raw != deep_freeze(prospective_raw)
         or set(preflight) != PREFLIGHT_REQUIRED_KEYS
     ):

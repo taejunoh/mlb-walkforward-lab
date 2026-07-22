@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import mlb_backtest.protocols as protocol_module
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
 from mlb_backtest.execution_registry import (
     advance_execution_phase,
@@ -72,6 +73,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DesignVerificationTest(unittest.TestCase):
+    HISTORICAL_AUTHORITY_RELATIVES = (
+        "protocols/v5_2_qd/historical_walkforward_500.json",
+        "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+    )
+
+    def copy_historical_authorities(self, root: Path) -> None:
+        for relative in self.HISTORICAL_AUTHORITY_RELATIVES:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+
     def test_phase_namespace_scan_rejects_directory_identity_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = ExecutionRegistryTest().make_repo(Path(directory))
@@ -1343,6 +1355,7 @@ class DesignVerificationTest(unittest.TestCase):
                 "v5_2_venue_timezones.schema.json",
             ):
                 shutil.copy2(ROOT / "schemas" / name, root / "schemas" / name)
+            self.copy_historical_authorities(root)
             for mutation in ("const", "additionalProperties", "properties"):
                 with self.subTest(mutation=mutation):
                     path = root / "schemas/v5_2_qd.schema.json"
@@ -1361,6 +1374,72 @@ class DesignVerificationTest(unittest.TestCase):
                         verify_contract_schemas(
                             root, config, historical, prospective, preflight
                         )
+
+    def test_combined_run_schema_writer_and_design_verifier_preserve_both_exact_branches(self) -> None:
+        self.assertTrue(hasattr(protocol_module, "historical_authority_schema"))
+        config = load_v52_config(ROOT / "config/v5_2_qd.json")
+        historical = load_run_spec(
+            ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+        )
+        source = protocol_module.load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+        )
+        prospective = load_prospective_spec(
+            ROOT / "protocols/v5_2_qd/prospective_2026.json"
+        )
+        preflight = parse_preflight(
+            json.loads(
+                (ROOT / "reports/v5_2_qd/walkforward_500_preflight.json").read_bytes()
+            )
+        )
+        schema = json.loads((ROOT / "schemas/v5_2_run_spec.schema.json").read_bytes())
+        self.assertEqual(schema, protocol_module.historical_authority_schema())
+        self.assertEqual(
+            canonical_json_bytes(source.raw),
+            canonical_json_bytes(schema["oneOf"][1]["const"]),
+        )
+        verify_contract_schemas(ROOT, config, historical, prospective, preflight)
+
+    def assert_missing_historical_authority_fails(self, missing: str) -> None:
+        config = load_v52_config(ROOT / "config/v5_2_qd.json")
+        historical = load_run_spec(
+            ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
+        )
+        prospective = load_prospective_spec(
+            ROOT / "protocols/v5_2_qd/prospective_2026.json"
+        )
+        preflight = parse_preflight(
+            json.loads(
+                (ROOT / "reports/v5_2_qd/walkforward_500_preflight.json").read_bytes()
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            shutil.copytree(ROOT / "schemas", root / "schemas")
+            for relative in self.HISTORICAL_AUTHORITY_RELATIVES:
+                if relative == missing:
+                    continue
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            with self.assertRaisesRegex(
+                ValueError,
+                rf"required input.*{Path(missing).name}|unavailable.*{Path(missing).name}",
+            ):
+                verify_contract_schemas(
+                    root, config, historical, prospective, preflight
+                )
+
+    def test_contract_schema_verifier_requires_checked_in_old_authority(self) -> None:
+        self.assert_missing_historical_authority_fails(
+            self.HISTORICAL_AUTHORITY_RELATIVES[0]
+        )
+
+    def test_contract_schema_verifier_requires_checked_in_source_authority(self) -> None:
+        self.assert_missing_historical_authority_fails(
+            self.HISTORICAL_AUTHORITY_RELATIVES[1]
+        )
 
     def test_task7d_closed_schema_semantic_tampering_fails(self) -> None:
         config = load_v52_config(ROOT / "config/v5_2_qd.json")
@@ -1398,6 +1477,7 @@ class DesignVerificationTest(unittest.TestCase):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 shutil.copytree(ROOT / "schemas", root / "schemas")
+                self.copy_historical_authorities(root)
                 (root / "schemas" / filename).write_bytes(
                     canonical_json_bytes(malformed) + b"\n"
                 )
@@ -1431,6 +1511,7 @@ class DesignVerificationTest(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 shutil.copytree(ROOT / "schemas", root / "schemas")
+                self.copy_historical_authorities(root)
                 path = root / relative
                 schema = json.loads(path.read_bytes())
                 if mutation == "definition-closure":
@@ -1491,10 +1572,13 @@ class DesignVerificationTest(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 shutil.copytree(ROOT / "schemas", root / "schemas")
+                self.copy_historical_authorities(root)
                 path = root / "schemas" / filename
                 schema = json.loads(path.read_text(encoding="utf-8"))
                 if case == "historical_ref":
-                    schema["properties"]["folds"]["items"]["$ref"] = "#/$defs/x"
+                    schema["oneOf"][0]["properties"]["folds"]["items"][
+                        "$ref"
+                    ] = "#/$defs/x"
                 elif case == "historical_closure":
                     schema["$defs"]["fold"]["additionalProperties"] = True
                 elif case == "prospective_closure":
