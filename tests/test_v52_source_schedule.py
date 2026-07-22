@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
+import tempfile
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,6 +17,7 @@ from mlb_backtest.v52_evidence import (
     V52EvidenceStore,
     logical_query_id,
 )
+from mlb_backtest.v52_source_contracts import recompute_query_sidecar
 import mlb_backtest.v52_duplicate_gamepk_disposition as disposition_module
 from mlb_backtest.v52_duplicate_gamepk_disposition import (
     DISPOSITION_ENDPOINT,
@@ -209,6 +212,172 @@ def _mutate_565534_predicate(
 
 
 class V52ScheduleSourceTest(unittest.TestCase):
+    def test_schedule_disposition_dispatch_requires_matching_authority_and_empty_raw(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        semantics = recompute_query_sidecar(
+            authority.query, b"", authority=authority
+        )
+        self.assertEqual(
+            semantics["disposition"], "SCHEDULE_DUPLICATE_GAMEPK_565534"
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            recompute_query_sidecar(authority.query, b"")
+        with self.assertRaises((TypeError, ValueError)):
+            recompute_query_sidecar(authority.query, b"not-rawless", authority=authority)
+        with self.assertRaises((TypeError, ValueError)):
+            recompute_query_sidecar(
+                authority.query,
+                b"",
+                authority=dataclasses.replace(
+                    authority, evidence_root=ROOT / "data/v5_2_qd/historical/raw"
+                ),
+            )
+
+    def test_duplicate_disposition_is_rawless_and_has_no_attempt_or_reservation(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        protected_old_files = (
+            ROOT / disposition_module.OLD_REGISTRATION_RELATIVE,
+            ROOT / disposition_module.OLD_QUARANTINE_RELATIVE,
+            ROOT / disposition_module.OLD_RAW_RELATIVE,
+        )
+        old_snapshot = {
+            path: (path.read_bytes(), hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in protected_old_files
+        }
+        self.assertEqual(
+            old_snapshot[ROOT / disposition_module.OLD_REGISTRATION_RELATIVE][1],
+            disposition_module.OLD_REGISTRATION_SHA256,
+        )
+        self.assertEqual(
+            old_snapshot[ROOT / disposition_module.OLD_QUARANTINE_RELATIVE][1],
+            disposition_module.OLD_QUARANTINE_SHA256,
+        )
+        self.assertEqual(
+            old_snapshot[ROOT / disposition_module.OLD_RAW_RELATIVE][1],
+            disposition_module.OLD_RAW_SHA256,
+        )
+        self.assertEqual(authority._read_old_payload()["totalGames"], 2472)
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(Path(td).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            with patch.object(
+                disposition_module.DuplicateGamePkDispositionAuthority,
+                "reauthenticate",
+                return_value=isolated,
+            ):
+                published = publish_duplicate_gamepk_disposition(store, isolated)
+                verified = store.read_verified_success(
+                    isolated.query, authority=isolated
+                )
+            folder = store.root / "queries" / isolated.query.source / published.query_id
+            self.assertEqual(published.storage_mode, "DERIVED_DISPOSITION")
+            self.assertIsNone(verified.raw_bytes)
+            self.assertEqual(verified.attempt_receipts, ())
+            self.assertEqual(list((folder / "attempts").iterdir()), [])
+            self.assertEqual(list((folder / "objects").iterdir()), [])
+            self.assertEqual(verified.success_receipt["attempt_number"], None)
+        for path, (contents, digest) in old_snapshot.items():
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+    def test_schedule_disposition_schema_is_closed_and_cross_bound_publish_fails(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(Path(td).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            semantics = recompute_query_sidecar(
+                authority.query, b"", authority=authority
+            )
+            with store.acquire_query(isolated.query):
+                with self.assertRaisesRegex(TypeError, "authenticated authority"):
+                    store.publish_derived_disposition(isolated.query, semantics)
+            with store.acquire_query(isolated.query):
+                with self.assertRaisesRegex(ValueError, "authority binding"):
+                    store.publish_derived_disposition(
+                        isolated.query,
+                        semantics,
+                        authority=dataclasses.replace(
+                            isolated,
+                            evidence_root=store.root.parent / "other-root",
+                        ),
+                    )
+            folder = store.root / "queries" / isolated.query.source / logical_query_id(isolated.query)
+            self.assertEqual(list((folder / "sidecars").iterdir()), [])
+
+            with patch.object(
+                disposition_module.DuplicateGamePkDispositionAuthority,
+                "reauthenticate",
+                return_value=isolated,
+            ):
+                with store.acquire_query(isolated.query):
+                    published = store.publish_derived_disposition(
+                        isolated.query, semantics, authority=isolated
+                    )
+                self.assertEqual(
+                    published.query_sidecar_sha256,
+                    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1",
+                )
+                sidecar = json.loads(
+                    (store.root / json.loads(published.success_receipt_path.read_bytes())["query_sidecar_path"]).read_bytes()
+                )
+            schema = json.loads(
+                (ROOT / "schemas/v5_2_derived_disposition_sidecar.schema.json").read_bytes()
+            )
+            jsonschema.Draft202012Validator.check_schema(schema)
+            jsonschema.validate(sidecar, schema)
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    {**sidecar, "unexpected": True}, schema
+                )
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    {**sidecar, "query_id": "a" * 64}, schema
+                )
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    {
+                        **sidecar,
+                        "semantics": {
+                            key: value
+                            for key, value in sidecar["semantics"].items()
+                            if key != "occurrence_counts"
+                        },
+                    },
+                    schema,
+                )
+
+    def test_schedule_disposition_final_rebind_rejects_changed_authority_before_success(self) -> None:
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(Path(td).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            with patch.object(
+                disposition_module.DuplicateGamePkDispositionAuthority,
+                "reauthenticate",
+                side_effect=[isolated, isolated, ValueError("authority changed")],
+            ), self.assertRaisesRegex(ValueError, "authority changed"):
+                publish_duplicate_gamepk_disposition(store, isolated)
+            folder = store.root / "queries" / isolated.query.source / logical_query_id(isolated.query)
+            self.assertFalse((folder / "success.json").exists())
+            self.assertEqual(list((folder / "attempts").iterdir()), [])
+            self.assertEqual(list((folder / "objects").iterdir()), [])
+
     def test_565534_exact_pair_retains_only_resumed_record_and_binds_disposition(self) -> None:
         from mlb_backtest.source_parsers.schedule import parse_schedule
 

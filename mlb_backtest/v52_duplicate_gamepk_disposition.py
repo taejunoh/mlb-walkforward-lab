@@ -43,6 +43,31 @@ RETAINED_OBJECT_SHA256 = "6b07d5e4781c472ca1e0a22b7190acdef61c8fe3d8885524835d6f
 NORMALIZED_GAMES_SHA256 = "a6089e74246b919b59519b93743a0281834ef759347faa67f457d5deb5191930"
 SELECTED_RAW_GAME_OBJECT_SHA256S_SHA256 = "114d3593ebee215b357622ee712011314061d0ded3e888d847dc90270a25a360"
 
+SUPPRESSED_OCCURRENCE = MappingProxyType(
+    {
+        "date_index": 54,
+        "game_index": 5,
+        "sha256": SUPPRESSED_OBJECT_SHA256,
+        "game_date": "2019-05-19T17:10:00Z",
+        "venue_id": 2394,
+        "calendar_event_id": "14-565534-2019-05-19",
+        "resume_date": "2019-09-07T00:15:00Z",
+        "resume_game_date": "2019-09-06",
+    }
+)
+RETAINED_OCCURRENCE = MappingProxyType(
+    {
+        "date_index": 161,
+        "game_index": 12,
+        "sha256": RETAINED_OBJECT_SHA256,
+        "game_date": "2019-09-07T00:15:00Z",
+        "venue_id": 10,
+        "calendar_event_id": "14-565534-2019-09-06",
+        "resumed_from": "2019-05-19T17:10:00Z",
+        "resumed_from_date": "2019-05-19",
+    }
+)
+
 OLD_REGISTRATION_RELATIVE = Path(
     "data/v5_2_qd/historical/raw/queries/mlb_schedule_game_feed"
 ) / OLD_QUERY_ID / "query.json"
@@ -128,6 +153,17 @@ class DuplicateGamePkDispositionAuthority:
 
     def recompute(self) -> ScheduleOccurrenceProjection:
         return self.project_payload(self._read_old_payload())
+
+    def reauthenticate(self) -> DuplicateGamePkDispositionAuthority:
+        """Rebuild and bind every new and old authority before use."""
+        rebound = build_duplicate_disposition_authority(
+            self.repository_root,
+            source_run_spec_path=self.source_run_spec_path,
+            acquisition_contract_path=self.acquisition_contract_path,
+        )
+        if rebound != self:
+            raise ValueError("565534 disposition authority changed during rebind")
+        return rebound
 
 
 def _canonical_sha256(value: object) -> str:
@@ -477,8 +513,8 @@ def _sidecar_semantics(authority: DuplicateGamePkDispositionAuthority, projectio
         "game_pk": 565534,
         "old_authority": authority.query.requested_range["old_authority"],
         "fixed_game_facts": {"season": 2019, "official_date": "2019-05-19", "away_team_id": 133, "home_team_id": 116, "terminal_status": "Final", "away_score": 7, "home_score": 3, "winner_team_id": 133},
-        "suppressed_occurrence": authority.query.requested_range["suppressed_occurrence"],
-        "retained_occurrence": authority.query.requested_range["retained_occurrence"],
+        "suppressed_occurrence": dict(SUPPRESSED_OCCURRENCE),
+        "retained_occurrence": dict(RETAINED_OCCURRENCE),
         "occurrence_counts": dict(projection.occurrence_counts),
         "normalized_games_sha256": NORMALIZED_GAMES_SHA256,
         "selected_raw_game_object_sha256s_sha256": (
@@ -490,9 +526,11 @@ def _sidecar_semantics(authority: DuplicateGamePkDispositionAuthority, projectio
 def publish_duplicate_gamepk_disposition(store: V52EvidenceStore, authority: DuplicateGamePkDispositionAuthority) -> PublishedEvidence:
     if not isinstance(store, V52EvidenceStore) or store.root != authority.evidence_root:
         raise ValueError("565534 disposition store root differs from authenticated authority")
-    projection = authority.recompute()
-    # The generic publication transaction owns the query lease.  Recompute once
-    # more immediately before entering it so callers cannot reuse stale authority.
-    if authority.recompute() != projection:
-        raise ValueError("565534 disposition authority changed before publication")
-    return store.publish_derived_disposition(authority.query, _sidecar_semantics(authority, projection))
+    rebound = authority.reauthenticate()
+    projection = rebound.recompute()
+    with store.acquire_query(rebound.query):
+        return store.publish_derived_disposition(
+            rebound.query,
+            _sidecar_semantics(rebound, projection),
+            authority=rebound,
+        )

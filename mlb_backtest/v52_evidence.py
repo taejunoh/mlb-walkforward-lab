@@ -2764,8 +2764,10 @@ class V52EvidenceStore:
             raise ValueError("query lease registration identity changed")
         self._verify_registered_lock(query_fd, lease._descriptor, lock_identity)
 
-    def _ensure_unpublished(self, query: LogicalQuery) -> None:
-        if self.load_success(query) is not None:
+    def _ensure_unpublished(
+        self, query: LogicalQuery, *, authority: object | None = None
+    ) -> None:
+        if self.load_success(query, authority=authority) is not None:
             raise RuntimeError("query success is already published and terminal")
 
     def acquire_query(self, query: LogicalQuery) -> ContextManager[QueryLease]:
@@ -3761,11 +3763,11 @@ class V52EvidenceStore:
             self._close_fds(descriptors)
 
     def _recover_pending_before_mutation(
-        self, query: LogicalQuery
+        self, query: LogicalQuery, *, authority: object | None = None
     ) -> PersistedAttemptEvidence | None:
         recovered = self.recover_failure_attempt(query)
         if recovered is not None:
-            self._ensure_unpublished(query)
+            self._ensure_unpublished(query, authority=authority)
         return recovered
 
     def read_verified_split_attempt(
@@ -4350,12 +4352,39 @@ class V52EvidenceStore:
         name = f"{digest}.json"
         return name, digest, contents
 
-    @staticmethod
     def _derived_semantics(
-        query: LogicalQuery, semantics: Mapping[str, object]
+        self,
+        query: LogicalQuery,
+        semantics: Mapping[str, object],
+        *,
+        authority: object | None = None,
     ) -> dict[str, object]:
         from .v52_seasons import SEASON_BOUNDARIES
         from .v52_source_contracts import recompute_query_sidecar
+
+        if query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
+            from .v52_duplicate_gamepk_disposition import (
+                DuplicateGamePkDispositionAuthority,
+            )
+
+            if not isinstance(authority, DuplicateGamePkDispositionAuthority):
+                raise TypeError(
+                    "schedule disposition requires its authenticated authority"
+                )
+            if authority.query != query or authority.evidence_root != self.root:
+                raise ValueError("schedule disposition authority binding differs")
+            expected = dict(
+                recompute_query_sidecar(query, b"", authority=authority)
+            )
+            supplied = _normalized_json_object(
+                semantics, "derived query_sidecar"
+            )
+            if supplied != expected:
+                raise ValueError("derived disposition semantics differ from query")
+            return expected
+
+        if authority is not None:
+            raise ValueError("preseason disposition must not receive an authority")
 
         expected_range = {
             "as_of_date",
@@ -4407,8 +4436,12 @@ class V52EvidenceStore:
         self,
         query: LogicalQuery,
         semantics: Mapping[str, object],
+        *,
+        authority: object | None = None,
     ) -> tuple[str, str, bytes]:
-        semantic_record = self._derived_semantics(query, semantics)
+        semantic_record = self._derived_semantics(
+            query, semantics, authority=authority
+        )
         sidecar = {
             "grain": query.grain,
             "parser_version": query.parser_version,
@@ -5034,15 +5067,19 @@ class V52EvidenceStore:
         self,
         query: LogicalQuery,
         query_sidecar: Mapping[str, object],
+        *,
+        authority: object | None = None,
     ) -> PublishedEvidence:
         self._require_lease(query)
-        if self._recover_pending_before_mutation(query) is not None:
+        if self._recover_pending_before_mutation(query, authority=authority) is not None:
             raise RuntimeError(
                 "pending failure transaction recovered; success publication refused"
             )
-        self._ensure_unpublished(query)
+        self._ensure_unpublished(query, authority=authority)
         sidecar_name, sidecar_sha256, sidecar_contents = (
-            self._derived_sidecar_artifact(query, query_sidecar)
+            self._derived_sidecar_artifact(
+                query, query_sidecar, authority=authority
+            )
         )
         query_id, descriptors = self._query_fds(query, create=False)
         try:
@@ -5145,6 +5182,9 @@ class V52EvidenceStore:
                         sidecar_snapshot,
                         "derived disposition sidecar",
                     )
+                    self._derived_semantics(
+                        query, query_sidecar, authority=authority
+                    )
                     _write_once_at(
                         query_fd,
                         "success.json",
@@ -5178,12 +5218,16 @@ class V52EvidenceStore:
                     raise
         finally:
             self._close_fds(descriptors)
-        published = self.verify_success(query)
+        published = self.verify_success(query, authority=authority)
         self._require_lease(query)
         return published
 
-    def load_success(self, query: LogicalQuery) -> PublishedEvidence | None:
-        verified = self._read_verified_success(query, missing_ok=True)
+    def load_success(
+        self, query: LogicalQuery, *, authority: object | None = None
+    ) -> PublishedEvidence | None:
+        verified = self._read_verified_success(
+            query, missing_ok=True, authority=authority
+        )
         return None if verified is None else verified.published_evidence
 
     def _read_bound_relative(
@@ -5240,6 +5284,7 @@ class V52EvidenceStore:
         query: LogicalQuery,
         *,
         missing_ok: bool,
+        authority: object | None = None,
         cleanup_tombstones: bool = True,
         lock_descriptor: int | None = None,
         inspection: Callable[[VerifiedEvidenceRead], None] | None = None,
@@ -5524,6 +5569,7 @@ class V52EvidenceStore:
                     self._derived_semantics(
                         query,
                         sidecar["semantics"],  # type: ignore[arg-type]
+                        authority=authority,
                     )
                 elif set(sidecar) != {
                     "byte_count",
@@ -5691,8 +5737,12 @@ class V52EvidenceStore:
                     os.close(owned_lock_descriptor)
                 self._close_fds(descriptors)
 
-    def read_verified_success(self, query: LogicalQuery) -> VerifiedEvidenceRead:
-        verified = self._read_verified_success(query, missing_ok=False)
+    def read_verified_success(
+        self, query: LogicalQuery, *, authority: object | None = None
+    ) -> VerifiedEvidenceRead:
+        verified = self._read_verified_success(
+            query, missing_ok=False, authority=authority
+        )
         if verified is None:
             raise RuntimeError("success receipt is missing")
         return verified
@@ -5701,6 +5751,8 @@ class V52EvidenceStore:
         self,
         query: LogicalQuery,
         inspection: Callable[[VerifiedEvidenceRead], None],
+        *,
+        authority: object | None = None,
     ) -> VerifiedEvidenceRead:
         if not self._read_only:
             raise ValueError(
@@ -5712,13 +5764,14 @@ class V52EvidenceStore:
             query,
             missing_ok=False,
             inspection=inspection,
+            authority=authority,
         )
         if verified is None:
             raise RuntimeError("success receipt is missing")
         return verified
 
     def read_verified_query_progress(
-        self, query: LogicalQuery
+        self, query: LogicalQuery, *, authority: object | None = None
     ) -> VerifiedQueryProgress:
         query_id = logical_query_id(query)
         descriptors: list[int] = []
@@ -5937,6 +5990,7 @@ class V52EvidenceStore:
                         missing_ok=False,
                         cleanup_tombstones=False,
                         lock_descriptor=lock_descriptor,
+                        authority=authority,
                     )
                     if success_snapshot is not None
                     else None
@@ -6160,8 +6214,12 @@ class V52EvidenceStore:
                     os.close(lock_descriptor)
             self._close_fds(descriptors)
 
-    def verify_success(self, query: LogicalQuery) -> PublishedEvidence:
-        return self.read_verified_success(query).published_evidence
+    def verify_success(
+        self, query: LogicalQuery, *, authority: object | None = None
+    ) -> PublishedEvidence:
+        return self.read_verified_success(
+            query, authority=authority
+        ).published_evidence
 
 
 __all__ = [

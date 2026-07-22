@@ -88,12 +88,33 @@ def require_query(
 
 
 def recompute_query_sidecar(
-    query: LogicalQuery, raw: bytes
+    query: LogicalQuery, raw: bytes, *, authority: object | None = None
 ) -> Mapping[str, object]:
     """Dispatch one raw response to its exact grain-specific recomputer."""
     if not isinstance(query, LogicalQuery):
         raise TypeError("query must be a LogicalQuery")
     key = (query.source, query.grain)
+    if (
+        key == ("mlb_schedule_game_feed", "season_schedule_and_game")
+        and query.endpoint
+        == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+    ):
+        from .v52_duplicate_gamepk_disposition import (
+            DuplicateGamePkDispositionAuthority,
+            _sidecar_semantics,
+        )
+
+        if not isinstance(authority, DuplicateGamePkDispositionAuthority):
+            raise TypeError("schedule disposition requires its authenticated authority")
+        if authority.query != query:
+            raise ValueError("schedule disposition authority query differs")
+        if raw != b"":
+            raise ValueError("schedule disposition must not claim raw bytes")
+        rebound = authority.reauthenticate()
+        projection = rebound.recompute()
+        return _sidecar_semantics(rebound, projection)
+    if authority is not None:
+        raise ValueError("authority is only valid for the schedule disposition")
     if key == ("mlb_schedule_game_feed", "season_schedule_and_game"):
         from .v52_sources.schedule import (
             recompute_boxscore_sidecar,

@@ -401,6 +401,42 @@ def _career_reference_fixture(
 
 
 class V52EvidenceTest(unittest.TestCase):
+    def test_old_preseason_derived_disposition_sidecar_bytes_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = V52EvidenceStore(_tmp(td) / "raw")
+            query = _derived_query()
+            with store.acquire_query(query):
+                published = store.publish_derived_disposition(
+                    query, _derived_semantics()
+                )
+            self.assertEqual(
+                published.query_sidecar_sha256,
+                "ca1960f47f758255062d3716ce45639199cdd4ff4e4cc36bf06cacfc27f4dd1a",
+            )
+            self.assertEqual(
+                store.read_verified_success(query).query_sidecar["semantics"],
+                _derived_semantics(),
+            )
+
+    def test_derived_manifest_schema_accepts_exact_schedule_disposition_branch(self):
+        query_id = "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+        manifest = {
+            "attempt_history": [],
+            "attempt_number": None,
+            "grain": "season_schedule_and_game",
+            "query_id": query_id,
+            "query_path": f"queries/mlb_schedule_game_feed/{query_id}/query.json",
+            "query_sha256": "a" * 64,
+            "query_sidecar_path": f"queries/mlb_schedule_game_feed/{query_id}/sidecars/{'b' * 64}.json",
+            "query_sidecar_sha256": "b" * 64,
+            "schema_version": 1,
+            "source": "mlb_schedule_game_feed",
+            "storage_mode": "DERIVED_DISPOSITION",
+        }
+        schema = json.loads(MANIFEST_SCHEMA.read_bytes())
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.validate(manifest, schema)
+
     @staticmethod
     def _tree_byte_inode_snapshot(root: Path) -> dict[Path, tuple[object, ...]]:
         snapshot: dict[Path, tuple[object, ...]] = {}
