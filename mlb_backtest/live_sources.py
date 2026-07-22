@@ -18,8 +18,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .live_top3_contracts import (
     FinalGameObservation,
@@ -43,7 +43,7 @@ from .source_parsers.schedule import (
     parse_schedule,
     validate_schedule_query_coverage,
 )
-from .sources import MLB_BASE, schedule_url
+from .sources import MLB_BASE
 
 
 MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -51,6 +51,8 @@ _READ_CHUNK_BYTES = 64 * 1024
 _MAX_PITCHER_LIST = 30
 _LOCK_OPEN_ATTEMPTS = 16
 _LAYOUT_OPEN_ATTEMPTS = 16
+_MAX_HTTP_REDIRECTS = 5
+_HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _OBSERVATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CANONICAL_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _RAW_MANIFEST_KEYS = frozenset(
@@ -350,13 +352,52 @@ def _read_bounded_response(response: object, *, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+class _NoFollowRedirectHandler(HTTPRedirectHandler):
+    """Return redirect responses so the live allowlist can inspect each hop."""
+
+    @staticmethod
+    def _return_response(_request, response, _code, _message, _headers):
+        return response
+
+    http_error_301 = _return_response
+    http_error_302 = _return_response
+    http_error_303 = _return_response
+    http_error_307 = _return_response
+    http_error_308 = _return_response
+
+
+def _default_live_opener(request: Request, *, timeout: int | float) -> object:
+    return build_opener(_NoFollowRedirectHandler()).open(request, timeout=timeout)
+
+
+def _redirect_location(headers: object) -> str:
+    if headers is None or not hasattr(headers, "get"):
+        raise ValueError("live HTTP redirect headers differ")
+    if hasattr(headers, "get_all"):
+        values = headers.get_all("Location")
+        if not isinstance(values, list) or len(values) != 1:
+            raise ValueError("live HTTP redirect Location differs")
+        location = values[0]
+    else:
+        location = headers.get("Location")
+    if (
+        not isinstance(location, str)
+        or not location
+        or location != location.strip()
+        or "\r" in location
+        or "\n" in location
+    ):
+        raise ValueError("live HTTP redirect Location differs")
+    return location
+
+
 def fetch_live_http(
     source: Literal["stats_api", "savant"],
     url: str,
     *,
     timeout: int | float = 90,
     max_bytes: int = MAX_JSON_BYTES,
-    opener: Callable[..., object] = urlopen,
+    opener: Callable[..., object] | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> LiveHttpObservation:
     """Fetch one bounded response and bind its exact source metadata."""
@@ -372,26 +413,43 @@ def fetch_live_http(
         raise ValueError("max_bytes must be a positive integer")
 
     started_at = _canonical_utc(clock(), "fetch clock")
-    request = Request(
-        requested_url, headers={"User-Agent": "mlb-experimental-live/1.0"}
-    )
-    response = opener(request, timeout=timeout)
-    with response:
-        final_url = _validate_source_url(source, response.geturl(), "final URL")
-        body = _read_bounded_response(response, max_bytes=max_bytes)
-        completed_at = _canonical_utc(clock(), "fetch clock")
-        headers = response.headers
-        return LiveHttpObservation(
-            requested_url=requested_url,
-            final_url=final_url,
-            started_at_utc=started_at,
-            response_completed_at_utc=completed_at,
-            http_status=response.status,
-            content_type=headers.get("Content-Type"),
-            etag=headers.get("ETag"),
-            last_modified=headers.get("Last-Modified"),
-            body=body,
+    transport = _default_live_opener if opener is None else opener
+    current_url = requested_url
+    for redirects_followed in range(_MAX_HTTP_REDIRECTS + 1):
+        request = Request(
+            current_url, headers={"User-Agent": "mlb-experimental-live/1.0"}
         )
+        response = transport(request, timeout=timeout)
+        with response:
+            final_url = _validate_source_url(source, response.geturl(), "final URL")
+            if final_url != current_url:
+                raise ValueError("live HTTP transport followed an unvalidated redirect")
+            status = getattr(response, "status", None)
+            if status in _HTTP_REDIRECT_STATUSES:
+                if redirects_followed == _MAX_HTTP_REDIRECTS:
+                    raise ValueError("live HTTP response has too many redirects")
+                location = _redirect_location(getattr(response, "headers", None))
+                current_url = _validate_source_url(
+                    source,
+                    urljoin(current_url, location),
+                    "redirect URL",
+                )
+                continue
+            body = _read_bounded_response(response, max_bytes=max_bytes)
+            completed_at = _canonical_utc(clock(), "fetch clock")
+            headers = response.headers
+            return LiveHttpObservation(
+                requested_url=requested_url,
+                final_url=final_url,
+                started_at_utc=started_at,
+                response_completed_at_utc=completed_at,
+                http_status=response.status,
+                content_type=headers.get("Content-Type"),
+                etag=headers.get("ETag"),
+                last_modified=headers.get("Last-Modified"),
+                body=body,
+            )
+    raise RuntimeError("unreachable live HTTP redirect state")
 
 
 def _decode_object(raw: bytes, label: str) -> dict[str, object]:
@@ -404,6 +462,20 @@ def _decode_object(raw: bytes, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"malformed {label}: root must be an object")
     return value
+
+
+def live_schedule_url(start: str, end: str) -> str:
+    """Build the result-free live schedule request used by both observations."""
+    query = urlencode(
+        {
+            "sportId": 1,
+            "gameType": "R",
+            "startDate": start,
+            "endDate": end,
+            "hydrate": "probablePitcher,venue",
+        }
+    )
+    return f"{MLB_BASE}/schedule?{query}"
 
 
 def _validate_raw_live_schedule(payload: dict[str, object]) -> None:
@@ -444,7 +516,10 @@ def parse_live_schedule(
             raise ValueError("live schedule result must contain only regular games")
         if not _CANONICAL_UTC_RE.fullmatch(str(game["scheduled_start_utc"])):
             raise ValueError("live schedule start must be canonical UTC")
-        projected.append({field: game[field] for field in _LIVE_SCHEDULE_FIELDS})
+        projection = {field: game[field] for field in _LIVE_SCHEDULE_FIELDS}
+        projection["away_lineup"] = ()
+        projection["home_lineup"] = ()
+        projected.append(projection)
     return tuple(projected)
 
 
@@ -952,6 +1027,142 @@ def _acquire_observation_claim(
     return relative, snapshot
 
 
+_LIVE_COMPLETION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "binding_role",
+        "observation_id",
+        "query_identity_json",
+        "receipt_relative",
+        "receipt_sha256",
+        "payload_sha256",
+        "manifest_sha256",
+        "durable_at_utc",
+    }
+)
+
+
+def _validate_observation_completion(
+    content: bytes, expected: Mapping[str, object]
+) -> str:
+    try:
+        completion = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("live observation completion is invalid") from exc
+    if (
+        not isinstance(completion, dict)
+        or set(completion) != _LIVE_COMPLETION_FIELDS
+        or canonical_json_bytes(completion) != content
+        or any(completion.get(key) != value for key, value in expected.items())
+    ):
+        raise ValueError("live observation completion differs")
+    durable_at = completion.get("durable_at_utc")
+    if not isinstance(durable_at, str) or not _CANONICAL_UTC_RE.fullmatch(durable_at):
+        raise ValueError("live observation completion durable time differs")
+    normalized = f"{durable_at[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("live observation completion durable time differs") from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("live observation completion durable time differs")
+    return durable_at
+
+
+def _acquire_observation_completion(
+    trusted: TrustedRoot,
+    *,
+    receipt_relative: Path,
+    expected: Mapping[str, object],
+    durable_clock: Callable[[], datetime],
+    final_rebind: Callable[[], None],
+) -> str:
+    stem = receipt_relative.name.removesuffix(".json")
+    completion_relative = receipt_relative.with_name(f"{stem}.completion.json")
+    seal_relative = receipt_relative.with_name(f"{stem}.completion.sha256")
+    completion_snapshot = read_regular_snapshot(
+        trusted,
+        completion_relative,
+        "live observation completion",
+        max_bytes=MAX_JSON_BYTES,
+        missing_ok=True,
+    )
+    seal_snapshot = read_regular_snapshot(
+        trusted,
+        seal_relative,
+        "live observation completion seal",
+        max_bytes=1024,
+        missing_ok=True,
+    )
+    if completion_snapshot is None:
+        if seal_snapshot is not None:
+            raise ValueError("live observation completion seal is orphaned")
+        durable_at = _canonical_utc(durable_clock(), "durable clock")
+        completion_bytes = canonical_json_bytes(
+            {**dict(expected), "durable_at_utc": durable_at}
+        )
+        try:
+            completion_snapshot = write_exclusive(
+                trusted,
+                completion_relative,
+                completion_bytes,
+                "live observation completion",
+                final_rebind=final_rebind,
+            )
+        except FileExistsError:
+            completion_snapshot = read_regular_snapshot(
+                trusted,
+                completion_relative,
+                "live observation completion",
+                max_bytes=MAX_JSON_BYTES,
+            )
+    if completion_snapshot is None:
+        raise ValueError("live observation completion is missing")
+    durable_at = _validate_observation_completion(
+        completion_snapshot.contents, expected
+    )
+    expected_seal = (
+        f"{hashlib.sha256(completion_snapshot.contents).hexdigest()}\n".encode()
+    )
+
+    def rebind_completion_evidence() -> None:
+        final_rebind()
+        rebind_regular_snapshot(
+            trusted,
+            completion_snapshot,
+            "live observation completion",
+            max_bytes=MAX_JSON_BYTES,
+        )
+
+    if seal_snapshot is None:
+        try:
+            seal_snapshot = write_exclusive(
+                trusted,
+                seal_relative,
+                expected_seal,
+                "live observation completion seal",
+                final_rebind=rebind_completion_evidence,
+            )
+        except FileExistsError:
+            seal_snapshot = read_regular_snapshot(
+                trusted,
+                seal_relative,
+                "live observation completion seal",
+                max_bytes=1024,
+            )
+    if seal_snapshot is None or seal_snapshot.contents != expected_seal:
+        raise ValueError("live observation completion seal differs")
+    rebind_completion_evidence()
+    rebind_regular_snapshot(
+        trusted,
+        seal_snapshot,
+        "live observation completion seal",
+        max_bytes=1024,
+    )
+    return durable_at
+
+
 def _persist_observation(
     root: Path,
     *,
@@ -1135,7 +1346,34 @@ def _persist_observation(
                 "live observation receipt",
                 max_bytes=MAX_JSON_BYTES,
             )
-            durable_at = _canonical_utc(durable_clock(), "durable clock")
+            receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+
+            def rebind_receipt_evidence() -> None:
+                rebind_evidence()
+                rebind_regular_snapshot(
+                    trusted,
+                    receipt_snapshot,
+                    "live observation receipt",
+                    max_bytes=MAX_JSON_BYTES,
+                )
+
+            durable_at = _acquire_observation_completion(
+                trusted,
+                receipt_relative=receipt_relative,
+                expected={
+                    "schema_version": 1,
+                    "source": source,
+                    "binding_role": binding_role,
+                    "observation_id": observation_id,
+                    "query_identity_json": query_identity_json,
+                    "receipt_relative": receipt_relative.as_posix(),
+                    "receipt_sha256": receipt_sha256,
+                    "payload_sha256": artifact.sha256,
+                    "manifest_sha256": manifest_sha256,
+                },
+                durable_clock=durable_clock,
+                final_rebind=rebind_receipt_evidence,
+            )
             binding = _build_source_binding(
                 source=source,
                 binding_role=binding_role,
@@ -1149,7 +1387,7 @@ def _persist_observation(
                 payload_relative=payload_relative.as_posix(),
                 manifest_sha256=manifest_sha256,
                 receipt_relative=receipt_relative.as_posix(),
-                receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
+                receipt_sha256=receipt_sha256,
             )
             return PersistedObservation(
                 binding, payload_snapshot.contents, payload_snapshot
@@ -1189,7 +1427,7 @@ def observe_live_slate(
 ) -> LiveSlateObservation:
     target_date = validate_target_date(target_date)
     with _live_root_session(root, expected_root_binding) as trusted:
-        request = schedule_url(target_date, target_date)
+        request = live_schedule_url(target_date, target_date)
         http = _validate_http_observation(
             fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
             source="stats_api",
@@ -1338,7 +1576,7 @@ def observe_final_game_schedule(
     target_date = validate_target_date(target_date)
     game_pk = _positive_int(saved_game.get("game_pk"), "game_pk")
     with _live_root_session(root, expected_root_binding) as trusted:
-        request = schedule_url(target_date, target_date)
+        request = live_schedule_url(target_date, target_date)
         http = _validate_http_observation(
             fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
             source="stats_api",
@@ -1421,6 +1659,7 @@ __all__ = [
     "boxscore_url",
     "compare_probable_pitchers",
     "fetch_live_http",
+    "live_schedule_url",
     "new_observation_id",
     "normalize_live_root_path",
     "observe_final_game_schedule",

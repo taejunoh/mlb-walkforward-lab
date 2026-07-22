@@ -1,6 +1,7 @@
 import hashlib
 import json
 import multiprocessing
+import os
 import queue
 import stat
 import tempfile
@@ -11,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 from mlb_backtest import live_history, live_sources, secure_fs
@@ -22,12 +24,17 @@ from mlb_backtest.live_sources import (
     LiveSlateObservation,
     compare_probable_pitchers,
     fetch_live_http,
+    live_schedule_url,
     observe_final_game_schedule,
     observe_live_slate,
     parse_live_schedule,
     parse_pregame_boxscore,
 )
-from mlb_backtest.live_top3_contracts import FinalGameObservation, SourceBinding
+from mlb_backtest.live_top3_contracts import (
+    FinalGameObservation,
+    SourceBinding,
+    canonical_json_bytes,
+)
 from mlb_backtest.sources import schedule_url
 
 
@@ -38,6 +45,7 @@ BOX_COMPLETE = FIXTURES / "boxscore_complete.json"
 BOX_PARTIAL = FIXTURES / "boxscore_partial.json"
 BOX_EMPTY_PITCHERS = FIXTURES / "boxscore_pregame_empty_pitchers.json"
 BOX_POSTSTART = FIXTURES / "boxscore_poststart_appearance_order.json"
+POSTED_LINEUP_SCHEDULE = FIXTURES.parent / "schedule_2025_05_01.json"
 
 
 class _Response:
@@ -76,16 +84,33 @@ class _Response:
         return self.chunk_type(chunk)
 
 
+class _SequenceOpener:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, request, *, timeout):
+        self.calls.append((request.full_url, timeout))
+        if not self.responses:
+            raise AssertionError("unexpected HTTP request")
+        return self.responses.pop(0)
+
+
 def _clock(*values):
     instants = iter(values)
     return lambda: next(instants)
 
 
-def _http(url, body, completed="2026-07-21T15:00:01Z"):
+def _http(
+    url,
+    body,
+    completed="2026-07-21T15:00:01Z",
+    started="2026-07-21T15:00:00Z",
+):
     return LiveHttpObservation(
         requested_url=url,
         final_url=url,
-        started_at_utc="2026-07-21T15:00:00Z",
+        started_at_utc=started,
         response_completed_at_utc=completed,
         http_status=200,
         content_type="application/json",
@@ -93,6 +118,24 @@ def _http(url, body, completed="2026-07-21T15:00:01Z"):
         last_modified=None,
         body=body,
     )
+
+
+def _posted_lineup_pregame_schedule():
+    payload = json.loads(POSTED_LINEUP_SCHEDULE.read_text())
+    game = payload["dates"][0]["games"][0]
+    game["status"] = {"detailedState": "Scheduled"}
+    game["teams"]["away"]["team"] = {"id": 110, "name": "Away Club"}
+    game["teams"]["home"]["team"] = {"id": 120, "name": "Home Club"}
+    game["teams"]["away"]["probablePitcher"] = {
+        "id": 501,
+        "fullName": "Away Pitcher",
+    }
+    game["teams"]["home"]["probablePitcher"] = {
+        "id": 601,
+        "fullName": "Home Pitcher",
+    }
+    payload["dates"][0]["games"] = [game]
+    return json.dumps(payload).encode()
 
 
 def _fd_count():
@@ -246,6 +289,152 @@ class LiveSourceTests(unittest.TestCase):
                     clock=lambda: now,
                 )
 
+    def test_http_fetch_rejects_unsafe_initial_url_before_transport(self):
+        now = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        unsafe = (
+            "http://statsapi.mlb.com/api/v1/schedule",
+            "https://127.0.0.1/internal",
+            "https://user@statsapi.mlb.com/api/v1/schedule",
+            "https://statsapi.mlb.com:443/api/v1/schedule",
+        )
+        for url in unsafe:
+            with self.subTest(url=url):
+                opener = _SequenceOpener()
+                with self.assertRaises(ValueError):
+                    fetch_live_http(
+                        "stats_api", url, opener=opener, clock=lambda: now
+                    )
+                self.assertEqual(opener.calls, [])
+
+    def test_http_fetch_rejects_unsafe_redirect_before_second_request(self):
+        now = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        requested = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+        unsafe = (
+            "http://statsapi.mlb.com/api/v1/internal",
+            "https://127.0.0.1/internal",
+            "https://user@statsapi.mlb.com/api/v1/internal",
+            "https://statsapi.mlb.com:443/api/v1/internal",
+        )
+        for location in unsafe:
+            with self.subTest(location=location):
+                opener = _SequenceOpener(
+                    _Response(
+                        status=302,
+                        final_url=requested,
+                        headers={"Location": location},
+                    )
+                )
+                with self.assertRaises(ValueError):
+                    fetch_live_http(
+                        "stats_api", requested, opener=opener, clock=lambda: now
+                    )
+                self.assertEqual(opener.calls, [(requested, 90)])
+
+    def test_http_fetch_validates_each_redirect_hop_before_follow(self):
+        now = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        requested = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+        allowed = "https://statsapi.mlb.com/api/v1/next"
+        opener = _SequenceOpener(
+            _Response(
+                status=302,
+                final_url=requested,
+                headers={"Location": "/api/v1/next"},
+            ),
+            _Response(
+                status=307,
+                final_url=allowed,
+                headers={"Location": "//169.254.169.254/latest/meta-data"},
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            fetch_live_http(
+                "stats_api", requested, opener=opener, clock=lambda: now
+            )
+
+        self.assertEqual(opener.calls, [(requested, 90), (allowed, 90)])
+
+    def test_http_fetch_follows_allowed_relative_same_host_redirect(self):
+        started = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        completed = datetime(2026, 7, 21, 15, 0, 1, tzinfo=timezone.utc)
+        requested = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+        redirected = "https://statsapi.mlb.com/api/v1/next?game=1"
+        opener = _SequenceOpener(
+            _Response(
+                status=302,
+                final_url=requested,
+                headers={"Location": "/api/v1/next?game=1"},
+            ),
+            _Response(
+                body=b"{}",
+                final_url=redirected,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": "2",
+                },
+            ),
+        )
+
+        observed = fetch_live_http(
+            "stats_api",
+            requested,
+            opener=opener,
+            clock=_clock(started, completed),
+        )
+
+        self.assertEqual(observed.final_url, redirected)
+        self.assertEqual(observed.body, b"{}")
+        self.assertEqual(opener.calls, [(requested, 90), (redirected, 90)])
+
+    def test_default_http_opener_installs_no_follow_redirect_handler(self):
+        started = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        completed = datetime(2026, 7, 21, 15, 0, 1, tzinfo=timezone.utc)
+        requested = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+        redirected = "https://statsapi.mlb.com/api/v1/next"
+        transport = mock.Mock()
+        transport.open.side_effect = (
+            _Response(
+                status=302,
+                final_url=requested,
+                headers={"Location": "/api/v1/next"},
+            ),
+            _Response(body=b"{}", final_url=redirected),
+        )
+
+        with patch.object(
+            live_sources, "build_opener", return_value=transport
+        ) as builder:
+            observed = fetch_live_http(
+                "stats_api",
+                requested,
+                clock=_clock(started, completed),
+            )
+
+        self.assertEqual(observed.final_url, redirected)
+        self.assertEqual(builder.call_count, 2)
+        self.assertTrue(
+            all(
+                isinstance(call.args[0], live_sources._NoFollowRedirectHandler)
+                for call in builder.call_args_list
+            )
+        )
+        self.assertEqual(
+            [call.args[0].full_url for call in transport.open.call_args_list],
+            [requested, redirected],
+        )
+
+    def test_http_fetch_rejects_transport_that_already_followed_redirect(self):
+        now = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
+        requested = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+        followed = "https://statsapi.mlb.com/api/v1/already-followed"
+        opener = _SequenceOpener(_Response(final_url=followed))
+
+        with self.assertRaisesRegex(ValueError, "redirect"):
+            fetch_live_http(
+                "stats_api", requested, opener=opener, clock=lambda: now
+            )
+        self.assertEqual(opener.calls, [(requested, 90)])
+
     def test_schedule_projection_is_result_free_and_validates_coverage(self):
         games = parse_live_schedule(
             SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
@@ -269,6 +458,87 @@ class LiveSourceTests(unittest.TestCase):
         wrong_date = SCHEDULE_COMPLETE.read_text().replace("2026-07-21", "2026-07-22")
         with self.assertRaises(ValueError):
             parse_live_schedule(wrong_date.encode(), requested_date="2026-07-21")
+
+    def test_live_schedule_url_requests_only_probables_and_venue_hydration(self):
+        url = live_schedule_url("2026-07-21", "2026-07-21")
+
+        self.assertIn("hydrate=probablePitcher%2Cvenue", url)
+        self.assertNotIn("lineup", url.lower())
+        self.assertNotIn("linescore", url.lower())
+
+    def test_real_posted_schedule_lineups_are_forced_out_of_projection(self):
+        raw = _posted_lineup_pregame_schedule()
+        provider_game = json.loads(raw)["dates"][0]["games"][0]
+        self.assertEqual(len(provider_game["lineups"]["awayPlayers"]), 9)
+        self.assertEqual(len(provider_game["lineups"]["homePlayers"]), 9)
+
+        projected = parse_live_schedule(raw, requested_date="2025-05-01")
+
+        self.assertEqual(projected[0]["away_lineup"], ())
+        self.assertEqual(projected[0]["home_lineup"], ())
+        self.assertEqual(projected[0]["away_probable_pitcher_id"], 501)
+        self.assertEqual(projected[0]["home_probable_pitcher_id"], 601)
+        self.assertNotIn("away_score", projected[0])
+        self.assertNotIn("home_score", projected[0])
+
+    def test_posted_schedule_lineups_never_reach_slate_final_or_service(self):
+        from tests.test_live_top3_service import _build
+
+        target_date = "2025-05-01"
+        schedule = _posted_lineup_pregame_schedule()
+        boxscore = BOX_COMPLETE.read_bytes()
+        ids = iter(("posted-schedule", "posted-boxscore", "posted-final"))
+
+        def fetcher(_source, url, *, max_bytes):
+            body = boxscore if "/boxscore" in url else schedule
+            return _http(
+                url,
+                body,
+                started="2025-05-01T12:00:00Z",
+                completed="2025-05-01T12:00:01Z",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            slate = observe_live_slate(
+                root,
+                target_date,
+                fetcher=fetcher,
+                observation_id_factory=lambda: next(ids),
+                durable_clock=lambda: datetime(
+                    2025, 5, 1, 12, 0, 2, tzinfo=timezone.utc
+                ),
+            )
+            final = observe_final_game_schedule(
+                root,
+                target_date,
+                slate.games[0],
+                fetcher=fetcher,
+                observation_id_factory=lambda: next(ids),
+                durable_clock=lambda: datetime(
+                    2025, 5, 1, 12, 0, 3, tzinfo=timezone.utc
+                ),
+            )
+
+        self.assertEqual(slate.games[0]["away_lineup"], ())
+        self.assertEqual(slate.games[0]["home_lineup"], ())
+        participant = slate.participants[778100]
+        self.assertEqual(participant.away_lineup, tuple(range(1001, 1010)))
+        self.assertEqual(participant.home_lineup, tuple(range(2001, 2010)))
+        self.assertIsInstance(final, FinalGameObservation)
+        self.assertEqual(final.projected_game["away_lineup"], ())
+        self.assertEqual(final.projected_game["home_lineup"], ())
+
+        result = _build(slate, lambda _game_pk, _target_date: final)
+        self.assertEqual(
+            [row["game_pk"] for row in result["unscored_games"]],
+            [778100],
+        )
+        self.assertNotIn(
+            "TARGET_PARTICIPANT_LEAKAGE",
+            result["unscored_games"][0]["reason_codes"],
+        )
+        self.assertEqual(result["excluded_games"], [])
 
     def test_schedule_rejects_nonregular_and_duplicate_game_ids(self):
         payload = json.loads(SCHEDULE_COMPLETE.read_text())
@@ -371,7 +641,15 @@ class LiveSourceTests(unittest.TestCase):
                 second.source_bindings[0].payload_sha256,
             )
             self.assertEqual(
-                len(tuple(root.glob("audit/experimental_daily/live_receipts/*.json"))),
+                len(
+                    tuple(
+                        path
+                        for path in root.glob(
+                            "audit/experimental_daily/live_receipts/*.json"
+                        )
+                        if not path.name.endswith(".completion.json")
+                    )
+                ),
                 4,
             )
             self.assertEqual(
@@ -798,7 +1076,7 @@ class LiveSourceTests(unittest.TestCase):
 
     def test_schedule_and_boxscore_receipts_exist_before_invalid_payload_parse(self):
         target_date = "2026-07-21"
-        schedule_request = schedule_url(target_date, target_date)
+        schedule_request = live_schedule_url(target_date, target_date)
         ids = iter(("invalid-schedule",))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -959,6 +1237,7 @@ class LiveSourceTests(unittest.TestCase):
         original_put = live_history._CapabilityRawStore.put_unique_query
         active = 0
         maximum_active = 0
+        durable_calls = 0
         state_lock = threading.Lock()
 
         def tracked_put(store, source, query, payload):
@@ -973,6 +1252,12 @@ class LiveSourceTests(unittest.TestCase):
                 with state_lock:
                     active -= 1
 
+        def durable_clock():
+            nonlocal durable_calls
+            with state_lock:
+                durable_calls += 1
+            return datetime(2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc)
+
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(
                 live_history._CapabilityRawStore,
@@ -983,13 +1268,17 @@ class LiveSourceTests(unittest.TestCase):
                     results = tuple(
                         executor.map(
                             lambda _index: _persist_direct(
-                                temporary, observation_id="concurrent-id"
+                                temporary,
+                                observation_id="concurrent-id",
+                                durable_clock=durable_clock,
                             ),
                             range(2),
                         )
                     )
             self.assertEqual(maximum_active, 1)
+            self.assertEqual(durable_calls, 1)
             self.assertEqual(results[0].payload_bytes, results[1].payload_bytes)
+            self.assertEqual(results[0].source_binding, results[1].source_binding)
             root = Path(temporary)
             self.assertEqual(
                 len(
@@ -1039,7 +1328,13 @@ class LiveSourceTests(unittest.TestCase):
                 16,
             )
             self.assertEqual(
-                len(tuple(root.glob("audit/experimental_daily/live_receipts/*.json"))),
+                len(
+                    tuple(
+                        root.glob(
+                            "audit/experimental_daily/live_receipts/*.completion.json"
+                        )
+                    )
+                ),
                 16,
             )
             self.assertEqual(
@@ -1078,7 +1373,13 @@ class LiveSourceTests(unittest.TestCase):
                 16,
             )
             self.assertEqual(
-                len(tuple(root.glob("audit/experimental_daily/live_receipts/*.json"))),
+                len(
+                    tuple(
+                        root.glob(
+                            "audit/experimental_daily/live_receipts/*.completion.json"
+                        )
+                    )
+                ),
                 16,
             )
             self.assertEqual(
@@ -1280,7 +1581,7 @@ class LiveSourceTests(unittest.TestCase):
                 )
             self.assertEqual(result.games[0]["game_pk"], 777001)
 
-    def test_durable_time_is_sampled_after_receipt_rebind_and_not_stored_in_receipt(
+    def test_durable_time_is_sampled_after_receipt_and_stored_in_completion(
         self,
     ):
         events = []
@@ -1325,20 +1626,201 @@ class LiveSourceTests(unittest.TestCase):
             receipt = json.loads(
                 (Path(temporary) / result.source_binding.receipt_relative).read_text()
             )
-            self.assertEqual(
-                events,
-                [
-                    "write-start",
-                    "write-return",
-                    "receipt-rebind",
-                    "durable-clock",
-                ],
-            )
+            self.assertEqual(events[:4], [
+                "write-start",
+                "write-return",
+                "receipt-rebind",
+                "durable-clock",
+            ])
             self.assertNotIn("durable_at_utc", receipt)
             self.assertNotIn("pre_receipt_persistence_at_utc", receipt)
+            completion = json.loads(
+                (
+                    Path(temporary)
+                    / "audit/experimental_daily/live_receipts"
+                    / "durable-order.completion.json"
+                ).read_text()
+            )
+            self.assertEqual(
+                completion["receipt_sha256"],
+                result.source_binding.receipt_sha256,
+            )
+            self.assertEqual(
+                completion["payload_sha256"],
+                result.source_binding.payload_sha256,
+            )
+            self.assertEqual(
+                completion["manifest_sha256"],
+                result.source_binding.manifest_sha256,
+            )
+            self.assertEqual(
+                completion["durable_at_utc"], "2026-07-21T15:00:02Z"
+            )
             self.assertEqual(
                 result.source_binding.durable_at_utc, "2026-07-21T15:00:02Z"
             )
+
+    def test_repeat_observation_reuses_completion_without_resampling_clock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            first = _persist_direct(
+                temporary,
+                observation_id="durable-repeat",
+                durable_clock=lambda: datetime(
+                    2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc
+                ),
+            )
+
+            def must_not_resample():
+                raise AssertionError("existing completion must own durable time")
+
+            second = _persist_direct(
+                temporary,
+                observation_id="durable-repeat",
+                durable_clock=must_not_resample,
+            )
+            completion_path = (
+                Path(temporary)
+                / "audit/experimental_daily/live_receipts"
+                / "durable-repeat.completion.json"
+            )
+            seal_path = completion_path.with_suffix(".sha256")
+
+            self.assertEqual(first.source_binding, second.source_binding)
+            self.assertEqual(
+                seal_path.read_bytes(),
+                f"{hashlib.sha256(completion_path.read_bytes()).hexdigest()}\n".encode(),
+            )
+
+    def test_crash_after_receipt_resumes_with_one_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def crash_before_completion():
+                raise RuntimeError("crash before completion")
+
+            with self.assertRaisesRegex(RuntimeError, "before completion"):
+                _persist_direct(
+                    temporary,
+                    observation_id="completion-resume",
+                    durable_clock=crash_before_completion,
+                )
+            receipt = (
+                root
+                / "audit/experimental_daily/live_receipts/completion-resume.json"
+            )
+            completion = receipt.with_name("completion-resume.completion.json")
+            self.assertTrue(receipt.is_file())
+            self.assertFalse(completion.exists())
+
+            recovered = _persist_direct(
+                temporary,
+                observation_id="completion-resume",
+                durable_clock=lambda: datetime(
+                    2026, 7, 21, 15, 0, 3, tzinfo=timezone.utc
+                ),
+            )
+
+            self.assertEqual(
+                recovered.source_binding.durable_at_utc,
+                "2026-07-21T15:00:03Z",
+            )
+            self.assertEqual(
+                len(tuple(receipt.parent.glob("completion-resume.completion.json"))),
+                1,
+            )
+
+    def test_crash_after_completion_write_recovers_without_resampling(self):
+        real_write = live_sources.write_exclusive
+        crashed = False
+
+        def crash_after_completion(*args, **kwargs):
+            nonlocal crashed
+            snapshot = real_write(*args, **kwargs)
+            if args[3] == "live observation completion" and not crashed:
+                crashed = True
+                raise RuntimeError("crash after completion write")
+            return snapshot
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                live_sources,
+                "write_exclusive",
+                side_effect=crash_after_completion,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "after completion"):
+                    _persist_direct(
+                        temporary,
+                        observation_id="completion-written",
+                        durable_clock=lambda: datetime(
+                            2026, 7, 21, 15, 0, 4, tzinfo=timezone.utc
+                        ),
+                    )
+
+            recovered = _persist_direct(
+                temporary,
+                observation_id="completion-written",
+                durable_clock=lambda: self.fail("durable clock was resampled"),
+            )
+            self.assertEqual(
+                recovered.source_binding.durable_at_utc,
+                "2026-07-21T15:00:04Z",
+            )
+
+    def test_completion_tamper_symlink_and_hardlink_fail_closed(self):
+        for attack in ("tamper", "symlink", "hardlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                observation_id = f"completion-{attack}"
+                completion = (
+                    root
+                    / "audit/experimental_daily/live_receipts"
+                    / f"{observation_id}.completion.json"
+                )
+                if attack == "tamper":
+                    _persist_direct(temporary, observation_id=observation_id)
+                    value = json.loads(completion.read_text())
+                    value["durable_at_utc"] = "2026-07-21T15:00:09Z"
+                    completion.write_bytes(canonical_json_bytes(value))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "before completion"):
+                        _persist_direct(
+                            temporary,
+                            observation_id=observation_id,
+                            durable_clock=lambda: (_ for _ in ()).throw(
+                                RuntimeError("crash before completion")
+                            ),
+                        )
+                    target = root / f"{attack}-target.json"
+                    target.write_bytes(b"{}")
+                    if attack == "symlink":
+                        completion.symlink_to(target)
+                    else:
+                        os.link(target, completion)
+
+                with self.assertRaises(ValueError):
+                    _persist_direct(temporary, observation_id=observation_id)
+
+    def test_root_swap_at_completion_clock_never_writes_outside(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            moved = base / "moved-root"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+
+            def swap_root():
+                root.rename(moved)
+                root.symlink_to(outside, target_is_directory=True)
+                return datetime(2026, 7, 21, 15, 0, 2, tzinfo=timezone.utc)
+
+            with self.assertRaises(ValueError):
+                _persist_direct(
+                    root,
+                    observation_id="completion-root-swap",
+                    durable_clock=swap_root,
+                )
+            self.assertEqual(tuple(outside.iterdir()), ())
 
     def test_manifest_seal_swap_during_receipt_write_is_detected_and_fds_close(self):
         root_holder = {}
