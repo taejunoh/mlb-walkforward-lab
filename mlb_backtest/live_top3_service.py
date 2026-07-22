@@ -9,7 +9,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 
-from .live_features import build_live_raw_game_features, _validate_venue_references
+from .live_features import (
+    build_live_raw_game_features,
+    prepare_live_feature_history,
+    _validate_venue_references,
+)
 from .live_model_card import (
     EXPECTED_MODEL_CARD_SHA256,
     FrozenLiveCard,
@@ -633,6 +637,9 @@ def build_live_top3_run(
         raise IntegrityError("duplicate source binding digest")
     if len({binding.observation_id for binding in all_bindings}) != len(all_bindings):
         raise IntegrityError("duplicate source binding observation id")
+    prepared_history = prepare_live_feature_history(
+        history, target_game_pks=slate_game_pks
+    )
 
     for (
         game,
@@ -733,7 +740,11 @@ def build_live_top3_run(
         candidate_feature_reason: str | None = None
         try:
             raw = build_live_raw_game_features(
-                participant, final, history, career_bf_by_pitcher
+                participant,
+                final,
+                history,
+                career_bf_by_pitcher,
+                prepared_history=prepared_history,
             )
         except CandidateFeatureFailure as error:
             if error.reason_code not in _CANDIDATE_LOCAL_FEATURE_REASONS:

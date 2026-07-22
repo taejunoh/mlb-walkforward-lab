@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import mlb_backtest.live_top3_service as service
+from mlb_backtest.feature_engine import FeatureHistory
 from mlb_backtest.live_features import (
     build_live_raw_game_features as real_build_live_raw_game_features,
 )
@@ -25,7 +26,8 @@ from mlb_backtest.live_top3_contracts import (
     validate_run_payload,
 )
 from mlb_backtest.live_top3_service import build_live_top3_run
-from tests.test_live_features import _bundle
+from mlb_backtest.statcast import StatcastData
+from tests.test_live_features import _bundle as _feature_bundle
 
 
 TARGET = "2025-05-01"
@@ -34,6 +36,40 @@ MODEL_CARD = Path(__file__).parents[1] / "audit/v5_1_bt/model_card.json"
 FORBIDDEN_SERVICE_IMPORT_NAMES = frozenset(
     {"outcome", "outcomes", "market", "odds", "pipeline", "ranking"}
 )
+
+
+def _service_feature_history() -> FeatureHistory:
+    source = _feature_bundle().feature_history
+
+    def detached(rows):
+        return tuple(
+            {
+                **row,
+                "game_pk": 700,
+                "event_id": f"700:{row['at_bat_number']}",
+            }
+            for row in rows
+        )
+
+    schedule = source.schedule_history
+    return FeatureHistory(
+        StatcastData(
+            detached(source.pitches),
+            detached(source.plate_appearances),
+        ),
+        slot_weights=dict(source.slot_weights),
+        schedule_history=tuple(dict(row) for row in schedule.rows),
+        schedule_coverage_start=schedule.coverage_start.isoformat(),
+        schedule_coverage_end=schedule.coverage_end.isoformat(),
+        schedule_coverage_complete=schedule.coverage_complete,
+        venue_by_name=dict(source.venue_by_name),
+        statcast_coverage_complete=source.statcast_coverage_complete,
+    )
+
+
+def _bundle(**overrides):
+    overrides.setdefault("feature_history", _service_feature_history())
+    return _feature_bundle(**overrides)
 
 
 def _forbidden_service_imports(source: str) -> tuple[str, ...]:
@@ -358,7 +394,7 @@ def _mutable(value):
     return value
 
 
-def _raw(participants, final, _history, career_bf):
+def _raw(participants, final, _history, career_bf, *, prepared_history=None):
     return {
         "game_pk": final.game_pk,
         "official_date": TARGET,
@@ -430,6 +466,71 @@ def _build(
 
 
 class LiveTop3ServiceTests(unittest.TestCase):
+    def test_prepares_history_once_and_reuses_authority_for_fifteen_games(self):
+        game_pks = tuple(range(901, 916))
+        games = tuple(
+            _game(game_pk, start="2025-05-01T23:00:00Z")
+            for game_pk in game_pks
+        )
+        seen_prepared = []
+
+        def feature(
+            participants, final, history, career_bf, *, prepared_history
+        ):
+            seen_prepared.append(prepared_history)
+            return _raw(
+                participants,
+                final,
+                history,
+                career_bf,
+                prepared_history=prepared_history,
+            )
+
+        with mock.patch.object(
+            service,
+            "prepare_live_feature_history",
+            wraps=service.prepare_live_feature_history,
+        ) as prepare:
+            _build(
+                _slate(games),
+                _final_observer(games),
+                feature_builder=feature,
+            )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(
+            prepare.call_args.kwargs["target_game_pks"], game_pks
+        )
+        self.assertEqual(len(seen_prepared), 15)
+        self.assertEqual(len({id(value) for value in seen_prepared}), 1)
+
+    def test_target_game_pk_in_history_aborts_before_feature_or_scoring(self):
+        game = _game(901, start="2025-05-01T23:00:00Z")
+        history = _bundle()
+        target_row = {
+            **history.feature_history.pitches[0],
+            "game_pk": 901,
+            "event_id": "901:1",
+        }
+        history.feature_history.pitches = (
+            *history.feature_history.pitches,
+            target_row,
+        )
+        feature = mock.Mock(side_effect=_raw)
+        scorer = mock.Mock(side_effect=_scorer({901: 1.0}))
+
+        with self.assertRaisesRegex(ValueError, "AS_OF_VIOLATION"):
+            _build(
+                _slate((game,)),
+                _final_observer((game,)),
+                feature_builder=feature,
+                scorer=scorer,
+                history=history,
+            )
+
+        self.assertEqual(feature.call_count, 0)
+        self.assertEqual(scorer.call_count, 0)
+
     def test_four_preliminary_candidates_select_exact_top_three(self):
         games = tuple(_game(game_pk) for game_pk in (1, 2, 3, 4))
         slate = _slate(games)
@@ -602,7 +703,7 @@ class LiveTop3ServiceTests(unittest.TestCase):
     def test_global_asof_and_card_failures_propagate(self):
         games = (_game(1),)
 
-        def asof(*_args):
+        def asof(*_args, **_kwargs):
             raise ValueError("AS_OF_VIOLATION")
 
         with self.assertRaisesRegex(ValueError, "AS_OF_VIOLATION"):
@@ -649,10 +750,23 @@ class LiveTop3ServiceTests(unittest.TestCase):
             "AS_OF_VIOLATION",
         ):
             with self.subTest(reason=reason):
-                def poisoned_feature(participant, final, history, career_bf):
+                def poisoned_feature(
+                    participant,
+                    final,
+                    history,
+                    career_bf,
+                    *,
+                    prepared_history,
+                ):
                     if final.game_pk == 2:
                         raise IntegrityError(reason)
-                    return _raw(participant, final, history, career_bf)
+                    return _raw(
+                        participant,
+                        final,
+                        history,
+                        career_bf,
+                        prepared_history=prepared_history,
+                    )
 
                 feature = mock.Mock(side_effect=poisoned_feature)
                 scorer = mock.Mock(side_effect=_scorer({1: 1.0, 2: 2.0}))
@@ -867,10 +981,18 @@ class LiveTop3ServiceTests(unittest.TestCase):
     def test_typed_candidate_feature_failure_only_unscored_failed_game(self):
         games = (_game(1), _game(2))
 
-        def feature(participant, final, history, career_bf):
+        def feature(
+            participant, final, history, career_bf, *, prepared_history
+        ):
             if final.game_pk == 2:
                 raise service.CandidateFeatureFailure("STARTER_CONFLICT")
-            return _raw(participant, final, history, career_bf)
+            return _raw(
+                participant,
+                final,
+                history,
+                career_bf,
+                prepared_history=prepared_history,
+            )
 
         scorer = mock.Mock(side_effect=_scorer({1: 1.0, 2: 2.0}))
         result = _build(
@@ -959,10 +1081,23 @@ class LiveTop3ServiceTests(unittest.TestCase):
         )
         for failure in failures:
             with self.subTest(arguments=failure.args):
-                def poisoned(participant, final, history, career_bf):
+                def poisoned(
+                    participant,
+                    final,
+                    history,
+                    career_bf,
+                    *,
+                    prepared_history,
+                ):
                     if final.game_pk == 2:
                         raise failure
-                    return _raw(participant, final, history, career_bf)
+                    return _raw(
+                        participant,
+                        final,
+                        history,
+                        career_bf,
+                        prepared_history=prepared_history,
+                    )
 
                 scorer = mock.Mock(side_effect=_scorer({1: 1.0, 2: 2.0}))
 
@@ -981,10 +1116,23 @@ class LiveTop3ServiceTests(unittest.TestCase):
         games = (_game(1), _game(2))
         for reason in ("AS_OF_VIOLATION", "TARGET_PARTICIPANT_LEAKAGE"):
             with self.subTest(reason=reason):
-                def feature(participant, final, history, career_bf):
+                def feature(
+                    participant,
+                    final,
+                    history,
+                    career_bf,
+                    *,
+                    prepared_history,
+                ):
                     if final.game_pk == 2:
                         raise service.CandidateFeatureFailure(reason)
-                    return _raw(participant, final, history, career_bf)
+                    return _raw(
+                        participant,
+                        final,
+                        history,
+                        career_bf,
+                        prepared_history=prepared_history,
+                    )
 
                 scorer = mock.Mock(side_effect=_scorer({1: 1.0, 2: 2.0}))
 

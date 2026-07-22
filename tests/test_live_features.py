@@ -4,6 +4,7 @@ import json
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 import mlb_backtest.live_features as live_features
 from mlb_backtest.feature_engine import FeatureHistory, build_raw_game_features
@@ -335,6 +336,211 @@ def _participants(**changes: object) -> PregameParticipants:
 
 
 class LiveFeatureTests(unittest.TestCase):
+    def test_prepared_authority_matches_legacy_builder_output(self):
+        bundle = _bundle()
+        prepared = live_features.prepare_live_feature_history(
+            bundle, target_game_pks=(GAME_PK,)
+        )
+
+        legacy = build_live_raw_game_features(
+            _participants(), _final(), bundle, {501: 1_234, 601: 2_345}
+        )
+        reused = build_live_raw_game_features(
+            _participants(),
+            _final(),
+            bundle,
+            {501: 1_234, 601: 2_345},
+            prepared_history=prepared,
+        )
+
+        self.assertIsInstance(
+            prepared, live_features.PreparedLiveFeatureHistory
+        )
+        self.assertEqual(reused, legacy)
+
+    def test_prepared_authority_is_deeply_read_only_between_candidates(self):
+        bundle = _bundle()
+        prepared = live_features.prepare_live_feature_history(
+            bundle, target_game_pks=(GAME_PK, 901)
+        )
+        before = build_live_raw_game_features(
+            _participants(),
+            _final(),
+            bundle,
+            {501: 1, 601: 2},
+            prepared_history=prepared,
+        )
+
+        with self.assertRaises(TypeError):
+            prepared.feature_history.pitches[0]["events"] = "home_run"
+        with self.assertRaises(AttributeError):
+            prepared.feature_history.pitches = ()
+        with self.assertRaises(AttributeError):
+            prepared.feature_history.schedule_history.rows = ()
+        with self.assertRaises(TypeError):
+            prepared.feature_history.pa_by_batter[101] = ()
+
+        after = build_live_raw_game_features(
+            _participants(),
+            _final(),
+            bundle,
+            {501: 1, 601: 2},
+            prepared_history=prepared,
+        )
+        self.assertEqual(after, before)
+
+    def test_prepared_history_namespaces_reject_direct_dict_mutation(self):
+        prepared = live_features.prepare_live_feature_history(
+            _bundle(), target_game_pks=(GAME_PK,)
+        )
+        feature_namespace = prepared.feature_history.__dict__
+        schedule_namespace = prepared.feature_history.schedule_history.__dict__
+        seal = prepared._seal
+
+        for label, namespace in (
+            ("feature", feature_namespace),
+            ("schedule", schedule_namespace),
+        ):
+            with self.subTest(namespace=label), self.assertRaises(TypeError):
+                namespace["forged"] = object()
+            for method, arguments in (
+                ("update", ({"forged": object()},)),
+                ("pop", ("_sealed",)),
+                ("setdefault", ("forged", object())),
+            ):
+                with self.subTest(namespace=label, method=method), self.assertRaises(
+                    (AttributeError, TypeError)
+                ):
+                    getattr(namespace, method)(*arguments)
+
+        with self.assertRaises(TypeError):
+            prepared.feature_history.pitches[0]["events"] = "home_run"
+        self.assertIs(prepared._seal, seal)
+
+    def test_prepare_rejects_any_target_game_pk_in_raw_history(self):
+        target_row = _pa(
+            GAME_PK,
+            CUTOFF,
+            501,
+            101,
+            hand="L",
+            home="HOM",
+            away="AWY",
+            top="Top",
+            at_bat=9,
+        )
+        pitch_history = _history()
+        pitch_history.pitches = (*pitch_history.pitches, target_row)
+        pa_history = _history()
+        pa_history.plate_appearances = (
+            *pa_history.plate_appearances,
+            target_row,
+        )
+        schedule_history = _history()
+        schedule_history.schedule_history.rows = (
+            *schedule_history.schedule_history.rows,
+            {
+                "game_pk": GAME_PK,
+                "official_date": CUTOFF,
+                "team_codes": ("AWY", "HOM"),
+                "home_team_code": "HOM",
+                "venue_name": "Park",
+                "innings": 9,
+            },
+        )
+
+        for history in (pitch_history, pa_history, schedule_history):
+            with self.subTest(history=history), self.assertRaisesRegex(
+                ValueError, "AS_OF_VIOLATION"
+            ):
+                live_features.prepare_live_feature_history(
+                    _bundle(feature_history=history),
+                    target_game_pks=(GAME_PK,),
+                )
+
+    def test_prepared_authority_rejects_forgery_other_bundle_and_unsealed_game(self):
+        bundle = _bundle()
+        prepared = live_features.prepare_live_feature_history(
+            bundle, target_game_pks=(GAME_PK,)
+        )
+        forged = live_features.PreparedLiveFeatureHistory(
+            bundle,
+            prepared.target_game_pks,
+            _history(),
+            prepared.venue_by_id,
+            prepared.venue_by_name,
+        )
+        cases = (
+            (bundle, _participants(), _final(), forged),
+            (_bundle(), _participants(), _final(), prepared),
+            (
+                bundle,
+                _participants(game_pk=901),
+                _final(game_pk=901),
+                prepared,
+            ),
+        )
+
+        for candidate_bundle, participants, final, authority in cases:
+            with self.subTest(final_game_pk=final.game_pk), self.assertRaisesRegex(
+                ValueError, "INVALID_PREPARED_HISTORY"
+            ):
+                build_live_raw_game_features(
+                    participants,
+                    final,
+                    candidate_bundle,
+                    {501: 1, 601: 2},
+                    prepared_history=authority,
+                )
+
+    def test_fifty_thousand_rows_are_detached_and_indexed_only_once(self):
+        rows = tuple(
+            _pa(
+                10_000 + index,
+                CUTOFF,
+                501 if index % 2 == 0 else 601,
+                101 if index % 2 == 0 else 201,
+                hand="L" if index % 2 == 0 else "R",
+                home="HOM",
+                away="AWY",
+                top="Top" if index % 2 == 0 else "Bot",
+                at_bat=1,
+            )
+            for index in range(50_000)
+        )
+        history = FeatureHistory(
+            StatcastData(rows, rows),
+            slot_weights={slot: 1 / 9 for slot in range(1, 10)},
+            schedule_coverage_start=CUTOFF,
+            schedule_coverage_end=CUTOFF,
+            schedule_coverage_complete=True,
+        )
+        bundle = _bundle(feature_history=history)
+
+        with mock.patch.object(
+            live_features,
+            "_detach_history_rows",
+            wraps=live_features._detach_history_rows,
+        ) as detach_rows, mock.patch.object(
+            live_features,
+            "_SealedScheduleHistory",
+            wraps=live_features._SealedScheduleHistory,
+        ) as schedule_constructor, mock.patch.object(
+            live_features,
+            "_SealedFeatureHistory",
+            wraps=live_features._SealedFeatureHistory,
+        ) as feature_constructor:
+            prepared = live_features.prepare_live_feature_history(
+                bundle, target_game_pks=tuple(range(901, 916))
+            )
+
+        self.assertIsInstance(
+            prepared.feature_history, FeatureHistory
+        )
+        self.assertEqual(detach_rows.call_count, 3)
+        self.assertEqual(schedule_constructor.call_count, 1)
+        self.assertEqual(feature_constructor.call_count, 1)
+
     def test_consistent_probable_participants_build_result_free_raw_row(self):
         raw = build_live_raw_game_features(
             _participants(), _final(), _bundle(), {501: 1_234, 601: 2_345}
@@ -670,11 +876,16 @@ class LiveFeatureTests(unittest.TestCase):
 
         for history in (pa_history, pitch_history, schedule_history):
             with self.subTest(history=history):
+                bundle = _bundle(feature_history=history)
+                prepared = live_features.prepare_live_feature_history(
+                    bundle, target_game_pks=(GAME_PK,)
+                )
                 poisoned = build_live_raw_game_features(
                     _participants(),
                     _final(),
-                    _bundle(feature_history=history),
+                    bundle,
                     {501: 1, 601: 2},
+                    prepared_history=prepared,
                 )
                 self.assertEqual(poisoned, clean)
 
