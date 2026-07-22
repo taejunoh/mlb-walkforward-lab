@@ -8,6 +8,7 @@ import os
 import stat
 import tempfile
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -37,6 +38,15 @@ FIXED_SEMANTIC_REVIEW = (
     AUDIT_NAMESPACE / "timezone_reviews/semantic.json"
 )
 FIXED_SEAL = AUDIT_NAMESPACE / "venue_timezone_seal.json"
+SOURCE_AUDIT_NAMESPACE = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition"
+)
+SOURCE_RUN_SPEC = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+SOURCE_CONTRACT = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
 PROVENANCE = {
     "query_batch_ids": ["c" * 64, "d" * 64],
     "run_spec_sha256": "a" * 64,
@@ -446,8 +456,324 @@ def _fixed_verified_gate_fixture(
     return batches, evidence_root
 
 
+def _source_reference_and_checkpoint_fixture(base: Path):
+    """Build the real superseding source authority through REFERENCE_INPUTS."""
+    from mlb_backtest.execution_registry import publish_acquisition_checkpoint
+    from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
+    from mlb_backtest.v52_query_plan import (
+        build_schedule_reference_batch,
+        build_static_batch,
+        publish_query_batch,
+    )
+    from mlb_backtest.v52_schedule_inventory import (
+        publish_schedule_anchor_inventory,
+    )
+    from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+    from tests.test_v52_game_evidence_inventory import (
+        _boxscore_raw,
+        _capture,
+        _pitching_raw,
+        _team_raw,
+    )
+    from tests.test_v52_schedule_inventory import _source_registry_fixture
+
+    fixture = _source_registry_fixture(base)
+    root = fixture.root
+    source_run_path = root / SOURCE_RUN_SPEC
+    static = build_static_batch(source_run_path, fixture.contract_path)
+    disposition_query_id = logical_query_id(static.queries[1])
+    static_ids = tuple(sorted(logical_query_id(query) for query in static.queries))
+    static_checkpoint = publish_acquisition_checkpoint(
+        root,
+        fixture.run_spec,
+        expected_prior_checkpoint_sha256=None,
+        stage="STATIC_SCHEDULES",
+        query_batch_ids=(static.batch_id,),
+        completed_query_ids=static_ids,
+        pending_query_ids=(),
+        quarantined_query_ids=(),
+        split_query_ids=(),
+        dispositioned_query_ids=(disposition_query_id,),
+    )
+    inventory = publish_schedule_anchor_inventory(
+        root,
+        fixture.run_spec,
+        acquisition_contract_path=fixture.contract_path,
+        static_batch_id=static.batch_id,
+        evidence_root=fixture.evidence_root,
+    )
+    reference = build_schedule_reference_batch(
+        root,
+        source_run_path,
+        acquisition_contract_path=fixture.contract_path,
+        static_batch_id=static.batch_id,
+        evidence_root=fixture.evidence_root,
+    )
+    publish_query_batch(root, reference)
+
+    anchors = {
+        int(row["game_pk"]): row
+        for row in json.loads(inventory.path.read_bytes())["anchors"]
+    }
+    store = V52EvidenceStore(fixture.evidence_root)
+    for query in reference.queries:
+        if store.read_verified_query_progress(query).status == "SUCCESS":
+            continue
+        if query.endpoint == "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING":
+            semantics = {
+                **recompute_query_sidecar(query, b""),
+                "reason": query.requested_range["reason"],
+            }
+            with store.acquire_query(query):
+                store.publish_derived_disposition(query, semantics)
+            continue
+        if "/game/" in query.endpoint and query.endpoint.endswith("/boxscore"):
+            raw = _boxscore_raw(anchors[int(query.requested_range["game_pk"])])
+        elif query.endpoint == "https://statsapi.mlb.com/api/v1/stats":
+            raw = _pitching_raw()
+        elif query.endpoint == "https://statsapi.mlb.com/api/v1/teams":
+            raw = _team_raw()
+        elif "/api/v1/venues/" in query.endpoint:
+            venue_id = int(query.requested_range["venue_id"])
+            raw = _canonical(
+                {
+                    "venues": [
+                        {
+                            "id": venue_id,
+                            "location": {
+                                "city": f"Venue {venue_id}",
+                                "defaultCoordinates": {
+                                    "latitude": 40.0,
+                                    "longitude": -75.0,
+                                },
+                            },
+                            "name": f"Park {venue_id}",
+                        }
+                    ]
+                }
+            )
+        else:
+            raise AssertionError(f"unexpected reference query: {query.endpoint}")
+        semantics = recompute_query_sidecar(query, raw)
+        with store.acquire_query(query) as lease:
+            store.publish_fetched(
+                query,
+                store.next_attempt_number(lease),
+                _capture(query, raw),
+                semantics,
+            )
+
+    cumulative_ids = tuple(
+        sorted(
+            logical_query_id(query)
+            for batch in (static, reference)
+            for query in batch.queries
+        )
+    )
+    reference_checkpoint = publish_acquisition_checkpoint(
+        root,
+        fixture.run_spec,
+        expected_prior_checkpoint_sha256=static_checkpoint.receipt_sha256,
+        stage="REFERENCE_INPUTS",
+        query_batch_ids=(static.batch_id, reference.batch_id),
+        completed_query_ids=cumulative_ids,
+        pending_query_ids=(),
+        quarantined_query_ids=(),
+        split_query_ids=(),
+        dispositioned_query_ids=(disposition_query_id,),
+        stage_evidence_receipts=(inventory.path,),
+    )
+    return fixture, (static, reference), inventory, reference_checkpoint
+
+
+def _source_verified_gate_fixture(base: Path):
+    from mlb_backtest.execution_registry import (
+        _using_verified_source_checkpoint,
+    )
+
+    fixture, batches, inventory, checkpoint = (
+        _source_reference_and_checkpoint_fixture(base)
+    )
+    with _using_verified_source_checkpoint(fixture.root, fixture.run_spec):
+        return _finish_source_verified_gate_fixture(
+            fixture, batches, inventory, checkpoint
+        )
+
+
+def _finish_source_verified_gate_fixture(
+    fixture, batches, inventory, checkpoint
+):
+    from mlb_backtest.v52_timezone_review import (
+        load_verified_timezone_gate,
+        publish_timezone_candidate,
+        seal_timezone_mapping,
+        write_timezone_review_receipt,
+    )
+
+    root = fixture.root
+    authority = {
+        "run_spec_path": root / SOURCE_RUN_SPEC,
+        "acquisition_contract_path": fixture.contract_path,
+    }
+    candidate_path = publish_timezone_candidate(
+        root=root,
+        evidence_root=fixture.evidence_root,
+        batch_ids=tuple(batch.batch_id for batch in batches),
+        **authority,
+    )
+    candidate = json.loads(candidate_path.read_bytes())
+    for row in candidate["timezone_rows"]:
+        row.update(
+            {
+                "effective_start": "2018-01-01",
+                "effective_end": "2024-12-31",
+                "time_zone": "America/New_York",
+            }
+        )
+    candidate_path.write_bytes(_canonical(candidate))
+    reviews = []
+    for leaf, identity, role in (
+        (
+            "coverage.json",
+            "source-reviewer-coverage",
+            "TIMEZONE_COVERAGE_REVIEW",
+        ),
+        (
+            "semantic.json",
+            "source-reviewer-semantic",
+            "TIMEZONE_SEMANTIC_REVIEW",
+        ),
+    ):
+        review_path = SOURCE_AUDIT_NAMESPACE / "timezone_reviews" / leaf
+        reviews.append(
+            write_timezone_review_receipt(
+                root,
+                candidate_path=candidate_path,
+                output=review_path,
+                reviewer_identity=identity,
+                reviewer_role=role,
+                decision="APPROVED",
+                **authority,
+            ).relative_to(root)
+        )
+    seal_timezone_mapping(
+        root,
+        candidate_path=candidate_path,
+        review_receipt_paths=reviews,
+        output=Path("config/v5_2_qd/venue_timezones.json"),
+        receipt_output=SOURCE_AUDIT_NAMESPACE / "venue_timezone_seal.json",
+        **authority,
+    )
+    gate = load_verified_timezone_gate(root, **authority)
+    return fixture, batches, inventory, checkpoint, candidate_path, gate
+
+
 class V52TimezoneReviewTest(unittest.TestCase):
-    def test_superseding_review_and_seal_stop_before_any_candidate_io(self) -> None:
+    def test_source_gate_public_lifecycle_and_fail_closed_rebinds(self) -> None:
+        import shutil
+
+        from mlb_backtest.execution_registry import (
+            _using_verified_source_checkpoint,
+            load_latest_acquisition_checkpoint,
+        )
+        from tests.test_v52_schedule_inventory import (
+            _memoized_disposition_projection_patch,
+            _memoized_registry_git_patch,
+        )
+
+        with (
+            _memoized_registry_git_patch(),
+            _memoized_disposition_projection_patch(),
+            tempfile.TemporaryDirectory() as directory,
+            ExitStack() as source_scope,
+        ):
+            base = Path(directory)
+            (
+                fixture,
+                _batches,
+                _inventory,
+                reference_checkpoint,
+                candidate_path,
+                gate,
+            ) = _source_verified_gate_fixture(base)
+            root = fixture.root
+            self.assertEqual(
+                candidate_path.relative_to(root),
+                SOURCE_AUDIT_NAMESPACE / "venue_timezone_candidate.json",
+            )
+            self.assertEqual(len(gate.reviews), 2)
+            self.assertEqual(
+                load_latest_acquisition_checkpoint(root, fixture.run_spec),
+                reference_checkpoint,
+            )
+            source_scope.enter_context(
+                _using_verified_source_checkpoint(root, fixture.run_spec)
+            )
+
+            from mlb_backtest.v52_timezone_review import (
+                load_verified_timezone_gate,
+            )
+
+            authority = {
+                "run_spec_path": root / SOURCE_RUN_SPEC,
+                "acquisition_contract_path": fixture.contract_path,
+            }
+            source_artifacts = (
+                SOURCE_AUDIT_NAMESPACE / "venue_timezone_candidate.json",
+                SOURCE_AUDIT_NAMESPACE / "timezone_reviews/coverage.json",
+                SOURCE_AUDIT_NAMESPACE / "timezone_reviews/semantic.json",
+                SOURCE_AUDIT_NAMESPACE / "venue_timezone_seal.json",
+            )
+            old_artifacts = tuple(
+                AUDIT_NAMESPACE
+                / relative.relative_to(SOURCE_AUDIT_NAMESPACE)
+                for relative in source_artifacts
+            )
+            for source_relative, old_relative in zip(
+                source_artifacts, old_artifacts, strict=True
+            ):
+                old_path = root / old_relative
+                old_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / source_relative, old_path)
+            shadow_gate = load_verified_timezone_gate(root, **authority)
+            self.assertEqual(shadow_gate.candidate, gate.candidate)
+
+            candidate_bytes = candidate_path.read_bytes()
+            candidate_path.unlink()
+            with self.assertRaises((FileNotFoundError, RuntimeError, ValueError)):
+                load_verified_timezone_gate(root, **authority)
+            candidate_path.write_bytes(candidate_bytes)
+            for old_relative in old_artifacts:
+                (root / old_relative).unlink()
+
+            wrong = json.loads(candidate_bytes)
+            wrong["run_spec_sha256"] = "0" * 64
+            candidate_path.write_bytes(_canonical(wrong))
+            with self.assertRaisesRegex(ValueError, "candidate|authority"):
+                load_verified_timezone_gate(root, **authority)
+            candidate_path.write_bytes(candidate_bytes)
+
+            fired = False
+
+            def mutate_before_final_rebind() -> None:
+                nonlocal fired
+                if not fired:
+                    fired = True
+                    candidate_path.write_bytes(candidate_bytes + b" ")
+
+            with (
+                patch(
+                    "mlb_backtest.v52_timezone_review."
+                    "_before_timezone_gate_final_rebind",
+                    side_effect=mutate_before_final_rebind,
+                ),
+                self.assertRaises((OSError, RuntimeError, ValueError)),
+            ):
+                load_verified_timezone_gate(root, **authority)
+            self.assertTrue(fired)
+            candidate_path.write_bytes(candidate_bytes)
+
+    def test_source_review_and_seal_reject_old_audit_namespace(self) -> None:
         import mlb_backtest.v52_timezone_review as timezone_review
 
         source_run = (
@@ -460,51 +786,33 @@ class V52TimezoneReviewTest(unittest.TestCase):
             / "protocols/v5_2_qd/"
             "historical_source_acquisition_superseding_565534.json"
         )
-        source_audit = (
-            ROOT / "audit/v5_2_qd/historical_superseding_565534/acquisition"
-        )
-        with (
-            patch.object(
-                timezone_review,
-                "open_trusted_root",
-                side_effect=AssertionError("trusted-root I/O reached"),
-            ) as root_io,
-            self.assertRaisesRegex(ValueError, "Task 6"),
-        ):
+        old_audit = ROOT / "audit/v5_2_qd/historical/acquisition"
+        with self.assertRaisesRegex(ValueError, "acquisition audit namespace"):
             timezone_review.write_timezone_review_receipt(
                 ROOT,
-                candidate_path=source_audit / "venue_timezone_candidate.json",
-                output=source_audit / "timezone_reviews/coverage.json",
+                candidate_path=old_audit / "venue_timezone_candidate.json",
+                output=old_audit / "timezone_reviews/coverage.json",
                 reviewer_identity="reviewer",
                 reviewer_role="TIMEZONE_COVERAGE_REVIEW",
                 decision="APPROVED",
                 run_spec_path=source_run,
                 acquisition_contract_path=source_contract,
             )
-        root_io.assert_not_called()
-        with (
-            patch.object(
-                timezone_review,
-                "open_trusted_root",
-                side_effect=AssertionError("trusted-root I/O reached"),
-            ) as root_io,
-            self.assertRaisesRegex(ValueError, "Task 6"),
-        ):
+        with self.assertRaisesRegex(ValueError, "acquisition audit namespace"):
             timezone_review.seal_timezone_mapping(
                 ROOT,
-                candidate_path=source_audit / "venue_timezone_candidate.json",
+                candidate_path=old_audit / "venue_timezone_candidate.json",
                 review_receipt_paths=(
-                    source_audit / "timezone_reviews/coverage.json",
-                    source_audit / "timezone_reviews/semantic.json",
+                    old_audit / "timezone_reviews/coverage.json",
+                    old_audit / "timezone_reviews/semantic.json",
                 ),
                 output=ROOT / "config/v5_2_qd/venue_timezones.json",
-                receipt_output=source_audit / "venue_timezone_seal.json",
+                receipt_output=old_audit / "venue_timezone_seal.json",
                 run_spec_path=source_run,
                 acquisition_contract_path=source_contract,
             )
-        root_io.assert_not_called()
 
-    def test_superseding_candidate_paths_fail_before_query_batch_io(self) -> None:
+    def test_source_candidate_rejects_wrong_evidence_and_cross_pair(self) -> None:
         from mlb_backtest.v52_timezone_review import build_timezone_candidate
 
         source_run = (
@@ -522,14 +830,6 @@ class V52TimezoneReviewTest(unittest.TestCase):
             build_timezone_candidate(
                 root=ROOT,
                 evidence_root=ROOT / "data/v5_2_qd/historical/raw",
-                batch_ids=("0" * 64,),
-                run_spec_path=source_run,
-                acquisition_contract_path=source_contract,
-            )
-        with self.assertRaisesRegex(ValueError, "Task 6"):
-            build_timezone_candidate(
-                root=ROOT,
-                evidence_root=source_raw,
                 batch_ids=("0" * 64,),
                 run_spec_path=source_run,
                 acquisition_contract_path=source_contract,

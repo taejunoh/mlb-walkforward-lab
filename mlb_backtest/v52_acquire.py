@@ -51,6 +51,9 @@ _SPLIT_REASONS = frozenset({"ROW_CAP", "SIZE_LIMIT", "TIMEOUT"})
 _FROZEN_DELAYS = (1, 2, 4, 8, 16)
 _FROZEN_JITTER_FRACTION = 0.25
 _RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
+_SOURCE_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
 _ACQUISITION_CONTRACT_RELATIVE = Path(
     "protocols/v5_2_qd/historical_source_acquisition.json"
 )
@@ -65,16 +68,16 @@ _PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json
 _SCHEDULE_INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
 )
+_SOURCE_SCHEDULE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+    "schedule_anchor_inventory.json"
+)
 _SCHEDULE_INVENTORY_SCHEMA_RELATIVE = Path(
     "schemas/v5_2_schedule_anchor_inventory.schema.json"
 )
-_TIMEZONE_STAGE_EVIDENCE_RELATIVES = (
-    _SCHEDULE_INVENTORY_RELATIVE,
-    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),
-    Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json"),
-    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json"),
-    Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
-    Path("config/v5_2_qd/venue_timezones.json"),
+_AUDIT_RELATIVE = Path("audit/v5_2_qd/historical")
+_SOURCE_AUDIT_RELATIVE = Path(
+    "audit/v5_2_qd/historical_superseding_565534"
 )
 _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
     64 * 1024 * 1024,
@@ -84,11 +87,49 @@ _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
     1024 * 1024,
     8 * 1024 * 1024,
 )
+
+
+def _authority_audit_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
+    if isinstance(run_spec, SourceRunSpec):
+        return _SOURCE_AUDIT_RELATIVE
+    if isinstance(run_spec, RunSpec):
+        return _AUDIT_RELATIVE
+    raise TypeError("acquisition authority must be a RunSpec or SourceRunSpec")
+
+
+def _schedule_inventory_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
+    if isinstance(run_spec, SourceRunSpec):
+        return _SOURCE_SCHEDULE_INVENTORY_RELATIVE
+    if isinstance(run_spec, RunSpec):
+        return _SCHEDULE_INVENTORY_RELATIVE
+    raise TypeError("schedule inventory authority must be a RunSpec or SourceRunSpec")
+
+
+def _timezone_stage_evidence_relatives(
+    run_spec: RunSpec | SourceRunSpec,
+) -> tuple[Path, ...]:
+    audit_relative = _authority_audit_relative(run_spec)
+    return (
+        _schedule_inventory_relative(run_spec),
+        audit_relative / "acquisition/timezone_reviews/coverage.json",
+        audit_relative / "acquisition/timezone_reviews/semantic.json",
+        audit_relative / "acquisition/venue_timezone_candidate.json",
+        audit_relative / "acquisition/venue_timezone_seal.json",
+        Path("config/v5_2_qd/venue_timezones.json"),
+    )
 _DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
 _PLAN_RELATIVE = Path(
     "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
+)
+_SOURCE_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+)
+_SOURCE_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
 )
 _RUNNER_LOCK_RELATIVE = Path(
     "audit/v5_2_qd/historical/execution/.acquisition-runner.lock"
@@ -107,6 +148,7 @@ class _RunnerGuard:
     descriptor: int
     parent_descriptor: int
     root: Path
+    lock_name: str = _RUNNER_LOCK_RELATIVE.name
 
 
 class _DiskBudget:
@@ -979,12 +1021,15 @@ def _validate_request_contract(
             _PROTECTED_INVENTORY_RELATIVE,
             "protected inventory",
         )
-        # Task 6 recognizes the source checkpoint authority.  Task 7 is still
-        # responsible for publishing its derived disposition query batch; until
-        # that immutable batch exists, acquisition must stop before any fetch.
-        raise TrustIntegrityError(
-            "Task 6 source checkpoint requires the Task 7 derived disposition batch"
+        contract, contract_contents = _read_canonical_object(
+            supplied_contract, "acquisition contract"
         )
+        if (
+            hashlib.sha256(contract_contents).hexdigest()
+            != context.acquisition_contract_sha256
+        ):
+            raise TrustIntegrityError("source acquisition contract changed")
+        return root, contract, contract_contents
     run_path = _require_exact_path(
         root, root / _RUN_SPEC_RELATIVE, _RUN_SPEC_RELATIVE, "run spec"
     )
@@ -1029,6 +1074,7 @@ def _real_authenticate(request: _AcquisitionRequest) -> _AcquisitionPlan:
     from .v52_legacy import PromotionDisposition, load_protected_legacy_catalog
     from .v52_legacy_decision_inventory import preview_legacy_decisions
     from .v52_query_plan import (
+        _build_statcast_root_batch,
         build_static_batch,
         build_statcast_root_batch,
     )
@@ -1046,11 +1092,32 @@ def _real_authenticate(request: _AcquisitionRequest) -> _AcquisitionPlan:
             protected_inventory_path=root / _PROTECTED_INVENTORY_RELATIVE,
             protected_inventory_sha256=protected_sha256,
         )
-        static = build_static_batch(
-            root / _RUN_SPEC_RELATIVE,
-            root / _ACQUISITION_CONTRACT_RELATIVE,
+        source_run = isinstance(request.run_spec, SourceRunSpec)
+        run_relative = (
+            Path(
+                "protocols/v5_2_qd/"
+                "historical_walkforward_500_superseding_565534.json"
+            )
+            if source_run
+            else _RUN_SPEC_RELATIVE
         )
-        statcast = build_statcast_root_batch(root)
+        contract_relative = (
+            _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+            if source_run
+            else _ACQUISITION_CONTRACT_RELATIVE
+        )
+        static = build_static_batch(
+            root / run_relative,
+            root / contract_relative,
+        )
+        statcast = (
+            _build_statcast_root_batch(
+                root / run_relative,
+                root / contract_relative,
+            )
+            if source_run
+            else build_statcast_root_batch(root)
+        )
         preview = preview_legacy_decisions(
             statcast,
             catalog,
@@ -1102,7 +1169,9 @@ def _validate_lock_directory(
 
 
 @contextmanager
-def _safe_lock_parent(root: Path) -> Iterator[int]:
+def _safe_lock_parent(
+    root: Path, lock_relative: Path = _RUNNER_LOCK_RELATIVE
+) -> Iterator[int]:
     flags = (
         os.O_RDONLY
         | os.O_DIRECTORY
@@ -1121,7 +1190,7 @@ def _safe_lock_parent(root: Path) -> Iterator[int]:
         _validate_lock_directory(root_descriptor, root)
         _acquire_runner_flock(root_descriptor)
         current_descriptor = root_descriptor
-        for component in _RUNNER_LOCK_RELATIVE.parent.parts:
+        for component in lock_relative.parent.parts:
             try:
                 os.mkdir(component, 0o700, dir_fd=current_descriptor)
             except FileExistsError:
@@ -1173,11 +1242,15 @@ def _acquire_runner_flock(descriptor: int) -> None:
         raise TrustIntegrityError("runner lock acquisition failed") from exc
 
 
-def _validate_runner_lock(descriptor: int, parent_descriptor: int) -> None:
+def _validate_runner_lock(
+    descriptor: int,
+    parent_descriptor: int,
+    lock_name: str = _RUNNER_LOCK_RELATIVE.name,
+) -> None:
     try:
         opened = os.fstat(descriptor)
         linked = os.stat(
-            _RUNNER_LOCK_RELATIVE.name,
+            lock_name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
@@ -1196,17 +1269,27 @@ def _validate_runner_lock(descriptor: int, parent_descriptor: int) -> None:
 @contextmanager
 def _real_runner_lock(request: _AcquisitionRequest) -> Iterator[None]:
     root = Path(os.path.abspath(os.fspath(request.root)))
+    namespaces = request.run_spec.raw.get("namespaces")
+    audit = namespaces.get("audit") if isinstance(namespaces, Mapping) else None
+    if not isinstance(audit, str):
+        raise TrustIntegrityError("runner lock audit namespace differs")
+    lock_relative = Path(audit) / "execution/.acquisition-runner.lock"
+    if (
+        lock_relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in lock_relative.parts)
+    ):
+        raise TrustIntegrityError("runner lock path differs")
     flags = (
         os.O_RDWR
         | os.O_CREAT
         | os.O_CLOEXEC
         | os.O_NOFOLLOW
     )
-    with _safe_lock_parent(root) as parent_descriptor:
+    with _safe_lock_parent(root, lock_relative) as parent_descriptor:
         _acquire_runner_flock(parent_descriptor)
         try:
             descriptor = os.open(
-                _RUNNER_LOCK_RELATIVE.name,
+                lock_relative.name,
                 flags,
                 0o600,
                 dir_fd=parent_descriptor,
@@ -1214,17 +1297,25 @@ def _real_runner_lock(request: _AcquisitionRequest) -> Iterator[None]:
         except OSError as exc:
             raise TrustIntegrityError("runner lock is unavailable") from exc
         try:
-            _validate_runner_lock(descriptor, parent_descriptor)
+            _validate_runner_lock(
+                descriptor, parent_descriptor, lock_relative.name
+            )
             _acquire_runner_flock(descriptor)
-            _validate_runner_lock(descriptor, parent_descriptor)
+            _validate_runner_lock(
+                descriptor, parent_descriptor, lock_relative.name
+            )
             token = _ACTIVE_RUNNER.set(
-                _RunnerGuard(descriptor, parent_descriptor, root)
+                _RunnerGuard(
+                    descriptor, parent_descriptor, root, lock_relative.name
+                )
             )
             try:
                 yield
             finally:
                 try:
-                    _validate_runner_lock(descriptor, parent_descriptor)
+                    _validate_runner_lock(
+                        descriptor, parent_descriptor, lock_relative.name
+                    )
                 finally:
                     _ACTIVE_RUNNER.reset(token)
         finally:
@@ -1239,7 +1330,9 @@ def _validate_active_runner(
     root = Path(os.path.abspath(os.fspath(request.root)))
     if binding is None or binding.root != root:
         raise TrustIntegrityError("active runner identity is unavailable")
-    _validate_runner_lock(binding.descriptor, binding.parent_descriptor)
+    _validate_runner_lock(
+        binding.descriptor, binding.parent_descriptor, binding.lock_name
+    )
 
 
 def _current_runner_guard(request: _AcquisitionRequest) -> _RunnerGuard:
@@ -1263,7 +1356,7 @@ def _real_before_network(
         load_execution_registry,
         load_latest_acquisition_checkpoint,
     )
-    from .v52_query_plan import load_query_batch
+    from .v52_query_plan import load_query_batch_for_authority
 
     if _real_authenticate(request) != plan:
         raise TrustIntegrityError("acquisition authority changed before fetch")
@@ -1285,7 +1378,9 @@ def _real_before_network(
     occurrences = 0
     try:
         for batch_id in query_batch_ids:
-            batch = load_query_batch(root, batch_id)
+            batch = load_query_batch_for_authority(
+                root, batch_id, request.run_spec
+            )
             occurrences += sum(item == query for item in batch.queries)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise TrustIntegrityError("query batch authority changed before fetch") from exc
@@ -2301,10 +2396,14 @@ def _ensure_canonical_raw_parent(request: _AcquisitionRequest) -> Path:
             os.close(descriptor)
 
 
-def _validate_schedule_inventory_schema(root: Path, inventory: object) -> None:
+def _validate_schedule_inventory_schema(
+    root: Path,
+    run_spec: RunSpec | SourceRunSpec,
+    inventory: object,
+) -> None:
     import jsonschema
 
-    expected_path = root / _SCHEDULE_INVENTORY_RELATIVE
+    expected_path = root / _schedule_inventory_relative(run_spec)
     if getattr(inventory, "path", None) != expected_path:
         raise TrustIntegrityError("schedule inventory path differs")
     schema_path = _require_exact_path(
@@ -2426,14 +2525,17 @@ def _required_gate_leaf_exists(root: Path, relative: Path) -> bool:
             os.close(descriptor)
 
 
-def _load_required_timezone_gate(root: Path) -> object:
+def _load_required_timezone_gate(
+    root: Path, run_spec: RunSpec | SourceRunSpec
+) -> object:
     from .v52_timezone_review import load_verified_timezone_gate
 
+    evidence_paths = _timezone_stage_evidence_relatives(run_spec)
     required_gate_paths = (
-        Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),
-        Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json"),
-        Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json"),
-        Path("config/v5_2_qd/venue_timezones.json"),
+        evidence_paths[1],
+        evidence_paths[2],
+        evidence_paths[4],
+        evidence_paths[5],
     )
     for relative in required_gate_paths:
         if not _required_gate_leaf_exists(root, relative):
@@ -2442,7 +2544,17 @@ def _load_required_timezone_gate(root: Path) -> object:
             )
     return _integrity_boundary(
         "timezone gate",
-        lambda: load_verified_timezone_gate(root),
+        lambda: (
+            load_verified_timezone_gate(
+                root,
+                run_spec_path=root / _SOURCE_RUN_SPEC_RELATIVE,
+                acquisition_contract_path=(
+                    root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+                ),
+            )
+            if isinstance(run_spec, SourceRunSpec)
+            else load_verified_timezone_gate(root)
+        ),
     )
 
 
@@ -2687,7 +2799,7 @@ def _run_remaining_stage(
     from .v52_query_plan import (
         build_legacy_partition_batch,
         build_statcast_root_batch,
-        load_query_batch,
+        load_query_batch_for_authority,
         load_split_receipt,
         publish_query_batch,
     )
@@ -2717,7 +2829,9 @@ def _run_remaining_stage(
     if latest_stage == "REMAINING":
         persisted_root = _integrity_boundary(
             "Statcast root batch replay",
-            lambda: load_query_batch(root, statcast_root.batch_id),
+            lambda: load_query_batch_for_authority(
+                root, statcast_root.batch_id, request.run_spec
+            ),
         )
         if persisted_root != statcast_root:
             raise TrustIntegrityError("persisted Statcast root batch differs")
@@ -2744,7 +2858,9 @@ def _run_remaining_stage(
     if latest_stage == "REMAINING":
         persisted_partition = _integrity_boundary(
             "legacy partition batch replay",
-            lambda: load_query_batch(root, partition.batch_id),
+            lambda: load_query_batch_for_authority(
+                root, partition.batch_id, request.run_spec
+            ),
         )
         if persisted_partition != partition:
             raise TrustIntegrityError("persisted legacy partition batch differs")
@@ -2791,7 +2907,9 @@ def _run_remaining_stage(
             batches.append(
                 _integrity_boundary(
                     "REMAINING split batch replay",
-                    lambda batch_id=batch_id: load_query_batch(root, batch_id),
+                    lambda batch_id=batch_id: load_query_batch_for_authority(
+                        root, batch_id, request.run_spec
+                    ),
                 )
             )
         split_ids.extend(latest_split_ids)
@@ -3056,19 +3174,11 @@ def _validate_resumed_timezone_checkpoint(
     batch_ids: tuple[str, str],
     completed_query_ids: tuple[str, ...],
     stage_evidence: tuple[Path, ...],
-    audit_relative: Path = Path("audit/v5_2_qd/historical"),
+    run_spec: RunSpec | SourceRunSpec,
 ) -> None:
     supplied_paths = getattr(checkpoint, "stage_evidence_receipt_paths", None)
     expected_relative_paths = tuple(
-        path.as_posix()
-        for path in (
-            audit_relative / "acquisition/schedule_anchor_inventory.json",
-            audit_relative / "acquisition/timezone_reviews/coverage.json",
-            audit_relative / "acquisition/timezone_reviews/semantic.json",
-            audit_relative / "acquisition/venue_timezone_candidate.json",
-            audit_relative / "acquisition/venue_timezone_seal.json",
-            Path("config/v5_2_qd/venue_timezones.json"),
-        )
+        path.as_posix() for path in _timezone_stage_evidence_relatives(run_spec)
     )
     expected_evidence = tuple(
         root / relative for relative in map(Path, expected_relative_paths)
@@ -3125,7 +3235,7 @@ def _real_run_stages(
         build_participant_derived_batch,
         build_schedule_reference_batch,
         build_static_batch,
-        load_query_batch,
+        load_query_batch_for_authority,
         publish_query_batch,
     )
     from .v52_schedule_inventory import (
@@ -3152,6 +3262,9 @@ def _real_run_stages(
     if not isinstance(audit_value, str):
         raise TrustIntegrityError("acquisition audit namespace differs")
     audit_relative = Path(audit_value)
+    expected_audit_relative = _authority_audit_relative(request.run_spec)
+    if audit_relative != expected_audit_relative:
+        raise TrustIntegrityError("acquisition audit namespace differs")
     evidence_root = _ensure_canonical_raw_parent(request)
     store = _integrity_boundary(
         "raw evidence store",
@@ -3207,7 +3320,9 @@ def _real_run_stages(
     else:
         persisted_static = _integrity_boundary(
             "static query batch replay",
-            lambda: load_query_batch(root, static.batch_id),
+            lambda: load_query_batch_for_authority(
+                root, static.batch_id, request.run_spec
+            ),
         )
         if persisted_static != static:
             raise TrustIntegrityError("persisted static batch authority differs")
@@ -3260,7 +3375,7 @@ def _real_run_stages(
                 **inventory_kwargs,
             ),
         )
-    _validate_schedule_inventory_schema(root, inventory)
+    _validate_schedule_inventory_schema(root, request.run_spec, inventory)
     reference = _integrity_boundary(
         "reference query batch",
         lambda: build_schedule_reference_batch(
@@ -3282,7 +3397,9 @@ def _real_run_stages(
     }:
         persisted_reference = _integrity_boundary(
             "reference query batch replay",
-            lambda: load_query_batch(root, reference.batch_id),
+            lambda: load_query_batch_for_authority(
+                root, reference.batch_id, request.run_spec
+            ),
         )
         if persisted_reference != reference:
             raise TrustIntegrityError("persisted reference batch authority differs")
@@ -3364,24 +3481,46 @@ def _real_run_stages(
 
     from .v52_timezone_review import publish_timezone_candidate
 
-    _integrity_boundary(
-        "timezone candidate publication",
-        lambda: publish_timezone_candidate(
-            root=root,
-            evidence_root=evidence_root,
-            batch_ids=(static.batch_id, reference.batch_id),
-        ),
-    )
-    _load_required_timezone_gate(root)
+    def publish_and_load_timezone_gate() -> None:
+        _integrity_boundary(
+            "timezone candidate publication",
+            lambda: publish_timezone_candidate(
+                root=root,
+                evidence_root=evidence_root,
+                batch_ids=(static.batch_id, reference.batch_id),
+                **(
+                    {
+                        "run_spec_path": root / run_spec_relative,
+                        "acquisition_contract_path": root / contract_relative,
+                    }
+                    if isinstance(request.run_spec, SourceRunSpec)
+                    else {}
+                ),
+            ),
+        )
+        _load_required_timezone_gate(root, request.run_spec)
 
-    timezone_stage_evidence = (
-        inventory.path,
-        root / audit_relative / "acquisition/timezone_reviews/coverage.json",
-        root / audit_relative / "acquisition/timezone_reviews/semantic.json",
-        root / audit_relative / "acquisition/venue_timezone_candidate.json",
-        root / audit_relative / "acquisition/venue_timezone_seal.json",
-        root / "config/v5_2_qd/venue_timezones.json",
+    if isinstance(request.run_spec, SourceRunSpec):
+        from .execution_registry import _using_verified_source_checkpoint
+
+        try:
+            with _using_verified_source_checkpoint(root, request.run_spec):
+                publish_and_load_timezone_gate()
+        except (OperationalBlock, TrustIntegrityError):
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise TrustIntegrityError(
+                "timezone source checkpoint authority verification failed"
+            ) from exc
+    else:
+        publish_and_load_timezone_gate()
+
+    timezone_stage_evidence = tuple(
+        root / relative
+        for relative in _timezone_stage_evidence_relatives(request.run_spec)
     )
+    if timezone_stage_evidence[0] != inventory.path:
+        raise TrustIntegrityError("timezone schedule inventory authority differs")
     if latest.stage == "REFERENCE_INPUTS":
         timezone_checkpoint_values: dict[str, object] = {
             "expected_prior_checkpoint_sha256": latest.receipt_sha256,
@@ -3413,7 +3552,7 @@ def _real_run_stages(
             batch_ids=(static.batch_id, reference.batch_id),
             completed_query_ids=cumulative_ids,
             stage_evidence=timezone_stage_evidence,
-            audit_relative=audit_relative,
+            run_spec=request.run_spec,
         )
     elif (
         latest.stage not in {"PARTICIPANT_DERIVED", "REMAINING"}
@@ -3448,7 +3587,9 @@ def _real_run_stages(
     if latest.stage in {"PARTICIPANT_DERIVED", "REMAINING"}:
         persisted_participant = _integrity_boundary(
             "participant query batch replay",
-            lambda: load_query_batch(root, participant.batch_id),
+            lambda: load_query_batch_for_authority(
+                root, participant.batch_id, request.run_spec
+            ),
         )
         if persisted_participant != participant:
             raise TrustIntegrityError("persisted participant batch authority differs")
@@ -3588,12 +3729,24 @@ def _real_begin_runtime(
     try:
         phase = runtime.phase
         if phase is None:
+            source_run = isinstance(request.run_spec, SourceRunSpec)
             state = initialize_execution_registry(
                 root,
                 request.run_spec,
-                design_path=root / _DESIGN_RELATIVE,
-                plan_path=root / _PLAN_RELATIVE,
-                acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+                design_path=root
+                / (
+                    _SOURCE_DESIGN_RELATIVE
+                    if source_run
+                    else _DESIGN_RELATIVE
+                ),
+                plan_path=root
+                / (_SOURCE_PLAN_RELATIVE if source_run else _PLAN_RELATIVE),
+                acquisition_contract_path=root
+                / (
+                    _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+                    if source_run
+                    else _ACQUISITION_CONTRACT_RELATIVE
+                ),
             )
             phase = state.phase
         if phase == "DESIGN_ACCEPTED":
@@ -3622,7 +3775,7 @@ def _real_replay_terminal(
     from .v52_legacy_decision_inventory import (
         load_verified_legacy_decision_inventory,
     )
-    from .v52_query_plan import load_query_batch
+    from .v52_query_plan import load_query_batch_for_authority
 
     root = Path(os.path.abspath(os.fspath(request.root)))
     try:
@@ -3641,9 +3794,10 @@ def _real_replay_terminal(
             raise TrustIntegrityError(
                 "SOURCES_READY terminal checkpoint authority differs"
             )
-        partition = load_query_batch(
+        partition = load_query_batch_for_authority(
             root,
             batch_ids[3],
+            request.run_spec,
             read_only_progress=True,
         )
         inventory = load_verified_legacy_decision_inventory(root)

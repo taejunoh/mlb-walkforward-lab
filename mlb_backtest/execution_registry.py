@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -277,6 +278,20 @@ _TIMEZONE_STAGE_EVIDENCE_PATHS = (
     "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
     "config/v5_2_qd/venue_timezones.json",
 )
+
+
+def _timezone_stage_evidence_paths(run_spec: Authority) -> tuple[str, ...]:
+    if isinstance(run_spec, SourceRunSpec):
+        audit = _authority_namespace(run_spec, "audit")
+        return (
+            (audit / "acquisition/schedule_anchor_inventory.json").as_posix(),
+            (audit / "acquisition/timezone_reviews/coverage.json").as_posix(),
+            (audit / "acquisition/timezone_reviews/semantic.json").as_posix(),
+            (audit / "acquisition/venue_timezone_candidate.json").as_posix(),
+            (audit / "acquisition/venue_timezone_seal.json").as_posix(),
+            "config/v5_2_qd/venue_timezones.json",
+        )
+    return _TIMEZONE_STAGE_EVIDENCE_PATHS
 _GAME_EVIDENCE_INVENTORY_PATH = (
     "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
 )
@@ -333,6 +348,25 @@ class AcquisitionCheckpoint:
     split_query_ids: tuple[str, ...]
     stage_evidence_receipt_paths: tuple[str, ...]
     dispositioned_query_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _VerifiedSourceCheckpointAuthority:
+    run_id: str
+    stage: str
+    query_batch_ids: tuple[str, ...]
+    completed_query_ids: tuple[str, ...]
+    pending_query_ids: tuple[str, ...]
+    quarantined_query_ids: tuple[str, ...]
+    split_query_ids: tuple[str, ...]
+    dispositioned_query_ids: tuple[str, ...]
+    _seal: object
+
+
+_SOURCE_CHECKPOINT_CAPABILITY_SEAL = object()
+_SOURCE_CHECKPOINT_AUTHORITY: ContextVar[
+    _VerifiedSourceCheckpointAuthority | None
+] = ContextVar("source_registry_checkpoint_authority", default=None)
 
 
 @dataclass(frozen=True)
@@ -634,6 +668,18 @@ def _read_relative_at(
     )
     try:
         return _read_file_at(parent_fd, relative.name, label)[0]
+    finally:
+        _close_directories(descriptors)
+
+
+def _read_relative_snapshot_at(
+    directory_descriptor: int, relative: Path, label: str
+) -> tuple[bytes, tuple[int, ...]]:
+    parent_fd, descriptors = _open_directory_at(
+        directory_descriptor, relative.parent
+    )
+    try:
+        return _read_file_at(parent_fd, relative.name, label)
     finally:
         _close_directories(descriptors)
 
@@ -2641,6 +2687,123 @@ def _validate_checkpoint_payload(
     return receipt
 
 
+def _issue_source_checkpoint_authority(
+    checkpoint: Mapping[str, object],
+    run_spec: SourceRunSpec,
+    lock_binding: _RegistryLockBinding,
+) -> _VerifiedSourceCheckpointAuthority:
+    """Issue a lexical capability only inside a locked registry replay."""
+    if not isinstance(run_spec, SourceRunSpec):
+        raise TypeError("source checkpoint capability requires a SourceRunSpec")
+    if type(lock_binding) is not _RegistryLockBinding:
+        raise TypeError("source checkpoint registry lock authority differs")
+    try:
+        lock_metadata = os.fstat(lock_binding.lock_descriptor)
+        execution_metadata = os.fstat(lock_binding.execution_descriptor)
+    except OSError as exc:
+        raise ValueError("source checkpoint registry lock is unavailable") from exc
+    if not stat.S_ISREG(lock_metadata.st_mode) or not stat.S_ISDIR(
+        execution_metadata.st_mode
+    ):
+        raise ValueError("source checkpoint registry lock identity differs")
+    validated = _validate_checkpoint_payload(checkpoint, run_spec)
+    batches = validated["query_batches"]
+    assert isinstance(batches, list)
+    query_batch_ids = tuple(str(item["batch_id"]) for item in batches)
+    completed = tuple(validated["completed_query_ids"])  # type: ignore[arg-type]
+    pending = tuple(validated["pending_query_ids"])  # type: ignore[arg-type]
+    quarantined = tuple(validated["quarantined_query_ids"])  # type: ignore[arg-type]
+    split = tuple(validated["split_query_ids"])  # type: ignore[arg-type]
+    dispositioned = tuple(validated["dispositioned_query_ids"])  # type: ignore[arg-type]
+    if (
+        not batches
+        or batches[0]["stage"] != "STATIC_SCHEDULES"
+        or dispositioned != (_DISPOSITIONED_QUERY_ID,)
+        or _DISPOSITIONED_QUERY_ID not in completed
+        or _DISPOSITIONED_QUERY_ID in pending
+        or _DISPOSITIONED_QUERY_ID in quarantined
+        or _DISPOSITIONED_QUERY_ID in split
+    ):
+        raise ValueError("source checkpoint capability bootstrap differs")
+    return _VerifiedSourceCheckpointAuthority(
+        run_id=run_spec.run_id,
+        stage=str(validated["stage"]),
+        query_batch_ids=query_batch_ids,
+        completed_query_ids=completed,
+        pending_query_ids=pending,
+        quarantined_query_ids=quarantined,
+        split_query_ids=split,
+        dispositioned_query_ids=dispositioned,
+        _seal=_SOURCE_CHECKPOINT_CAPABILITY_SEAL,
+    )
+
+
+@contextmanager
+def _using_source_checkpoint_authority(
+    checkpoint: _VerifiedSourceCheckpointAuthority,
+) -> Iterator[None]:
+    if (
+        type(checkpoint) is not _VerifiedSourceCheckpointAuthority
+        or checkpoint._seal is not _SOURCE_CHECKPOINT_CAPABILITY_SEAL
+    ):
+        raise TypeError("source checkpoint authority capability differs")
+    token = _SOURCE_CHECKPOINT_AUTHORITY.set(checkpoint)
+    try:
+        yield
+    finally:
+        _SOURCE_CHECKPOINT_AUTHORITY.reset(token)
+
+
+def _current_source_checkpoint_authority(
+) -> _VerifiedSourceCheckpointAuthority | None:
+    return _SOURCE_CHECKPOINT_AUTHORITY.get()
+
+
+@contextmanager
+def _using_verified_source_checkpoint(
+    root: Path,
+    run_spec: SourceRunSpec,
+) -> Iterator[None]:
+    """Hold one authenticated source checkpoint authority across a replay."""
+    if not isinstance(run_spec, SourceRunSpec):
+        raise TypeError("verified checkpoint scope requires a SourceRunSpec")
+    current = _current_source_checkpoint_authority()
+    if current is not None:
+        if current.run_id != run_spec.run_id:
+            raise ValueError("source checkpoint scope run differs")
+        yield
+        return
+
+    paths = _paths(root, run_spec)
+    with _registry_lock(paths, create=False, exclusive=False) as lock_binding:
+        state, registry_payloads = _load_locked(paths, run_spec, lock_binding)
+        if state.phase not in {"ACQUIRING", "SOURCES_READY"}:
+            raise ValueError(
+                "source checkpoint scope requires ACQUIRING or SOURCES_READY"
+            )
+        snapshot = _capture_git_snapshot(paths.root, registry_payloads[0])
+        checkpoints, payloads, _ = _load_checkpoints_locked(
+            paths,
+            run_spec,
+            registry_payloads,
+            snapshot,
+            lock_binding,
+            verify_latest_progress=False,
+            read_only_progress=_checkpoint_progress_is_read_only(
+                run_spec,
+                state.phase,
+                registry_payloads[-1].get("acquisition_checkpoint_head"),
+            ),
+        )
+        if not checkpoints or not payloads:
+            raise ValueError("source checkpoint scope requires a checkpoint")
+        authority = _issue_source_checkpoint_authority(
+            payloads[-1], run_spec, lock_binding
+        )
+        with _using_source_checkpoint_authority(authority):
+            yield
+
+
 def _checkpoint_from_payload(
     payload: Mapping[str, object], receipt_sha256: str
 ) -> AcquisitionCheckpoint:
@@ -2839,29 +3002,20 @@ def _checkpoint_stage_authority(
     run_binding: Mapping[str, object],
     contract_binding: Mapping[str, object],
     read_only_progress: bool = False,
+    source_checkpoint_authority: object | None = None,
 ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
     from mlb_backtest.v52_query_plan import (
+        _build_schedule_reference_batch_from_inventory,
         build_legacy_partition_batch,
         build_participant_derived_batch,
-        build_schedule_reference_batch,
         build_statcast_root_batch,
         build_static_batch,
-        load_query_batch,
+        load_query_batch_for_authority,
     )
 
     run_path = paths.root / str(run_binding["path"])
     contract_path = paths.root / str(contract_binding["path"])
     static_batch = build_static_batch(run_path, contract_path)
-    if isinstance(run_spec, SourceRunSpec):
-        if stage != "STATIC_SCHEDULES":
-            raise ValueError(
-                "superseding source checkpoint requires the derived disposition batch"
-            )
-        # Task 7 owns publication of this batch.  Do not silently publish a
-        # source checkpoint from the ordinary seven-query static batch.
-        raise ValueError(
-            "superseding source checkpoint requires the derived disposition batch"
-        )
     if stage == "STATIC_SCHEDULES":
         return (static_batch,), ()
     if stage not in {
@@ -2878,36 +3032,66 @@ def _checkpoint_stage_authority(
     )
 
     evidence_root = _checkpoint_evidence_root(paths, run_spec)
-    verified = load_verified_schedule_anchor_inventory(
-        paths.root,
-        run_spec,
-        acquisition_contract_path=contract_path,
-        static_batch_id=static_batch.batch_id,
-        evidence_root=evidence_root,
-        read_only_progress=read_only_progress,
-    )
-    reference_batch = build_schedule_reference_batch(
-        paths.root,
-        run_path,
-        acquisition_contract_path=contract_path,
-        static_batch_id=static_batch.batch_id,
-        evidence_root=evidence_root,
-        read_only_progress=read_only_progress,
+    if source_checkpoint_authority is not None:
+        with _using_source_checkpoint_authority(source_checkpoint_authority):
+            verified = load_verified_schedule_anchor_inventory(
+                paths.root,
+                run_spec,
+                acquisition_contract_path=contract_path,
+                static_batch_id=static_batch.batch_id,
+                evidence_root=evidence_root,
+                read_only_progress=read_only_progress,
+            )
+    else:
+        verified = load_verified_schedule_anchor_inventory(
+            paths.root,
+            run_spec,
+            acquisition_contract_path=contract_path,
+            static_batch_id=static_batch.batch_id,
+            evidence_root=evidence_root,
+            read_only_progress=read_only_progress,
+        )
+    reference_batch = _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=str(run_binding["sha256"]),
+        acquisition_contract_sha256=str(contract_binding["sha256"]),
     )
     if reference_batch.derived_from_sha256 != verified.sha256:
         raise ValueError("REFERENCE_INPUTS inventory-derived batch binding differs")
     if stage == "REFERENCE_INPUTS":
+        schedule_inventory_path = (
+            _authority_namespace(run_spec, "audit")
+            / "acquisition/schedule_anchor_inventory.json"
+        ).as_posix()
         return (
             (static_batch, reference_batch),
-            ({"path": _SCHEDULE_INVENTORY_PATH, "sha256": verified.sha256},),
+            ({"path": schedule_inventory_path, "sha256": verified.sha256},),
         )
 
     from mlb_backtest.v52_timezone_review import load_verified_timezone_gate
 
-    gate = load_verified_timezone_gate(
-        paths.root,
-        read_only_progress=read_only_progress,
+    gate_kwargs = (
+        {
+            "run_spec_path": run_path,
+            "acquisition_contract_path": contract_path,
+        }
+        if isinstance(run_spec, SourceRunSpec)
+        else {}
     )
+    if source_checkpoint_authority is not None:
+        with _using_source_checkpoint_authority(source_checkpoint_authority):
+            gate = load_verified_timezone_gate(
+                paths.root,
+                read_only_progress=read_only_progress,
+                **gate_kwargs,
+            )
+    else:
+        gate = load_verified_timezone_gate(
+            paths.root,
+            read_only_progress=read_only_progress,
+            **gate_kwargs,
+        )
     if (
         gate.run_spec_sha256 != run_binding["sha256"]
         or gate.acquisition_contract_sha256 != contract_binding["sha256"]
@@ -2916,26 +3100,27 @@ def _checkpoint_stage_authority(
         != (static_batch.batch_id, reference_batch.batch_id)
     ):
         raise ValueError("TIMEZONE_REVIEW gate authority binding differs")
+    timezone_paths = _timezone_stage_evidence_paths(run_spec)
     stage_evidence = (
-        {"path": _TIMEZONE_STAGE_EVIDENCE_PATHS[0], "sha256": verified.sha256},
+        {"path": timezone_paths[0], "sha256": verified.sha256},
         {
-            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[1],
+            "path": timezone_paths[1],
             "sha256": gate.review_sha256s[0],
         },
         {
-            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[2],
+            "path": timezone_paths[2],
             "sha256": gate.review_sha256s[1],
         },
         {
-            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[3],
+            "path": timezone_paths[3],
             "sha256": gate.candidate_sha256,
         },
         {
-            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[4],
+            "path": timezone_paths[4],
             "sha256": gate.seal_sha256,
         },
         {
-            "path": _TIMEZONE_STAGE_EVIDENCE_PATHS[5],
+            "path": timezone_paths[5],
             "sha256": gate.mapping_sha256,
         },
     )
@@ -2986,9 +3171,10 @@ def _checkpoint_stage_authority(
     )
 
     root_expected = build_statcast_root_batch(paths.root)
-    root_batch = load_query_batch(
+    root_batch = load_query_batch_for_authority(
         paths.root,
         root_expected.batch_id,
+        run_spec,
         read_only_progress=read_only_progress,
     )
     if root_batch != root_expected or len(root_batch.queries) != 46:
@@ -3105,13 +3291,13 @@ def _checkpoint_current_semantic(
     split_receipt_paths: Sequence[Path],
     dispositioned_query_ids: Sequence[str] = (),
     read_only_progress: bool = False,
+    source_checkpoint_authority: object | None = None,
 ) -> dict[str, object]:
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
     from mlb_backtest.v52_query_plan import (
-        load_query_batch,
+        load_query_batch_for_authority,
         load_split_receipt,
     )
-
     if stage not in ACQUISITION_STAGES:
         raise ValueError("acquisition checkpoint stage differs")
     base = registry_payloads[0]
@@ -3132,11 +3318,23 @@ def _checkpoint_current_semantic(
     for raw_batch_id in query_batch_ids:
         if not isinstance(raw_batch_id, str) or not _SHA256.fullmatch(raw_batch_id):
             raise ValueError("checkpoint batch ID differs")
-        batch = load_query_batch(
-            paths.root,
-            raw_batch_id,
-            read_only_progress=read_only_progress,
-        )
+        if source_checkpoint_authority is not None:
+            with _using_source_checkpoint_authority(
+                source_checkpoint_authority
+            ):
+                batch = load_query_batch_for_authority(
+                    paths.root,
+                    raw_batch_id,
+                    run_spec,
+                    read_only_progress=read_only_progress,
+                )
+        else:
+            batch = load_query_batch_for_authority(
+                paths.root,
+                raw_batch_id,
+                run_spec,
+                read_only_progress=read_only_progress,
+            )
         batch_index = ACQUISITION_STAGES.index(batch.stage)
         if batch_index < prior_stage_index or batch_index > ACQUISITION_STAGES.index(stage):
             raise ValueError("checkpoint batch stage order differs")
@@ -3180,6 +3378,7 @@ def _checkpoint_current_semantic(
             run_binding=run_binding,
             contract_binding=contract_binding,
             read_only_progress=read_only_progress,
+            source_checkpoint_authority=source_checkpoint_authority,
         )
     )
     if stage == "REMAINING":
@@ -3455,11 +3654,15 @@ def _checkpoint_artifacts_and_population(
     paths: _RegistryPaths,
     run_spec: Authority,
     payload: Mapping[str, object],
+    lock_binding: _RegistryLockBinding,
     *,
     read_only_progress: bool = False,
 ) -> set[str]:
     from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
-    from mlb_backtest.v52_query_plan import load_query_batch, load_split_receipt
+    from mlb_backtest.v52_query_plan import (
+        load_query_batch_for_authority,
+        load_split_receipt,
+    )
 
     stage = str(payload["stage"])
     if stage not in _OPEN_CHECKPOINT_STAGES:
@@ -3472,15 +3675,30 @@ def _checkpoint_artifacts_and_population(
     batch_query_ids: dict[str, set[str]] = {}
     batches = payload["query_batches"]
     assert isinstance(batches, list)
+    source_checkpoint_authority = (
+        _issue_source_checkpoint_authority(payload, run_spec, lock_binding)
+        if isinstance(run_spec, SourceRunSpec)
+        else None
+    )
     loaded_batch_sequence: list[object] = []
     for item in batches:
         assert isinstance(item, Mapping)
         batch_id = str(item["batch_id"])
-        batch = load_query_batch(
-            paths.root,
-            batch_id,
-            read_only_progress=read_only_progress,
-        )
+        if source_checkpoint_authority is not None:
+            with _using_source_checkpoint_authority(source_checkpoint_authority):
+                batch = load_query_batch_for_authority(
+                    paths.root,
+                    batch_id,
+                    run_spec,
+                    read_only_progress=read_only_progress,
+                )
+        else:
+            batch = load_query_batch_for_authority(
+                paths.root,
+                batch_id,
+                run_spec,
+                read_only_progress=read_only_progress,
+            )
         if batch.stage != item["stage"]:
             raise ValueError("checkpoint batch stage binding differs")
         loaded_batch_sequence.append(batch)
@@ -3509,25 +3727,6 @@ def _checkpoint_artifacts_and_population(
     contract_binding = payload["acquisition_contract"]
     assert isinstance(run_binding, Mapping)
     assert isinstance(contract_binding, Mapping)
-    authoritative_batches, authoritative_stage_evidence = (
-        _checkpoint_stage_authority(
-            paths,
-            run_spec,
-            stage=stage,
-            run_binding=run_binding,
-            contract_binding=contract_binding,
-            read_only_progress=read_only_progress,
-        )
-    )
-    if stage == "REMAINING":
-        authority_matches = (
-            tuple(loaded_batch_sequence[: len(authoritative_batches)])
-            == authoritative_batches
-        )
-    else:
-        authority_matches = tuple(loaded_batch_sequence) == authoritative_batches
-    if not authority_matches:
-        raise ValueError(f"checkpoint {stage} batch authority differs")
     populations = set().union(
         set(payload["completed_query_ids"]),
         set(payload["pending_query_ids"]),
@@ -3558,6 +3757,28 @@ def _checkpoint_artifacts_and_population(
         or _DISPOSITIONED_QUERY_ID not in set(payload["completed_query_ids"])
     ):
         raise ValueError("source disposition query population differs")
+    authoritative_batches, authoritative_stage_evidence = (
+        _checkpoint_stage_authority(
+            paths,
+            run_spec,
+            stage=stage,
+            run_binding=run_binding,
+            contract_binding=contract_binding,
+            read_only_progress=read_only_progress,
+            source_checkpoint_authority=(
+                source_checkpoint_authority
+            ),
+        )
+    )
+    if stage == "REMAINING":
+        authority_matches = (
+            tuple(loaded_batch_sequence[: len(authoritative_batches)])
+            == authoritative_batches
+        )
+    else:
+        authority_matches = tuple(loaded_batch_sequence) == authoritative_batches
+    if not authority_matches:
+        raise ValueError(f"checkpoint {stage} batch authority differs")
     if stage == "REFERENCE_INPUTS":
         static_batch_id = str(batches[0]["batch_id"])
         if (
@@ -3921,7 +4142,7 @@ def _validate_checkpoint_progression(
             "REFERENCE_INPUTS checkpoint lacks schedule anchor evidence"
         )
     if current_stage == "TIMEZONE_REVIEW":
-        if evidence_paths != set(_TIMEZONE_STAGE_EVIDENCE_PATHS):
+        if evidence_paths != set(_timezone_stage_evidence_paths(run_spec)):
             raise ValueError(
                 "TIMEZONE_REVIEW checkpoint lacks its sealed semantic gate evidence"
             )
@@ -4033,6 +4254,7 @@ def _load_checkpoints_locked(
     _validate_checkpoint_name_chain(names)
     checkpoints: list[AcquisitionCheckpoint] = []
     payloads: list[Mapping[str, object]] = []
+    checkpoint_snapshots: list[tuple[bytes, tuple[int, ...]]] = []
     prior_sha: str | None = None
     previous: Mapping[str, object] | None = None
     base = registry_payloads[0]
@@ -4040,7 +4262,7 @@ def _load_checkpoints_locked(
         match = _CHECKPOINT_NAME.fullmatch(name)
         assert match is not None
         receipt_sha = match.group("sha")
-        contents = _read_relative_at(
+        contents, checkpoint_identity = _read_relative_snapshot_at(
             lock_binding.execution_descriptor,
             checkpoint_child / name,
             "acquisition checkpoint",
@@ -4063,11 +4285,13 @@ def _load_checkpoints_locked(
             paths,
             run_spec,
             payload,
+            lock_binding,
             read_only_progress=read_only_progress,
         )
         _validate_checkpoint_progression(previous, payload, run_spec)
         checkpoints.append(_checkpoint_from_payload(payload, receipt_sha))
         payloads.append(payload)
+        checkpoint_snapshots.append((contents, checkpoint_identity))
         prior_sha = receipt_sha
         previous = payload
     if names:
@@ -4083,6 +4307,11 @@ def _load_checkpoints_locked(
             _close_directories(descriptors)
     if payloads and verify_latest_progress:
         latest = payloads[-1]
+        source_checkpoint_authority = None
+        if isinstance(run_spec, SourceRunSpec):
+            source_checkpoint_authority = _issue_source_checkpoint_authority(
+                latest, run_spec, lock_binding
+            )
         current_semantic = _checkpoint_current_semantic(
             paths,
             run_spec,
@@ -4106,9 +4335,30 @@ def _load_checkpoints_locked(
             ],
             dispositioned_query_ids=latest.get("dispositioned_query_ids", ()),
             read_only_progress=read_only_progress,
+            source_checkpoint_authority=source_checkpoint_authority,
         )
         if _checkpoint_semantic_projection(latest) != current_semantic:
             raise ValueError("latest acquisition checkpoint differs from verified progress")
+    if names:
+        checkpoint_fd, descriptors = _open_directory_at(
+            lock_binding.execution_descriptor, checkpoint_child
+        )
+        try:
+            if tuple(sorted(os.listdir(checkpoint_fd))) != names:
+                raise _ReceiptMembershipError(
+                    "acquisition checkpoint membership changed during final rebind"
+                )
+        finally:
+            _close_directories(descriptors)
+        for name, snapshot in zip(names, checkpoint_snapshots):
+            if _read_relative_snapshot_at(
+                lock_binding.execution_descriptor,
+                checkpoint_child / name,
+                "acquisition checkpoint final rebind",
+            ) != snapshot:
+                raise ValueError(
+                    "acquisition checkpoint identity or bytes changed during replay"
+                )
     return tuple(checkpoints), tuple(payloads), names
 
 
@@ -4271,6 +4521,38 @@ def load_latest_acquisition_checkpoint(
                 registry_payloads[-1].get("acquisition_checkpoint_head"),
             ),
         )
+        if not checkpoints and isinstance(run_spec, SourceRunSpec):
+            from mlb_backtest.v52_query_plan import build_static_batch
+
+            base = registry_payloads[0]
+            run_binding = _validate_binding_value(
+                base["run_spec"], "checkpoint RunSpec"
+            )
+            contract_binding = _validate_binding_value(
+                base["acquisition_contract"], "checkpoint acquisition contract"
+            )
+            static_batch = build_static_batch(
+                paths.root / str(run_binding["path"]),
+                paths.root / str(contract_binding["path"]),
+            )
+            static_path = (
+                paths.root
+                / _authority_namespace(run_spec, "audit")
+                / "acquisition/query_batches"
+                / f"{static_batch.batch_id}.json"
+            )
+            try:
+                os.lstat(static_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ValueError(
+                    "source static batch identity is unavailable"
+                ) from exc
+            else:
+                raise ValueError(
+                    "source static batch requires an acquisition checkpoint"
+                )
         return checkpoints[-1] if checkpoints else None
 
 
@@ -4432,8 +4714,11 @@ def publish_acquisition_checkpoint(
         (pending_query_ids, "pending query IDs"),
         (quarantined_query_ids, "quarantined query IDs"),
         (split_query_ids, "split query IDs"),
-        *((dispositioned_query_ids, "dispositioned query IDs")
-          if dispositioned_query_ids is not _UNSET else ()),
+        *(
+            ((dispositioned_query_ids, "dispositioned query IDs"),)
+            if dispositioned_query_ids is not _UNSET
+            else ()
+        ),
     ):
         supplied = tuple(values)
         try:
@@ -4479,6 +4764,11 @@ def publish_acquisition_checkpoint(
             lock_binding,
             verify_latest_progress=False,
         )
+        source_checkpoint_authority = None
+        if isinstance(run_spec, SourceRunSpec) and checkpoint_payloads:
+            source_checkpoint_authority = _issue_source_checkpoint_authority(
+                checkpoint_payloads[-1], run_spec, lock_binding
+            )
         semantic = _checkpoint_current_semantic(
             paths,
             run_spec,
@@ -4495,6 +4785,7 @@ def publish_acquisition_checkpoint(
             dispositioned_query_ids=(
                 () if dispositioned_query_ids is _UNSET else dispositioned_query_ids
             ),
+            source_checkpoint_authority=source_checkpoint_authority,
         )
         semantic_snapshots = _checkpoint_semantic_snapshots(paths, semantic)
 
@@ -4515,6 +4806,7 @@ def publish_acquisition_checkpoint(
                 dispositioned_query_ids=(
                     () if dispositioned_query_ids is _UNSET else dispositioned_query_ids
                 ),
+                source_checkpoint_authority=source_checkpoint_authority,
             )
             if rebound != semantic:
                 raise ValueError(
@@ -4548,6 +4840,10 @@ def publish_acquisition_checkpoint(
         }
         _validate_checkpoint_payload(payload, run_spec)
         _validate_checkpoint_progression(previous_payload, payload, run_spec)
+        if isinstance(run_spec, SourceRunSpec):
+            source_checkpoint_authority = _issue_source_checkpoint_authority(
+                payload, run_spec, lock_binding
+            )
         contents = canonical_json_bytes(payload) + b"\n"
         digest = _sha256_bytes(contents)
         relative = paths.checkpoints_relative / f"{sequence:08d}-{digest}.json"

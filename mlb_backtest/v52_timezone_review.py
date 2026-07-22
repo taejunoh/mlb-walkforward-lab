@@ -28,7 +28,12 @@ from .secure_fs import (
 )
 from .v52_evidence import V52EvidenceStore, logical_query_id
 from .protocols import SourceRunSpec
-from .v52_query_plan import SourceAuthorityContext, _load_static_contracts, load_query_batch
+from .v52_query_plan import (
+    SourceAuthorityContext,
+    _load_static_contracts,
+    load_query_batch,
+    load_query_batch_for_authority,
+)
 from .v52_source_contracts import QUERY_SIDECAR_KEYS, canonical_json_bytes
 
 
@@ -57,17 +62,18 @@ _RUN_SPEC_PATH = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 _ACQUISITION_CONTRACT_PATH = Path(
     "protocols/v5_2_qd/historical_source_acquisition.json"
 )
+_SOURCE_RUN_SPEC_PATH = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+_SOURCE_ACQUISITION_CONTRACT_PATH = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _VENUE_ENDPOINT_PREFIX = "https://statsapi.mlb.com/api/v1/venues/"
 _MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 _MAX_MAPPING_BYTES = 8 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_AUTHORITY_BYTES = 64 * 1024 * 1024
-_ACTIVE_ACQUISITION_AUDIT: ContextVar[Path] = ContextVar(
-    "v52_timezone_acquisition_audit", default=_ACQUISITION_AUDIT
-)
-
-
 @dataclass(frozen=True)
 class VerifiedTimezoneGate:
     candidate: Mapping[str, object]
@@ -94,6 +100,68 @@ class _CurrentTimezoneAuthority:
     query_batch_ids: tuple[str, str]
     query_batch_sha256s: tuple[str, str]
     snapshots: tuple[_SafeSnapshot, ...]
+
+
+@dataclass(frozen=True)
+class _TimezonePaths:
+    acquisition_audit: Path
+    candidate: Path
+    coverage_review: Path
+    semantic_review: Path
+    seal: Path
+    schedule_inventory: Path
+    run_spec: Path
+    acquisition_contract: Path
+    query_batch_root: Path
+
+
+def _timezone_paths(
+    context: SourceAuthorityContext | None,
+) -> _TimezonePaths:
+    if context is None:
+        audit = _ACQUISITION_AUDIT
+        run_spec = _RUN_SPEC_PATH
+        contract = _ACQUISITION_CONTRACT_PATH
+    else:
+        audit = context.acquisition_audit_root.relative_to(
+            context.repository_root
+        )
+        run_spec = context.authority_path.relative_to(context.repository_root)
+        contract = context.acquisition_contract_path.relative_to(
+            context.repository_root
+        )
+        expected = (
+            (
+                Path("audit/v5_2_qd/historical_superseding_565534/acquisition"),
+                _SOURCE_RUN_SPEC_PATH,
+                _SOURCE_ACQUISITION_CONTRACT_PATH,
+            )
+            if isinstance(context.authority, SourceRunSpec)
+            else (
+                _ACQUISITION_AUDIT,
+                _RUN_SPEC_PATH,
+                _ACQUISITION_CONTRACT_PATH,
+            )
+        )
+        if (audit, run_spec, contract) != expected:
+            raise ValueError("timezone authority paths differ")
+    return _TimezonePaths(
+        acquisition_audit=audit,
+        candidate=audit / "venue_timezone_candidate.json",
+        coverage_review=audit / "timezone_reviews/coverage.json",
+        semantic_review=audit / "timezone_reviews/semantic.json",
+        seal=audit / "venue_timezone_seal.json",
+        schedule_inventory=audit / "schedule_anchor_inventory.json",
+        run_spec=run_spec,
+        acquisition_contract=contract,
+        query_batch_root=audit / "query_batches",
+    )
+
+
+_OLD_TIMEZONE_PATHS = _timezone_paths(None)
+_ACTIVE_TIMEZONE_PATHS: ContextVar[_TimezonePaths] = ContextVar(
+    "v52_timezone_paths", default=_OLD_TIMEZONE_PATHS
+)
 
 
 def _before_review_final_rebind() -> None:
@@ -349,6 +417,51 @@ def _project_timezone_candidate(
     )
     observed, schedule_hashes = _observed_from_schedules(schedule_sidecars)
     venues, venue_hashes = _venues_from_sidecars(venue_sidecars)
+    return _project_timezone_candidate_components(
+        observed,
+        schedule_hashes,
+        venues,
+        venue_hashes,
+        query_batch_ids=batch_ids,
+        run_spec_sha256=run_hash,
+        acquisition_contract_sha256=contract_hash,
+    )
+
+
+def _project_timezone_candidate_components(
+    observed: Mapping[tuple[int, str], tuple[bool, bool]],
+    schedule_hashes: Sequence[str],
+    venues: Mapping[int, Mapping[str, object]],
+    venue_hashes: Sequence[str],
+    *,
+    query_batch_ids: Sequence[str],
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+) -> Mapping[str, object]:
+    batch_ids = [
+        _sha256_text(value, "candidate query batch ID")
+        for value in query_batch_ids
+    ]
+    schedule_hash_values = [
+        _sha256_text(value, "candidate schedule sidecar SHA-256")
+        for value in schedule_hashes
+    ]
+    venue_hash_values = [
+        _sha256_text(value, "candidate venue sidecar SHA-256")
+        for value in venue_hashes
+    ]
+    if (
+        not observed
+        or batch_ids != sorted(set(batch_ids))
+        or schedule_hash_values != sorted(set(schedule_hash_values))
+        or venue_hash_values != sorted(set(venue_hash_values))
+    ):
+        raise ValueError("candidate component authority differs")
+    run_hash = _sha256_text(run_spec_sha256, "candidate run_spec_sha256")
+    contract_hash = _sha256_text(
+        acquisition_contract_sha256,
+        "candidate acquisition_contract_sha256",
+    )
     observed_scope = {venue_id for venue_id, _ in observed}
     missing = observed_scope - set(venues)
     extra = set(venues) - observed_scope
@@ -384,13 +497,67 @@ def _project_timezone_candidate(
         "observed_venue_dates": observed_rows,
         "query_batch_ids": batch_ids,
         "run_spec_sha256": run_hash,
-        "schedule_sidecar_sha256s": schedule_hashes,
+        "schedule_sidecar_sha256s": schedule_hash_values,
         "schema_version": 1,
         "timezone_rows": timezone_rows,
         "venue_scope": sorted(observed_scope),
-        "venue_sidecar_sha256s": venue_hashes,
+        "venue_sidecar_sha256s": venue_hash_values,
         "venues": [venues[venue_id] for venue_id in sorted(venues)],
     }
+
+
+def _schedule_inventory_components(
+    payload: Mapping[str, object],
+) -> tuple[dict[tuple[int, str], tuple[bool, bool]], list[str]]:
+    anchors = payload.get("anchors")
+    season_sources = payload.get("season_sources")
+    if (
+        not isinstance(anchors, Sequence)
+        or isinstance(anchors, (str, bytes))
+        or not anchors
+        or not isinstance(season_sources, Sequence)
+        or isinstance(season_sources, (str, bytes))
+        or not season_sources
+    ):
+        raise ValueError("timezone source schedule inventory differs")
+    observed: dict[tuple[int, str], tuple[bool, bool]] = {}
+    games: set[int] = set()
+    for anchor in anchors:
+        if not isinstance(anchor, Mapping):
+            raise ValueError("timezone source schedule anchor differs")
+        game_pk = _positive(anchor.get("game_pk"), "timezone source game_pk")
+        if game_pk in games:
+            raise ValueError("timezone source schedule game is duplicated")
+        games.add(game_pk)
+        venue_id = _positive(anchor.get("venue_id"), "timezone source venue ID")
+        official = _day(
+            anchor.get("official_date"), "timezone source official date"
+        ).isoformat()
+        neutral = anchor.get("neutral_site")
+        alternate = anchor.get("alternate_site")
+        if type(neutral) is not bool or type(alternate) is not bool:
+            raise ValueError("timezone source observed venue flags differ")
+        key = (venue_id, official)
+        disposition = (neutral, alternate)
+        if key in observed and observed[key] != disposition:
+            raise ValueError("timezone source venue disposition conflicts")
+        observed[key] = disposition
+    sidecar_hashes = []
+    for source in season_sources:
+        if not isinstance(source, Mapping):
+            raise ValueError("timezone source season binding differs")
+        query_sidecar = source.get("query_sidecar")
+        if not isinstance(query_sidecar, Mapping):
+            raise ValueError("timezone source sidecar binding differs")
+        sidecar_hashes.append(
+            _sha256_text(
+                query_sidecar.get("sha256"),
+                "timezone source schedule sidecar SHA-256",
+            )
+        )
+    if len(sidecar_hashes) != len(set(sidecar_hashes)):
+        raise ValueError("timezone source sidecar population differs")
+    return observed, sorted(sidecar_hashes)
 
 
 def _normalize_timezone_rows(
@@ -644,7 +811,7 @@ def _acquisition_audit_relative(
     root: TrustedRoot, path: Path, label: str
 ) -> Path:
     relative = _relative_from_trusted(root, path, label)
-    prefix = _ACTIVE_ACQUISITION_AUDIT.get().parts
+    prefix = _ACTIVE_TIMEZONE_PATHS.get().acquisition_audit.parts
     if relative.parts[: len(prefix)] != prefix or len(relative.parts) <= len(prefix):
         raise ValueError(
             f"{label} must stay in the acquisition audit namespace"
@@ -853,15 +1020,11 @@ def _explicit_authority_context(
 
 @contextmanager
 def _authority_scope(context: SourceAuthorityContext | None):
-    if context is None:
-        yield
-        return
-    relative = context.acquisition_audit_root.relative_to(context.repository_root)
-    token = _ACTIVE_ACQUISITION_AUDIT.set(relative)
+    token = _ACTIVE_TIMEZONE_PATHS.set(_timezone_paths(context))
     try:
         yield
     finally:
-        _ACTIVE_ACQUISITION_AUDIT.reset(token)
+        _ACTIVE_TIMEZONE_PATHS.reset(token)
 
 
 def write_timezone_review_receipt(
@@ -879,10 +1042,6 @@ def write_timezone_review_receipt(
     context = _explicit_authority_context(
         root, run_spec_path, acquisition_contract_path
     )
-    if context is not None and isinstance(context.authority, SourceRunSpec):
-        raise ValueError(
-            "superseding timezone review checkpoints are not enabled before Task 6"
-        )
     with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _write_timezone_review_receipt(
             trusted,
@@ -1012,10 +1171,6 @@ def seal_timezone_mapping(
     context = _explicit_authority_context(
         root, run_spec_path, acquisition_contract_path
     )
-    if context is not None and isinstance(context.authority, SourceRunSpec):
-        raise ValueError(
-            "superseding timezone seal checkpoints are not enabled before Task 6"
-        )
     with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _seal_timezone_mapping(
             trusted,
@@ -1195,13 +1350,12 @@ def build_timezone_candidate(
     if context is not None:
         if Path(os.path.abspath(os.fspath(evidence_root))) != context.raw_root:
             raise ValueError("timezone evidence root differs from authority")
-        if isinstance(context.authority, SourceRunSpec):
-            raise ValueError(
-                "superseding query-batch checkpoints are not enabled before Task 6"
-            )
     with _authority_scope(context), open_trusted_root(root) as trusted:
         result = _build_timezone_candidate(
-            trusted, evidence_root=evidence_root, batch_ids=batch_ids
+            trusted,
+            evidence_root=evidence_root,
+            batch_ids=batch_ids,
+            authority_context=context,
         )
         trusted.assert_bound()
         return result
@@ -1212,6 +1366,7 @@ def _build_timezone_candidate(
     *,
     evidence_root: Path,
     batch_ids: Sequence[str],
+    authority_context: SourceAuthorityContext | None = None,
 ) -> Mapping[str, object]:
     if (
         isinstance(batch_ids, (str, bytes))
@@ -1226,11 +1381,22 @@ def _build_timezone_candidate(
     venue_sidecars: list[Mapping[str, object]] = []
     seen_queries: set[str] = set()
     contributing_batch_ids: set[str] = set()
+    stage_batch_ids: dict[str, str] = {}
     binding: tuple[str, str] | None = None
     for batch_id in batch_ids:
         root.assert_bound()
-        batch = load_query_batch(root.path, batch_id)
+        batch = (
+            load_query_batch_for_authority(
+                root.path, batch_id, authority_context.authority
+            )
+            if authority_context is not None
+            else load_query_batch(root.path, batch_id)
+        )
         root.assert_bound()
+        if batch.stage in {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}:
+            if batch.stage in stage_batch_ids:
+                raise ValueError("candidate stage batch population differs")
+            stage_batch_ids[batch.stage] = batch.batch_id
         for query in batch.queries:
             query_id = logical_query_id(query)
             kind: str | None = None
@@ -1324,19 +1490,59 @@ def _build_timezone_candidate(
                 venue_sidecars.append(sidecar)
                 continue
             raise AssertionError("unreachable candidate query classification")
-    if not schedule_sidecars or not venue_sidecars:
+    source_authority = (
+        authority_context is not None
+        and isinstance(authority_context.authority, SourceRunSpec)
+    )
+    if (not source_authority and not schedule_sidecars) or not venue_sidecars:
         raise ValueError(
             "candidate requires schedule anchors and venue reference evidence"
         )
     if binding is None:
         raise AssertionError("unreachable candidate provenance binding")
-    candidate = _project_timezone_candidate(
-        schedule_sidecars,
-        venue_sidecars,
-        query_batch_ids=sorted(contributing_batch_ids),
-        run_spec_sha256=binding[0],
-        acquisition_contract_sha256=binding[1],
-    )
+    if authority_context is not None and binding != (
+        authority_context.authority_sha256,
+        authority_context.acquisition_contract_sha256,
+    ):
+        raise ValueError("candidate query authority differs from explicit authority")
+    if source_authority:
+        from .v52_schedule_inventory import (
+            load_verified_schedule_anchor_inventory,
+        )
+
+        if set(stage_batch_ids) != {"STATIC_SCHEDULES", "REFERENCE_INPUTS"}:
+            raise ValueError("source candidate requires exact static/reference batches")
+        static_batch_id = stage_batch_ids["STATIC_SCHEDULES"]
+        root.assert_bound()
+        verified_inventory = load_verified_schedule_anchor_inventory(
+            root.path,
+            authority_context.authority,
+            acquisition_contract_path=authority_context.acquisition_contract_path,
+            static_batch_id=static_batch_id,
+            evidence_root=authority_context.raw_root,
+        )
+        root.assert_bound()
+        observed, schedule_hashes = _schedule_inventory_components(
+            verified_inventory.payload
+        )
+        venues, venue_hashes = _venues_from_sidecars(venue_sidecars)
+        candidate = _project_timezone_candidate_components(
+            observed,
+            schedule_hashes,
+            venues,
+            venue_hashes,
+            query_batch_ids=sorted(contributing_batch_ids),
+            run_spec_sha256=binding[0],
+            acquisition_contract_sha256=binding[1],
+        )
+    else:
+        candidate = _project_timezone_candidate(
+            schedule_sidecars,
+            venue_sidecars,
+            query_batch_ids=sorted(contributing_batch_ids),
+            run_spec_sha256=binding[0],
+            acquisition_contract_sha256=binding[1],
+        )
     root.assert_bound()
     return candidate
 
@@ -1378,16 +1584,24 @@ def publish_timezone_candidate(
     if context is not None:
         if Path(os.path.abspath(os.fspath(evidence_root))) != context.raw_root:
             raise ValueError("timezone evidence root differs from authority")
-        if isinstance(context.authority, SourceRunSpec):
-            raise ValueError(
-                "superseding query-batch checkpoints are not enabled before Task 6"
-            )
     with _authority_scope(context), open_trusted_root(root) as trusted:
-        result = _publish_timezone_candidate(
-            trusted,
-            evidence_root=evidence_root,
-            batch_ids=batch_ids,
-        )
+        if context is not None and isinstance(context.authority, SourceRunSpec):
+            from .execution_registry import _using_verified_source_checkpoint
+
+            with _using_verified_source_checkpoint(root, context.authority):
+                result = _publish_timezone_candidate(
+                    trusted,
+                    evidence_root=evidence_root,
+                    batch_ids=batch_ids,
+                    authority_context=context,
+                )
+        else:
+            result = _publish_timezone_candidate(
+                trusted,
+                evidence_root=evidence_root,
+                batch_ids=batch_ids,
+                authority_context=context,
+            )
         trusted.assert_bound()
         return result
 
@@ -1397,16 +1611,19 @@ def _publish_timezone_candidate(
     *,
     evidence_root: Path,
     batch_ids: Sequence[str],
+    authority_context: SourceAuthorityContext | None = None,
 ) -> Path:
+    paths = _ACTIVE_TIMEZONE_PATHS.get()
     candidate = _build_timezone_candidate(
         root,
         evidence_root=evidence_root,
         batch_ids=batch_ids,
+        authority_context=authority_context,
     )
     contents = _canonical_file_bytes(candidate)
     existing = _read_safe_snapshot_from_trusted(
         root,
-        _CANDIDATE_PATH,
+        paths.candidate,
         "timezone candidate",
         missing_ok=True,
         max_bytes=_MAX_CANDIDATE_BYTES,
@@ -1428,6 +1645,7 @@ def _publish_timezone_candidate(
             root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
+            authority_context=authority_context,
         )
         if rebound != candidate:
             raise ValueError("timezone candidate authority changed during replay")
@@ -1436,6 +1654,7 @@ def _publish_timezone_candidate(
             root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
+            authority_context=authority_context,
         )
         if final != candidate:
             raise ValueError("timezone candidate authority changed during final rebind")
@@ -1446,20 +1665,21 @@ def _publish_timezone_candidate(
             max_bytes=_MAX_CANDIDATE_BYTES,
         )
         root.assert_bound()
-        return root.path / _CANDIDATE_PATH
+        return root.path / paths.candidate
 
     def rebind() -> None:
         current = _build_timezone_candidate(
             root,
             evidence_root=evidence_root,
             batch_ids=batch_ids,
+            authority_context=authority_context,
         )
         if current != candidate:
             raise ValueError("timezone candidate authority changed before publication")
 
     path, snapshot = _reconcile_or_write_from_trusted(
         root,
-        _CANDIDATE_PATH,
+        paths.candidate,
         contents,
         "timezone candidate",
         final_rebind=rebind,
@@ -1495,11 +1715,13 @@ def _current_timezone_authority(
     root: TrustedRoot,
     *,
     read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
 ) -> _CurrentTimezoneAuthority:
     from .protocols import parse_run_spec
     from .v52_query_plan import (
         build_schedule_reference_batch,
         load_query_batch,
+        load_query_batch_for_authority,
     )
     from .v52_schedule_inventory import (
         _read_inventory_contents,
@@ -1507,25 +1729,35 @@ def _current_timezone_authority(
     )
     from .v52_sources.references import recompute_venue_query_sidecar
 
+    paths = _timezone_paths(authority_context)
     run_snapshot = _required_snapshot(
         root,
-        _RUN_SPEC_PATH,
+        paths.run_spec,
         "timezone gate RunSpec",
         max_bytes=_MAX_RECEIPT_BYTES,
     )
     contract_snapshot = _required_snapshot(
         root,
-        _ACQUISITION_CONTRACT_PATH,
+        paths.acquisition_contract,
         "timezone gate acquisition contract",
         max_bytes=_MAX_RECEIPT_BYTES,
     )
-    run_spec = parse_run_spec(
-        _json_object(
-            run_snapshot.contents,
-            "timezone gate RunSpec",
-            canonical=True,
+    if authority_context is None:
+        run_spec = parse_run_spec(
+            _json_object(
+                run_snapshot.contents,
+                "timezone gate RunSpec",
+                canonical=True,
+            )
         )
-    )
+    else:
+        run_spec = authority_context.authority
+        if (
+            _sha256(run_snapshot.contents) != authority_context.authority_sha256
+            or _sha256(contract_snapshot.contents)
+            != authority_context.acquisition_contract_sha256
+        ):
+            raise ValueError("timezone explicit authority bytes differ")
     namespaces = run_spec.raw.get("namespaces")
     raw_namespace = (
         namespaces.get("raw") if isinstance(namespaces, Mapping) else None
@@ -1542,7 +1774,9 @@ def _current_timezone_authority(
         raise ValueError("timezone gate RunSpec raw namespace differs")
 
     root.assert_bound()
-    inventory_contents = _read_inventory_contents(root.path)
+    inventory_contents = _read_inventory_contents(
+        root.path, paths.schedule_inventory
+    )
     root.assert_bound()
     inventory_record = _json_object(
         inventory_contents,
@@ -1560,7 +1794,7 @@ def _current_timezone_authority(
     verified_inventory = load_verified_schedule_anchor_inventory(
         root.path,
         run_spec,
-        acquisition_contract_path=root.path / _ACQUISITION_CONTRACT_PATH,
+        acquisition_contract_path=root.path / paths.acquisition_contract,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
@@ -1568,7 +1802,7 @@ def _current_timezone_authority(
     root.assert_bound()
     inventory_snapshot = _required_snapshot(
         root,
-        _SCHEDULE_INVENTORY_PATH,
+        paths.schedule_inventory,
         "timezone gate schedule inventory",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
@@ -1576,24 +1810,31 @@ def _current_timezone_authority(
         raise ValueError("timezone gate schedule inventory hash differs")
     static_batch_snapshot = _required_snapshot(
         root,
-        _ACQUISITION_AUDIT
-        / "query_batches"
-        / f"{static_batch_id}.json",
+        paths.query_batch_root / f"{static_batch_id}.json",
         "timezone gate STATIC_SCHEDULES batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
     root.assert_bound()
-    static_batch = load_query_batch(
-        root.path,
-        static_batch_id,
-        read_only_progress=read_only_progress,
+    static_batch = (
+        load_query_batch_for_authority(
+            root.path,
+            static_batch_id,
+            run_spec,
+            read_only_progress=read_only_progress,
+        )
+        if authority_context is not None
+        else load_query_batch(
+            root.path,
+            static_batch_id,
+            read_only_progress=read_only_progress,
+        )
     )
     root.assert_bound()
     root.assert_bound()
     reference_expected = build_schedule_reference_batch(
         root.path,
-        root.path / _RUN_SPEC_PATH,
-        acquisition_contract_path=root.path / _ACQUISITION_CONTRACT_PATH,
+        root.path / paths.run_spec,
+        acquisition_contract_path=root.path / paths.acquisition_contract,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
@@ -1601,17 +1842,24 @@ def _current_timezone_authority(
     root.assert_bound()
     reference_batch_snapshot = _required_snapshot(
         root,
-        _ACQUISITION_AUDIT
-        / "query_batches"
-        / f"{reference_expected.batch_id}.json",
+        paths.query_batch_root / f"{reference_expected.batch_id}.json",
         "timezone gate REFERENCE_INPUTS batch",
         max_bytes=_MAX_AUTHORITY_BYTES,
     )
     root.assert_bound()
-    reference_batch = load_query_batch(
-        root.path,
-        reference_expected.batch_id,
-        read_only_progress=read_only_progress,
+    reference_batch = (
+        load_query_batch_for_authority(
+            root.path,
+            reference_expected.batch_id,
+            run_spec,
+            read_only_progress=read_only_progress,
+        )
+        if authority_context is not None
+        else load_query_batch(
+            root.path,
+            reference_expected.batch_id,
+            read_only_progress=read_only_progress,
+        )
     )
     root.assert_bound()
     if reference_batch != reference_expected:
@@ -1794,14 +2042,22 @@ def load_verified_timezone_gate(
     context = _explicit_authority_context(
         root, run_spec_path, acquisition_contract_path
     )
-    if context is not None and isinstance(context.authority, SourceRunSpec):
-        raise ValueError(
-            "superseding query-batch checkpoints are not enabled before Task 6"
-        )
     with _authority_scope(context), open_trusted_root(root) as trusted:
-        result = _load_verified_timezone_gate(
-            trusted, read_only_progress=read_only_progress
-        )
+        if context is not None and isinstance(context.authority, SourceRunSpec):
+            from .execution_registry import _using_verified_source_checkpoint
+
+            with _using_verified_source_checkpoint(root, context.authority):
+                result = _load_verified_timezone_gate(
+                    trusted,
+                    read_only_progress=read_only_progress,
+                    authority_context=context,
+                )
+        else:
+            result = _load_verified_timezone_gate(
+                trusted,
+                read_only_progress=read_only_progress,
+                authority_context=context,
+            )
         trusted.assert_bound()
         return result
 
@@ -1810,23 +2066,25 @@ def _load_verified_timezone_gate(
     root: TrustedRoot,
     *,
     read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
 ) -> VerifiedTimezoneGate:
+    paths = _timezone_paths(authority_context)
     fixed_snapshots = (
         _required_snapshot(
             root,
-            _CANDIDATE_PATH,
+            paths.candidate,
             "timezone candidate",
             max_bytes=_MAX_CANDIDATE_BYTES,
         ),
         _required_snapshot(
             root,
-            _COVERAGE_REVIEW_PATH,
+            paths.coverage_review,
             "timezone coverage review",
             max_bytes=_MAX_RECEIPT_BYTES,
         ),
         _required_snapshot(
             root,
-            _SEMANTIC_REVIEW_PATH,
+            paths.semantic_review,
             "timezone semantic review",
             max_bytes=_MAX_RECEIPT_BYTES,
         ),
@@ -1838,7 +2096,7 @@ def _load_verified_timezone_gate(
         ),
         _required_snapshot(
             root,
-            _SEAL_PATH,
+            paths.seal,
             "timezone mapping seal receipt",
             max_bytes=_MAX_RECEIPT_BYTES,
         ),
@@ -1855,9 +2113,17 @@ def _load_verified_timezone_gate(
             canonical=True,
         )
     )
-    authority = _current_timezone_authority(
-        root,
-        read_only_progress=read_only_progress,
+    authority = (
+        _current_timezone_authority(
+            root,
+            read_only_progress=read_only_progress,
+            authority_context=authority_context,
+        )
+        if authority_context is not None
+        else _current_timezone_authority(
+            root,
+            read_only_progress=read_only_progress,
+        )
     )
     _rebind_timezone_authority(root, authority)
     candidate_projection = {
@@ -1877,18 +2143,18 @@ def _load_verified_timezone_gate(
         raise ValueError("timezone mapping differs from resolved candidate")
 
     candidate_binding = {
-        "path": _CANDIDATE_PATH.as_posix(),
+        "path": paths.candidate.as_posix(),
         "sha256": _sha256(candidate_snapshot.contents),
     }
     roles_and_reviews = (
         (
             "TIMEZONE_COVERAGE_REVIEW",
-            _COVERAGE_REVIEW_PATH,
+            paths.coverage_review,
             coverage_snapshot,
         ),
         (
             "TIMEZONE_SEMANTIC_REVIEW",
-            _SEMANTIC_REVIEW_PATH,
+            paths.semantic_review,
             semantic_snapshot,
         ),
     )
@@ -1932,9 +2198,17 @@ def _load_verified_timezone_gate(
         raise ValueError("timezone mapping seal authority differs")
 
     _before_timezone_gate_final_rebind()
-    rebound_authority = _current_timezone_authority(
-        root,
-        read_only_progress=read_only_progress,
+    rebound_authority = (
+        _current_timezone_authority(
+            root,
+            read_only_progress=read_only_progress,
+            authority_context=authority_context,
+        )
+        if authority_context is not None
+        else _current_timezone_authority(
+            root,
+            read_only_progress=read_only_progress,
+        )
     )
     _rebind_timezone_authority(root, authority)
     _rebind_timezone_authority(root, rebound_authority)

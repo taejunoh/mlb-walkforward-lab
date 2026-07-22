@@ -9,6 +9,7 @@ import re
 import secrets
 import stat
 import subprocess
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,13 @@ _SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE = Path(
 )
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
+_SOURCE_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches"
+)
+_SOURCE_SCHEDULE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+    "schedule_anchor_inventory.json"
+)
 _GAME_EVIDENCE_INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
 )
@@ -195,6 +203,15 @@ _SOURCE_SUPERSEDES = {
     "quarantine_receipt_sha256": "a2f26dd297fc2f0de084c857e6deb575973f147e8c9712a724d82308a9a693f8",
     "raw_sha256": "6eeedd3877eeef18dae400dba8920dcde0cc79b3ab76b08316385868e89df1e0",
 }
+_SOURCE_RUN_SPEC_SHA256 = (
+    "88a4253d76b0f73694fbdc5ddbe64217c37ae379d7ee80931a64ab7742014850"
+)
+_SOURCE_ACQUISITION_CONTRACT_SHA256 = (
+    "3ddf83fdec9a328f5005fe8f62f4f680f4ef81516acd1aef2f90845b11c11d58"
+)
+_SOURCE_STATIC_BATCH_ID = (
+    "d4d07954d69d91d7f721aee9554e83b925c8d3c3cd60f7dc7efeba9f5ed5c661"
+)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -267,6 +284,67 @@ def _validate_static_schedule_stage(
     _validate_shared_query_bindings(queries, "STATIC_SCHEDULES")
     for query, year in zip(queries, years):
         first, last = SEASON_BOUNDARIES[year]
+        if year == 2019 and query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
+            from .v52_duplicate_gamepk_disposition import (
+                OLD_QUERY_ID,
+                OLD_RAW_SHA256,
+                OLD_REGISTRATION_RELATIVE,
+                OLD_REGISTRATION_SHA256,
+                OLD_QUARANTINE_RELATIVE,
+                OLD_QUARANTINE_SHA256,
+                OLD_RAW_RELATIVE,
+                OLD_RAW_BYTE_COUNT,
+                RETAINED_OBJECT_SHA256,
+                SUPPRESSED_OBJECT_SHA256,
+            )
+
+            expected_derived_range = {
+                "year": 2019,
+                "start_date": first.isoformat(),
+                "end_date": last.isoformat(),
+                "disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+                "game_pk": 565534,
+                "old_authority": {
+                    "query_id": OLD_QUERY_ID,
+                    "query_registration": {
+                        "path": str(OLD_REGISTRATION_RELATIVE),
+                        "sha256": OLD_REGISTRATION_SHA256,
+                    },
+                    "quarantine_receipt": {
+                        "path": str(OLD_QUARANTINE_RELATIVE),
+                        "sha256": OLD_QUARANTINE_SHA256,
+                    },
+                    "raw": {
+                        "path": str(OLD_RAW_RELATIVE),
+                        "sha256": OLD_RAW_SHA256,
+                        "byte_count": OLD_RAW_BYTE_COUNT,
+                    },
+                },
+                "suppressed_occurrence": {
+                    "date_index": 54,
+                    "game_index": 5,
+                    "sha256": SUPPRESSED_OBJECT_SHA256,
+                },
+                "retained_occurrence": {
+                    "date_index": 161,
+                    "game_index": 12,
+                    "sha256": RETAINED_OBJECT_SHA256,
+                },
+            }
+            if (
+                query.source != "mlb_schedule_game_feed"
+                or query.grain != "season_schedule_and_game"
+                or query.expected_media_type != "application/json"
+                or query.parser_version != "v5.2.1"
+                or query.parent_query_id is not None
+                or dict(query.parameters) != {}
+                or dict(query.requested_range) != expected_derived_range
+                or query.run_spec_sha256 != _SOURCE_RUN_SPEC_SHA256
+                or query.acquisition_contract_sha256
+                != _SOURCE_ACQUISITION_CONTRACT_SHA256
+            ):
+                raise ValueError("STATIC_SCHEDULES derived 2019 query differs")
+            continue
         expected_parameters = {
             "sportId": 1,
             "gameType": "R",
@@ -1368,9 +1446,24 @@ def build_static_batch(
     acquisition_contract_path: Path,
 ) -> QueryBatch:
     inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+    context = _load_static_contracts(run_spec_path, acquisition_contract_path)
+    disposition_query: LogicalQuery | None = None
+    if isinstance(context.authority, SourceRunSpec):
+        from .v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+
+        disposition_query = build_duplicate_disposition_authority(
+            context.repository_root,
+            source_run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+        ).query
 
     queries: list[LogicalQuery] = []
     for season in inputs.seasons:
+        if season.year == 2019 and disposition_query is not None:
+            queries.append(disposition_query)
+            continue
         queries.append(
             _logical_query(
                 source="mlb_schedule_game_feed",
@@ -1449,6 +1542,121 @@ def _validate_binding_hashes(
     _validate_sha256(acquisition_contract_sha256, "acquisition_contract_sha256")
 
 
+def _batch_root_for_batch(root: Path, batch: QueryBatch) -> Path:
+    """Select only the authenticated authority namespace of this batch."""
+    if not batch.queries:
+        raise ValueError("query batch must contain authority-bound queries")
+    source_bound = all(
+        query.run_spec_sha256 == _SOURCE_RUN_SPEC_SHA256
+        and query.acquisition_contract_sha256
+        == _SOURCE_ACQUISITION_CONTRACT_SHA256
+        for query in batch.queries
+    )
+    if not source_bound:
+        return _ACQUISITION_BATCH_ROOT
+    source_context = _load_static_contracts(
+        root / _SOURCE_RUN_SPEC_RELATIVE,
+        root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if (
+        source_context.authority_sha256 != _SOURCE_RUN_SPEC_SHA256
+        or source_context.acquisition_contract_sha256
+        != _SOURCE_ACQUISITION_CONTRACT_SHA256
+    ):
+        raise ValueError("query batch source authority differs")
+    return _SOURCE_ACQUISITION_BATCH_ROOT
+
+
+def _source_reference_batch_id(root: Path) -> str | None:
+    """Derive the source reference ID from authority artifacts, never batch paths."""
+    try:
+        os.lstat(root / _SOURCE_RUN_SPEC_RELATIVE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("source RunSpec identity is unavailable") from exc
+    try:
+        os.lstat(root / _SOURCE_SCHEDULE_INVENTORY_RELATIVE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("source schedule inventory identity is unavailable") from exc
+    context = _load_static_contracts(
+        root / _SOURCE_RUN_SPEC_RELATIVE,
+        root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    contents = _read_repository_file(
+        root,
+        _SOURCE_SCHEDULE_INVENTORY_RELATIVE,
+        "source schedule anchor inventory",
+    )
+    inventory = _parse_json_object(
+        contents, "source schedule anchor inventory", canonical=True
+    )
+    return _build_schedule_reference_batch_from_inventory(
+        inventory,
+        inventory_sha256=_sha256_bytes(contents),
+        run_spec_sha256=context.authority_sha256,
+        acquisition_contract_sha256=context.acquisition_contract_sha256,
+    ).batch_id
+
+
+def _batch_root_for_authority(
+    root: Path,
+    authority: RunSpec | SourceRunSpec | None,
+    *,
+    batch_id: str,
+) -> Path:
+    if authority is None:
+        if batch_id == _SOURCE_STATIC_BATCH_ID:
+            context = _load_static_contracts(
+                root / _SOURCE_RUN_SPEC_RELATIVE,
+                root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            if build_static_batch(
+                context.authority_path, context.acquisition_contract_path
+            ).batch_id != batch_id:
+                raise ValueError("source static batch authority differs")
+            return _SOURCE_ACQUISITION_BATCH_ROOT
+        if _source_reference_batch_id(root) == batch_id:
+            return _SOURCE_ACQUISITION_BATCH_ROOT
+        return _ACQUISITION_BATCH_ROOT
+    if isinstance(authority, RunSpec):
+        return _ACQUISITION_BATCH_ROOT
+    if isinstance(authority, SourceRunSpec):
+        context = _load_static_contracts(
+            root / _SOURCE_RUN_SPEC_RELATIVE,
+            root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        expected = _SOURCE_ACQUISITION_BATCH_ROOT
+    else:
+        raise TypeError("query batch authority must be a RunSpec or SourceRunSpec")
+    if context.authority != authority:
+        raise ValueError("query batch authority object differs from repository bytes")
+    return expected
+
+
+def _reject_batch_shadow(root: Path, selected_root: Path, batch_id: str) -> None:
+    alternate = (
+        _SOURCE_ACQUISITION_BATCH_ROOT
+        if selected_root == _ACQUISITION_BATCH_ROOT
+        else _ACQUISITION_BATCH_ROOT
+    )
+    try:
+        os.lstat(root / alternate / f"{batch_id}.json")
+    except FileNotFoundError:
+        return
+    raise ValueError("query batch is shadowed across authority namespaces")
+
+
+def _rebind_batch_namespace(
+    root: Path, selected_root: Path, batch: QueryBatch
+) -> None:
+    if _batch_root_for_batch(root, batch) != selected_root:
+        raise ValueError("query batch authority namespace changed")
+    _reject_batch_shadow(root, selected_root, batch.batch_id)
+
+
 _SCHEDULE_INVENTORY_KEYS = frozenset(
     {
         "acquisition_contract",
@@ -1464,7 +1672,7 @@ _SCHEDULE_INVENTORY_KEYS = frozenset(
         "venue_ids",
     }
 )
-_SCHEDULE_ANCHOR_KEYS = frozenset(
+_SOURCE_SCHEDULE_ANCHOR_KEYS = frozenset(
     {
         "alternate_site",
         "away_score",
@@ -1477,6 +1685,7 @@ _SCHEDULE_ANCHOR_KEYS = frozenset(
         "neutral_site",
         "official_date",
         "played",
+        "raw_game_object_sha256",
         "scheduled_innings",
         "scheduled_start_utc",
         "season",
@@ -1486,6 +1695,9 @@ _SCHEDULE_ANCHOR_KEYS = frozenset(
         "winner_team_id",
     }
 )
+_OLD_SCHEDULE_ANCHOR_KEYS = _SOURCE_SCHEDULE_ANCHOR_KEYS - {
+    "raw_game_object_sha256"
+}
 _SCHEDULE_SOURCE_KEYS = frozenset(
     {
         "game_count",
@@ -1501,6 +1713,8 @@ _SCHEDULE_SOURCE_KEYS = frozenset(
         "unplayed_game_count",
     }
 )
+_DERIVED_SCHEDULE_SOURCE_KEYS = _SCHEDULE_SOURCE_KEYS | {"occurrence_counts"}
+_SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
 
 
 def _inventory_binding(
@@ -1543,22 +1757,37 @@ def _validated_schedule_inventory_anchors(
         raise ValueError("schedule inventory SHA-256 differs from canonical bytes")
     if set(anchor_inventory) != _SCHEDULE_INVENTORY_KEYS:
         raise ValueError("schedule inventory top-level keys differ")
+    run_id = anchor_inventory.get("run_id")
+    source_branch = run_id == _SOURCE_RUN_ID
     if (
         anchor_inventory.get("artifact_kind") != "SCHEDULE_ANCHOR_INVENTORY"
         or anchor_inventory.get("schema_version") != 1
-        or anchor_inventory.get("run_id") != "historical_walkforward_500"
+        or run_id not in {"historical_walkforward_500", _SOURCE_RUN_ID}
     ):
         raise ValueError("schedule inventory identity differs")
+    expected_run_path = (
+        _SOURCE_RUN_SPEC_RELATIVE if source_branch else _RUN_SPEC_RELATIVE
+    ).as_posix()
+    expected_contract_path = (
+        _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+        if source_branch
+        else _ACQUISITION_CONTRACT_RELATIVE
+    ).as_posix()
+    batch_root = (
+        Path("audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches")
+        if source_branch
+        else _ACQUISITION_BATCH_ROOT
+    )
     _inventory_binding(
         anchor_inventory.get("run_spec"),
         "RunSpec",
-        expected_path=_RUN_SPEC_RELATIVE.as_posix(),
+        expected_path=expected_run_path,
         expected_sha256=run_spec_sha256,
     )
     _inventory_binding(
         anchor_inventory.get("acquisition_contract"),
         "acquisition contract",
-        expected_path=_ACQUISITION_CONTRACT_RELATIVE.as_posix(),
+        expected_path=expected_contract_path,
         expected_sha256=acquisition_contract_sha256,
     )
     static_batch = anchor_inventory.get("static_batch")
@@ -1575,7 +1804,7 @@ def _validated_schedule_inventory_anchors(
         {"path": static_batch.get("path"), "sha256": static_batch.get("sha256")},
         "static batch",
         expected_path=(
-            _ACQUISITION_BATCH_ROOT / f"{static_batch_id}.json"
+            batch_root / f"{static_batch_id}.json"
         ).as_posix(),
     )
 
@@ -1595,7 +1824,12 @@ def _validated_schedule_inventory_anchors(
         season: [] for season in range(2018, 2025)
     }
     for raw in raw_anchors:
-        if not isinstance(raw, Mapping) or set(raw) != _SCHEDULE_ANCHOR_KEYS:
+        expected_anchor_keys = (
+            _SOURCE_SCHEDULE_ANCHOR_KEYS
+            if source_branch
+            else _OLD_SCHEDULE_ANCHOR_KEYS
+        )
+        if not isinstance(raw, Mapping) or set(raw) != expected_anchor_keys:
             raise ValueError("schedule inventory anchor keys differ")
         season = raw.get("season")
         game_pk = raw.get("game_pk")
@@ -1617,6 +1851,11 @@ def _validated_schedule_inventory_anchors(
             raise ValueError("schedule inventory anchor season differs")
         if type(raw.get("played")) is not bool:
             raise ValueError("schedule inventory anchor played differs")
+        if source_branch:
+            _validate_sha256(
+                raw.get("raw_game_object_sha256"),
+                "schedule inventory raw-object provenance",
+            )
         official = _iso_date(
             raw.get("official_date"), "schedule inventory official_date"
         )
@@ -1637,6 +1876,26 @@ def _validated_schedule_inventory_anchors(
         venues.add(venue_id)
         anchors.append(raw)
         by_season[season].append(raw)
+
+    if source_branch:
+        from .v52_duplicate_gamepk_disposition import (
+            RETAINED_OBJECT_SHA256,
+            SUPPRESSED_OBJECT_SHA256,
+        )
+
+        if any(
+            anchor.get("raw_game_object_sha256") == SUPPRESSED_OBJECT_SHA256
+            for anchor in anchors
+        ):
+            raise ValueError("schedule inventory contains suppressed raw occurrence")
+
+        retained = [anchor for anchor in anchors if anchor.get("game_pk") == 565534]
+        if len(retained) != 1 or (
+            retained[0].get("venue_id") != 10
+            or retained[0].get("scheduled_start_utc") != "2019-09-07T00:15:00Z"
+            or retained[0].get("raw_game_object_sha256") != RETAINED_OBJECT_SHA256
+        ):
+            raise ValueError("schedule inventory retained 565534 anchor differs")
 
     inventory_team_ids = anchor_inventory.get("team_ids")
     inventory_venue_ids = anchor_inventory.get("venue_ids")
@@ -1668,7 +1927,13 @@ def _validated_schedule_inventory_anchors(
     ):
         raise ValueError("schedule inventory season sources differ")
     for season, source in zip(range(2018, 2025), sources, strict=True):
-        if not isinstance(source, Mapping) or set(source) != _SCHEDULE_SOURCE_KEYS:
+        derived_2019 = source_branch and season == 2019
+        expected_keys = (
+            _DERIVED_SCHEDULE_SOURCE_KEYS
+            if derived_2019
+            else _SCHEDULE_SOURCE_KEYS
+        )
+        if not isinstance(source, Mapping) or set(source) != expected_keys:
             raise ValueError("schedule inventory season source keys differ")
         rows = by_season[season]
         played = sum(row.get("played") is True for row in rows)
@@ -1681,12 +1946,26 @@ def _validated_schedule_inventory_anchors(
             or source.get("game_count") != len(rows)
             or source.get("played_game_count") != played
             or source.get("unplayed_game_count") != len(rows) - played
-            or source.get("storage_mode")
-            not in {"FETCHED_RAW", "PROTECTED_LEGACY_REFERENCE"}
         ):
             raise ValueError("schedule inventory season source differs")
         _validate_sha256(source.get("query_id"), "schedule source query ID")
-        _validate_sha256(source.get("raw_sha256"), "schedule source raw SHA-256")
+        if derived_2019:
+            from .v52_duplicate_gamepk_disposition import EXPECTED_OCCURRENCE_COUNTS
+
+            if (
+                source.get("storage_mode") != "DERIVED_DISPOSITION"
+                or source.get("raw_sha256") is not None
+                or source.get("occurrence_counts")
+                != dict(EXPECTED_OCCURRENCE_COUNTS)
+            ):
+                raise ValueError("schedule inventory derived 2019 source differs")
+        else:
+            if source.get("storage_mode") not in {
+                "FETCHED_RAW",
+                "PROTECTED_LEGACY_REFERENCE",
+            }:
+                raise ValueError("schedule inventory season source differs")
+            _validate_sha256(source.get("raw_sha256"), "schedule source raw SHA-256")
         _inventory_binding(source.get("query_sidecar"), "query sidecar")
         _inventory_binding(source.get("success_receipt"), "success receipt")
     return anchors
@@ -1864,7 +2143,7 @@ def build_schedule_reference_batch(
 ) -> QueryBatch:
     repository_root = Path(os.path.abspath(os.fspath(repository_root)))
     run_spec_path = Path(os.path.abspath(os.fspath(run_spec_path)))
-    authority_root, _ = _authority_branch(
+    authority_root, authority_branch = _authority_branch(
         run_spec_path, acquisition_contract_path
     )
     if authority_root != repository_root:
@@ -1872,9 +2151,17 @@ def build_schedule_reference_batch(
     from .protocols import load_run_spec
     from .v52_schedule_inventory import load_verified_schedule_anchor_inventory
 
+    if authority_branch.schema_index == 1:
+        authority = _load_static_contracts(
+            run_spec_path, acquisition_contract_path
+        ).authority
+        if not isinstance(authority, SourceRunSpec):
+            raise ValueError("source reference authority differs")
+    else:
+        authority = load_run_spec(run_spec_path)
     verified = load_verified_schedule_anchor_inventory(
         repository_root,
-        load_run_spec(run_spec_path),
+        authority,
         acquisition_contract_path=acquisition_contract_path,
         static_batch_id=static_batch_id,
         evidence_root=evidence_root,
@@ -1965,6 +2252,65 @@ def _load_fixed_reference_batch_authority(
     )
 
 
+def _load_source_reference_batch_authority(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    from .v52_schedule_inventory import (
+        _read_inventory_contents,
+        load_verified_schedule_anchor_inventory,
+    )
+
+    context = _load_static_contracts(
+        repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+        repository_root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if not isinstance(context.authority, SourceRunSpec):
+        raise ValueError("source reference authority differs")
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(repository_root)
+        / "schedule_anchor_inventory.json"
+    )
+    inventory_record = _parse_json_object(
+        _read_inventory_contents(repository_root, inventory_relative),
+        "source schedule anchor inventory",
+        canonical=True,
+    )
+    static_binding = inventory_record.get("static_batch")
+    if not isinstance(static_binding, dict):
+        raise ValueError("source schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_binding.get("batch_id"), "source schedule inventory static batch ID"
+    )
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        context.authority,
+        acquisition_contract_path=context.acquisition_contract_path,
+        static_batch_id=static_batch_id,
+        evidence_root=context.raw_root,
+        read_only_progress=read_only_progress,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("source schedule inventory authority bindings differ")
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "source schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "source schedule acquisition contract SHA-256",
+        ),
+    )
+
+
 def _validate_reference_batch_authority(
     repository_root: Path,
     batch: QueryBatch,
@@ -1973,9 +2319,15 @@ def _validate_reference_batch_authority(
 ) -> None:
     if batch.stage != "REFERENCE_INPUTS":
         return
-    expected = _load_fixed_reference_batch_authority(
-        repository_root,
-        read_only_progress=read_only_progress,
+    expected = (
+        _load_source_reference_batch_authority(
+            repository_root, read_only_progress=read_only_progress
+        )
+        if _batch_root_for_batch(repository_root, batch)
+        == _SOURCE_ACQUISITION_BATCH_ROOT
+        else _load_fixed_reference_batch_authority(
+            repository_root, read_only_progress=read_only_progress
+        )
     )
     if batch != expected:
         raise ValueError(
@@ -2149,6 +2501,32 @@ def _validate_participant_batch_authority(
         raise ValueError("PARTICIPANT_DERIVED differs from fixed game inventory replay")
 
 
+def _is_source_static_batch(batch: QueryBatch) -> bool:
+    return (
+        batch.stage == "STATIC_SCHEDULES"
+        and bool(batch.queries)
+        and all(
+            query.run_spec_sha256 == _SOURCE_RUN_SPEC_SHA256
+            and query.acquisition_contract_sha256
+            == _SOURCE_ACQUISITION_CONTRACT_SHA256
+            for query in batch.queries
+        )
+    )
+
+
+def _validate_source_static_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if not _is_source_static_batch(batch):
+        return
+    expected = build_static_batch(
+        repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+        repository_root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if batch != expected:
+        raise ValueError("source STATIC_SCHEDULES differs from authority replay")
+
+
 def _is_statcast_root_batch(batch: QueryBatch) -> bool:
     return (
         batch.stage == "REMAINING"
@@ -2213,6 +2591,7 @@ def _validate_query_batch_authority(
     *,
     read_only_progress: bool = False,
 ) -> None:
+    _validate_source_static_batch_authority(repository_root, batch)
     _validate_reference_batch_authority(
         repository_root,
         batch,
@@ -2858,8 +3237,10 @@ def _open_existing_directory(parent_fd: int, name: str) -> int:
         raise
 
 
-def _verify_opened_batch_chain(root: Path, descriptors: Sequence[int]) -> None:
-    expected_components = _ACQUISITION_BATCH_ROOT.parts
+def _verify_opened_batch_chain(
+    root: Path, descriptors: Sequence[int], batch_root: Path
+) -> None:
+    expected_components = batch_root.parts
     if len(descriptors) != len(expected_components) + 1:
         raise ValueError("query batch ancestor chain differs")
     fresh_root = _open_root(root)
@@ -2897,15 +3278,20 @@ def _load_query_batch(
     *,
     invoke_authority_hook: bool,
     read_only_progress: bool = False,
+    authority: RunSpec | SourceRunSpec | None = None,
 ) -> QueryBatch:
     if type(invoke_authority_hook) is not bool:
         raise TypeError("invoke_authority_hook must be a bool")
     root = Path(root)
     requested_id = _validate_sha256(batch_id, "batch_id")
+    batch_root = _batch_root_for_authority(
+        root, authority, batch_id=requested_id
+    )
+    _reject_batch_shadow(root, batch_root, requested_id)
     descriptors = [_open_root(root)]
     try:
         current = descriptors[0]
-        for component in _ACQUISITION_BATCH_ROOT.parts:
+        for component in batch_root.parts:
             current = _open_existing_directory(current, component)
             descriptors.append(current)
         loaded = _read_linked_regular(current, f"{requested_id}.json", "query batch")
@@ -2956,11 +3342,20 @@ def _load_query_batch(
         }
         if batch.batch_id != requested_id or record != expected:
             raise ValueError("query batch canonical ID binding differs")
-        _validate_query_batch_authority(
-            root,
-            batch,
-            read_only_progress=read_only_progress,
+        if _batch_root_for_batch(root, batch) != batch_root:
+            raise ValueError("query batch is stored under the wrong authority root")
+        validation_depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+        validation_token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(
+            validation_depth + 1
         )
+        try:
+            _validate_query_batch_authority(
+                root,
+                batch,
+                read_only_progress=read_only_progress,
+            )
+        finally:
+            _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(validation_token)
         rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
         if rebound is None:
             raise ValueError("query batch is missing after reconstruction")
@@ -2969,9 +3364,10 @@ def _load_query_batch(
             rebound_metadata
         ) != _batch_file_identity(metadata):
             raise ValueError("query batch identity or bytes changed during load")
-        _verify_opened_batch_chain(root, descriptors)
+        _verify_opened_batch_chain(root, descriptors, batch_root)
         if invoke_authority_hook and (
-            batch.stage == "PARTICIPANT_DERIVED"
+            batch.stage in {"PARTICIPANT_DERIVED", "REFERENCE_INPUTS"}
+            or _is_source_static_batch(batch)
             or _is_statcast_root_batch(batch)
             or _is_legacy_partition_batch_candidate(root, batch)
         ):
@@ -2980,6 +3376,7 @@ def _load_query_batch(
                 batch,
                 read_only_progress=read_only_progress,
             )
+        _rebind_batch_namespace(root, batch_root, batch)
         return batch
     finally:
         for descriptor in reversed(descriptors):
@@ -2998,6 +3395,25 @@ def load_query_batch(
         invoke_authority_hook=True,
         read_only_progress=read_only_progress,
     )
+
+
+def _load_query_batch_for_authority(
+    repository_root: Path,
+    batch_id: str,
+    authority: RunSpec | SourceRunSpec,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    return _load_query_batch(
+        repository_root,
+        batch_id,
+        invoke_authority_hook=True,
+        read_only_progress=read_only_progress,
+        authority=authority,
+    )
+
+
+load_query_batch_for_authority = _load_query_batch_for_authority
 
 
 def _reconcile_batch_final(
@@ -3100,6 +3516,11 @@ def _before_query_batch_authority_rebind() -> None:
     """Deterministic authority-mutation test hook; production does nothing."""
 
 
+_QUERY_BATCH_AUTHORITY_REBIND_DEPTH: ContextVar[int] = ContextVar(
+    "query_batch_authority_rebind_depth", default=0
+)
+
+
 def _rebind_query_batch_authority(
     root: Path,
     batch: QueryBatch,
@@ -3112,16 +3533,23 @@ def _rebind_query_batch_authority(
             "REFERENCE_INPUTS",
             "PARTICIPANT_DERIVED",
         }
+        and not _is_source_static_batch(batch)
         and not _is_statcast_root_batch(batch)
         and not _is_legacy_partition_batch_candidate(root, batch)
     ):
         return
-    _before_query_batch_authority_rebind()
-    _validate_query_batch_authority(
-        root,
-        batch,
-        read_only_progress=read_only_progress,
-    )
+    depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+    token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(depth + 1)
+    try:
+        if depth == 0:
+            _before_query_batch_authority_rebind()
+        _validate_query_batch_authority(
+            root,
+            batch,
+            read_only_progress=read_only_progress,
+        )
+    finally:
+        _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(token)
 
 
 def _cleanup_owned_query_batch_final(
@@ -3147,7 +3575,16 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     if not isinstance(batch, QueryBatch):
         raise TypeError("batch must be a QueryBatch")
     root = Path(root)
-    _validate_query_batch_authority(root, batch)
+    validation_depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+    validation_token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(
+        validation_depth + 1
+    )
+    try:
+        _validate_query_batch_authority(root, batch)
+    finally:
+        _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(validation_token)
+    batch_root = _batch_root_for_batch(root, batch)
+    _reject_batch_shadow(root, batch_root, batch.batch_id)
     payload = _batch_payload(batch.stage, batch.derived_from_sha256, batch.queries)
     expected_id = _sha256_bytes(_canonical_json_bytes(payload))
     if batch.batch_id != expected_id:
@@ -3158,7 +3595,7 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
     descriptors = [root_fd]
     try:
         current = root_fd
-        for component in _ACQUISITION_BATCH_ROOT.parts:
+        for component in batch_root.parts:
             current = _open_or_create_directory(current, component)
             descriptors.append(current)
         fcntl.flock(current, fcntl.LOCK_EX)
@@ -3168,7 +3605,8 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
             _cleanup_prelink_batch_temps(current, batch.batch_id)
             if existing is not None:
                 _rebind_query_batch_authority(root, batch)
-                return root / _ACQUISITION_BATCH_ROOT / name
+                _rebind_batch_namespace(root, batch_root, batch)
+                return root / batch_root / name
             temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
             flags = (
                 os.O_WRONLY
@@ -3210,7 +3648,8 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
                     if concurrent is None:
                         raise ValueError("concurrent query batch final disappeared")
                     _rebind_query_batch_authority(root, batch)
-                    return root / _ACQUISITION_BATCH_ROOT / name
+                    _rebind_batch_namespace(root, batch_root, batch)
+                    return root / batch_root / name
                 _unlink_owned_temp(current, temp_name, descriptor)
                 temp_exists = False
                 created_identity = _batch_file_identity(os.fstat(descriptor))
@@ -3222,7 +3661,8 @@ def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
                     ):
                         raise ValueError("query batch bytes changed after publication")
                     _rebind_query_batch_authority(root, batch)
-                    return root / _ACQUISITION_BATCH_ROOT / name
+                    _rebind_batch_namespace(root, batch_root, batch)
+                    return root / batch_root / name
                 except BaseException:
                     _cleanup_owned_query_batch_final(
                         current,

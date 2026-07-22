@@ -10,15 +10,17 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import jsonschema
 from jsonschema import Draft202012Validator, FormatChecker
 
 from mlb_backtest.protocols import load_run_spec, load_source_run_spec
-from mlb_backtest.v52_evidence import AttemptCapture, V52EvidenceStore
+from mlb_backtest.v52_evidence import AttemptCapture, V52EvidenceStore, logical_query_id
 from mlb_backtest.v52_query_plan import build_static_batch, publish_query_batch
 from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
 
@@ -199,7 +201,271 @@ def _kwargs(fixture: _Fixture) -> dict[str, object]:
     }
 
 
+@dataclasses.dataclass(frozen=True)
+class _SourceFixture:
+    root: Path
+    evidence_root: Path
+    run_spec: object
+    contract_path: Path
+    batch_id: str
+
+
+def _source_fixture(base: Path) -> _SourceFixture:
+    """Copy the authenticated source authority and forensic 565534 inputs offline."""
+    from mlb_backtest.v52_duplicate_gamepk_disposition import (
+        OLD_QUARANTINE_RELATIVE,
+        OLD_RAW_RELATIVE,
+        OLD_REGISTRATION_RELATIVE,
+        build_duplicate_disposition_authority,
+        publish_duplicate_gamepk_disposition,
+    )
+    root = (base / "repo").resolve()
+    authority_files = tuple(
+        dict.fromkeys(
+            (
+                *_SOURCE_AUTHORITY_FILES,
+                Path("schemas/v5_2_run_spec.schema.json"),
+                Path("schemas/v5_2_derived_disposition_sidecar.schema.json"),
+            )
+        )
+    )
+    for relative in authority_files:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    for relative in (
+        OLD_REGISTRATION_RELATIVE,
+        OLD_QUARANTINE_RELATIVE,
+        OLD_RAW_RELATIVE,
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    for relative in (
+        "data/v5_2_qd/historical_superseding_565534/raw",
+        "data/v5_2_qd/historical_superseding_565534/sources",
+        "audit/v5_2_qd/historical_superseding_565534/acquisition",
+        "audit/v5_2_qd/historical_superseding_565534/execution",
+        "reports/v5_2_qd/historical_superseding_565534",
+    ):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "schedule@example.test"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Schedule Test"], cwd=root, check=True
+    )
+    subprocess.run(["git", "add", *map(str, authority_files)], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "source authority"], cwd=root, check=True)
+
+    source_run_path = root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT)
+    source_contract_path = root / SOURCE_CONTRACT_PATH.relative_to(ROOT)
+    source_run = load_source_run_spec(source_run_path)
+    batch = build_static_batch(source_run_path, source_contract_path)
+    publish_query_batch(root, batch)
+    authority = build_duplicate_disposition_authority(
+        root,
+        source_run_spec_path=source_run_path,
+        acquisition_contract_path=source_contract_path,
+    )
+    store = V52EvidenceStore(
+        root / "data/v5_2_qd/historical_superseding_565534/raw"
+    )
+    for index, query in enumerate(batch.queries):
+        if index == 1:
+            publish_duplicate_gamepk_disposition(store, authority)
+            continue
+        raw = _schedule_raw(query, index)
+        sidecar = recompute_schedule_anchor_sidecar(raw, query)
+        with store.acquire_query(query) as lease:
+            store.publish_fetched(
+                query,
+                store.next_attempt_number(lease),
+                _capture(raw),
+                sidecar["semantics"],
+            )
+
+    return _SourceFixture(
+        root=root,
+        evidence_root=store.root,
+        run_spec=source_run,
+        contract_path=source_contract_path,
+        batch_id=batch.batch_id,
+    )
+
+
+def _source_registry_fixture(base: Path) -> _SourceFixture:
+    """Build a source fixture with the real append-only execution registry.
+
+    The normal source fixture intentionally stays small for parser/evidence
+    tests.  Integration tests that exercise the registry loader need the
+    complete bound-code tuple and Task 0 lineage copied into the fixture
+    repository before initializing the registry.
+    """
+    from mlb_backtest.execution_registry import (
+        advance_execution_phase,
+        initialize_execution_registry,
+    )
+    from tests.test_execution_registry import (
+        BASELINE_RELATIVE,
+        BOUND_EXECUTION_CODE,
+        BOUND_SCHEMA_PATHS,
+        PROTECTED_RELATIVE,
+    )
+
+    fixture = _source_fixture(base)
+    root = fixture.root
+    for relative in (
+        BASELINE_RELATIVE,
+        PROTECTED_RELATIVE,
+        *BOUND_EXECUTION_CODE,
+        *BOUND_SCHEMA_PATHS,
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "execution registry authority"],
+        cwd=root,
+        check=True,
+    )
+    initialize_execution_registry(
+        root,
+        fixture.run_spec,
+        design_path=root
+        / "docs/superpowers/specs/"
+        / "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md",
+        plan_path=root
+        / "docs/superpowers/plans/"
+        / "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md",
+        acquisition_contract_path=fixture.contract_path,
+    )
+    advance_execution_phase(
+        root,
+        fixture.run_spec,
+        expected_phase="DESIGN_ACCEPTED",
+        next_phase="ACQUIRING",
+        inventory_path=root / PROTECTED_RELATIVE,
+        validation_receipts=(),
+    )
+    return fixture
+
+
+def _memoized_registry_git_patch():
+    """Isolate immutable Git plumbing while exercising real registry loaders."""
+    import mlb_backtest.execution_registry as execution_registry
+    import mlb_backtest.v52_query_plan as query_plan
+
+    original = execution_registry._git
+    original_bytes = execution_registry._git_bytes
+    original_capture = execution_registry._capture_git_snapshot
+    original_head_blob = query_plan._verify_head_blob
+    cache: dict[tuple[str, tuple[str, ...]], str] = {}
+
+    def cached(root: Path, *args: str) -> str:
+        key = (os.fspath(root), tuple(args))
+        if key not in cache:
+            cache[key] = original(root, *args)
+        return cache[key]
+
+    bytes_cache: dict[tuple[str, tuple[str, ...]], bytes] = {}
+
+    def cached_bytes(root: Path, *args: str) -> bytes:
+        key = (os.fspath(root), tuple(args))
+        if key not in bytes_cache:
+            bytes_cache[key] = original_bytes(root, *args)
+        return bytes_cache[key]
+
+    head_cache: dict[str, object] = {}
+
+    def stable_snapshot(root: Path, _evidence: Mapping[str, object]):
+        key = os.fspath(root)
+        if key not in head_cache:
+            head_cache[key] = original_capture(root, _evidence)
+        return head_cache[key]
+
+    head_blob_cache: dict[tuple[object, ...], str] = {}
+
+    def cached_head_blob(
+        root: Path,
+        relative: Path,
+        contents: bytes,
+        label: str,
+        *,
+        expected_blob: object | None = None,
+    ) -> str:
+        key = (
+            os.fspath(root),
+            relative.as_posix(),
+            hashlib.sha256(contents).hexdigest(),
+            label,
+            expected_blob,
+        )
+        if key not in head_blob_cache:
+            head_blob_cache[key] = original_head_blob(
+                root,
+                relative,
+                contents,
+                label,
+                expected_blob=expected_blob,
+            )
+        return head_blob_cache[key]
+
+    stack = ExitStack()
+    stack.enter_context(
+        patch.object(execution_registry, "_git_bytes", cached_bytes)
+    )
+    stack.enter_context(patch.object(execution_registry, "_git", cached))
+    stack.enter_context(
+        patch.object(execution_registry, "_capture_git_snapshot", stable_snapshot)
+    )
+    stack.enter_context(patch.object(query_plan, "_verify_head_blob", cached_head_blob))
+    return stack
+
+
+def _memoized_disposition_projection_patch():
+    """Memoize the immutable 2019 projection after one real recomputation."""
+    from mlb_backtest.v52_duplicate_gamepk_disposition import (
+        DuplicateGamePkDispositionAuthority,
+    )
+
+    original = DuplicateGamePkDispositionAuthority.recompute
+    cache: dict[tuple[object, ...], object] = {}
+
+    def cached(authority: DuplicateGamePkDispositionAuthority):
+        key = (
+            authority.repository_root,
+            authority.source_run_spec_path,
+            authority.acquisition_contract_path,
+            authority._snapshots,
+        )
+        if key not in cache:
+            cache[key] = original(authority)
+        return cache[key]
+
+    return patch.object(
+        DuplicateGamePkDispositionAuthority,
+        "recompute",
+        cached,
+    )
+
+
 class V52ScheduleInventoryTest(unittest.TestCase):
+    @staticmethod
+    def _checkpoint(fixture: _SourceFixture, disposition_id: str, *, completed: tuple[str, ...] | None = None):
+        return SimpleNamespace(
+            query_batch_ids=(fixture.batch_id,),
+            dispositioned_query_ids=(disposition_id,),
+            completed_query_ids=completed if completed is not None else (disposition_id,),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+
     def test_source_authority_rejects_wrong_raw_root_and_cross_pair_before_evidence(self) -> None:
         from mlb_backtest.v52_schedule_inventory import (
             build_schedule_anchor_inventory,
@@ -559,6 +825,363 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bounded|limit|exceeds"):
                 load_verified_schedule_anchor_inventory(**_kwargs(fixture))
 
+    def test_schedule_inventory_contains_one_565534_and_only_retained_children(self) -> None:
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            EXPECTED_OCCURRENCE_COUNTS,
+            RETAINED_OBJECT_SHA256,
+            SUPPRESSED_OBJECT_SHA256,
+            build_duplicate_disposition_authority,
+        )
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_query_plan import build_static_batch
+        from mlb_backtest.v52_query_plan import (
+            _build_schedule_reference_batch_from_inventory,
+        )
+        from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_inventory
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = _source_fixture(Path(td).resolve())
+            disposition_id = logical_query_id(
+                build_static_batch(
+                    fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+                    fixture.contract_path,
+                ).queries[1]
+            )
+            checkpoint = self._checkpoint(fixture, disposition_id)
+            with (
+                patch(
+                    "mlb_backtest.execution_registry.load_execution_registry",
+                    return_value=SimpleNamespace(phase="ACQUIRING"),
+                ),
+                patch(
+                    "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                    return_value=checkpoint,
+                ),
+            ):
+                payload = build_schedule_anchor_inventory(
+                    fixture.root,
+                    fixture.run_spec,
+                    acquisition_contract_path=fixture.contract_path,
+                    static_batch_id=fixture.batch_id,
+                    evidence_root=fixture.evidence_root,
+                )
+
+            self.assertEqual(payload["run_id"], fixture.run_spec.run_id)
+            self.assertEqual(
+                [row["season"] for row in payload["season_sources"]],
+                list(range(2018, 2025)),
+            )
+            source_2019 = payload["season_sources"][1]
+            self.assertEqual(source_2019["storage_mode"], "DERIVED_DISPOSITION")
+            self.assertIsNone(source_2019["raw_sha256"])
+            authority = build_duplicate_disposition_authority(
+                fixture.root,
+                source_run_spec_path=fixture.root
+                / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+                acquisition_contract_path=fixture.contract_path,
+            )
+            self.assertEqual(
+                source_2019["query_id"], logical_query_id(authority.query)
+            )
+            for binding_name in ("query_sidecar", "success_receipt"):
+                binding = source_2019[binding_name]
+                self.assertEqual(set(binding), {"path", "sha256"})
+                self.assertTrue(binding["path"])
+                self.assertEqual(len(binding["sha256"]), 64)
+            self.assertEqual(
+                source_2019["occurrence_counts"], EXPECTED_OCCURRENCE_COUNTS
+            )
+            self.assertEqual(
+                payload["static_batch"]["batch_id"], fixture.batch_id
+            )
+            anchors = payload["anchors"]
+            retained = [anchor for anchor in anchors if anchor["game_pk"] == 565534]
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0]["venue_id"], 10)
+            self.assertEqual(
+                retained[0]["scheduled_start_utc"], "2019-09-07T00:15:00Z"
+            )
+            self.assertEqual(
+                retained[0]["raw_game_object_sha256"], RETAINED_OBJECT_SHA256
+            )
+            self.assertFalse(
+                any(
+                    anchor.get("raw_game_object_sha256") == SUPPRESSED_OBJECT_SHA256
+                    for anchor in anchors
+                )
+            )
+            self.assertTrue(
+                all(
+                    isinstance(anchor.get("raw_game_object_sha256"), str)
+                    and len(anchor["raw_game_object_sha256"]) == 64
+                    for anchor in anchors
+                )
+            )
+
+            inventory_sha256 = hashlib.sha256(_canonical(payload)).hexdigest()
+            run_sha256 = payload["run_spec"]["sha256"]
+            contract_sha256 = payload["acquisition_contract"]["sha256"]
+            reference = _build_schedule_reference_batch_from_inventory(
+                payload,
+                inventory_sha256=inventory_sha256,
+                run_spec_sha256=run_sha256,
+                acquisition_contract_sha256=contract_sha256,
+            )
+            boxscores = [
+                query
+                for query in reference.queries
+                if query.requested_range.get("game_pk") == 565534
+            ]
+            self.assertEqual(len(boxscores), 1)
+            consumers = [
+                query
+                for query in reference.queries
+                if 565534 in query.requested_range.get("consuming_game_pks", [])
+            ]
+            self.assertGreaterEqual(len(consumers), 1)
+            self.assertTrue(
+                all(
+                    query.requested_range["consuming_game_pks"].count(565534) == 1
+                    for query in consumers
+                )
+            )
+
+    def test_source_inventory_requires_authenticated_task6_checkpoint_population(self) -> None:
+        import mlb_backtest.v52_schedule_inventory as inventory
+        from mlb_backtest.v52_evidence import logical_query_id
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = _source_fixture(Path(td).resolve())
+            disposition_id = logical_query_id(
+                build_static_batch(
+                    fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+                    fixture.contract_path,
+                ).queries[1]
+            )
+            for failure in (
+                "missing checkpoint",
+                "wrong disposition population",
+                "derived query not completed",
+                "checkpoint changed after first read",
+            ):
+                with self.subTest(failure=failure):
+                    if failure == "missing checkpoint":
+                        checkpoint = None
+                    elif failure == "wrong disposition population":
+                        checkpoint = self._checkpoint(fixture, "0" * 64)
+                    elif failure == "derived query not completed":
+                        checkpoint = self._checkpoint(fixture, disposition_id, completed=())
+                    else:
+                        checkpoint = self._checkpoint(fixture, disposition_id)
+                    values = [checkpoint]
+                    if failure == "missing checkpoint":
+                        values.append(None)
+                    if failure == "checkpoint changed after first read":
+                        values.append(self._checkpoint(fixture, "1" * 64))
+                    with patch.object(
+                        inventory,
+                        "load_source_verification_checkpoint",
+                        side_effect=values,
+                        create=True,
+                    ), patch(
+                        "mlb_backtest.execution_registry.load_execution_registry",
+                        return_value=SimpleNamespace(phase="ACQUIRING"),
+                    ), patch(
+                        "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                        side_effect=values,
+                    ):
+                        with self.assertRaises(ValueError):
+                            inventory.build_schedule_anchor_inventory(
+                                fixture.root,
+                                fixture.run_spec,
+                                acquisition_contract_path=fixture.contract_path,
+                                static_batch_id=fixture.batch_id,
+                                evidence_root=fixture.evidence_root,
+                            )
+
+    def test_source_inventory_uses_real_registry_checkpoint_and_fails_closed_on_mutation(self) -> None:
+        """The schedule gate must consume the append-only registry, not a mock."""
+        from mlb_backtest.execution_registry import (
+            load_execution_registry,
+            load_latest_acquisition_checkpoint,
+            publish_acquisition_checkpoint,
+        )
+        from mlb_backtest.v52_query_plan import build_static_batch
+        from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_inventory
+
+        with (
+            _memoized_registry_git_patch(),
+            _memoized_disposition_projection_patch(),
+            tempfile.TemporaryDirectory() as td,
+        ):
+            fixture = _source_registry_fixture(Path(td).resolve())
+            disposition_query_id = logical_query_id(
+                build_static_batch(
+                    fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+                    fixture.contract_path,
+                ).queries[1]
+            )
+            completed_query_ids = tuple(
+                sorted(
+                    logical_query_id(query)
+                    for query in build_static_batch(
+                        fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
+                        fixture.contract_path,
+                    ).queries
+                )
+            )
+            checkpoint = publish_acquisition_checkpoint(
+                fixture.root,
+                fixture.run_spec,
+                expected_prior_checkpoint_sha256=None,
+                stage="STATIC_SCHEDULES",
+                query_batch_ids=(fixture.batch_id,),
+                completed_query_ids=completed_query_ids,
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+                dispositioned_query_ids=(disposition_query_id,),
+            )
+            self.assertEqual(
+                load_execution_registry(fixture.root, fixture.run_spec).phase,
+                "ACQUIRING",
+            )
+            self.assertEqual(
+                load_latest_acquisition_checkpoint(fixture.root, fixture.run_spec),
+                checkpoint,
+            )
+            payload = build_schedule_anchor_inventory(
+                fixture.root,
+                fixture.run_spec,
+                acquisition_contract_path=fixture.contract_path,
+                static_batch_id=fixture.batch_id,
+                evidence_root=fixture.evidence_root,
+            )
+            self.assertEqual(payload["run_id"], fixture.run_spec.run_id)
+
+            canonical_checkpoint_path = (
+                fixture.root
+                / "audit/v5_2_qd/historical_superseding_565534/execution/"
+                / "acquisition_checkpoints"
+                / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+            )
+            original = canonical_checkpoint_path.read_bytes()
+            original_payload = json.loads(original)
+            for mutation in (
+                "missing",
+                "wrong disposition",
+                "incomplete disposition",
+                "final bytes",
+            ):
+                with self.subTest(mutation=mutation):
+                    for candidate in canonical_checkpoint_path.parent.iterdir():
+                        if candidate.name.startswith("00000000-"):
+                            candidate.unlink()
+                    checkpoint_path = canonical_checkpoint_path
+                    checkpoint_path.write_bytes(original)
+                    if mutation == "missing":
+                        checkpoint_path.unlink()
+                    elif mutation in {
+                        "wrong disposition",
+                        "incomplete disposition",
+                    }:
+                        forged = copy.deepcopy(original_payload)
+                        if mutation == "wrong disposition":
+                            forged["dispositioned_query_ids"] = ["0" * 64]
+                        else:
+                            forged["completed_query_ids"].remove(
+                                disposition_query_id
+                            )
+                            forged["pending_query_ids"] = [
+                                disposition_query_id
+                            ]
+                        forged_bytes = _canonical(forged)
+                        forged_digest = hashlib.sha256(forged_bytes).hexdigest()
+                        checkpoint_path.unlink()
+                        checkpoint_path = checkpoint_path.with_name(
+                            f"{checkpoint.sequence:08d}-{forged_digest}.json"
+                        )
+                        checkpoint_path.write_bytes(forged_bytes)
+                    else:
+                        checkpoint_path.write_bytes(original + b" ")
+                    with (
+                        patch.object(
+                            V52EvidenceStore,
+                            "read_verified_query_progress",
+                            side_effect=AssertionError(
+                                "checkpoint disposition reached evidence read"
+                            ),
+                        ),
+                        patch.object(
+                            V52EvidenceStore,
+                            "read_verified_success",
+                            side_effect=AssertionError(
+                                "checkpoint disposition reached inventory evidence"
+                            ),
+                        ),
+                        patch(
+                            "mlb_backtest.v52_schedule_inventory._read_inventory_contents",
+                            side_effect=AssertionError(
+                                "checkpoint disposition reached inventory read"
+                            ),
+                        ),
+                        self.assertRaises((OSError, RuntimeError, ValueError)),
+                    ):
+                        if mutation != "final bytes":
+                            build_schedule_anchor_inventory(
+                                fixture.root,
+                                fixture.run_spec,
+                                acquisition_contract_path=fixture.contract_path,
+                                static_batch_id=fixture.batch_id,
+                                evidence_root=fixture.evidence_root,
+                            )
+                        else:
+                            load_latest_acquisition_checkpoint(
+                                fixture.root, fixture.run_spec
+                            )
+
+    def test_source_checkpoint_context_rejects_raw_mapping_and_old_run_authority(self) -> None:
+        import mlb_backtest.execution_registry as registry
+        import mlb_backtest.v52_schedule_inventory as inventory
+
+        raw_checkpoint = {
+            "run_id": "historical_walkforward_500_superseding_565534",
+            "stage": "STATIC_SCHEDULES",
+            "query_batches": [
+                {
+                    "batch_id": "1" * 64,
+                    "stage": "STATIC_SCHEDULES",
+                }
+            ],
+            "completed_query_ids": ["2" * 64],
+            "pending_query_ids": [],
+            "quarantined_query_ids": [],
+            "split_query_ids": [],
+            "dispositioned_query_ids": ["2" * 64],
+        }
+        self.assertFalse(
+            hasattr(inventory, "_using_source_checkpoint_authority")
+        )
+        self.assertFalse(
+            hasattr(inventory, "_issue_source_checkpoint_authority")
+        )
+        with self.assertRaises((AttributeError, TypeError, ValueError)):
+            with registry._using_source_checkpoint_authority(raw_checkpoint):
+                pass
+
+        source_run = load_source_run_spec(SOURCE_RUN_SPEC_PATH)
+        old_run = load_run_spec(RUN_SPEC_PATH)
+        for run_spec in (source_run, old_run):
+            with self.subTest(run_id=run_spec.run_id), self.assertRaises(
+                (AttributeError, TypeError, ValueError)
+            ):
+                registry._issue_source_checkpoint_authority(
+                    raw_checkpoint,
+                    run_spec,
+                    object(),
+                )
+
     def test_schema_is_canonical_closed_and_rejects_extra_keys(self) -> None:
         schema_bytes = SCHEMA_PATH.read_bytes()
         schema = json.loads(schema_bytes)
@@ -583,6 +1206,37 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             bad_path = copy.deepcopy(valid)
             bad_path["run_spec"]["path"] = "audit/../escape.json"
             self.assertFalse(validator.is_valid(bad_path))
+
+    def test_schema_has_exact_old_and_source_schedule_inventory_branches(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_bytes())
+        branches = schema.get("oneOf")
+        self.assertIsInstance(branches, list)
+        by_run = {
+            branch["properties"]["run_id"]["const"]: branch
+            for branch in branches
+            if isinstance(branch, dict)
+            and isinstance(branch.get("properties"), dict)
+            and isinstance(branch["properties"].get("run_id"), dict)
+            and "const" in branch["properties"]["run_id"]
+        }
+        self.assertEqual(
+            set(by_run),
+            {"historical_walkforward_500", "historical_walkforward_500_superseding_565534"},
+        )
+        old_branch = by_run["historical_walkforward_500"]
+        source_branch = by_run["historical_walkforward_500_superseding_565534"]
+        old_defs = old_branch.get("$defs", schema.get("$defs", {}))
+        source_defs = source_branch.get("$defs", schema.get("$defs", {}))
+        old_anchor = old_defs["anchor"]
+        source_anchor = source_defs["anchor"]
+        self.assertNotIn("raw_game_object_sha256", old_anchor["required"])
+        self.assertIn("raw_game_object_sha256", source_anchor["required"])
+        source_season = source_defs["seasonSource"]
+        self.assertIn("occurrence_counts", source_season["properties"])
+        self.assertEqual(
+            source_season["properties"]["storage_mode"]["enum"],
+            ["FETCHED_RAW", "DERIVED_DISPOSITION"],
+        )
 
 
 if __name__ == "__main__":

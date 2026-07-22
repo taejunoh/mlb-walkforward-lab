@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from mlb_backtest.v52_evidence import (
     AttemptCapture,
@@ -988,6 +988,435 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(TrustIntegrityError, "SHA-256"):
             _run_acquisition(self._request(plan_only=True), invalid)
+
+    def test_schedule_inventory_and_timezone_paths_follow_exact_run_authority(
+        self,
+    ) -> None:
+        import shutil
+
+        from mlb_backtest.execution_registry import publish_acquisition_checkpoint
+        from mlb_backtest.protocols import load_run_spec, load_source_run_spec
+        from mlb_backtest.v52_acquire import (
+            OperationalBlock,
+            TrustIntegrityError,
+            _load_required_timezone_gate,
+            _schedule_inventory_relative,
+            _timezone_stage_evidence_relatives,
+            _validate_schedule_inventory_schema,
+        )
+        from mlb_backtest.v52_query_plan import build_static_batch
+        from mlb_backtest.v52_schedule_inventory import (
+            publish_schedule_anchor_inventory,
+        )
+        from tests.test_v52_schedule_inventory import (
+            ROOT as INVENTORY_ROOT,
+            SOURCE_RUN_SPEC_PATH,
+            _memoized_disposition_projection_patch,
+            _memoized_registry_git_patch,
+            _source_registry_fixture,
+        )
+
+        with (
+            _memoized_registry_git_patch(),
+            _memoized_disposition_projection_patch(),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            fixture = _source_registry_fixture(Path(directory))
+            static = build_static_batch(
+                fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(INVENTORY_ROOT),
+                fixture.contract_path,
+            )
+            disposition_query_id = logical_query_id(static.queries[1])
+            publish_acquisition_checkpoint(
+                fixture.root,
+                fixture.run_spec,
+                expected_prior_checkpoint_sha256=None,
+                stage="STATIC_SCHEDULES",
+                query_batch_ids=(static.batch_id,),
+                completed_query_ids=tuple(
+                    sorted(logical_query_id(query) for query in static.queries)
+                ),
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+                dispositioned_query_ids=(disposition_query_id,),
+            )
+            verified = publish_schedule_anchor_inventory(
+                fixture.root,
+                fixture.run_spec,
+                acquisition_contract_path=fixture.contract_path,
+                static_batch_id=static.batch_id,
+                evidence_root=fixture.evidence_root,
+            )
+            _validate_schedule_inventory_schema(
+                fixture.root, fixture.run_spec, verified
+            )
+
+            import mlb_backtest.v52_acquire as acquire
+
+            request = acquire._AcquisitionRequest(
+                root=fixture.root,
+                run_spec=fixture.run_spec,
+                years=range(2018, 2025),
+                mode="hybrid",
+                resume=True,
+                stop_after="reference-inputs",
+                legacy_root=fixture.root / "data/v5_1_bt/raw",
+                protected_inventory_path=(
+                    fixture.root / "audit/v5_1_bt/protected_raw_inventory.json"
+                ),
+                reserve_bytes=20 * 1024**3,
+                plan_only=False,
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "source STATIC-to-REFERENCE resume fetched"
+                ),
+                acquisition_contract_path=fixture.contract_path,
+            )
+            plan = acquire._AcquisitionPlan(
+                contract_sha256=hashlib.sha256(
+                    fixture.contract_path.read_bytes()
+                ).hexdigest(),
+                query_batch_ids=(static.batch_id,),
+                legacy_dispositions=("PROMOTED",) + ("FETCH_REQUIRED",) * 47,
+            )
+
+            def finish_stage(*_args, stage, batches, **_kwargs):
+                query_ids = tuple(
+                    sorted(
+                        logical_query_id(query)
+                        for batch in batches
+                        for query in batch.queries
+                    )
+                )
+                checkpoint = SimpleNamespace(
+                    receipt_sha256=("e" if stage == "STATIC_SCHEDULES" else "f")
+                    * 64,
+                    stage=stage,
+                    query_batch_ids=tuple(batch.batch_id for batch in batches),
+                    completed_query_ids=query_ids,
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                )
+                return acquire._StageResult(
+                    checkpoint=checkpoint,
+                    fetched=0,
+                    resumed=len(query_ids),
+                    network_attempts=0,
+                )
+
+            with (
+                patch.object(acquire, "_real_authenticate", return_value=plan),
+                patch.object(
+                    acquire,
+                    "_current_runner_guard",
+                    return_value=acquire._RunnerGuard(-1, -1, fixture.root),
+                ),
+                patch.object(acquire, "_execute_stage", side_effect=finish_stage),
+                patch.object(
+                    acquire,
+                    "_validate_schedule_inventory_schema",
+                    wraps=_validate_schedule_inventory_schema,
+                ) as schema_validation,
+            ):
+                summary = acquire._real_run_stages(request, plan)
+            schema_validation.assert_called_once_with(
+                fixture.root, fixture.run_spec, ANY
+            )
+            self.assertEqual(summary.query_batch_sha256s[0], static.batch_id)
+            self.assertEqual(summary.network_attempts, 0)
+
+            source_relative = Path(
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "schedule_anchor_inventory.json"
+            )
+            old_relative = Path(
+                "audit/v5_2_qd/historical/acquisition/"
+                "schedule_anchor_inventory.json"
+            )
+            self.assertEqual(
+                _schedule_inventory_relative(fixture.run_spec), source_relative
+            )
+            source_timezone = _timezone_stage_evidence_relatives(fixture.run_spec)
+            self.assertEqual(source_timezone[0], source_relative)
+            self.assertTrue(
+                all(
+                    "historical_superseding_565534" in relative.as_posix()
+                    for relative in source_timezone[:-1]
+                )
+            )
+
+            old_run = load_run_spec(
+                fixture.root
+                / "protocols/v5_2_qd/historical_walkforward_500.json"
+            )
+            self.assertEqual(_schedule_inventory_relative(old_run), old_relative)
+            self.assertEqual(
+                _timezone_stage_evidence_relatives(old_run)[0], old_relative
+            )
+            for relative in (
+                _timezone_stage_evidence_relatives(old_run)[index]
+                for index in (1, 2, 4, 5)
+            ):
+                path = fixture.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_text("{}\n")
+            with (
+                patch(
+                    "mlb_backtest.v52_timezone_review.load_verified_timezone_gate",
+                    side_effect=AssertionError(
+                        "source timezone gate fell back to old evidence"
+                    ),
+                ),
+                self.assertRaises(OperationalBlock),
+            ):
+                _load_required_timezone_gate(fixture.root, fixture.run_spec)
+
+            old_path = fixture.root / old_relative
+            old_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(verified.path, old_path)
+            verified.path.unlink()
+            with self.assertRaises(TrustIntegrityError):
+                _validate_schedule_inventory_schema(
+                    fixture.root, fixture.run_spec, verified
+                )
+
+            source_run = load_source_run_spec(
+                fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(INVENTORY_ROOT)
+            )
+            self.assertEqual(
+                _schedule_inventory_relative(source_run), source_relative
+            )
+
+    def test_source_timezone_continuation_uses_exact_authority_and_evidence(
+        self,
+    ) -> None:
+        from mlb_backtest.protocols import load_source_run_spec
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _RunnerGuard,
+            _real_run_stages,
+            _timezone_stage_evidence_relatives,
+        )
+
+        source_run = load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = Path(
+            "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        static_query = _query()
+        reference_query = dataclasses.replace(
+            _query(),
+            parameters={"season": 2023, "sportId": 1},
+            requested_range={"year": 2023},
+        )
+        static = SimpleNamespace(batch_id="c" * 64, queries=(static_query,))
+        reference = SimpleNamespace(
+            batch_id="d" * 64,
+            derived_from_sha256="1" * 64,
+            queries=(reference_query,),
+        )
+        completed_ids = tuple(
+            sorted(
+                (logical_query_id(static_query), logical_query_id(reference_query))
+            )
+        )
+        dispositioned_id = logical_query_id(static_query)
+        latest = SimpleNamespace(
+            receipt_sha256="e" * 64,
+            stage="REFERENCE_INPUTS",
+            query_batch_ids=(static.batch_id, reference.batch_id),
+            completed_query_ids=completed_ids,
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        plan = _AcquisitionPlan(
+            "a" * 64,
+            (static.batch_id,),
+            ("PROMOTED",) + ("FETCH_REQUIRED",) * 47,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            request = dataclasses.replace(
+                self._request(plan_only=False, resume=True),
+                root=root,
+                run_spec=source_run,
+                acquisition_contract_path=root / source_contract,
+            )
+            inventory = SimpleNamespace(
+                path=root
+                / "audit/v5_2_qd/historical_superseding_565534/"
+                "acquisition/schedule_anchor_inventory.json",
+                sha256="1" * 64,
+            )
+            evidence = tuple(
+                root / relative
+                for relative in _timezone_stage_evidence_relatives(source_run)
+            )
+            for path in evidence:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+            checkpoint_calls: list[Mapping[str, object]] = []
+
+            def publish_checkpoint(*_args, **kwargs):
+                checkpoint_calls.append(kwargs)
+                return SimpleNamespace(
+                    receipt_sha256="f" * 64,
+                    stage="TIMEZONE_REVIEW",
+                    query_batch_ids=tuple(kwargs["query_batch_ids"]),
+                    completed_query_ids=completed_ids,
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                    split_receipt_sha256s=(),
+                    stage_evidence_receipt_paths=tuple(
+                        path.relative_to(root).as_posix() for path in evidence
+                    ),
+                    stage_evidence_receipt_sha256s=tuple(
+                        hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in evidence
+                    ),
+                )
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._real_authenticate",
+                        return_value=plan,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._current_runner_guard",
+                        return_value=_RunnerGuard(-1, -1, root),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                        return_value=root
+                        / "data/v5_2_qd/historical_superseding_565534/raw",
+                    )
+                )
+                stack.enter_context(
+                    patch("mlb_backtest.v52_acquire.V52EvidenceStore", return_value=object())
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.execution_registry."
+                        "load_latest_acquisition_checkpoint",
+                        return_value=latest,
+                    )
+                )
+                publish = stack.enter_context(
+                    patch(
+                        "mlb_backtest.execution_registry."
+                        "publish_acquisition_checkpoint",
+                        side_effect=publish_checkpoint,
+                    )
+                )
+                scope = stack.enter_context(
+                    patch(
+                        "mlb_backtest.execution_registry."
+                        "_using_verified_source_checkpoint",
+                        return_value=nullcontext(),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.build_static_batch",
+                        return_value=static,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.load_query_batch_for_authority",
+                        side_effect=lambda _root, batch_id, _authority: {
+                            static.batch_id: static,
+                            reference.batch_id: reference,
+                        }[batch_id],
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_schedule_inventory."
+                        "load_verified_schedule_anchor_inventory",
+                        return_value=inventory,
+                    )
+                )
+                stack.enter_context(
+                    patch("mlb_backtest.v52_acquire._validate_schedule_inventory_schema")
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
+                        return_value=reference,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._stage_populations",
+                        return_value=(completed_ids, (), ()),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._source_disposition_authorities",
+                        return_value={dispositioned_id: object()},
+                    )
+                )
+                candidate = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_timezone_review.publish_timezone_candidate",
+                        return_value=evidence[3],
+                    )
+                )
+                gate = stack.enter_context(
+                    patch("mlb_backtest.v52_acquire._load_required_timezone_gate")
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_game_evidence_inventory."
+                        "publish_game_evidence_inventory",
+                        side_effect=RuntimeError("after source timezone checkpoint"),
+                    )
+                )
+                with self.assertRaisesRegex(TrustIntegrityError, "game evidence"):
+                    _real_run_stages(request, plan)
+
+            candidate.assert_called_once_with(
+                root=root,
+                evidence_root=(
+                    root / "data/v5_2_qd/historical_superseding_565534/raw"
+                ),
+                batch_ids=(static.batch_id, reference.batch_id),
+                run_spec_path=(
+                    root
+                    / "protocols/v5_2_qd/"
+                    "historical_walkforward_500_superseding_565534.json"
+                ),
+                acquisition_contract_path=root / source_contract,
+            )
+            gate.assert_called_once_with(root, source_run)
+            scope.assert_called_once_with(root, source_run)
+            publish.assert_called_once()
+            self.assertEqual(len(checkpoint_calls), 1)
+            self.assertEqual(checkpoint_calls[0]["stage"], "TIMEZONE_REVIEW")
+            self.assertEqual(
+                checkpoint_calls[0]["stage_evidence_receipts"], evidence
+            )
+            self.assertEqual(
+                checkpoint_calls[0]["dispositioned_query_ids"],
+                (dispositioned_id,),
+            )
 
     def test_authentication_failure_precedes_runtime_operations(self) -> None:
         from mlb_backtest.v52_acquire import (
@@ -4654,11 +5083,12 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             _load_required_timezone_gate,
         )
         from tests.test_v52_timezone_review import _fixed_verified_gate_fixture
+        old_run_spec = self._request(plan_only=True).run_spec
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             _fixed_verified_gate_fixture(root)
-            gate = _load_required_timezone_gate(root)
+            gate = _load_required_timezone_gate(root, old_run_spec)
             self.assertEqual(len(gate.reviews), 2)
 
             review = (
@@ -4668,13 +5098,13 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             original = review.read_bytes()
             review.write_bytes(review.read_bytes() + b" ")
             with self.assertRaisesRegex(TrustIntegrityError, "timezone gate"):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
             binding_invalid = json.loads(original)
             binding_invalid["reviewer_identity"] = "forged-reviewer"
             review.write_bytes(canonical_json_bytes(binding_invalid) + b"\n")
             with self.assertRaisesRegex(TrustIntegrityError, "timezone gate"):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4690,7 +5120,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(OperationalBlock, "review|seal"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4703,7 +5133,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(OperationalBlock, "review|seal"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4723,7 +5153,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(OperationalBlock, "review|seal"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4747,7 +5177,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(TrustIntegrityError, "ancestor|identity|path"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4771,7 +5201,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(TrustIntegrityError, "ancestor|identity|path"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4790,7 +5220,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(TrustIntegrityError, "identity|hardlink|path"),
             ):
-                _load_required_timezone_gate(root)
+                _load_required_timezone_gate(root, old_run_spec)
 
     def test_resumed_timezone_checkpoint_requires_exact_boundary_before_inventory(self) -> None:
         from mlb_backtest.execution_registry import AcquisitionCheckpoint
@@ -4798,6 +5228,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             TrustIntegrityError,
             _validate_resumed_timezone_checkpoint,
         )
+        old_run_spec = self._request(plan_only=True).run_spec
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -4848,6 +5279,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 batch_ids=batches,
                 completed_query_ids=completed,
                 stage_evidence=evidence,
+                run_spec=old_run_spec,
             )
 
             cases = {
@@ -4881,6 +5313,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         batch_ids=batches,
                         completed_query_ids=completed,
                         stage_evidence=evidence,
+                        run_spec=old_run_spec,
                     )
 
     def test_shared_disk_budget_prevents_cross_pool_overcommit_and_releases(self) -> None:
