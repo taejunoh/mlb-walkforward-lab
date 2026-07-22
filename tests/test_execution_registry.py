@@ -19,14 +19,13 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import jsonschema
 from jsonschema import FormatChecker
 
 from mlb_backtest.diagnostics import canonical_json_bytes
 from mlb_backtest.protocols import (
-    RunSpec,
     SourceRunSpec,
     load_run_spec,
     load_source_run_spec,
@@ -149,6 +148,14 @@ SOURCE_ADDENDUM_RELATIVE = Path(
 SOURCE_EXECUTION_RELATIVE = Path(
     "audit/v5_2_qd/historical_superseding_565534/execution"
 )
+SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+OLD_CHECKPOINT_SHA256 = (
+    "00b8b6eae2c0ba8de17f6ed1c05f0c9ddfb98e967e9b7ef0284581cc98b5ad06"
+)
+OLD_CHECKPOINT_RELATIVE = Path(
+    "audit/v5_2_qd/historical/execution/acquisition_checkpoints/"
+    f"00000000-{OLD_CHECKPOINT_SHA256}.json"
+)
 ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
 PROTECTED_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
@@ -189,7 +196,9 @@ EXECUTION_IMPORT_CLOSURE = tuple(
 )
 BOUND_PYTHON_EXTRAS = (Path("mlb_backtest/verify_v52_design.py"),)
 BOUND_SCHEMA_PATHS = (
+    ACQUISITION_SCHEMA_RELATIVE,
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
+    Path("schemas/v5_2_derived_disposition_sidecar.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_game_evidence_inventory.schema.json"),
@@ -271,7 +280,443 @@ def _checkpoint_schema_payload(
     }
 
 
+def _source_checkpoint_payload(
+    *,
+    dispositioned_query_ids: list[str] | None = None,
+    completed_query_ids: list[str] | None = None,
+    pending_query_ids: list[str] | None = None,
+    quarantined_query_ids: list[str] | None = None,
+    split_query_ids: list[str] | None = None,
+) -> dict[str, object]:
+    """Build a minimal source-branch checkpoint candidate for parser tests."""
+    payload = _checkpoint_schema_payload(
+        stage="STATIC_SCHEDULES",
+        query_batches=[],
+        stage_evidence=[],
+    )
+    payload.update(
+        {
+            "run_id": SOURCE_RUN_ID,
+            "run_spec": {
+                "path": SOURCE_RUN_SPEC_RELATIVE.as_posix(),
+                "sha256": "a" * 64,
+            },
+            "acquisition_contract": {
+                "path": SOURCE_CONTRACT_RELATIVE.as_posix(),
+                "sha256": "b" * 64,
+            },
+            "execution_phase_receipt": {
+                "path": (
+                    SOURCE_EXECUTION_RELATIVE
+                    / ("phase_receipts/000001-ACQUIRING-" + "c" * 64 + ".json")
+                ).as_posix(),
+                "sha256": "c" * 64,
+            },
+            "dispositioned_query_ids": list(
+                dispositioned_query_ids
+                if dispositioned_query_ids is not None
+                else []
+            ),
+        }
+    )
+    for key, value in (
+        ("completed_query_ids", completed_query_ids),
+        ("pending_query_ids", pending_query_ids),
+        ("quarantined_query_ids", quarantined_query_ids),
+        ("split_query_ids", split_query_ids),
+    ):
+        if value is not None:
+            payload[key] = list(value)
+    return payload
+
+
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_checkpoint_requires_exact_dispositioned_query_ids(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        self.assertIn("oneOf", schema)
+        branches = {
+            branch["properties"]["run_id"]["const"]: branch
+            for branch in schema["oneOf"]
+            if isinstance(branch.get("properties", {}).get("run_id"), dict)
+            and "const" in branch["properties"]["run_id"]
+        }
+        self.assertIn("historical_walkforward_500", branches)
+        self.assertIn(SOURCE_RUN_ID, branches)
+        self.assertNotIn(
+            "dispositioned_query_ids", branches["historical_walkforward_500"]["required"]
+        )
+        self.assertIn(
+            "dispositioned_query_ids", branches[SOURCE_RUN_ID]["required"]
+        )
+
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        valid = _source_checkpoint_payload()
+        validated = self.registry._validate_checkpoint_payload(valid, source)
+        checkpoint = self.registry._checkpoint_from_payload(validated, "d" * 64)
+        self.assertEqual(checkpoint.dispositioned_query_ids, ())
+
+        missing = dict(valid)
+        del missing["dispositioned_query_ids"]
+        with self.assertRaisesRegex(ValueError, "dispositioned|checkpoint"):
+            self.registry._validate_checkpoint_payload(missing, source)
+
+        unsorted = dict(valid)
+        unsorted["dispositioned_query_ids"] = ["b" * 64, "a" * 64]
+        with self.assertRaisesRegex(ValueError, "sorted|dispositioned"):
+            self.registry._validate_checkpoint_payload(unsorted, source)
+
+        duplicate = dict(valid)
+        duplicate["dispositioned_query_ids"] = ["a" * 64, "a" * 64]
+        with self.assertRaisesRegex(ValueError, "unique|dispositioned"):
+            self.registry._validate_checkpoint_payload(duplicate, source)
+
+        derived = "e" * 64
+        pending = _source_checkpoint_payload(
+            dispositioned_query_ids=[derived], pending_query_ids=[derived]
+        )
+        with self.assertRaisesRegex(ValueError, "completed|pending|dispositioned"):
+            self.registry._validate_checkpoint_payload(pending, source)
+
+    def test_source_completed_derived_query_requires_exact_disposition_id(
+        self,
+    ) -> None:
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        query_id = self.registry._DISPOSITIONED_QUERY_ID
+
+        pending = _source_checkpoint_payload(
+            dispositioned_query_ids=[],
+            pending_query_ids=[query_id],
+        )
+        validated = self.registry._validate_checkpoint_payload(pending, source)
+        self.assertEqual(validated["dispositioned_query_ids"], [])
+        self.assertEqual(validated["pending_query_ids"], [query_id])
+
+        completed = _source_checkpoint_payload(
+            dispositioned_query_ids=[],
+            completed_query_ids=[query_id],
+        )
+        with self.assertRaisesRegex(ValueError, "completed|disposition"):
+            self.registry._validate_checkpoint_payload(completed, source)
+
+    def test_source_checkpoint_semantic_projection_preserves_dispositioned_query_ids(
+        self,
+    ) -> None:
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        dispositioned_query_id = self.registry._DISPOSITIONED_QUERY_ID
+        payload = _source_checkpoint_payload(
+            dispositioned_query_ids=[dispositioned_query_id],
+            completed_query_ids=[dispositioned_query_id],
+        )
+        validated = self.registry._validate_checkpoint_payload(payload, source)
+        checkpoint = self.registry._checkpoint_from_payload(validated, "d" * 64)
+        self.assertEqual(
+            checkpoint.dispositioned_query_ids, (dispositioned_query_id,)
+        )
+
+        semantic = self.registry._checkpoint_semantic_projection(validated)
+
+        self.assertIn("dispositioned_query_ids", semantic)
+        self.assertEqual(
+            semantic["dispositioned_query_ids"], [dispositioned_query_id]
+        )
+
+    def test_source_checkpoint_schema_rejects_duplicate_disposition_ids(
+        self,
+    ) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        valid = _source_checkpoint_payload()
+        jsonschema.validate(valid, schema, format_checker=FORMAT_CHECKER)
+
+        duplicate = copy.deepcopy(valid)
+        duplicate["dispositioned_query_ids"] = ["a" * 64, "a" * 64]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                duplicate,
+                schema,
+                format_checker=FORMAT_CHECKER,
+            )
+
+    def test_source_second_checkpoint_progression_accepts_append_only_bindings_and_keeps_disposition(
+        self,
+    ) -> None:
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        query_id = self.registry._DISPOSITIONED_QUERY_ID
+        attempt = {
+            "path": (
+                "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                f"mlb_schedule_game_feed/{query_id}/attempts/000001.json"
+            ),
+            "query_id": query_id,
+            "receipt_kind": "ATTEMPT",
+            "sha256": "1" * 64,
+        }
+        success = {
+            "path": (
+                "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                f"mlb_schedule_game_feed/{query_id}/success.json"
+            ),
+            "query_id": query_id,
+            "receipt_kind": "SUCCESS",
+            "sha256": "2" * 64,
+        }
+        stage_binding = {
+            "path": (
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "stage-evidence.json"
+            ),
+            "sha256": "3" * 64,
+        }
+        previous = _source_checkpoint_payload(
+            dispositioned_query_ids=[query_id],
+            completed_query_ids=[query_id],
+        )
+        batch_id = "9" * 64
+        previous["query_batches"] = [
+            {
+                "batch_id": batch_id,
+                "path": (
+                    "audit/v5_2_qd/historical_superseding_565534/"
+                    f"acquisition/query_batches/{batch_id}.json"
+                ),
+                "sha256": "a" * 64,
+                "stage": "STATIC_SCHEDULES",
+            }
+        ]
+        previous["query_evidence_receipts"] = [attempt]
+        previous["stage_evidence_receipts"] = [stage_binding]
+        current = copy.deepcopy(previous)
+        current.update(
+            {
+                "sequence": 3,
+                "prior_checkpoint_sha256": "4" * 64,
+                "recorded_at_utc": "2026-07-14T00:00:01.000000Z",
+                "query_evidence_receipts": [attempt, success],
+            }
+        )
+        previous = self.registry._validate_checkpoint_payload(previous, source)
+        current = self.registry._validate_checkpoint_payload(current, source)
+
+        self.registry._validate_checkpoint_progression(previous, current, source)
+
+        checkpoint = self.registry._checkpoint_from_payload(current, "5" * 64)
+        self.assertEqual(checkpoint.dispositioned_query_ids, (query_id,))
+
+    def test_source_checkpoint_progression_rejects_genesis_skip_and_recorded_at_regression(
+        self,
+    ) -> None:
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        genesis_remaining = _source_checkpoint_payload()
+        genesis_remaining["stage"] = "REMAINING"
+        with self.assertRaisesRegex(ValueError, "first|genesis|stage"):
+            self.registry._validate_checkpoint_progression(
+                None, genesis_remaining, source
+            )
+
+        previous = _source_checkpoint_payload()
+        batch_id = "9" * 64
+        previous["query_batches"] = [
+            {
+                "batch_id": batch_id,
+                "path": (
+                    "audit/v5_2_qd/historical_superseding_565534/"
+                    f"acquisition/query_batches/{batch_id}.json"
+                ),
+                "sha256": "8" * 64,
+                "stage": "STATIC_SCHEDULES",
+            }
+        ]
+        skipped = copy.deepcopy(previous)
+        skipped.update(
+            {
+                "stage": "REMAINING",
+                "sequence": 3,
+                "prior_checkpoint_sha256": "6" * 64,
+                "recorded_at_utc": "2026-07-14T00:00:02.000000Z",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "skip|stage|next"):
+            self.registry._validate_checkpoint_progression(previous, skipped, source)
+
+        previous["recorded_at_utc"] = "2026-07-14T00:00:02.000000Z"
+        regressed = copy.deepcopy(previous)
+        regressed.update(
+            {
+                "sequence": 3,
+                "prior_checkpoint_sha256": "7" * 64,
+                "recorded_at_utc": "2026-07-14T00:00:01.000000Z",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "recorded|time|regress"):
+            self.registry._validate_checkpoint_progression(
+                previous, regressed, source
+            )
+
+    def test_source_pending_disposition_replay_uses_authority_when_disposition_list_is_empty(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+
+        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=ROOT / SOURCE_RUN_SPEC_RELATIVE,
+            acquisition_contract_path=ROOT / SOURCE_CONTRACT_RELATIVE,
+        )
+        query_id = self.registry._DISPOSITIONED_QUERY_ID
+        batch_id = "9" * 64
+        batch = SimpleNamespace(
+            batch_id=batch_id,
+            stage="STATIC_SCHEDULES",
+            derived_from_sha256=None,
+            queries=(authority.query,),
+        )
+        payload = _source_checkpoint_payload(
+            dispositioned_query_ids=[],
+            pending_query_ids=[query_id],
+        )
+        payload["query_batches"] = [
+            {
+                "batch_id": batch_id,
+                "path": (
+                    "audit/v5_2_qd/historical_superseding_565534/"
+                    f"acquisition/query_batches/{batch_id}.json"
+                ),
+                "sha256": "8" * 64,
+                "stage": "STATIC_SCHEDULES",
+            }
+        ]
+        bindings = {
+            str(item["path"]): {
+                "path": str(item["path"]),
+                "sha256": str(item["sha256"]),
+            }
+            for key in (
+                "query_batches",
+                "stage_evidence_receipts",
+                "split_receipts",
+            )
+            for item in payload[key]
+        }
+        bindings.update(
+            {
+                str(payload[key]["path"]): dict(payload[key])
+                for key in (
+                    "run_spec",
+                    "acquisition_contract",
+                    "execution_phase_receipt",
+                )
+            }
+        )
+        progress = SimpleNamespace(
+            status="PENDING",
+            attempt_receipts=(),
+            published_evidence=None,
+            quarantines=(),
+        )
+        store = SimpleNamespace(read_verified_query_progress=Mock(return_value=progress))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw_root = root / source.raw["namespaces"]["raw"]
+            raw_root.mkdir(parents=True)
+            paths = self.registry._paths(root, source)
+
+            def artifact_binding(
+                _root: Path, relative: Path, _label: str
+            ) -> dict[str, str]:
+                return bindings[relative.as_posix()]
+
+            with (
+                patch(
+                    "mlb_backtest.v52_query_plan.load_query_batch",
+                    return_value=batch,
+                ),
+                patch.object(
+                    self.registry,
+                    "_checkpoint_stage_authority",
+                    return_value=((batch,), ()),
+                ),
+                patch.object(
+                    self.registry,
+                    "_checkpoint_artifact_binding",
+                    side_effect=artifact_binding,
+                ),
+                patch.object(
+                    self.registry,
+                    "_source_disposition_authority",
+                    return_value=authority,
+                ) as build_authority,
+                patch(
+                    "mlb_backtest.v52_evidence.V52EvidenceStore",
+                    return_value=store,
+                ),
+            ):
+                observed = self.registry._checkpoint_artifacts_and_population(
+                    paths,
+                    source,
+                    payload,
+                )
+
+        self.assertEqual(observed, {query_id})
+        build_authority.assert_called_once()
+        store.read_verified_query_progress.assert_called_once_with(
+            authority.query,
+            authority=authority,
+        )
+
+    def test_old_checkpoint_bytes_parse_to_trailing_empty_tuple_and_old_writer_omits_field(
+        self,
+    ) -> None:
+        immutable_path = ROOT / OLD_CHECKPOINT_RELATIVE
+        immutable_bytes = immutable_path.read_bytes()
+        self.assertEqual(hashlib.sha256(immutable_bytes).hexdigest(), OLD_CHECKPOINT_SHA256)
+        immutable_payload = json.loads(immutable_bytes)
+        immutable_validated = self.registry._validate_checkpoint_payload(
+            immutable_payload, self.old_run_spec
+        )
+        immutable_checkpoint = self.registry._checkpoint_from_payload(
+            immutable_validated, OLD_CHECKPOINT_SHA256
+        )
+        with self.subTest("immutable parser trailing field and bytes"):
+            self.assertEqual(immutable_checkpoint.dispositioned_query_ids, ())
+            self.assertEqual(immutable_path.read_bytes(), immutable_bytes)
+
+        payload = _checkpoint_schema_payload(
+            stage="STATIC_SCHEDULES", query_batches=[], stage_evidence=[]
+        )
+        encoded = canonical_json_bytes(payload) + b"\n"
+        parsed_payload = json.loads(encoded)
+        validated = self.registry._validate_checkpoint_payload(
+            parsed_payload, self.old_run_spec
+        )
+        self.registry._checkpoint_from_payload(validated, "f" * 64)
+        self.assertEqual(encoded, canonical_json_bytes(parsed_payload) + b"\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            batch, query_ids = self.checkpoint_fixture(root, run_spec)
+            checkpoint = self.publish_pending_checkpoint(
+                root,
+                run_spec,
+                batch,
+                query_ids,
+                expected_prior=None,
+            )
+            checkpoint_path = (
+                root
+                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+            )
+            self.assertNotIn(
+                b'"dispositioned_query_ids"', checkpoint_path.read_bytes()
+            )
+
     def test_checkpoint_value_retains_stage_evidence_paths(self) -> None:
         payload = {
             "sequence": 9,
@@ -706,7 +1151,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 before_quarantine,
             )
 
-    def test_source_checkpoint_apis_reject_before_task6_without_path_access(
+    def test_source_checkpoint_apis_are_authority_typed_and_branch_exact(
         self,
     ) -> None:
         checkpoint_apis = (
@@ -721,7 +1166,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(annotation=api.__name__):
                 self.assertIs(
                     typing.get_type_hints(api)["run_spec"],
-                    RunSpec,
+                    self.registry.Authority,
                 )
         self.assertEqual(
             typing.get_type_hints(self.registry.advance_execution_phase)[
@@ -730,67 +1175,24 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.registry.Authority,
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            root, authority = self.make_source_repo(Path(directory))
-            missing = root / "must-not-be-read.json"
-            calls = (
-                lambda: self.registry.load_latest_acquisition_checkpoint(
-                    root, authority
-                ),
-                lambda: self.registry.load_source_verification_checkpoint(
-                    root, authority
-                ),
-                lambda: self.registry.load_terminal_acquisition_checkpoint(
-                    root, authority
-                ),
-                lambda: self.registry.validate_sources_ready_evidence_set(
-                    root,
-                    authority,
-                    inventory_path=missing,
-                    checkpoint_path=missing,
-                    validation_receipts=(missing,),
-                ),
-                lambda: self.registry.publish_acquisition_checkpoint(
-                    root,
-                    authority,
-                    expected_prior_checkpoint_sha256=None,
-                    stage="STATIC_SCHEDULES",
-                    query_batch_ids=(),
-                    completed_query_ids=(),
-                    pending_query_ids=(),
-                    quarantined_query_ids=(),
-                    split_query_ids=(),
-                ),
-                lambda: self.registry.advance_sources_ready_phase(
-                    root,
-                    authority,
-                    inventory_path=missing,
-                    validation_receipts=(missing,),
-                    expected_checkpoint_path=missing,
-                ),
-                lambda: self.registry.advance_execution_phase(
-                    root,
-                    authority,
-                    expected_phase="ACQUIRING",
-                    next_phase="SOURCES_READY",
-                    inventory_path=missing,
-                    validation_receipts=(missing,),
-                ),
+        authority = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        validated = self.registry._validate_checkpoint_payload(
+            _source_checkpoint_payload(), authority
+        )
+        self.assertEqual(validated["run_id"], authority.run_id)
+        self.assertEqual(validated["dispositioned_query_ids"], [])
+        with self.assertRaisesRegex(ValueError, "require dispositioned"):
+            self.registry.publish_acquisition_checkpoint(
+                ROOT,
+                authority,
+                expected_prior_checkpoint_sha256=None,
+                stage="STATIC_SCHEDULES",
+                query_batch_ids=(),
+                completed_query_ids=(),
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
             )
-            execution_root = root / SOURCE_EXECUTION_RELATIVE
-            self.assertFalse(execution_root.exists())
-            with patch.object(
-                self.registry,
-                "_paths",
-                side_effect=AssertionError("checkpoint API touched paths"),
-            ):
-                for call in calls:
-                    with self.subTest(runtime=call):
-                        with self.assertRaisesRegex(
-                            ValueError, "SourceRunSpec.*before Task 6"
-                        ):
-                            call()
-            self.assertFalse(execution_root.exists())
 
     def test_make_repo_owns_bound_schemas_when_execution_tuple_is_stale(self) -> None:
         without_schemas = tuple(
@@ -1669,10 +2071,67 @@ class ExecutionRegistryTest(unittest.TestCase):
         schema_path = ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json"
         schema = json.loads(schema_path.read_bytes())
         jsonschema.Draft202012Validator.check_schema(schema)
-        self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        self.assertEqual(set(schema), {"$defs", "$schema", "oneOf"})
+        self.assertEqual(len(schema["oneOf"]), 2)
+        branches = {
+            branch["properties"]["run_id"]["const"]: branch
+            for branch in schema["oneOf"]
+        }
         self.assertEqual(
-            schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
+            set(branches),
+            {"historical_walkforward_500", SOURCE_RUN_ID},
+        )
+        canonical_legacy_fields = {
+            "acquisition_contract",
+            "completed_query_ids",
+            "execution_phase",
+            "execution_phase_receipt",
+            "git_head",
+            "pending_query_ids",
+            "prior_checkpoint_sha256",
+            "quarantined_query_ids",
+            "query_batches",
+            "query_evidence_receipts",
+            "receipt_kind",
+            "recorded_at_utc",
+            "run_id",
+            "run_spec",
+            "schema_version",
+            "sequence",
+            "split_query_ids",
+            "split_receipts",
+            "stage",
+            "stage_evidence_receipts",
+        }
+        legacy = branches["historical_walkforward_500"]
+        source = branches[SOURCE_RUN_ID]
+        for run_id, branch in branches.items():
+            with self.subTest(closed_branch=run_id):
+                self.assertFalse(branch["additionalProperties"])
+                self.assertEqual(
+                    set(branch["properties"]), set(branch["required"])
+                )
+        self.assertEqual(set(legacy["properties"]), canonical_legacy_fields)
+        self.assertNotIn("dispositioned_query_ids", legacy["required"])
+        self.assertEqual(
+            set(source["properties"]),
+            canonical_legacy_fields | {"dispositioned_query_ids"},
+        )
+        self.assertIn("dispositioned_query_ids", source["required"])
+
+        publish_hints = typing.get_type_hints(
+            self.registry.publish_acquisition_checkpoint
+        )
+        load_hints = typing.get_type_hints(
+            self.registry.load_latest_acquisition_checkpoint
+        )
+        self.assertIs(publish_hints["run_spec"], self.registry.Authority)
+        self.assertIs(load_hints["run_spec"], self.registry.Authority)
+        self.assertIs(
+            publish_hints["return"], self.registry.AcquisitionCheckpoint
+        )
+        self.assertEqual(
+            load_hints["return"], self.registry.AcquisitionCheckpoint | None
         )
         self.assertTrue(
             {
@@ -2974,6 +3433,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(phase=phase, checkpoint_head=checkpoint_head):
                 self.assertEqual(
                     self.registry._checkpoint_progress_is_read_only(
+                        self.old_run_spec,
                         phase,
                         checkpoint_head,
                     ),
@@ -3785,7 +4245,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             "recorded_at_utc": "2026-07-14T00:00:01.000000Z",
         }
         with self.assertRaisesRegex(ValueError, "REFERENCE_INPUTS|batch|stage"):
-            self.registry._validate_checkpoint_progression(previous, reference)
+            self.registry._validate_checkpoint_progression(
+                previous, reference, self.old_run_spec
+            )
 
         reference_batch = {**batch, "batch_id": "d" * 64, "stage": "REFERENCE_INPUTS"}
         reference = {**reference, "query_batches": [batch, reference_batch]}
@@ -3795,7 +4257,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             "recorded_at_utc": "2026-07-14T00:00:02.000000Z",
         }
         with self.assertRaisesRegex(ValueError, "TIMEZONE_REVIEW|evidence|gate"):
-            self.registry._validate_checkpoint_progression(reference, timezone)
+            self.registry._validate_checkpoint_progression(
+                reference, timezone, self.old_run_spec
+            )
 
     def test_checkpoint_runtime_rejects_duplicate_binding_arrays(self) -> None:
         binding = {"path": "audit/evidence.json", "sha256": "a" * 64}
@@ -6516,8 +6980,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             original = self.registry._success_contents
             lock = root / "audit/v5_2_qd/historical/execution/.registry.lock"
 
-            def replace_lock(payload):
-                contents = original(payload)
+            def replace_lock(payload, authority):
+                contents = original(payload, authority)
                 lock.unlink()
                 lock.write_bytes(b"")
                 return contents

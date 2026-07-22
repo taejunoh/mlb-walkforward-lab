@@ -32,6 +32,16 @@ PROTECTED_DUPLICATES = (
     ROOT / "schemas/v5_2_preflight.schema 2.json",
     ROOT / "tests/test_v52_query_plan 2.py",
 )
+SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+OLD_QUERY_ID = "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8"
+OLD_QUERY_REGISTRATION_PATH = (
+    "data/v5_2_qd/historical/raw/queries/mlb_schedule_game_feed/"
+    f"{OLD_QUERY_ID}/query.json"
+)
+OLD_QUARANTINED_RAW_PATH = (
+    "data/v5_2_qd/historical/raw/quarantine/mlb_schedule_game_feed/"
+    f"{OLD_QUERY_ID}/6eeedd3877eeef18dae400dba8920dcde0cc79b3ab76b08316385868e89df1e0.raw"
+)
 
 
 def _canonical_file(value: object) -> bytes:
@@ -263,7 +273,14 @@ class V52AcquirePublicE2ETest(unittest.TestCase):
     def test_bounded_runtime_closure_keeps_current_schema_bindings(self) -> None:
         from mlb_backtest import execution_registry
 
-        self.assertEqual(len(self.bound_schema_paths), 15)
+        self.assertEqual(len(self.bound_schema_paths), 16)
+        self.assertTrue(
+            {
+                "schemas/v5_2_acquisition_contract.schema.json",
+                "schemas/v5_2_derived_disposition_sidecar.schema.json",
+            }
+            <= set(self.bound_schema_paths)
+        )
         self.assertEqual(
             execution_registry._BOUND_EXECUTION_CODE,
             ("mlb_backtest/execution_registry.py", *self.bound_schema_paths),
@@ -315,6 +332,104 @@ class V52AcquirePublicE2ETest(unittest.TestCase):
             }
             <= set(self.bound_schema_paths)
         )
+
+    def test_new_checkpoint_never_contains_old_query_id_or_old_artifact_binding(
+        self,
+    ) -> None:
+        from mlb_backtest import execution_registry
+
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
+        )
+        with self.subTest("schema branch"):
+            self.assertIn("oneOf", schema)
+            if "oneOf" in schema:
+                source_branches = [
+                    branch
+                    for branch in schema["oneOf"]
+                    if branch.get("properties", {})
+                    .get("run_id", {})
+                    .get("const")
+                    == SOURCE_RUN_ID
+                ]
+                self.assertEqual(len(source_branches), 1)
+                if source_branches:
+                    source_branch = source_branches[0]
+                    serialized_branch = canonical_json_bytes(source_branch)
+                    for forbidden in (
+                        OLD_QUERY_ID,
+                        OLD_QUERY_REGISTRATION_PATH,
+                        OLD_QUARANTINED_RAW_PATH,
+                        "data/v5_2_qd/historical/raw/quarantine/",
+                    ):
+                        self.assertNotIn(forbidden.encode(), serialized_branch)
+                    self.assertIn(
+                        "dispositioned_query_ids", source_branch["required"]
+                    )
+                    self.assertEqual(
+                        source_branch["properties"]["run_id"],
+                        {"const": SOURCE_RUN_ID},
+                    )
+
+        # Runtime boundary: a source checkpoint may not smuggle the immutable
+        # old query registration or its old-root artifact into any population.
+        from tests.test_execution_registry import _source_checkpoint_payload
+
+        source_run = load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        old_paths = {
+            "execution": (
+                "audit/v5_2_qd/historical/execution/phase_receipts/forged.json"
+            ),
+            "acquisition": (
+                "audit/v5_2_qd/historical/acquisition/query_batches/forged.json"
+            ),
+            "raw": OLD_QUERY_REGISTRATION_PATH,
+        }
+        binding_factories = {
+            "query_evidence_receipts": lambda path: {
+                "path": path,
+                "query_id": "1" * 64,
+                "receipt_kind": "SUCCESS",
+                "sha256": "2" * 64,
+            },
+            "stage_evidence_receipts": lambda path: {
+                "path": path,
+                "sha256": "3" * 64,
+            },
+            "query_batches": lambda path: {
+                "batch_id": "4" * 64,
+                "path": path,
+                "sha256": "5" * 64,
+                "stage": "STATIC_SCHEDULES",
+            },
+            "split_receipts": lambda path: {
+                "parent_query_id": "6" * 64,
+                "path": path,
+                "sha256": "7" * 64,
+                "split_receipt_id": "8" * 64,
+            },
+        }
+        for field, make_binding in binding_factories.items():
+            for namespace, old_path in old_paths.items():
+                with self.subTest(field=field, namespace=namespace):
+                    contaminated = _source_checkpoint_payload()
+                    if field in {
+                        "stage_evidence_receipts",
+                        "split_receipts",
+                    }:
+                        contaminated["stage"] = "REMAINING"
+                    contaminated[field] = [make_binding(old_path)]
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "old|artifact|binding|namespace|path",
+                    ):
+                        execution_registry._validate_checkpoint_payload(
+                            contaminated, source_run
+                        )
 
     def test_real_public_flow_stops_for_manual_gate_then_reaches_terminal_replay(
         self,
@@ -562,6 +677,658 @@ class V52AcquirePublicE2ETest(unittest.TestCase):
             result.checkpoint.completed_query_ids,
             tuple(sorted(result.checkpoint.completed_query_ids)),
         )
+
+    def test_source_derived_stage_threads_disposition_authority_and_checkpoint_id(
+        self,
+    ) -> None:
+        from contextlib import nullcontext
+
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _AcquisitionRequest,
+            _execute_stage,
+        )
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            DuplicateGamePkDispositionAuthority,
+            build_duplicate_disposition_authority,
+        )
+        from mlb_backtest.v52_evidence import (
+            V52EvidenceStore,
+            logical_query_id,
+        )
+
+        source_run = load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=(
+                ROOT
+                / "protocols/v5_2_qd/"
+                / "historical_walkforward_500_superseding_565534.json"
+            ),
+            acquisition_contract_path=(
+                ROOT
+                / "protocols/v5_2_qd/"
+                / "historical_source_acquisition_superseding_565534.json"
+            ),
+        )
+        self.assertIsInstance(authority, DuplicateGamePkDispositionAuthority)
+        query_id = logical_query_id(authority.query)
+        self.assertEqual(
+            query_id,
+            "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095",
+        )
+        batch = SimpleNamespace(batch_id="b" * 64, queries=(authority.query,))
+        request = _AcquisitionRequest(
+            root=ROOT,
+            run_spec=source_run,
+            years=range(2018, 2025),
+            mode="hybrid",
+            resume=True,
+            stop_after=None,
+            legacy_root=ROOT / LEGACY_ROOT,
+            protected_inventory_path=ROOT / INVENTORY_PATH,
+            reserve_bytes=20 * 1024**3,
+            plan_only=False,
+        )
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            checkpoint = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
+            checkpoints.append(checkpoint)
+            return checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            isolated = dataclasses.replace(authority, evidence_root=store.root)
+            pending = SimpleNamespace(status="PENDING")
+            success = SimpleNamespace(status="SUCCESS")
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._source_disposition_authorities",
+                    return_value={query_id: isolated},
+                ),
+                patch.object(
+                    store,
+                    "read_verified_query_progress",
+                    side_effect=(pending, pending, success, success),
+                ) as progress,
+                patch.object(
+                    store, "acquire_query", return_value=nullcontext()
+                ),
+                patch.object(
+                    store,
+                    "publish_derived_disposition",
+                    return_value=SimpleNamespace(query_id=query_id),
+                ) as derived_writer,
+            ):
+                result = _execute_stage(
+                    request,
+                    _AcquisitionPlan(
+                        contract_sha256="a" * 64,
+                        query_batch_ids=(batch.batch_id,),
+                        legacy_dispositions=("FETCH_REQUIRED",),
+                    ),
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail(
+                        "derived disposition must not fetch"
+                    ),
+                    checkpoint_publisher=publish,
+                    parser=lambda _raw, _query: {},
+                )
+
+        self.assertEqual(len(checkpoints), 2)
+        self.assertEqual(checkpoints[0].dispositioned_query_ids, ())
+        self.assertEqual(checkpoints[1].dispositioned_query_ids, (query_id,))
+        self.assertEqual(result.checkpoint.dispositioned_query_ids, (query_id,))
+        self.assertEqual(len(progress.call_args_list), 4)
+        self.assertTrue(
+            all(
+                call.kwargs.get("authority") is isolated
+                for call in progress.call_args_list
+            )
+        )
+        derived_writer.assert_called_once()
+        self.assertIs(derived_writer.call_args.kwargs["authority"], isolated)
+
+    def test_source_real_run_stages_threads_authenticated_paths_and_stops_before_network_without_task7(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _AcquisitionRequest,
+            _real_run_stages,
+        )
+
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        fetcher = Mock(side_effect=AssertionError("network must remain closed"))
+        request = _AcquisitionRequest(
+            root=ROOT,
+            run_spec=source_run,
+            years=range(2018, 2025),
+            mode="hybrid",
+            resume=True,
+            stop_after=None,
+            legacy_root=ROOT / LEGACY_ROOT,
+            protected_inventory_path=ROOT / INVENTORY_PATH,
+            reserve_bytes=20 * 1024**3,
+            plan_only=False,
+            fetcher=fetcher,
+            acquisition_contract_path=source_contract_path,
+        )
+        plan = _AcquisitionPlan(
+            contract_sha256="a" * 64,
+            query_batch_ids=("b" * 64,),
+            legacy_dispositions=(),
+        )
+        source_raw = ROOT / source_run.raw["namespaces"]["raw"]
+        static = SimpleNamespace(batch_id="b" * 64, queries=())
+        latest = SimpleNamespace(
+            stage="STATIC_SCHEDULES",
+            receipt_sha256="c" * 64,
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        inventory = SimpleNamespace(
+            path=(
+                ROOT
+                / source_run.raw["namespaces"]["audit"]
+                / "acquisition/schedule_anchor_inventory.json"
+            ),
+            sha256="d" * 64,
+        )
+
+        def build_static(run_spec_path: Path, acquisition_contract_path: Path):
+            self.assertEqual(run_spec_path, source_run_path)
+            self.assertEqual(acquisition_contract_path, source_contract_path)
+            return static
+
+        def publish_inventory(root: Path, authority, **kwargs):
+            self.assertEqual(root, ROOT)
+            self.assertIs(authority, source_run)
+            self.assertEqual(
+                kwargs,
+                {
+                    "acquisition_contract_path": source_contract_path,
+                    "static_batch_id": static.batch_id,
+                    "evidence_root": source_raw,
+                },
+            )
+            return inventory
+
+        def build_reference(
+            root: Path,
+            run_spec_path: Path,
+            *,
+            acquisition_contract_path: Path,
+            static_batch_id: str,
+            evidence_root: Path,
+        ):
+            self.assertEqual(root, ROOT)
+            self.assertEqual(run_spec_path, source_run_path)
+            self.assertEqual(acquisition_contract_path, source_contract_path)
+            self.assertEqual(static_batch_id, static.batch_id)
+            self.assertEqual(evidence_root, source_raw)
+            raise TrustIntegrityError(
+                "Task 7 derived disposition batch is not available"
+            )
+
+        with (
+            patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan),
+            patch("mlb_backtest.v52_acquire._current_runner_guard"),
+            patch(
+                "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                return_value=source_raw,
+            ),
+            patch("mlb_backtest.v52_acquire.V52EvidenceStore"),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                return_value=None,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.build_static_batch",
+                side_effect=build_static,
+            ),
+            patch("mlb_backtest.v52_query_plan.publish_query_batch"),
+            patch(
+                "mlb_backtest.v52_acquire._execute_stage",
+                return_value=SimpleNamespace(
+                    checkpoint=latest,
+                    fetched=0,
+                    resumed=0,
+                    network_attempts=0,
+                ),
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_inventory.publish_schedule_anchor_inventory",
+                side_effect=publish_inventory,
+            ),
+            patch("mlb_backtest.v52_acquire._validate_schedule_inventory_schema"),
+            patch(
+                "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
+                side_effect=build_reference,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                TrustIntegrityError, "reference query batch integrity verification"
+            ):
+                _real_run_stages(request, plan)
+        fetcher.assert_not_called()
+
+    def test_source_terminal_replay_rejects_missing_disposition_before_opening_raw_store(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _AcquisitionRequest,
+            _real_replay_terminal,
+        )
+
+        source_run = load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        plan = _AcquisitionPlan(
+            contract_sha256="a" * 64,
+            query_batch_ids=("1" * 64, "2" * 64, "3" * 64),
+            legacy_dispositions=("PROMOTED", *("FETCH_REQUIRED",) * 47),
+        )
+        checkpoint = SimpleNamespace(
+            stage="REMAINING",
+            query_batch_ids=("1" * 64, "2" * 64, "3" * 64, "4" * 64),
+            completed_query_ids=("8" * 64,),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            stage_evidence_receipt_sha256s=tuple(f"{index:064x}" for index in range(10)),
+            dispositioned_query_ids=(),
+        )
+        inventory = SimpleNamespace(
+            payload={"protected_inventory": {"sha256": "5" * 64}}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw_root = root / source_run.raw["namespaces"]["raw"]
+            raw_root.mkdir(parents=True)
+            request = _AcquisitionRequest(
+                root=root,
+                run_spec=source_run,
+                years=range(2018, 2025),
+                mode="hybrid",
+                resume=True,
+                stop_after=None,
+                legacy_root=root / LEGACY_ROOT,
+                protected_inventory_path=root / INVENTORY_PATH,
+                reserve_bytes=20 * 1024**3,
+                plan_only=False,
+            )
+            with (
+                patch(
+                    "mlb_backtest.execution_registry.load_terminal_acquisition_checkpoint",
+                    return_value=checkpoint,
+                ),
+                patch(
+                    "mlb_backtest.v52_query_plan.load_query_batch",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy_decision_inventory.load_verified_legacy_decision_inventory",
+                    return_value=inventory,
+                ),
+                patch(
+                    "mlb_backtest.v52_legacy.load_protected_legacy_catalog",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._validate_remaining_decisions",
+                    return_value=((SimpleNamespace(), SimpleNamespace()),),
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire._validate_terminal_remaining_promotion"
+                ),
+                patch(
+                    "mlb_backtest.v52_acquire.V52EvidenceStore.open_read_only"
+                ) as open_store,
+            ):
+                with self.assertRaisesRegex(
+                    TrustIntegrityError, "disposition|terminal.*authority"
+                ):
+                    _real_replay_terminal(request, plan)
+        open_store.assert_not_called()
+
+    def test_source_timezone_checkpoint_writer_uses_disposition_and_new_audit_paths(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _AcquisitionRequest,
+            _real_run_stages,
+        )
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+        from mlb_backtest.v52_evidence import logical_query_id
+
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=source_run_path,
+            acquisition_contract_path=source_contract_path,
+        )
+        query_id = logical_query_id(authority.query)
+        static = SimpleNamespace(batch_id="1" * 64, queries=(authority.query,))
+        inventory = SimpleNamespace(
+            path=(
+                ROOT
+                / source_run.raw["namespaces"]["audit"]
+                / "acquisition/schedule_anchor_inventory.json"
+            ),
+            sha256="2" * 64,
+        )
+        reference = SimpleNamespace(
+            batch_id="3" * 64,
+            queries=(),
+            derived_from_sha256=inventory.sha256,
+        )
+        static_checkpoint = SimpleNamespace(
+            stage="STATIC_SCHEDULES",
+            receipt_sha256="4" * 64,
+            query_batch_ids=(static.batch_id,),
+            completed_query_ids=(query_id,),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        reference_checkpoint = SimpleNamespace(
+            stage="REFERENCE_INPUTS",
+            receipt_sha256="5" * 64,
+            query_batch_ids=(static.batch_id, reference.batch_id),
+            completed_query_ids=(query_id,),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        request = _AcquisitionRequest(
+            root=ROOT,
+            run_spec=source_run,
+            years=range(2018, 2025),
+            mode="hybrid",
+            resume=True,
+            stop_after=None,
+            legacy_root=ROOT / LEGACY_ROOT,
+            protected_inventory_path=ROOT / INVENTORY_PATH,
+            reserve_bytes=20 * 1024**3,
+            plan_only=False,
+            acquisition_contract_path=source_contract_path,
+        )
+        plan = _AcquisitionPlan(
+            contract_sha256="6" * 64,
+            query_batch_ids=(static.batch_id,),
+            legacy_dispositions=(),
+        )
+        audit_root = ROOT / source_run.raw["namespaces"]["audit"]
+
+        def capture_timezone(
+            root: Path, run_spec, **values
+        ) -> SimpleNamespace:
+            self.assertEqual(root, ROOT)
+            self.assertIs(run_spec, source_run)
+            self.assertEqual(values["stage"], "TIMEZONE_REVIEW")
+            self.assertEqual(values["dispositioned_query_ids"], (query_id,))
+            self.assertEqual(
+                values["stage_evidence_receipts"],
+                (
+                    inventory.path,
+                    audit_root / "acquisition/timezone_reviews/coverage.json",
+                    audit_root / "acquisition/timezone_reviews/semantic.json",
+                    audit_root / "acquisition/venue_timezone_candidate.json",
+                    audit_root / "acquisition/venue_timezone_seal.json",
+                    ROOT / "config/v5_2_qd/venue_timezones.json",
+                ),
+            )
+            raise TrustIntegrityError("stop after timezone checkpoint assertion")
+
+        with (
+            patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan),
+            patch("mlb_backtest.v52_acquire._current_runner_guard"),
+            patch(
+                "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                return_value=ROOT / source_run.raw["namespaces"]["raw"],
+            ),
+            patch("mlb_backtest.v52_acquire.V52EvidenceStore"),
+            patch(
+                "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                return_value=None,
+            ),
+            patch("mlb_backtest.v52_query_plan.build_static_batch", return_value=static),
+            patch("mlb_backtest.v52_query_plan.publish_query_batch"),
+            patch(
+                "mlb_backtest.v52_acquire._execute_stage",
+                side_effect=(
+                    SimpleNamespace(
+                        checkpoint=static_checkpoint,
+                        fetched=0,
+                        resumed=0,
+                        network_attempts=0,
+                    ),
+                    SimpleNamespace(
+                        checkpoint=reference_checkpoint,
+                        fetched=0,
+                        resumed=0,
+                        network_attempts=0,
+                    ),
+                ),
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_inventory.publish_schedule_anchor_inventory",
+                return_value=inventory,
+            ),
+            patch("mlb_backtest.v52_acquire._validate_schedule_inventory_schema"),
+            patch(
+                "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
+                return_value=reference,
+            ),
+            patch("mlb_backtest.v52_timezone_review.publish_timezone_candidate"),
+            patch("mlb_backtest.v52_acquire._load_required_timezone_gate"),
+            patch(
+                "mlb_backtest.v52_acquire._source_disposition_authorities",
+                return_value={query_id: authority},
+            ),
+            patch(
+                "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                side_effect=capture_timezone,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                TrustIntegrityError, "timezone checkpoint integrity verification"
+            ):
+                _real_run_stages(request, plan)
+
+    def test_source_remaining_checkpoint_writer_uses_disposition_and_new_audit_paths(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            TrustIntegrityError,
+            _AcquisitionPlan,
+            _AcquisitionRequest,
+            _run_remaining_stage,
+        )
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+        from mlb_backtest.v52_evidence import logical_query_id
+
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            / "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        authority = build_duplicate_disposition_authority(
+            ROOT,
+            source_run_spec_path=source_run_path,
+            acquisition_contract_path=source_contract_path,
+        )
+        query_id = logical_query_id(authority.query)
+        prefix = (
+            SimpleNamespace(batch_id="1" * 64, queries=(authority.query,)),
+            SimpleNamespace(batch_id="2" * 64, queries=()),
+            SimpleNamespace(batch_id="3" * 64, queries=()),
+        )
+        partition = SimpleNamespace(batch_id="4" * 64, queries=())
+        request = _AcquisitionRequest(
+            root=ROOT,
+            run_spec=source_run,
+            years=range(2018, 2025),
+            mode="hybrid",
+            resume=True,
+            stop_after=None,
+            legacy_root=ROOT / LEGACY_ROOT,
+            protected_inventory_path=ROOT / INVENTORY_PATH,
+            reserve_bytes=20 * 1024**3,
+            plan_only=False,
+            acquisition_contract_path=source_contract_path,
+        )
+        plan = _AcquisitionPlan(
+            contract_sha256="5" * 64,
+            query_batch_ids=tuple(batch.batch_id for batch in prefix),
+            legacy_dispositions=(),
+        )
+        latest = SimpleNamespace(
+            stage="PARTICIPANT_DERIVED",
+            receipt_sha256="6" * 64,
+            query_batch_ids=tuple(batch.batch_id for batch in prefix),
+            completed_query_ids=(query_id,),
+            pending_query_ids=(),
+            quarantined_query_ids=(),
+            split_query_ids=(),
+        )
+        audit_root = ROOT / source_run.raw["namespaces"]["audit"]
+        participant_evidence = tuple(
+            audit_root / f"acquisition/participant-{index}.json"
+            for index in range(7)
+        )
+        expected_remaining_evidence = tuple(
+            sorted(
+                (
+                    *participant_evidence,
+                    ROOT / INVENTORY_PATH,
+                    audit_root / "acquisition/legacy_decision_inventory.json",
+                    audit_root
+                    / "acquisition/query_batches"
+                    / f"{prefix[1].batch_id}.json",
+                ),
+                key=str,
+            )
+        )
+        inventory = SimpleNamespace(
+            payload={"protected_inventory": {"sha256": "7" * 64}}
+        )
+
+        def capture_remaining(
+            root: Path, run_spec, **values
+        ) -> SimpleNamespace:
+            self.assertEqual(root, ROOT)
+            self.assertIs(run_spec, source_run)
+            self.assertEqual(values["stage"], "REMAINING")
+            self.assertEqual(values["dispositioned_query_ids"], (query_id,))
+            self.assertEqual(
+                values["query_batch_ids"],
+                (*tuple(batch.batch_id for batch in prefix), partition.batch_id),
+            )
+            self.assertEqual(
+                values["stage_evidence_receipts"], expected_remaining_evidence
+            )
+            self.assertEqual(values["split_receipt_paths"], ())
+            raise TrustIntegrityError("stop after REMAINING checkpoint assertion")
+
+        with (
+            patch(
+                "mlb_backtest.v52_query_plan.build_statcast_root_batch",
+                return_value=prefix[1],
+            ),
+            patch("mlb_backtest.v52_query_plan.publish_query_batch"),
+            patch(
+                "mlb_backtest.v52_legacy_decision_inventory.publish_legacy_decision_inventory",
+                return_value=inventory,
+            ),
+            patch(
+                "mlb_backtest.v52_query_plan.build_legacy_partition_batch",
+                return_value=partition,
+            ),
+            patch(
+                "mlb_backtest.v52_legacy.load_protected_legacy_catalog",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "mlb_backtest.v52_acquire._validate_remaining_decisions",
+                return_value=(),
+            ),
+            patch(
+                "mlb_backtest.v52_acquire._source_disposition_authorities",
+                return_value={query_id: authority},
+            ),
+            patch(
+                "mlb_backtest.v52_acquire._remaining_populations",
+                return_value=((query_id,), (), (), ()),
+            ),
+            patch(
+                "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                side_effect=capture_remaining,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                TrustIntegrityError, "REMAINING checkpoint integrity verification"
+            ):
+                _run_remaining_stage(
+                    request,
+                    plan,
+                    SimpleNamespace(),
+                    fixed_prefix=prefix,
+                    participant_evidence=participant_evidence,
+                    latest=latest,
+                    evidence_root=ROOT / source_run.raw["namespaces"]["raw"],
+                    runner_guard=SimpleNamespace(),
+                    disk_budget=SimpleNamespace(),
+                )
 
     def test_remaining_wave_preregisters_every_peer_before_network_gates(
         self,

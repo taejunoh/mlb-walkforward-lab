@@ -54,6 +54,12 @@ _RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 _ACQUISITION_CONTRACT_RELATIVE = Path(
     "protocols/v5_2_qd/historical_source_acquisition.json"
 )
+_SOURCE_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+_SOURCE_DISPOSITION_QUERY_ID = (
+    "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+)
 _LEGACY_ROOT_RELATIVE = Path("data/v5_1_bt/raw")
 _PROTECTED_INVENTORY_RELATIVE = Path("audit/v5_1_bt/protected_raw_inventory.json")
 _SCHEDULE_INVENTORY_RELATIVE = Path(
@@ -741,6 +747,23 @@ class _AcquireOps:
     ] = _stages_unavailable
 
 
+def _require_source_terminal_disposition(checkpoint: object) -> None:
+    if (
+        getattr(checkpoint, "dispositioned_query_ids", ())
+        != (_SOURCE_DISPOSITION_QUERY_ID,)
+        or _SOURCE_DISPOSITION_QUERY_ID
+        not in getattr(checkpoint, "completed_query_ids", ())
+        or _SOURCE_DISPOSITION_QUERY_ID
+        in getattr(checkpoint, "pending_query_ids", ())
+        or _SOURCE_DISPOSITION_QUERY_ID
+        in getattr(checkpoint, "quarantined_query_ids", ())
+        or _SOURCE_DISPOSITION_QUERY_ID in getattr(checkpoint, "split_query_ids", ())
+    ):
+        raise TrustIntegrityError(
+            "superseding SOURCES_READY requires the completed disposition query"
+        )
+
+
 def _summary_for_plan(plan: _AcquisitionPlan) -> AcquisitionSummary:
     hashes = (plan.contract_sha256, *plan.query_batch_ids)
     if (
@@ -924,7 +947,12 @@ def _validate_request_contract(
         raise TrustIntegrityError("free-space reserve is below 20 GiB")
 
     supplied_contract = (
-        root / _ACQUISITION_CONTRACT_RELATIVE
+        root
+        / (
+            _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+            if isinstance(request.run_spec, SourceRunSpec)
+            else _ACQUISITION_CONTRACT_RELATIVE
+        )
         if request.acquisition_contract_path is None
         else request.acquisition_contract_path
     )
@@ -951,8 +979,11 @@ def _validate_request_contract(
             _PROTECTED_INVENTORY_RELATIVE,
             "protected inventory",
         )
+        # Task 6 recognizes the source checkpoint authority.  Task 7 is still
+        # responsible for publishing its derived disposition query batch; until
+        # that immutable batch exists, acquisition must stop before any fetch.
         raise TrustIntegrityError(
-            "superseding source checkpoints are not enabled before Task 6"
+            "Task 6 source checkpoint requires the Task 7 derived disposition batch"
         )
     run_path = _require_exact_path(
         root, root / _RUN_SPEC_RELATIVE, _RUN_SPEC_RELATIVE, "run spec"
@@ -1353,6 +1384,8 @@ def _select_stage_failure(failures: Sequence[_StageFailure]) -> _StageFailure | 
 def _stage_populations(
     store: V52EvidenceStore,
     batches: Sequence[object],
+    *,
+    disposition_authorities: Mapping[str, object] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     completed: list[str] = []
     pending: list[str] = []
@@ -1371,7 +1404,10 @@ def _stage_populations(
             seen.add(query_id)
             progress = _integrity_boundary(
                 "query evidence replay",
-                lambda query=query: store.read_verified_query_progress(query),
+                lambda query=query: store.read_verified_query_progress(
+                    query,
+                    authority=(disposition_authorities or {}).get(query_id),
+                ),
             )
             if progress.status == "SUCCESS":
                 completed.append(query_id)
@@ -1382,10 +1418,51 @@ def _stage_populations(
     return tuple(sorted(completed)), tuple(sorted(pending)), tuple(sorted(quarantined))
 
 
+def _source_disposition_authorities(
+    request: _AcquisitionRequest,
+    batches: Sequence[object],
+) -> Mapping[str, object]:
+    """Build the one exact disposition authority for every source-run replay."""
+    if not isinstance(request.run_spec, SourceRunSpec):
+        return {}
+    from .v52_duplicate_gamepk_disposition import (
+        DISPOSITION_ENDPOINT,
+        build_duplicate_disposition_authority,
+    )
+
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    authority = build_duplicate_disposition_authority(
+        root,
+        source_run_spec_path=(
+            root
+            / "protocols/v5_2_qd/"
+            / "historical_walkforward_500_superseding_565534.json"
+        ),
+        acquisition_contract_path=(
+            root
+            / "protocols/v5_2_qd/"
+            / "historical_source_acquisition_superseding_565534.json"
+        ),
+    )
+    found = [
+        query
+        for batch in batches
+        for query in getattr(batch, "queries", ())
+        if isinstance(query, LogicalQuery) and query.endpoint == DISPOSITION_ENDPOINT
+    ]
+    if not found:
+        return {}
+    if len(found) != 1 or found[0] != authority.query:
+        raise TrustIntegrityError("source disposition query authority differs")
+    return {logical_query_id(authority.query): authority}
+
+
 def _remaining_stage_evidence(
     root: Path,
     participant_evidence: Sequence[Path],
     statcast_root_batch_id: str,
+    *,
+    audit_relative: Path = Path("audit/v5_2_qd/historical"),
 ) -> tuple[Path, ...]:
     if (
         not isinstance(statcast_root_batch_id, str)
@@ -1402,10 +1479,8 @@ def _remaining_stage_evidence(
             (
                 *participant,
                 root / _PROTECTED_INVENTORY_RELATIVE,
-                root
-                / "audit/v5_2_qd/historical/acquisition/legacy_decision_inventory.json",
-                root
-                / "audit/v5_2_qd/historical/acquisition/query_batches"
+                root / audit_relative / "acquisition/legacy_decision_inventory.json",
+                root / audit_relative / "acquisition/query_batches"
                 / f"{statcast_root_batch_id}.json",
             ),
             key=os.fspath,
@@ -1420,6 +1495,8 @@ def _remaining_populations(
     store: V52EvidenceStore,
     batches: Sequence[object],
     split_query_ids: Sequence[str],
+    *,
+    disposition_authorities: Mapping[str, object] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     split = tuple(sorted(split_query_ids))
     if len(split) != len(set(split)):
@@ -1444,7 +1521,10 @@ def _remaining_populations(
                 continue
             progress = _integrity_boundary(
                 "REMAINING query evidence replay",
-                lambda query=query: store.read_verified_query_progress(query),
+                lambda query=query: store.read_verified_query_progress(
+                    query,
+                    authority=(disposition_authorities or {}).get(query_id),
+                ),
             )
             if progress.status == "SUCCESS":
                 completed.append(query_id)
@@ -1878,14 +1958,28 @@ def _execute_stage(
     batch_ids = tuple(getattr(batch, "batch_id", None) for batch in batches)
     if not batch_ids or any(not isinstance(value, str) for value in batch_ids):
         raise TypeError("stage batches must expose batch IDs")
+    disposition_authorities = _integrity_boundary(
+        "source disposition authority",
+        lambda: _source_disposition_authorities(request, batches),
+    )
     selected_parser = (
-        (lambda raw, query: recompute_query_sidecar(query, raw))
+        (
+            lambda raw, query: recompute_query_sidecar(
+                query,
+                raw,
+                authority=disposition_authorities.get(logical_query_id(query)),
+            )
+        )
         if parser is None
         else parser
     )
 
     def publish(prior: str | None) -> object:
-        completed, pending, quarantined = _stage_populations(store, batches)
+        completed, pending, quarantined = _stage_populations(
+            store,
+            batches,
+            disposition_authorities=disposition_authorities,
+        )
         values = {
             "expected_prior_checkpoint_sha256": prior,
             "stage": stage,
@@ -1897,6 +1991,12 @@ def _execute_stage(
             "stage_evidence_receipts": tuple(stage_evidence),
             "split_receipt_paths": (),
         }
+        if isinstance(request.run_spec, SourceRunSpec):
+            values["dispositioned_query_ids"] = tuple(
+                query_id
+                for query_id in completed
+                if query_id in disposition_authorities
+            )
         if checkpoint_publisher is not None:
             return checkpoint_publisher(**values)
         return _integrity_boundary(
@@ -1929,7 +2029,10 @@ def _execute_stage(
     for query in active_queries:
         progress = _integrity_boundary(
             "query evidence replay",
-            lambda query=query: store.read_verified_query_progress(query),
+            lambda query=query: store.read_verified_query_progress(
+                query,
+                authority=disposition_authorities.get(logical_query_id(query)),
+            ),
         )
         if progress.status == "SUCCESS":
             resumed += 1
@@ -1983,7 +2086,11 @@ def _execute_stage(
 
         def publish_derived() -> PublishedEvidence:
             with store.acquire_query(query):
-                return store.publish_derived_disposition(query, semantics)
+                return store.publish_derived_disposition(
+                    query,
+                    semantics,
+                    authority=disposition_authorities.get(logical_query_id(query)),
+                )
 
         _integrity_boundary("derived disposition", publish_derived)
 
@@ -2021,7 +2128,10 @@ def _execute_stage(
         )
         progress = _integrity_boundary(
             "query evidence replay",
-            lambda: store.read_verified_query_progress(query),
+            lambda: store.read_verified_query_progress(
+                query,
+                authority=disposition_authorities.get(logical_query_id(query)),
+            ),
         )
         if progress.status != "SUCCESS":
             raise RuntimeError("query acquirer returned without verified success")
@@ -2132,7 +2242,11 @@ def _execute_stage(
             network_attempts=network_attempts,
         )
     checkpoint = publish(prior)
-    completed, pending, quarantined = _stage_populations(store, batches)
+    completed, pending, quarantined = _stage_populations(
+        store,
+        batches,
+        disposition_authorities=disposition_authorities,
+    )
     if pending or quarantined:
         raise OperationalBlock(f"{stage} is not terminal")
     return _StageResult(
@@ -2147,7 +2261,11 @@ def _ensure_canonical_raw_parent(request: _AcquisitionRequest) -> Path:
     namespaces = request.run_spec.raw.get("namespaces")
     raw_value = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
     relative = Path(raw_value) if isinstance(raw_value, str) else Path()
-    expected = Path("data/v5_2_qd/historical/raw")
+    expected = Path(
+        "data/v5_2_qd/historical_superseding_565534/raw"
+        if isinstance(request.run_spec, SourceRunSpec)
+        else "data/v5_2_qd/historical/raw"
+    )
     if relative != expected:
         raise TrustIntegrityError("raw evidence namespace differs")
     root = Path(os.path.abspath(os.fspath(request.root)))
@@ -2578,6 +2696,11 @@ def _run_remaining_stage(
     if len(prefix) != 3:
         raise TrustIntegrityError("REMAINING fixed prefix differs")
     root = Path(os.path.abspath(os.fspath(request.root)))
+    namespaces = request.run_spec.raw.get("namespaces")
+    audit_value = namespaces.get("audit") if isinstance(namespaces, Mapping) else None
+    if not isinstance(audit_value, str):
+        raise TrustIntegrityError("REMAINING audit namespace differs")
+    audit_relative = Path(audit_value)
     latest_stage = getattr(latest, "stage", None)
     if latest_stage not in {"PARTICIPANT_DERIVED", "REMAINING"}:
         raise TrustIntegrityError("REMAINING prior checkpoint differs")
@@ -2701,13 +2824,20 @@ def _run_remaining_stage(
         root,
         participant_evidence,
         statcast_root.batch_id,
+        audit_relative=audit_relative,
     )
     current = latest
+    disposition_authorities = _source_disposition_authorities(request, batches)
 
     def populations() -> tuple[
         tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
     ]:
-        return _remaining_populations(store, batches, split_ids)
+        return _remaining_populations(
+            store,
+            batches,
+            split_ids,
+            disposition_authorities=disposition_authorities,
+        )
 
     def publish_current() -> object:
         nonlocal current
@@ -2716,29 +2846,39 @@ def _run_remaining_stage(
             sorted(
                 (
                     root
-                    / "audit/v5_2_qd/historical/acquisition/split_receipts"
+                    / audit_relative
+                    / "acquisition/split_receipts"
                     / f"{parent_id}.json"
                     for parent_id in split
                 ),
                 key=os.fspath,
             )
         )
+        checkpoint_values: dict[str, object] = {
+            "expected_prior_checkpoint_sha256": getattr(
+                current, "receipt_sha256", None
+            ),
+            "stage": "REMAINING",
+            "query_batch_ids": tuple(batch.batch_id for batch in batches),
+            "completed_query_ids": completed,
+            "pending_query_ids": pending,
+            "quarantined_query_ids": quarantined,
+            "split_query_ids": split,
+            "stage_evidence_receipts": stage_evidence,
+            "split_receipt_paths": split_paths,
+        }
+        if isinstance(request.run_spec, SourceRunSpec):
+            checkpoint_values["dispositioned_query_ids"] = tuple(
+                query_id
+                for query_id in completed
+                if query_id in disposition_authorities
+            )
         current = _integrity_boundary(
             "REMAINING checkpoint",
             lambda: publish_acquisition_checkpoint(
                 root,
                 request.run_spec,
-                expected_prior_checkpoint_sha256=getattr(
-                    current, "receipt_sha256", None
-                ),
-                stage="REMAINING",
-                query_batch_ids=tuple(batch.batch_id for batch in batches),
-                completed_query_ids=completed,
-                pending_query_ids=pending,
-                quarantined_query_ids=quarantined,
-                split_query_ids=split,
-                stage_evidence_receipts=stage_evidence,
-                split_receipt_paths=split_paths,
+                **checkpoint_values,
             ),
         )
         return current
@@ -2916,13 +3056,22 @@ def _validate_resumed_timezone_checkpoint(
     batch_ids: tuple[str, str],
     completed_query_ids: tuple[str, ...],
     stage_evidence: tuple[Path, ...],
+    audit_relative: Path = Path("audit/v5_2_qd/historical"),
 ) -> None:
     supplied_paths = getattr(checkpoint, "stage_evidence_receipt_paths", None)
     expected_relative_paths = tuple(
-        relative.as_posix() for relative in _TIMEZONE_STAGE_EVIDENCE_RELATIVES
+        path.as_posix()
+        for path in (
+            audit_relative / "acquisition/schedule_anchor_inventory.json",
+            audit_relative / "acquisition/timezone_reviews/coverage.json",
+            audit_relative / "acquisition/timezone_reviews/semantic.json",
+            audit_relative / "acquisition/venue_timezone_candidate.json",
+            audit_relative / "acquisition/venue_timezone_seal.json",
+            Path("config/v5_2_qd/venue_timezones.json"),
+        )
     )
     expected_evidence = tuple(
-        root / relative for relative in _TIMEZONE_STAGE_EVIDENCE_RELATIVES
+        root / relative for relative in map(Path, expected_relative_paths)
     )
     if stage_evidence != expected_evidence:
         raise TrustIntegrityError("timezone checkpoint boundary differs")
@@ -2988,6 +3137,21 @@ def _real_run_stages(
         raise TrustIntegrityError("acquisition authority changed before stage execution")
     runner_guard = _current_runner_guard(request)
     root = Path(os.path.abspath(os.fspath(request.root)))
+    run_spec_relative = (
+        Path("protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json")
+        if isinstance(request.run_spec, SourceRunSpec)
+        else _RUN_SPEC_RELATIVE
+    )
+    contract_relative = (
+        _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+        if isinstance(request.run_spec, SourceRunSpec)
+        else _ACQUISITION_CONTRACT_RELATIVE
+    )
+    namespaces = request.run_spec.raw.get("namespaces")
+    audit_value = namespaces.get("audit") if isinstance(namespaces, Mapping) else None
+    if not isinstance(audit_value, str):
+        raise TrustIntegrityError("acquisition audit namespace differs")
+    audit_relative = Path(audit_value)
     evidence_root = _ensure_canonical_raw_parent(request)
     store = _integrity_boundary(
         "raw evidence store",
@@ -3010,8 +3174,8 @@ def _real_run_stages(
     static = _integrity_boundary(
         "static query batch",
         lambda: build_static_batch(
-            root / _RUN_SPEC_RELATIVE,
-            root / _ACQUISITION_CONTRACT_RELATIVE,
+            root / run_spec_relative,
+            root / contract_relative,
         ),
     )
     fetched = 0
@@ -3069,7 +3233,7 @@ def _real_run_stages(
         raise OperationalBlock("STATIC_SCHEDULES is not terminal")
 
     inventory_kwargs = {
-        "acquisition_contract_path": root / _ACQUISITION_CONTRACT_RELATIVE,
+        "acquisition_contract_path": root / contract_relative,
         "static_batch_id": static.batch_id,
         "evidence_root": evidence_root,
     }
@@ -3101,8 +3265,8 @@ def _real_run_stages(
         "reference query batch",
         lambda: build_schedule_reference_batch(
             root,
-            root / _RUN_SPEC_RELATIVE,
-            acquisition_contract_path=root / _ACQUISITION_CONTRACT_RELATIVE,
+            root / run_spec_relative,
+            acquisition_contract_path=root / contract_relative,
             static_batch_id=static.batch_id,
             evidence_root=evidence_root,
         ),
@@ -3148,7 +3312,14 @@ def _real_run_stages(
         )
     )
     if terminal_reference:
-        completed, pending, quarantined = _stage_populations(store, cumulative_batches)
+        cumulative_authorities = _source_disposition_authorities(
+            request, cumulative_batches
+        )
+        completed, pending, quarantined = _stage_populations(
+            store,
+            cumulative_batches,
+            disposition_authorities=cumulative_authorities,
+        )
         if completed != cumulative_ids or pending or quarantined:
             raise TrustIntegrityError("terminal reference evidence replay differs")
         resumed += len(reference.queries)
@@ -3205,26 +3376,34 @@ def _real_run_stages(
 
     timezone_stage_evidence = (
         inventory.path,
-        root / "audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json",
-        root / "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
-        root / "audit/v5_2_qd/historical/acquisition/venue_timezone_candidate.json",
-        root / "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+        root / audit_relative / "acquisition/timezone_reviews/coverage.json",
+        root / audit_relative / "acquisition/timezone_reviews/semantic.json",
+        root / audit_relative / "acquisition/venue_timezone_candidate.json",
+        root / audit_relative / "acquisition/venue_timezone_seal.json",
         root / "config/v5_2_qd/venue_timezones.json",
     )
     if latest.stage == "REFERENCE_INPUTS":
+        timezone_checkpoint_values: dict[str, object] = {
+            "expected_prior_checkpoint_sha256": latest.receipt_sha256,
+            "stage": "TIMEZONE_REVIEW",
+            "query_batch_ids": (static.batch_id, reference.batch_id),
+            "completed_query_ids": cumulative_ids,
+            "pending_query_ids": (),
+            "quarantined_query_ids": (),
+            "split_query_ids": (),
+            "stage_evidence_receipts": timezone_stage_evidence,
+        }
+        if isinstance(request.run_spec, SourceRunSpec):
+            timezone_checkpoint_values["dispositioned_query_ids"] = tuple(
+                query_id
+                for query_id in cumulative_ids
+                if query_id
+                in _source_disposition_authorities(request, cumulative_batches)
+            )
         latest = _integrity_boundary(
             "timezone checkpoint",
             lambda: publish_acquisition_checkpoint(
-                root,
-                request.run_spec,
-                expected_prior_checkpoint_sha256=latest.receipt_sha256,
-                stage="TIMEZONE_REVIEW",
-                query_batch_ids=(static.batch_id, reference.batch_id),
-                completed_query_ids=cumulative_ids,
-                pending_query_ids=(),
-                quarantined_query_ids=(),
-                split_query_ids=(),
-                stage_evidence_receipts=timezone_stage_evidence,
+                root, request.run_spec, **timezone_checkpoint_values
             ),
         )
     if latest.stage == "TIMEZONE_REVIEW":
@@ -3234,6 +3413,7 @@ def _real_run_stages(
             batch_ids=(static.batch_id, reference.batch_id),
             completed_query_ids=cumulative_ids,
             stage_evidence=timezone_stage_evidence,
+            audit_relative=audit_relative,
         )
     elif (
         latest.stage not in {"PARTICIPANT_DERIVED", "REMAINING"}
@@ -3304,7 +3484,14 @@ def _real_run_stages(
         )
     )
     if terminal_participant:
-        completed, pending, quarantined = _stage_populations(store, participant_batches)
+        participant_authorities = _source_disposition_authorities(
+            request, participant_batches
+        )
+        completed, pending, quarantined = _stage_populations(
+            store,
+            participant_batches,
+            disposition_authorities=participant_authorities,
+        )
         if completed != participant_ids or pending or quarantined:
             raise TrustIntegrityError("terminal participant evidence replay differs")
         resumed += len(participant.queries)
@@ -3360,11 +3547,16 @@ def _real_inspect_runtime(
     from .execution_registry import load_execution_registry
 
     root = Path(os.path.abspath(os.fspath(request.root)))
-    phase_root = root / "audit/v5_2_qd/historical/execution/phase_receipts"
+    namespaces = request.run_spec.raw.get("namespaces")
+    audit = namespaces.get("audit") if isinstance(namespaces, Mapping) else None
+    raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(audit, str) or not isinstance(raw, str):
+        raise TrustIntegrityError("runtime authority namespaces differ")
+    phase_root = root / audit / "execution/phase_receipts"
     progress_paths = (
-        root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints",
-        root / "audit/v5_2_qd/historical/acquisition/query_batches",
-        root / "data/v5_2_qd/historical/raw",
+        root / audit / "execution/acquisition_checkpoints",
+        root / audit / "acquisition/query_batches",
+        root / raw,
     )
     has_progress = any(path.exists() for path in progress_paths)
     if not phase_root.exists():
@@ -3435,6 +3627,8 @@ def _real_replay_terminal(
     root = Path(os.path.abspath(os.fspath(request.root)))
     try:
         checkpoint = load_terminal_acquisition_checkpoint(root, request.run_spec)
+        if isinstance(request.run_spec, SourceRunSpec):
+            _require_source_terminal_disposition(checkpoint)
         batch_ids = checkpoint.query_batch_ids
         if (
             checkpoint.stage != "REMAINING"
@@ -3467,7 +3661,11 @@ def _real_replay_terminal(
             protected_inventory_sha256=str(protected["sha256"]),
         )
         promoted = _validate_remaining_decisions(partition, inventory, catalog)
-        evidence_root = root / "data/v5_2_qd/historical/raw"
+        namespaces = request.run_spec.raw.get("namespaces")
+        raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+        if not isinstance(raw, str):
+            raise TrustIntegrityError("SOURCES_READY raw namespace differs")
+        evidence_root = root / raw
         if not evidence_root.is_dir():
             raise TrustIntegrityError(
                 "SOURCES_READY raw evidence authority is unavailable"
@@ -3628,7 +3826,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             acquisition_contract_path=(
                 args.acquisition_contract
                 if args.acquisition_contract is not None
-                else args.root / _ACQUISITION_CONTRACT_RELATIVE
+                else args.root
+                / (
+                    _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+                    if isinstance(run_spec, SourceRunSpec)
+                    else _ACQUISITION_CONTRACT_RELATIVE
+                )
             ),
         )
     except KeyboardInterrupt:
