@@ -176,6 +176,7 @@ def run_daily_top3(
             target_date,
             card,
             fetcher=fetcher,
+            expected_root_binding=trusted.binding,
         )
         slate = _bound_call(
             trusted,
@@ -200,6 +201,7 @@ def run_daily_top3(
             target_date,
             _observed_pitcher_ids(slate),
             fetcher=fetcher,
+            expected_root_binding=trusted.binding,
         )
 
         def observe_final(game_pk: int, requested_date: str):

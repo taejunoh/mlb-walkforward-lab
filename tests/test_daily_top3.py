@@ -210,7 +210,9 @@ class DailyTop3Tests(unittest.TestCase):
                 mock.patch.object(
                     daily_top3, "load_frozen_live_card_bytes", return_value=object()
                 ),
-                mock.patch.object(daily_top3, "build_live_history", return_value=object()),
+                mock.patch.object(
+                    daily_top3, "build_live_history", return_value=object()
+                ) as history,
                 mock.patch.object(daily_top3, "observe_live_slate", return_value=slate),
                 mock.patch.object(daily_top3, "load_live_career_bf", return_value=({}, ())) as career,
                 mock.patch.object(daily_top3, "observe_final_game_schedule", return_value=observed) as final,
@@ -231,7 +233,9 @@ class DailyTop3Tests(unittest.TestCase):
                 )
 
         self.assertEqual(result, ({"payload": "validated"}, *expected_paths))
+        self.assertIsNotNone(history.call_args.kwargs["expected_root_binding"])
         self.assertEqual(career.call_args.args[2], (101, 202))
+        self.assertIsNotNone(career.call_args.kwargs["expected_root_binding"])
         self.assertEqual(final.call_args.args, (root, "2026-07-21", saved_game))
         self.assertEqual(final.call_args.kwargs["fetcher"], fetcher)
         self.assertIsNotNone(final.call_args.kwargs["expected_root_binding"])
@@ -333,6 +337,82 @@ class DailyTop3Tests(unittest.TestCase):
                     )
             slate.assert_not_called()
             self.assertEqual(tuple(outside.iterdir()), ())
+
+    def test_daily_binding_rejects_directory_replacement_at_history_or_career_entry(self):
+        from mlb_backtest import daily_top3, live_history
+
+        for phase in ("history", "career"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                dir=Path.cwd()
+            ) as temporary:
+                base = Path(temporary)
+                root = base / "root"
+                moved = base / "moved-root"
+                replacement = base / "replacement"
+                root.mkdir()
+                replacement.mkdir()
+                card = root / "card.json"
+                card.write_bytes(b"model card fixture")
+                slate_value = SimpleNamespace(
+                    games=(),
+                    participants={
+                        1: SimpleNamespace(
+                            away_pitcher_list_id=101,
+                            home_pitcher_list_id=202,
+                        )
+                    },
+                )
+
+                def swap_root_once():
+                    root.rename(moved)
+                    replacement.rename(root)
+
+                def history_entry(*args, **kwargs):
+                    swap_root_once()
+                    return live_history.build_live_history(*args, **kwargs)
+
+                def career_entry(*args, **kwargs):
+                    swap_root_once()
+                    return live_history.load_live_career_bf(*args, **kwargs)
+
+                history_side_effect = history_entry if phase == "history" else None
+                career_side_effect = career_entry if phase == "career" else None
+                with (
+                    mock.patch.object(
+                        daily_top3,
+                        "load_frozen_live_card_bytes",
+                        return_value=object(),
+                    ),
+                    mock.patch.object(
+                        daily_top3,
+                        "build_live_history",
+                        side_effect=history_side_effect,
+                        return_value=object(),
+                    ),
+                    mock.patch.object(
+                        daily_top3,
+                        "observe_live_slate",
+                        return_value=slate_value,
+                    ) as observe_slate,
+                    mock.patch.object(
+                        daily_top3,
+                        "load_live_career_bf",
+                        side_effect=career_side_effect,
+                        return_value=({}, ()),
+                    ),
+                ):
+                    with self.assertRaises(ValueError):
+                        daily_top3.run_daily_top3(
+                            root,
+                            "2026-07-21",
+                            Path("card.json"),
+                            utc_clock=datetime(
+                                2026, 7, 21, 16, tzinfo=timezone.utc
+                            ),
+                        )
+                if phase == "history":
+                    observe_slate.assert_not_called()
+                self.assertEqual(tuple(root.iterdir()), ())
 
     def test_model_card_snapshot_bytes_survive_leaf_symlink_or_fifo_swap(self):
         from mlb_backtest import daily_top3
