@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import importlib
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -1996,6 +1997,78 @@ class V52VerifySourcesTest(unittest.TestCase):
                         **{**vars(fixture), "game_inventory": bad_inventory}
                     )
                 )
+
+    @unittest.skipUnless(
+        os.environ.get("MLB_RUN_SLOW_SOURCE_REPLAY_INTEGRATION") == "1",
+        "requires the fixed protected 3GB corpus; opt in with "
+        "MLB_RUN_SLOW_SOURCE_REPLAY_INTEGRATION=1",
+    )
+    def test_public_source_loader_authenticates_disposition_inventory(self) -> None:
+        """Replay real source authority through the public sealed loader boundary.
+
+        This deliberately opt-in integration test rehashes the fixed protected
+        3GB legacy corpus while authenticating terminal semantic authority.
+        """
+
+        from mlb_backtest.protocols import SourceRunSpec
+        from mlb_backtest.v52_acquire import acquire_sources
+        from mlb_backtest.v52_verify_sources import load_snapshot_replay_inputs
+        from tests.test_v52_acquire_e2e import DeterministicFetcher
+        from tests.test_v52_timezone_review import _source_verified_gate_fixture
+
+        protected_raw = ROOT / "data/v5_1_bt/raw"
+        self.assertTrue(protected_raw.is_dir())
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, *_ = _source_verified_gate_fixture(Path(directory))
+            fixture_raw = fixture.root / "data/v5_1_bt/raw"
+            # The legacy-decision writer verifies this immutable corpus.  Use
+            # hard links so the genuine source bytes are available without a
+            # multi-gigabyte test copy.
+            for source in protected_raw.rglob("*"):
+                target = fixture_raw / source.relative_to(protected_raw)
+                if source.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif source.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(source, target)
+
+            acquire_sources(
+                fixture.root,
+                fixture.run_spec,
+                years=range(2018, 2025),
+                mode="hybrid",
+                resume=True,
+                stop_after=None,
+                legacy_root=fixture_raw,
+                protected_inventory_path=(
+                    fixture.root / "audit/v5_1_bt/protected_raw_inventory.json"
+                ),
+                fetcher=DeterministicFetcher(),
+                acquisition_contract_path=fixture.contract_path,
+            )
+            inputs = load_snapshot_replay_inputs(
+                fixture.root,
+                fixture.run_spec,
+                acquisition_contract_path=fixture.contract_path,
+            )
+
+            self.assertIsInstance(fixture.run_spec, SourceRunSpec)
+            self.assertEqual(inputs.run_id, fixture.run_spec.run_id)
+            self.assertEqual(inputs.graph.checkpoint.stage, "REMAINING")
+            self.assertEqual(
+                inputs.dispositioned_query_ids,
+                (inputs.duplicate_gamepk_disposition.query_id,),
+            )
+            source_snapshot = next(
+                snapshot
+                for snapshot in inputs.game_snapshots
+                if snapshot.season == 2019
+            ).as_mapping()
+            self.assertEqual(
+                source_snapshot["duplicate_gamepk_disposition"],
+                inputs.duplicate_gamepk_disposition.as_mapping(),
+            )
 
     def test_game_snapshot_mapping_validation_rejects_forgery(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
