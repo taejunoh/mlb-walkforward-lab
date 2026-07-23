@@ -779,7 +779,7 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
         )
         self.contract_path = self.root / "contract.json"
         self.schedule = object()
-        self.games = object()
+        self.games = SimpleNamespace(payload={"run_id": self.run_spec.run_id})
         self.timezone = object()
         self.records = (object(),)
         self.snapshots = (object(),)
@@ -846,6 +846,8 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
             self.games,
             self.timezone,
             self.schedule,
+            duplicate_gamepk_disposition=None,
+            dispositioned_query_ids=(),
         )
 
     def test_factory_fails_closed_without_exactly_one_static_schedule_batch(self) -> None:
@@ -1029,7 +1031,7 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
                 patch.object(
                     verifier,
                     "load_verified_schedule_anchor_inventory",
-                    return_value=object(),
+                    return_value=SimpleNamespace(payload={"anchors": []}),
                 ),
                 patch.object(
                     verifier,
@@ -1043,7 +1045,7 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
                 ),
                 patch.object(
                     verifier, "_build_game_normalized_snapshots", return_value=()
-                ),
+                ) as build_games,
                 patch.object(
                     verifier,
                     "recompute_query_sidecar",
@@ -1095,13 +1097,23 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
             self.assertEqual(
                 replay.records[0].storage_mode, "DERIVED_DISPOSITION"
             )
+            self.assertEqual(replay.duplicate_gamepk_disposition.query_id, disposition_id)
+            build_games.assert_called_once_with(
+                source_run.run_id,
+                (replay.records[0],),
+                games,
+                build_games.call_args.args[3],
+                build_games.call_args.args[4],
+                duplicate_gamepk_disposition=replay.duplicate_gamepk_disposition,
+                dispositioned_query_ids=(disposition_id,),
+            )
 
 
 class V52VerifySourcesTest(unittest.TestCase):
-    def test_superseding_replay_inputs_propagate_disposition_identity_to_game_and_history(
+    def test_superseding_replay_inputs_limit_disposition_identity_to_game_2019(
         self,
     ) -> None:
-        """Derived schedule authority is present in every replayed game family."""
+        """Only the 2019 game envelope carries the schedule disposition."""
         from tests.v52_snapshot_store_fixture import fake_81, replay_inputs
 
         disposition_id = (
@@ -1123,10 +1135,7 @@ class V52VerifySourcesTest(unittest.TestCase):
         )
         snapshots = list(fake_81())
         for index, snapshot in enumerate(snapshots):
-            if snapshot.source in {
-                "mlb_schedule_game_feed",
-                "prior_schedule_history",
-            }:
+            if snapshot.source == "mlb_schedule_game_feed" and snapshot.season == 2019:
                 snapshots[index] = dataclasses.replace(
                     snapshot,
                     dispositioned_query_ids=(disposition_id,),
@@ -1143,12 +1152,12 @@ class V52VerifySourcesTest(unittest.TestCase):
         self.assertEqual(replay.dispositioned_query_ids, (disposition_id,))
         self.assertEqual(replay.duplicate_gamepk_disposition, binding)
         for snapshot in replay.game_snapshots:
-            if snapshot.source in {
-                "mlb_schedule_game_feed",
-                "prior_schedule_history",
-            }:
+            if snapshot.source == "mlb_schedule_game_feed" and snapshot.season == 2019:
                 self.assertEqual(snapshot.dispositioned_query_ids, (disposition_id,))
                 self.assertEqual(snapshot.duplicate_gamepk_disposition, binding)
+            else:
+                self.assertEqual(snapshot.dispositioned_query_ids, ())
+                self.assertIsNone(snapshot.duplicate_gamepk_disposition)
         self.assertNotIn(
             "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
             replay.dispositioned_query_ids,
@@ -1782,7 +1791,29 @@ class V52VerifySourcesTest(unittest.TestCase):
             with self.subTest(runtime_attack=index), self.assertRaises(ValueError):
                 verifier._validate_normalized_snapshot_mapping(attack)
 
-    def test_normalized_source_game_snapshot_uses_authenticated_source_run_id(
+    def test_game_snapshot_reducer_accepts_disposition_capability_keywords(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        binding = verifier.DuplicateGamePkDispositionBinding(
+            query_id="a" * 64,
+            success_receipt=verifier.AuthorityBinding("fixture/receipt.json", "b" * 64),
+            query_sidecar=verifier.AuthorityBinding("fixture/sidecar.json", "c" * 64),
+        )
+        with self.assertRaises(ValueError):
+            verifier._build_game_normalized_snapshots(
+                "historical_walkforward_500",
+                authority.records,
+                authority.game_inventory,
+                authority.timezone_gate,
+                authority.schedule_inventory,
+                duplicate_gamepk_disposition=binding,
+                dispositioned_query_ids=(binding.query_id,),
+            )
+
+    def test_source_game_snapshot_structural_validation_is_not_authentication(
         self,
     ) -> None:
         from mlb_backtest import v52_verify_sources as verifier

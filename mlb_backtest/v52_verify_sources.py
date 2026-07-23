@@ -17,14 +17,19 @@ from .execution_registry import (
 )
 from .v52_game_evidence_inventory import (
     VerifiedGameEvidenceInventory,
+    _replace_source_disposition_lineage,
     load_verified_game_evidence_inventory,
     validate_game_evidence_snapshot,
 )
 from .v52_schedule_inventory import (
     VerifiedScheduleAnchorInventory,
+    build_schedule_anchor_provenance,
     load_verified_schedule_anchor_inventory,
 )
-from .v52_sources.schedule import recompute_game_evidence_snapshot
+from .v52_sources.schedule import (
+    derived_schedule_sidecar_adapter,
+    recompute_game_evidence_snapshot,
+)
 from .v52_timezone_review import (
     VerifiedTimezoneGate,
     load_verified_timezone_gate,
@@ -92,6 +97,7 @@ _BOXSCORE_ENDPOINT = re.compile(
     r"^https://statsapi\.mlb\.com/api/v1/game/(?P<game_pk>[1-9][0-9]*)/boxscore$"
 )
 _GAME_SEASONS = tuple(range(2018, 2025))
+_SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
 _NORMALIZED_ENVELOPE_KEYS = frozenset(
     {
         "grain",
@@ -375,6 +381,8 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         inputs.game_inventory,
         inputs.timezone_gate,
         inputs.schedule_inventory,
+        duplicate_gamepk_disposition=inputs.duplicate_gamepk_disposition,
+        dispositioned_query_ids=inputs.dispositioned_query_ids,
     )
     if schedule != inputs.game_snapshots:
         raise ValueError("upstream game snapshot authority differs")
@@ -477,7 +485,10 @@ def _validate_normalized_snapshot_mapping(
     disposition_ids = envelope.get("dispositioned_query_ids")
     if disposition is not None or disposition_ids is not None:
         if (
-            source not in {"mlb_schedule_game_feed", "prior_schedule_history"}
+            envelope["run_id"] != _SOURCE_RUN_ID
+            or season != 2019
+            or source != "mlb_schedule_game_feed"
+            or grain != "season_game_evidence_snapshot"
             or not isinstance(disposition, Mapping)
             or set(disposition) != {"query_id", "success_receipt", "query_sidecar"}
             or not isinstance(disposition.get("query_id"), str)
@@ -495,6 +506,12 @@ def _validate_normalized_snapshot_mapping(
             ):
                 raise ValueError("normalized snapshot disposition binding differs")
     if source == "mlb_schedule_game_feed" and grain == "season_game_evidence_snapshot":
+        if (
+            envelope["run_id"] == _SOURCE_RUN_ID
+            and season == 2019
+            and (disposition is None or disposition_ids is None)
+        ):
+            raise ValueError("normalized source 2019 disposition binding differs")
         split_hashes = _sorted_unique_sha256s(
             envelope.get("split_receipt_sha256s"),
             "split receipt hashes",
@@ -527,6 +544,16 @@ def _validate_normalized_snapshot_mapping(
         for game in games:
             if not isinstance(game, Mapping) or game.get("season") != season:
                 raise ValueError("normalized snapshot game season differs")
+            if envelope["run_id"] == _SOURCE_RUN_ID:
+                played = game.get("verification_status") == "VERIFIED"
+                provenance_fields = {
+                    "raw_game_object_sha256",
+                    "normalized_anchor_sha256",
+                }
+                if (played and not provenance_fields <= set(game)) or (
+                    not played and provenance_fields & set(game)
+                ):
+                    raise ValueError("normalized source game provenance keys differ")
         validate_game_evidence_snapshot(payload, run_id=envelope["run_id"])
         return envelope
 
@@ -1399,6 +1426,57 @@ def _authenticate_authority_paths(
     return context
 
 
+def _game_inventory_disposition_binding(
+    game_inventory: VerifiedGameEvidenceInventory,
+    run_id: str,
+) -> tuple[DuplicateGamePkDispositionBinding | None, tuple[str, ...]]:
+    """Return the sole source-run disposition capability sealed by the inventory."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("game inventory run_id differs")
+    payload = getattr(game_inventory, "payload", None)
+    if not isinstance(payload, Mapping):
+        raise ValueError("game inventory run_id binding differs")
+    if isinstance(game_inventory, VerifiedGameEvidenceInventory) and (
+        payload.get("run_id") != run_id
+    ):
+        raise ValueError("game inventory run_id binding differs")
+    binding_value = payload.get("duplicate_gamepk_disposition")
+    ids_value = payload.get("dispositioned_query_ids")
+    if run_id != _SOURCE_RUN_ID:
+        if binding_value is not None or ids_value is not None:
+            raise ValueError("non-source game inventory must omit disposition authority")
+        return None, ()
+    if (
+        not isinstance(binding_value, Mapping)
+        or set(binding_value) != {"query_id", "success_receipt", "query_sidecar"}
+        or not isinstance(binding_value.get("query_id"), str)
+        or _SHA256.fullmatch(binding_value["query_id"]) is None
+        or not isinstance(ids_value, list)
+        or ids_value != [binding_value["query_id"]]
+    ):
+        raise ValueError("source game inventory disposition authority differs")
+
+    def binding(value: object, label: str) -> AuthorityBinding:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"path", "sha256"}
+            or not isinstance(value.get("path"), str)
+            or not isinstance(value.get("sha256"), str)
+            or _SHA256.fullmatch(value["sha256"]) is None
+        ):
+            raise ValueError(f"source game inventory disposition {label} differs")
+        return AuthorityBinding(value["path"], value["sha256"])
+
+    return (
+        DuplicateGamePkDispositionBinding(
+            binding_value["query_id"],
+            binding(binding_value["success_receipt"], "success receipt"),
+            binding(binding_value["query_sidecar"], "query sidecar"),
+        ),
+        (binding_value["query_id"],),
+    )
+
+
 def load_snapshot_replay_inputs(
     root: Path,
     run_spec: RunSpec | SourceRunSpec,
@@ -1458,6 +1536,9 @@ def load_snapshot_replay_inputs(
     games = load_verified_game_evidence_inventory(
         authenticated_root, read_only_progress=True, **source_loader_kwargs
     )
+    disposition, dispositioned = _game_inventory_disposition_binding(
+        games, run_spec.run_id
+    )
     store = V52EvidenceStore.open_read_only(evidence_root)
     disposition_authority: DuplicateGamePkDispositionAuthority | None = None
     if isinstance(run_spec, SourceRunSpec):
@@ -1479,42 +1560,19 @@ def load_snapshot_replay_inputs(
     )
     game_snapshots = tuple(
         _build_game_normalized_snapshots(
-            run_spec.run_id, records, games, timezone, schedule
+            run_spec.run_id,
+            records,
+            games,
+            timezone,
+            schedule,
+            duplicate_gamepk_disposition=disposition,
+            dispositioned_query_ids=dispositioned,
         )
     )
-    disposition: DuplicateGamePkDispositionBinding | None = None
-    dispositioned: tuple[str, ...] = ()
-    if isinstance(run_spec, SourceRunSpec):
-        payload = games.payload
-        raw_binding = payload.get("duplicate_gamepk_disposition")
-        raw_ids = payload.get("dispositioned_query_ids")
-        if (
-            not isinstance(raw_binding, Mapping)
-            or set(raw_binding) != {"query_id", "success_receipt", "query_sidecar"}
-            or not isinstance(raw_binding.get("query_id"), str)
-            or not isinstance(raw_ids, (list, tuple))
-            or tuple(raw_ids) != tuple(sorted(raw_ids))
-            or tuple(raw_ids) != (raw_binding["query_id"],)
-        ):
-            raise ValueError("source replay disposition binding differs")
-        def binding(value: object, label: str) -> AuthorityBinding:
-            if (
-                not isinstance(value, Mapping)
-                or set(value) != {"path", "sha256"}
-                or not isinstance(value.get("path"), str)
-                or not isinstance(value.get("sha256"), str)
-                or _SHA256.fullmatch(value["sha256"]) is None
-            ):
-                raise ValueError(f"source replay disposition {label} differs")
-            return AuthorityBinding(value["path"], value["sha256"])
-        disposition = DuplicateGamePkDispositionBinding(
-            raw_binding["query_id"],
-            binding(raw_binding["success_receipt"], "success receipt"),
-            binding(raw_binding["query_sidecar"], "query sidecar"),
-        )
-        dispositioned = tuple(raw_ids)
-        if graph.checkpoint.dispositioned_query_ids != dispositioned:
-            raise ValueError("source replay checkpoint disposition IDs differ")
+    if isinstance(run_spec, SourceRunSpec) and (
+        graph.checkpoint.dispositioned_query_ids != dispositioned
+    ):
+        raise ValueError("source replay checkpoint disposition IDs differ")
     return SnapshotReplayInputs(
         run_spec.run_id,
         graph,
@@ -1739,12 +1797,60 @@ def _normalized_snapshot(
     )
 
 
+def _verified_schedule_sidecar(
+    record: VerifiedQueryRecord,
+    run_id: str,
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None,
+    source_anchors: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], str | None]:
+    """Verify ordinary schedule evidence or adapt the one raw-less disposition."""
+    if record.storage_mode != "DERIVED_DISPOSITION":
+        return _verified_sidecar(record), None
+    query = record.query
+    if (
+        run_id != _SOURCE_RUN_ID
+        or duplicate_gamepk_disposition is None
+        or record.query_id != logical_query_id(query)
+        or record.query_id != duplicate_gamepk_disposition.query_id
+        or record.query_sidecar_sha256
+        != duplicate_gamepk_disposition.query_sidecar.sha256
+        or query.endpoint != "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+        or record.raw_sha256 is not None
+        or record.retained_raw_bytes is not None
+        or not isinstance(record.query_sidecar_bytes, bytes)
+        or not record.query_sidecar_bytes.endswith(b"\n")
+        or hashlib.sha256(record.query_sidecar_bytes).hexdigest()
+        != record.query_sidecar_sha256
+    ):
+        raise ValueError("source schedule disposition binding differs")
+    try:
+        published = json.loads(record.query_sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("source schedule disposition sidecar differs") from exc
+    if (
+        not isinstance(published, dict)
+        or canonical_json_bytes(published) + b"\n" != record.query_sidecar_bytes
+        or published.get("storage_mode") != "DERIVED_DISPOSITION"
+        or published.get("schema_version") != 1
+        or published.get("parser_version") != query.parser_version
+        or published.get("query_id") != record.query_id
+        or published.get("source") != query.source
+        or published.get("grain") != query.grain
+    ):
+        raise ValueError("source schedule disposition sidecar differs")
+    adapter = dict(derived_schedule_sidecar_adapter(query, source_anchors))
+    return adapter, hashlib.sha256(canonical_json_bytes(adapter) + b"\n").hexdigest()
+
+
 def _build_game_normalized_snapshots(
     run_id: str,
     records: Sequence[VerifiedQueryRecord],
     game_inventory: VerifiedGameEvidenceInventory,
     timezone_gate: VerifiedTimezoneGate,
     schedule_inventory: VerifiedScheduleAnchorInventory,
+    *,
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
+    dispositioned_query_ids: tuple[str, ...] = (),
 ) -> tuple[NormalizedSnapshot, ...]:
     """Reduce already loader-verified authorities without filesystem access.
 
@@ -1761,21 +1867,47 @@ def _build_game_normalized_snapshots(
         raise TypeError("timezone gate authority differs")
     if not isinstance(schedule_inventory, VerifiedScheduleAnchorInventory):
         raise TypeError("schedule inventory authority differs")
+    expected_disposition, expected_disposition_ids = _game_inventory_disposition_binding(
+        game_inventory, run_id
+    )
+    if (
+        duplicate_gamepk_disposition != expected_disposition
+        or tuple(dispositioned_query_ids) != expected_disposition_ids
+    ):
+        raise ValueError("game snapshot disposition capability differs")
+    if run_id == _SOURCE_RUN_ID:
+        raw_source_anchors = schedule_inventory.payload.get("anchors")
+        if not isinstance(raw_source_anchors, list):
+            raise ValueError("source schedule inventory anchors differ")
+    else:
+        raw_source_anchors = []
 
     by_season: dict[int, list[tuple[VerifiedQueryRecord, dict[str, object]]]] = {
         season: [] for season in _GAME_SEASONS
     }
     seen_query_ids: set[str] = set()
     for record in records:
-        sidecar = _verified_sidecar(record)
         query = record.query
+        if record.storage_mode == "DERIVED_DISPOSITION":
+            if (
+                run_id != _SOURCE_RUN_ID
+                or duplicate_gamepk_disposition is None
+                or record.query_id != duplicate_gamepk_disposition.query_id
+            ):
+                raise ValueError("game snapshot schedule disposition differs")
+            season = 2019
+            sidecar = {}  # Adapted once the exact season anchors are available.
+        else:
+            sidecar = _verified_sidecar(record)
         if (
             query.source != "mlb_schedule_game_feed"
             or query.grain != "season_schedule_and_game"
         ):
             raise ValueError("game snapshot query source or grain differs")
         boxscore_match = _BOXSCORE_ENDPOINT.fullmatch(query.endpoint)
-        if query.endpoint == _SCHEDULE_ENDPOINT:
+        if record.storage_mode == "DERIVED_DISPOSITION":
+            pass
+        elif query.endpoint == _SCHEDULE_ENDPOINT:
             season = query.requested_range.get("year")
         elif boxscore_match is not None:
             season = query.requested_range.get("season")
@@ -1813,7 +1945,23 @@ def _build_game_normalized_snapshots(
         ]
         if len(anchors) != 1:
             raise ValueError("game snapshot requires one schedule query per season")
-        schedule_record, schedule_sidecar = anchors[0]
+        schedule_record, _schedule_sidecar = anchors[0]
+        if run_id == _SOURCE_RUN_ID and (
+            (season == 2019)
+            != (schedule_record.storage_mode == "DERIVED_DISPOSITION")
+        ):
+            raise ValueError("source game snapshot disposition season differs")
+        source_anchors = [
+            anchor
+            for anchor in raw_source_anchors
+            if anchor.get("season") == season
+        ]
+        schedule_sidecar, adapter_sha256 = _verified_schedule_sidecar(
+            schedule_record,
+            run_id,
+            duplicate_gamepk_disposition,
+            source_anchors,
+        )
         schedule_records[season] = schedule_record
         schedule_sidecars.append(schedule_sidecar)
         boxscores: dict[int, tuple[bytes, str]] = {}
@@ -1831,7 +1979,24 @@ def _build_game_normalized_snapshots(
                 record.query_sidecar_bytes,
                 record.query_sidecar_sha256,
             )
-        payload = dict(recompute_game_evidence_snapshot([schedule_sidecar], boxscores))
+        season_provenance = (
+            build_schedule_anchor_provenance(source_anchors)
+            if run_id == _SOURCE_RUN_ID
+            else None
+        )
+        payload = dict(
+            recompute_game_evidence_snapshot(
+                [schedule_sidecar],
+                boxscores,
+                schedule_provenance=season_provenance,
+            )
+        )
+        if adapter_sha256 is not None:
+            payload = _replace_source_disposition_lineage(
+                payload,
+                synthetic_sidecar_sha256=adapter_sha256,
+                derived_sidecar_sha256=schedule_record.query_sidecar_sha256,
+            )
         inputs = tuple(record for record, _sidecar in season_records)
         snapshot_inputs[season] = inputs
         payloads.append(payload)
@@ -1877,7 +2042,7 @@ def _build_game_normalized_snapshots(
         or set(game_payload)
         != (
             _SOURCE_GAME_INVENTORY_KEYS
-            if game_payload.get("run_id") == "historical_walkforward_500_superseding_565534"
+            if game_payload.get("run_id") == _SOURCE_RUN_ID
             else _OLD_GAME_INVENTORY_KEYS
         )
         or (
@@ -1887,34 +2052,6 @@ def _build_game_normalized_snapshots(
         )
     ):
         raise ValueError("game inventory identity differs")
-    source_disposition = game_payload.get("duplicate_gamepk_disposition")
-    source_ids = game_payload.get("dispositioned_query_ids")
-    source_branch = game_payload.get("run_id") == "historical_walkforward_500_superseding_565534"
-    normalized_disposition: DuplicateGamePkDispositionBinding | None = None
-    normalized_disposition_ids: tuple[str, ...] = ()
-    if source_branch:
-        if (
-            not isinstance(source_disposition, Mapping)
-            or set(source_disposition) != {"query_id", "success_receipt", "query_sidecar"}
-            or not isinstance(source_disposition.get("query_id"), str)
-            or not isinstance(source_ids, list)
-            or source_ids != [source_disposition["query_id"]]
-        ):
-            raise ValueError("game inventory disposition authority differs")
-        normalized_disposition = DuplicateGamePkDispositionBinding(
-            source_disposition["query_id"],
-            AuthorityBinding(
-                source_disposition["success_receipt"]["path"],
-                source_disposition["success_receipt"]["sha256"],
-            ),
-            AuthorityBinding(
-                source_disposition["query_sidecar"]["path"],
-                source_disposition["query_sidecar"]["sha256"],
-            ),
-        )
-        normalized_disposition_ids = tuple(source_ids)
-    elif source_disposition is not None or source_ids is not None:
-        raise ValueError("historical game inventory must omit disposition authority")
     if (
         _binding_sha256(game_payload.get("run_spec"), "game RunSpec")
         != timezone_gate.run_spec_sha256
@@ -2008,11 +2145,11 @@ def _build_game_normalized_snapshots(
                 snapshot_inputs[season],
                 payload,
                 (
-                    normalized_disposition
+                    duplicate_gamepk_disposition
                     if season == 2019 else None
                 ),
                 (
-                    normalized_disposition_ids
+                    dispositioned_query_ids
                     if season == 2019 else ()
                 ),
             )
@@ -2098,14 +2235,6 @@ def _history_normalized_snapshot(
         ),
         "split_receipt_sha256s": [],
         "status": "READY",
-        **(
-            {
-                "duplicate_gamepk_disposition": game_snapshot.duplicate_gamepk_disposition.as_mapping(),
-                "dispositioned_query_ids": list(game_snapshot.dispositioned_query_ids),
-            }
-            if game_snapshot.duplicate_gamepk_disposition is not None
-            else {}
-        ),
     }
     envelope = _validate_normalized_snapshot_mapping(envelope)
     contents = canonical_json_bytes(envelope) + b"\n"
@@ -2131,8 +2260,8 @@ def _history_normalized_snapshot(
         payload=frozen_payload,
         canonical_bytes=contents,
         sha256=digest,
-        duplicate_gamepk_disposition=game_snapshot.duplicate_gamepk_disposition,
-        dispositioned_query_ids=game_snapshot.dispositioned_query_ids,
+        duplicate_gamepk_disposition=None,
+        dispositioned_query_ids=(),
     )
 
 
