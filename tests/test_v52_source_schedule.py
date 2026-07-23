@@ -112,6 +112,31 @@ def _artifact(sidecar: dict[str, object]) -> tuple[bytes, str]:
     return raw, hashlib.sha256(raw).hexdigest()
 
 
+def _test_schedule_provenance(
+    anchor_sidecar: Mapping[str, object],
+) -> dict[int, dict[str, object]]:
+    semantics = anchor_sidecar["semantics"]
+    assert isinstance(semantics, Mapping)
+    anchors = semantics["anchors"]
+    assert isinstance(anchors, list)
+    return {
+        int(anchor["game_pk"]): {
+            "game_pk": anchor["game_pk"],
+            "official_date": anchor["official_date"],
+            "away_team_id": anchor["away_team_id"],
+            "home_team_id": anchor["home_team_id"],
+            "raw_game_object_sha256": hashlib.sha256(
+                f"raw:{anchor['game_pk']}".encode()
+            ).hexdigest(),
+            "normalized_anchor_sha256": hashlib.sha256(
+                f"normalized:{anchor['game_pk']}".encode()
+            ).hexdigest(),
+        }
+        for anchor in anchors
+        if isinstance(anchor, Mapping)
+    }
+
+
 def _plain_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _plain_json(item) for key, item in value.items()}
@@ -932,6 +957,87 @@ class V52ScheduleSourceTest(unittest.TestCase):
                 played["boxscore_query_sidecar_sha256"],
             },
         )
+
+    def test_game_snapshot_carries_source_anchor_provenance_only_when_supplied(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_sources.schedule import (
+            recompute_boxscore_sidecar,
+            recompute_game_evidence_snapshot,
+            recompute_schedule_anchor_sidecar,
+        )
+
+        anchor = recompute_schedule_anchor_sidecar(_schedule_raw(), _query())
+        boxscore = _artifact(
+            dict(recompute_boxscore_sidecar(_boxscore_raw(), _box_query()))
+        )
+        old = recompute_game_evidence_snapshot([anchor], {9001: boxscore})
+        provenance = _test_schedule_provenance(anchor)
+        source = recompute_game_evidence_snapshot(
+            [anchor], {9001: boxscore}, schedule_provenance=provenance
+        )
+
+        old_played, old_unplayed = old["games"]
+        source_played, source_unplayed = source["games"]
+        self.assertNotIn("raw_game_object_sha256", old_played)
+        self.assertNotIn("normalized_anchor_sha256", old_played)
+        self.assertNotIn("raw_game_object_sha256", old_unplayed)
+        self.assertNotIn("normalized_anchor_sha256", old_unplayed)
+        self.assertEqual(
+            source_played["raw_game_object_sha256"],
+            provenance[9001]["raw_game_object_sha256"],
+        )
+        self.assertEqual(
+            source_played["normalized_anchor_sha256"],
+            provenance[9001]["normalized_anchor_sha256"],
+        )
+        self.assertNotIn("raw_game_object_sha256", source_unplayed)
+        self.assertNotIn("normalized_anchor_sha256", source_unplayed)
+        self.assertNotEqual(
+            source_played["source_game_sha256"], old_played["source_game_sha256"]
+        )
+        jsonschema.validate(old, json.loads(SCHEMA.read_text()))
+        jsonschema.validate(source, json.loads(SCHEMA.read_text()))
+
+    def test_game_snapshot_rejects_incomplete_schedule_provenance(self) -> None:
+        from mlb_backtest.v52_sources.schedule import (
+            recompute_boxscore_sidecar,
+            recompute_game_evidence_snapshot,
+            recompute_schedule_anchor_sidecar,
+        )
+
+        anchor = recompute_schedule_anchor_sidecar(_schedule_raw(), _query())
+        boxscore = _artifact(
+            dict(recompute_boxscore_sidecar(_boxscore_raw(), _box_query()))
+        )
+        provenance = _test_schedule_provenance(anchor)
+        for label, mutate in (
+            ("empty", lambda value: value.clear()),
+            ("incomplete", lambda value: value.pop(9002)),
+            (
+                "extra",
+                lambda value: value.update(
+                    {9003: {
+                        "game_pk": 9003,
+                        "official_date": "2024-04-04",
+                        "away_team_id": 10,
+                        "home_team_id": 20,
+                        "raw_game_object_sha256": "a" * 64,
+                        "normalized_anchor_sha256": "b" * 64,
+                    }}
+                ),
+            ),
+            (
+                "identity",
+                lambda value: value[9001].update({"away_team_id": 999}),
+            ),
+        ):
+            candidate = copy.deepcopy(provenance)
+            mutate(candidate)
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "provenance"):
+                recompute_game_evidence_snapshot(
+                    [anchor], {9001: boxscore}, schedule_provenance=candidate
+                )
 
     def test_game_snapshot_rejects_missing_boxscore_and_identity_disagreement(self) -> None:
         from mlb_backtest.v52_sources.schedule import (

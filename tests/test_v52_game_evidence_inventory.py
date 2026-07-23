@@ -822,6 +822,53 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                 ):
                     inventory_module.publish_game_evidence_inventory(root)
 
+    def test_source_projection_rejects_rebound_provenance_hash_mutation(self) -> None:
+        from mlb_backtest import v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.v52_source_contracts import canonical_sha256
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _fixture(root)
+            authority = inventory_module._build_current_authority(root)
+        snapshot = {
+            "games": _thaw(authority.payload["games"]),
+            "grain": "season_game_evidence_snapshot",
+            "schema_version": 1,
+            "source_query_sidecar_sha256s": authority.payload[
+                "source_query_sidecar_sha256s"
+            ],
+        }
+        for game in snapshot["games"]:
+            if not game["played"]:
+                continue
+            game["raw_game_object_sha256"] = "a" * 64
+            game["normalized_anchor_sha256"] = "b" * 64
+            lineage = {
+                "anchor_sidecar_sha256": game["schedule_query_sidecar_sha256"],
+                "boxscore_query_sidecar_sha256": game[
+                    "boxscore_query_sidecar_sha256"
+                ],
+                "game": {
+                    key: value
+                    for key, value in game.items()
+                    if key != "source_game_sha256"
+                },
+            }
+            game["source_game_sha256"] = canonical_sha256(lineage)
+        inventory_module._validate_game_projection(
+            snapshot,
+            run_id="historical_walkforward_500_superseding_565534",
+        )
+        for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
+            candidate = json.loads(_canonical(snapshot))
+            played = next(game for game in candidate["games"] if game["played"])
+            played[field] = "c" * 64
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "hash"):
+                inventory_module._validate_game_projection(
+                    candidate,
+                    run_id="historical_walkforward_500_superseding_565534",
+                )
+
     def test_oversized_serialized_inventory_fails_before_final_publish(self) -> None:
         from mlb_backtest import v52_game_evidence_inventory as inventory_module
 
@@ -1061,7 +1108,29 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
         verified_schedule = SimpleNamespace(
             sha256=schedule_sha,
             payload={
-                "anchors": [{"game_pk": 565534, "season": 2019}],
+                "anchors": [
+                    {
+                        "alternate_site": False,
+                        "away_score": 2,
+                        "away_team_id": 10,
+                        "completed_innings": 9,
+                        "doubleheader_order": 1,
+                        "game_pk": 565534,
+                        "home_score": 4,
+                        "home_team_id": 20,
+                        "neutral_site": False,
+                        "official_date": "2019-09-06",
+                        "played": True,
+                        "raw_game_object_sha256": "9" * 64,
+                        "scheduled_innings": 9,
+                        "scheduled_start_utc": "2019-09-07T00:15:00Z",
+                        "season": 2019,
+                        "season_start_date": "2019-03-20",
+                        "terminal_status": "Final",
+                        "venue_id": 31,
+                        "winner_team_id": 20,
+                    }
+                ],
                 "season_sources": season_sources,
             },
         )
@@ -1191,8 +1260,11 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
         )
         captured_adapters: list[Mapping[str, object]] = []
 
-        def game_snapshot(schedule_sidecars, _boxscores):
+        captured_provenance: list[Mapping[int, Mapping[str, object]]] = []
+
+        def game_snapshot(schedule_sidecars, _boxscores, *, schedule_provenance):
             captured_adapters.extend(schedule_sidecars)
+            captured_provenance.append(schedule_provenance)
             adapter = schedule_sidecars[-1]
             adapter_sha = hashlib.sha256(_canonical(adapter)).hexdigest()
             return {
@@ -1306,6 +1378,16 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             },
         )
         self.assertEqual(adapter["raw_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertNotIn(
+            "raw_game_object_sha256", adapter["semantics"]["anchors"][0]
+        )
+        self.assertEqual(
+            set(captured_provenance[-1]),
+            {
+                int(anchor["game_pk"])
+                for anchor in verified_schedule.payload["anchors"]
+            },
+        )
         disposition_calls = [
             authority
             for _operation, authority in authority_calls
@@ -1444,7 +1526,23 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
         )
         source["duplicate_gamepk_disposition"] = _disposition_binding()
         source["dispositioned_query_ids"] = [_DISPOSITION_QUERY_ID]
+        for game in source["games"]:
+            if game["played"]:
+                game["raw_game_object_sha256"] = "a" * 64
+                game["normalized_anchor_sha256"] = "b" * 64
         jsonschema.validate(source, schema)
+
+        incomplete_source = json.loads(_canonical(source))
+        incomplete_played = next(
+            game for game in incomplete_source["games"] if game["played"]
+        )
+        del incomplete_played["raw_game_object_sha256"]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(incomplete_source, schema)
+
+        partial_only_source = json.loads(_canonical(source))
+        partial_only_source["games"] = [{"game_pk": 565534, "season": 2019}]
+        jsonschema.validate(partial_only_source, schema)
 
         source_as_old = json.loads(_canonical(source))
         source_as_old.pop("duplicate_gamepk_disposition")

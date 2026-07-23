@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
 from ..source_parsers.schedule import parse_schedule, validate_schedule_query_coverage
-from ..v52_evidence import LogicalQuery
+from ..v52_evidence import LogicalQuery, logical_query_id
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
     canonical_json_bytes,
@@ -25,6 +25,29 @@ _STARTING_BATTING_ORDERS = frozenset(
     str(slot) for slot in range(100, 1000, 100)
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_SCHEDULE_ANCHOR_KEYS = frozenset(
+    {
+        "alternate_site",
+        "away_score",
+        "away_team_id",
+        "completed_innings",
+        "doubleheader_order",
+        "game_pk",
+        "home_score",
+        "home_team_id",
+        "neutral_site",
+        "official_date",
+        "played",
+        "raw_game_object_sha256",
+        "scheduled_innings",
+        "scheduled_start_utc",
+        "season",
+        "season_start_date",
+        "terminal_status",
+        "venue_id",
+        "winner_team_id",
+    }
+)
 
 
 def _day(value: object, label: str) -> date:
@@ -339,9 +362,82 @@ def recompute_boxscore_sidecar(
     )
 
 
+def derived_schedule_sidecar_adapter(
+    query: LogicalQuery,
+    source_anchors: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Adapt source-owned schedule anchors into the rawless reducer envelope."""
+    if isinstance(source_anchors, (str, bytes)) or not isinstance(
+        source_anchors, Sequence
+    ):
+        raise ValueError("source schedule anchors must be a sequence")
+    anchors: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for raw_anchor in source_anchors:
+        if not isinstance(raw_anchor, Mapping):
+            raise ValueError("source schedule anchor must be an object")
+        anchor = dict(raw_anchor)
+        if set(anchor) != _SOURCE_SCHEDULE_ANCHOR_KEYS:
+            raise ValueError("source schedule anchor keys differ")
+        game_pk = _positive(anchor.get("game_pk"), "source schedule anchor gamePk")
+        if game_pk in seen:
+            raise ValueError("source schedule anchors contain duplicate gamePk")
+        seen.add(game_pk)
+        away_team_id = _positive(
+            anchor.get("away_team_id"), "source schedule away team ID"
+        )
+        home_team_id = _positive(
+            anchor.get("home_team_id"), "source schedule home team ID"
+        )
+        _positive(anchor.get("venue_id"), "source schedule venue ID")
+        _positive(
+            anchor.get("doubleheader_order"), "source schedule doubleheader order"
+        )
+        if (
+            not isinstance(anchor.get("raw_game_object_sha256"), str)
+            or _SHA256.fullmatch(anchor["raw_game_object_sha256"]) is None
+            or type(anchor.get("played")) is not bool
+            or type(anchor.get("neutral_site")) is not bool
+            or type(anchor.get("alternate_site")) is not bool
+            or away_team_id == home_team_id
+        ):
+            raise ValueError("source schedule anchor values differ")
+        season = anchor.get("season")
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in range(2018, 2025)
+        ):
+            raise ValueError("source schedule anchor season differs")
+        _day(anchor.get("official_date"), "source schedule official date")
+        _day(anchor.get("season_start_date"), "source schedule season start date")
+        if season == 2019:
+            anchors.append(
+                {
+                    key: value
+                    for key, value in anchor.items()
+                    if key != "raw_game_object_sha256"
+                }
+            )
+    if not anchors:
+        raise ValueError("source schedule adapter requires 2019 anchors")
+    return {
+        "byte_count": 0,
+        "grain": query.grain,
+        "parser_version": query.parser_version,
+        "query_id": logical_query_id(query),
+        "raw_sha256": hashlib.sha256(b"").hexdigest(),
+        "schema_version": 1,
+        "semantics": {"anchors": anchors},
+        "source": query.source,
+    }
+
+
 def recompute_game_evidence_snapshot(
     schedule_anchors: Sequence[Mapping[str, object]],
     boxscores: Mapping[int, tuple[bytes, str]],
+    *,
+    schedule_provenance: Mapping[int, Mapping[str, object]] | None = None,
 ) -> Mapping[str, object]:
     """Join verified schedule anchors with per-played-game boxscore evidence."""
     if isinstance(schedule_anchors, (str, bytes)) or not isinstance(
@@ -395,6 +491,31 @@ def recompute_game_evidence_snapshot(
 
     if not anchors_by_pk:
         raise ValueError("schedule game snapshot requires a nonempty game population")
+    if schedule_provenance is not None:
+        if not isinstance(schedule_provenance, Mapping) or set(schedule_provenance) != set(
+            anchors_by_pk
+        ):
+            raise ValueError("schedule provenance population differs")
+        for game_pk, (anchor, _anchor_hash) in anchors_by_pk.items():
+            provenance = schedule_provenance.get(game_pk)
+            if not isinstance(provenance, Mapping) or set(provenance) != {
+                "game_pk",
+                "official_date",
+                "away_team_id",
+                "home_team_id",
+                "raw_game_object_sha256",
+                "normalized_anchor_sha256",
+            }:
+                raise ValueError("schedule provenance keys differ")
+            if any(
+                provenance.get(field) != anchor.get(field)
+                for field in ("game_pk", "official_date", "away_team_id", "home_team_id")
+            ):
+                raise ValueError("schedule provenance identity differs")
+            for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
+                value = provenance.get(field)
+                if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                    raise ValueError("schedule provenance hash differs")
 
     played_anchor_pks = {
         game_pk for game_pk, (anchor, _hash) in anchors_by_pk.items()
@@ -491,6 +612,12 @@ def recompute_game_evidence_snapshot(
             "participant_provenance": "RECONSTRUCTED_FINAL_PARTICIPANTS",
             "verification_status": "VERIFIED",
         }
+        if schedule_provenance is not None:
+            provenance = schedule_provenance[game_pk]
+            game["raw_game_object_sha256"] = provenance["raw_game_object_sha256"]
+            game["normalized_anchor_sha256"] = provenance[
+                "normalized_anchor_sha256"
+            ]
         game["source_game_sha256"] = canonical_sha256(
             {
                 "anchor_sidecar_sha256": anchor_hash,
@@ -508,6 +635,7 @@ def recompute_game_evidence_snapshot(
 
 
 __all__ = [
+    "derived_schedule_sidecar_adapter",
     "recompute_boxscore_sidecar",
     "recompute_game_evidence_snapshot",
     "recompute_schedule_anchor_sidecar",

@@ -32,13 +32,17 @@ from .v52_query_plan import (
     build_schedule_reference_batch,
     load_query_batch,
 )
-from .v52_schedule_inventory import load_verified_schedule_anchor_inventory
+from .v52_schedule_inventory import (
+    build_schedule_anchor_provenance,
+    load_verified_schedule_anchor_inventory,
+)
 from .v52_source_contracts import (
     canonical_json_bytes,
     canonical_sha256,
     recompute_query_sidecar,
 )
 from .v52_sources.schedule import (
+    derived_schedule_sidecar_adapter,
     recompute_boxscore_sidecar,
     recompute_game_evidence_snapshot,
     recompute_schedule_anchor_sidecar,
@@ -75,6 +79,7 @@ _SEMANTIC_REVIEW_RELATIVE = Path(
 _MAPPING_RELATIVE = Path("config/v5_2_qd/venue_timezones.json")
 _SEAL_RELATIVE = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json")
 _RUN_ID = "historical_walkforward_500"
+_SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _MAX_EVIDENCE_BYTES = 256 * 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -744,7 +749,7 @@ def _batch_binding(
     }
 
 
-def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
+def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) -> None:
     if set(snapshot) != {
         "games",
         "grain",
@@ -773,6 +778,11 @@ def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
         expected_keys = _COMMON_GAME_KEYS | (
             {"boxscore_query_sidecar_sha256"} if played is True else set()
         )
+        if run_id == _SOURCE_RUN_ID and played is True:
+            expected_keys |= {
+                "raw_game_object_sha256",
+                "normalized_anchor_sha256",
+            }
         if set(row) != expected_keys:
             raise ValueError("game participant projection field keys differ")
         season = row.get("season")
@@ -840,6 +850,11 @@ def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
             value = row.get(field)
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"game participant {field} differs")
+        if run_id == _SOURCE_RUN_ID and played is True:
+            for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
+                value = row.get(field)
+                if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                    raise ValueError(f"game participant {field} differs")
         projected_sidecars.add(str(row["schedule_query_sidecar_sha256"]))
         if prior_game_pk is not None and game_pk <= prior_game_pk:
             raise ValueError("game participant inventory is not strictly ordered")
@@ -922,11 +937,13 @@ def _validate_game_projection(snapshot: Mapping[str, object]) -> None:
         raise ValueError("game participant source sidecar coverage differs")
 
 
-def validate_game_evidence_snapshot(snapshot: Mapping[str, object]) -> None:
+def validate_game_evidence_snapshot(
+    snapshot: Mapping[str, object], *, run_id: str = _RUN_ID
+) -> None:
     """Validate a normalized game snapshot with the inventory authority rules."""
     if not isinstance(snapshot, Mapping):
         raise TypeError("game evidence snapshot must be a mapping")
-    _validate_game_projection(snapshot)
+    _validate_game_projection(snapshot, run_id=run_id)
 
 
 def _build_current_authority(
@@ -1082,6 +1099,7 @@ def _build_current_authority(
     disposition_verified: VerifiedEvidenceRead | None = None
     disposition_binding: dict[str, object] | None = None
     disposition_adapter_sha256: str | None = None
+    schedule_provenance: Mapping[int, Mapping[str, object]] | None = None
     if isinstance(context.authority, SourceRunSpec):
         from .v52_duplicate_gamepk_disposition import (
             build_duplicate_disposition_authority,
@@ -1155,28 +1173,11 @@ def _build_current_authority(
         ):
             if verified.raw_bytes is not None or disposition_binding is None:
                 raise ValueError("game evidence source disposition raw authority differs")
-            anchors = verified_schedule.payload.get("anchors")
-            if not isinstance(anchors, list):
+            source_anchors = verified_schedule.payload.get("anchors")
+            if not isinstance(source_anchors, list):
                 raise ValueError("game evidence source disposition anchors differ")
-            adapter = {
-                "byte_count": 0,
-                "grain": query.grain,
-                "parser_version": query.parser_version,
-                "query_id": logical_query_id(query),
-                "raw_sha256": hashlib.sha256(b"").hexdigest(),
-                "schema_version": 1,
-                "semantics": {
-                    "anchors": [
-                        dict(anchor)
-                        for anchor in anchors
-                        if isinstance(anchor, Mapping)
-                        and anchor.get("season") == 2019
-                    ]
-                },
-                "source": query.source,
-            }
-            if not adapter["semantics"]["anchors"]:
-                raise ValueError("game evidence source disposition adapter anchors differ")
+            adapter = derived_schedule_sidecar_adapter(query, source_anchors)
+            schedule_provenance = build_schedule_anchor_provenance(source_anchors)
             disposition_adapter_sha256 = _sha256(_canonical_file_bytes(adapter))
             schedule_sidecars.append(adapter)
             disposition_verified = verified
@@ -1201,7 +1202,16 @@ def _build_current_authority(
             sidecar_bytes = _canonical_file_bytes(boxscore_sidecar)
             boxscores[game_pk] = (sidecar_bytes, _sha256(sidecar_bytes))
 
-    game_snapshot = dict(recompute_game_evidence_snapshot(schedule_sidecars, boxscores))
+    if schedule_provenance is None:
+        game_snapshot = dict(recompute_game_evidence_snapshot(schedule_sidecars, boxscores))
+    else:
+        game_snapshot = dict(
+            recompute_game_evidence_snapshot(
+                schedule_sidecars,
+                boxscores,
+                schedule_provenance=schedule_provenance,
+            )
+        )
     if disposition_verified is not None:
         if disposition_adapter_sha256 is None:
             raise AssertionError("source disposition adapter hash was not captured")
@@ -1223,7 +1233,7 @@ def _build_current_authority(
             or rebound_verified.raw_bytes is not None
         ):
             raise ValueError("game evidence source disposition changed before return")
-    _validate_game_projection(game_snapshot)
+    _validate_game_projection(game_snapshot, run_id=context.run_id)
     games = game_snapshot["games"]
     if not isinstance(games, list):
         raise AssertionError("validated game evidence games must be a list")
