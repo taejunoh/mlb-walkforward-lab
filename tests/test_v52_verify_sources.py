@@ -1920,6 +1920,38 @@ class V52VerifySourcesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replay(fixture)
 
+    def test_game_builder_rejects_receipt_digest_drift_from_inventory_capability(
+        self,
+    ) -> None:
+        """A dynamic receipt digest must still equal authenticated inventory."""
+        from mlb_backtest import v52_verify_sources as verifier
+
+        fixture = _authenticated_source_game_authority()
+        replacement_sha256 = (
+            "9" * 64
+            if fixture.binding.success_receipt.sha256 != "9" * 64
+            else "8" * 64
+        )
+        forged_binding = dataclasses.replace(
+            fixture.binding,
+            success_receipt=dataclasses.replace(
+                fixture.binding.success_receipt,
+                sha256=replacement_sha256,
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "game snapshot disposition capability differs"
+        ):
+            verifier._build_game_normalized_snapshots(
+                "historical_walkforward_500_superseding_565534",
+                fixture.records,
+                fixture.game_inventory,
+                fixture.timezone_gate,
+                fixture.schedule_inventory,
+                duplicate_gamepk_disposition=forged_binding,
+                dispositioned_query_ids=(fixture.disposition_id,),
+            )
+
     @unittest.skipUnless(
         os.environ.get("MLB_RUN_SLOW_SOURCE_REPLAY_INTEGRATION") == "1",
         "requires the fixed protected 3GB corpus; opt in with "
@@ -2243,6 +2275,15 @@ class V52VerifySourcesTest(unittest.TestCase):
         self.assertEqual(
             verifier._validate_normalized_snapshot_mapping(snapshot), snapshot
         )
+        dynamic_receipt = json.loads(canonical_json_bytes(snapshot))
+        dynamic_receipt["duplicate_gamepk_disposition"]["success_receipt"][
+            "sha256"
+        ] = "9" * 64
+        jsonschema.validate(dynamic_receipt, schema)
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(dynamic_receipt),
+            dynamic_receipt,
+        )
 
         attacks: dict[str, dict[str, object]] = {}
         for field, value in (
@@ -2250,7 +2291,7 @@ class V52VerifySourcesTest(unittest.TestCase):
             ("query_sidecar.path", "sealed/other-sidecar.json"),
             ("query_sidecar.sha256", "0" * 64),
             ("success_receipt.path", "sealed/other-success.json"),
-            ("success_receipt.sha256", "0" * 64),
+            ("success_receipt.sha256", "A" * 64),
             ("dispositioned_query_ids", ["0" * 64]),
         ):
             forged = json.loads(canonical_json_bytes(snapshot))

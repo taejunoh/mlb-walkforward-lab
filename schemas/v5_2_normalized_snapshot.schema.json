@@ -3,6 +3,32 @@
   "title": "v5.2 immutable normalized source snapshot candidate",
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task10Disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "query_id": {"const": "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"},
+        "query_sidecar": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {"const": "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json"},
+            "sha256": {"const": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"}
+          },
+          "required": ["path", "sha256"]
+        },
+        "success_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {"const": "data/v5_2_qd/historical_superseding_565534/raw/queries/mlb_schedule_game_feed/8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/success.json"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          },
+          "required": ["path", "sha256"]
+        }
+      },
+      "required": ["query_id", "query_sidecar", "success_receipt"]
+    },
     "date": {"type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
     "positiveId": {"type": "integer", "minimum": 1},
     "nullableNonnegative": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
@@ -378,7 +404,7 @@
         "logical_query_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "contains": {"const": "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"}, "uniqueItems": true},
         "source_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "contains": {"const": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"}, "uniqueItems": true},
         "split_receipt_sha256s": {"type": "array", "maxItems": 0, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
-        "duplicate_gamepk_disposition": {"const": {"query_id": "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095", "query_sidecar": {"path": "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json", "sha256": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"}, "success_receipt": {"path": "data/v5_2_qd/historical_superseding_565534/raw/queries/mlb_schedule_game_feed/8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/success.json", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"}}},
+        "duplicate_gamepk_disposition": {"$ref": "#/$defs/task10Disposition"},
         "dispositioned_query_ids": {"const": ["8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"]},
         "payload": {"$ref": "#/$defs/sourceHistoryPayload"}
       },
@@ -431,7 +457,7 @@
         "logical_query_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "contains": {"const": "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"}, "uniqueItems": true},
         "source_query_sidecar_sha256s": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}, "contains": {"const": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"}, "uniqueItems": true},
         "split_receipt_sha256s": {"type": "array", "maxItems": 0, "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
-        "duplicate_gamepk_disposition": {"const": {"query_id": "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095", "query_sidecar": {"path": "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json", "sha256": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"}, "success_receipt": {"path": "data/v5_2_qd/historical_superseding_565534/raw/queries/mlb_schedule_game_feed/8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/success.json", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"}}},
+        "duplicate_gamepk_disposition": {"$ref": "#/$defs/task10Disposition"},
         "dispositioned_query_ids": {"const": ["8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"]},
         "payload": {"allOf": [{"$ref": "#/$defs/gamePayload"}, {"properties": {"games": {"items": {"allOf": [{"$ref": "#/$defs/game"}, {"if": {"properties": {"verification_status": {"const": "VERIFIED"}}}, "then": {"required": ["raw_game_object_sha256", "normalized_anchor_sha256"]}, "else": {"not": {"anyOf": [{"required": ["raw_game_object_sha256"]}, {"required": ["normalized_anchor_sha256"]}]}}}]}}}}]}
       },

@@ -32,16 +32,16 @@ INVENTORY = Path(
     "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
 )
 
-# Task 8 source-only duplicate disposition authority.  These are the immutable
-# identities produced by the approved 565534 derived query; downstream game
-# inventory must carry them without retaining the old quarantined query.
+# Task 8 source-only duplicate disposition authority. Query and sidecar
+# identities are fixed; the receipt digest below is only a fixture sentinel.
+# Production authenticates its dynamic content digest through the inventory.
 _DISPOSITION_QUERY_ID = (
     "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
 )
 _DISPOSITION_SIDECAR_SHA256 = (
     "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
 )
-_DISPOSITION_RECEIPT_SHA256 = "8" * 64
+_FIXTURE_DISPOSITION_RECEIPT_SHA256 = "8" * 64
 _OLD_QUARANTINED_QUERY_ID = (
     "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8"
 )
@@ -64,7 +64,7 @@ def _disposition_binding() -> dict[str, object]:
                 "mlb_schedule_game_feed/"
                 f"{_DISPOSITION_QUERY_ID}/success.json"
             ),
-            "sha256": _DISPOSITION_RECEIPT_SHA256,
+            "sha256": _FIXTURE_DISPOSITION_RECEIPT_SHA256,
         },
     }
 

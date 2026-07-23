@@ -39,7 +39,6 @@ def _source_store_case():
         TASK10_DISPOSITION_SIDECAR_PATH,
         TASK10_DISPOSITION_SIDECAR_SHA256,
         TASK10_DISPOSITION_SUCCESS_PATH,
-        TASK10_DISPOSITION_SUCCESS_SHA256,
     )
     from mlb_backtest.v52_verify_sources import (
         AuthorityBinding,
@@ -56,7 +55,9 @@ def _source_store_case():
         ),
         success_receipt=AuthorityBinding(
             TASK10_DISPOSITION_SUCCESS_PATH,
-            TASK10_DISPOSITION_SUCCESS_SHA256,
+            # Fixture-only digest. Production authenticates the content digest
+            # through the inventory capability instead of a policy constant.
+            "8" * 64,
         ),
     )
 
@@ -569,6 +570,13 @@ class InventoryTests(unittest.TestCase):
         ):
             build_source(missing_source_authority)
 
+        receipt_digest_drift = dataclasses.replace(
+            binding,
+            success_receipt=AuthorityBinding(
+                binding.success_receipt.path,
+                "9" * 64,
+            ),
+        )
         for label, candidate in (
             (
                 "empty-binding-ids",
@@ -590,6 +598,16 @@ class InventoryTests(unittest.TestCase):
                         source_replay,
                         duplicate_gamepk_disposition=None,
                         dispositioned_query_ids=(),
+                    ),
+                ),
+            ),
+            (
+                "receipt-digest-drift",
+                dataclasses.replace(
+                    source_inputs,
+                    replay=dataclasses.replace(
+                        source_replay,
+                        duplicate_gamepk_disposition=receipt_digest_drift,
                     ),
                 ),
             ),
@@ -711,10 +729,22 @@ class InventoryTests(unittest.TestCase):
         second_dynamic_receipt["duplicate_gamepk_disposition"][
             "success_receipt"
         ]["sha256"] = "9" * 64
-        with self.assertRaises(jsonschema.ValidationError):
-            jsonschema.validate(second_dynamic_receipt, schema)
-        with self.assertRaises((TypeError, ValueError)):
+        # The receipt content digest is authority-bound by the inventory and
+        # registry, not a policy constant embedded in this standalone schema.
+        jsonschema.validate(second_dynamic_receipt, schema)
+        self.assertEqual(
             parse_inventory(_canonical_raw(second_dynamic_receipt))
+            .duplicate_gamepk_disposition.success_receipt.sha256,
+            "9" * 64,
+        )
+        malformed_receipt = json.loads(_canonical_raw(source))
+        malformed_receipt["duplicate_gamepk_disposition"][
+            "success_receipt"
+        ]["sha256"] = "A" * 64
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(malformed_receipt, schema)
+        with self.assertRaises((TypeError, ValueError)):
+            parse_inventory(_canonical_raw(malformed_receipt))
 
         source_as_old = json.loads(_canonical_raw(source))
         source_as_old.pop("duplicate_gamepk_disposition")

@@ -118,24 +118,6 @@ TASK10_DISPOSITION_SUCCESS_PATH = (
     "data/v5_2_qd/historical_superseding_565534/raw/queries/"
     f"mlb_schedule_game_feed/{TASK10_DISPOSITION_QUERY_ID}/success.json"
 )
-TASK10_DISPOSITION_SUCCESS_SHA256 = "8" * 64
-TASK10_DISPOSITION_BINDING = MappingProxyType(
-    {
-        "query_id": TASK10_DISPOSITION_QUERY_ID,
-        "query_sidecar": MappingProxyType(
-            {
-                "path": TASK10_DISPOSITION_SIDECAR_PATH,
-                "sha256": TASK10_DISPOSITION_SIDECAR_SHA256,
-            }
-        ),
-        "success_receipt": MappingProxyType(
-            {
-                "path": TASK10_DISPOSITION_SUCCESS_PATH,
-                "sha256": TASK10_DISPOSITION_SUCCESS_SHA256,
-            }
-        ),
-    }
-)
 
 
 def _expected_neutralization_records() -> tuple[Mapping[str, object], ...]:
@@ -212,8 +194,26 @@ def validate_schedule_neutralizations(
 
 
 def validate_task10_disposition_binding(value: object) -> None:
-    """Require the one immutable Task10 duplicate-game disposition binding."""
-    if not isinstance(value, Mapping) or value != TASK10_DISPOSITION_BINDING:
+    """Validate fixed Task10 identity while leaving the receipt digest dynamic."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"query_id", "query_sidecar", "success_receipt"}
+    ):
+        raise ValueError("duplicate gamePk disposition differs")
+    query_sidecar = value.get("query_sidecar")
+    success_receipt = value.get("success_receipt")
+    if (
+        value.get("query_id") != TASK10_DISPOSITION_QUERY_ID
+        or not isinstance(query_sidecar, Mapping)
+        or set(query_sidecar) != {"path", "sha256"}
+        or query_sidecar.get("path") != TASK10_DISPOSITION_SIDECAR_PATH
+        or query_sidecar.get("sha256") != TASK10_DISPOSITION_SIDECAR_SHA256
+        or not isinstance(success_receipt, Mapping)
+        or set(success_receipt) != {"path", "sha256"}
+        or success_receipt.get("path") != TASK10_DISPOSITION_SUCCESS_PATH
+        or not isinstance(success_receipt.get("sha256"), str)
+        or _SHA256.fullmatch(success_receipt["sha256"]) is None
+    ):
         raise ValueError("duplicate gamePk disposition differs")
 
 
@@ -442,12 +442,10 @@ __all__ = [
     "EXPECTED_NEUTRALIZATIONS",
     "KNOWN_UNAPPROVED_NEIGHBORS",
     "SOURCE_RUN_ID",
-    "TASK10_DISPOSITION_BINDING",
     "TASK10_DISPOSITION_QUERY_ID",
     "TASK10_DISPOSITION_SIDECAR_PATH",
     "TASK10_DISPOSITION_SIDECAR_SHA256",
     "TASK10_DISPOSITION_SUCCESS_PATH",
-    "TASK10_DISPOSITION_SUCCESS_SHA256",
     "recompute_prior_history_sidecar",
     "validate_task10_disposition_binding",
     "validate_schedule_neutralizations",

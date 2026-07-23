@@ -212,9 +212,29 @@ class V52HistorySourceTest(unittest.TestCase):
     def test_source_2019_requires_exact_disposition_and_targets(self) -> None:
         from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
 
+        dynamic_disposition = copy.deepcopy(_task10_disposition())
+        dynamic_disposition["success_receipt"]["sha256"] = "9" * 64
+        recompute_prior_history_sidecar(
+            _task10_source_snapshot(),
+            source_snapshot_sha256="1" * 64,
+            run_id=SOURCE_RUN_ID,
+            duplicate_gamepk_disposition=dynamic_disposition,
+        )
         for mutation in (
             {"query_id": "0" * 64},
             {"query_sidecar": {"path": "wrong", "sha256": "0" * 64}},
+            {
+                "success_receipt": {
+                    "path": "wrong",
+                    "sha256": "9" * 64,
+                }
+            },
+            {
+                "success_receipt": {
+                    "path": _task10_disposition()["success_receipt"]["path"],
+                    "sha256": "A" * 64,
+                }
+            },
         ):
             disposition = copy.deepcopy(_task10_disposition())
             disposition.update(mutation)
