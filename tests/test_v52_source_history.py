@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 import jsonschema
@@ -52,15 +53,290 @@ def _schedule_snapshot() -> dict[str, object]:
 
 
 SOURCE_SNAPSHOT_SHA256 = "f" * 64
+SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+
+
+def _task10_source_snapshot() -> dict[str, object]:
+    fixture = json.loads(
+        (
+            ROOT
+            / "tests/fixtures/v52_schedule_neutralizations/boundary_anchors.json"
+        ).read_text()
+    )
+    games = []
+    for record in fixture["records"]:
+        anchor = record["anchor"]
+        games.append(
+            {
+                **anchor,
+                "feature_history_cutoff": (
+                    date.fromisoformat(anchor["official_date"]) - timedelta(days=1)
+                ).isoformat(),
+                "normalized_anchor_sha256": record["normalized_anchor_sha256"],
+                "source_game_sha256": hashlib.sha256(
+                    f"source:{anchor['game_pk']}".encode()
+                ).hexdigest(),
+                "verification_status": "VERIFIED",
+            }
+        )
+    return {
+        "games": games,
+        "grain": "season_game_evidence_snapshot",
+        "schema_version": 1,
+        "source_query_sidecar_sha256s": ["1" * 64],
+    }
+
+
+def _task10_disposition() -> dict[str, object]:
+    query_id = "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+    return {
+        "query_id": query_id,
+        "query_sidecar": {
+            "path": (
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "query_sidecars/"
+                "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json"
+            ),
+            "sha256": "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1",
+        },
+        "success_receipt": {
+            "path": (
+                "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                f"mlb_schedule_game_feed/{query_id}/success.json"
+            ),
+            "sha256": "8" * 64,
+        },
+    }
 
 
 class V52HistorySourceTest(unittest.TestCase):
+    def test_three_exact_duplicate_dependency_neutralizations_and_no_others(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_sources.history import (
+            EXPECTED_NEUTRALIZATIONS,
+            SOURCE_RUN_ID as history_source_run_id,
+            recompute_prior_history_sidecar,
+        )
+
+        snapshot = recompute_prior_history_sidecar(
+            _task10_source_snapshot(),
+            source_snapshot_sha256="1" * 64,
+            run_id=SOURCE_RUN_ID,
+            duplicate_gamepk_disposition=_task10_disposition(),
+        )
+        identities = tuple(
+            (
+                row["target_raw_game_object_sha256"],
+                row["target_normalized_anchor_sha256"],
+                row["game_pk"],
+                row["official_date"],
+                row["team_id"],
+            )
+            for row in snapshot["schedule_neutralizations"]
+        )
+        self.assertEqual(history_source_run_id, SOURCE_RUN_ID)
+        self.assertEqual(identities, EXPECTED_NEUTRALIZATIONS)
+        self.assertEqual(len(identities), 3)
+        jsonschema.validate(
+            snapshot,
+            json.loads(SCHEMA.read_text()),
+            format_checker=jsonschema.FormatChecker(),
+        )
+        for row in snapshot["schedule_neutralizations"]:
+            self.assertEqual(
+                {
+                    "value": row["value"],
+                    "sample_size": row["sample_size"],
+                    "quality": row["quality"],
+                    "reason_codes": row["reason_codes"],
+                },
+                {
+                    "value": 50.0,
+                    "sample_size": 0,
+                    "quality": 0.0,
+                    "reason_codes": [
+                        "schedule_neutral_duplicate_gamepk_dependency"
+                    ],
+                },
+            )
+
+    def test_schedule_neutralization_mutations_are_rejected(self) -> None:
+        from mlb_backtest.v52_sources.history import (
+            recompute_prior_history_sidecar,
+            validate_schedule_neutralizations,
+        )
+
+        baseline = recompute_prior_history_sidecar(
+            _task10_source_snapshot(),
+            source_snapshot_sha256="1" * 64,
+            run_id=SOURCE_RUN_ID,
+            duplicate_gamepk_disposition=_task10_disposition(),
+        )
+        rows = baseline["schedule_neutralizations"]
+        attacks = {
+            "missing": rows[:-1],
+            "duplicate": rows + [rows[0]],
+            "changed-hash": [
+                {**rows[0], "target_raw_game_object_sha256": "0" * 64},
+                *rows[1:],
+            ],
+            "truncated-hash": [
+                {**rows[0], "target_normalized_anchor_sha256": "a" * 63},
+                *rows[1:],
+            ],
+            "reordered": list(reversed(rows)),
+            "extra": rows + [{**rows[0], "team_id": 999}],
+        }
+        for name, value in attacks.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                validate_schedule_neutralizations(value)
+
+        for name, value in attacks.items():
+            attack = copy.deepcopy(baseline)
+            attack["schedule_neutralizations"] = value
+            with self.subTest(schema=name), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(attack, json.loads(SCHEMA.read_text()))
+
+        old = recompute_prior_history_sidecar(
+            _schedule_snapshot(),
+            source_snapshot_sha256="1" * 64,
+            run_id="historical_walkforward_500",
+        )
+        old["schedule_neutralizations"] = []
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(old, json.loads(SCHEMA.read_text()))
+
+    def test_source_2019_requires_exact_disposition_and_targets(self) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        for mutation in (
+            {"query_id": "0" * 64},
+            {"query_sidecar": {"path": "wrong", "sha256": "0" * 64}},
+        ):
+            disposition = copy.deepcopy(_task10_disposition())
+            disposition.update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                recompute_prior_history_sidecar(
+                    _task10_source_snapshot(),
+                    source_snapshot_sha256="1" * 64,
+                    run_id=SOURCE_RUN_ID,
+                    duplicate_gamepk_disposition=disposition,
+                )
+        for mutate in (
+            lambda value: value.update(
+                {
+                    "games": [
+                        game for game in value["games"] if game["game_pk"] != 565338
+                    ]
+                }
+            ),
+            lambda value: value["games"].append(copy.deepcopy(value["games"][0])),
+            lambda value: value["games"][0].update({"official_date": "2019-05-21"}),
+            lambda value: value["games"][0].update({"away_team_id": 999}),
+            lambda value: value["games"][0].update(
+                {"raw_game_object_sha256": "0" * 64}
+            ),
+            lambda value: value["games"][0].update(
+                {"normalized_anchor_sha256": "0" * 64}
+            ),
+        ):
+            snapshot = _task10_source_snapshot()
+            mutate(snapshot)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                recompute_prior_history_sidecar(
+                    snapshot,
+                    source_snapshot_sha256="1" * 64,
+                    run_id=SOURCE_RUN_ID,
+                    duplicate_gamepk_disposition=_task10_disposition(),
+                )
+
+    def test_legacy_history_bytes_are_unchanged(self) -> None:
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        old = recompute_prior_history_sidecar(
+            _schedule_snapshot(),
+            source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+            run_id="historical_walkforward_500",
+        )
+        self.assertNotIn("schedule_neutralizations", old)
+        # Base canonical payload bytes exclude the publisher's trailing newline.
+        encoded = canonical_json_bytes(old)
+        self.assertEqual(len(encoded), 687)
+        self.assertEqual(
+            hashlib.sha256(encoded).hexdigest(),
+            "b4803935007402aa248928f01b06ba9f4d4c18463fdec3d574fa8b586578f941",
+        )
+        self.assertEqual(len(encoded + b"\n"), 688)
+
+    def test_runtime_matrix_closes_source_fields_and_disposition(self) -> None:
+        from mlb_backtest.v52_source_contracts import canonical_sha256
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        sourced = _task10_source_snapshot()
+        with self.assertRaises(ValueError):
+            recompute_prior_history_sidecar(
+                sourced,
+                source_snapshot_sha256="1" * 64,
+                run_id="historical_walkforward_500",
+            )
+        for game in sourced["games"]:
+            game["season"] = 2020
+            anchor = {
+                key: game[key]
+                for key in (
+                    "alternate_site",
+                    "away_score",
+                    "away_team_id",
+                    "completed_innings",
+                    "doubleheader_order",
+                    "game_pk",
+                    "home_score",
+                    "home_team_id",
+                    "neutral_site",
+                    "official_date",
+                    "played",
+                    "raw_game_object_sha256",
+                    "scheduled_innings",
+                    "scheduled_start_utc",
+                    "season",
+                    "season_start_date",
+                    "terminal_status",
+                    "venue_id",
+                    "winner_team_id",
+                )
+            }
+            game["normalized_anchor_sha256"] = canonical_sha256(anchor)
+        source_2020 = recompute_prior_history_sidecar(
+            sourced,
+            source_snapshot_sha256="1" * 64,
+            run_id=SOURCE_RUN_ID,
+        )
+        self.assertNotIn("schedule_neutralizations", source_2020)
+        with self.assertRaises(ValueError):
+            recompute_prior_history_sidecar(
+                sourced,
+                source_snapshot_sha256="1" * 64,
+                run_id=SOURCE_RUN_ID,
+                duplicate_gamepk_disposition=_task10_disposition(),
+            )
+        sourced["games"][0].pop("normalized_anchor_sha256")
+        with self.assertRaises(ValueError):
+            recompute_prior_history_sidecar(
+                sourced,
+                source_snapshot_sha256="1" * 64,
+                run_id=SOURCE_RUN_ID,
+            )
     def test_prior_history_binds_every_source_game_hash_and_d1_cutoff(self) -> None:
         from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
 
         snapshot = recompute_prior_history_sidecar(
             _schedule_snapshot(),
             source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+            run_id="historical_walkforward_500",
         )
         jsonschema.validate(
             snapshot,
@@ -77,6 +353,7 @@ class V52HistorySourceTest(unittest.TestCase):
             recompute_prior_history_sidecar(
                 _schedule_snapshot(),
                 source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                run_id="historical_walkforward_500",
             ),
         )
 
@@ -92,6 +369,7 @@ class V52HistorySourceTest(unittest.TestCase):
                 recompute_prior_history_sidecar(
                     _schedule_snapshot(),
                     source_snapshot_sha256=digest,  # type: ignore[arg-type]
+                    run_id="historical_walkforward_500",
                 )
 
     def test_prior_history_rejects_missing_hash_non_d1_and_unverified_game(self) -> None:
@@ -104,6 +382,7 @@ class V52HistorySourceTest(unittest.TestCase):
                 recompute_prior_history_sidecar(
                     snapshot,
                     source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                    run_id="historical_walkforward_500",
                 )
 
     def test_prior_history_rejects_noncanonical_or_non_utc_start_time(self) -> None:
@@ -121,6 +400,7 @@ class V52HistorySourceTest(unittest.TestCase):
                 recompute_prior_history_sidecar(
                     snapshot,
                     source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                    run_id="historical_walkforward_500",
                 )
 
     def test_history_schema_requires_canonical_utc_start_time(self) -> None:
@@ -130,6 +410,7 @@ class V52HistorySourceTest(unittest.TestCase):
         baseline = recompute_prior_history_sidecar(
             _schedule_snapshot(),
             source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+            run_id="historical_walkforward_500",
         )
         for scheduled_start in (
             "not-a-date-time",
@@ -173,6 +454,7 @@ class V52HistorySourceTest(unittest.TestCase):
             recompute_prior_history_sidecar(
                 empty_schedule,
                 source_snapshot_sha256=SOURCE_SNAPSHOT_SHA256,
+                run_id="historical_walkforward_500",
             )
         schema = json.loads(SCHEMA.read_text())
         with self.assertRaises(jsonschema.ValidationError):
