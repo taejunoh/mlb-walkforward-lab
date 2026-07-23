@@ -15,8 +15,9 @@ from unittest.mock import patch
 import jsonschema
 
 from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
-from mlb_backtest.v52_source_contracts import canonical_json_bytes
+from mlb_backtest.v52_source_contracts import canonical_json_bytes, query_sidecar
 from mlb_backtest.v52_sources.schedule import canonical_sha256
+from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
 from tests.test_v52_source_history import _task10_disposition, _task10_source_snapshot
 from tests.test_v52_verify_sources import (
     _authenticated_source_game_authority,
@@ -197,6 +198,110 @@ def _source_game_snapshots():
             game["source_game_sha256"] = _source_game_hash(game)
         snapshots.append(_rebuild(mapping))
     return tuple(snapshots), authority
+
+
+def _fixture_source_2019_snapshot():
+    """Build the source 2019 game snapshot from the frozen anchor fixture.
+
+    The ordinary schedule sidecar is deliberately raw-less (the adapter strips
+    each anchor's raw hash); deterministic boxscore sidecars then provide the
+    participant evidence used by the game reducer.
+    """
+    from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_provenance
+    from mlb_backtest.v52_sources.schedule import (
+        derived_schedule_sidecar_adapter,
+        recompute_game_evidence_snapshot,
+    )
+
+    fixture = json.loads(
+        (ROOT / "tests/fixtures/v52_schedule_neutralizations/boundary_anchors.json").read_text()
+    )
+    anchors = [record["anchor"] for record in fixture["records"]]
+    schedule_query = LogicalQuery(
+        source="mlb_schedule_game_feed",
+        grain="season_schedule_and_game",
+        endpoint="https://statsapi.mlb.com/api/v1/schedule",
+        parameters={},
+        requested_range={
+            "year": 2019,
+            "start_date": "2019-03-20",
+            "end_date": "2019-09-30",
+        },
+        expected_media_type="application/json",
+        parser_version="v5.2.1",
+        parent_query_id=None,
+        run_spec_sha256="a" * 64,
+        acquisition_contract_sha256="b" * 64,
+    )
+    schedule_sidecar = derived_schedule_sidecar_adapter(schedule_query, anchors)
+    if any("raw_game_object_sha256" in anchor for anchor in schedule_sidecar["semantics"]["anchors"]):
+        raise AssertionError("ordinary schedule sidecar leaked raw anchor hashes")
+    boxscores = {}
+    box_query_ids = []
+    for anchor in anchors:
+        game_pk = anchor["game_pk"]
+        box_query = dataclasses.replace(
+            schedule_query,
+            endpoint=f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore",
+            requested_range={
+                "season": 2019,
+                "game_pk": game_pk,
+                "official_date": anchor["official_date"],
+            },
+        )
+        box_query_ids.append(logical_query_id(box_query))
+        raw = canonical_json_bytes({"fixture_game_pk": game_pk})
+        semantics = {
+            "actual_starter_ids": [game_pk + 1000, game_pk + 2000],
+            "away_starting_hitter_ids": [game_pk * 10 + slot for slot in range(1, 10)],
+            "away_team_id": anchor["away_team_id"],
+            "home_starting_hitter_ids": [game_pk * 20 + slot for slot in range(1, 10)],
+            "home_team_id": anchor["home_team_id"],
+            "away_score": anchor["away_score"],
+            "home_score": anchor["home_score"],
+            "winner_team_id": anchor["winner_team_id"],
+            "game_pk": game_pk,
+            "official_date": anchor["official_date"],
+        }
+        sidecar = query_sidecar(raw, box_query, semantics)
+        sidecar_bytes = canonical_json_bytes(sidecar) + b"\n"
+        boxscores[game_pk] = (
+            sidecar_bytes,
+            hashlib.sha256(sidecar_bytes).hexdigest(),
+        )
+
+    payload = dict(
+        recompute_game_evidence_snapshot(
+            [schedule_sidecar],
+            boxscores,
+            schedule_provenance=build_schedule_anchor_provenance(anchors),
+        )
+    )
+    disposition = _task10_disposition()
+    disposition_sha = disposition["query_sidecar"]["sha256"]
+    adapter_sha = hashlib.sha256(canonical_json_bytes(schedule_sidecar) + b"\n").hexdigest()
+    for game in payload["games"]:
+        game["schedule_query_sidecar_sha256"] = disposition_sha
+        game["source_game_sha256"] = _source_game_hash(game)
+    payload["source_query_sidecar_sha256s"] = sorted(
+        (set(payload["source_query_sidecar_sha256s"]) - {adapter_sha})
+        | {disposition_sha}
+    )
+    mapping = {
+        "schema_version": 1,
+        "run_id": "historical_walkforward_500_superseding_565534",
+        "season": 2019,
+        "source": "mlb_schedule_game_feed",
+        "grain": "season_game_evidence_snapshot",
+        "status": "READY",
+        "logical_query_ids": sorted([disposition["query_id"], *box_query_ids]),
+        "source_query_sidecar_sha256s": payload["source_query_sidecar_sha256s"],
+        "split_receipt_sha256s": [],
+        "payload": payload,
+        "duplicate_gamepk_disposition": disposition,
+        "dispositioned_query_ids": [disposition["query_id"]],
+    }
+    return _rebuild(mapping)
 
 
 class V52HistoryNormalizedSnapshotTest(unittest.TestCase):
@@ -530,6 +635,128 @@ class V52HistoryNormalizedSnapshotTest(unittest.TestCase):
             "schedule_neutralizations",
             next(snapshot for snapshot in histories if snapshot.season == 2020).payload,
         )
+
+    def test_task10_source_vertical_replay_preparation_and_feature_gate(self) -> None:
+        """Exercise fixture anchors through evidence, history, preparation, and features."""
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.feature_engine import build_raw_game_features
+        from mlb_backtest.statcast import StatcastData
+        from mlb_backtest.prepare import ScheduleHistoryBuild, build_feature_history
+        from tests.test_feature_engine import mapping, task10_game
+
+        source_2019 = _fixture_source_2019_snapshot()
+        source_games, authority = _source_game_snapshots()
+        source_games = tuple(
+            source_2019 if snapshot.season == 2019 else snapshot
+            for snapshot in source_games
+        )
+        histories = verifier._build_history_normalized_snapshots(
+            "historical_walkforward_500_superseding_565534",
+            source_games,
+            duplicate_gamepk_disposition=authority.binding,
+            dispositioned_query_ids=(authority.disposition_id,),
+        )
+        source_history = next(snapshot for snapshot in histories if snapshot.season == 2019)
+        self.assertEqual(len(source_history.payload["schedule_neutralizations"]), 3)
+
+        schema = json.loads(SCHEMA.read_text())
+        jsonschema.validate(source_2019.as_mapping(), schema, format_checker=jsonschema.FormatChecker())
+        jsonschema.validate(source_history.as_mapping(), schema, format_checker=jsonschema.FormatChecker())
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(source_2019.as_mapping()),
+            source_2019.as_mapping(),
+        )
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(source_history.as_mapping()),
+            source_history.as_mapping(),
+        )
+        self.assertEqual(
+            verifier._validate_history_snapshot_lineage(source_history, source_2019),
+            source_history.as_mapping(),
+        )
+        with (
+            patch.object(Path, "read_bytes", side_effect=AssertionError("filesystem access")),
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("network access")),
+        ):
+            self.assertEqual(
+                verifier._validate_history_snapshot_lineage(source_history, source_2019),
+                source_history.as_mapping(),
+            )
+
+        fixture = json.loads(
+            (ROOT / "tests/fixtures/v52_schedule_neutralizations/boundary_anchors.json").read_text()
+        )
+        rows = tuple(
+            {
+                "game_pk": anchor["game_pk"],
+                "official_date": anchor["official_date"],
+                "team_codes": ["AWY", "HOM"],
+                "away_team_code": "AWY",
+                "home_team_code": "HOM",
+                "away_team_id": anchor["away_team_id"],
+                "home_team_id": anchor["home_team_id"],
+                "venue_name": "Park",
+                "innings": anchor["completed_innings"],
+            }
+            for record in fixture["records"]
+            for anchor in (record["anchor"],)
+        )
+        schedule_build = ScheduleHistoryBuild(
+            rows=rows,
+            coverage_start="2019-05-20",
+            coverage_end="2019-09-07",
+            coverage_complete=True,
+            source_manifest_sha256="d" * 64,
+            expected_game_pks=tuple(sorted(row["game_pk"] for row in rows)),
+            schedule_neutralizations=tuple(
+                {
+                    **dict(record),
+                    "reason_codes": list(record["reason_codes"]),
+                }
+                for record in source_history.payload["schedule_neutralizations"]
+            ),
+        )
+        feature_history = build_feature_history(
+            StatcastData((), ()),
+            {slot: 1 / 9 for slot in range(1, 10)},
+            schedule_build,
+        )
+        target = task10_game(566156, "2019-09-06", 116, 133)
+        raw = build_raw_game_features(
+            target,
+            feature_history,
+            mapping(),
+            {"2019-09-05": {"as_of_date": "2019-09-05", "value": 4.0, "earned_runs": 4, "outs": 27, "source": "mlb_stats_api", "manifest_sha256": "e" * 64}},
+        )
+        expected = {
+            "value": 50.0,
+            "sample_size": 0,
+            "quality": 0.0,
+            "flags": ["schedule_neutral_duplicate_gamepk_dependency"],
+        }
+        self.assertEqual(raw["away"]["schedule"], expected)
+        self.assertEqual(raw["home"]["schedule"], expected)
+
+    def test_old_run_payload_and_game_rows_remain_legacy_shaped(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from tests.test_prepare import _task10_schedule_history_build
+
+        old_game = self.games[0]
+        old_history = self._build()[0]
+        self.assertEqual(
+            set(old_history.payload),
+            {"games", "grain", "schema_version", "source_game_sha256s", "source_snapshot_sha256"},
+        )
+        self.assertNotIn("schedule_neutralizations", old_history.payload)
+        self.assertEqual(_task10_schedule_history_build().schedule_neutralizations, ())
+        for row in old_game.payload["games"]:
+            self.assertNotIn("raw_game_object_sha256", row)
+            self.assertNotIn("normalized_anchor_sha256", row)
+        with (
+            patch.object(Path, "read_bytes", side_effect=AssertionError("I/O")),
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("I/O")),
+        ):
+            verifier._validate_history_snapshot_lineage(old_history, old_game)
 
     def test_history_runtime_closes_source_disposition_and_neutralizations(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
