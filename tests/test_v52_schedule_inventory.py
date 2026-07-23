@@ -29,6 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_SPEC_PATH = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 CONTRACT_PATH = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 SCHEMA_PATH = ROOT / "schemas/v5_2_schedule_anchor_inventory.schema.json"
+NEUTRALIZATION_FIXTURE = (
+    ROOT / "tests/fixtures/v52_schedule_neutralizations/boundary_anchors.json"
+)
 INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
 )
@@ -465,6 +468,50 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             quarantined_query_ids=(),
             split_query_ids=(),
         )
+
+    def test_source_anchor_provenance_binds_exact_boundary_hashes(self) -> None:
+        from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_provenance
+
+        fixture = json.loads(NEUTRALIZATION_FIXTURE.read_text())
+        anchors = [row["anchor"] for row in fixture["records"]]
+        actual = build_schedule_anchor_provenance(anchors)
+        self.assertEqual(set(actual), {565338, 565535, 566156, 566157})
+        for row in fixture["records"]:
+            game_pk = row["anchor"]["game_pk"]
+            self.assertEqual(
+                actual[game_pk],
+                {
+                    "game_pk": game_pk,
+                    "official_date": row["anchor"]["official_date"],
+                    "away_team_id": row["anchor"]["away_team_id"],
+                    "home_team_id": row["anchor"]["home_team_id"],
+                    "raw_game_object_sha256": row["anchor"]["raw_game_object_sha256"],
+                    "normalized_anchor_sha256": row["normalized_anchor_sha256"],
+                },
+            )
+
+    def test_source_anchor_provenance_rejects_closed_shape_attacks(self) -> None:
+        from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_provenance
+
+        fixture = json.loads(NEUTRALIZATION_FIXTURE.read_text())
+        anchor = fixture["records"][0]["anchor"]
+        attacks = (
+            {
+                key: value
+                for key, value in anchor.items()
+                if key != "raw_game_object_sha256"
+            },
+            {**anchor, "unexpected": True},
+            {
+                **anchor,
+                "raw_game_object_sha256": anchor["raw_game_object_sha256"][:32],
+            },
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack), self.assertRaises(ValueError):
+                build_schedule_anchor_provenance([attack])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            build_schedule_anchor_provenance([anchor, anchor])
 
     def test_source_authority_rejects_wrong_raw_root_and_cross_pair_before_evidence(self) -> None:
         from mlb_backtest.v52_schedule_inventory import (

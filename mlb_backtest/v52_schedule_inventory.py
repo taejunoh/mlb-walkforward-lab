@@ -500,6 +500,43 @@ def _derived_projection_anchors(
     return anchors, projection.occurrence_counts
 
 
+def build_schedule_anchor_provenance(
+    anchors: Sequence[Mapping[str, object]],
+) -> Mapping[int, Mapping[str, object]]:
+    """Bind compact source-anchor identity and immutable provenance hashes."""
+    result: dict[int, Mapping[str, object]] = {}
+    for raw_anchor in anchors:
+        if not isinstance(raw_anchor, Mapping):
+            raise ValueError("source anchor provenance row differs")
+        anchor = dict(raw_anchor)
+        if set(anchor) != _SOURCE_ANCHOR_KEYS:
+            raise ValueError("source anchor provenance keys differ")
+        game_pk = _positive_int(
+            anchor.get("game_pk"), "source anchor provenance gamePk"
+        )
+        if game_pk in result:
+            raise ValueError("source anchor provenance contains duplicate gamePk")
+        raw_sha256 = anchor.get("raw_game_object_sha256")
+        if (
+            not isinstance(raw_sha256, str)
+            or _SHA256.fullmatch(raw_sha256) is None
+        ):
+            raise ValueError("source anchor raw-object provenance differs")
+        result[game_pk] = MappingProxyType(
+            {
+                "game_pk": game_pk,
+                "official_date": anchor["official_date"],
+                "away_team_id": anchor["away_team_id"],
+                "home_team_id": anchor["home_team_id"],
+                "raw_game_object_sha256": raw_sha256,
+                "normalized_anchor_sha256": hashlib.sha256(
+                    _canonical_json_bytes(anchor)
+                ).hexdigest(),
+            }
+        )
+    return MappingProxyType(result)
+
+
 def _validate_binding(value: object, label: str) -> None:
     if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
         raise ValueError(f"{label} binding differs")
@@ -1138,6 +1175,7 @@ def load_verified_schedule_anchor_inventory(
 __all__ = [
     "VerifiedScheduleAnchorInventory",
     "build_schedule_anchor_inventory",
+    "build_schedule_anchor_provenance",
     "load_verified_schedule_anchor_inventory",
     "publish_schedule_anchor_inventory",
 ]
