@@ -414,6 +414,7 @@ class FeatureHistory:
         schedule_coverage_start: str | None = None,
         schedule_coverage_end: str | None = None,
         schedule_coverage_complete: bool = False,
+        schedule_neutralizations: Iterable[Mapping[str, object]] = (),
         venue_by_name: Mapping[str, Mapping[str, object]] | None = None,
         statcast_coverage_complete: bool = True,
     ) -> None:
@@ -435,16 +436,21 @@ class FeatureHistory:
             sorted(statcast.plate_appearances, key=self._pitch_key)
         )
         self.roles = MappingProxyType(identify_pitcher_roles(self.pitches))
-        self.schedule_history = (
-            schedule_history
-            if isinstance(schedule_history, ScheduleHistory)
-            else ScheduleHistory(
+        neutralization_records = tuple(schedule_neutralizations)
+        if isinstance(schedule_history, ScheduleHistory):
+            if neutralization_records:
+                raise ValueError(
+                    "schedule neutralizations require schedule history rows"
+                )
+            self.schedule_history = schedule_history
+        else:
+            self.schedule_history = ScheduleHistory(
                 schedule_history,
                 coverage_start=schedule_coverage_start,
                 coverage_end=schedule_coverage_end,
                 coverage_complete=schedule_coverage_complete,
+                schedule_neutralizations=neutralization_records,
             )
-        )
         self.venue_by_name = MappingProxyType(dict(venue_by_name or {}))
         self.pa_by_pitcher = self._index(self.plate_appearances, "pitcher_id")
         self.pa_by_batter = self._index(self.plate_appearances, "batter_id")
@@ -973,8 +979,27 @@ def _travel_fields(
 
 
 def _schedule_component(
-    game: Mapping[str, object], history: FeatureHistory, team_code: str, target: date
+    game: Mapping[str, object],
+    history: FeatureHistory,
+    team_code: str,
+    team_id: int | None,
+    target: date,
 ) -> dict:
+    game_pk = int(game["game_pk"])
+    target_key = (game_pk, target.isoformat())
+    if target_key in history.schedule_history.neutralization_game_dates:
+        if type(team_id) is not int or team_id <= 0:
+            raise ValueError("schedule neutralization team_id is invalid")
+        neutralization = history.schedule_history.neutralization_by_key.get(
+            (game_pk, target.isoformat(), team_id)
+        )
+        if neutralization is not None:
+            return _metric(
+                neutralization["value"],
+                neutralization["sample_size"],
+                neutralization["quality"],
+                flags=list(neutralization["reason_codes"]),
+            )
     prior = [
         r
         for r in history.schedule_history.by_team.get(team_code, ())
@@ -1417,6 +1442,19 @@ def _build_side_components(
     if name not in team_code_by_name:
         raise ValueError(f"team mapping missing {name}")
     code = team_code_by_name[name]
+    team_id: int | None = None
+    target_key = (int(game["game_pk"]), target.isoformat())
+    if target_key in history.schedule_history.neutralization_game_dates:
+        if game.get(f"{side}_team_code") != code:
+            raise ValueError("schedule neutralization team code is invalid")
+        team_id = game.get(f"{side}_team_id")
+        if type(team_id) is not int or team_id <= 0:
+            raise ValueError("schedule neutralization team_id is invalid")
+        expected_team_id = history.schedule_history.team_id_by_game_date_code.get(
+            (int(game["game_pk"]), target.isoformat(), code)
+        )
+        if expected_team_id is None or team_id != expected_team_id:
+            raise ValueError("schedule neutralization team identity is invalid")
     return {
         "team_code": code,
         "starter": _starter_component(
@@ -1430,7 +1468,7 @@ def _build_side_components(
             history, game[f"{side}_lineup"], opponent_hand, target
         ),
         "bullpen": _bullpen_component(history, code, target),
-        "schedule": _schedule_component(game, history, code, target),
+        "schedule": _schedule_component(game, history, code, team_id, target),
         "environment": _metric(50.0, 0, 0.0, flags=["environment_unavailable"]),
         "defense": _metric(50.0, 0, 0.0, flags=["defense_unavailable"]),
     }

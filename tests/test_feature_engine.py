@@ -205,6 +205,44 @@ def build(target, history, team_map=None, league_era=None):
     )
 
 
+def task10_feature_history():
+    return FeatureHistory(
+        data([]),
+        slot_weights={i: 1 / 9 for i in range(1, 10)},
+        schedule_history=task10_schedule_rows(),
+        schedule_coverage_start="2019-05-01",
+        schedule_coverage_end="2019-09-30",
+        schedule_coverage_complete=True,
+        schedule_neutralizations=schedule_neutralization_records(),
+    )
+
+
+def task10_game(
+    game_pk: int,
+    official_date: str,
+    away_team_id: int,
+    home_team_id: int,
+    **changes,
+):
+    return game(
+        game_pk=game_pk,
+        official_date=official_date,
+        away_team_code="AWY",
+        home_team_code="HOM",
+        away_team_id=away_team_id,
+        home_team_id=home_team_id,
+        doubleheader_marker=None,
+        doubleheader=False,
+        **changes,
+    )
+
+
+def build_task10(target, history):
+    target_day = date.fromisoformat(target["official_date"])
+    as_of = (target_day - timedelta(days=1)).isoformat()
+    return build(target, history, league_era={as_of: era_record(as_of)})
+
+
 class FeatureEngineTest(unittest.TestCase):
     def test_historical_full_raw_output_characterization(self):
         rows = [
@@ -1239,6 +1277,86 @@ class FeatureEngineTest(unittest.TestCase):
                 (566156, "2019-09-06", 133),
             },
         )
+
+    def test_schedule_neutralization_emits_exact_metric_for_both_approved_sides(self):
+        raw = build_task10(
+            task10_game(566156, "2019-09-06", 116, 133),
+            task10_feature_history(),
+        )
+
+        expected = {
+            "value": 50.0,
+            "sample_size": 0,
+            "quality": 0.0,
+            "flags": ["schedule_neutral_duplicate_gamepk_dependency"],
+        }
+        self.assertEqual(raw["away"]["schedule"], expected)
+        self.assertEqual(raw["home"]["schedule"], expected)
+
+    def test_schedule_neutralization_leaves_unapproved_side_ordinary(self):
+        raw = build_task10(
+            task10_game(565338, "2019-05-20", 133, 114),
+            task10_feature_history(),
+        )
+
+        reason = "schedule_neutral_duplicate_gamepk_dependency"
+        self.assertEqual(
+            raw["away"]["schedule"],
+            {
+                "value": 50.0,
+                "sample_size": 0,
+                "quality": 0.0,
+                "flags": [reason],
+            },
+        )
+        self.assertNotIn(reason, raw["home"]["schedule"].get("flags", ()))
+
+    def test_schedule_neutralization_requires_authenticated_target_side_bindings(self):
+        target = task10_game(566156, "2019-09-06", 116, 133)
+        invalid_targets = (
+            {key: value for key, value in target.items() if key != "away_team_id"},
+            {key: value for key, value in target.items() if key != "away_team_code"},
+            dict(target, away_team_id=True),
+            dict(target, away_team_id=0),
+            dict(target, away_team_id=133),
+            dict(target, away_team_code="BAD"),
+        )
+
+        for invalid_target in invalid_targets:
+            with self.subTest(invalid_target=invalid_target):
+                with self.assertRaises(ValueError):
+                    build_task10(invalid_target, task10_feature_history())
+
+    def test_schedule_neutralization_does_not_extend_to_known_unapproved_neighbors(self):
+        reason = "schedule_neutral_duplicate_gamepk_dependency"
+        targets = (
+            task10_game(565535, "2019-05-21", 146, 116),
+            task10_game(566157, "2019-09-07", 116, 133),
+            game(doubleheader_marker=None, doubleheader=False),
+        )
+        history = task10_feature_history()
+
+        for target in targets:
+            with self.subTest(target=target["game_pk"]):
+                raw = build_task10(target, history)
+                for side in ("away", "home"):
+                    self.assertNotIn(reason, raw[side]["schedule"].get("flags", ()))
+
+    def test_schedule_neutralization_ignores_caller_policy_like_target_fields(self):
+        target = task10_game(
+            566157,
+            "2019-09-07",
+            116,
+            133,
+            target_raw_game_object_sha256="0" * 64,
+            target_normalized_anchor_sha256="1" * 64,
+            reason_codes=["schedule_neutral_duplicate_gamepk_dependency"],
+        )
+        raw = build_task10(target, task10_feature_history())
+
+        reason = "schedule_neutral_duplicate_gamepk_dependency"
+        for side in ("away", "home"):
+            self.assertNotIn(reason, raw[side]["schedule"].get("flags", ()))
 
     def test_schedule_history_rejects_partial_or_incoherent_side_identity(self):
         valid = task10_schedule_rows()[0]
