@@ -1214,6 +1214,32 @@ class FeatureEngineTest(unittest.TestCase):
         with self.assertRaises(AttributeError):
             stored["reason_codes"].append("stored_mutation")
 
+    def test_schedule_history_materializes_neutralization_iterable_once(self):
+        iterations = 0
+
+        def neutralizations():
+            nonlocal iterations
+            iterations += 1
+            yield from schedule_neutralization_records()
+
+        schedule = ScheduleHistory(
+            task10_schedule_rows(),
+            coverage_start="2019-05-01",
+            coverage_end="2019-09-30",
+            coverage_complete=True,
+            schedule_neutralizations=neutralizations(),
+        )
+
+        self.assertEqual(iterations, 1)
+        self.assertEqual(
+            set(schedule.neutralization_by_key),
+            {
+                (565338, "2019-05-20", 133),
+                (566156, "2019-09-06", 116),
+                (566156, "2019-09-06", 133),
+            },
+        )
+
     def test_schedule_history_rejects_partial_or_incoherent_side_identity(self):
         valid = task10_schedule_rows()[0]
         invalid = (

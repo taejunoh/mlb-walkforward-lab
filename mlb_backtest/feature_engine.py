@@ -269,8 +269,9 @@ class ScheduleHistory:
             }
         )
         self.team_id_by_game_date_code = MappingProxyType(team_id_by_game_date_code)
+        neutralization_records = tuple(schedule_neutralizations)
         validated_neutralizations = validate_schedule_neutralizations(
-            schedule_neutralizations
+            neutralization_records
         )
         canonical_neutralizations = tuple(
             MappingProxyType(
