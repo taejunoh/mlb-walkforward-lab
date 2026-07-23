@@ -69,7 +69,11 @@ from .v52_source_contracts import (
     query_sidecar,
     recompute_query_sidecar,
 )
-from .v52_sources.history import recompute_prior_history_sidecar
+from .v52_sources.history import (
+    _validate_disposition as _validate_history_disposition,
+    recompute_prior_history_sidecar,
+    validate_schedule_neutralizations,
+)
 from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
     validate_statcast_child_coverage,
@@ -124,6 +128,9 @@ _HISTORY_PAYLOAD_KEYS = frozenset(
         "source_snapshot_sha256",
     }
 )
+_SOURCE_HISTORY_PAYLOAD_KEYS = _HISTORY_PAYLOAD_KEYS | {
+    "schedule_neutralizations"
+}
 _HISTORY_GAME_KEYS = frozenset(
     {
         "away_team_id",
@@ -399,7 +406,12 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         schedule,
         inputs.timezone_gate,
     )
-    history = _build_history_normalized_snapshots(inputs.run_id, schedule)
+    history = _build_history_normalized_snapshots(
+        inputs.run_id,
+        schedule,
+        duplicate_gamepk_disposition=inputs.duplicate_gamepk_disposition,
+        dispositioned_query_ids=inputs.dispositioned_query_ids,
+    )
     career = _build_career_bf_normalized_snapshots(
         inputs.run_id, inputs.records, inputs.graph, schedule
     )
@@ -483,12 +495,21 @@ def _validate_normalized_snapshot_mapping(
     grain = envelope.get("grain")
     disposition = envelope.get("duplicate_gamepk_disposition")
     disposition_ids = envelope.get("dispositioned_query_ids")
-    if disposition is not None or disposition_ids is not None:
+    disposition_keys = {
+        "duplicate_gamepk_disposition",
+        "dispositioned_query_ids",
+    }
+    has_disposition = bool(disposition_keys & set(envelope))
+    if has_disposition:
         if (
-            envelope["run_id"] != _SOURCE_RUN_ID
+            disposition_keys - set(envelope)
+            or envelope["run_id"] != _SOURCE_RUN_ID
             or season != 2019
-            or source != "mlb_schedule_game_feed"
-            or grain != "season_game_evidence_snapshot"
+            or (source, grain)
+            not in {
+                ("mlb_schedule_game_feed", "season_game_evidence_snapshot"),
+                ("prior_schedule_history", "verified_game_projection"),
+            }
             or not isinstance(disposition, Mapping)
             or set(disposition) != {"query_id", "success_receipt", "query_sidecar"}
             or not isinstance(disposition.get("query_id"), str)
@@ -509,7 +530,7 @@ def _validate_normalized_snapshot_mapping(
         if (
             envelope["run_id"] == _SOURCE_RUN_ID
             and season == 2019
-            and (disposition is None or disposition_ids is None)
+            and not has_disposition
         ):
             raise ValueError("normalized source 2019 disposition binding differs")
         split_hashes = _sorted_unique_sha256s(
@@ -565,11 +586,21 @@ def _validate_normalized_snapshot_mapping(
         )
         if split_hashes:
             raise ValueError("history split receipt hashes must be empty")
+        source_2019 = envelope["run_id"] == _SOURCE_RUN_ID and season == 2019
+        if source_2019 != has_disposition:
+            raise ValueError("normalized source history disposition binding differs")
+        if source_2019:
+            try:
+                _validate_history_disposition(disposition)
+            except ValueError as exc:
+                raise ValueError(
+                    "normalized source history disposition binding differs"
+                ) from exc
         payload_value = envelope.get("payload")
-        if (
-            not isinstance(payload_value, Mapping)
-            or set(payload_value) != _HISTORY_PAYLOAD_KEYS
-        ):
+        expected_payload_keys = (
+            _SOURCE_HISTORY_PAYLOAD_KEYS if source_2019 else _HISTORY_PAYLOAD_KEYS
+        )
+        if not isinstance(payload_value, Mapping) or set(payload_value) != expected_payload_keys:
             raise ValueError("normalized snapshot history payload keys differ")
         payload = dict(payload_value)
         games = payload.get("games")
@@ -590,6 +621,19 @@ def _validate_normalized_snapshot_mapping(
             or source_hashes != sorted(set(source_hashes))
         ):
             raise ValueError("normalized snapshot history source hashes differ")
+        neutralizations = payload.get("schedule_neutralizations")
+        if source_2019:
+            try:
+                if not neutralizations or not isinstance(neutralizations, list) or list(
+                    validate_schedule_neutralizations(neutralizations)
+                ) != neutralizations:
+                    raise ValueError("normalized source history neutralizations differ")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "normalized source history neutralizations differ"
+                ) from exc
+        elif neutralizations is not None:
+            raise ValueError("normalized history rejects source neutralizations")
 
         observed: list[tuple[date, int]] = []
         seen_game_pks: set[int] = set()
@@ -2203,9 +2247,19 @@ def _validate_history_snapshot_lineage(
         or history_snapshot.season != game_snapshot.season
     ):
         raise ValueError("history normalized snapshot lineage differs")
+    source_2019 = (
+        game_snapshot.run_id == _SOURCE_RUN_ID and game_snapshot.season == 2019
+    )
+    disposition = game_snapshot.duplicate_gamepk_disposition
+    if source_2019 != (disposition is not None):
+        raise ValueError("history normalized snapshot lineage differs")
     payload = recompute_prior_history_sidecar(
         game_snapshot.payload,
         source_snapshot_sha256=game_snapshot.sha256,
+        run_id=game_snapshot.run_id,
+        duplicate_gamepk_disposition=(
+            disposition.as_mapping() if source_2019 else None
+        ),
     )
     expected = _history_normalized_snapshot(
         game_snapshot.run_id, game_snapshot, payload
@@ -2229,6 +2283,12 @@ def _history_normalized_snapshot(
 ) -> NormalizedSnapshot:
     if payload.get("source_snapshot_sha256") != game_snapshot.sha256:
         raise ValueError("history upstream source snapshot SHA-256 differs")
+    source_2019 = run_id == _SOURCE_RUN_ID and game_snapshot.season == 2019
+    disposition = game_snapshot.duplicate_gamepk_disposition
+    if source_2019 != (disposition is not None):
+        raise ValueError("history source disposition authority differs")
+    if source_2019 != bool(game_snapshot.dispositioned_query_ids):
+        raise ValueError("history source disposition query IDs differ")
     envelope: dict[str, object] = {
         "grain": "verified_game_projection",
         "logical_query_ids": list(game_snapshot.logical_query_ids),
@@ -2242,6 +2302,14 @@ def _history_normalized_snapshot(
         ),
         "split_receipt_sha256s": [],
         "status": "READY",
+        **(
+            {
+                "duplicate_gamepk_disposition": disposition.as_mapping(),
+                "dispositioned_query_ids": list(game_snapshot.dispositioned_query_ids),
+            }
+            if source_2019
+            else {}
+        ),
     }
     envelope = _validate_normalized_snapshot_mapping(envelope)
     contents = canonical_json_bytes(envelope) + b"\n"
@@ -2267,14 +2335,19 @@ def _history_normalized_snapshot(
         payload=frozen_payload,
         canonical_bytes=contents,
         sha256=digest,
-        duplicate_gamepk_disposition=None,
-        dispositioned_query_ids=(),
+        duplicate_gamepk_disposition=disposition if source_2019 else None,
+        dispositioned_query_ids=(
+            game_snapshot.dispositioned_query_ids if source_2019 else ()
+        ),
     )
 
 
 def _build_history_normalized_snapshots(
     run_id: str,
     game_snapshots: Sequence[NormalizedSnapshot],
+    *,
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
+    dispositioned_query_ids: tuple[str, ...] = (),
 ) -> tuple[NormalizedSnapshot, ...]:
     """Project seven authenticated game snapshots into prior history without I/O."""
     if not isinstance(run_id, str) or not run_id:
@@ -2323,12 +2396,33 @@ def _build_history_normalized_snapshots(
     if set(game_by_season) != set(_GAME_SEASONS):
         raise ValueError("history requires exactly seven 2018-2024 game snapshots")
 
+    source_2019 = game_by_season[2019]
+    expected_disposition = (
+        source_2019.duplicate_gamepk_disposition
+        if run_id == _SOURCE_RUN_ID
+        else None
+    )
+    expected_disposition_ids = (
+        source_2019.dispositioned_query_ids if run_id == _SOURCE_RUN_ID else ()
+    )
+    if (
+        duplicate_gamepk_disposition != expected_disposition
+        or tuple(dispositioned_query_ids) != expected_disposition_ids
+    ):
+        raise ValueError("history disposition authority differs")
+
     snapshots: list[NormalizedSnapshot] = []
     for season in _GAME_SEASONS:
         game_snapshot = game_by_season[season]
         payload = recompute_prior_history_sidecar(
             game_snapshot.payload,
             source_snapshot_sha256=game_snapshot.sha256,
+            run_id=game_snapshot.run_id,
+            duplicate_gamepk_disposition=(
+                duplicate_gamepk_disposition.as_mapping()
+                if run_id == _SOURCE_RUN_ID and season == 2019
+                else None
+            ),
         )
         snapshots.append(_history_normalized_snapshot(run_id, game_snapshot, payload))
     return tuple(snapshots)

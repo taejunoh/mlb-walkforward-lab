@@ -7,6 +7,7 @@ import hashlib
 import json
 import socket
 import unittest
+import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +17,11 @@ import jsonschema
 from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
 from mlb_backtest.v52_sources.schedule import canonical_sha256
-from tests.test_v52_verify_sources import _normalized_game_authority
+from tests.test_v52_source_history import _task10_disposition, _task10_source_snapshot
+from tests.test_v52_verify_sources import (
+    _authenticated_source_game_authority,
+    _normalized_game_authority,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +66,18 @@ def _rebuild(mapping: dict[str, object]):
     from mlb_backtest import v52_verify_sources as verifier
 
     contents = canonical_json_bytes(mapping) + b"\n"
+    disposition_value = mapping.get("duplicate_gamepk_disposition")
+    disposition = None
+    if isinstance(disposition_value, dict):
+        disposition = verifier.DuplicateGamePkDispositionBinding(
+            query_id=disposition_value["query_id"],
+            success_receipt=verifier.AuthorityBinding(
+                **disposition_value["success_receipt"]
+            ),
+            query_sidecar=verifier.AuthorityBinding(
+                **disposition_value["query_sidecar"]
+            ),
+        )
     return verifier.NormalizedSnapshot(
         schema_version=1,
         run_id=str(mapping["run_id"]),
@@ -76,6 +93,8 @@ def _rebuild(mapping: dict[str, object]):
         payload=mapping["payload"],
         canonical_bytes=contents,
         sha256=hashlib.sha256(contents).hexdigest(),
+        duplicate_gamepk_disposition=disposition,
+        dispositioned_query_ids=tuple(mapping.get("dispositioned_query_ids", ())),
     )
 
 
@@ -95,6 +114,89 @@ def _source_game_hash(game: dict[str, object]) -> str:
             "boxscore_query_sidecar_sha256"
         ]
     return canonical_sha256(lineage)
+
+
+def _source_game_snapshots():
+    """Build source-run game envelopes with the sealed neutralization anchors."""
+    from mlb_backtest import v52_verify_sources as verifier
+
+    authority = _authenticated_source_game_authority()
+    originals = verifier._build_game_normalized_snapshots(
+        "historical_walkforward_500_superseding_565534",
+        authority.records,
+        authority.game_inventory,
+        authority.timezone_gate,
+        authority.schedule_inventory,
+        duplicate_gamepk_disposition=authority.binding,
+        dispositioned_query_ids=(authority.disposition_id,),
+    )
+    disposition_value = _task10_disposition()
+    authority.binding = verifier.DuplicateGamePkDispositionBinding(
+        query_id=disposition_value["query_id"],
+        success_receipt=verifier.AuthorityBinding(
+            **disposition_value["success_receipt"]
+        ),
+        query_sidecar=verifier.AuthorityBinding(**disposition_value["query_sidecar"]),
+    )
+    authority.disposition_id = authority.binding.query_id
+    snapshots = []
+    for original in originals:
+        mapping = _mutable(original)
+        if original.season == 2019:
+            mapping["duplicate_gamepk_disposition"] = authority.binding.as_mapping()
+            mapping["dispositioned_query_ids"] = [authority.disposition_id]
+            template = dict(mapping["payload"]["games"][0])
+            games = []
+            for anchor in _task10_source_snapshot()["games"]:
+                game = {
+                    **template,
+                    **anchor,
+                    "boxscore_query_sidecar_sha256": template[
+                        "boxscore_query_sidecar_sha256"
+                    ],
+                    "participant_provenance": template["participant_provenance"],
+                    "actual_starter_ids": template["actual_starter_ids"],
+                    "away_starting_hitter_ids": template[
+                        "away_starting_hitter_ids"
+                    ],
+                    "home_starting_hitter_ids": template[
+                        "home_starting_hitter_ids"
+                    ],
+                }
+                game["source_game_sha256"] = _source_game_hash(game)
+                games.append(game)
+            mapping["payload"]["games"] = sorted(
+                games, key=lambda row: (row["official_date"], row["game_pk"])
+            )
+        else:
+            for game in mapping["payload"]["games"]:
+                game["game_pk"] += original.season * 1_000_000
+        opening, closing = SEASON_BOUNDARIES[original.season]
+        for game in mapping["payload"]["games"]:
+            official = game["official_date"]
+            if not opening.isoformat() <= official <= closing.isoformat():
+                official = opening.isoformat()
+                game["official_date"] = official
+                game["scheduled_start_utc"] = f"{official}T17:05:00Z"
+            game["season_start_date"] = opening.isoformat()
+            game["feature_history_cutoff"] = (
+                date.fromisoformat(official) - timedelta(days=1)
+            ).isoformat()
+            if game["played"]:
+                anchor_keys = (
+                    "alternate_site", "away_score", "away_team_id",
+                    "completed_innings", "doubleheader_order", "game_pk",
+                    "home_score", "home_team_id", "neutral_site", "official_date",
+                    "played", "raw_game_object_sha256", "scheduled_innings",
+                    "scheduled_start_utc", "season", "season_start_date",
+                    "terminal_status", "venue_id", "winner_team_id",
+                )
+                game["normalized_anchor_sha256"] = canonical_sha256(
+                    {key: game[key] for key in anchor_keys}
+                )
+            game["source_game_sha256"] = _source_game_hash(game)
+        snapshots.append(_rebuild(mapping))
+    return tuple(snapshots), authority
 
 
 class V52HistoryNormalizedSnapshotTest(unittest.TestCase):
@@ -381,6 +483,172 @@ class V52HistoryNormalizedSnapshotTest(unittest.TestCase):
             forged = _rebuild(attack)
             with self.assertRaisesRegex(ValueError, "lineage"):
                 verifier._validate_history_snapshot_lineage(forged, game)
+
+    def test_source_2019_history_replays_authenticated_neutralizations(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.v52_sources.history import EXPECTED_NEUTRALIZATIONS
+
+        games, authority = _source_game_snapshots()
+        histories = verifier._build_history_normalized_snapshots(
+            "historical_walkforward_500_superseding_565534",
+            games,
+            duplicate_gamepk_disposition=authority.binding,
+            dispositioned_query_ids=(authority.disposition_id,),
+        )
+        source_game = next(snapshot for snapshot in games if snapshot.season == 2019)
+        source_history = next(
+            snapshot for snapshot in histories if snapshot.season == 2019
+        )
+        self.assertEqual(
+            tuple(
+                (
+                    row["target_raw_game_object_sha256"],
+                    row["target_normalized_anchor_sha256"],
+                    row["game_pk"],
+                    row["official_date"],
+                    row["team_id"],
+                )
+                for row in source_history.payload["schedule_neutralizations"]
+            ),
+            EXPECTED_NEUTRALIZATIONS,
+        )
+        self.assertEqual(
+            verifier._validate_history_snapshot_lineage(source_history, source_game),
+            source_history.as_mapping(),
+        )
+        self.assertEqual(
+            source_history.duplicate_gamepk_disposition,
+            authority.binding,
+        )
+        self.assertEqual(source_history.dispositioned_query_ids, (authority.disposition_id,))
+        jsonschema.validate(
+            source_history.as_mapping(),
+            json.loads(SCHEMA.read_text()),
+            format_checker=jsonschema.FormatChecker(),
+        )
+        self.assertNotIn(
+            "schedule_neutralizations",
+            next(snapshot for snapshot in histories if snapshot.season == 2020).payload,
+        )
+
+    def test_history_runtime_closes_source_disposition_and_neutralizations(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        games, authority = _source_game_snapshots()
+        history = next(
+            snapshot
+            for snapshot in verifier._build_history_normalized_snapshots(
+                "historical_walkforward_500_superseding_565534",
+                games,
+                duplicate_gamepk_disposition=authority.binding,
+                dispositioned_query_ids=(authority.disposition_id,),
+            )
+            if snapshot.season == 2019
+        )
+        for label, mutate in (
+            ("run", lambda value: value.update({"run_id": RUN_ID})),
+            (
+                "query",
+                lambda value: value.update(
+                    {"dispositioned_query_ids": ["0" * 64]}
+                ),
+            ),
+            (
+                "path",
+                lambda value: value["duplicate_gamepk_disposition"]["query_sidecar"].update(
+                    {"path": "wrong"}
+                ),
+            ),
+            (
+                "sha",
+                lambda value: value["duplicate_gamepk_disposition"]["query_sidecar"].update(
+                    {"sha256": "0" * 64}
+                ),
+            ),
+            (
+                "missing",
+                lambda value: value["payload"].pop("schedule_neutralizations"),
+            ),
+            (
+                "empty",
+                lambda value: value["payload"].update(
+                    {"schedule_neutralizations": []}
+                ),
+            ),
+            (
+                "raw",
+                lambda value: value["payload"]["schedule_neutralizations"][0].update(
+                    {"target_raw_game_object_sha256": "0" * 64}
+                ),
+            ),
+            (
+                "anchor",
+                lambda value: value["payload"]["schedule_neutralizations"][0].update(
+                    {"target_normalized_anchor_sha256": "0" * 64}
+                ),
+            ),
+            (
+                "reordered",
+                lambda value: value["payload"]["schedule_neutralizations"].reverse(),
+            ),
+            (
+                "extra",
+                lambda value: value["payload"]["schedule_neutralizations"].append(
+                    copy.deepcopy(value["payload"]["schedule_neutralizations"][0])
+                ),
+            ),
+        ):
+            attack = _mutable(history)
+            mutate(attack)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                verifier._validate_normalized_snapshot_mapping(attack)
+            with self.subTest(schema=label), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(
+                    attack,
+                    json.loads(SCHEMA.read_text()),
+                    format_checker=jsonschema.FormatChecker(),
+                )
+
+        other_source = next(
+            snapshot
+            for snapshot in verifier._build_history_normalized_snapshots(
+                "historical_walkforward_500_superseding_565534",
+                games,
+                duplicate_gamepk_disposition=authority.binding,
+                dispositioned_query_ids=(authority.disposition_id,),
+            )
+            if snapshot.season == 2020
+        ).as_mapping()
+        other_source["payload"]["schedule_neutralizations"] = []
+        with self.assertRaises(ValueError):
+            verifier._validate_normalized_snapshot_mapping(other_source)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                other_source,
+                json.loads(SCHEMA.read_text()),
+                format_checker=jsonschema.FormatChecker(),
+            )
+
+        old = self._build()[0]
+        with (
+            patch.object(Path, "read_bytes", side_effect=AssertionError("I/O")),
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("I/O")),
+        ):
+            self.assertEqual(
+                verifier._validate_history_snapshot_lineage(old, self.games[0]),
+                old.as_mapping(),
+            )
+        self.assertNotIn("schedule_neutralizations", old.payload)
+        mixed = old.as_mapping()
+        mixed["payload"]["schedule_neutralizations"] = []
+        mixed["duplicate_gamepk_disposition"] = _task10_disposition()
+        mixed["dispositioned_query_ids"] = [
+            mixed["duplicate_gamepk_disposition"]["query_id"]
+        ]
+        with self.assertRaises(ValueError):
+            verifier._validate_normalized_snapshot_mapping(mixed)
 
 
 if __name__ == "__main__":
