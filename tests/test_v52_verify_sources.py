@@ -895,7 +895,9 @@ def _authenticated_source_game_authority() -> SimpleNamespace:
         payload={
             "run_id": source_run_id,
             "season_sources": season_sources,
-            "anchors": source_anchors,
+            # Verified schedule inventories deep-freeze JSON arrays at the
+            # loader boundary, so source replay receives this exact tuple.
+            "anchors": tuple(source_anchors),
         },
     )
     games = [game for payload in payloads for game in payload["games"]]
@@ -1959,6 +1961,25 @@ class V52VerifySourcesTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             replay(fixture, "historical_walkforward_500")
+        for invalid_anchors in ({"season": 2019}, "anchors", b"anchors", ({},)):
+            bad_schedule_inventory = dataclasses.replace(
+                fixture.schedule_inventory,
+                payload={
+                    **fixture.schedule_inventory.payload,
+                    "anchors": invalid_anchors,
+                },
+            )
+            with self.subTest(anchors=type(invalid_anchors).__name__), self.assertRaises(
+                ValueError
+            ):
+                replay(
+                    SimpleNamespace(
+                        **{
+                            **vars(fixture),
+                            "schedule_inventory": bad_schedule_inventory,
+                        }
+                    )
+                )
         bad_query = SimpleNamespace(
             **{
                 **vars(fixture),

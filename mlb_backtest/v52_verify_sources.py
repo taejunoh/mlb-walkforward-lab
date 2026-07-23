@@ -1877,7 +1877,11 @@ def _build_game_normalized_snapshots(
         raise ValueError("game snapshot disposition capability differs")
     if run_id == _SOURCE_RUN_ID:
         raw_source_anchors = schedule_inventory.payload.get("anchors")
-        if not isinstance(raw_source_anchors, list):
+        if (
+            isinstance(raw_source_anchors, (str, bytes))
+            or not isinstance(raw_source_anchors, Sequence)
+            or any(not isinstance(anchor, Mapping) for anchor in raw_source_anchors)
+        ):
             raise ValueError("source schedule inventory anchors differ")
     else:
         raw_source_anchors = []
