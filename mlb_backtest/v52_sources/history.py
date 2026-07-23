@@ -282,6 +282,11 @@ def recompute_prior_history_sidecar(
             "INELIGIBLE_UNPLAYED",
         }:
             raise ValueError("prior history requires verified source games")
+        if run_id == SOURCE_RUN_ID:
+            season = raw.get("season")
+            if isinstance(season, bool) or not isinstance(season, int):
+                raise ValueError("source game season differs")
+            source_seasons.add(season)
         has_provenance = any(
             field in raw
             for field in ("raw_game_object_sha256", "normalized_anchor_sha256")
@@ -291,11 +296,7 @@ def recompute_prior_history_sidecar(
                 raise ValueError("non-source history rejects source provenance")
         elif raw.get("verification_status") == "VERIFIED":
             anchor = _source_anchor(raw)
-            season = anchor["season"]
-            if isinstance(season, bool) or not isinstance(season, int):
-                raise ValueError("source game season differs")
-            source_seasons.add(season)
-            if season == 2019:
+            if anchor["season"] == 2019:
                 source_2019_anchors[game_pk] = anchor
         elif has_provenance:
             raise ValueError("unplayed source game has provenance")
@@ -389,11 +390,36 @@ def recompute_prior_history_sidecar(
         anchor = source_2019_anchors[game_pk]
         if team_id not in {anchor["away_team_id"], anchor["home_team_id"]}:
             raise ValueError("source history neutralization team differs")
-        if (raw_sha256, anchor_sha256, game_pk, official_date, team_id) in KNOWN_UNAPPROVED_NEIGHBORS:
-            raise ValueError("source history neutralization neighbor differs")
+    input_identities = {
+        (
+            anchor["raw_game_object_sha256"],
+            canonical_sha256(anchor),
+            game_pk,
+            anchor["official_date"],
+            team_id,
+        )
+        for game_pk, anchor in source_2019_anchors.items()
+        for team_id in (anchor["away_team_id"], anchor["home_team_id"])
+    }
+    if not set(EXPECTED_NEUTRALIZATIONS).issubset(input_identities):
+        raise ValueError("source history neutralization targets differ")
+    if not set(KNOWN_UNAPPROVED_NEIGHBORS).issubset(input_identities):
+        raise ValueError("source history known neighbor differs")
     neutralizations = validate_schedule_neutralizations(
         [dict(record) for record in _expected_neutralization_records()]
     )
+    emitted_identities = {
+        (
+            record["target_raw_game_object_sha256"],
+            record["target_normalized_anchor_sha256"],
+            record["game_pk"],
+            record["official_date"],
+            record["team_id"],
+        )
+        for record in neutralizations
+    }
+    if emitted_identities & set(KNOWN_UNAPPROVED_NEIGHBORS):
+        raise ValueError("source history emitted an unapproved neighbor")
     return {
         "games": games,
         "grain": "verified_game_projection",

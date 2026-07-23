@@ -253,6 +253,65 @@ class V52HistorySourceTest(unittest.TestCase):
                     duplicate_gamepk_disposition=_task10_disposition(),
                 )
 
+    def test_source_2019_rejects_unplayed_neighbor_from_another_season(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        snapshot = _task10_source_snapshot()
+        neighbor = next(
+            game for game in snapshot["games"] if game["game_pk"] == 565535
+        )
+        neighbor.update({"season": 2020, "verification_status": "INELIGIBLE_UNPLAYED"})
+        neighbor.pop("raw_game_object_sha256")
+        neighbor.pop("normalized_anchor_sha256")
+        with self.assertRaisesRegex(ValueError, "one season"):
+            recompute_prior_history_sidecar(
+                snapshot,
+                source_snapshot_sha256="1" * 64,
+                run_id=SOURCE_RUN_ID,
+                duplicate_gamepk_disposition=_task10_disposition(),
+            )
+
+    def test_565535_and_566157_complete_hashes_are_known_but_unapproved(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_sources.history import (
+            KNOWN_UNAPPROVED_NEIGHBORS,
+            recompute_prior_history_sidecar,
+        )
+
+        source = _task10_source_snapshot()
+        snapshot = recompute_prior_history_sidecar(
+            source,
+            source_snapshot_sha256="1" * 64,
+            run_id=SOURCE_RUN_ID,
+            duplicate_gamepk_disposition=_task10_disposition(),
+        )
+        input_identities = {
+            (
+                game["raw_game_object_sha256"],
+                game["normalized_anchor_sha256"],
+                game["game_pk"],
+                game["official_date"],
+                team_id,
+            )
+            for game in source["games"]
+            for team_id in (game["away_team_id"], game["home_team_id"])
+        }
+        emitted = {
+            (
+                row["target_raw_game_object_sha256"],
+                row["target_normalized_anchor_sha256"],
+                row["game_pk"],
+                row["official_date"],
+                row["team_id"],
+            )
+            for row in snapshot["schedule_neutralizations"]
+        }
+        self.assertTrue(set(KNOWN_UNAPPROVED_NEIGHBORS).issubset(input_identities))
+        self.assertFalse(set(KNOWN_UNAPPROVED_NEIGHBORS) & emitted)
+
     def test_legacy_history_bytes_are_unchanged(self) -> None:
         from mlb_backtest.v52_source_contracts import canonical_json_bytes
         from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
