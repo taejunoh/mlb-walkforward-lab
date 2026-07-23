@@ -5018,11 +5018,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ) as load_split,
                 self.assertRaisesRegex(ValueError, "split|child|receipt"),
             ):
-                self.registry._checkpoint_artifacts_and_population(
-                    paths,
-                    run_spec,
-                    payload,
-                )
+                with self.registry._registry_lock(
+                    paths, create=False, exclusive=False
+                ) as lock_binding:
+                    self.registry._checkpoint_artifacts_and_population(
+                        paths,
+                        run_spec,
+                        payload,
+                        lock_binding,
+                    )
             load_split.assert_called_once_with(
                 root,
                 parent,
