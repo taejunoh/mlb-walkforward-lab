@@ -1155,7 +1155,11 @@ class FeatureEngineTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            tuple(map(dict, schedule.schedule_neutralizations)), records
+            tuple(map(dict, schedule.schedule_neutralizations)),
+            tuple(
+                {**record, "reason_codes": tuple(record["reason_codes"])}
+                for record in records
+            ),
         )
         self.assertEqual(
             set(schedule.neutralization_by_key),
@@ -1188,6 +1192,27 @@ class FeatureEngineTest(unittest.TestCase):
             schedule.neutralization_by_key[(1, "2019-01-01", 1)] = {}
         with self.assertRaises(TypeError):
             schedule.team_id_by_game_date_code[(1, "2019-01-01", "AWY")] = 1
+
+    def test_schedule_history_owns_immutable_neutralization_reason_codes(self):
+        records = schedule_neutralization_records()
+        schedule = ScheduleHistory(
+            task10_schedule_rows(),
+            coverage_start="2019-05-01",
+            coverage_end="2019-09-30",
+            coverage_complete=True,
+            schedule_neutralizations=records,
+        )
+        records[0]["reason_codes"].append("caller_mutation")
+
+        stored = schedule.schedule_neutralizations[0]
+        indexed = schedule.neutralization_by_key[(566156, "2019-09-06", 116)]
+        self.assertEqual(
+            stored["reason_codes"],
+            ("schedule_neutral_duplicate_gamepk_dependency",),
+        )
+        self.assertEqual(indexed["reason_codes"], stored["reason_codes"])
+        with self.assertRaises(AttributeError):
+            stored["reason_codes"].append("stored_mutation")
 
     def test_schedule_history_rejects_partial_or_incoherent_side_identity(self):
         valid = task10_schedule_rows()[0]
