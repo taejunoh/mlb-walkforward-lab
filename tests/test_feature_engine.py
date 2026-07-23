@@ -17,6 +17,7 @@ from mlb_backtest.feature_engine import (
 from mlb_backtest.sources import parse_schedule
 from mlb_backtest.scoring_prep import build_raw_features_by_date
 from mlb_backtest.statcast import StatcastData, parse_statcast
+from mlb_backtest.v52_sources.history import EXPECTED_NEUTRALIZATIONS
 
 
 def pa(
@@ -83,6 +84,73 @@ def mapping():
     result = {"Home": "HOM", "Away": "AWY"}
     result.update({f"Team {i}": f"T{i:02d}" for i in range(28)})
     return result
+
+
+def schedule_neutralization_records() -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "game_pk": game_pk,
+            "official_date": official_date,
+            "team_id": team_id,
+            "target_raw_game_object_sha256": raw_sha256,
+            "target_normalized_anchor_sha256": anchor_sha256,
+            "value": 50.0,
+            "sample_size": 0,
+            "quality": 0.0,
+            "reason_codes": ["schedule_neutral_duplicate_gamepk_dependency"],
+        }
+        for raw_sha256, anchor_sha256, game_pk, official_date, team_id
+        in EXPECTED_NEUTRALIZATIONS
+    )
+
+
+def task10_schedule_rows() -> tuple[dict[str, object], ...]:
+    return (
+        {
+            "game_pk": 565338,
+            "official_date": "2019-05-20",
+            "team_codes": ["AWY", "HOM"],
+            "away_team_code": "AWY",
+            "home_team_code": "HOM",
+            "away_team_id": 133,
+            "home_team_id": 114,
+            "venue_name": "Park",
+            "innings": 9,
+        },
+        {
+            "game_pk": 565535,
+            "official_date": "2019-05-21",
+            "team_codes": ["AWY", "HOM"],
+            "away_team_code": "AWY",
+            "home_team_code": "HOM",
+            "away_team_id": 146,
+            "home_team_id": 116,
+            "venue_name": "Park",
+            "innings": 11,
+        },
+        {
+            "game_pk": 566156,
+            "official_date": "2019-09-06",
+            "team_codes": ["AWY", "HOM"],
+            "away_team_code": "AWY",
+            "home_team_code": "HOM",
+            "away_team_id": 116,
+            "home_team_id": 133,
+            "venue_name": "Park",
+            "innings": 11,
+        },
+        {
+            "game_pk": 566157,
+            "official_date": "2019-09-07",
+            "team_codes": ["AWY", "HOM"],
+            "away_team_code": "AWY",
+            "home_team_code": "HOM",
+            "away_team_id": 116,
+            "home_team_id": 133,
+            "venue_name": "Park",
+            "innings": 9,
+        },
+    )
 
 
 def game(**changes):
@@ -1073,6 +1141,69 @@ class FeatureEngineTest(unittest.TestCase):
                     [row],
                     coverage_start="2025-04-01",
                     coverage_end="2025-04-30",
+                    coverage_complete=True,
+                )
+
+    def test_schedule_history_indexes_exact_schedule_neutralizations_separately(self):
+        records = schedule_neutralization_records()
+        schedule = ScheduleHistory(
+            task10_schedule_rows(),
+            coverage_start="2019-05-01",
+            coverage_end="2019-09-30",
+            coverage_complete=True,
+            schedule_neutralizations=records,
+        )
+
+        self.assertEqual(
+            tuple(map(dict, schedule.schedule_neutralizations)), records
+        )
+        self.assertEqual(
+            set(schedule.neutralization_by_key),
+            {
+                (565338, "2019-05-20", 133),
+                (566156, "2019-09-06", 116),
+                (566156, "2019-09-06", 133),
+            },
+        )
+        self.assertEqual(
+            schedule.neutralization_game_dates,
+            frozenset(
+                {
+                    (565338, "2019-05-20"),
+                    (566156, "2019-09-06"),
+                }
+            ),
+        )
+        self.assertEqual(
+            schedule.team_id_by_game_date_code[(566156, "2019-09-06", "AWY")],
+            116,
+        )
+        self.assertEqual(
+            schedule.team_id_by_game_date_code[(566156, "2019-09-06", "HOM")],
+            133,
+        )
+        self.assertEqual(set(schedule.game_dates), {565338, 565535, 566156, 566157})
+        self.assertFalse(schedule.has_game(566156, date(2019, 9, 7)))
+        with self.assertRaises(TypeError):
+            schedule.neutralization_by_key[(1, "2019-01-01", 1)] = {}
+        with self.assertRaises(TypeError):
+            schedule.team_id_by_game_date_code[(1, "2019-01-01", "AWY")] = 1
+
+    def test_schedule_history_rejects_partial_or_incoherent_side_identity(self):
+        valid = task10_schedule_rows()[0]
+        invalid = (
+            {key: value for key, value in valid.items() if key != "away_team_id"},
+            dict(valid, away_team_id=True),
+            dict(valid, home_team_id=133),
+            dict(valid, home_team_code="AWY"),
+            dict(valid, team_codes=["HOM", "AWY"]),
+        )
+        for row in invalid:
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                ScheduleHistory(
+                    [row],
+                    coverage_start="2019-05-20",
+                    coverage_end="2019-05-20",
                     coverage_complete=True,
                 )
 

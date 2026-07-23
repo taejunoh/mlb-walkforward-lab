@@ -16,6 +16,7 @@ from .features.context import schedule_score
 from .features.starter import expected_innings
 from .prepare import assert_pregame_history
 from .statcast import StatcastData, identify_pitcher_roles
+from .v52_sources.history import validate_schedule_neutralizations
 
 
 OUT_EVENTS = frozenset(
@@ -108,6 +109,7 @@ class ScheduleHistory:
         coverage_start: str | None,
         coverage_end: str | None,
         coverage_complete: bool,
+        schedule_neutralizations: Iterable[Mapping[str, object]] = (),
     ) -> None:
         if not isinstance(coverage_complete, bool):
             raise ValueError("schedule coverage_complete must be boolean")
@@ -167,6 +169,36 @@ class ScheduleHistory:
                 not isinstance(home_code, str) or home_code not in team_codes
             ):
                 raise ValueError("schedule history home_team_code is invalid")
+            side_fields = (
+                "away_team_code",
+                "home_team_code",
+                "away_team_id",
+                "home_team_id",
+            )
+            if any(
+                field in row
+                for field in ("away_team_code", "away_team_id", "home_team_id")
+            ):
+                if not all(field in row for field in side_fields):
+                    raise ValueError("schedule history side identity is incomplete")
+                away_code = row["away_team_code"]
+                home_code = row["home_team_code"]
+                away_team_id = row["away_team_id"]
+                home_team_id = row["home_team_id"]
+                if (
+                    not isinstance(away_code, str)
+                    or not away_code
+                    or not isinstance(home_code, str)
+                    or not home_code
+                    or away_code == home_code
+                    or type(away_team_id) is not int
+                    or away_team_id <= 0
+                    or type(home_team_id) is not int
+                    or home_team_id <= 0
+                    or away_team_id == home_team_id
+                    or list(team_codes) != [away_code, home_code]
+                ):
+                    raise ValueError("schedule history side identity is invalid")
             venue_name = row.get("venue_name")
             if venue_name is not None and (
                 not isinstance(venue_name, str) or not venue_name
@@ -200,6 +232,7 @@ class ScheduleHistory:
         )
         by_team: defaultdict[str, list] = defaultdict(list)
         by_team_date: defaultdict[tuple[str, date], list] = defaultdict(list)
+        team_id_by_game_date_code: dict[tuple[int, str, str], int] = {}
         dated = []
         for row in canonical:
             scheduled = _day(
@@ -210,6 +243,15 @@ class ScheduleHistory:
                 code = str(team_code)
                 by_team[code].append(row)
                 by_team_date[(code, scheduled)].append(row)
+            if "away_team_code" in row:
+                for team_code, team_id in (
+                    (str(row["away_team_code"]), int(row["away_team_id"])),
+                    (str(row["home_team_code"]), int(row["home_team_id"])),
+                ):
+                    side_key = (int(row["game_pk"]), scheduled.isoformat(), team_code)
+                    if side_key in team_id_by_game_date_code:
+                        raise ValueError("schedule history side identity is duplicated")
+                    team_id_by_game_date_code[side_key] = team_id
         self.rows = canonical
         self.by_team = MappingProxyType(
             {key: tuple(value) for key, value in sorted(by_team.items())}
@@ -225,6 +267,25 @@ class ScheduleHistory:
                 )
                 for row in canonical
             }
+        )
+        self.team_id_by_game_date_code = MappingProxyType(team_id_by_game_date_code)
+        canonical_neutralizations = validate_schedule_neutralizations(
+            schedule_neutralizations
+        )
+        self.schedule_neutralizations = canonical_neutralizations
+        self.neutralization_by_key = MappingProxyType(
+            {
+                (
+                    int(record["game_pk"]),
+                    str(record["official_date"]),
+                    int(record["team_id"]),
+                ): record
+                for record in canonical_neutralizations
+            }
+        )
+        self.neutralization_game_dates = frozenset(
+            (int(record["game_pk"]), str(record["official_date"]))
+            for record in canonical_neutralizations
         )
         self.input_max_date = self._dates[-1] if self._dates else None
 
