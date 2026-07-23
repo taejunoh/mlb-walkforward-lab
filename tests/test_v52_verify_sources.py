@@ -2149,20 +2149,57 @@ class V52VerifySourcesTest(unittest.TestCase):
         snapshot["run_id"] = "historical_walkforward_500_superseding_565534"
         snapshot["duplicate_gamepk_disposition"] = disposition
         snapshot["dispositioned_query_ids"] = [disposition["query_id"]]
-        snapshot["logical_query_ids"] = sorted(
-            [disposition["query_id"], *snapshot["logical_query_ids"][1:]]
+        ordinary_schedule = next(
+            record
+            for record in authority.records
+            if (
+                record.query.endpoint
+                == "https://statsapi.mlb.com/api/v1/schedule"
+                and record.query.requested_range.get("year") == snapshot["season"]
+            )
         )
-        prior_schedule_sidecars = {
-            game["schedule_query_sidecar_sha256"]
-            for game in snapshot["payload"]["games"]
+        original_query_ids = set(snapshot["logical_query_ids"])
+        original_sidecar_sha256s = set(
+            snapshot["source_query_sidecar_sha256s"]
+        )
+        snapshot_records = tuple(
+            record
+            for record in authority.records
+            if record.query_id in original_query_ids
+        )
+        self.assertEqual(
+            {record.query_sidecar_sha256 for record in snapshot_records},
+            original_sidecar_sha256s,
+        )
+        boxscore_records = tuple(
+            record
+            for record in snapshot_records
+            if record.query.endpoint.endswith("/boxscore")
+        )
+        boxscore_query_ids = original_query_ids - {ordinary_schedule.query_id}
+        boxscore_sidecar_sha256s = original_sidecar_sha256s - {
+            ordinary_schedule.query_sidecar_sha256
         }
+        self.assertEqual(
+            {record.query_id for record in boxscore_records},
+            boxscore_query_ids,
+        )
+        self.assertEqual(
+            {record.query_sidecar_sha256 for record in boxscore_records},
+            boxscore_sidecar_sha256s,
+        )
+        snapshot["logical_query_ids"] = sorted(
+            disposition["query_id"]
+            if value == ordinary_schedule.query_id
+            else value
+            for value in snapshot["logical_query_ids"]
+        )
         exact_sidecar = disposition["query_sidecar"]["sha256"]
         exact_sidecars = sorted(
-            (
-                set(snapshot["payload"]["source_query_sidecar_sha256s"])
-                - prior_schedule_sidecars
-            )
-            | {exact_sidecar}
+            exact_sidecar
+            if value == ordinary_schedule.query_sidecar_sha256
+            else value
+            for value in snapshot["payload"]["source_query_sidecar_sha256s"]
         )
         snapshot["source_query_sidecar_sha256s"] = exact_sidecars
         snapshot["payload"]["source_query_sidecar_sha256s"] = exact_sidecars
@@ -2184,6 +2221,22 @@ class V52VerifySourcesTest(unittest.TestCase):
                 "normalized_anchor_sha256"
             ]
             reseal(game)
+
+        self.assertEqual(
+            set(snapshot["logical_query_ids"]) - {disposition["query_id"]},
+            boxscore_query_ids,
+        )
+        self.assertEqual(
+            set(snapshot["source_query_sidecar_sha256s"]) - {exact_sidecar},
+            boxscore_sidecar_sha256s,
+        )
+        self.assertNotIn(
+            ordinary_schedule.query_id, snapshot["logical_query_ids"]
+        )
+        self.assertNotIn(
+            ordinary_schedule.query_sidecar_sha256,
+            snapshot["source_query_sidecar_sha256s"],
+        )
 
         schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
         jsonschema.validate(snapshot, schema)
