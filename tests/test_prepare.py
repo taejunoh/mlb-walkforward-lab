@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -37,10 +38,69 @@ from mlb_backtest.statcast import (
     parse_statcast,
     statcast_url,
 )
+from mlb_backtest.v52_sources.history import (
+    EXPECTED_NEUTRALIZATIONS,
+    validate_schedule_neutralizations,
+)
 
 
 ROOT = Path(__file__).parents[1]
 STATCAST = ROOT / "tests" / "fixtures" / "statcast_mini.csv"
+
+
+def _neutralization_records() -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "game_pk": game_pk,
+            "official_date": official_date,
+            "team_id": team_id,
+            "target_raw_game_object_sha256": raw_sha256,
+            "target_normalized_anchor_sha256": anchor_sha256,
+            "value": 50.0,
+            "sample_size": 0,
+            "quality": 0.0,
+            "reason_codes": ["schedule_neutral_duplicate_gamepk_dependency"],
+        }
+        for raw_sha256, anchor_sha256, game_pk, official_date, team_id
+        in EXPECTED_NEUTRALIZATIONS
+    )
+
+
+def _task10_schedule_history_build(
+    schedule_neutralizations: tuple[dict[str, object], ...] = (),
+) -> ScheduleHistoryBuild:
+    return ScheduleHistoryBuild(
+        rows=(
+            {
+                "game_pk": 565338,
+                "official_date": "2019-05-20",
+                "team_codes": ["AWY", "HOM"],
+                "away_team_code": "AWY",
+                "home_team_code": "HOM",
+                "away_team_id": 133,
+                "home_team_id": 114,
+                "venue_name": "Park",
+                "innings": 9,
+            },
+            {
+                "game_pk": 566156,
+                "official_date": "2019-09-06",
+                "team_codes": ["AWY", "HOM"],
+                "away_team_code": "AWY",
+                "home_team_code": "HOM",
+                "away_team_id": 116,
+                "home_team_id": 133,
+                "venue_name": "Park",
+                "innings": 11,
+            },
+        ),
+        coverage_start="2019-05-01",
+        coverage_end="2019-09-30",
+        coverage_complete=True,
+        source_manifest_sha256="d" * 64,
+        expected_game_pks=(565338, 566156),
+        schedule_neutralizations=schedule_neutralizations,
+    )
 
 
 class PrepareBoundaryTest(unittest.TestCase):
@@ -883,7 +943,10 @@ class PrepareBoundaryTest(unittest.TestCase):
             built.provenance["status_counts"], {"Cancelled": 1, "Final": 2}
         )
         self.assertEqual(built.rows[0]["team_codes"], ["AWY", "HOM"])
+        self.assertEqual(built.rows[0]["away_team_code"], "AWY")
         self.assertEqual(built.rows[0]["home_team_code"], "HOM")
+        self.assertEqual(built.rows[0]["away_team_id"], 1)
+        self.assertEqual(built.rows[0]["home_team_id"], 2)
         self.assertIsNone(built.rows[0]["innings"])
         self.assertEqual(built.rows[1]["innings"], 12)
         self.assertEqual(built.rows[0]["venue_city"], "Pittsburgh")
@@ -1009,6 +1072,80 @@ class PrepareBoundaryTest(unittest.TestCase):
         self.assertEqual(history.pitches, historical.pitches)
         self.assertEqual(history.plate_appearances, historical.plate_appearances)
         self.assertEqual(history.schedule_history.rows, historical.schedule_history.rows)
+
+    def test_schedule_history_build_transports_exact_schedule_neutralizations(self):
+        records = _neutralization_records()
+        parsed = parse_statcast(STATCAST)
+        source = StatcastData(
+            tuple(dict(row, outs_recorded=0) for row in parsed.pitches),
+            tuple(
+                dict(row, outs_recorded=0) for row in parsed.plate_appearances
+            ),
+        )
+        history = build_feature_history(
+            source,
+            {slot: 1 / 9 for slot in range(1, 10)},
+            _task10_schedule_history_build(records),
+        )
+
+        self.assertEqual(
+            tuple(map(dict, history.schedule_history.schedule_neutralizations)),
+            tuple(
+                dict(record, reason_codes=tuple(record["reason_codes"]))
+                for record in validate_schedule_neutralizations(records)
+            ),
+        )
+        with self.assertRaises(TypeError):
+            history.schedule_history.neutralization_by_key[
+                (566156, "2019-09-06", 116)
+            ] = {}
+
+    def test_schedule_history_build_rejects_neutralization_mutations(self):
+        records = _neutralization_records()
+        changed_raw_hash = list(copy.deepcopy(records))
+        changed_raw_hash[0]["target_raw_game_object_sha256"] = "0" * 64
+        changed_metric = list(copy.deepcopy(records))
+        changed_metric[0]["quality"] = 1.0
+        attacks = (
+            records[:-1],
+            records + records[:1],
+            tuple(reversed(records)),
+            tuple(changed_raw_hash),
+            tuple(changed_metric),
+        )
+
+        for neutralizations in attacks:
+            with self.subTest(neutralizations=neutralizations), self.assertRaises(
+                ValueError
+            ):
+                _task10_schedule_history_build(neutralizations)
+
+    def test_schedule_history_build_accepts_empty_neutralizations_by_default(self):
+        self.assertEqual(
+            _task10_schedule_history_build().schedule_neutralizations,
+            (),
+        )
+
+    def test_legacy_schedule_history_build_constructor_defaults_neutralizations(self):
+        schedule_build = ScheduleHistoryBuild(
+            rows=(
+                {
+                    "game_pk": 1,
+                    "official_date": "2024-04-01",
+                    "team_codes": ["AWY", "HOM"],
+                    "home_team_code": "HOM",
+                    "venue_name": "Park",
+                    "innings": 9,
+                },
+            ),
+            coverage_start="2024-04-01",
+            coverage_end="2024-04-01",
+            coverage_complete=True,
+            source_manifest_sha256="e" * 64,
+            expected_game_pks=(1,),
+        )
+        self.assertEqual(schedule_build.schedule_neutralizations, ())
+
 
 
 if __name__ == "__main__":

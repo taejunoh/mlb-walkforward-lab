@@ -21,6 +21,7 @@ from .sources import (
     schedule_url,
     validate_schedule_query_coverage,
 )
+from .v52_sources.history import validate_schedule_neutralizations
 
 _EVIDENCE_TOKEN = object()
 PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
@@ -154,6 +155,7 @@ class ScheduleHistoryBuild:
     source_manifest_sha256: str | None
     expected_game_pks: tuple[int, ...]
     provenance: Mapping[str, object] = dataclass_field(default_factory=dict)
+    schedule_neutralizations: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.coverage_complete) is not bool:
@@ -189,6 +191,8 @@ class ScheduleHistoryBuild:
             raise ValueError("source manifest SHA must be lowercase SHA-256")
         if self.coverage_complete and not valid_hash:
             raise ValueError("complete schedule coverage requires a valid manifest SHA")
+        canonical = validate_schedule_neutralizations(self.schedule_neutralizations)
+        object.__setattr__(self, "schedule_neutralizations", canonical)
 
 
 @dataclass(frozen=True)
@@ -1261,12 +1265,21 @@ def schedule_history_rows(
             "game_pk": game_pk,
             "official_date": official.isoformat(),
             "team_codes": [away_code, home_code],
+            "away_team_code": away_code,
             "home_team_code": home_code,
+            "away_team_id": _positive_id(
+                game.get("away_team_id"), "schedule away_team_id"
+            ),
+            "home_team_id": _positive_id(
+                game.get("home_team_id"), "schedule home_team_id"
+            ),
             "venue_name": venue_name,
             "innings": innings,
             "final_outs": game.get("final_outs"),
             "doubleheader_marker": game.get("doubleheader_marker"),
         }
+        if row["away_team_id"] == row["home_team_id"]:
+            raise ValueError("schedule history requires distinct numeric team identities")
         if row["doubleheader_marker"] not in {None, "GAME1", "GAME2"}:
             raise ValueError("doubleheader_marker must be GAME1, GAME2, or None")
         venue_id = game.get("venue_id")
@@ -1387,6 +1400,7 @@ def build_feature_history(
         coverage_start=schedule_build.coverage_start,
         coverage_end=schedule_build.coverage_end,
         coverage_complete=schedule_build.coverage_complete,
+        schedule_neutralizations=schedule_build.schedule_neutralizations,
     )
     for name, value in tuple(vars(frozen_schedule).items()):
         object.__setattr__(
