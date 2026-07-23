@@ -1782,6 +1782,48 @@ class V52VerifySourcesTest(unittest.TestCase):
             with self.subTest(runtime_attack=index), self.assertRaises(ValueError):
                 verifier._validate_normalized_snapshot_mapping(attack)
 
+    def test_normalized_source_game_snapshot_uses_authenticated_source_run_id(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.v52_source_contracts import canonical_sha256
+
+        authority = _normalized_game_authority()
+        snapshot = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )[0].as_mapping()
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(snapshot), snapshot
+        )
+        snapshot["run_id"] = "historical_walkforward_500_superseding_565534"
+        for game in snapshot["payload"]["games"]:
+            if not game["played"]:
+                continue
+            game["raw_game_object_sha256"] = "a" * 64
+            game["normalized_anchor_sha256"] = "b" * 64
+            game["source_game_sha256"] = canonical_sha256(
+                {
+                    "anchor_sidecar_sha256": game[
+                        "schedule_query_sidecar_sha256"
+                    ],
+                    "boxscore_query_sidecar_sha256": game[
+                        "boxscore_query_sidecar_sha256"
+                    ],
+                    "game": {
+                        key: value
+                        for key, value in game.items()
+                        if key != "source_game_sha256"
+                    },
+                }
+            )
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(snapshot), snapshot
+        )
+
     def test_game_normalized_snapshot_authority_mismatches_fail_closed(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
 

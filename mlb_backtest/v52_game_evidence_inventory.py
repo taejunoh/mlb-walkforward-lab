@@ -938,7 +938,7 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
 
 
 def validate_game_evidence_snapshot(
-    snapshot: Mapping[str, object], *, run_id: str = _RUN_ID
+    snapshot: Mapping[str, object], *, run_id: str
 ) -> None:
     """Validate a normalized game snapshot with the inventory authority rules."""
     if not isinstance(snapshot, Mapping):

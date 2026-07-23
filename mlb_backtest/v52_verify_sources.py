@@ -527,7 +527,7 @@ def _validate_normalized_snapshot_mapping(
         for game in games:
             if not isinstance(game, Mapping) or game.get("season") != season:
                 raise ValueError("normalized snapshot game season differs")
-        validate_game_evidence_snapshot(payload)
+        validate_game_evidence_snapshot(payload, run_id=envelope["run_id"])
         return envelope
 
     if source == "prior_schedule_history" and grain == "verified_game_projection":

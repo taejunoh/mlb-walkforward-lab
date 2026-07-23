@@ -822,7 +822,9 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                 ):
                     inventory_module.publish_game_evidence_inventory(root)
 
-    def test_source_projection_rejects_rebound_provenance_hash_mutation(self) -> None:
+    def test_source_provenance_hash_mutation_is_rejected_at_publication_final_rebind(
+        self,
+    ) -> None:
         from mlb_backtest import v52_game_evidence_inventory as inventory_module
         from mlb_backtest.v52_source_contracts import canonical_sha256
 
@@ -830,44 +832,77 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             root = Path(directory).resolve()
             _fixture(root)
             authority = inventory_module._build_current_authority(root)
-        snapshot = {
-            "games": _thaw(authority.payload["games"]),
-            "grain": "season_game_evidence_snapshot",
-            "schema_version": 1,
-            "source_query_sidecar_sha256s": authority.payload[
-                "source_query_sidecar_sha256s"
-            ],
-        }
-        for game in snapshot["games"]:
-            if not game["played"]:
-                continue
-            game["raw_game_object_sha256"] = "a" * 64
-            game["normalized_anchor_sha256"] = "b" * 64
-            lineage = {
-                "anchor_sidecar_sha256": game["schedule_query_sidecar_sha256"],
-                "boxscore_query_sidecar_sha256": game[
-                    "boxscore_query_sidecar_sha256"
-                ],
-                "game": {
-                    key: value
-                    for key, value in game.items()
-                    if key != "source_game_sha256"
-                },
-            }
-            game["source_game_sha256"] = canonical_sha256(lineage)
-        inventory_module._validate_game_projection(
-            snapshot,
-            run_id="historical_walkforward_500_superseding_565534",
-        )
-        for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
-            candidate = json.loads(_canonical(snapshot))
-            played = next(game for game in candidate["games"] if game["played"])
-            played[field] = "c" * 64
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "hash"):
-                inventory_module._validate_game_projection(
-                    candidate,
-                    run_id="historical_walkforward_500_superseding_565534",
+            source_payload = _thaw(authority.payload)
+            source_payload["run_id"] = "historical_walkforward_500_superseding_565534"
+
+            def rehash(game: dict[str, object]) -> None:
+                game["source_game_sha256"] = canonical_sha256(
+                    {
+                        "anchor_sidecar_sha256": game[
+                            "schedule_query_sidecar_sha256"
+                        ],
+                        "boxscore_query_sidecar_sha256": game[
+                            "boxscore_query_sidecar_sha256"
+                        ],
+                        "game": {
+                            key: value
+                            for key, value in game.items()
+                            if key != "source_game_sha256"
+                        },
+                    }
                 )
+
+            for game in source_payload["games"]:
+                if game["played"]:
+                    game["raw_game_object_sha256"] = "a" * 64
+                    game["normalized_anchor_sha256"] = "b" * 64
+                    rehash(game)
+            source_snapshot = {
+                "games": source_payload["games"],
+                "grain": "season_game_evidence_snapshot",
+                "schema_version": 1,
+                "source_query_sidecar_sha256s": source_payload[
+                    "source_query_sidecar_sha256s"
+                ],
+            }
+            inventory_module._validate_game_projection(
+                source_snapshot,
+                run_id=source_payload["run_id"],
+            )
+            source_authority = dataclasses.replace(
+                authority,
+                payload=source_payload,
+                context=dataclasses.replace(
+                    authority.context, run_id=source_payload["run_id"]
+                ),
+            )
+
+            for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
+                changed_payload = json.loads(_canonical(source_payload))
+                changed_game = next(
+                    game for game in changed_payload["games"] if game["played"]
+                )
+                changed_game[field] = "c" * 64
+                rehash(changed_game)
+                inventory_module._validate_game_projection(
+                    {
+                        "games": changed_payload["games"],
+                        "grain": "season_game_evidence_snapshot",
+                        "schema_version": 1,
+                        "source_query_sidecar_sha256s": changed_payload[
+                            "source_query_sidecar_sha256s"
+                        ],
+                    },
+                    run_id=changed_payload["run_id"],
+                )
+                changed = dataclasses.replace(source_authority, payload=changed_payload)
+                with self.subTest(field=field), patch.object(
+                    inventory_module,
+                    "_build_current_authority",
+                    side_effect=(source_authority, changed),
+                ), self.assertRaisesRegex(ValueError, "authority|changed|rebind"):
+                    inventory_module.publish_game_evidence_inventory(root)
+                self.assertFalse((root / INVENTORY).exists())
 
     def test_oversized_serialized_inventory_fails_before_final_publish(self) -> None:
         from mlb_backtest import v52_game_evidence_inventory as inventory_module

@@ -1031,6 +1031,54 @@ class V52ScheduleSourceTest(unittest.TestCase):
                 "identity",
                 lambda value: value[9001].update({"away_team_id": 999}),
             ),
+            (
+                "missing-raw-hash-key",
+                lambda value: value[9001].pop("raw_game_object_sha256"),
+            ),
+            (
+                "missing-normalized-hash-key",
+                lambda value: value[9001].pop("normalized_anchor_sha256"),
+            ),
+            (
+                "extra-record-key",
+                lambda value: value[9001].update({"unexpected": True}),
+            ),
+            (
+                "truncated-raw-hash",
+                lambda value: value[9001].update(
+                    {"raw_game_object_sha256": "a" * 63}
+                ),
+            ),
+            (
+                "uppercase-raw-hash",
+                lambda value: value[9001].update(
+                    {"raw_game_object_sha256": "A" * 64}
+                ),
+            ),
+            (
+                "malformed-raw-hash",
+                lambda value: value[9001].update(
+                    {"raw_game_object_sha256": "g" * 64}
+                ),
+            ),
+            (
+                "truncated-normalized-hash",
+                lambda value: value[9001].update(
+                    {"normalized_anchor_sha256": "b" * 63}
+                ),
+            ),
+            (
+                "uppercase-normalized-hash",
+                lambda value: value[9001].update(
+                    {"normalized_anchor_sha256": "B" * 64}
+                ),
+            ),
+            (
+                "malformed-normalized-hash",
+                lambda value: value[9001].update(
+                    {"normalized_anchor_sha256": "g" * 64}
+                ),
+            ),
         ):
             candidate = copy.deepcopy(provenance)
             mutate(candidate)
