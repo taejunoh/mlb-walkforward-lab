@@ -39,12 +39,17 @@ from .v52_evidence import (
     canonical_query_bytes,
     logical_query_id,
 )
+from .v52_duplicate_gamepk_disposition import (
+    DuplicateGamePkDispositionAuthority,
+    build_duplicate_disposition_authority,
+)
 from .v52_query_plan import (
     QueryBatch,
     SourceAuthorityContext,
     SplitReceipt,
     _SOURCE_RUN_SPEC_RELATIVE,
     _RUN_SPEC_RELATIVE,
+    _load_query_batch_for_authority,
     _load_static_contracts,
     _make_batch,
     bisect_statcast_query,
@@ -78,7 +83,7 @@ from .v52_timezone_review import (
 
 
 _STATCAST_ROOT_BATCH_PATH = re.compile(
-    r"^audit/v5_2_qd/historical/acquisition/query_batches/"
+    r"^audit/v5_2_qd/historical(?:_superseding_565534)?/acquisition/query_batches/"
     r"(?P<batch_id>[0-9a-f]{64})\.json$"
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -182,7 +187,7 @@ _PITCHING_RECORD_COMMON_KEYS = frozenset(
     }
 )
 _PITCHING_RECORD_NUMERIC_KEYS = frozenset({"batters_faced", "earned_runs", "outs"})
-_GAME_INVENTORY_KEYS = frozenset(
+_OLD_GAME_INVENTORY_KEYS = frozenset(
     {
         "acquisition_contract",
         "artifact_kind",
@@ -197,6 +202,9 @@ _GAME_INVENTORY_KEYS = frozenset(
         "timezone_gate",
     }
 )
+_SOURCE_GAME_INVENTORY_KEYS = _OLD_GAME_INVENTORY_KEYS | {
+    "duplicate_gamepk_disposition", "dispositioned_query_ids"
+}
 _GAME_COUNT_KEYS = frozenset(
     {
         "game_count",
@@ -236,6 +244,33 @@ class VerifiedQueryRecord:
 
 
 @dataclass(frozen=True)
+class AuthorityBinding:
+    """A closed path/digest binding shared by replay and source inventory."""
+
+    path: str
+    sha256: str
+
+    def as_mapping(self) -> dict[str, object]:
+        return {"path": self.path, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class DuplicateGamePkDispositionBinding:
+    """The sole superseding-run schedule disposition authority."""
+
+    query_id: str
+    success_receipt: AuthorityBinding
+    query_sidecar: AuthorityBinding
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            "query_id": self.query_id,
+            "success_receipt": self.success_receipt.as_mapping(),
+            "query_sidecar": self.query_sidecar.as_mapping(),
+        }
+
+
+@dataclass(frozen=True)
 class NormalizedSnapshot:
     schema_version: Literal[1]
     run_id: str
@@ -263,6 +298,8 @@ class NormalizedSnapshot:
     payload: Mapping[str, object]
     canonical_bytes: bytes
     sha256: str
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
+    dispositioned_query_ids: tuple[str, ...] = ()
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -276,6 +313,14 @@ class NormalizedSnapshot:
             "source_query_sidecar_sha256s": list(self.source_query_sidecar_sha256s),
             "split_receipt_sha256s": list(self.split_receipt_sha256s),
             "status": self.status,
+            **(
+                {
+                    "duplicate_gamepk_disposition": self.duplicate_gamepk_disposition.as_mapping(),
+                    "dispositioned_query_ids": list(self.dispositioned_query_ids),
+                }
+                if self.duplicate_gamepk_disposition is not None
+                else {}
+            ),
         }
 
 
@@ -290,6 +335,11 @@ class SnapshotReplayInputs:
     game_inventory: VerifiedGameEvidenceInventory
     timezone_gate: VerifiedTimezoneGate
     schedule_inventory: VerifiedScheduleAnchorInventory
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
+    dispositioned_query_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dispositioned_query_ids", tuple(self.dispositioned_query_ids))
 
     @property
     def game_evidence_inventory(self) -> VerifiedGameEvidenceInventory:
@@ -396,7 +446,11 @@ def _sorted_unique_sha256s(
 def _validate_normalized_snapshot_mapping(
     value: object,
 ) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _NORMALIZED_ENVELOPE_KEYS:
+    if not isinstance(value, Mapping) or set(value) not in {
+        _NORMALIZED_ENVELOPE_KEYS,
+        _NORMALIZED_ENVELOPE_KEYS
+        | {"duplicate_gamepk_disposition", "dispositioned_query_ids"},
+    }:
         raise ValueError("normalized snapshot envelope keys differ")
     envelope = dict(value)
     season = envelope.get("season")
@@ -419,6 +473,27 @@ def _validate_normalized_snapshot_mapping(
 
     source = envelope.get("source")
     grain = envelope.get("grain")
+    disposition = envelope.get("duplicate_gamepk_disposition")
+    disposition_ids = envelope.get("dispositioned_query_ids")
+    if disposition is not None or disposition_ids is not None:
+        if (
+            source not in {"mlb_schedule_game_feed", "prior_schedule_history"}
+            or not isinstance(disposition, Mapping)
+            or set(disposition) != {"query_id", "success_receipt", "query_sidecar"}
+            or not isinstance(disposition.get("query_id"), str)
+            or not isinstance(disposition_ids, list)
+            or disposition_ids != [disposition["query_id"]]
+        ):
+            raise ValueError("normalized snapshot disposition binding differs")
+        for binding in (disposition["success_receipt"], disposition["query_sidecar"]):
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"path", "sha256"}
+                or not isinstance(binding.get("path"), str)
+                or not isinstance(binding.get("sha256"), str)
+                or _SHA256.fullmatch(binding["sha256"]) is None
+            ):
+                raise ValueError("normalized snapshot disposition binding differs")
     if source == "mlb_schedule_game_feed" and grain == "season_game_evidence_snapshot":
         split_hashes = _sorted_unique_sha256s(
             envelope.get("split_receipt_sha256s"),
@@ -1192,6 +1267,7 @@ def _query_batch_artifact_sha256(batch: QueryBatch) -> str:
 def _load_statcast_root_batch(
     root: Path,
     checkpoint: AcquisitionCheckpoint,
+    authority: RunSpec | SourceRunSpec | None = None,
 ) -> QueryBatch:
     paths = checkpoint.stage_evidence_receipt_paths
     hashes = checkpoint.stage_evidence_receipt_sha256s
@@ -1207,7 +1283,11 @@ def _load_statcast_root_batch(
     batch_id, expected_sha256 = candidates[0]
     if batch_id in checkpoint.query_batch_ids:
         raise ValueError("terminal Statcast root batch overlaps checkpoint batches")
-    batch = load_query_batch(root, batch_id, read_only_progress=True)
+    batch = (
+        _load_query_batch_for_authority(root, batch_id, authority, read_only_progress=True)
+        if isinstance(authority, SourceRunSpec)
+        else load_query_batch(root, batch_id, read_only_progress=True)
+    )
     if (
         batch.batch_id != batch_id
         or batch.stage != "REMAINING"
@@ -1227,13 +1307,19 @@ def _load_statcast_root_batch(
 
 def _load_terminal_query_graph(
     root: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
 ) -> _TerminalQueryGraph:
     raw_relative = _safe_raw_namespace(run_spec)
     checkpoint = load_source_verification_checkpoint(root, run_spec)
-    statcast_root_batch = _load_statcast_root_batch(root, checkpoint)
+    statcast_root_batch = _load_statcast_root_batch(root, checkpoint, run_spec)
     batches = tuple(
-        load_query_batch(root, batch_id, read_only_progress=True)
+        (
+            _load_query_batch_for_authority(
+                root, batch_id, run_spec, read_only_progress=True
+            )
+            if isinstance(run_spec, SourceRunSpec)
+            else load_query_batch(root, batch_id, read_only_progress=True)
+        )
         for batch_id in checkpoint.query_batch_ids
     )
     evidence_root = root / raw_relative
@@ -1299,10 +1385,15 @@ def _authenticate_authority_paths(
         authority_relative = _SOURCE_RUN_SPEC_RELATIVE
     else:
         raise TypeError("run_spec must be a RunSpec or SourceRunSpec")
-    context = _load_static_contracts(
-        root / authority_relative,
-        Path(acquisition_contract_path),
-    )
+    try:
+        context = _load_static_contracts(
+            root / authority_relative,
+            Path(acquisition_contract_path),
+        )
+    except ValueError as exc:
+        if isinstance(run_spec, SourceRunSpec):
+            raise ValueError("source authority pair differs") from exc
+        raise
     if context.repository_root != root or context.authority != run_spec:
         raise ValueError("authority object differs from authenticated repository bytes")
     return context
@@ -1327,10 +1418,6 @@ def load_snapshot_replay_inputs(
         context = _authenticate_authority_paths(
             root, run_spec, acquisition_contract_path
         )
-        if isinstance(run_spec, SourceRunSpec):
-            raise ValueError(
-                "SourceRunSpec checkpoint authority is unavailable before Task 6"
-            )
         authenticated_contract_path = context.acquisition_contract_path
         authenticated_root = context.repository_root
         evidence_root = context.raw_root
@@ -1357,15 +1444,77 @@ def load_snapshot_replay_inputs(
         evidence_root=evidence_root,
         read_only_progress=True,
     )
-    timezone = load_verified_timezone_gate(authenticated_root, read_only_progress=True)
-    games = load_verified_game_evidence_inventory(authenticated_root, read_only_progress=True)
+    source_loader_kwargs = (
+        {
+            "run_spec_path": context.authority_path,
+            "acquisition_contract_path": context.acquisition_contract_path,
+        }
+        if context is not None and isinstance(run_spec, SourceRunSpec)
+        else {}
+    )
+    timezone = load_verified_timezone_gate(
+        authenticated_root, read_only_progress=True, **source_loader_kwargs
+    )
+    games = load_verified_game_evidence_inventory(
+        authenticated_root, read_only_progress=True, **source_loader_kwargs
+    )
     store = V52EvidenceStore.open_read_only(evidence_root)
-    records = tuple(_recompute_verified_query_records(store, graph.completed_queries))
+    disposition_authority: DuplicateGamePkDispositionAuthority | None = None
+    if isinstance(run_spec, SourceRunSpec):
+        if context is None:
+            raise ValueError("source replay requires authenticated disposition authority")
+        disposition_authority = build_duplicate_disposition_authority(
+            authenticated_root,
+            source_run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+        )
+    records = tuple(
+        _recompute_verified_query_records(store, graph.completed_queries)
+        if disposition_authority is None
+        else _recompute_verified_query_records(
+            store,
+            graph.completed_queries,
+            duplicate_gamepk_disposition_authority=disposition_authority,
+        )
+    )
     game_snapshots = tuple(
         _build_game_normalized_snapshots(
             run_spec.run_id, records, games, timezone, schedule
         )
     )
+    disposition: DuplicateGamePkDispositionBinding | None = None
+    dispositioned: tuple[str, ...] = ()
+    if isinstance(run_spec, SourceRunSpec):
+        payload = games.payload
+        raw_binding = payload.get("duplicate_gamepk_disposition")
+        raw_ids = payload.get("dispositioned_query_ids")
+        if (
+            not isinstance(raw_binding, Mapping)
+            or set(raw_binding) != {"query_id", "success_receipt", "query_sidecar"}
+            or not isinstance(raw_binding.get("query_id"), str)
+            or not isinstance(raw_ids, (list, tuple))
+            or tuple(raw_ids) != tuple(sorted(raw_ids))
+            or tuple(raw_ids) != (raw_binding["query_id"],)
+        ):
+            raise ValueError("source replay disposition binding differs")
+        def binding(value: object, label: str) -> AuthorityBinding:
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != {"path", "sha256"}
+                or not isinstance(value.get("path"), str)
+                or not isinstance(value.get("sha256"), str)
+                or _SHA256.fullmatch(value["sha256"]) is None
+            ):
+                raise ValueError(f"source replay disposition {label} differs")
+            return AuthorityBinding(value["path"], value["sha256"])
+        disposition = DuplicateGamePkDispositionBinding(
+            raw_binding["query_id"],
+            binding(raw_binding["success_receipt"], "success receipt"),
+            binding(raw_binding["query_sidecar"], "query sidecar"),
+        )
+        dispositioned = tuple(raw_ids)
+        if graph.checkpoint.dispositioned_query_ids != dispositioned:
+            raise ValueError("source replay checkpoint disposition IDs differ")
     return SnapshotReplayInputs(
         run_spec.run_id,
         graph,
@@ -1374,6 +1523,8 @@ def load_snapshot_replay_inputs(
         games,
         timezone,
         schedule,
+        disposition,
+        dispositioned,
     )
 
 
@@ -1390,11 +1541,28 @@ def _recompute_completed_queries(
 def _recompute_verified_query_records(
     store: V52EvidenceStore,
     queries: Sequence[LogicalQuery],
+    *,
+    duplicate_gamepk_disposition_authority: (
+        DuplicateGamePkDispositionAuthority | None
+    ) = None,
 ) -> tuple[VerifiedQueryRecord, ...]:
-    return tuple(
-        _read_verified_query_record(store, query)
-        for query in sorted(queries, key=logical_query_id)
-    )
+    records: list[VerifiedQueryRecord] = []
+    for query in sorted(queries, key=logical_query_id):
+        if (
+            duplicate_gamepk_disposition_authority is not None
+            and query == duplicate_gamepk_disposition_authority.query
+        ):
+            record = _read_verified_query_record(
+                store,
+                query,
+                duplicate_gamepk_disposition_authority=(
+                    duplicate_gamepk_disposition_authority
+                ),
+            )
+        else:
+            record = _read_verified_query_record(store, query)
+        records.append(record)
+    return tuple(records)
 
 
 def _retain_raw_for_aggregation(query: LogicalQuery) -> bool:
@@ -1507,6 +1675,8 @@ def _normalized_snapshot(
     season: int,
     records: Sequence[VerifiedQueryRecord],
     payload: Mapping[str, object],
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
+    dispositioned_query_ids: tuple[str, ...] = (),
 ) -> NormalizedSnapshot:
     query_ids = tuple(sorted({record.query_id for record in records}))
     hashes_value = payload.get("source_query_sidecar_sha256s")
@@ -1534,6 +1704,14 @@ def _normalized_snapshot(
         "source_query_sidecar_sha256s": list(sidecar_hashes),
         "split_receipt_sha256s": [],
         "status": "READY",
+        **(
+            {
+                "duplicate_gamepk_disposition": duplicate_gamepk_disposition.as_mapping(),
+                "dispositioned_query_ids": list(dispositioned_query_ids),
+            }
+            if duplicate_gamepk_disposition is not None
+            else {}
+        ),
     }
     envelope = _validate_normalized_snapshot_mapping(envelope)
     contents = canonical_json_bytes(envelope) + b"\n"
@@ -1556,6 +1734,8 @@ def _normalized_snapshot(
         payload=frozen_payload,
         canonical_bytes=contents,
         sha256=digest,
+        duplicate_gamepk_disposition=duplicate_gamepk_disposition,
+        dispositioned_query_ids=dispositioned_query_ids,
     )
 
 
@@ -1694,7 +1874,12 @@ def _build_game_normalized_snapshots(
     game_payload = _plain_json(game_inventory.payload)
     if (
         not isinstance(game_payload, dict)
-        or set(game_payload) != _GAME_INVENTORY_KEYS
+        or set(game_payload)
+        != (
+            _SOURCE_GAME_INVENTORY_KEYS
+            if game_payload.get("run_id") == "historical_walkforward_500_superseding_565534"
+            else _OLD_GAME_INVENTORY_KEYS
+        )
         or (
             game_payload.get("artifact_kind") != "GAME_EVIDENCE_INVENTORY"
             or game_payload.get("schema_version") != 1
@@ -1702,6 +1887,34 @@ def _build_game_normalized_snapshots(
         )
     ):
         raise ValueError("game inventory identity differs")
+    source_disposition = game_payload.get("duplicate_gamepk_disposition")
+    source_ids = game_payload.get("dispositioned_query_ids")
+    source_branch = game_payload.get("run_id") == "historical_walkforward_500_superseding_565534"
+    normalized_disposition: DuplicateGamePkDispositionBinding | None = None
+    normalized_disposition_ids: tuple[str, ...] = ()
+    if source_branch:
+        if (
+            not isinstance(source_disposition, Mapping)
+            or set(source_disposition) != {"query_id", "success_receipt", "query_sidecar"}
+            or not isinstance(source_disposition.get("query_id"), str)
+            or not isinstance(source_ids, list)
+            or source_ids != [source_disposition["query_id"]]
+        ):
+            raise ValueError("game inventory disposition authority differs")
+        normalized_disposition = DuplicateGamePkDispositionBinding(
+            source_disposition["query_id"],
+            AuthorityBinding(
+                source_disposition["success_receipt"]["path"],
+                source_disposition["success_receipt"]["sha256"],
+            ),
+            AuthorityBinding(
+                source_disposition["query_sidecar"]["path"],
+                source_disposition["query_sidecar"]["sha256"],
+            ),
+        )
+        normalized_disposition_ids = tuple(source_ids)
+    elif source_disposition is not None or source_ids is not None:
+        raise ValueError("historical game inventory must omit disposition authority")
     if (
         _binding_sha256(game_payload.get("run_spec"), "game RunSpec")
         != timezone_gate.run_spec_sha256
@@ -1789,7 +2002,20 @@ def _build_game_normalized_snapshots(
 
     for season, payload in zip(_GAME_SEASONS, payloads, strict=True):
         snapshots.append(
-            _normalized_snapshot(run_id, season, snapshot_inputs[season], payload)
+            _normalized_snapshot(
+                run_id,
+                season,
+                snapshot_inputs[season],
+                payload,
+                (
+                    normalized_disposition
+                    if season == 2019 else None
+                ),
+                (
+                    normalized_disposition_ids
+                    if season == 2019 else ()
+                ),
+            )
         )
     return tuple(snapshots)
 
@@ -1872,6 +2098,14 @@ def _history_normalized_snapshot(
         ),
         "split_receipt_sha256s": [],
         "status": "READY",
+        **(
+            {
+                "duplicate_gamepk_disposition": game_snapshot.duplicate_gamepk_disposition.as_mapping(),
+                "dispositioned_query_ids": list(game_snapshot.dispositioned_query_ids),
+            }
+            if game_snapshot.duplicate_gamepk_disposition is not None
+            else {}
+        ),
     }
     envelope = _validate_normalized_snapshot_mapping(envelope)
     contents = canonical_json_bytes(envelope) + b"\n"
@@ -1897,6 +2131,8 @@ def _history_normalized_snapshot(
         payload=frozen_payload,
         canonical_bytes=contents,
         sha256=digest,
+        duplicate_gamepk_disposition=game_snapshot.duplicate_gamepk_disposition,
+        dispositioned_query_ids=game_snapshot.dispositioned_query_ids,
     )
 
 
@@ -3606,6 +3842,10 @@ def _build_reference_normalized_snapshots(
 def _read_verified_query_record(
     store: V52EvidenceStore,
     query: LogicalQuery,
+    *,
+    duplicate_gamepk_disposition_authority: (
+        DuplicateGamePkDispositionAuthority | None
+    ) = None,
 ) -> VerifiedQueryRecord:
     if not isinstance(store, V52EvidenceStore) or not store._read_only:
         raise ValueError("source verification requires a read-only evidence store")
@@ -3632,11 +3872,28 @@ def _read_verified_query_record(
                 or verified.success_receipt.get("attempt_history") != []
             ):
                 raise ValueError("derived disposition evidence binding differs")
-            reason = query.requested_range.get("reason")
-            if reason != "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START":
-                raise ValueError("derived disposition reason binding differs")
-            semantics = dict(recompute_query_sidecar(query, b""))
-            semantics["reason"] = reason
+            if duplicate_gamepk_disposition_authority is not None:
+                if (
+                    query.endpoint
+                    != "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+                    or query != duplicate_gamepk_disposition_authority.query
+                ):
+                    raise ValueError(
+                        "schedule disposition authority query binding differs"
+                    )
+                semantics = dict(
+                    recompute_query_sidecar(
+                        query,
+                        b"",
+                        authority=duplicate_gamepk_disposition_authority,
+                    )
+                )
+            else:
+                reason = query.requested_range.get("reason")
+                if reason != "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START":
+                    raise ValueError("derived disposition reason binding differs")
+                semantics = dict(recompute_query_sidecar(query, b""))
+                semantics["reason"] = reason
             expected_sidecar = {
                 "grain": query.grain,
                 "parser_version": query.parser_version,
@@ -3684,7 +3941,14 @@ def _read_verified_query_record(
             retained_raw_bytes=retained_raw,
         )
 
-    store.inspect_verified_success(query, recompute_verified_read)
+    if duplicate_gamepk_disposition_authority is None:
+        store.inspect_verified_success(query, recompute_verified_read)
+    else:
+        store.inspect_verified_success(
+            query,
+            recompute_verified_read,
+            authority=duplicate_gamepk_disposition_authority,
+        )
     if result is None:
         raise AssertionError("verified success inspection did not produce a result")
     return result

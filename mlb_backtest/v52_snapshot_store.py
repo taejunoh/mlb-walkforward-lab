@@ -25,6 +25,8 @@ from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from .secure_fs import TrustedRoot, open_trusted_root
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import (
+    AuthorityBinding,
+    DuplicateGamePkDispositionBinding,
     SnapshotReplayInputs,
     NormalizedSnapshot,
     replay_verified_snapshots,
@@ -33,6 +35,23 @@ from .v52_verify_sources import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OLD_RUN_ID = "historical_walkforward_500"
+_FIXTURE_RUN_ID = "fixture-run"
+_SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+_DISPOSITION_QUERY_ID = "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+_DISPOSITION_SIDECAR_SHA256 = "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+_DISPOSITION_SIDECAR_PATH = (
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/"
+    f"{_DISPOSITION_SIDECAR_SHA256}.json"
+)
+_DISPOSITION_SUCCESS_PATH = (
+    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+    f"mlb_schedule_game_feed/{_DISPOSITION_QUERY_ID}/success.json"
+)
+_SOURCE_TIMEZONE_GATE_PATH = (
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+    "venue_timezone_seal.json"
+)
 _LOCK_ISSUER = object()
 _SOURCES = (
     "baseball_savant_statcast",
@@ -59,7 +78,7 @@ _SOURCE_TOTALS = {
     "prior_schedule_history": 7,
     "venue_team_timezone_table": 7,
 }
-_TOP_LEVEL_KEYS = frozenset(
+_OLD_TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version", "artifact_kind", "run_id", "status", "critical_errors",
         "network_attempts", "source_gate_ready", "run_spec", "acquisition_contract",
@@ -68,15 +87,9 @@ _TOP_LEVEL_KEYS = frozenset(
         "source_seasons", "counts",
     }
 )
-
-
-@dataclass(frozen=True)
-class AuthorityBinding:
-    path: str
-    sha256: str
-
-    def as_mapping(self) -> dict[str, object]:
-        return {"path": self.path, "sha256": self.sha256}
+_SOURCE_TOP_LEVEL_KEYS = _OLD_TOP_LEVEL_KEYS | {
+    "duplicate_gamepk_disposition", "dispositioned_query_ids"
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +111,11 @@ class AuthorityBindings:
     schedule_inventory: AuthorityBinding
     game_evidence_inventory: AuthorityBinding
     timezone_gate: AuthorityBinding
+    duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
+    dispositioned_query_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dispositioned_query_ids", tuple(self.dispositioned_query_ids))
 
 
 @dataclass(frozen=True)
@@ -266,8 +284,16 @@ class SourceInventory:
     def timezone_gate(self) -> AuthorityBinding:
         return self.bindings.timezone_gate
 
+    @property
+    def duplicate_gamepk_disposition(self) -> DuplicateGamePkDispositionBinding | None:
+        return self.bindings.duplicate_gamepk_disposition
+
+    @property
+    def dispositioned_query_ids(self) -> tuple[str, ...]:
+        return self.bindings.dispositioned_query_ids
+
     def as_mapping(self) -> dict[str, object]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "artifact_kind": self.artifact_kind,
             "run_id": self.run_id,
@@ -288,6 +314,10 @@ class SourceInventory:
             "source_seasons": [row.as_mapping() for row in self.source_seasons],
             "counts": _plain_json(self.counts),
         }
+        if self.duplicate_gamepk_disposition is not None:
+            result["duplicate_gamepk_disposition"] = self.duplicate_gamepk_disposition.as_mapping()
+            result["dispositioned_query_ids"] = list(self.dispositioned_query_ids)
+        return result
 
 
 def build_inventory(inputs: SnapshotStoreInputs) -> SourceInventory:
@@ -304,8 +334,26 @@ def _validate_build_inputs(inputs: SnapshotStoreInputs) -> None:
     if not isinstance(inputs.replay, SnapshotReplayInputs) or not isinstance(inputs.bindings, AuthorityBindings):
         raise TypeError("snapshot store inputs contain invalid authorities")
     _validate_bindings(inputs.bindings)
-    if not isinstance(inputs.replay.run_id, str) or not inputs.replay.run_id:
-        raise ValueError("replay run_id must be a nonempty string")
+    _validate_run_disposition(
+        inputs.replay.run_id,
+        inputs.replay.duplicate_gamepk_disposition,
+        inputs.replay.dispositioned_query_ids,
+        "replay",
+    )
+    _validate_run_disposition(
+        inputs.replay.run_id,
+        inputs.bindings.duplicate_gamepk_disposition,
+        inputs.bindings.dispositioned_query_ids,
+        "binding",
+    )
+    _validate_source_binding_paths(inputs.replay.run_id, inputs.bindings)
+    if (
+        inputs.replay.duplicate_gamepk_disposition
+        != inputs.bindings.duplicate_gamepk_disposition
+        or inputs.replay.dispositioned_query_ids
+        != inputs.bindings.dispositioned_query_ids
+    ):
+        raise ValueError("replay disposition authority differs from bindings")
 
 
 def _build_inventory_from_replayed(
@@ -406,12 +454,27 @@ def _freeze_counts(rows: tuple[SnapshotInventoryRow, ...]) -> Mapping[str, objec
 
 
 def _inventory_from_mapping(payload: Mapping[str, object]) -> SourceInventory:
-    if set(payload) != _TOP_LEVEL_KEYS:
+    source_branch = "duplicate_gamepk_disposition" in payload or "dispositioned_query_ids" in payload
+    if set(payload) != (_SOURCE_TOP_LEVEL_KEYS if source_branch else _OLD_TOP_LEVEL_KEYS):
         raise ValueError("inventory top-level keys differ")
+    disposition: DuplicateGamePkDispositionBinding | None = None
+    dispositioned: tuple[str, ...] = ()
+    if source_branch:
+        raw = _mapping(payload["duplicate_gamepk_disposition"], "duplicate disposition")
+        if set(raw) != {"query_id", "success_receipt", "query_sidecar"}:
+            raise ValueError("duplicate disposition keys differ")
+        query_id = _literal(raw["query_id"], str, "disposition query ID")
+        disposition = DuplicateGamePkDispositionBinding(
+            query_id,
+            _binding_from_mapping(raw["success_receipt"]),
+            _binding_from_mapping(raw["query_sidecar"]),
+        )
+        dispositioned = tuple(_sha_values(payload["dispositioned_query_ids"], "dispositioned query IDs"))
     bindings = AuthorityBindings(
         _binding_from_mapping(payload["run_spec"]), _binding_from_mapping(payload["acquisition_contract"]),
         _terminal_from_mapping(payload["terminal_checkpoint"]), _binding_from_mapping(payload["schedule_inventory"]),
         _binding_from_mapping(payload["game_evidence_inventory"]), _binding_from_mapping(payload["timezone_gate"]),
+        disposition, dispositioned,
     )
     snapshots = tuple(_snapshot_row_from_mapping(value) for value in _array(payload["snapshots"], "snapshots"))
     seasons = tuple(_source_season_from_mapping(value) for value in _array(payload["source_seasons"], "source_seasons"))
@@ -488,9 +551,14 @@ def _validate_inventory(inventory: SourceInventory) -> None:
         raise TypeError("inventory must be SourceInventory")
     if (inventory.schema_version, inventory.artifact_kind, inventory.status, inventory.critical_errors, inventory.network_attempts, inventory.source_gate_ready) != (1, "V5_2_SOURCE_INVENTORY", "READY_CANDIDATE", (), 0, True):
         raise ValueError("inventory frozen fields differ")
-    if not isinstance(inventory.run_id, str) or not inventory.run_id:
-        raise ValueError("inventory run_id differs")
     _validate_bindings(inventory.bindings)
+    _validate_run_disposition(
+        inventory.run_id,
+        inventory.duplicate_gamepk_disposition,
+        inventory.dispositioned_query_ids,
+        "inventory",
+    )
+    _validate_source_binding_paths(inventory.run_id, inventory.bindings)
     rows = inventory.snapshots
     if not isinstance(rows, tuple) or len(rows) != 81:
         raise ValueError("inventory must contain 81 snapshot rows")
@@ -566,6 +634,55 @@ def _validate_bindings(bindings: AuthorityBindings) -> None:
     if not isinstance(terminal, TerminalCheckpointBinding) or terminal.stage != "REMAINING" or isinstance(terminal.sequence, bool) or not isinstance(terminal.sequence, int) or terminal.sequence < 0:
         raise ValueError("terminal checkpoint binding differs")
     _validate_binding(terminal)
+    disposition = bindings.duplicate_gamepk_disposition
+    ids = bindings.dispositioned_query_ids
+    if disposition is None:
+        if ids:
+            raise ValueError("historical authority cannot carry disposition IDs")
+        return
+    if (
+        not isinstance(disposition, DuplicateGamePkDispositionBinding)
+        or not isinstance(disposition.query_id, str)
+        or _SHA256.fullmatch(disposition.query_id) is None
+        or ids != (disposition.query_id,)
+    ):
+        raise ValueError("duplicate disposition authority differs")
+    _validate_binding(disposition.success_receipt)
+    _validate_binding(disposition.query_sidecar)
+
+
+def _validate_run_disposition(
+    run_id: object,
+    disposition: DuplicateGamePkDispositionBinding | None,
+    dispositioned_query_ids: tuple[str, ...],
+    label: str,
+) -> None:
+    if run_id in {_OLD_RUN_ID, _FIXTURE_RUN_ID}:
+        if disposition is not None or dispositioned_query_ids:
+            raise ValueError(f"{label} legacy run cannot carry disposition authority")
+        return
+    if run_id != _SOURCE_RUN_ID:
+        raise ValueError(f"{label} run_id differs")
+    if (
+        disposition is None
+        or disposition.query_id != _DISPOSITION_QUERY_ID
+        or disposition.query_sidecar.path != _DISPOSITION_SIDECAR_PATH
+        or disposition.query_sidecar.sha256 != _DISPOSITION_SIDECAR_SHA256
+        or disposition.success_receipt.path != _DISPOSITION_SUCCESS_PATH
+        or dispositioned_query_ids != (_DISPOSITION_QUERY_ID,)
+    ):
+        raise ValueError(f"{label} superseding run requires disposition authority")
+
+
+def _validate_source_binding_paths(
+    run_id: object,
+    bindings: AuthorityBindings,
+) -> None:
+    if (
+        run_id == _SOURCE_RUN_ID
+        and bindings.timezone_gate.path != _SOURCE_TIMEZONE_GATE_PATH
+    ):
+        raise ValueError("superseding timezone gate authority path differs")
 
 
 def _validate_binding(binding: AuthorityBinding | TerminalCheckpointBinding) -> None:
@@ -1100,10 +1217,24 @@ def _freeze_replayed_snapshots(
         if not isinstance(payload, Mapping):
             raise PublishError("replayed snapshot payload must be a mapping")
         copied = NormalizedSnapshot(
-            snapshot.schema_version, snapshot.run_id, snapshot.season, snapshot.source,
-            snapshot.grain, snapshot.status, tuple(snapshot.logical_query_ids),
-            tuple(snapshot.source_query_sidecar_sha256s), tuple(snapshot.split_receipt_sha256s),
-            payload, snapshot.canonical_bytes, snapshot.sha256,
+            schema_version=snapshot.schema_version,
+            run_id=snapshot.run_id,
+            season=snapshot.season,
+            source=snapshot.source,
+            grain=snapshot.grain,
+            status=snapshot.status,
+            logical_query_ids=tuple(snapshot.logical_query_ids),
+            source_query_sidecar_sha256s=tuple(
+                snapshot.source_query_sidecar_sha256s
+            ),
+            split_receipt_sha256s=tuple(snapshot.split_receipt_sha256s),
+            payload=payload,
+            canonical_bytes=snapshot.canonical_bytes,
+            sha256=snapshot.sha256,
+            duplicate_gamepk_disposition=(
+                snapshot.duplicate_gamepk_disposition
+            ),
+            dispositioned_query_ids=tuple(snapshot.dispositioned_query_ids),
         )
         if (
             copied.canonical_bytes != canonical_json_bytes(copied.as_mapping()) + b"\n"

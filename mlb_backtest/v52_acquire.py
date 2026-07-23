@@ -89,6 +89,20 @@ _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
 )
 
 
+def _request_authority_paths(
+    request: _AcquisitionRequest, root: Path
+) -> tuple[Path, Path]:
+    """Return the exact RunSpec/contract pair selected by this invocation."""
+    if isinstance(request.run_spec, SourceRunSpec):
+        return (
+            root / _SOURCE_RUN_SPEC_RELATIVE,
+            root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        )
+    if isinstance(request.run_spec, RunSpec):
+        return root / _RUN_SPEC_RELATIVE, root / _ACQUISITION_CONTRACT_RELATIVE
+    raise TypeError("acquisition request authority differs")
+
+
 def _authority_audit_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
     if isinstance(run_spec, SourceRunSpec):
         return _SOURCE_AUDIT_RELATIVE
@@ -1074,9 +1088,9 @@ def _real_authenticate(request: _AcquisitionRequest) -> _AcquisitionPlan:
     from .v52_legacy import PromotionDisposition, load_protected_legacy_catalog
     from .v52_legacy_decision_inventory import preview_legacy_decisions
     from .v52_query_plan import (
-        _build_statcast_root_batch,
         build_static_batch,
         build_statcast_root_batch,
+        build_statcast_root_batch_for_authority,
     )
 
     try:
@@ -1092,30 +1106,18 @@ def _real_authenticate(request: _AcquisitionRequest) -> _AcquisitionPlan:
             protected_inventory_path=root / _PROTECTED_INVENTORY_RELATIVE,
             protected_inventory_sha256=protected_sha256,
         )
-        source_run = isinstance(request.run_spec, SourceRunSpec)
-        run_relative = (
-            Path(
-                "protocols/v5_2_qd/"
-                "historical_walkforward_500_superseding_565534.json"
-            )
-            if source_run
-            else _RUN_SPEC_RELATIVE
-        )
-        contract_relative = (
-            _SOURCE_ACQUISITION_CONTRACT_RELATIVE
-            if source_run
-            else _ACQUISITION_CONTRACT_RELATIVE
-        )
+        run_path, contract_path = _request_authority_paths(request, root)
         static = build_static_batch(
-            root / run_relative,
-            root / contract_relative,
+            run_path,
+            contract_path,
         )
         statcast = (
-            _build_statcast_root_batch(
-                root / run_relative,
-                root / contract_relative,
+            build_statcast_root_batch_for_authority(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
             )
-            if source_run
+            if isinstance(request.run_spec, SourceRunSpec)
             else build_statcast_root_batch(root)
         )
         preview = preview_legacy_decisions(
@@ -2799,6 +2801,7 @@ def _run_remaining_stage(
     from .v52_query_plan import (
         build_legacy_partition_batch,
         build_statcast_root_batch,
+        build_statcast_root_batch_for_authority,
         load_query_batch_for_authority,
         load_split_receipt,
         publish_query_batch,
@@ -2816,10 +2819,19 @@ def _run_remaining_stage(
     latest_stage = getattr(latest, "stage", None)
     if latest_stage not in {"PARTICIPANT_DERIVED", "REMAINING"}:
         raise TrustIntegrityError("REMAINING prior checkpoint differs")
+    run_path, contract_path = _request_authority_paths(request, root)
 
     statcast_root = _integrity_boundary(
         "Statcast root batch",
-        lambda: build_statcast_root_batch(root),
+        lambda: (
+            build_statcast_root_batch_for_authority(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
+            )
+            if isinstance(request.run_spec, SourceRunSpec)
+            else build_statcast_root_batch(root)
+        ),
     )
     if (
         len(plan.query_batch_ids) != 3
@@ -2846,14 +2858,26 @@ def _run_remaining_stage(
         if latest_stage == "REMAINING"
         else "legacy decision inventory publication",
         lambda: (
-            load_verified_legacy_decision_inventory(root)
+            load_verified_legacy_decision_inventory(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
+            )
             if latest_stage == "REMAINING"
-            else publish_legacy_decision_inventory(root)
+            else publish_legacy_decision_inventory(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
+            )
         ),
     )
     partition = _integrity_boundary(
         "legacy partition batch",
-        lambda: build_legacy_partition_batch(root),
+        lambda: build_legacy_partition_batch(
+            root,
+            run_spec_path=run_path,
+            acquisition_contract_path=contract_path,
+        ),
     )
     if latest_stage == "REMAINING":
         persisted_partition = _integrity_boundary(
@@ -3247,16 +3271,7 @@ def _real_run_stages(
         raise TrustIntegrityError("acquisition authority changed before stage execution")
     runner_guard = _current_runner_guard(request)
     root = Path(os.path.abspath(os.fspath(request.root)))
-    run_spec_relative = (
-        Path("protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json")
-        if isinstance(request.run_spec, SourceRunSpec)
-        else _RUN_SPEC_RELATIVE
-    )
-    contract_relative = (
-        _SOURCE_ACQUISITION_CONTRACT_RELATIVE
-        if isinstance(request.run_spec, SourceRunSpec)
-        else _ACQUISITION_CONTRACT_RELATIVE
-    )
+    run_path, contract_path = _request_authority_paths(request, root)
     namespaces = request.run_spec.raw.get("namespaces")
     audit_value = namespaces.get("audit") if isinstance(namespaces, Mapping) else None
     if not isinstance(audit_value, str):
@@ -3287,8 +3302,8 @@ def _real_run_stages(
     static = _integrity_boundary(
         "static query batch",
         lambda: build_static_batch(
-            root / run_spec_relative,
-            root / contract_relative,
+            run_path,
+            contract_path,
         ),
     )
     fetched = 0
@@ -3348,7 +3363,7 @@ def _real_run_stages(
         raise OperationalBlock("STATIC_SCHEDULES is not terminal")
 
     inventory_kwargs = {
-        "acquisition_contract_path": root / contract_relative,
+        "acquisition_contract_path": contract_path,
         "static_batch_id": static.batch_id,
         "evidence_root": evidence_root,
     }
@@ -3380,8 +3395,8 @@ def _real_run_stages(
         "reference query batch",
         lambda: build_schedule_reference_batch(
             root,
-            root / run_spec_relative,
-            acquisition_contract_path=root / contract_relative,
+            run_path,
+            acquisition_contract_path=contract_path,
             static_batch_id=static.batch_id,
             evidence_root=evidence_root,
         ),
@@ -3490,8 +3505,8 @@ def _real_run_stages(
                 batch_ids=(static.batch_id, reference.batch_id),
                 **(
                     {
-                        "run_spec_path": root / run_spec_relative,
-                        "acquisition_contract_path": root / contract_relative,
+                        "run_spec_path": run_path,
+                        "acquisition_contract_path": contract_path,
                     }
                     if isinstance(request.run_spec, SourceRunSpec)
                     else {}
@@ -3571,16 +3586,28 @@ def _real_run_stages(
     if latest.stage in {"PARTICIPANT_DERIVED", "REMAINING"}:
         game_inventory = _integrity_boundary(
             "game evidence inventory replay",
-            lambda: load_verified_game_evidence_inventory(root),
+            lambda: load_verified_game_evidence_inventory(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
+            ),
         )
     else:
         game_inventory = _integrity_boundary(
             "game evidence inventory publication",
-            lambda: publish_game_evidence_inventory(root),
+            lambda: publish_game_evidence_inventory(
+                root,
+                run_spec_path=run_path,
+                acquisition_contract_path=contract_path,
+            ),
         )
     participant = _integrity_boundary(
         "participant query batch",
-        lambda: build_participant_derived_batch(root),
+        lambda: build_participant_derived_batch(
+            root,
+            run_spec_path=run_path,
+            acquisition_contract_path=contract_path,
+        ),
     )
     if participant.derived_from_sha256 != game_inventory.sha256:
         raise TrustIntegrityError("participant batch inventory binding differs")

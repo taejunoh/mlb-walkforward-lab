@@ -1521,7 +1521,49 @@ def _build_statcast_root_batch(
     return _make_batch("REMAINING", None, queries)
 
 
+def _explicit_authority_paths(
+    repository_root: Path,
+    *,
+    run_spec_path: Path | None,
+    acquisition_contract_path: Path | None,
+) -> tuple[Path, Path]:
+    """Return one authenticated authority pair without a namespace fallback.
+
+    The legacy public builders intentionally keep their zero-argument authority
+    seam.  A caller selecting the superseding authority, however, must name
+    both files.  Accepting one side, or silently falling back to the legacy
+    pair, would let a source-stage replay bind its batch under the wrong root.
+    """
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    if (run_spec_path is None) != (acquisition_contract_path is None):
+        raise ValueError("RunSpec and acquisition contract must be supplied together")
+    if run_spec_path is None:
+        return root / _RUN_SPEC_RELATIVE, root / _ACQUISITION_CONTRACT_RELATIVE
+    run_path = Path(run_spec_path)
+    contract_path = Path(acquisition_contract_path)
+    authority_root, _branch = _authority_branch(run_path, contract_path)
+    if authority_root != root:
+        raise ValueError("RunSpec path differs from repository root")
+    return run_path, contract_path
+
+
+def build_statcast_root_batch_for_authority(
+    repository_root: Path,
+    *,
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    """Build the canonical Statcast root for one explicitly selected authority."""
+    run_path, contract_path = _explicit_authority_paths(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    return _build_statcast_root_batch(run_path, contract_path)
+
+
 def build_statcast_root_batch(repository_root: Path) -> QueryBatch:
+    """Build the legacy canonical Statcast root with its frozen public seam."""
     root = Path(repository_root)
     return _build_statcast_root_batch(
         root / _RUN_SPEC_RELATIVE,
@@ -2447,20 +2489,49 @@ def _build_participant_derived_batch_from_inventory(
 def build_participant_derived_batch(
     repository_root: Path,
     *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
     read_only_progress: bool = False,
 ) -> QueryBatch:
     from .v52_game_evidence_inventory import (
         load_verified_game_evidence_inventory,
     )
 
-    root = Path(repository_root)
-    verified = load_verified_game_evidence_inventory(
-        root,
-        read_only_progress=read_only_progress,
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    explicit_authority = (
+        run_spec_path is not None or acquisition_contract_path is not None
     )
+    if explicit_authority:
+        authority_path, contract_path = _explicit_authority_paths(
+            root,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
+        )
+        context = _load_static_contracts(authority_path, contract_path)
+        verified = load_verified_game_evidence_inventory(
+            root,
+            run_spec_path=authority_path,
+            acquisition_contract_path=contract_path,
+            read_only_progress=read_only_progress,
+        )
+        expected_inventory_path = (
+            context.acquisition_audit_root / "game_evidence_inventory.json"
+        )
+        if verified.path != expected_inventory_path:
+            raise ValueError("game evidence inventory authority path differs")
+        try:
+            inventory_relative = verified.path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("game evidence inventory authority path differs") from exc
+    else:
+        verified = load_verified_game_evidence_inventory(
+            root,
+            read_only_progress=read_only_progress,
+        )
+        inventory_relative = _GAME_EVIDENCE_INVENTORY_RELATIVE
     inventory_contents = _read_repository_file(
         root,
-        _GAME_EVIDENCE_INVENTORY_RELATIVE,
+        inventory_relative,
         "game evidence inventory",
     )
     inventory_sha256 = _sha256_bytes(inventory_contents)
@@ -2493,8 +2564,16 @@ def _validate_participant_batch_authority(
 ) -> None:
     if batch.stage != "PARTICIPANT_DERIVED":
         return
+    source_kwargs: dict[str, Path] = {}
+    if _batch_root_for_batch(repository_root, batch) == _SOURCE_ACQUISITION_BATCH_ROOT:
+        source_kwargs = {
+            "run_spec_path": repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+            "acquisition_contract_path": repository_root
+            / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        }
     expected = build_participant_derived_batch(
         repository_root,
+        **source_kwargs,
         read_only_progress=read_only_progress,
     )
     if batch != expected:
@@ -2541,7 +2620,18 @@ def _validate_statcast_root_batch_authority(
 ) -> None:
     if not _is_statcast_root_batch(batch):
         return
-    expected = build_statcast_root_batch(repository_root)
+    source_kwargs: dict[str, Path] = {}
+    if _batch_root_for_batch(repository_root, batch) == _SOURCE_ACQUISITION_BATCH_ROOT:
+        source_kwargs = {
+            "run_spec_path": repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+            "acquisition_contract_path": repository_root
+            / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        }
+    expected = (
+        build_statcast_root_batch_for_authority(repository_root, **source_kwargs)
+        if source_kwargs
+        else build_statcast_root_batch(repository_root)
+    )
     if batch != expected:
         raise ValueError("REMAINING root differs from fixed Statcast authority replay")
 
@@ -2557,10 +2647,19 @@ def _is_legacy_partition_batch_candidate(
         for query in batch.queries
     ):
         return False
-    root_ids = {
-        logical_query_id(parent)
-        for parent in build_statcast_root_batch(repository_root).queries
-    }
+    source_kwargs: dict[str, Path] = {}
+    if _batch_root_for_batch(repository_root, batch) == _SOURCE_ACQUISITION_BATCH_ROOT:
+        source_kwargs = {
+            "run_spec_path": repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+            "acquisition_contract_path": repository_root
+            / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        }
+    root_batch = (
+        build_statcast_root_batch_for_authority(repository_root, **source_kwargs)
+        if source_kwargs
+        else build_statcast_root_batch(repository_root)
+    )
+    root_ids = {logical_query_id(parent) for parent in root_batch.queries}
     direct_root_ids = {
         query.parent_query_id
         for query in batch.queries
@@ -2577,8 +2676,16 @@ def _validate_legacy_partition_batch_authority(
 ) -> None:
     if not _is_legacy_partition_batch_candidate(repository_root, batch):
         return
+    source_kwargs: dict[str, Path] = {}
+    if _batch_root_for_batch(repository_root, batch) == _SOURCE_ACQUISITION_BATCH_ROOT:
+        source_kwargs = {
+            "run_spec_path": repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+            "acquisition_contract_path": repository_root
+            / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        }
     expected = build_legacy_partition_batch(
         repository_root,
+        **source_kwargs,
         read_only_progress=read_only_progress,
     )
     if batch != expected:
@@ -2953,6 +3060,8 @@ def build_legacy_partition_batch_from_catalog(
 def build_legacy_partition_batch(
     repository_root: Path,
     *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
     read_only_progress: bool = False,
 ) -> QueryBatch:
     """Replay the sealed legacy decisions into the fixed first-level partition."""
@@ -2960,16 +3069,42 @@ def build_legacy_partition_batch(
         _load_legacy_partition_decision_replay,
     )
 
-    root = Path(repository_root)
-    decision_sha256, protected_sha256, decisions = (
-        _load_legacy_partition_decision_replay(root)
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    explicit_authority = (
+        run_spec_path is not None or acquisition_contract_path is not None
     )
-    expected_root = build_statcast_root_batch(root)
+    if explicit_authority:
+        authority_path, contract_path = _explicit_authority_paths(
+            root,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
+        )
+        context = _load_static_contracts(authority_path, contract_path)
+        decision_sha256, protected_sha256, decisions = (
+            _load_legacy_partition_decision_replay(
+                root,
+                run_spec_path=authority_path,
+                acquisition_contract_path=contract_path,
+            )
+        )
+        expected_root = build_statcast_root_batch_for_authority(
+            root,
+            run_spec_path=authority_path,
+            acquisition_contract_path=contract_path,
+        )
+        authority: RunSpec | SourceRunSpec | None = context.authority
+    else:
+        decision_sha256, protected_sha256, decisions = (
+            _load_legacy_partition_decision_replay(root)
+        )
+        expected_root = build_statcast_root_batch(root)
+        authority = None
     root_batch = _load_query_batch(
         root,
         expected_root.batch_id,
         invoke_authority_hook=False,
         read_only_progress=read_only_progress,
+        authority=authority,
     )
     if root_batch != expected_root or len(root_batch.queries) != 46:
         raise ValueError("legacy partition Statcast root authority differs")

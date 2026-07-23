@@ -1382,7 +1382,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 gate = stack.enter_context(
                     patch("mlb_backtest.v52_acquire._load_required_timezone_gate")
                 )
-                stack.enter_context(
+                game_inventory = stack.enter_context(
                     patch(
                         "mlb_backtest.v52_game_evidence_inventory."
                         "publish_game_evidence_inventory",
@@ -1407,6 +1407,15 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             )
             gate.assert_called_once_with(root, source_run)
             scope.assert_called_once_with(root, source_run)
+            game_inventory.assert_called_once_with(
+                root,
+                run_spec_path=(
+                    root
+                    / "protocols/v5_2_qd/"
+                    "historical_walkforward_500_superseding_565534.json"
+                ),
+                acquisition_contract_path=root / source_contract,
+            )
             publish.assert_called_once()
             self.assertEqual(len(checkpoint_calls), 1)
             self.assertEqual(checkpoint_calls[0]["stage"], "TIMEZONE_REVIEW")

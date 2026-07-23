@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import errno
 import hashlib
 import os
@@ -15,6 +16,8 @@ import urllib.request
 import json
 from dataclasses import FrozenInstanceError, replace
 
+import jsonschema
+
 from mlb_backtest import v52_verify_sources as verifier
 from tests.v52_snapshot_store_fixture import (
     fake_81,
@@ -25,6 +28,113 @@ from tests.v52_snapshot_store_fixture import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _source_store_case():
+    """Build one exact superseding-run input/snapshot authority fixture."""
+    from mlb_backtest.v52_snapshot_store import AuthorityBindings
+    from mlb_backtest.v52_source_contracts import canonical_json_bytes
+    from mlb_backtest.v52_verify_sources import (
+        AuthorityBinding,
+        DuplicateGamePkDispositionBinding,
+    )
+
+    disposition_id = (
+        "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+    )
+    sidecar_sha = (
+        "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+    )
+    binding = DuplicateGamePkDispositionBinding(
+        query_id=disposition_id,
+        query_sidecar=AuthorityBinding(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            f"query_sidecars/{sidecar_sha}.json",
+            sidecar_sha,
+        ),
+        success_receipt=AuthorityBinding(
+            "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+            f"mlb_schedule_game_feed/{disposition_id}/success.json",
+            "8" * 64,
+        ),
+    )
+
+    def source_snapshot(snapshot):
+        candidate = dataclasses.replace(
+            snapshot,
+            run_id="historical_walkforward_500_superseding_565534",
+            duplicate_gamepk_disposition=binding,
+            dispositioned_query_ids=(disposition_id,),
+        )
+        contents = canonical_json_bytes(candidate.as_mapping()) + b"\n"
+        return dataclasses.replace(
+            candidate,
+            canonical_bytes=contents,
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
+
+    base_inputs = store_inputs()
+    source_bindings = AuthorityBindings(
+        run_spec=AuthorityBinding(
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json",
+            "a" * 64,
+        ),
+        acquisition_contract=AuthorityBinding(
+            "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json",
+            "b" * 64,
+        ),
+        terminal_checkpoint=replace(
+            base_inputs.bindings.terminal_checkpoint,
+            path=(
+                "audit/v5_2_qd/historical_superseding_565534/execution/"
+                "checkpoint.json"
+            ),
+        ),
+        schedule_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "schedule_anchor_inventory.json",
+            "d" * 64,
+        ),
+        game_evidence_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "game_evidence_inventory.json",
+            "e" * 64,
+        ),
+        timezone_gate=AuthorityBinding(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "venue_timezone_seal.json",
+            "f" * 64,
+        ),
+        duplicate_gamepk_disposition=binding,
+        dispositioned_query_ids=(disposition_id,),
+    )
+    source_replay = dataclasses.replace(
+        base_inputs.replay,
+        run_id="historical_walkforward_500_superseding_565534",
+        game_snapshots=tuple(
+            source_snapshot(snapshot)
+            for snapshot in base_inputs.replay.game_snapshots
+        ),
+        duplicate_gamepk_disposition=binding,
+        dispositioned_query_ids=(disposition_id,),
+    )
+    source_inputs = dataclasses.replace(
+        base_inputs,
+        replay=source_replay,
+        bindings=source_bindings,
+    )
+    source_snapshots = tuple(source_snapshot(snapshot) for snapshot in fake_81())
+    return (
+        base_inputs,
+        source_inputs,
+        source_snapshots,
+        source_bindings,
+        source_replay,
+        binding,
+        disposition_id,
+    )
 
 
 class ReplayTests(unittest.TestCase):
@@ -386,6 +496,243 @@ class InventoryTests(unittest.TestCase):
 
         with self.assertRaises(ValueError), patched_store_replay():
             build_inventory(store_inputs(current_phase="PUBLISHED"))
+
+    def test_source_inventory_binds_disposition_and_rejects_stale_identity(self):
+        """Source-only inventory must carry the exact derived authority."""
+        from mlb_backtest.v52_snapshot_store import (
+            build_inventory,
+            inventory_bytes,
+            parse_inventory,
+        )
+        from mlb_backtest.v52_verify_sources import AuthorityBinding
+
+        (
+            base_inputs,
+            source_inputs,
+            source_snapshots,
+            source_bindings,
+            source_replay,
+            binding,
+            disposition_id,
+        ) = _source_store_case()
+        with patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=tuple(sorted(source_snapshots, key=verifier.snapshot_sort_key)),
+        ):
+            inventory = build_inventory(source_inputs)
+        self.assertEqual(inventory.dispositioned_query_ids, (disposition_id,))
+        self.assertEqual(inventory.duplicate_gamepk_disposition, binding)
+        self.assertNotIn(
+            "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
+            inventory.dispositioned_query_ids,
+        )
+
+        def build_source(candidate):
+            with patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=tuple(
+                    sorted(source_snapshots, key=verifier.snapshot_sort_key)
+                ),
+            ):
+                return build_inventory(candidate)
+
+        missing_source_authority = dataclasses.replace(
+            source_inputs,
+            replay=dataclasses.replace(
+                source_replay,
+                duplicate_gamepk_disposition=None,
+                dispositioned_query_ids=(),
+            ),
+            bindings=dataclasses.replace(
+                source_bindings,
+                duplicate_gamepk_disposition=None,
+                dispositioned_query_ids=(),
+            ),
+        )
+        with self.assertRaisesRegex(
+            (TypeError, ValueError), "disposition|source|authority|binding"
+        ):
+            build_source(missing_source_authority)
+
+        for label, candidate in (
+            (
+                "empty-binding-ids",
+                dataclasses.replace(
+                    source_inputs,
+                    replay=dataclasses.replace(
+                        source_replay, dispositioned_query_ids=()
+                    ),
+                    bindings=dataclasses.replace(
+                        source_bindings, dispositioned_query_ids=()
+                    ),
+                ),
+            ),
+            (
+                "replay-binding-missing",
+                dataclasses.replace(
+                    source_inputs,
+                    replay=dataclasses.replace(
+                        source_replay,
+                        duplicate_gamepk_disposition=None,
+                        dispositioned_query_ids=(),
+                    ),
+                ),
+            ),
+            (
+                "legacy-timezone-gate-path",
+                dataclasses.replace(
+                    source_inputs,
+                    bindings=dataclasses.replace(
+                        source_bindings,
+                        timezone_gate=AuthorityBinding(
+                            "audit/v5_2_qd/historical_superseding_565534/"
+                            "acquisition/timezone_gate.json",
+                            "f" * 64,
+                        ),
+                    ),
+                ),
+            ),
+        ):
+            with self.subTest(label=label), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                build_source(candidate)
+
+        source_raw = inventory_bytes(inventory)
+        for label, mutate in (
+            (
+                "missing-both",
+                lambda value: (
+                    value.pop("duplicate_gamepk_disposition"),
+                    value.pop("dispositioned_query_ids"),
+                ),
+            ),
+            (
+                "missing-binding",
+                lambda value: value.pop("duplicate_gamepk_disposition"),
+            ),
+            (
+                "empty-ids",
+                lambda value: value.__setitem__("dispositioned_query_ids", []),
+            ),
+        ):
+            with self.subTest(inventory=label):
+                candidate = json.loads(source_raw)
+                mutate(candidate)
+                with self.assertRaises((TypeError, ValueError)):
+                    parse_inventory(_canonical_raw(candidate))
+
+        with patched_store_replay():
+            old_inventory = build_inventory(store_inputs())
+        old_payload = old_inventory.as_mapping()
+        self.assertNotIn("duplicate_gamepk_disposition", old_payload)
+        self.assertNotIn("dispositioned_query_ids", old_payload)
+        self.assertEqual(parse_inventory(inventory_bytes(old_inventory)), old_inventory)
+
+    def test_source_inventory_schema_exactly_separates_authority_branches(self):
+        from mlb_backtest.v52_snapshot_store import parse_inventory
+
+        schema = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "schemas/v5_2_source_inventory.schema.json"
+            ).read_bytes()
+        )
+        old = self._inventory().as_mapping()
+        jsonschema.validate(old, schema)
+
+        disposition_id = (
+            "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+        )
+        sidecar_sha = (
+            "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+        )
+        source = json.loads(_canonical_raw(old))
+        source["run_id"] = "historical_walkforward_500_superseding_565534"
+        source["run_spec"]["path"] = (
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source["acquisition_contract"]["path"] = (
+            "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source["terminal_checkpoint"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/execution/"
+            "checkpoint.json"
+        )
+        source["schedule_inventory"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "schedule_anchor_inventory.json"
+        )
+        source["game_evidence_inventory"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "game_evidence_inventory.json"
+        )
+        source["timezone_gate"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "venue_timezone_seal.json"
+        )
+        source["duplicate_gamepk_disposition"] = {
+            "query_id": disposition_id,
+            "query_sidecar": {
+                "path": (
+                    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                    f"query_sidecars/{sidecar_sha}.json"
+                ),
+                "sha256": sidecar_sha,
+            },
+            "success_receipt": {
+                "path": (
+                    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                    f"mlb_schedule_game_feed/{disposition_id}/success.json"
+                ),
+                "sha256": "8" * 64,
+            },
+        }
+        source["dispositioned_query_ids"] = [disposition_id]
+        jsonschema.validate(source, schema)
+
+        source_as_old = json.loads(_canonical_raw(source))
+        source_as_old.pop("duplicate_gamepk_disposition")
+        source_as_old.pop("dispositioned_query_ids")
+        old_as_source = json.loads(_canonical_raw(old))
+        old_as_source["duplicate_gamepk_disposition"] = source[
+            "duplicate_gamepk_disposition"
+        ]
+        old_as_source["dispositioned_query_ids"] = [disposition_id]
+        attacks = {
+            "source-as-old": source_as_old,
+            "old-as-source": old_as_source,
+            "generic-sidecar-path": json.loads(_canonical_raw(source)),
+            "generic-success-path": json.loads(_canonical_raw(source)),
+            "wrong-terminal-namespace": json.loads(_canonical_raw(source)),
+            "legacy-timezone-gate-path": json.loads(_canonical_raw(source)),
+            "tampered-snapshot-count": json.loads(_canonical_raw(source)),
+        }
+        attacks["generic-sidecar-path"]["duplicate_gamepk_disposition"][
+            "query_sidecar"
+        ]["path"] = "sealed/query_sidecar.json"
+        attacks["generic-success-path"]["duplicate_gamepk_disposition"][
+            "success_receipt"
+        ]["path"] = "sealed/success.json"
+        attacks["wrong-terminal-namespace"]["terminal_checkpoint"]["path"] = (
+            "audit/v5_2_qd/historical/execution/checkpoint.json"
+        )
+        attacks["legacy-timezone-gate-path"]["timezone_gate"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "timezone_gate.json"
+        )
+        attacks["tampered-snapshot-count"]["counts"]["snapshot_count"] = 80
+        for label, candidate in attacks.items():
+            with self.subTest(label=label), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(candidate, schema)
+            with self.subTest(label=f"semantic-{label}"), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                parse_inventory(_canonical_raw(candidate))
 
 
 class PublishTests(unittest.TestCase):
@@ -891,6 +1238,67 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(loaded.snapshots, tuple(sorted(fake_81(), key=verifier.snapshot_sort_key)))
         with self.assertRaises(FrozenInstanceError):
             loaded.inventory = inventory  # type: ignore[misc]
+
+    def test_source_publish_load_round_trip_preserves_disposition_authority(self):
+        from mlb_backtest.v52_snapshot_store import (
+            build_inventory,
+            inventory_bytes,
+            load_snapshot_store,
+            publish_snapshot_store,
+        )
+        from mlb_backtest.v52_source_contracts import canonical_json_bytes
+
+        (
+            _base_inputs,
+            source_inputs,
+            source_snapshots,
+            _source_bindings,
+            _source_replay,
+            binding,
+            disposition_id,
+        ) = _source_store_case()
+        expected = tuple(
+            sorted(source_snapshots, key=verifier.snapshot_sort_key)
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=expected,
+        ):
+            root = Path(directory).resolve()
+            inventory = build_inventory(source_inputs)
+            publish_snapshot_store(
+                root,
+                inventory,
+                source_inputs,
+                lock_owner="source-round-trip",
+            )
+            loaded = load_snapshot_store(root, source_inputs)
+            committed = (root / "source_inventory.json").read_bytes()
+
+        self.assertEqual(loaded.inventory, inventory)
+        self.assertEqual(inventory_bytes(loaded.inventory), committed)
+        self.assertEqual(
+            loaded.inventory.duplicate_gamepk_disposition, binding
+        )
+        self.assertEqual(
+            loaded.inventory.dispositioned_query_ids, (disposition_id,)
+        )
+        self.assertEqual(len(loaded.snapshots), len(expected))
+        for actual, original in zip(loaded.snapshots, expected, strict=True):
+            self.assertEqual(
+                actual.duplicate_gamepk_disposition,
+                original.duplicate_gamepk_disposition,
+            )
+            self.assertEqual(
+                actual.dispositioned_query_ids,
+                original.dispositioned_query_ids,
+            )
+            self.assertEqual(actual.canonical_bytes, original.canonical_bytes)
+            self.assertEqual(
+                actual.canonical_bytes,
+                canonical_json_bytes(actual.as_mapping()) + b"\n",
+            )
+            self.assertEqual(actual.sha256, original.sha256)
 
     def test_publisher_verifies_with_its_owned_lock_before_release(self):
         import mlb_backtest.v52_snapshot_store as store

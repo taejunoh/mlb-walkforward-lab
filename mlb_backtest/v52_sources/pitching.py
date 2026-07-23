@@ -9,14 +9,10 @@ from bisect import bisect_right, insort
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
 
 from ..source_parsers.pitching import parse_league_era, parse_prior_career_bf
 from ..v52_evidence import LogicalQuery, canonical_query_bytes, logical_query_id
-from ..v52_query_plan import (
-    SplitReceipt,
-    bisect_statcast_query,
-    validate_statcast_query,
-)
 from ..v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
@@ -24,6 +20,9 @@ from ..v52_source_contracts import (
     query_sidecar,
     require_query,
 )
+
+if TYPE_CHECKING:
+    from ..v52_query_plan import SplitReceipt
 
 
 _STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
@@ -78,6 +77,26 @@ _CAREER_LAST_ROOT_ORDINAL_BY_YEAR = {
     year: _CAREER_ROOT_ORDINAL_BY_START[monthly_ranges(*boundary)[-1][0]]
     for year, boundary in SEASON_BOUNDARIES.items()
 }
+
+
+def validate_statcast_query(query: LogicalQuery) -> tuple[date, date]:
+    """Keep the non-Statcast parser import surface offline-only."""
+    from ..v52_query_plan import validate_statcast_query as validate
+
+    return validate(query)
+
+
+def bisect_statcast_query(query: LogicalQuery) -> tuple[LogicalQuery, LogicalQuery]:
+    """Load the query-plan split helper only for Statcast replay work."""
+    from ..v52_query_plan import bisect_statcast_query as bisect
+
+    return bisect(query)
+
+
+def _is_split_receipt(value: object) -> bool:
+    from ..v52_query_plan import SplitReceipt
+
+    return isinstance(value, SplitReceipt)
 
 
 def _day(value: object, label: str) -> date:
@@ -684,7 +703,7 @@ def _validate_split_receipts(
     generated_ids: set[str] = set()
     for receipt in split_receipts:
         if (
-            not isinstance(receipt, SplitReceipt)
+            not _is_split_receipt(receipt)
             or not _SHA256.fullmatch(receipt.split_receipt_id)
             or not _SHA256.fullmatch(receipt.receipt_sha256)
             or receipt.stage != "REMAINING"
@@ -771,7 +790,7 @@ def _seed_bodyless_split_parents(
 ) -> None:
     parent_of_query: dict[str, str] = {}
     for receipt in split_receipts:
-        if not isinstance(receipt, SplitReceipt):
+        if not _is_split_receipt(receipt):
             continue
         for child_id in receipt.child_query_ids:
             parent_of_query[child_id] = receipt.parent_query_id
@@ -781,7 +800,7 @@ def _seed_bodyless_split_parents(
         progressed = False
         remaining = []
         for receipt in unresolved:
-            if not isinstance(receipt, SplitReceipt):
+            if not _is_split_receipt(receipt):
                 remaining.append(receipt)
                 continue
             parent_id = receipt.parent_query_id

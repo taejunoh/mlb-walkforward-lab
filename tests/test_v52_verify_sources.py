@@ -910,9 +910,252 @@ class SnapshotReplayInputFactoryTests(unittest.TestCase):
                     acquisition_contract_path=self.contract_path,
                 )
 
+    def test_source_offline_replay_authenticates_derived_schedule_read(self) -> None:
+        """The real evidence store must receive the disposition capability."""
+        from mlb_backtest.protocols import load_source_run_spec
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            DISPOSITION_ENDPOINT,
+            DuplicateGamePkDispositionAuthority,
+            _requested_range,
+        )
+
+        verifier = self.verifier
+        source_run_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract_path = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source_run = load_source_run_spec(source_run_path)
+        query = LogicalQuery(
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=DISPOSITION_ENDPOINT,
+            parameters={},
+            requested_range=_requested_range(),
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256="a" * 64,
+            acquisition_contract_sha256="b" * 64,
+        )
+        semantics = {"authenticated_projection": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            evidence_root = (
+                root
+                / "data/v5_2_qd/historical_superseding_565534/raw"
+            )
+            evidence_root.parent.mkdir(parents=True)
+            authority = DuplicateGamePkDispositionAuthority(
+                repository_root=root,
+                evidence_root=evidence_root,
+                source_run_spec_path=source_run_path,
+                acquisition_contract_path=source_contract_path,
+                query=query,
+                old_raw_relative=Path("sealed/old.raw"),
+                _snapshots=(),
+            )
+            with (
+                patch.object(
+                    DuplicateGamePkDispositionAuthority,
+                    "reauthenticate",
+                    autospec=True,
+                    side_effect=lambda current: current,
+                ),
+                patch(
+                    "mlb_backtest.v52_source_contracts.recompute_query_sidecar",
+                    return_value=semantics,
+                ),
+            ):
+                store = V52EvidenceStore(evidence_root)
+                with store.acquire_query(query):
+                    published = store.publish_derived_disposition(
+                        query, semantics, authority=authority
+                    )
+
+            disposition_id = logical_query_id(query)
+            binding = {
+                "query_id": disposition_id,
+                "success_receipt": {
+                    "path": "sealed/success.json",
+                    "sha256": hashlib.sha256(
+                        published.success_receipt_path.read_bytes()
+                    ).hexdigest(),
+                },
+                "query_sidecar": {
+                    "path": "sealed/sidecar.json",
+                    "sha256": published.query_sidecar_sha256,
+                },
+            }
+            games = SimpleNamespace(
+                payload={
+                    "duplicate_gamepk_disposition": binding,
+                    "dispositioned_query_ids": [disposition_id],
+                }
+            )
+            graph = SimpleNamespace(
+                query_batches=(
+                    SimpleNamespace(
+                        stage="STATIC_SCHEDULES", batch_id="c" * 64
+                    ),
+                ),
+                completed_queries=(query,),
+                checkpoint=SimpleNamespace(
+                    dispositioned_query_ids=(disposition_id,)
+                ),
+            )
+            context = SimpleNamespace(
+                acquisition_contract_path=source_contract_path,
+                authority=source_run,
+                authority_path=source_run_path,
+                raw_root=evidence_root,
+                repository_root=root,
+            )
+            with (
+                patch.object(
+                    verifier,
+                    "_authenticate_authority_paths",
+                    return_value=context,
+                ),
+                patch.object(
+                    verifier, "_load_terminal_query_graph", return_value=graph
+                ),
+                patch.object(
+                    verifier,
+                    "load_verified_schedule_anchor_inventory",
+                    return_value=object(),
+                ),
+                patch.object(
+                    verifier,
+                    "load_verified_timezone_gate",
+                    return_value=object(),
+                ),
+                patch.object(
+                    verifier,
+                    "load_verified_game_evidence_inventory",
+                    return_value=games,
+                ),
+                patch.object(
+                    verifier, "_build_game_normalized_snapshots", return_value=()
+                ),
+                patch.object(
+                    verifier,
+                    "recompute_query_sidecar",
+                    return_value=semantics,
+                ),
+                patch(
+                    "mlb_backtest.v52_source_contracts.recompute_query_sidecar",
+                    return_value=semantics,
+                ),
+                patch.object(
+                    verifier,
+                    "build_duplicate_disposition_authority",
+                    return_value=authority,
+                ) as build_authority,
+                patch.object(
+                    DuplicateGamePkDispositionAuthority,
+                    "reauthenticate",
+                    autospec=True,
+                    side_effect=lambda current: current,
+                ),
+            ):
+                read_only = V52EvidenceStore.open_read_only(evidence_root)
+                with self.assertRaisesRegex(TypeError, "authenticated authority"):
+                    verifier._read_verified_query_record(read_only, query)
+                wrong_authority = dataclasses.replace(
+                    authority,
+                    query=dataclasses.replace(query, parent_query_id="f" * 64),
+                )
+                with self.assertRaisesRegex(ValueError, "authority|query|binding"):
+                    verifier._read_verified_query_record(
+                        read_only,
+                        query,
+                        duplicate_gamepk_disposition_authority=wrong_authority,
+                    )
+                replay = verifier.load_snapshot_replay_inputs(
+                    root,
+                    source_run,
+                    acquisition_contract_path=source_contract_path,
+                )
+
+            build_authority.assert_called_once_with(
+                root,
+                source_run_spec_path=source_run_path,
+                acquisition_contract_path=source_contract_path,
+            )
+            self.assertEqual(replay.dispositioned_query_ids, (disposition_id,))
+            self.assertEqual(len(replay.records), 1)
+            self.assertEqual(replay.records[0].query_id, disposition_id)
+            self.assertEqual(
+                replay.records[0].storage_mode, "DERIVED_DISPOSITION"
+            )
+
 
 class V52VerifySourcesTest(unittest.TestCase):
-    def test_superseding_pair_stops_before_checkpoint_replay(self) -> None:
+    def test_superseding_replay_inputs_propagate_disposition_identity_to_game_and_history(
+        self,
+    ) -> None:
+        """Derived schedule authority is present in every replayed game family."""
+        from tests.v52_snapshot_store_fixture import fake_81, replay_inputs
+
+        disposition_id = (
+            "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+        )
+        sidecar_sha = (
+            "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+        )
+        receipt_sha = "8" * 64
+        from mlb_backtest.v52_verify_sources import (
+            AuthorityBinding,
+            DuplicateGamePkDispositionBinding,
+        )
+
+        binding = DuplicateGamePkDispositionBinding(
+            query_id=disposition_id,
+            query_sidecar=AuthorityBinding("sidecar.json", sidecar_sha),
+            success_receipt=AuthorityBinding("success.json", receipt_sha),
+        )
+        snapshots = list(fake_81())
+        for index, snapshot in enumerate(snapshots):
+            if snapshot.source in {
+                "mlb_schedule_game_feed",
+                "prior_schedule_history",
+            }:
+                snapshots[index] = dataclasses.replace(
+                    snapshot,
+                    dispositioned_query_ids=(disposition_id,),
+                    duplicate_gamepk_disposition=binding,
+                )
+        base = replay_inputs()
+        replay = dataclasses.replace(
+            base,
+            run_id="historical_walkforward_500_superseding_565534",
+            game_snapshots=tuple(snapshots),
+            duplicate_gamepk_disposition=binding,
+            dispositioned_query_ids=(disposition_id,),
+        )
+        self.assertEqual(replay.dispositioned_query_ids, (disposition_id,))
+        self.assertEqual(replay.duplicate_gamepk_disposition, binding)
+        for snapshot in replay.game_snapshots:
+            if snapshot.source in {
+                "mlb_schedule_game_feed",
+                "prior_schedule_history",
+            }:
+                self.assertEqual(snapshot.dispositioned_query_ids, (disposition_id,))
+                self.assertEqual(snapshot.duplicate_gamepk_disposition, binding)
+        self.assertNotIn(
+            "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
+            replay.dispositioned_query_ids,
+        )
+
+    def test_superseding_pair_authenticates_then_reaches_source_graph(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
         from mlb_backtest.protocols import load_source_run_spec
         from mlb_backtest.v52_verify_sources import load_snapshot_replay_inputs
 
@@ -927,19 +1170,36 @@ class V52VerifySourcesTest(unittest.TestCase):
             "historical_source_acquisition_superseding_565534.json"
         )
         source_run = load_source_run_spec(source_run_path)
-        with self.assertRaisesRegex(ValueError, "Task 6"):
+
+        class SourceGraphReached(RuntimeError):
+            pass
+
+        with patch.object(
+            verifier,
+            "_load_terminal_query_graph",
+            side_effect=SourceGraphReached("source graph reached"),
+        ) as graph_loader, self.assertRaisesRegex(
+            SourceGraphReached, "source graph reached"
+        ):
             load_snapshot_replay_inputs(
                 ROOT,
                 source_run,
                 acquisition_contract_path=source_contract_path,
             )
-        with self.assertRaises(ValueError):
+        graph_loader.assert_called_once_with(ROOT, source_run)
+
+        with patch.object(
+            verifier, "_load_terminal_query_graph"
+        ) as graph_loader, self.assertRaisesRegex(
+            ValueError, "source authority pair differs"
+        ):
             load_snapshot_replay_inputs(
                 ROOT,
                 source_run,
                 acquisition_contract_path=ROOT
                 / "protocols/v5_2_qd/historical_source_acquisition.json",
             )
+        graph_loader.assert_not_called()
 
     def test_completed_query_graph_classifies_root_and_split_leaves(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier

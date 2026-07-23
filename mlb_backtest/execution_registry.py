@@ -3009,6 +3009,7 @@ def _checkpoint_stage_authority(
         build_legacy_partition_batch,
         build_participant_derived_batch,
         build_statcast_root_batch,
+        build_statcast_root_batch_for_authority,
         build_static_batch,
         load_query_batch_for_authority,
     )
@@ -3133,10 +3134,14 @@ def _checkpoint_stage_authority(
 
     inventory = load_verified_game_evidence_inventory(
         paths.root,
+        run_spec_path=run_path,
+        acquisition_contract_path=contract_path,
         read_only_progress=read_only_progress,
     )
     participant_batch = build_participant_derived_batch(
         paths.root,
+        run_spec_path=run_path,
+        acquisition_contract_path=contract_path,
         read_only_progress=read_only_progress,
     )
     if (
@@ -3148,12 +3153,22 @@ def _checkpoint_stage_authority(
         )
     ):
         raise ValueError("PARTICIPANT_DERIVED game inventory authority differs")
+    try:
+        inventory_relative = inventory.path.relative_to(paths.root).as_posix()
+    except ValueError as exc:
+        raise ValueError("PARTICIPANT_DERIVED game inventory path differs") from exc
+    expected_inventory_relative = (
+        _authority_namespace(run_spec, "audit")
+        / "acquisition/game_evidence_inventory.json"
+    ).as_posix()
+    if inventory_relative != expected_inventory_relative:
+        raise ValueError("PARTICIPANT_DERIVED game inventory path differs")
     participant_stage_evidence = tuple(
         sorted(
             (
                 *stage_evidence,
                 {
-                    "path": _GAME_EVIDENCE_INVENTORY_PATH,
+                    "path": inventory_relative,
                     "sha256": inventory.sha256,
                 },
             ),
@@ -3170,7 +3185,15 @@ def _checkpoint_stage_authority(
         load_verified_legacy_decision_inventory,
     )
 
-    root_expected = build_statcast_root_batch(paths.root)
+    root_expected = (
+        build_statcast_root_batch_for_authority(
+            paths.root,
+            run_spec_path=run_path,
+            acquisition_contract_path=contract_path,
+        )
+        if isinstance(run_spec, SourceRunSpec)
+        else build_statcast_root_batch(paths.root)
+    )
     root_batch = load_query_batch_for_authority(
         paths.root,
         root_expected.batch_id,
@@ -3179,9 +3202,15 @@ def _checkpoint_stage_authority(
     )
     if root_batch != root_expected or len(root_batch.queries) != 46:
         raise ValueError("REMAINING Statcast root authority differs")
-    decision = load_verified_legacy_decision_inventory(paths.root)
+    decision = load_verified_legacy_decision_inventory(
+        paths.root,
+        run_spec_path=run_path,
+        acquisition_contract_path=contract_path,
+    )
     partition_batch = build_legacy_partition_batch(
         paths.root,
+        run_spec_path=run_path,
+        acquisition_contract_path=contract_path,
         read_only_progress=read_only_progress,
     )
     if (
@@ -3197,9 +3226,13 @@ def _checkpoint_stage_authority(
         Path(_PROTECTED_RAW_INVENTORY_PATH),
         "REMAINING protected raw inventory",
     )
+    decision_relative = (
+        _authority_namespace(run_spec, "audit")
+        / "acquisition/legacy_decision_inventory.json"
+    )
     decision_binding = _checkpoint_artifact_binding(
         paths.root,
-        Path(_LEGACY_DECISION_INVENTORY_PATH),
+        decision_relative,
         "REMAINING legacy decision inventory",
     )
     root_relative = (

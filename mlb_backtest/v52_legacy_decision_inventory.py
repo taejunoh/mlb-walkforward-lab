@@ -15,6 +15,7 @@ from typing import Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .protocols import SourceRunSpec
 from .v52_evidence import LogicalQuery, logical_query_id
 from .v52_legacy import (
     LegacyDecisionEvidence,
@@ -35,6 +36,7 @@ from .v52_query_plan import (
     SourceAuthorityContext,
     build_legacy_partition_batch_from_catalog,
     build_statcast_root_batch,
+    build_statcast_root_batch_for_authority,
 )
 from .v52_source_contracts import canonical_json_bytes
 
@@ -53,7 +55,7 @@ _LEGACY_DECISION_INVENTORY_RELATIVE = Path(
 _PERMITTED_YEARS = (2022, 2023, 2024)
 _RUN_ID = "historical_walkforward_500"
 _EXPECTED_SCHEMA_SHA256 = (
-    "39864790fa275262bbdb932efaa9f52138aa6d29b98881666b01b9fbb80a68e5"
+    "584c16e7df2b582e296d350f5595490c0522519f0c006bfe3b05abb8e69a919c"
 )
 _MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 _TOP_LEVEL_KEYS = frozenset(
@@ -134,11 +136,6 @@ def _authority_context(
     context = _load_static_contracts(supplied_run, supplied_contract)
     if context.repository_root != root:
         raise ValueError("authority pair repository root differs")
-    # Query-batch/checkpoint replay has no SourceRunSpec authority until Task 6.
-    from .protocols import SourceRunSpec
-
-    if isinstance(context.authority, SourceRunSpec):
-        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
     return context
 
 
@@ -472,9 +469,20 @@ def _assemble(
         protected_inventory_path=root / _PROTECTED_INVENTORY_RELATIVE,
         protected_inventory_sha256=protected_sha256,
     )
-    root_expected = build_statcast_root_batch(root)
+    root_expected = (
+        build_statcast_root_batch_for_authority(
+            root,
+            run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+        )
+        if isinstance(context.authority, SourceRunSpec)
+        else build_statcast_root_batch(root)
+    )
     root_batch = _load_query_batch(
-        root, root_expected.batch_id, invoke_authority_hook=False
+        root,
+        root_expected.batch_id,
+        invoke_authority_hook=False,
+        authority=context.authority,
     )
     if root_batch != root_expected or len(root_batch.queries) != 46:
         raise ValueError("Statcast root batch authority differs")
@@ -931,9 +939,16 @@ def load_verified_legacy_decision_inventory(
 
 def _load_legacy_partition_decision_replay(
     repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
 ) -> tuple[str, str, tuple[Mapping[str, object], ...]]:
     """Return the sealed decision-file hash, protected hash, and frozen decisions."""
-    verified = load_verified_legacy_decision_inventory(repository_root)
+    verified = load_verified_legacy_decision_inventory(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
     protected = verified.payload.get("protected_inventory")
     decisions = verified.payload.get("decisions")
     counts = verified.payload.get("counts")

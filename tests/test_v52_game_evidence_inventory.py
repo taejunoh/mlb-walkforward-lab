@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import jsonschema
@@ -30,6 +31,42 @@ SCHEMA = ROOT / "schemas/v5_2_game_evidence_inventory.schema.json"
 INVENTORY = Path(
     "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
 )
+
+# Task 8 source-only duplicate disposition authority.  These are the immutable
+# identities produced by the approved 565534 derived query; downstream game
+# inventory must carry them without retaining the old quarantined query.
+_DISPOSITION_QUERY_ID = (
+    "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+)
+_DISPOSITION_SIDECAR_SHA256 = (
+    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+)
+_DISPOSITION_RECEIPT_SHA256 = "8" * 64
+_OLD_QUARANTINED_QUERY_ID = (
+    "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8"
+)
+
+
+def _disposition_binding() -> dict[str, object]:
+    return {
+        "query_id": _DISPOSITION_QUERY_ID,
+        "query_sidecar": {
+            "path": (
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "query_sidecars/"
+                f"{_DISPOSITION_SIDECAR_SHA256}.json"
+            ),
+            "sha256": _DISPOSITION_SIDECAR_SHA256,
+        },
+        "success_receipt": {
+            "path": (
+                "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                "mlb_schedule_game_feed/"
+                f"{_DISPOSITION_QUERY_ID}/success.json"
+            ),
+            "sha256": _DISPOSITION_RECEIPT_SHA256,
+        },
+    }
 
 
 def _canonical(value: object) -> bytes:
@@ -271,10 +308,9 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             )
             self.assertNotEqual(completed.returncode, 0)
 
-    def test_superseding_pair_stops_before_query_batch_replay(self) -> None:
-        from mlb_backtest.v52_game_evidence_inventory import (
-            build_game_evidence_inventory,
-        )
+    def test_superseding_pair_authenticates_exact_paths_before_replay(self) -> None:
+        from mlb_backtest import v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.protocols import SourceRunSpec
 
         source_run = (
             ROOT
@@ -286,18 +322,23 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             / "protocols/v5_2_qd/"
             "historical_source_acquisition_superseding_565534.json"
         )
-        with self.assertRaisesRegex(TypeError, "Task 6"):
-            build_game_evidence_inventory(
+        context = inventory_module._authority_context(
+            ROOT, source_run, source_contract
+        )
+        self.assertIsInstance(context.authority, SourceRunSpec)
+        self.assertEqual(
+            context.run_id,
+            "historical_walkforward_500_superseding_565534",
+        )
+        self.assertEqual(
+            context.acquisition_audit_root,
+            ROOT / "audit/v5_2_qd/historical_superseding_565534/acquisition",
+        )
+        with self.assertRaisesRegex(ValueError, "pair|contract|authority"):
+            inventory_module._authority_context(
                 ROOT,
-                run_spec_path=source_run,
-                acquisition_contract_path=source_contract,
-            )
-        with self.assertRaises(ValueError):
-            build_game_evidence_inventory(
-                ROOT,
-                run_spec_path=source_run,
-                acquisition_contract_path=ROOT
-                / "protocols/v5_2_qd/historical_source_acquisition.json",
+                source_run,
+                ROOT / "protocols/v5_2_qd/historical_source_acquisition.json",
             )
 
     @staticmethod
@@ -868,6 +909,574 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                 (rebound.st_dev, rebound.st_ino),
                 (winner_stat.st_dev, winner_stat.st_ino),
             )
+
+    def test_actual_source_run_verified_load_reaches_both_final_rebinds(self) -> None:
+        """The authenticated SourceRunSpec must use the real verified-load path."""
+        from mlb_backtest import v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.protocols import SourceRunSpec
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        context = inventory_module._authority_context(
+            ROOT, source_run, source_contract
+        )
+        self.assertIsInstance(context.authority, SourceRunSpec)
+        inventory_relative = (
+            context.acquisition_audit_root.relative_to(ROOT)
+            / "game_evidence_inventory.json"
+        )
+        payload = {
+            "artifact_kind": "GAME_EVIDENCE_INVENTORY",
+            "run_id": context.run_id,
+            "schema_version": 1,
+        }
+        snapshot = SimpleNamespace(
+            contents=_canonical(payload),
+            identity=(1, 2, 3),
+            relative=inventory_relative,
+        )
+        authority = inventory_module._Authority(payload, (), context)
+
+        with (
+            patch.object(
+                inventory_module, "_required_snapshot", return_value=snapshot
+            ) as read_inventory,
+            patch.object(
+                inventory_module,
+                "_build_current_authority",
+                side_effect=(authority, authority),
+            ) as build_authority,
+            patch.object(inventory_module, "_rebind_authority") as rebind_authority,
+            patch.object(
+                inventory_module, "_rebind_safe_snapshot"
+            ) as rebind_inventory,
+            patch.object(
+                inventory_module, "_before_game_inventory_final_rebind"
+            ) as final_hook,
+        ):
+            loaded = inventory_module.load_verified_game_evidence_inventory(
+                ROOT,
+                read_only_progress=True,
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+
+        self.assertEqual(loaded.path, ROOT / inventory_relative)
+        self.assertEqual(_thaw(loaded.payload), payload)
+        read_inventory.assert_called_once_with(
+            ROOT, inventory_relative, "game evidence inventory"
+        )
+        self.assertEqual(build_authority.call_count, 2)
+        final_hook.assert_called_once_with()
+        rebind_authority.assert_called_once_with(ROOT, authority)
+        rebind_inventory.assert_called_once_with(
+            ROOT,
+            snapshot,
+            "game evidence inventory",
+            max_bytes=inventory_module._MAX_ARTIFACT_BYTES,
+        )
+
+    def test_source_build_authenticates_disposition_semantics_and_adapter(self) -> None:
+        """The source build traverses the authority-only derived query branch."""
+        from mlb_backtest import v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            DISPOSITION_ENDPOINT,
+            _requested_range,
+        )
+        from mlb_backtest.v52_evidence import LogicalQuery
+
+        source_run = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = (
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        context = inventory_module._authority_context(
+            ROOT, source_run, source_contract
+        )
+        disposition_query = LogicalQuery(
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=DISPOSITION_ENDPOINT,
+            parameters={},
+            requested_range=_requested_range(),
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256=context.authority_sha256,
+            acquisition_contract_sha256=context.acquisition_contract_sha256,
+        )
+        self.assertEqual(logical_query_id(disposition_query), _DISPOSITION_QUERY_ID)
+        schedule_query = LogicalQuery(
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint="https://statsapi.mlb.com/api/v1/schedule",
+            parameters={},
+            requested_range={"year": 2018},
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256=context.authority_sha256,
+            acquisition_contract_sha256=context.acquisition_contract_sha256,
+        )
+        schedule_contents = _canonical(
+            {"static_batch": {"batch_id": "1" * 64}}
+        )
+        schedule_sha = hashlib.sha256(schedule_contents).hexdigest()
+        static_batch = SimpleNamespace(
+            batch_id="1" * 64,
+            stage="STATIC_SCHEDULES",
+            derived_from_sha256=None,
+            queries=(schedule_query, disposition_query),
+        )
+        reference_batch = SimpleNamespace(
+            batch_id="2" * 64,
+            stage="REFERENCE_INPUTS",
+            derived_from_sha256=schedule_sha,
+            queries=(),
+        )
+        source_binding = _disposition_binding()
+        season_sources = [
+            {"season": season}
+            for season in range(2018, 2025)
+        ]
+        season_sources[1] = {
+            "season": 2019,
+            "storage_mode": "DERIVED_DISPOSITION",
+            "raw_sha256": None,
+            **source_binding,
+        }
+        verified_schedule = SimpleNamespace(
+            sha256=schedule_sha,
+            payload={
+                "anchors": [{"game_pk": 565534, "season": 2019}],
+                "season_sources": season_sources,
+            },
+        )
+
+        snapshot_contents = {
+            "game evidence RunSpec": source_run.read_bytes(),
+            "game evidence acquisition contract": source_contract.read_bytes(),
+            "game evidence schedule inventory": schedule_contents,
+            "game evidence STATIC_SCHEDULES batch": _canonical({"id": "1" * 64}),
+            "game evidence REFERENCE_INPUTS batch": _canonical({"id": "2" * 64}),
+            "game evidence timezone candidate": _canonical({"kind": "candidate"}),
+            "game evidence timezone coverage review": _canonical({"kind": "coverage"}),
+            "game evidence timezone semantic review": _canonical({"kind": "semantic"}),
+            "game evidence timezone mapping": _canonical({"kind": "mapping"}),
+            "game evidence timezone seal": _canonical({"kind": "seal"}),
+        }
+        identity = iter(range(1, 100))
+
+        def required_snapshot(_root, relative, label, **_kwargs):
+            return SimpleNamespace(
+                contents=snapshot_contents[label],
+                identity=(next(identity),),
+                relative=relative,
+            )
+
+        timezone_gate = SimpleNamespace(
+            run_spec_sha256=hashlib.sha256(
+                snapshot_contents["game evidence RunSpec"]
+            ).hexdigest(),
+            acquisition_contract_sha256=hashlib.sha256(
+                snapshot_contents["game evidence acquisition contract"]
+            ).hexdigest(),
+            schedule_inventory_sha256=schedule_sha,
+            query_batch_ids=(static_batch.batch_id, reference_batch.batch_id),
+            query_batch_sha256s=(
+                hashlib.sha256(
+                    snapshot_contents["game evidence STATIC_SCHEDULES batch"]
+                ).hexdigest(),
+                hashlib.sha256(
+                    snapshot_contents["game evidence REFERENCE_INPUTS batch"]
+                ).hexdigest(),
+            ),
+            candidate_sha256=hashlib.sha256(
+                snapshot_contents["game evidence timezone candidate"]
+            ).hexdigest(),
+            review_sha256s=(
+                hashlib.sha256(
+                    snapshot_contents["game evidence timezone coverage review"]
+                ).hexdigest(),
+                hashlib.sha256(
+                    snapshot_contents["game evidence timezone semantic review"]
+                ).hexdigest(),
+            ),
+            mapping_sha256=hashlib.sha256(
+                snapshot_contents["game evidence timezone mapping"]
+            ).hexdigest(),
+            seal_sha256=hashlib.sha256(
+                snapshot_contents["game evidence timezone seal"]
+            ).hexdigest(),
+        )
+        ordinary_semantics = {"season": 2018}
+        disposition_semantics = {"authenticated_projection": True}
+
+        def verified(query, semantics, raw, storage_mode, sidecar_sha):
+            published = SimpleNamespace(
+                storage_mode=storage_mode,
+                query_sidecar_sha256=sidecar_sha,
+            )
+            return SimpleNamespace(
+                registered_query=query,
+                published_evidence=published,
+                attempt_receipts=(),
+                query_sidecar={
+                    "source": query.source,
+                    "grain": query.grain,
+                    "parser_version": query.parser_version,
+                    "schema_version": 1,
+                    "query_id": logical_query_id(query),
+                    "semantics": semantics,
+                },
+                raw_bytes=raw,
+                success_receipt={"storage_mode": storage_mode},
+            )
+
+        ordinary_verified = verified(
+            schedule_query,
+            ordinary_semantics,
+            b"{}",
+            "FETCHED_RAW",
+            "7" * 64,
+        )
+        disposition_verified = verified(
+            disposition_query,
+            disposition_semantics,
+            None,
+            "DERIVED_DISPOSITION",
+            _DISPOSITION_SIDECAR_SHA256,
+        )
+        def verified_for(query):
+            return (
+                disposition_verified
+                if query == disposition_query
+                else ordinary_verified
+            )
+        authority_calls: list[tuple[str, object | None]] = []
+
+        class FakeStore:
+            def read_verified_query_progress(self, query, *, authority=None):
+                authority_calls.append(("progress", authority))
+                value = verified_for(query)
+                return SimpleNamespace(
+                    status="SUCCESS",
+                    registered_query=query,
+                    published_evidence=value.published_evidence,
+                    pending_attempt_numbers=(),
+                    quarantines=(),
+                    attempt_receipts=(),
+                )
+
+            def read_verified_success(self, query, *, authority=None):
+                authority_calls.append(("success", authority))
+                return verified_for(query)
+
+        disposition_authority = SimpleNamespace(
+            query=disposition_query,
+            reauthenticate=lambda: disposition_authority,
+        )
+        captured_adapters: list[Mapping[str, object]] = []
+
+        def game_snapshot(schedule_sidecars, _boxscores):
+            captured_adapters.extend(schedule_sidecars)
+            adapter = schedule_sidecars[-1]
+            adapter_sha = hashlib.sha256(_canonical(adapter)).hexdigest()
+            return {
+                "games": [
+                    {
+                        "actual_starter_ids": [],
+                        "played": False,
+                        "schedule_query_sidecar_sha256": adapter_sha,
+                        "season": 2019,
+                        "source_game_sha256": "6" * 64,
+                    }
+                ],
+                "source_query_sidecar_sha256s": [adapter_sha],
+            }
+
+        def recompute(query, raw, *, authority=None):
+            if query == disposition_query:
+                self.assertIs(authority, disposition_authority)
+                self.assertEqual(raw, b"")
+                return disposition_semantics
+            self.assertIsNone(authority)
+            return ordinary_semantics
+
+        with (
+            patch.object(
+                inventory_module,
+                "_required_snapshot",
+                side_effect=required_snapshot,
+            ),
+            patch.object(
+                inventory_module,
+                "load_verified_schedule_anchor_inventory",
+                return_value=verified_schedule,
+            ),
+            patch.object(
+                inventory_module,
+                "_load_authority_batch",
+                side_effect=(static_batch, reference_batch),
+            ),
+            patch.object(
+                inventory_module,
+                "build_schedule_reference_batch",
+                return_value=reference_batch,
+            ),
+            patch.object(
+                inventory_module,
+                "load_verified_timezone_gate",
+                return_value=timezone_gate,
+            ),
+            patch.object(
+                inventory_module.V52EvidenceStore,
+                "open_read_only",
+                return_value=FakeStore(),
+            ),
+            patch(
+                "mlb_backtest.v52_duplicate_gamepk_disposition."
+                "build_duplicate_disposition_authority",
+                return_value=disposition_authority,
+            ),
+            patch.object(
+                inventory_module,
+                "_verified_evidence_snapshots",
+                return_value=(),
+            ),
+            patch.object(
+                inventory_module,
+                "recompute_query_sidecar",
+                side_effect=recompute,
+            ),
+            patch.object(
+                inventory_module,
+                "recompute_schedule_anchor_sidecar",
+                return_value=ordinary_verified.query_sidecar,
+            ),
+            patch.object(
+                inventory_module,
+                "recompute_game_evidence_snapshot",
+                side_effect=game_snapshot,
+            ),
+            patch.object(inventory_module, "_validate_game_projection"),
+        ):
+            built = inventory_module._build_current_authority(
+                ROOT,
+                read_only_progress=True,
+                run_spec_path=source_run,
+                acquisition_contract_path=source_contract,
+            )
+
+        self.assertEqual(
+            built.payload["duplicate_gamepk_disposition"], source_binding
+        )
+        self.assertEqual(
+            built.payload["dispositioned_query_ids"], [_DISPOSITION_QUERY_ID]
+        )
+        self.assertEqual(
+            built.payload["source_query_sidecar_sha256s"],
+            [_DISPOSITION_SIDECAR_SHA256],
+        )
+        adapter = captured_adapters[-1]
+        self.assertEqual(
+            set(adapter),
+            {
+                "byte_count",
+                "grain",
+                "parser_version",
+                "query_id",
+                "raw_sha256",
+                "schema_version",
+                "semantics",
+                "source",
+            },
+        )
+        self.assertEqual(adapter["raw_sha256"], hashlib.sha256(b"").hexdigest())
+        disposition_calls = [
+            authority
+            for _operation, authority in authority_calls
+            if authority is not None
+        ]
+        self.assertEqual(disposition_calls, [disposition_authority] * 3)
+
+    def test_superseding_inventory_schema_carries_only_derived_disposition_authority(
+        self,
+    ) -> None:
+        """The new branch carries the derived receipt/sidecar and sorted ID.
+
+        This is deliberately a schema-level RED test: the old closed schema
+        must reject the source-only run until Task 8 adds its exact oneOf
+        branch.  The old quarantined query ID is not part of the downstream
+        binding.
+        """
+        payload = {
+            "acquisition_contract": {
+                "path": "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+                "sha256": "b" * 64,
+            },
+            "artifact_kind": "GAME_EVIDENCE_INVENTORY",
+            "counts": {
+                "game_count": 1,
+                "played_game_count": 0,
+                "unique_actual_starter_count": 0,
+                "unplayed_game_count": 1,
+                "verified_feature_consumer_game_count": 0,
+            },
+            "games": [{"game_pk": 565534, "season": 2019}],
+            "query_batches": [
+                {
+                    "batch_id": "1" * 64,
+                    "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches/"
+                    + "1" * 64 + ".json",
+                    "sha256": "1" * 64,
+                    "stage": "STATIC_SCHEDULES",
+                },
+                {
+                    "batch_id": "2" * 64,
+                    "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches/"
+                    + "2" * 64 + ".json",
+                    "sha256": "2" * 64,
+                    "stage": "REFERENCE_INPUTS",
+                },
+            ],
+            "run_id": "historical_walkforward_500_superseding_565534",
+            "run_spec": {
+                "path": "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+                "sha256": "a" * 64,
+            },
+            "schedule_inventory": {
+                "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/schedule_anchor_inventory.json",
+                "sha256": "c" * 64,
+            },
+            "schema_version": 1,
+            "source_query_sidecar_sha256s": [_DISPOSITION_SIDECAR_SHA256],
+            "timezone_gate": {
+                "candidate": {
+                    "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/venue_timezone_candidate.json",
+                    "sha256": "f" * 64,
+                },
+                "mapping": {
+                    "path": "config/v5_2_qd/venue_timezones.json",
+                    "sha256": "0" * 64,
+                },
+                "reviews": [
+                    {
+                        "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/timezone_reviews/coverage.json",
+                        "sha256": "1" * 64,
+                    },
+                    {
+                        "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/timezone_reviews/semantic.json",
+                        "sha256": "2" * 64,
+                    },
+                ],
+                "seal": {
+                    "path": "audit/v5_2_qd/historical_superseding_565534/acquisition/venue_timezone_seal.json",
+                    "sha256": "3" * 64,
+                },
+            },
+            "duplicate_gamepk_disposition": _disposition_binding(),
+            "dispositioned_query_ids": [_DISPOSITION_QUERY_ID],
+        }
+        jsonschema.validate(payload, json.loads(SCHEMA.read_bytes()))
+
+    def test_schema_exactly_separates_old_and_source_authority_branches(self) -> None:
+        """Neither authority may validate by falling through the other branch."""
+        from mlb_backtest.v52_game_evidence_inventory import (
+            publish_game_evidence_inventory,
+        )
+
+        schema = json.loads(SCHEMA.read_bytes())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _fixture(root)
+            old = _thaw(publish_game_evidence_inventory(root).payload)
+        self.assertIsInstance(old, dict)
+        jsonschema.validate(old, schema)
+
+        source = json.loads(_canonical(old))
+        source["run_id"] = "historical_walkforward_500_superseding_565534"
+        source["run_spec"]["path"] = (
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source["acquisition_contract"]["path"] = (
+            "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        source["schedule_inventory"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "schedule_anchor_inventory.json"
+        )
+        for batch in source["query_batches"]:
+            batch["path"] = (
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                f"query_batches/{batch['batch_id']}.json"
+            )
+        source["timezone_gate"]["candidate"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "venue_timezone_candidate.json"
+        )
+        source["timezone_gate"]["reviews"][0]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "timezone_reviews/coverage.json"
+        )
+        source["timezone_gate"]["reviews"][1]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "timezone_reviews/semantic.json"
+        )
+        source["timezone_gate"]["seal"]["path"] = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "venue_timezone_seal.json"
+        )
+        source["duplicate_gamepk_disposition"] = _disposition_binding()
+        source["dispositioned_query_ids"] = [_DISPOSITION_QUERY_ID]
+        jsonschema.validate(source, schema)
+
+        source_as_old = json.loads(_canonical(source))
+        source_as_old.pop("duplicate_gamepk_disposition")
+        source_as_old.pop("dispositioned_query_ids")
+        old_as_source = json.loads(_canonical(old))
+        old_as_source["duplicate_gamepk_disposition"] = _disposition_binding()
+        old_as_source["dispositioned_query_ids"] = [_DISPOSITION_QUERY_ID]
+
+        attacks = {
+            "source-as-old": source_as_old,
+            "old-as-source": old_as_source,
+            "generic-sidecar-path": json.loads(_canonical(source)),
+            "generic-success-path": json.loads(_canonical(source)),
+            "wrong-batch-namespace": json.loads(_canonical(source)),
+            "zero-game-count": json.loads(_canonical(source)),
+        }
+        attacks["generic-sidecar-path"]["duplicate_gamepk_disposition"][
+            "query_sidecar"
+        ]["path"] = "sealed/query_sidecar.json"
+        attacks["generic-success-path"]["duplicate_gamepk_disposition"][
+            "success_receipt"
+        ]["path"] = "sealed/success.json"
+        attacks["wrong-batch-namespace"]["query_batches"][0]["path"] = (
+            "audit/v5_2_qd/historical/acquisition/query_batches/"
+            f"{source['query_batches'][0]['batch_id']}.json"
+        )
+        attacks["zero-game-count"]["counts"]["game_count"] = 0
+        for label, candidate in attacks.items():
+            with self.subTest(label=label), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(candidate, schema)
 
 
 if __name__ == "__main__":

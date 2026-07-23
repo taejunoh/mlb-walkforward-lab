@@ -154,7 +154,7 @@ def _statcast_root_batch_path(root: Path) -> Path:
 
 
 class V52LegacyDecisionInventoryTest(unittest.TestCase):
-    def test_superseding_pair_stops_before_query_batch_replay(self) -> None:
+    def test_superseding_pair_authenticates_then_requires_source_batch(self) -> None:
         from mlb_backtest.v52_legacy_decision_inventory import (
             build_legacy_decision_inventory,
         )
@@ -169,7 +169,9 @@ class V52LegacyDecisionInventoryTest(unittest.TestCase):
             / "protocols/v5_2_qd/"
             "historical_source_acquisition_superseding_565534.json"
         )
-        with self.assertRaisesRegex(TypeError, "Task 6"):
+        with self.assertRaisesRegex(
+            ValueError, "query batch|ancestors|missing|source"
+        ):
             build_legacy_decision_inventory(
                 ROOT,
                 run_spec_path=source_run,
@@ -791,6 +793,73 @@ class V52LegacyDecisionInventoryTest(unittest.TestCase):
                 published.path.write_bytes(_canonical_json(forged))
                 with self.assertRaises((RuntimeError, ValueError)):
                     inventory_module.load_verified_legacy_decision_inventory(root)
+
+class SourceLegacyDecisionAuthorityTest(unittest.TestCase):
+    def test_source_partition_stays_in_source_authority_namespace(self) -> None:
+        from mlb_backtest.v52_legacy_decision_inventory import (
+            preview_legacy_decisions,
+        )
+        from mlb_backtest.v52_query_plan import (
+            _batch_root_for_batch,
+            build_statcast_root_batch_for_authority,
+            publish_query_batch,
+        )
+        from tests.test_v52_schedule_inventory import (
+            ROOT as SCHEDULE_ROOT,
+            SOURCE_RUN_SPEC_PATH,
+            _source_registry_fixture,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = _source_registry_fixture(base / "source")
+            legacy_root, inventory_path, inventory_sha256 = (
+                _legacy_decision_repository(base / "legacy")
+            )
+            catalog = _load(
+                legacy_root,
+                legacy_root / LEGACY_ROOT,
+                inventory_path,
+                inventory_sha256,
+            )
+            run_path = fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(SCHEDULE_ROOT)
+            root_batch = build_statcast_root_batch_for_authority(
+                fixture.root,
+                run_spec_path=run_path,
+                acquisition_contract_path=fixture.contract_path,
+            )
+            publish_query_batch(fixture.root, root_batch)
+            preview = preview_legacy_decisions(
+                root_batch,
+                catalog,
+                protected_inventory_sha256=inventory_sha256,
+            )
+            partition = preview.partition_batch
+            selected_root = _batch_root_for_batch(fixture.root, partition)
+
+            self.assertEqual(
+                selected_root,
+                Path(
+                    "audit/v5_2_qd/historical_superseding_565534/"
+                    "acquisition/query_batches"
+                ),
+            )
+            self.assertFalse(
+                (
+                    fixture.root
+                    / "audit/v5_2_qd/historical/acquisition/query_batches"
+                    / f"{partition.batch_id}.json"
+                ).exists()
+            )
+            self.assertEqual(partition.derived_from_sha256, inventory_sha256)
+            self.assertEqual(len(partition.queries), 48)
+            self.assertTrue(
+                all(
+                    query.run_spec_sha256
+                    == hashlib.sha256(run_path.read_bytes()).hexdigest()
+                    for query in partition.queries
+                )
+            )
 
 
 if __name__ == "__main__":

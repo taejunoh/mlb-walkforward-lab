@@ -24,6 +24,7 @@ from .v52_evidence import (
 from .v52_query_plan import (
     SourceAuthorityContext,
     _context_roots,
+    _load_query_batch_for_authority,
     _load_static_contracts,
     _read_repository_file,
     _validate_run_bound_acquisition_contract,
@@ -612,8 +613,12 @@ def _verified_evidence_snapshots(
     return tuple(snapshots)
 
 
-def _raw_namespace(run_spec: RunSpec) -> Path:
-    namespaces = run_spec.raw.get("namespaces")
+def _raw_namespace(run_spec: RunSpec | SourceRunSpec) -> Path:
+    namespaces = (
+        run_spec.raw.get("namespaces")
+        if isinstance(run_spec, RunSpec)
+        else run_spec.namespaces
+    )
     value = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
     if not isinstance(value, str):
         raise ValueError("game evidence RunSpec raw namespace differs")
@@ -626,6 +631,103 @@ def _raw_namespace(run_spec: RunSpec) -> Path:
     ):
         raise ValueError("game evidence RunSpec raw namespace differs")
     return relative
+
+
+def _load_authority_batch(
+    root: Path,
+    batch_id: str,
+    authority: RunSpec | SourceRunSpec,
+    *,
+    read_only_progress: bool,
+) -> QueryBatch:
+    """Load a batch only from the namespace selected by its sealed authority.
+
+    The historical public seam remains in place for the original RunSpec.
+    The superseding run must never probe the historical namespace as a
+    fallback, so it always uses the authority-explicit loader.
+    """
+    if isinstance(authority, SourceRunSpec):
+        return _load_query_batch_for_authority(
+            root, batch_id, authority, read_only_progress=read_only_progress
+        )
+    return load_query_batch(root, batch_id, read_only_progress=read_only_progress)
+
+
+def _source_disposition_binding(
+    schedule_payload: Mapping[str, object],
+    disposition_query_id: str,
+) -> dict[str, object]:
+    """Extract the one closed disposition binding from source schedule authority."""
+    sources = schedule_payload.get("season_sources")
+    if not isinstance(sources, list) or len(sources) != 7:
+        raise ValueError("source schedule disposition season sources differ")
+    source = sources[1]
+    if (
+        not isinstance(source, Mapping)
+        or source.get("season") != 2019
+        or source.get("storage_mode") != "DERIVED_DISPOSITION"
+        or source.get("raw_sha256") is not None
+        or source.get("query_id") != disposition_query_id
+    ):
+        raise ValueError("source schedule disposition binding differs")
+    success = source.get("success_receipt")
+    sidecar = source.get("query_sidecar")
+    for value, label in ((success, "success receipt"), (sidecar, "query sidecar")):
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"path", "sha256"}
+            or not isinstance(value.get("path"), str)
+            or not isinstance(value.get("sha256"), str)
+            or _SHA256.fullmatch(value["sha256"]) is None
+        ):
+            raise ValueError(f"source schedule disposition {label} differs")
+    return {
+        "query_id": disposition_query_id,
+        "success_receipt": dict(success),
+        "query_sidecar": dict(sidecar),
+    }
+
+
+def _replace_source_disposition_lineage(
+    snapshot: Mapping[str, object],
+    *,
+    synthetic_sidecar_sha256: str,
+    derived_sidecar_sha256: str,
+) -> dict[str, object]:
+    """Bind the 2019 projected games to the actual derived sidecar.
+
+    ``recompute_game_evidence_snapshot`` deliberately accepts only raw-backed
+    schedule sidecars.  A source disposition has no raw bytes, so a temporary
+    shape-valid adapter is used for the parser reduction and every resulting
+    2019 lineage digest is then recomputed against the authenticated derived
+    sidecar SHA-256.  The adapter digest is never published.
+    """
+    result = json.loads(_canonical_file_bytes(snapshot))
+    if not isinstance(result, dict) or not isinstance(result.get("games"), list):
+        raise ValueError("source game evidence projection differs")
+    for game in result["games"]:
+        if not isinstance(game, dict) or game.get("season") != 2019:
+            continue
+        if game.get("schedule_query_sidecar_sha256") != synthetic_sidecar_sha256:
+            raise ValueError("source game disposition adapter lineage differs")
+        game["schedule_query_sidecar_sha256"] = derived_sidecar_sha256
+        lineage: dict[str, object] = {
+            "anchor_sidecar_sha256": derived_sidecar_sha256,
+            "game": {key: value for key, value in game.items() if key != "source_game_sha256"},
+        }
+        if game.get("played") is True:
+            boxscore = game.get("boxscore_query_sidecar_sha256")
+            if not isinstance(boxscore, str) or _SHA256.fullmatch(boxscore) is None:
+                raise ValueError("source game disposition boxscore lineage differs")
+            lineage["boxscore_query_sidecar_sha256"] = boxscore
+        game["source_game_sha256"] = canonical_sha256(lineage)
+    hashes = result.get("source_query_sidecar_sha256s")
+    if not isinstance(hashes, list) or synthetic_sidecar_sha256 not in hashes:
+        raise ValueError("source game disposition sidecar population differs")
+    result["source_query_sidecar_sha256s"] = sorted(
+        (set(hashes) - {synthetic_sidecar_sha256}) | {derived_sidecar_sha256}
+    )
+    return result
 
 
 def _batch_binding(
@@ -835,10 +937,6 @@ def _build_current_authority(
     acquisition_contract_path: Path | None = None,
 ) -> _Authority:
     context = _authority_context(root, run_spec_path, acquisition_contract_path)
-    # Query-batch/checkpoint machinery remains RunSpec-only until Task 6.  The
-    # static pair above is authenticated before this deliberate rejection.
-    if isinstance(context.authority, SourceRunSpec):
-        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
     authority_relative = context.authority_path.relative_to(root)
     contract_relative = context.acquisition_contract_path.relative_to(root)
     acquisition_relative = context.acquisition_audit_root.relative_to(root)
@@ -857,12 +955,14 @@ def _build_current_authority(
         contract_relative,
         "game evidence acquisition contract",
     )
-    run_spec = parse_run_spec(
-        _json_object(run_snapshot.contents, "game evidence RunSpec")
+    run_spec = (
+        parse_run_spec(_json_object(run_snapshot.contents, "game evidence RunSpec"))
+        if isinstance(context.authority, RunSpec)
+        else context.authority
     )
     if run_spec.run_id != context.run_id:
         raise ValueError("game evidence RunSpec run_id differs")
-    evidence_root = root / _raw_namespace(run_spec)
+    evidence_root = context.raw_root
 
     schedule_snapshot = _required_snapshot(
         root,
@@ -892,10 +992,8 @@ def _build_current_authority(
     if verified_schedule.sha256 != _sha256(schedule_snapshot.contents):
         raise ValueError("game evidence schedule inventory hash differs")
 
-    static_batch = load_query_batch(
-        root,
-        static_batch_id,
-        read_only_progress=read_only_progress,
+    static_batch = _load_authority_batch(
+        root, static_batch_id, context.authority, read_only_progress=read_only_progress
     )
     reference_expected = build_schedule_reference_batch(
         root,
@@ -905,9 +1003,10 @@ def _build_current_authority(
         evidence_root=evidence_root,
         read_only_progress=read_only_progress,
     )
-    reference_batch = load_query_batch(
+    reference_batch = _load_authority_batch(
         root,
         reference_expected.batch_id,
+        context.authority,
         read_only_progress=read_only_progress,
     )
     if (
@@ -928,9 +1027,16 @@ def _build_current_authority(
         "game evidence REFERENCE_INPUTS batch",
     )
 
+    timezone_kwargs = (
+        {
+            "run_spec_path": context.authority_path,
+            "acquisition_contract_path": context.acquisition_contract_path,
+        }
+        if isinstance(context.authority, SourceRunSpec)
+        else {}
+    )
     timezone_gate = load_verified_timezone_gate(
-        root,
-        read_only_progress=read_only_progress,
+        root, read_only_progress=read_only_progress, **timezone_kwargs
     )
     timezone_snapshots = tuple(
         _required_snapshot(root, relative, label)
@@ -972,8 +1078,32 @@ def _build_current_authority(
     schedule_sidecars: list[Mapping[str, object]] = []
     boxscores: dict[int, tuple[bytes, str]] = {}
     evidence_snapshots: list[_BoundSnapshot] = []
+    disposition_authority = None
+    disposition_verified: VerifiedEvidenceRead | None = None
+    disposition_binding: dict[str, object] | None = None
+    disposition_adapter_sha256: str | None = None
+    if isinstance(context.authority, SourceRunSpec):
+        from .v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+
+        disposition_authority = build_duplicate_disposition_authority(
+            root,
+            source_run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+        )
+        if static_batch.queries[1] != disposition_authority.query:
+            raise ValueError("game evidence source disposition static query differs")
+        disposition_binding = _source_disposition_binding(
+            verified_schedule.payload, logical_query_id(disposition_authority.query)
+        )
     for query in (*static_batch.queries, *reference_batch.queries):
-        progress = store.read_verified_query_progress(query)
+        query_authority = (
+            disposition_authority
+            if disposition_authority is not None and query == disposition_authority.query
+            else None
+        )
+        progress = store.read_verified_query_progress(query, authority=query_authority)
         if (
             progress.status != "SUCCESS"
             or progress.registered_query != query
@@ -984,7 +1114,10 @@ def _build_current_authority(
             raise ValueError(
                 "game evidence query progress is not an exact terminal success"
             )
-        verified = store.read_verified_success(query)
+        verified = store.read_verified_success(
+            query,
+            authority=query_authority,
+        )
         if (
             verified.registered_query != query
             or progress.published_evidence != verified.published_evidence
@@ -1000,16 +1133,54 @@ def _build_current_authority(
             _verified_evidence_snapshots(root, evidence_root, verified)
         )
         raw = verified.raw_bytes if verified.raw_bytes is not None else b""
-        recomputed = recompute_query_sidecar(query, raw)
-        expected_sidecar = dict(recomputed)
-        if verified.published_evidence.storage_mode == "DERIVED_DISPOSITION":
+        if query_authority is not None:
+            expected_sidecar = dict(
+                recompute_query_sidecar(query, b"", authority=query_authority)
+            )
+        else:
+            expected_sidecar = dict(recompute_query_sidecar(query, raw))
+        if (
+            verified.published_evidence.storage_mode == "DERIVED_DISPOSITION"
+            and query_authority is None
+        ):
             reason = query.requested_range.get("reason")
             if not isinstance(reason, str) or not reason:
                 raise ValueError("game evidence derived disposition reason differs")
             expected_sidecar["reason"] = reason
         if expected_sidecar != verified.query_sidecar.get("semantics"):
             raise ValueError("game evidence raw/sidecar semantics differ")
-        if query in static_batch.queries:
+        if (
+            disposition_authority is not None
+            and query == disposition_authority.query
+        ):
+            if verified.raw_bytes is not None or disposition_binding is None:
+                raise ValueError("game evidence source disposition raw authority differs")
+            anchors = verified_schedule.payload.get("anchors")
+            if not isinstance(anchors, list):
+                raise ValueError("game evidence source disposition anchors differ")
+            adapter = {
+                "byte_count": 0,
+                "grain": query.grain,
+                "parser_version": query.parser_version,
+                "query_id": logical_query_id(query),
+                "raw_sha256": hashlib.sha256(b"").hexdigest(),
+                "schema_version": 1,
+                "semantics": {
+                    "anchors": [
+                        dict(anchor)
+                        for anchor in anchors
+                        if isinstance(anchor, Mapping)
+                        and anchor.get("season") == 2019
+                    ]
+                },
+                "source": query.source,
+            }
+            if not adapter["semantics"]["anchors"]:
+                raise ValueError("game evidence source disposition adapter anchors differ")
+            disposition_adapter_sha256 = _sha256(_canonical_file_bytes(adapter))
+            schedule_sidecars.append(adapter)
+            disposition_verified = verified
+        elif query in static_batch.queries:
             if verified.raw_bytes is None:
                 raise ValueError("game evidence schedule raw bytes are missing")
             schedule_sidecar = recompute_schedule_anchor_sidecar(
@@ -1031,6 +1202,27 @@ def _build_current_authority(
             boxscores[game_pk] = (sidecar_bytes, _sha256(sidecar_bytes))
 
     game_snapshot = dict(recompute_game_evidence_snapshot(schedule_sidecars, boxscores))
+    if disposition_verified is not None:
+        if disposition_adapter_sha256 is None:
+            raise AssertionError("source disposition adapter hash was not captured")
+        game_snapshot = _replace_source_disposition_lineage(
+            game_snapshot,
+            synthetic_sidecar_sha256=disposition_adapter_sha256,
+            derived_sidecar_sha256=disposition_verified.published_evidence.query_sidecar_sha256,
+        )
+        if disposition_authority is None:
+            raise AssertionError("source disposition authority was not captured")
+        rebound_disposition = disposition_authority.reauthenticate()
+        rebound_verified = store.read_verified_success(
+            rebound_disposition.query, authority=rebound_disposition
+        )
+        if (
+            rebound_verified.published_evidence != disposition_verified.published_evidence
+            or rebound_verified.success_receipt != disposition_verified.success_receipt
+            or rebound_verified.query_sidecar != disposition_verified.query_sidecar
+            or rebound_verified.raw_bytes is not None
+        ):
+            raise ValueError("game evidence source disposition changed before return")
     _validate_game_projection(game_snapshot)
     games = game_snapshot["games"]
     if not isinstance(games, list):
@@ -1086,6 +1278,9 @@ def _build_current_authority(
             },
         },
     }
+    if disposition_binding is not None:
+        payload["duplicate_gamepk_disposition"] = disposition_binding
+        payload["dispositioned_query_ids"] = [disposition_binding["query_id"]]
     return _Authority(
         payload=payload,
         snapshots=(
@@ -1409,8 +1604,6 @@ def load_verified_game_evidence_inventory(
         }
     )
     context = _authority_context(root, run_spec_path, acquisition_contract_path)
-    if isinstance(context.authority, SourceRunSpec):
-        raise TypeError("SourceRunSpec query-batch authority is unavailable before Task 6")
     inventory_relative = (
         context.acquisition_audit_root.relative_to(root)
         / "game_evidence_inventory.json"
