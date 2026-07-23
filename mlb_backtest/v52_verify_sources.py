@@ -1941,7 +1941,10 @@ def _build_game_normalized_snapshots(
         anchors = [
             (record, sidecar)
             for record, sidecar in season_records
-            if record.query.endpoint == _SCHEDULE_ENDPOINT
+            if (
+                record.query.endpoint == _SCHEDULE_ENDPOINT
+                or record.storage_mode == "DERIVED_DISPOSITION"
+            )
         ]
         if len(anchors) != 1:
             raise ValueError("game snapshot requires one schedule query per season")

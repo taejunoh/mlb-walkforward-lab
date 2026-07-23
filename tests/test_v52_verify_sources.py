@@ -26,7 +26,7 @@ from mlb_backtest.v52_evidence import (
     logical_query_id,
 )
 from mlb_backtest.v52_query_plan import QueryBatch, SplitReceipt
-from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+from mlb_backtest.v52_source_contracts import canonical_sha256, recompute_query_sidecar
 from tests.test_v52_source_schedule import (
     _box_query,
     _boxscore_raw,
@@ -754,6 +754,184 @@ def _normalized_game_authority() -> SimpleNamespace:
         timezone_gate=timezone_gate,
         game_inventory=game_inventory,
         per_season_payloads=tuple(per_season_payloads),
+    )
+
+
+def _authenticated_source_game_authority() -> SimpleNamespace:
+    """Build a sealed seven-season source fixture without mocking the reducer."""
+    from mlb_backtest import v52_verify_sources as verifier
+    from mlb_backtest.v52_duplicate_gamepk_disposition import (
+        DISPOSITION_ENDPOINT,
+        _requested_range,
+    )
+    from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_provenance
+    from mlb_backtest.v52_sources.schedule import (
+        derived_schedule_sidecar_adapter,
+        recompute_game_evidence_snapshot,
+    )
+
+    base = _normalized_game_authority()
+    source_run_id = "historical_walkforward_500_superseding_565534"
+    records = list(base.records)
+    schedules = {
+        record.query.requested_range["year"]: record
+        for record in records
+        if record.query.endpoint == "https://statsapi.mlb.com/api/v1/schedule"
+    }
+    source_anchors = []
+    for record in schedules.values():
+        for anchor in json.loads(record.query_sidecar_bytes)["semantics"]["anchors"]:
+            source_anchors.append(
+                {
+                    **anchor,
+                    "raw_game_object_sha256": hashlib.sha256(
+                        f"source-raw-{anchor['game_pk']}".encode()
+                    ).hexdigest(),
+                }
+            )
+    old_2019 = schedules[2019]
+    disposition_query = dataclasses.replace(
+        old_2019.query,
+        endpoint=DISPOSITION_ENDPOINT,
+        parameters={},
+        requested_range=_requested_range(),
+    )
+    disposition_id = logical_query_id(disposition_query)
+    disposition_sidecar = {
+        "grain": disposition_query.grain,
+        "parser_version": disposition_query.parser_version,
+        "query_id": disposition_id,
+        "schema_version": 1,
+        "semantics": {"disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534"},
+        "source": disposition_query.source,
+        "storage_mode": "DERIVED_DISPOSITION",
+    }
+    disposition_bytes = canonical_json_bytes(disposition_sidecar) + b"\n"
+    disposition_sha = hashlib.sha256(disposition_bytes).hexdigest()
+    disposition_record = dataclasses.replace(
+        old_2019,
+        query=disposition_query,
+        query_id=disposition_id,
+        query_sidecar_bytes=disposition_bytes,
+        query_sidecar_sha256=disposition_sha,
+        raw_sha256=None,
+        storage_mode="DERIVED_DISPOSITION",
+    )
+    records[records.index(old_2019)] = disposition_record
+    schedules[2019] = disposition_record
+    binding = verifier.DuplicateGamePkDispositionBinding(
+        query_id=disposition_id,
+        success_receipt=verifier.AuthorityBinding("fixture/source-receipt.json", "e" * 64),
+        query_sidecar=verifier.AuthorityBinding("fixture/source-sidecar.json", disposition_sha),
+    )
+
+    payloads = []
+    season_sources = []
+    for season in range(2018, 2025):
+        schedule = schedules[season]
+        anchors = [anchor for anchor in source_anchors if anchor["season"] == season]
+        boxscore = next(
+            record
+            for record in records
+            if record.query.requested_range.get("season") == season
+            and record.query.requested_range.get("game_pk") is not None
+        )
+        game_pk = boxscore.query.requested_range["game_pk"]
+        if season == 2019:
+            schedule_sidecar = derived_schedule_sidecar_adapter(schedule.query, anchors)
+        else:
+            schedule_sidecar = json.loads(schedule.query_sidecar_bytes)
+        payload = dict(
+            recompute_game_evidence_snapshot(
+                [schedule_sidecar],
+                {game_pk: (boxscore.query_sidecar_bytes, boxscore.query_sidecar_sha256)},
+                schedule_provenance=build_schedule_anchor_provenance(anchors),
+            )
+        )
+        if season == 2019:
+            adapter_sha = hashlib.sha256(
+                canonical_json_bytes(schedule_sidecar) + b"\n"
+            ).hexdigest()
+            for game in payload["games"]:
+                game["schedule_query_sidecar_sha256"] = disposition_sha
+                game["source_game_sha256"] = canonical_sha256(
+                    {
+                        "anchor_sidecar_sha256": disposition_sha,
+                        **(
+                            {
+                                "boxscore_query_sidecar_sha256": game[
+                                    "boxscore_query_sidecar_sha256"
+                                ]
+                            }
+                            if game["played"]
+                            else {}
+                        ),
+                        "game": {
+                            key: value
+                            for key, value in game.items()
+                            if key != "source_game_sha256"
+                        },
+                    }
+                )
+            payload["source_query_sidecar_sha256s"] = sorted(
+                (set(payload["source_query_sidecar_sha256s"]) - {adapter_sha})
+                | {disposition_sha}
+            )
+        payloads.append(payload)
+        season_sources.append(
+            {
+                "season": season,
+                "query_id": schedule.query_id,
+                "query_sidecar": {
+                    "path": f"fixture/source-{season}.json",
+                    "sha256": schedule.query_sidecar_sha256,
+                },
+            }
+        )
+
+    schedule_inventory = dataclasses.replace(
+        base.schedule_inventory,
+        payload={
+            "run_id": source_run_id,
+            "season_sources": season_sources,
+            "anchors": source_anchors,
+        },
+    )
+    games = [game for payload in payloads for game in payload["games"]]
+    game_inventory = dataclasses.replace(
+        base.game_inventory,
+        payload={
+            **base.game_inventory.payload,
+            "run_id": source_run_id,
+            "games": games,
+            "source_query_sidecar_sha256s": sorted(
+                {
+                    digest
+                    for payload in payloads
+                    for digest in payload["source_query_sidecar_sha256s"]
+                }
+            ),
+            "duplicate_gamepk_disposition": binding.as_mapping(),
+            "dispositioned_query_ids": [disposition_id],
+        },
+    )
+    timezone_gate = dataclasses.replace(
+        base.timezone_gate,
+        candidate={
+            "schedule_sidecar_sha256s": sorted(
+                row["query_sidecar"]["sha256"] for row in season_sources
+            )
+        },
+    )
+    return SimpleNamespace(
+        binding=binding,
+        disposition_id=disposition_id,
+        expected_payloads=tuple(payloads),
+        game_inventory=game_inventory,
+        records=tuple(records),
+        schedule_inventory=schedule_inventory,
+        source_anchors=source_anchors,
+        timezone_gate=timezone_gate,
     )
 
 
@@ -1710,6 +1888,127 @@ class V52VerifySourcesTest(unittest.TestCase):
             with self.assertRaises(dataclasses.FrozenInstanceError):
                 snapshot.season = 2025
 
+    def test_authenticated_source_replay_rebinds_disposition_provenance_exactly(
+        self,
+    ) -> None:
+        """A real source disposition record reaches adapter/provenance/rebind code."""
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.protocols import SourceRunSpec, load_source_run_spec
+
+        source_run = load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        self.assertIsInstance(source_run, SourceRunSpec)
+
+        def replay(fixture: SimpleNamespace, run_id: str | None = None):
+            return verifier._build_game_normalized_snapshots(
+                source_run.run_id if run_id is None else run_id,
+                fixture.records,
+                fixture.game_inventory,
+                fixture.timezone_gate,
+                fixture.schedule_inventory,
+                duplicate_gamepk_disposition=fixture.binding,
+                dispositioned_query_ids=(fixture.disposition_id,),
+            )
+
+        fixture = _authenticated_source_game_authority()
+        snapshots = replay(fixture)
+        self.assertEqual(
+            tuple(verifier._plain_json(snapshot.payload) for snapshot in snapshots),
+            fixture.expected_payloads,
+        )
+        schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
+        for snapshot in snapshots:
+            envelope = snapshot.as_mapping()
+            jsonschema.validate(envelope, schema)
+            if snapshot.season == 2019:
+                self.assertEqual(
+                    envelope["duplicate_gamepk_disposition"],
+                    fixture.binding.as_mapping(),
+                )
+                self.assertEqual(
+                    envelope["dispositioned_query_ids"], [fixture.disposition_id])
+            else:
+                self.assertNotIn("duplicate_gamepk_disposition", envelope)
+                self.assertNotIn("dispositioned_query_ids", envelope)
+            for game in snapshot.payload["games"]:
+                if game["played"]:
+                    self.assertIn("raw_game_object_sha256", game)
+                    self.assertIn("normalized_anchor_sha256", game)
+                    self.assertEqual(
+                        game["source_game_sha256"],
+                        canonical_sha256(
+                            {
+                                "anchor_sidecar_sha256": game[
+                                    "schedule_query_sidecar_sha256"
+                                ],
+                                "boxscore_query_sidecar_sha256": game[
+                                    "boxscore_query_sidecar_sha256"
+                                ],
+                                "game": {
+                                    key: value
+                                    for key, value in game.items()
+                                    if key != "source_game_sha256"
+                                },
+                            }
+                        ),
+                    )
+
+        with self.assertRaises(ValueError):
+            replay(fixture, "historical_walkforward_500")
+        bad_query = SimpleNamespace(
+            **{
+                **vars(fixture),
+                "records": tuple(
+                    dataclasses.replace(record, query_id="0" * 64)
+                    if record.storage_mode == "DERIVED_DISPOSITION"
+                    else record
+                    for record in fixture.records
+                ),
+            }
+        )
+        with self.assertRaises(ValueError):
+            replay(bad_query)
+        bad_sidecar = SimpleNamespace(
+            **{
+                **vars(fixture),
+                "binding": dataclasses.replace(
+                    fixture.binding,
+                    query_sidecar=verifier.AuthorityBinding(
+                        "fixture/source-sidecar.json", "0" * 64
+                    ),
+                ),
+            }
+        )
+        with self.assertRaises(ValueError):
+            replay(bad_sidecar)
+        for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
+            payload = json.loads(canonical_json_bytes(fixture.game_inventory.payload))
+            next(
+                game for game in payload["games"] if game["played"]
+            )[field] = "0" * 64
+            bad_inventory = dataclasses.replace(fixture.game_inventory, payload=payload)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                replay(
+                    SimpleNamespace(
+                        **{**vars(fixture), "game_inventory": bad_inventory}
+                    )
+                )
+
+    def test_game_snapshot_mapping_validation_rejects_forgery(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        snapshots = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )
+        schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
         forged = snapshots[0].as_mapping()
         forged["unexpected"] = True
         with self.assertRaises(jsonschema.ValidationError):
