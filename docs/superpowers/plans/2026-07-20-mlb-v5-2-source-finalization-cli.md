@@ -1527,13 +1527,14 @@ The source-finalization context is **namespace-parametric** for the isolated
 superseding source run. The exact superseding source authority binds
 `historical_source_acquisition_superseding_565534.json` to its authenticated
 exact disposition sidecar authority. It does not infer an authority from a path
-name. Their old-run behavior and receipt selection semantics remain unchanged.
+name. The superseding-run amendment leaves old-run behavior and
+receipt-selection semantics unchanged.
 The existing old-run defaults, including their selection behavior, are not
 rewritten by this amendment.
 
-This plan still authorizes source finalization only. Any later continuation may
-consider only a `SOURCES_READY` source inventory bound to the superseding run
-and must carry forward the exact neutralization projection authenticated by
+This amendment does not authorize downstream execution. Any later continuation
+may consider only a `SOURCES_READY` source inventory bound to the superseding
+run and must carry forward the exact neutralization projection authenticated by
 that authority. It must not select a receipt by glob, timestamp, or “latest” convention.
 No `SOURCES_READY` inventory is asserted to exist. Fit, OOF, cards, targets,
 outcomes, and 500-pick work require a separately approved plan that

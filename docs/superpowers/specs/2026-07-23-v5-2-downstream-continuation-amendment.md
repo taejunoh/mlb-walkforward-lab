@@ -15,9 +15,15 @@ disposition authority is the contract-bound derived disposition, rather than a
 replacement raw artifact. This amendment does not change old-run selection
 behavior, evidence, defaults, or receipt semantics.
 
+The exact superseding source authority binds
+`historical_source_acquisition_superseding_565534.json` to its authenticated
+exact disposition sidecar authority. This amendment does not authorize
+downstream execution.
+
 ## Downstream gate
 
-For a later continuation, only a `SOURCES_READY` source inventory bound to the superseding run may be considered, and the old run remains blocked. Any later
+For a later continuation, only a `SOURCES_READY` source inventory bound to the
+superseding run may be considered, and the old run remains blocked. Any later
 consumer must propagate the exact neutralization projection authenticated by
 the superseding authority. It may not silently select a "latest" registry,
 inventory, review, replay, or source root; every input must identify the exact

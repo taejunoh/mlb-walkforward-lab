@@ -638,9 +638,18 @@ design.
 Run matching tests and `git diff --check`, then:
 
 ```bash
-git add docs/superpowers/specs/2026-07-19-mlb-v5-2-source-finalization-cli-design.md docs/superpowers/plans/2026-07-20-mlb-v5-2-source-finalization-cli.md docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md docs/superpowers/specs/2026-07-23-v5-2-downstream-continuation-amendment.md tests/test_v52_downstream_documentation.py
+git add \
+  docs/superpowers/plans/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md \
+  docs/superpowers/specs/2026-07-19-mlb-v5-2-source-finalization-cli-design.md \
+  docs/superpowers/plans/2026-07-20-mlb-v5-2-source-finalization-cli.md \
+  docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md \
+  docs/superpowers/specs/2026-07-23-v5-2-downstream-continuation-amendment.md \
+  tests/test_v52_downstream_documentation.py
 git commit -m "docs: bind downstream gates to superseding source run"
 ```
+
+This Task 12 commit stages this governing plan once for its narrow correction.
+Afterward, Task 13 must not stage the plan authority again.
 
 ### Task 13: Run the offline acceptance gate and prove old evidence immutability
 

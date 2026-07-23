@@ -23,6 +23,7 @@ CONTINUATION_AMENDMENT = (
     ROOT / "docs/superpowers/specs/2026-07-23-v5-2-downstream-continuation-amendment.md"
 )
 TASK12_CONTINUATION_DOCS = (DIAGNOSTIC_PLAN, CONTINUATION_AMENDMENT)
+TASK12_NO_EXECUTION_DOCS = SOURCE_FINALIZATION_DOCS + (CONTINUATION_AMENDMENT,)
 PINNED_DESIGN = (
     ROOT / "docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md"
 )
@@ -45,12 +46,20 @@ def _task12_amendment(path: Path) -> str:
     return re.sub(r"\s+", " ", match.group(0)).strip()
 
 
+def _downstream_amendment(path: Path) -> str:
+    """Return the Task 12 section, or the standalone amendment in full."""
+    if path == CONTINUATION_AMENDMENT:
+        return _normalized_text(path)
+    return _task12_amendment(path)
+
+
 class V52DownstreamDocumentationTest(unittest.TestCase):
     def test_source_finalization_docs_bind_superseding_authority_without_execution(self) -> None:
         """Finalization amendments must be explicit in both source-workflow docs."""
         required_clauses = (
             "namespace-parametric",
-            "Their old-run behavior and receipt selection semantics remain unchanged.",
+            "The superseding-run amendment leaves old-run behavior and "
+            "receipt-selection semantics unchanged.",
             "must not select a receipt by glob, timestamp, or \u201clatest\u201d convention",
         )
         for path in SOURCE_FINALIZATION_DOCS:
@@ -85,9 +94,16 @@ class V52DownstreamDocumentationTest(unittest.TestCase):
             "`historical_source_acquisition_superseding_565534.json` to its "
             "authenticated exact disposition sidecar authority."
         )
-        for path in SOURCE_FINALIZATION_DOCS:
+        for path in TASK12_NO_EXECUTION_DOCS:
             with self.subTest(path=path.name):
-                self.assertIn(expected, _task12_amendment(path))
+                self.assertIn(expected, _downstream_amendment(path))
+
+    def test_task12_amendments_explicitly_prohibit_downstream_execution(self) -> None:
+        """Neither source finalization nor its continuation amendment authorizes it."""
+        expected = "This amendment does not authorize downstream execution."
+        for path in TASK12_NO_EXECUTION_DOCS:
+            with self.subTest(path=path.name):
+                self.assertIn(expected, _downstream_amendment(path))
 
     def test_task12_sections_do_not_assert_sources_ready_and_require_reapproval(self) -> None:
         """No source-ready result is claimed; all downstream work needs a new plan."""

@@ -437,7 +437,8 @@ For the isolated superseding source run, finalization is **namespace-parametric*
 the context is bound to the exact source-run specification. The exact
 superseding source authority binds
 `historical_source_acquisition_superseding_565534.json` to its authenticated
-exact disposition sidecar authority. Their old-run behavior and receipt selection semantics remain unchanged.
+exact disposition sidecar authority. The superseding-run amendment leaves
+old-run behavior and receipt-selection semantics unchanged.
 The old defaults remain bound to the old run, and a superseding invocation may
 use only its authenticated namespaces and exact contract.
 
