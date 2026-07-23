@@ -5229,7 +5229,11 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
 
     def test_timezone_checkpoint_rejects_nonterminal_and_extra_evidence(self):
-        from mlb_backtest.v52_query_plan import _make_batch, publish_query_batch
+        from mlb_backtest.v52_query_plan import (
+            _make_batch,
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
 
         for attack in ("nonterminal", "extra-evidence", "new-batch"):
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
@@ -5263,7 +5267,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
                     stage_evidence = (*stage_evidence, extra)
                 elif attack == "new-batch":
-                    timezone_batch = _make_batch("TIMEZONE_REVIEW", None, ())
+                    timezone_batch = _make_batch(
+                        "TIMEZONE_REVIEW",
+                        None,
+                        (build_statcast_root_batch(root).queries[0],),
+                    )
                     publish_query_batch(root, timezone_batch)
                     query_batch_ids = (
                         fixture[0].batch_id,
@@ -7363,7 +7371,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             def parse_broken_schema(contents: bytes, label: str) -> object:
                 if label == "source receipt schema" and contents == strict:
                     broken = json.loads(strict)
-                    broken["properties"]["decision"] = {"$ref": "#/$defs/missing"}
+                    broken["$ref"] = "#/$defs/missing"
                     return broken
                 return original(contents, label)
 
