@@ -1520,3 +1520,20 @@ git push origin feature/mlb-v5-1-backtest
 - The immutable `SOURCES_READY` receipt selects exactly two distinct replays and at least one approved review.
 - The finalization roots, transitive production imports, dynamic schemas, verifier, and snapshot store are exactly bound as execution code.
 - Full tests and Ruff pass, the four protected duplicate files remain untouched, and no fixture is published into the real historical namespace.
+
+## Task 12 downstream-continuation amendment
+
+The source-finalization context is **namespace-parametric** for the isolated
+superseding source run. Its exact authority is
+`historical_source_acquisition_superseding_565534.json` and its authenticated
+disposition sidecar; it does not infer an authority from a path name. Their old-run behavior and receipt selection semantics remain unchanged.
+The existing old-run defaults, including their selection behavior, are not
+rewritten by this amendment.
+
+This plan still authorizes source finalization only. Any later continuation may
+consider only a `SOURCES_READY` source inventory bound to the superseding run
+and must carry forward the exact neutralization projection authenticated by
+that authority. It must not select a receipt by glob, timestamp, or “latest” convention.
+No `SOURCES_READY` inventory is asserted to exist. Fit, OOF, cards, targets,
+outcomes, and 500-pick execution require a separately approved plan that
+explicitly selects the superseding run.

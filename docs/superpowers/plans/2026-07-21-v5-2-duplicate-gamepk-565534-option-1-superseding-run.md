@@ -597,8 +597,16 @@ git commit -m "chore: bind duplicate disposition execution code"
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-19-mlb-v5-2-source-finalization-cli-design.md`
 - Modify: `docs/superpowers/plans/2026-07-20-mlb-v5-2-source-finalization-cli.md`
-- Modify: `docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md`
 - Modify: `docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md`
+- Create: `docs/superpowers/specs/2026-07-23-v5-2-downstream-continuation-amendment.md`
+- Create: `tests/test_v52_downstream_documentation.py`
+
+**Narrow correction:** The approved 2026-07-12 design remains byte-identical
+to its runtime-approved `fd04e8b` blob and SHA-256 pin. Do not edit, re-pin,
+or reapprove that design. The new non-runtime downstream-continuation
+amendment supersedes only the downstream-continuation interpretation of that
+design; it is not a runtime-approved design authority. This task does not
+claim rollout, hashes, or that a `SOURCES_READY` inventory exists.
 
 - [ ] **Step 1: Add documentation assertions before prose changes**
 
@@ -618,12 +626,19 @@ Then run only the matching local `unittest` modules. Expected: assertions for th
 
 State that old behavior remains unchanged and that any later fit/OOF/card/target/outcome/500 work requires a separately approved plan explicitly selecting the superseding run. Do not add rollout results, production hashes, or imply that `SOURCES_READY` already exists.
 
+Keep `docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md`
+byte-identical: its approved runtime pin makes the former instruction to amend
+that file inapplicable. Put the downstream-continuation interpretation in
+`2026-07-23-v5-2-downstream-continuation-amendment.md` instead. That amendment
+is non-runtime documentation only; it does not re-pin or reapprove the 7/12
+design.
+
 - [ ] **Step 4: Verify and commit**
 
 Run matching tests and `git diff --check`, then:
 
 ```bash
-git add docs/superpowers/specs/2026-07-19-mlb-v5-2-source-finalization-cli-design.md docs/superpowers/plans/2026-07-20-mlb-v5-2-source-finalization-cli.md docs/superpowers/specs/2026-07-12-mlb-v5-2-diagnostic-and-500-pick-design.md docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md
+git add docs/superpowers/specs/2026-07-19-mlb-v5-2-source-finalization-cli-design.md docs/superpowers/plans/2026-07-20-mlb-v5-2-source-finalization-cli.md docs/superpowers/plans/2026-07-12-mlb-v5-2-diagnostic-and-500-pick.md docs/superpowers/specs/2026-07-23-v5-2-downstream-continuation-amendment.md tests/test_v52_downstream_documentation.py
 git commit -m "docs: bind downstream gates to superseding source run"
 ```
 

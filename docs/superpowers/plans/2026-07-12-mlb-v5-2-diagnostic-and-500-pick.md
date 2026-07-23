@@ -2864,3 +2864,14 @@ The deferred plan must use TDD and subagent-driven development, must begin from 
 - [ ] All function/type/property names are consistent across tasks: `V51Evidence`, `V52Config`, `FoldSpec`, `RunSpec`, `ProspectiveSpec`, `build_diagnostic`, `build_preflight`, and `verify_design_deliverables`.
 - [ ] All commands use the established `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest` and Ruff style and include an expected result.
 - [ ] No current task changes any sealed v5.1 artifact.
+
+## Task 12 downstream-continuation amendment
+
+This plan's old-run selection behavior remains unchanged. The superseding
+`gamePk=565534` source run is a separate authority and only a `SOURCES_READY` source inventory bound to the superseding run may be considered by a later continuation; the old run remains blocked. Any such continuation must carry the exact neutralization projection authenticated by the superseding disposition authority.
+
+No Plan B/C artifact is created. A later consumer may not silently select a
+"latest" registry, inventory, review, replay, or source root. `SOURCES_READY`
+is not claimed to exist in this amendment. Fit, OOF, cards, targets, outcomes,
+and 500-pick work require a separately approved plan that explicitly selects
+the superseding run.

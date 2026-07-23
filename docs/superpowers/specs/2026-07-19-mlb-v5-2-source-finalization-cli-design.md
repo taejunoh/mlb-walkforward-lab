@@ -430,3 +430,20 @@ repository root:
 
 Until the missing v5.2 acquisition hierarchy exists, this sequence stops at
 steps 1–2 with an explicit no-registry/no-checkpoint report.
+
+## 13. Task 12 downstream-continuation amendment
+
+For the isolated superseding source run, finalization is **namespace-parametric**:
+the context is bound to the exact source-run specification and to
+`historical_source_acquisition_superseding_565534.json`, including its exact
+disposition sidecar authority. Their old-run behavior and receipt selection semantics remain unchanged.
+The old defaults remain bound to the old run, and a superseding invocation may
+use only its authenticated namespaces and exact contract.
+
+This amendment does not authorize downstream execution. A later continuation
+may consider only a `SOURCES_READY` source inventory bound to the superseding
+run, must propagate the exact neutralization projection from that authority,
+and must not select a receipt by glob, timestamp, or “latest” convention.
+`SOURCES_READY` is not claimed to exist here. Fit, OOF, cards, targets,
+outcomes, and 500-pick work remain subject to a separately approved plan that
+explicitly selects the superseding run.
