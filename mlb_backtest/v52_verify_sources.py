@@ -71,8 +71,10 @@ from .v52_source_contracts import (
     recompute_query_sidecar,
 )
 from .v52_sources.history import (
-    _validate_disposition as _validate_history_disposition,
+    TASK10_DISPOSITION_QUERY_ID,
+    TASK10_DISPOSITION_SIDECAR_SHA256,
     recompute_prior_history_sidecar,
+    validate_task10_disposition_binding,
     validate_schedule_neutralizations,
 )
 from .v52_sources.statcast import (
@@ -528,9 +530,14 @@ def _validate_normalized_snapshot_mapping(
             ):
                 raise ValueError("normalized snapshot disposition binding differs")
         try:
-            _validate_history_disposition(disposition)
+            validate_task10_disposition_binding(disposition)
         except ValueError as exc:
             raise ValueError("normalized snapshot disposition binding differs") from exc
+        if (
+            TASK10_DISPOSITION_QUERY_ID not in query_ids
+            or TASK10_DISPOSITION_SIDECAR_SHA256 not in top_sidecars
+        ):
+            raise ValueError("normalized snapshot disposition lineage differs")
     if source == "mlb_schedule_game_feed" and grain == "season_game_evidence_snapshot":
         if (
             envelope["run_id"] == _SOURCE_RUN_ID
@@ -598,7 +605,7 @@ def _validate_normalized_snapshot_mapping(
             raise ValueError("normalized source history disposition binding differs")
         if source_2019:
             try:
-                _validate_history_disposition(disposition)
+                validate_task10_disposition_binding(disposition)
             except ValueError as exc:
                 raise ValueError(
                     "normalized source history disposition binding differs"

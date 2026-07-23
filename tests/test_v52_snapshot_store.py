@@ -34,37 +34,52 @@ def _source_store_case():
     """Build one exact superseding-run input/snapshot authority fixture."""
     from mlb_backtest.v52_snapshot_store import AuthorityBindings
     from mlb_backtest.v52_source_contracts import canonical_json_bytes
+    from mlb_backtest.v52_sources.history import (
+        TASK10_DISPOSITION_QUERY_ID,
+        TASK10_DISPOSITION_SIDECAR_PATH,
+        TASK10_DISPOSITION_SIDECAR_SHA256,
+        TASK10_DISPOSITION_SUCCESS_PATH,
+        TASK10_DISPOSITION_SUCCESS_SHA256,
+    )
     from mlb_backtest.v52_verify_sources import (
         AuthorityBinding,
         DuplicateGamePkDispositionBinding,
     )
 
-    disposition_id = (
-        "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
-    )
-    sidecar_sha = (
-        "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
-    )
+    disposition_id = TASK10_DISPOSITION_QUERY_ID
+    sidecar_sha = TASK10_DISPOSITION_SIDECAR_SHA256
     binding = DuplicateGamePkDispositionBinding(
         query_id=disposition_id,
         query_sidecar=AuthorityBinding(
-            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
-            f"query_sidecars/{sidecar_sha}.json",
+            TASK10_DISPOSITION_SIDECAR_PATH,
             sidecar_sha,
         ),
         success_receipt=AuthorityBinding(
-            "data/v5_2_qd/historical_superseding_565534/raw/queries/"
-            f"mlb_schedule_game_feed/{disposition_id}/success.json",
-            "8" * 64,
+            TASK10_DISPOSITION_SUCCESS_PATH,
+            TASK10_DISPOSITION_SUCCESS_SHA256,
         ),
     )
 
     def source_snapshot(snapshot):
+        owns_disposition = snapshot.season == 2019 and snapshot.source in {
+            "mlb_schedule_game_feed",
+            "prior_schedule_history",
+        }
         candidate = dataclasses.replace(
             snapshot,
             run_id="historical_walkforward_500_superseding_565534",
-            duplicate_gamepk_disposition=binding,
-            dispositioned_query_ids=(disposition_id,),
+            logical_query_ids=(
+                (disposition_id,)
+                if owns_disposition
+                else snapshot.logical_query_ids
+            ),
+            source_query_sidecar_sha256s=(
+                (sidecar_sha,)
+                if owns_disposition
+                else snapshot.source_query_sidecar_sha256s
+            ),
+            duplicate_gamepk_disposition=binding if owns_disposition else None,
+            dispositioned_query_ids=(disposition_id,) if owns_disposition else (),
         )
         contents = canonical_json_bytes(candidate.as_mapping()) + b"\n"
         return dataclasses.replace(
@@ -696,12 +711,10 @@ class InventoryTests(unittest.TestCase):
         second_dynamic_receipt["duplicate_gamepk_disposition"][
             "success_receipt"
         ]["sha256"] = "9" * 64
-        jsonschema.validate(second_dynamic_receipt, schema)
-        self.assertEqual(
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(second_dynamic_receipt, schema)
+        with self.assertRaises((TypeError, ValueError)):
             parse_inventory(_canonical_raw(second_dynamic_receipt))
-            .duplicate_gamepk_disposition.success_receipt.sha256,
-            "9" * 64,
-        )
 
         source_as_old = json.loads(_canonical_raw(source))
         source_as_old.pop("duplicate_gamepk_disposition")

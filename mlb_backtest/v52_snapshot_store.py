@@ -24,6 +24,10 @@ from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 from .secure_fs import TrustedRoot, open_trusted_root
 from .v52_source_contracts import canonical_json_bytes
+from .v52_sources.history import (
+    TASK10_DISPOSITION_QUERY_ID,
+    validate_task10_disposition_binding,
+)
 from .v52_verify_sources import (
     AuthorityBinding,
     DuplicateGamePkDispositionBinding,
@@ -38,16 +42,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OLD_RUN_ID = "historical_walkforward_500"
 _FIXTURE_RUN_ID = "fixture-run"
 _SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
-_DISPOSITION_QUERY_ID = "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
-_DISPOSITION_SIDECAR_SHA256 = "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
-_DISPOSITION_SIDECAR_PATH = (
-    "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/"
-    f"{_DISPOSITION_SIDECAR_SHA256}.json"
-)
-_DISPOSITION_SUCCESS_PATH = (
-    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
-    f"mlb_schedule_game_feed/{_DISPOSITION_QUERY_ID}/success.json"
-)
 _SOURCE_TIMEZONE_GATE_PATH = (
     "audit/v5_2_qd/historical_superseding_565534/acquisition/"
     "venue_timezone_seal.json"
@@ -663,15 +657,16 @@ def _validate_run_disposition(
         return
     if run_id != _SOURCE_RUN_ID:
         raise ValueError(f"{label} run_id differs")
-    if (
-        disposition is None
-        or disposition.query_id != _DISPOSITION_QUERY_ID
-        or disposition.query_sidecar.path != _DISPOSITION_SIDECAR_PATH
-        or disposition.query_sidecar.sha256 != _DISPOSITION_SIDECAR_SHA256
-        or disposition.success_receipt.path != _DISPOSITION_SUCCESS_PATH
-        or dispositioned_query_ids != (_DISPOSITION_QUERY_ID,)
+    if disposition is None or dispositioned_query_ids != (
+        TASK10_DISPOSITION_QUERY_ID,
     ):
         raise ValueError(f"{label} superseding run requires disposition authority")
+    try:
+        validate_task10_disposition_binding(disposition.as_mapping())
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            f"{label} superseding run requires disposition authority"
+        ) from exc
 
 
 def _validate_source_binding_paths(

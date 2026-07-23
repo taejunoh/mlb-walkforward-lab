@@ -122,15 +122,8 @@ def _source_game_snapshots():
     from mlb_backtest import v52_verify_sources as verifier
 
     authority = _authenticated_source_game_authority()
-    originals = verifier._build_game_normalized_snapshots(
-        "historical_walkforward_500_superseding_565534",
-        authority.records,
-        authority.game_inventory,
-        authority.timezone_gate,
-        authority.schedule_inventory,
-        duplicate_gamepk_disposition=authority.binding,
-        dispositioned_query_ids=(authority.disposition_id,),
-    )
+    synthetic_disposition_id = authority.disposition_id
+    synthetic_sidecar_sha256 = authority.binding.query_sidecar.sha256
     disposition_value = _task10_disposition()
     authority.binding = verifier.DuplicateGamePkDispositionBinding(
         query_id=disposition_value["query_id"],
@@ -141,7 +134,61 @@ def _source_game_snapshots():
     )
     authority.disposition_id = authority.binding.query_id
     snapshots = []
-    for original in originals:
+    for season, expected_payload in zip(
+        range(2018, 2025), authority.expected_payloads, strict=True
+    ):
+        payload = json.loads(canonical_json_bytes(expected_payload))
+        sidecar_sha256s = list(payload["source_query_sidecar_sha256s"])
+        matching_records = tuple(
+            record
+            for record in authority.records
+            if record.query_sidecar_sha256 in sidecar_sha256s
+        )
+        query_ids = sorted(record.query_id for record in matching_records)
+        if season == 2019:
+            exact_sidecar_sha256 = authority.binding.query_sidecar.sha256
+            sidecar_sha256s = sorted(
+                exact_sidecar_sha256
+                if value == synthetic_sidecar_sha256
+                else value
+                for value in sidecar_sha256s
+            )
+            payload["source_query_sidecar_sha256s"] = sidecar_sha256s
+            query_ids = sorted(
+                authority.disposition_id
+                if value == synthetic_disposition_id
+                else value
+                for value in query_ids
+            )
+            for game in payload["games"]:
+                if (
+                    game["schedule_query_sidecar_sha256"]
+                    == synthetic_sidecar_sha256
+                ):
+                    game["schedule_query_sidecar_sha256"] = exact_sidecar_sha256
+                game["source_game_sha256"] = _source_game_hash(game)
+        original = _rebuild(
+            {
+                "schema_version": 1,
+                "run_id": "historical_walkforward_500_superseding_565534",
+                "season": season,
+                "source": "mlb_schedule_game_feed",
+                "grain": "season_game_evidence_snapshot",
+                "status": "READY",
+                "logical_query_ids": query_ids,
+                "source_query_sidecar_sha256s": sidecar_sha256s,
+                "split_receipt_sha256s": [],
+                "payload": payload,
+                **(
+                    {
+                        "duplicate_gamepk_disposition": authority.binding.as_mapping(),
+                        "dispositioned_query_ids": [authority.disposition_id],
+                    }
+                    if season == 2019
+                    else {}
+                ),
+            }
+        )
         mapping = _mutable(original)
         if original.season == 2019:
             mapping["duplicate_gamepk_disposition"] = authority.binding.as_mapping()
@@ -932,6 +979,36 @@ class V52HistoryNormalizedSnapshotTest(unittest.TestCase):
                 "sha",
                 lambda value: value["duplicate_gamepk_disposition"]["query_sidecar"].update(
                     {"sha256": "0" * 64}
+                ),
+            ),
+            (
+                "lineage-query",
+                lambda value: value.update(
+                    {
+                        "logical_query_ids": sorted(
+                            "9" * 64
+                            if item
+                            == value["duplicate_gamepk_disposition"]["query_id"]
+                            else item
+                            for item in value["logical_query_ids"]
+                        )
+                    }
+                ),
+            ),
+            (
+                "lineage-sidecar",
+                lambda value: value.update(
+                    {
+                        "source_query_sidecar_sha256s": sorted(
+                            "9" * 64
+                            if item
+                            == value["duplicate_gamepk_disposition"][
+                                "query_sidecar"
+                            ]["sha256"]
+                            else item
+                            for item in value["source_query_sidecar_sha256s"]
+                        )
+                    }
                 ),
             ),
             (

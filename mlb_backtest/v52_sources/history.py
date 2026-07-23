@@ -104,19 +104,37 @@ _SOURCE_ANCHOR_KEYS = frozenset(
         "winner_team_id",
     }
 )
-_DISPOSITION_QUERY_ID = (
+TASK10_DISPOSITION_QUERY_ID = (
     "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
 )
-_DISPOSITION_SIDECAR_SHA256 = (
+TASK10_DISPOSITION_SIDECAR_SHA256 = (
     "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
 )
-_DISPOSITION_SIDECAR_PATH = (
+TASK10_DISPOSITION_SIDECAR_PATH = (
     "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/"
-    f"{_DISPOSITION_SIDECAR_SHA256}.json"
+    f"{TASK10_DISPOSITION_SIDECAR_SHA256}.json"
 )
-_DISPOSITION_SUCCESS_PATH = (
+TASK10_DISPOSITION_SUCCESS_PATH = (
     "data/v5_2_qd/historical_superseding_565534/raw/queries/"
-    f"mlb_schedule_game_feed/{_DISPOSITION_QUERY_ID}/success.json"
+    f"mlb_schedule_game_feed/{TASK10_DISPOSITION_QUERY_ID}/success.json"
+)
+TASK10_DISPOSITION_SUCCESS_SHA256 = "8" * 64
+TASK10_DISPOSITION_BINDING = MappingProxyType(
+    {
+        "query_id": TASK10_DISPOSITION_QUERY_ID,
+        "query_sidecar": MappingProxyType(
+            {
+                "path": TASK10_DISPOSITION_SIDECAR_PATH,
+                "sha256": TASK10_DISPOSITION_SIDECAR_SHA256,
+            }
+        ),
+        "success_receipt": MappingProxyType(
+            {
+                "path": TASK10_DISPOSITION_SUCCESS_PATH,
+                "sha256": TASK10_DISPOSITION_SUCCESS_SHA256,
+            }
+        ),
+    }
 )
 
 
@@ -193,19 +211,9 @@ def validate_schedule_neutralizations(
     return tuple(records)
 
 
-def _validate_disposition(value: object) -> None:
-    expected = {
-        "query_id": _DISPOSITION_QUERY_ID,
-        "query_sidecar": {
-            "path": _DISPOSITION_SIDECAR_PATH,
-            "sha256": _DISPOSITION_SIDECAR_SHA256,
-        },
-        "success_receipt": {
-            "path": _DISPOSITION_SUCCESS_PATH,
-            "sha256": "8" * 64,
-        },
-    }
-    if not isinstance(value, Mapping) or dict(value) != expected:
+def validate_task10_disposition_binding(value: object) -> None:
+    """Require the one immutable Task10 duplicate-game disposition binding."""
+    if not isinstance(value, Mapping) or value != TASK10_DISPOSITION_BINDING:
         raise ValueError("duplicate gamePk disposition differs")
 
 
@@ -371,7 +379,7 @@ def recompute_prior_history_sidecar(
             "source_game_sha256s": sorted(source_hashes),
             "source_snapshot_sha256": source_snapshot_sha256,
         }
-    _validate_disposition(duplicate_gamepk_disposition)
+    validate_task10_disposition_binding(duplicate_gamepk_disposition)
     expected_anchors = {
         game_pk: (raw_sha256, anchor_sha256, official_date)
         for raw_sha256, anchor_sha256, game_pk, official_date, _team_id in EXPECTED_NEUTRALIZATIONS
@@ -434,6 +442,13 @@ __all__ = [
     "EXPECTED_NEUTRALIZATIONS",
     "KNOWN_UNAPPROVED_NEIGHBORS",
     "SOURCE_RUN_ID",
+    "TASK10_DISPOSITION_BINDING",
+    "TASK10_DISPOSITION_QUERY_ID",
+    "TASK10_DISPOSITION_SIDECAR_PATH",
+    "TASK10_DISPOSITION_SIDECAR_SHA256",
+    "TASK10_DISPOSITION_SUCCESS_PATH",
+    "TASK10_DISPOSITION_SUCCESS_SHA256",
     "recompute_prior_history_sidecar",
+    "validate_task10_disposition_binding",
     "validate_schedule_neutralizations",
 ]

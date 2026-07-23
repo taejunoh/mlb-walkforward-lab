@@ -2130,27 +2130,46 @@ class V52VerifySourcesTest(unittest.TestCase):
         }
 
         def reseal(game: dict[str, object]) -> None:
-            game["source_game_sha256"] = canonical_sha256(
-                {
-                    "anchor_sidecar_sha256": game[
-                        "schedule_query_sidecar_sha256"
-                    ],
-                    "boxscore_query_sidecar_sha256": game[
-                        "boxscore_query_sidecar_sha256"
-                    ],
-                    "game": {
-                        key: value
-                        for key, value in game.items()
-                        if key != "source_game_sha256"
-                    },
-                }
-            )
+            lineage = {
+                "anchor_sidecar_sha256": game[
+                    "schedule_query_sidecar_sha256"
+                ],
+                "game": {
+                    key: value
+                    for key, value in game.items()
+                    if key != "source_game_sha256"
+                },
+            }
+            if game["played"]:
+                lineage["boxscore_query_sidecar_sha256"] = game[
+                    "boxscore_query_sidecar_sha256"
+                ]
+            game["source_game_sha256"] = canonical_sha256(lineage)
 
         snapshot["run_id"] = "historical_walkforward_500_superseding_565534"
         snapshot["duplicate_gamepk_disposition"] = disposition
         snapshot["dispositioned_query_ids"] = [disposition["query_id"]]
+        snapshot["logical_query_ids"] = sorted(
+            [disposition["query_id"], *snapshot["logical_query_ids"][1:]]
+        )
+        prior_schedule_sidecars = {
+            game["schedule_query_sidecar_sha256"]
+            for game in snapshot["payload"]["games"]
+        }
+        exact_sidecar = disposition["query_sidecar"]["sha256"]
+        exact_sidecars = sorted(
+            (
+                set(snapshot["payload"]["source_query_sidecar_sha256s"])
+                - prior_schedule_sidecars
+            )
+            | {exact_sidecar}
+        )
+        snapshot["source_query_sidecar_sha256s"] = exact_sidecars
+        snapshot["payload"]["source_query_sidecar_sha256s"] = exact_sidecars
         for game in snapshot["payload"]["games"]:
+            game["schedule_query_sidecar_sha256"] = exact_sidecar
             if not game["played"]:
+                reseal(game)
                 continue
             game["raw_game_object_sha256"] = "a" * 64
             provenance = build_schedule_anchor_provenance(
@@ -2192,6 +2211,38 @@ class V52VerifySourcesTest(unittest.TestCase):
             attacks[field] = forged
 
         for label, forged in attacks.items():
+            with self.subTest(boundary="schema", attack=label), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(forged, schema)
+            with self.subTest(boundary="runtime", attack=label), self.assertRaises(
+                ValueError
+            ):
+                verifier._validate_normalized_snapshot_mapping(forged)
+
+        lineage_attacks = {}
+        missing_query = json.loads(canonical_json_bytes(snapshot))
+        missing_query["logical_query_ids"] = sorted(
+            "9" * 64 if value == disposition["query_id"] else value
+            for value in missing_query["logical_query_ids"]
+        )
+        lineage_attacks["omitted-disposition-query"] = missing_query
+
+        missing_sidecar = json.loads(canonical_json_bytes(snapshot))
+        replacement_sidecar = "9" * 64
+        missing_sidecar["source_query_sidecar_sha256s"] = sorted(
+            replacement_sidecar if value == exact_sidecar else value
+            for value in missing_sidecar["source_query_sidecar_sha256s"]
+        )
+        missing_sidecar["payload"]["source_query_sidecar_sha256s"] = list(
+            missing_sidecar["source_query_sidecar_sha256s"]
+        )
+        for game in missing_sidecar["payload"]["games"]:
+            game["schedule_query_sidecar_sha256"] = replacement_sidecar
+            reseal(game)
+        lineage_attacks["omitted-disposition-sidecar"] = missing_sidecar
+
+        for label, forged in lineage_attacks.items():
             with self.subTest(boundary="schema", attack=label), self.assertRaises(
                 jsonschema.ValidationError
             ):
