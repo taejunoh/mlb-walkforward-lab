@@ -602,8 +602,8 @@ git commit -m "chore: bind duplicate disposition execution code"
 - Create: `tests/test_v52_downstream_documentation.py`
 
 **Narrow correction:** The approved 2026-07-12 design remains byte-identical
-to its runtime-approved `fd04e8b` blob and SHA-256 pin. Do not edit, re-pin,
-or reapprove that design. The new non-runtime downstream-continuation
+to its runtime-approved blob. Do not edit, re-pin, or reapprove that design.
+The new non-runtime downstream-continuation
 amendment supersedes only the downstream-continuation interpretation of that
 design; it is not a runtime-approved design authority. This task does not
 claim rollout, hashes, or that a `SOURCES_READY` inventory exists.

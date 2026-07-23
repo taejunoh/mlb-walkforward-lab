@@ -23,7 +23,6 @@ the superseding authority. It may not silently select a "latest" registry,
 inventory, review, replay, or source root; every input must identify the exact
 superseding authority.
 
-No Plan B/C artifact is created. This text neither asserts nor implies that a
-`SOURCES_READY` inventory exists. Later fit, OOF, cards, targets, outcomes, and
-500-pick work require a separately approved plan that explicitly selects the
-superseding run.
+No Plan B/C artifact is created. No `SOURCES_READY` inventory is asserted to
+exist. Fit, OOF, cards, targets, outcomes, and 500-pick work require a
+separately approved plan that explicitly selects the superseding run.

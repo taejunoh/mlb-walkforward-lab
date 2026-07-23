@@ -434,9 +434,10 @@ steps 1–2 with an explicit no-registry/no-checkpoint report.
 ## 13. Task 12 downstream-continuation amendment
 
 For the isolated superseding source run, finalization is **namespace-parametric**:
-the context is bound to the exact source-run specification and to
-`historical_source_acquisition_superseding_565534.json`, including its exact
-disposition sidecar authority. Their old-run behavior and receipt selection semantics remain unchanged.
+the context is bound to the exact source-run specification. The exact
+superseding source authority binds
+`historical_source_acquisition_superseding_565534.json` to its authenticated
+exact disposition sidecar authority. Their old-run behavior and receipt selection semantics remain unchanged.
 The old defaults remain bound to the old run, and a superseding invocation may
 use only its authenticated namespaces and exact contract.
 
