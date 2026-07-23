@@ -146,6 +146,32 @@ class ParticipantBuild:
     provenance: dict[str, object]
 
 
+def _immutable_schedule_neutralizations(
+    value: object,
+) -> tuple[Mapping[str, object], ...]:
+    validated = validate_schedule_neutralizations(value)
+    return tuple(
+        MappingProxyType(
+            {
+                "game_pk": record["game_pk"],
+                "official_date": record["official_date"],
+                "team_id": record["team_id"],
+                "target_raw_game_object_sha256": record[
+                    "target_raw_game_object_sha256"
+                ],
+                "target_normalized_anchor_sha256": record[
+                    "target_normalized_anchor_sha256"
+                ],
+                "value": record["value"],
+                "sample_size": record["sample_size"],
+                "quality": record["quality"],
+                "reason_codes": tuple(record["reason_codes"]),
+            }
+        )
+        for record in validated
+    )
+
+
 @dataclass(frozen=True)
 class ScheduleHistoryBuild:
     rows: tuple[dict[str, object], ...]
@@ -191,7 +217,9 @@ class ScheduleHistoryBuild:
             raise ValueError("source manifest SHA must be lowercase SHA-256")
         if self.coverage_complete and not valid_hash:
             raise ValueError("complete schedule coverage requires a valid manifest SHA")
-        canonical = validate_schedule_neutralizations(self.schedule_neutralizations)
+        canonical = _immutable_schedule_neutralizations(
+            self.schedule_neutralizations
+        )
         object.__setattr__(self, "schedule_neutralizations", canonical)
 
 
@@ -1400,7 +1428,13 @@ def build_feature_history(
         coverage_start=schedule_build.coverage_start,
         coverage_end=schedule_build.coverage_end,
         coverage_complete=schedule_build.coverage_complete,
-        schedule_neutralizations=schedule_build.schedule_neutralizations,
+        schedule_neutralizations=tuple(
+            {
+                **record,
+                "reason_codes": list(record["reason_codes"]),
+            }
+            for record in schedule_build.schedule_neutralizations
+        ),
     )
     for name, value in tuple(vars(frozen_schedule).items()):
         object.__setattr__(

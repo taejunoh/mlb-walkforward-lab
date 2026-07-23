@@ -1120,6 +1120,24 @@ class PrepareBoundaryTest(unittest.TestCase):
             ):
                 _task10_schedule_history_build(neutralizations)
 
+    def test_schedule_history_build_owns_immutable_neutralization_records(self):
+        records = _neutralization_records()
+        schedule_build = _task10_schedule_history_build(records)
+
+        records[0]["reason_codes"].append("caller_mutation")
+        records[0]["quality"] = 1.0
+
+        stored = schedule_build.schedule_neutralizations[0]
+        self.assertEqual(
+            stored["reason_codes"],
+            ("schedule_neutral_duplicate_gamepk_dependency",),
+        )
+        self.assertEqual(stored["quality"], 0.0)
+        with self.assertRaises(TypeError):
+            stored["quality"] = 1.0
+        with self.assertRaises(AttributeError):
+            stored["reason_codes"].append("stored_mutation")
+
     def test_schedule_history_build_accepts_empty_neutralizations_by_default(self):
         self.assertEqual(
             _task10_schedule_history_build().schedule_neutralizations,
