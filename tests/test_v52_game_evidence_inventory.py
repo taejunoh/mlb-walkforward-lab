@@ -822,10 +822,14 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                 ):
                     inventory_module.publish_game_evidence_inventory(root)
 
-    def test_source_provenance_hash_mutation_is_rejected_at_publication_final_rebind(
+    def test_source_provenance_hash_mutation_is_rejected_at_runtime_or_final_rebind(
         self,
     ) -> None:
         from mlb_backtest import v52_game_evidence_inventory as inventory_module
+        from mlb_backtest.v52_schedule_inventory import (
+            _SOURCE_ANCHOR_KEYS,
+            build_schedule_anchor_provenance,
+        )
         from mlb_backtest.v52_source_contracts import canonical_sha256
 
         with tempfile.TemporaryDirectory() as directory:
@@ -855,7 +859,17 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             for game in source_payload["games"]:
                 if game["played"]:
                     game["raw_game_object_sha256"] = "a" * 64
-                    game["normalized_anchor_sha256"] = "b" * 64
+                    provenance = build_schedule_anchor_provenance(
+                        [
+                            {
+                                key: game[key]
+                                for key in _SOURCE_ANCHOR_KEYS
+                            }
+                        ]
+                    )
+                    game["normalized_anchor_sha256"] = provenance[game["game_pk"]][
+                        "normalized_anchor_sha256"
+                    ]
                     rehash(game)
             source_snapshot = {
                 "games": source_payload["games"],
@@ -883,16 +897,36 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                     game for game in changed_payload["games"] if game["played"]
                 )
                 changed_game[field] = "c" * 64
+                if field == "raw_game_object_sha256":
+                    provenance = build_schedule_anchor_provenance(
+                        [
+                            {
+                                key: changed_game[key]
+                                for key in _SOURCE_ANCHOR_KEYS
+                            }
+                        ]
+                    )
+                    changed_game["normalized_anchor_sha256"] = provenance[
+                        changed_game["game_pk"]
+                    ]["normalized_anchor_sha256"]
                 rehash(changed_game)
+                changed_snapshot = {
+                    "games": changed_payload["games"],
+                    "grain": "season_game_evidence_snapshot",
+                    "schema_version": 1,
+                    "source_query_sidecar_sha256s": changed_payload[
+                        "source_query_sidecar_sha256s"
+                    ],
+                }
+                if field == "normalized_anchor_sha256":
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        inventory_module._validate_game_projection(
+                            changed_snapshot,
+                            run_id=changed_payload["run_id"],
+                        )
+                    continue
                 inventory_module._validate_game_projection(
-                    {
-                        "games": changed_payload["games"],
-                        "grain": "season_game_evidence_snapshot",
-                        "schema_version": 1,
-                        "source_query_sidecar_sha256s": changed_payload[
-                            "source_query_sidecar_sha256s"
-                        ],
-                    },
+                    changed_snapshot,
                     run_id=changed_payload["run_id"],
                 )
                 changed = dataclasses.replace(source_authority, payload=changed_payload)

@@ -1891,10 +1891,10 @@ class V52VerifySourcesTest(unittest.TestCase):
             with self.assertRaises(dataclasses.FrozenInstanceError):
                 snapshot.season = 2025
 
-    def test_authenticated_source_replay_rebinds_disposition_provenance_exactly(
+    def test_source_replay_rejects_synthetic_disposition_provenance(
         self,
     ) -> None:
-        """A real source disposition record reaches adapter/provenance/rebind code."""
+        """A fixture cannot impersonate the one immutable source disposition."""
         from mlb_backtest import v52_verify_sources as verifier
         from mlb_backtest.protocols import SourceRunSpec, load_source_run_spec
 
@@ -1917,107 +1917,8 @@ class V52VerifySourcesTest(unittest.TestCase):
             )
 
         fixture = _authenticated_source_game_authority()
-        snapshots = replay(fixture)
-        self.assertEqual(
-            tuple(verifier._plain_json(snapshot.payload) for snapshot in snapshots),
-            fixture.expected_payloads,
-        )
-        schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
-        for snapshot in snapshots:
-            envelope = snapshot.as_mapping()
-            jsonschema.validate(envelope, schema)
-            if snapshot.season == 2019:
-                self.assertEqual(
-                    envelope["duplicate_gamepk_disposition"],
-                    fixture.binding.as_mapping(),
-                )
-                self.assertEqual(
-                    envelope["dispositioned_query_ids"], [fixture.disposition_id])
-            else:
-                self.assertNotIn("duplicate_gamepk_disposition", envelope)
-                self.assertNotIn("dispositioned_query_ids", envelope)
-            for game in snapshot.payload["games"]:
-                if game["played"]:
-                    self.assertIn("raw_game_object_sha256", game)
-                    self.assertIn("normalized_anchor_sha256", game)
-                    self.assertEqual(
-                        game["source_game_sha256"],
-                        canonical_sha256(
-                            {
-                                "anchor_sidecar_sha256": game[
-                                    "schedule_query_sidecar_sha256"
-                                ],
-                                "boxscore_query_sidecar_sha256": game[
-                                    "boxscore_query_sidecar_sha256"
-                                ],
-                                "game": {
-                                    key: value
-                                    for key, value in game.items()
-                                    if key != "source_game_sha256"
-                                },
-                            }
-                        ),
-                    )
-
         with self.assertRaises(ValueError):
-            replay(fixture, "historical_walkforward_500")
-        for invalid_anchors in ({"season": 2019}, "anchors", b"anchors", ({},)):
-            bad_schedule_inventory = dataclasses.replace(
-                fixture.schedule_inventory,
-                payload={
-                    **fixture.schedule_inventory.payload,
-                    "anchors": invalid_anchors,
-                },
-            )
-            with self.subTest(anchors=type(invalid_anchors).__name__), self.assertRaises(
-                ValueError
-            ):
-                replay(
-                    SimpleNamespace(
-                        **{
-                            **vars(fixture),
-                            "schedule_inventory": bad_schedule_inventory,
-                        }
-                    )
-                )
-        bad_query = SimpleNamespace(
-            **{
-                **vars(fixture),
-                "records": tuple(
-                    dataclasses.replace(record, query_id="0" * 64)
-                    if record.storage_mode == "DERIVED_DISPOSITION"
-                    else record
-                    for record in fixture.records
-                ),
-            }
-        )
-        with self.assertRaises(ValueError):
-            replay(bad_query)
-        bad_sidecar = SimpleNamespace(
-            **{
-                **vars(fixture),
-                "binding": dataclasses.replace(
-                    fixture.binding,
-                    query_sidecar=verifier.AuthorityBinding(
-                        "fixture/source-sidecar.json", "0" * 64
-                    ),
-                ),
-            }
-        )
-        with self.assertRaises(ValueError):
-            replay(bad_sidecar)
-        for field in ("raw_game_object_sha256", "normalized_anchor_sha256"):
-            payload = json.loads(canonical_json_bytes(fixture.game_inventory.payload))
-            next(
-                game for game in payload["games"] if game["played"]
-            )[field] = "0" * 64
-            bad_inventory = dataclasses.replace(fixture.game_inventory, payload=payload)
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                replay(
-                    SimpleNamespace(
-                        **{**vars(fixture), "game_inventory": bad_inventory}
-                    )
-                )
+            replay(fixture)
 
     @unittest.skipUnless(
         os.environ.get("MLB_RUN_SLOW_SOURCE_REPLAY_INTEGRATION") == "1",
@@ -2184,6 +2085,129 @@ class V52VerifySourcesTest(unittest.TestCase):
             with self.subTest(runtime_attack=index), self.assertRaises(ValueError):
                 verifier._validate_normalized_snapshot_mapping(attack)
 
+    def test_source_game_snapshot_mapping_binds_disposition_and_anchor_exactly(
+        self,
+    ) -> None:
+        """Source-only semantic fields are immutable even after rehashing."""
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.v52_schedule_inventory import (
+            _SOURCE_ANCHOR_KEYS,
+            build_schedule_anchor_provenance,
+        )
+        from mlb_backtest.v52_source_contracts import canonical_sha256
+
+        authority = _normalized_game_authority()
+        snapshot = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )[1].as_mapping()
+        disposition = {
+            "query_id": (
+                "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
+            ),
+            "query_sidecar": {
+                "path": (
+                    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                    "query_sidecars/"
+                    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json"
+                ),
+                "sha256": (
+                    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+                ),
+            },
+            "success_receipt": {
+                "path": (
+                    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                    "mlb_schedule_game_feed/"
+                    "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/"
+                    "success.json"
+                ),
+                "sha256": "8" * 64,
+            },
+        }
+
+        def reseal(game: dict[str, object]) -> None:
+            game["source_game_sha256"] = canonical_sha256(
+                {
+                    "anchor_sidecar_sha256": game[
+                        "schedule_query_sidecar_sha256"
+                    ],
+                    "boxscore_query_sidecar_sha256": game[
+                        "boxscore_query_sidecar_sha256"
+                    ],
+                    "game": {
+                        key: value
+                        for key, value in game.items()
+                        if key != "source_game_sha256"
+                    },
+                }
+            )
+
+        snapshot["run_id"] = "historical_walkforward_500_superseding_565534"
+        snapshot["duplicate_gamepk_disposition"] = disposition
+        snapshot["dispositioned_query_ids"] = [disposition["query_id"]]
+        for game in snapshot["payload"]["games"]:
+            if not game["played"]:
+                continue
+            game["raw_game_object_sha256"] = "a" * 64
+            provenance = build_schedule_anchor_provenance(
+                [
+                    {
+                        key: game[key]
+                        for key in _SOURCE_ANCHOR_KEYS
+                    }
+                ]
+            )
+            game["normalized_anchor_sha256"] = provenance[game["game_pk"]][
+                "normalized_anchor_sha256"
+            ]
+            reseal(game)
+
+        schema = json.loads(NORMALIZED_SNAPSHOT_SCHEMA.read_bytes())
+        jsonschema.validate(snapshot, schema)
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(snapshot), snapshot
+        )
+
+        attacks: dict[str, dict[str, object]] = {}
+        for field, value in (
+            ("query_id", "0" * 64),
+            ("query_sidecar.path", "sealed/other-sidecar.json"),
+            ("query_sidecar.sha256", "0" * 64),
+            ("success_receipt.path", "sealed/other-success.json"),
+            ("success_receipt.sha256", "0" * 64),
+            ("dispositioned_query_ids", ["0" * 64]),
+        ):
+            forged = json.loads(canonical_json_bytes(snapshot))
+            if field == "query_id":
+                forged["duplicate_gamepk_disposition"]["query_id"] = value
+            elif field == "dispositioned_query_ids":
+                forged[field] = value
+            else:
+                binding, key = field.split(".")
+                forged["duplicate_gamepk_disposition"][binding][key] = value
+            attacks[field] = forged
+
+        for label, forged in attacks.items():
+            with self.subTest(boundary="schema", attack=label), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.validate(forged, schema)
+            with self.subTest(boundary="runtime", attack=label), self.assertRaises(
+                ValueError
+            ):
+                verifier._validate_normalized_snapshot_mapping(forged)
+
+        forged = json.loads(canonical_json_bytes(snapshot))
+        played = next(game for game in forged["payload"]["games"] if game["played"])
+        played["normalized_anchor_sha256"] = "0" * 64
+        reseal(played)
+        with self.assertRaises(ValueError):
+            verifier._validate_normalized_snapshot_mapping(forged)
+
     def test_game_snapshot_reducer_accepts_disposition_capability_keywords(
         self,
     ) -> None:
@@ -2206,7 +2230,7 @@ class V52VerifySourcesTest(unittest.TestCase):
                 dispositioned_query_ids=(binding.query_id,),
             )
 
-    def test_source_game_snapshot_structural_validation_is_not_authentication(
+    def test_source_game_snapshot_validation_authenticates_normalized_anchor(
         self,
     ) -> None:
         from mlb_backtest import v52_verify_sources as verifier
@@ -2244,9 +2268,8 @@ class V52VerifySourcesTest(unittest.TestCase):
                     },
                 }
             )
-        self.assertEqual(
-            verifier._validate_normalized_snapshot_mapping(snapshot), snapshot
-        )
+        with self.assertRaises(ValueError):
+            verifier._validate_normalized_snapshot_mapping(snapshot)
 
     def test_game_normalized_snapshot_authority_mismatches_fail_closed(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier

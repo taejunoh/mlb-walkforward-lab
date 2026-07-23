@@ -33,6 +33,7 @@ from .v52_query_plan import (
     load_query_batch,
 )
 from .v52_schedule_inventory import (
+    _SOURCE_ANCHOR_KEYS,
     build_schedule_anchor_provenance,
     load_verified_schedule_anchor_inventory,
 )
@@ -855,6 +856,7 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
                 value = row.get(field)
                 if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                     raise ValueError(f"game participant {field} differs")
+            validate_source_normalized_anchor_provenance(row)
         projected_sidecars.add(str(row["schedule_query_sidecar_sha256"]))
         if prior_game_pk is not None and game_pk <= prior_game_pk:
             raise ValueError("game participant inventory is not strictly ordered")
@@ -935,6 +937,20 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
         raise ValueError("game participant source sidecar population differs")
     if sidecars != sorted(projected_sidecars):
         raise ValueError("game participant source sidecar coverage differs")
+
+
+def validate_source_normalized_anchor_provenance(game: Mapping[str, object]) -> None:
+    """Require a source anchor digest to bind the closed schedule projection."""
+    if not isinstance(game, Mapping):
+        raise ValueError("source game normalized anchor provenance differs")
+    try:
+        anchor = {key: game[key] for key in _SOURCE_ANCHOR_KEYS}
+        provenance = build_schedule_anchor_provenance([anchor])
+        expected = provenance[anchor["game_pk"]]["normalized_anchor_sha256"]
+    except (KeyError, ValueError) as exc:
+        raise ValueError("source game normalized anchor provenance differs") from exc
+    if game.get("normalized_anchor_sha256") != expected:
+        raise ValueError("source game normalized anchor provenance differs")
 
 
 def validate_game_evidence_snapshot(

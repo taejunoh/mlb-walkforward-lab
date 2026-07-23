@@ -19,6 +19,7 @@ from .v52_game_evidence_inventory import (
     VerifiedGameEvidenceInventory,
     _replace_source_disposition_lineage,
     load_verified_game_evidence_inventory,
+    validate_source_normalized_anchor_provenance,
     validate_game_evidence_snapshot,
 )
 from .v52_schedule_inventory import (
@@ -526,6 +527,10 @@ def _validate_normalized_snapshot_mapping(
                 or _SHA256.fullmatch(binding["sha256"]) is None
             ):
                 raise ValueError("normalized snapshot disposition binding differs")
+        try:
+            _validate_history_disposition(disposition)
+        except ValueError as exc:
+            raise ValueError("normalized snapshot disposition binding differs") from exc
     if source == "mlb_schedule_game_feed" and grain == "season_game_evidence_snapshot":
         if (
             envelope["run_id"] == _SOURCE_RUN_ID
@@ -575,6 +580,8 @@ def _validate_normalized_snapshot_mapping(
                     not played and provenance_fields & set(game)
                 ):
                     raise ValueError("normalized source game provenance keys differ")
+                if played:
+                    validate_source_normalized_anchor_provenance(game)
         validate_game_evidence_snapshot(payload, run_id=envelope["run_id"])
         return envelope
 
