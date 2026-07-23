@@ -692,6 +692,16 @@ class InventoryTests(unittest.TestCase):
         }
         source["dispositioned_query_ids"] = [disposition_id]
         jsonschema.validate(source, schema)
+        second_dynamic_receipt = json.loads(_canonical_raw(source))
+        second_dynamic_receipt["duplicate_gamepk_disposition"][
+            "success_receipt"
+        ]["sha256"] = "9" * 64
+        jsonschema.validate(second_dynamic_receipt, schema)
+        self.assertEqual(
+            parse_inventory(_canonical_raw(second_dynamic_receipt))
+            .duplicate_gamepk_disposition.success_receipt.sha256,
+            "9" * 64,
+        )
 
         source_as_old = json.loads(_canonical_raw(source))
         source_as_old.pop("duplicate_gamepk_disposition")

@@ -240,6 +240,7 @@ def _require_mutable_context(
     )
     if any(value is None for value in required):
         raise FinalizationError("AUTHORITY_MISSING", "finalization authority is missing", (), 3)
+    _source_disposition_payload_fields(context, context.inventory)
     return context
 
 
@@ -707,6 +708,10 @@ def _authority_bindings(
     schedule = getattr(replay, "schedule_inventory")
     games = getattr(replay, "game_inventory")
     timezone = getattr(replay, "timezone_gate")
+    disposition = getattr(replay, "duplicate_gamepk_disposition", None)
+    dispositioned_query_ids = tuple(
+        getattr(replay, "dispositioned_query_ids", ())
+    )
     return AuthorityBindings(
         run_spec=_binding(root, run_spec_path),
         acquisition_contract=_binding(root, contract_path),
@@ -729,6 +734,8 @@ def _authority_bindings(
             ),
             timezone.seal_sha256,
         ),
+        duplicate_gamepk_disposition=disposition,
+        dispositioned_query_ids=dispositioned_query_ids,
     )
 
 
@@ -741,7 +748,7 @@ def _rebind_context_authorities(
     run_spec_path: Path,
     contract_path: Path,
     protected_path: Path,
-    run_spec: RunSpec,
+    run_spec: RunSpec | SourceRunSpec,
     registry: ExecutionRegistryState,
     checkpoint: AcquisitionCheckpoint,
     inventory: SourceInventory,
@@ -850,10 +857,12 @@ def build_context(common_args: CommonArgs) -> FinalizationContext:
         else:
             # Preserve the established unit seam for a mocked static loader.
             run_spec = parse_run_spec(json.loads(run_spec_bytes))
-        if isinstance(run_spec, SourceRunSpec):
+        if isinstance(run_spec, SourceRunSpec) and not isinstance(
+            authority_context, SourceAuthorityContext
+        ):
             raise FinalizationError(
-                "CHECKPOINT_AUTHORITY_UNAVAILABLE",
-                "superseding source checkpoints are not enabled before Task 6",
+                "AUTHORITY_MALFORMED",
+                "superseding source authority context is unavailable",
                 (str(run_spec_path), str(contract_path)),
                 3,
             )
@@ -949,6 +958,81 @@ def _checkpoint_status(checkpoint: AcquisitionCheckpoint | None) -> Mapping[str,
     }
 
 
+def _source_disposition_payload_fields(
+    context: FinalizationContext, inventory: SourceInventory | None
+) -> dict[str, object]:
+    """Return the closed superseding disposition binding for receipt payloads.
+
+    Old-run source receipts intentionally retain their existing byte shape.  A
+    SourceRunSpec, in contrast, cannot reach any mutation or evidence writer
+    unless the replay, inventory, and selected terminal checkpoint all carry
+    the same one-query disposition authority.
+    """
+    if not isinstance(context.run_spec, SourceRunSpec):
+        return {}
+    authority = context.authority_context
+    if (
+        not isinstance(authority, SourceAuthorityContext)
+        or authority.authority != context.run_spec
+        or authority.repository_root != context.root
+    ):
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED",
+            "superseding source authority context differs",
+            (),
+            4,
+        )
+    if inventory is None or context.snapshot_inputs is None or context.checkpoint is None:
+        raise FinalizationError(
+            "AUTHORITY_MISSING", "superseding disposition authority is missing", (), 3
+        )
+    disposition = inventory.duplicate_gamepk_disposition
+    query_ids = inventory.dispositioned_query_ids
+    replay = context.snapshot_inputs.replay
+    bindings = context.snapshot_inputs.bindings
+    if (
+        disposition is None
+        or query_ids != (disposition.query_id,)
+        or replay.duplicate_gamepk_disposition != disposition
+        or replay.dispositioned_query_ids != query_ids
+        or bindings.duplicate_gamepk_disposition != disposition
+        or bindings.dispositioned_query_ids != query_ids
+        or context.checkpoint.dispositioned_query_ids != query_ids
+        or disposition.query_id not in context.checkpoint.completed_query_ids
+        or disposition.query_id in context.checkpoint.pending_query_ids
+        or disposition.query_id in context.checkpoint.quarantined_query_ids
+        or disposition.query_id in context.checkpoint.split_query_ids
+    ):
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED",
+            "superseding disposition authority differs from source evidence",
+            (),
+            4,
+        )
+    return {
+        "duplicate_gamepk_disposition": disposition.as_mapping(),
+        "dispositioned_query_ids": list(query_ids),
+    }
+
+
+def _rebind_source_disposition_payload(
+    context: FinalizationContext,
+    inventory: SourceInventory,
+    payload: Mapping[str, object],
+) -> None:
+    """Keep source-only receipt fields bound through the final write boundary."""
+    expected = _source_disposition_payload_fields(context, inventory)
+    if not expected:
+        return
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise FinalizationError(
+            "POSTCONDITION_FAILED",
+            "superseding disposition receipt binding changed before publication",
+            (),
+            5,
+        )
+
+
 def _has_terminal_checkpoint(checkpoint: AcquisitionCheckpoint | None) -> bool:
     return bool(
         checkpoint is not None
@@ -959,7 +1043,7 @@ def _has_terminal_checkpoint(checkpoint: AcquisitionCheckpoint | None) -> bool:
 
 
 def _context_is_ready_for_mutation(context: FinalizationContext) -> bool:
-    return bool(
+    ready = bool(
         not context.blockers
         and context.run_spec is not None
         and context.registry is not None
@@ -970,6 +1054,13 @@ def _context_is_ready_for_mutation(context: FinalizationContext) -> bool:
         and context.registry.phase == context.phase
         and _has_terminal_checkpoint(context.checkpoint)
     )
+    if not ready:
+        return False
+    try:
+        _source_disposition_payload_fields(context, context.inventory)
+    except FinalizationError:
+        return False
+    return True
 
 
 def _published_inventory_matches(
@@ -1512,6 +1603,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         "git_head": context.git_head,
         "occurred_at_utc": _utc_now(),
     }
+    payload.update(_source_disposition_payload_fields(context, context.inventory))
     # Re-read the explicit selection after calculating the payload, then do a
     # second read-only preflight before making the receipt visible.
     rebound_ids, rebound_document = _load_query_ids_document(
@@ -1552,6 +1644,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
             raise FinalizationError(
                 "POSTCONDITION_FAILED", "preflight changed before publication", (), 5
             )
+        _rebind_source_disposition_payload(context, context.inventory, payload)
 
     receipt = _write_validated_receipt(
         context.root,
@@ -1559,6 +1652,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         payload,
         schema_name="v5_2_source_review_receipt.schema.json",
         expected_prefix=review_prefix,
+        pre_write_rebind=rebind_dependencies,
         final_rebind=rebind_dependencies,
     )
     marker_payload: dict[str, object] = {
@@ -1578,9 +1672,11 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         "git_head": context.git_head,
         "occurred_at_utc": _utc_now(),
     }
+    marker_payload.update(_source_disposition_payload_fields(context, context.inventory))
 
     def rebind_marker_dependencies() -> None:
         rebind_dependencies()
+        _rebind_source_disposition_payload(context, context.inventory, marker_payload)
         expected_binding = {
             "path": receipt.path.relative_to(context.root).as_posix(),
             "sha256": receipt.sha256,
@@ -1621,6 +1717,7 @@ def write_review(context: FinalizationContext, request: ReviewRequest) -> Review
         schema_name="v5_2_source_receipt_commit.schema.json",
         expected_prefix=review_prefix,
         pre_write_rebind=rebind_marker_dependencies,
+        final_rebind=rebind_marker_dependencies,
     )
     return ReceiptReport(
         receipt.path,
@@ -1667,6 +1764,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         )
     inventory = _load_clean_replay_inventory(context)
     payload = _clean_replay_payload(context, inventory, execution_id)
+    payload.update(_source_disposition_payload_fields(context, inventory))
 
     def rebind_dependencies() -> None:
         if run_preflight(context) != preflight:
@@ -1678,6 +1776,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
             raise FinalizationError(
                 "POSTCONDITION_FAILED", "clean replay changed before publication", (), 5
             )
+        _rebind_source_disposition_payload(context, rebound_inventory, payload)
 
     receipt = _write_validated_receipt(
         context.root,
@@ -1685,6 +1784,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         payload,
         schema_name="v5_2_clean_source_replay_receipt.schema.json",
         expected_prefix=replay_prefix,
+        pre_write_rebind=rebind_dependencies,
         final_rebind=rebind_dependencies,
     )
     if context.run_spec is None or context.snapshot_inputs is None or context.git_head is None:
@@ -1706,9 +1806,11 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         "git_head": context.git_head,
         "occurred_at_utc": _utc_now(),
     }
+    marker_payload.update(_source_disposition_payload_fields(context, inventory))
 
     def rebind_marker_dependencies() -> None:
         rebind_dependencies()
+        _rebind_source_disposition_payload(context, inventory, marker_payload)
         expected_binding = {
             "path": receipt.path.relative_to(context.root).as_posix(),
             "sha256": receipt.sha256,
@@ -1749,6 +1851,7 @@ def write_replay(context: FinalizationContext, request: ReplayRequest) -> Replay
         schema_name="v5_2_source_receipt_commit.schema.json",
         expected_prefix=replay_prefix,
         pre_write_rebind=rebind_marker_dependencies,
+        final_rebind=rebind_marker_dependencies,
     )
     return ReplayReport(
         receipt.path,
@@ -1767,18 +1870,18 @@ def advance_sources_ready(
     context: FinalizationContext, request: AdvanceRequest
 ) -> AdvanceReport:
     """Advance only an explicit, ordered source evidence set to SOURCES_READY."""
+    if isinstance(context.run_spec, SourceRunSpec) and context.phase == "SOURCES_READY":
+        raise FinalizationError(
+            "PHASE_BLOCKED",
+            "SOURCES_READY is terminal for the superseding source authority",
+            (),
+            4,
+        )
     context = _require_mutable_context(
         context, phase=frozenset({"ACQUIRING", "SOURCES_READY"})
     )
     if context.run_spec is None or context.registry is None or context.checkpoint is None:
         raise FinalizationError("AUTHORITY_MISSING", "advance authority is missing", (), 3)
-    if isinstance(context.run_spec, SourceRunSpec):
-        raise FinalizationError(
-            "CHECKPOINT_AUTHORITY_UNAVAILABLE",
-            "superseding source checkpoints are not enabled before Task 6",
-            (),
-            3,
-        )
     if len(request.review_receipts) < 1 or len(request.replay_receipts) != 2:
         raise _advance_input_error("advance requires at least one review and exactly two replays")
 

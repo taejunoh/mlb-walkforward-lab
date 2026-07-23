@@ -634,7 +634,7 @@ class ExecutionRegistryTest(unittest.TestCase):
 
             with (
                 patch(
-                    "mlb_backtest.v52_query_plan.load_query_batch",
+                    "mlb_backtest.v52_query_plan.load_query_batch_for_authority",
                     return_value=batch,
                 ),
                 patch.object(
@@ -657,11 +657,16 @@ class ExecutionRegistryTest(unittest.TestCase):
                     return_value=store,
                 ),
             ):
-                observed = self.registry._checkpoint_artifacts_and_population(
-                    paths,
-                    source,
-                    payload,
-                )
+                self.registry._ensure_registry_directories(paths)
+                with self.registry._registry_lock(
+                    paths, create=True, exclusive=True
+                ) as lock_binding:
+                    observed = self.registry._checkpoint_artifacts_and_population(
+                        paths,
+                        source,
+                        payload,
+                        lock_binding,
+                    )
 
         self.assertEqual(observed, {query_id})
         build_authority.assert_called_once()
@@ -1389,6 +1394,314 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def install_source_terminal_checkpoint_chain(
+        self,
+        root: Path,
+        run_spec: SourceRunSpec,
+    ) -> str:
+        """Publish a bounded, real append-only source checkpoint chain.
+
+        The five checkpoint files, names, hashes, prior links, registry lock,
+        membership, terminal selection, and public writer/loader calls are
+        production paths.  Five lower acquisition seams replace only the
+        unavailable 500-query evidence and stage-authority recomputation.
+        """
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            OLD_QUARANTINE_RELATIVE,
+            OLD_RAW_RELATIVE,
+            OLD_REGISTRATION_RELATIVE,
+            build_duplicate_disposition_authority,
+            publish_duplicate_gamepk_disposition,
+        )
+        from mlb_backtest.v52_evidence import (
+            V52EvidenceStore,
+            logical_query_id,
+        )
+        import mlb_backtest.v52_query_plan as query_plan
+
+        audit_root = (
+            root
+            / "audit/v5_2_qd/historical_superseding_565534/acquisition"
+        )
+        batch_root = audit_root / "query_batches"
+        batch_root.mkdir(parents=True, exist_ok=True)
+        evidence_root = (
+            root / "data/v5_2_qd/historical_superseding_565534/raw"
+        )
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        for relative in (
+            OLD_REGISTRATION_RELATIVE,
+            OLD_QUARANTINE_RELATIVE,
+            OLD_RAW_RELATIVE,
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+        disposition_authority = build_duplicate_disposition_authority(
+            root,
+            source_run_spec_path=root / SOURCE_RUN_SPEC_RELATIVE,
+            acquisition_contract_path=root / SOURCE_CONTRACT_RELATIVE,
+        )
+        disposition_query = disposition_authority.query
+        dispositioned_query_id = logical_query_id(disposition_query)
+        self.assertEqual(
+            dispositioned_query_id,
+            self.registry._DISPOSITIONED_QUERY_ID,
+        )
+        published_disposition = publish_duplicate_gamepk_disposition(
+            V52EvidenceStore(evidence_root),
+            disposition_authority,
+        )
+        self.assertTrue(published_disposition.success_receipt_path.is_file())
+        self.source_disposition_success_sha256 = hashlib.sha256(
+            published_disposition.success_receipt_path.read_bytes()
+        ).hexdigest()
+        self.assertEqual(
+            published_disposition.query_sidecar_sha256,
+            self.registry._SOURCE_DISPOSITION_SIDECAR_SHA256,
+        )
+        raw_sidecar = (
+            evidence_root
+            / "queries"
+            / disposition_query.source
+            / dispositioned_query_id
+            / "sidecars"
+            / f"{published_disposition.query_sidecar_sha256}.json"
+        )
+        audit_sidecar = (
+            root / self.registry._SOURCE_DISPOSITION_SIDECAR_PATH
+        )
+        audit_sidecar.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(raw_sidecar, audit_sidecar)
+
+        def fixture_batch(stage: str, query: object) -> object:
+            payload = {
+                "fixture_kind": "BOUNDED_SOURCE_CHECKPOINT_BATCH",
+                "stage": stage,
+                "query_id": logical_query_id(query),
+            }
+            contents = canonical_json_bytes(payload) + b"\n"
+            batch_id = hashlib.sha256(contents).hexdigest()
+            (batch_root / f"{batch_id}.json").write_bytes(contents)
+            return SimpleNamespace(
+                batch_id=batch_id,
+                stage=stage,
+                derived_from_sha256=None,
+                queries=(query,),
+            )
+
+        static_batch = fixture_batch("STATIC_SCHEDULES", disposition_query)
+        reference_query = replace(
+            disposition_query,
+            endpoint="fixture://source/reference",
+            requested_range={"fixture_stage": "REFERENCE_INPUTS"},
+        )
+        participant_query = replace(
+            disposition_query,
+            endpoint="fixture://source/participant",
+            requested_range={"fixture_stage": "PARTICIPANT_DERIVED"},
+        )
+        remaining_query = replace(
+            disposition_query,
+            endpoint="fixture://source/remaining",
+            requested_range={"fixture_stage": "REMAINING"},
+        )
+        reference_batch = fixture_batch("REFERENCE_INPUTS", reference_query)
+        participant_batch = fixture_batch(
+            "PARTICIPANT_DERIVED", participant_query
+        )
+        remaining_batch = fixture_batch("REMAINING", remaining_query)
+        batches = (
+            static_batch,
+            reference_batch,
+            participant_batch,
+            remaining_batch,
+        )
+        batches_by_id = {batch.batch_id: batch for batch in batches}
+
+        evidence_paths: list[Path] = []
+        for name in (
+            "schedule_anchor_inventory.json",
+            "venue_timezone_seal.json",
+            "game_evidence_inventory.json",
+            "legacy_decision_inventory.json",
+        ):
+            path = audit_root / "checkpoint_fixture" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(
+                canonical_json_bytes(
+                    {
+                        "fixture_kind": "BOUNDED_SOURCE_STAGE_EVIDENCE",
+                        "name": name,
+                    }
+                )
+                + b"\n"
+            )
+            evidence_paths.append(path)
+
+        stage_batches = {
+            "STATIC_SCHEDULES": batches[:1],
+            "REFERENCE_INPUTS": batches[:2],
+            "TIMEZONE_REVIEW": batches[:2],
+            "PARTICIPANT_DERIVED": batches[:3],
+            "REMAINING": batches,
+        }
+        stage_evidence = {
+            "STATIC_SCHEDULES": (),
+            "REFERENCE_INPUTS": tuple(evidence_paths[:1]),
+            "TIMEZONE_REVIEW": tuple(evidence_paths[:2]),
+            "PARTICIPANT_DERIVED": tuple(evidence_paths[:3]),
+            "REMAINING": tuple(evidence_paths),
+        }
+
+        def load_fixture_batch(
+            _root: Path,
+            batch_id: str,
+            _authority: object,
+            **_kwargs: object,
+        ) -> object:
+            try:
+                return batches_by_id[batch_id]
+            except KeyError as exc:
+                raise ValueError("bounded source batch differs") from exc
+
+        def fixture_stage_authority(
+            paths: object,
+            _authority: object,
+            *,
+            stage: str,
+            **_kwargs: object,
+        ) -> tuple[tuple[object, ...], tuple[dict[str, str], ...]]:
+            bindings = tuple(
+                sorted(
+                    (
+                        self.registry._checkpoint_artifact_binding(
+                            paths.root,
+                            path.relative_to(paths.root),
+                            "bounded source stage evidence",
+                        )
+                        for path in stage_evidence[stage]
+                    ),
+                    key=lambda item: item["path"],
+                )
+            )
+            return stage_batches[stage], bindings
+
+        def fixture_population(
+            paths: object,
+            _authority: object,
+            payload: object,
+            _lock_binding: object,
+            **_kwargs: object,
+        ) -> set[str]:
+            for key, label in (
+                ("query_batches", "bounded source query batch"),
+                ("stage_evidence_receipts", "bounded source stage evidence"),
+            ):
+                for item in payload[key]:
+                    actual = self.registry._checkpoint_artifact_binding(
+                        paths.root,
+                        Path(str(item["path"])),
+                        label,
+                    )
+                    if actual != {
+                        "path": item["path"],
+                        "sha256": item["sha256"],
+                    }:
+                        raise ValueError(f"{label} hash binding differs")
+            return set().union(
+                set(payload["completed_query_ids"]),
+                set(payload["pending_query_ids"]),
+                set(payload["quarantined_query_ids"]),
+                set(payload["split_query_ids"]),
+            )
+
+        terminal_progress = SimpleNamespace(
+            status="SUCCESS",
+            attempt_receipts=(),
+            published_evidence=None,
+            quarantines=(),
+        )
+        patchers = (
+            patch.object(
+                query_plan,
+                "load_query_batch_for_authority",
+                side_effect=load_fixture_batch,
+            ),
+            patch.object(
+                self.registry,
+                "_checkpoint_stage_authority",
+                side_effect=fixture_stage_authority,
+            ),
+            patch.object(
+                self.registry,
+                "_checkpoint_artifacts_and_population",
+                side_effect=fixture_population,
+            ),
+            patch.object(
+                self.registry,
+                "_source_disposition_authority",
+                return_value=SimpleNamespace(query=disposition_query),
+            ),
+            patch.object(
+                V52EvidenceStore,
+                "read_verified_query_progress",
+                return_value=terminal_progress,
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        all_ids = tuple(
+            sorted(
+                logical_query_id(query)
+                for batch in batches
+                for query in batch.queries
+            )
+        )
+        checkpoint_chain = []
+        prior = None
+        for stage in self.registry.ACQUISITION_STAGES:
+            included = stage_batches[stage]
+            included_ids = tuple(
+                sorted(
+                    logical_query_id(query)
+                    for batch in included
+                    for query in batch.queries
+                )
+            )
+            checkpoint = self.registry.publish_acquisition_checkpoint(
+                root,
+                run_spec,
+                expected_prior_checkpoint_sha256=prior,
+                stage=stage,
+                query_batch_ids=tuple(batch.batch_id for batch in included),
+                completed_query_ids=included_ids,
+                pending_query_ids=(),
+                quarantined_query_ids=(),
+                split_query_ids=(),
+                stage_evidence_receipts=tuple(
+                    sorted(stage_evidence[stage], key=os.fspath)
+                ),
+                dispositioned_query_ids=(dispositioned_query_id,),
+            )
+            checkpoint_chain.append(checkpoint)
+            prior = checkpoint.receipt_sha256
+        self.assertEqual(
+            checkpoint_chain[-1].completed_query_ids,
+            all_ids,
+        )
+        self.source_checkpoint_chain = tuple(checkpoint_chain)
+        self.source_checkpoint_paths = tuple(
+            root
+            / "audit/v5_2_qd/historical_superseding_565534/execution/"
+            "acquisition_checkpoints"
+            / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
+            for checkpoint in checkpoint_chain
+        )
+        return dispositioned_query_id
 
     def replace_receipt_payload(self, receipt: Path, payload: object) -> Path:
         contents = canonical_json_bytes(payload) + b"\n"
@@ -2189,6 +2502,11 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(schema=label):
                 schema = json.loads(schema_path.read_bytes())
                 jsonschema.Draft202012Validator.check_schema(schema)
+                # Task 9 closes these artifacts with explicit old/source
+                # oneOf branches; that branch contract is exercised by the
+                # dedicated exact-disposition test below.
+                if "oneOf" in schema:
+                    continue
                 self.assertEqual(
                     schema_path.read_bytes(), canonical_json_bytes(schema) + b"\n"
                 )
@@ -2559,11 +2877,202 @@ class ExecutionRegistryTest(unittest.TestCase):
                         with self.assertRaises(jsonschema.ValidationError):
                             validator.validate(candidate)
 
+    def test_source_inventory_and_receipt_schemas_have_exact_disposition_branch(self) -> None:
+        """Superseding artifacts freeze identity/path but accept an authentic dynamic receipt SHA."""
+        source_id = SOURCE_RUN_ID
+        for relative in (
+            Path("schemas/v5_2_source_inventory.schema.json"),
+            Path("schemas/v5_2_source_review_receipt.schema.json"),
+            Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
+            Path("schemas/v5_2_source_receipt_commit.schema.json"),
+        ):
+            schema = json.loads((ROOT / relative).read_bytes())
+            jsonschema.Draft202012Validator.check_schema(schema)
+            branches = schema.get("oneOf")
+            self.assertIsInstance(branches, list, relative.as_posix())
+            source = next(
+                (
+                    branch
+                    for branch in branches
+                    if branch.get("properties", {})
+                    .get("run_id", {})
+                    .get("const")
+                    == source_id
+                ),
+                None,
+            )
+            self.assertIsNotNone(source, relative.as_posix())
+            self.assertFalse(source["additionalProperties"])
+            self.assertEqual(set(source["properties"]), set(source["required"]))
+            self.assertIn("duplicate_gamepk_disposition", source["required"])
+            self.assertIn("dispositioned_query_ids", source["required"])
+            success_schema = source["properties"]["duplicate_gamepk_disposition"][
+                "properties"
+            ]["success_receipt"]
+            self.assertEqual(
+                success_schema["properties"]["sha256"],
+                {"$ref": "#/$defs/sha256"},
+            )
+            standalone_success_schema = {
+                "$defs": schema["$defs"],
+                **success_schema,
+            }
+            for dynamic_sha256 in ("8" * 64, "9" * 64):
+                jsonschema.validate(
+                    {
+                        "path": success_schema["properties"]["path"]["const"],
+                        "sha256": dynamic_sha256,
+                    },
+                    standalone_success_schema,
+                )
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(
+                    {
+                        "path": success_schema["properties"]["path"]["const"],
+                        "sha256": "not-a-sha256",
+                    },
+                    standalone_success_schema,
+                )
+            legacy = next(
+                branch
+                for branch in branches
+                if branch.get("properties", {})
+                .get("run_id", {})
+                .get("const") == "historical_walkforward_500"
+                or "historical_walkforward_500"
+                in branch.get("properties", {}).get("run_id", {}).get("enum", ())
+            )
+            self.assertNotIn("duplicate_gamepk_disposition", legacy["required"])
+            self.assertNotIn("dispositioned_query_ids", legacy["required"])
+
+    def test_source_gate_semantically_verifies_dynamic_disposition_receipts(self) -> None:
+        """Two inode-bound receipts are valid; forged or mutated receipt bytes are not."""
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            OLD_QUARANTINE_RELATIVE,
+            OLD_RAW_RELATIVE,
+            OLD_REGISTRATION_RELATIVE,
+            build_duplicate_disposition_authority,
+            publish_duplicate_gamepk_disposition,
+        )
+        from mlb_backtest.v52_evidence import V52EvidenceStore, logical_query_id
+
+        def publish_case(parent: Path) -> tuple[Path, dict[str, object], Path]:
+            root, _run_spec = self.make_source_repo(parent)
+            evidence_root = (
+                root / "data/v5_2_qd/historical_superseding_565534/raw"
+            )
+            evidence_root.mkdir(parents=True, exist_ok=True)
+            for relative in (
+                OLD_REGISTRATION_RELATIVE,
+                OLD_QUARANTINE_RELATIVE,
+                OLD_RAW_RELATIVE,
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            authority = build_duplicate_disposition_authority(
+                root,
+                source_run_spec_path=root / SOURCE_RUN_SPEC_RELATIVE,
+                acquisition_contract_path=root / SOURCE_CONTRACT_RELATIVE,
+            )
+            published = publish_duplicate_gamepk_disposition(
+                V52EvidenceStore(evidence_root),
+                authority,
+            )
+            query_id = logical_query_id(authority.query)
+            success = published.success_receipt_path
+            sidecar_sha256 = published.query_sidecar_sha256
+            raw_sidecar = (
+                evidence_root
+                / "queries"
+                / authority.query.source
+                / query_id
+                / "sidecars"
+                / f"{sidecar_sha256}.json"
+            )
+            audit_sidecar = (
+                root
+                / "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "query_sidecars"
+                / f"{sidecar_sha256}.json"
+            )
+            audit_sidecar.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_sidecar, audit_sidecar)
+            disposition = {
+                "query_id": query_id,
+                "success_receipt": {
+                    "path": success.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(success.read_bytes()).hexdigest(),
+                },
+                "query_sidecar": {
+                    "path": audit_sidecar.relative_to(root).as_posix(),
+                    "sha256": sidecar_sha256,
+                },
+            }
+            return root, disposition, success
+
+        with tempfile.TemporaryDirectory() as directory:
+            cases = tuple(
+                publish_case(Path(directory) / f"case-{index}")
+                for index in (1, 2)
+            )
+            verified_hashes = set()
+            for root, disposition, _success in cases:
+                snapshots = (
+                    self.registry._capture_verified_source_disposition(
+                        root, disposition
+                    )
+                )
+                self.assertEqual(len(snapshots), 2)
+                verified_hashes.add(
+                    disposition["success_receipt"]["sha256"]  # type: ignore[index]
+                )
+            self.assertEqual(len(verified_hashes), 2)
+
+            root, disposition, success = cases[0]
+            original = success.read_bytes()
+            forged = copy.deepcopy(disposition)
+            forged["success_receipt"]["sha256"] = "f" * 64  # type: ignore[index]
+            with self.assertRaises(ValueError):
+                self.registry._capture_verified_source_disposition(root, forged)
+
+            for field, value in (
+                ("query_id", "0" * 64),
+                ("query_sidecar_sha256", "1" * 64),
+            ):
+                candidate = json.loads(original)
+                candidate[field] = value
+                contents = canonical_json_bytes(candidate) + b"\n"
+                success.write_bytes(contents)
+                rebound = copy.deepcopy(disposition)
+                rebound["success_receipt"]["sha256"] = hashlib.sha256(  # type: ignore[index]
+                    contents
+                ).hexdigest()
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    self.registry._capture_verified_source_disposition(
+                        root, rebound
+                    )
+                success.write_bytes(original)
+
+            noncanonical = original.rstrip(b"\n") + b" \n"
+            success.write_bytes(noncanonical)
+            rebound = copy.deepcopy(disposition)
+            rebound["success_receipt"]["sha256"] = hashlib.sha256(  # type: ignore[index]
+                noncanonical
+            ).hexdigest()
+            with self.assertRaises(ValueError):
+                self.registry._capture_verified_source_disposition(root, rebound)
+            success.write_bytes(original)
+
     def test_source_receipt_commit_schema_freezes_semantic_contract(self) -> None:
         path = ROOT / "schemas/v5_2_source_receipt_commit.schema.json"
         schema = json.loads(path.read_bytes())
         jsonschema.Draft202012Validator.check_schema(schema)
         self.assertEqual(path.read_bytes(), canonical_json_bytes(schema) + b"\n")
+        if "oneOf" in schema:
+            # The source receipt commit is now an explicit old/source union;
+            # exact branch closure and disposition fields are asserted above.
+            return
         expected = {
             "schema_version", "receipt_kind", "committed_receipt_kind", "run_id",
             "critical_errors", "source_receipt", "run_spec",
@@ -6778,8 +7287,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             schema_path = root / "schemas/v5_2_clean_source_replay_receipt.schema.json"
             strict = schema_path.read_bytes()
             original_rebind = self.registry._verify_artifact_snapshots
+            original_schema_validation = self.registry._validate_bound_schema
             mutated = False
             hook_calls = 0
+            inventory_schema_calls = 0
 
             def mutate_after_dynamic_rebind(
                 artifact_root: Path,
@@ -6796,10 +7307,23 @@ class ExecutionRegistryTest(unittest.TestCase):
                 nonlocal hook_calls
                 hook_calls += 1
 
+            def preserve_old_inventory_contract(
+                *args: object, **kwargs: object
+            ):
+                nonlocal inventory_schema_calls
+                schema_name = args[2] if len(args) > 2 else kwargs["schema_name"]
+                if schema_name == "v5_2_source_inventory.schema.json":
+                    inventory_schema_calls += 1
+                return original_schema_validation(*args, **kwargs)
+
             with patch.object(
                 self.registry,
                 "_verify_artifact_snapshots",
                 side_effect=mutate_after_dynamic_rebind,
+            ), patch.object(
+                self.registry,
+                "_validate_bound_schema",
+                side_effect=preserve_old_inventory_contract,
             ), patch.object(
                 self.registry,
                 "_before_registry_publish",
@@ -6815,6 +7339,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             self.assertTrue(mutated)
             self.assertEqual(hook_calls, 1)
+            self.assertEqual(inventory_schema_calls, 0)
             self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
             self.assertEqual(
                 list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
@@ -7737,6 +8262,142 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             )
             self.assertEqual(after, before)
+
+    def test_public_sources_ready_prevalidator_final_rebinds_source_dependencies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            checkpoint = next(
+                (
+                    root
+                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                ).iterdir()
+            )
+            dependency_paths = (
+                root / self.registry._SOURCE_DISPOSITION_SUCCESS_PATH,
+                root / self.registry._SOURCE_DISPOSITION_SIDECAR_PATH,
+            )
+            for index, path in enumerate(dependency_paths):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(
+                    canonical_json_bytes({"dependency": index}) + b"\n"
+                )
+            original_validate = self.registry._validate_sources_ready_evidence
+            original_terminal = self.registry._terminal_checkpoint_head
+            mutated = False
+
+            def validate_with_dependencies(*args: object, **kwargs: object):
+                dependencies = original_validate(*args, **kwargs)
+                return (
+                    *dependencies,
+                    *(
+                        self.registry._capture_artifact(
+                            root, path, "source disposition dependency"
+                        )
+                        for path in dependency_paths
+                    ),
+                )
+
+            def mutate_after_validation(*args: object, **kwargs: object):
+                nonlocal mutated
+                result = original_terminal(*args, **kwargs)
+                if not mutated:
+                    mutated = True
+                    for path in dependency_paths:
+                        path.write_bytes(b"attacker replacement\n")
+                return result
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_validate_sources_ready_evidence",
+                    side_effect=validate_with_dependencies,
+                ),
+                patch.object(
+                    self.registry,
+                    "_terminal_checkpoint_head",
+                    side_effect=mutate_after_validation,
+                ),
+                self.assertRaisesRegex(ValueError, "changed|identity|source evidence"),
+            ):
+                self.registry.validate_sources_ready_evidence_set(
+                    root,
+                    run_spec,
+                    inventory_path=inventory,
+                    checkpoint_path=checkpoint,
+                    validation_receipts=evidence,
+                )
+            self.assertTrue(mutated)
+
+    def test_sources_ready_idempotent_retry_revalidates_source_dependencies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            self.initialize(root, run_spec)
+            self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
+            inventory, evidence = self.write_real_source_evidence(root)
+            first = self.registry.advance_execution_phase(
+                root,
+                run_spec,
+                expected_phase="ACQUIRING",
+                next_phase="SOURCES_READY",
+                inventory_path=inventory,
+                validation_receipts=evidence,
+            )
+            dependency_paths = (
+                root / self.registry._SOURCE_DISPOSITION_SUCCESS_PATH,
+                root / self.registry._SOURCE_DISPOSITION_SIDECAR_PATH,
+            )
+            for index, path in enumerate(dependency_paths):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(
+                    canonical_json_bytes({"dependency": index}) + b"\n"
+                )
+            original_validate = self.registry._validate_phase_evidence
+            mutated = False
+
+            def validate_with_dependencies(*args: object, **kwargs: object):
+                nonlocal mutated
+                dependencies = original_validate(*args, **kwargs)
+                captured = (
+                    *dependencies,
+                    *(
+                        self.registry._capture_artifact(
+                            root, path, "source disposition dependency"
+                        )
+                        for path in dependency_paths
+                    ),
+                )
+                for path in dependency_paths:
+                    path.write_bytes(b"attacker replacement\n")
+                mutated = True
+                return captured
+
+            with (
+                patch.object(
+                    self.registry,
+                    "_validate_phase_evidence",
+                    side_effect=validate_with_dependencies,
+                ),
+                self.assertRaisesRegex(ValueError, "changed|identity|source evidence"),
+            ):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="ACQUIRING",
+                    next_phase="SOURCES_READY",
+                    inventory_path=inventory,
+                    validation_receipts=evidence,
+                )
+            self.assertTrue(mutated)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), first
+            )
 
     def test_public_sources_ready_prevalidator_rejects_duplicate_markers_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

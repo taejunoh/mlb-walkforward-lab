@@ -21,11 +21,12 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from mlb_backtest import v52_source_finalize as cli
 from mlb_backtest import v52_source_orchestration as orchestration
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
+from mlb_backtest.protocols import SourceRunSpec, load_source_run_spec
 from mlb_backtest.v52_snapshot_store import (
     AuthorityBinding,
     LoadedSnapshotStore,
@@ -34,6 +35,7 @@ from mlb_backtest.v52_snapshot_store import (
     publish_snapshot_store,
 )
 from mlb_backtest.v52_source_contracts import canonical_json_bytes
+from mlb_backtest.v52_verify_sources import DuplicateGamePkDispositionBinding
 from mlb_backtest.v52_verify_sources import snapshot_sort_key
 from tests.v52_snapshot_store_fixture import fake_81, patched_store_replay, store_inputs
 
@@ -42,10 +44,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
-    def test_superseding_cli_authority_stops_before_checkpoint_services(self) -> None:
+    def test_superseding_cli_without_registry_is_absent_not_task6_blocked(self) -> None:
         from mlb_backtest.v52_source_orchestration import (
             CommonArgs,
-            FinalizationError,
             build_context,
         )
 
@@ -59,20 +60,20 @@ class CliTests(unittest.TestCase):
             / "protocols/v5_2_qd/"
             "historical_source_acquisition_superseding_565534.json"
         )
-        with self.assertRaises(FinalizationError) as raised:
-            build_context(
-                CommonArgs(
-                    root=ROOT,
-                    run_spec=source_run,
-                    acquisition_contract=source_contract,
-                    protected_inventory=ROOT
-                    / "audit/v5_1_bt/protected_raw_inventory.json",
-                )
+        context = build_context(
+            CommonArgs(
+                root=ROOT,
+                run_spec=source_run,
+                acquisition_contract=source_contract,
+                protected_inventory=ROOT
+                / "audit/v5_1_bt/protected_raw_inventory.json",
             )
-        self.assertEqual(
-            raised.exception.error_code, "CHECKPOINT_AUTHORITY_UNAVAILABLE"
         )
-        self.assertIn("Task 6", raised.exception.message)
+        self.assertEqual(context.phase, "ABSENT")
+        self.assertEqual(
+            tuple(blocker.code for blocker in context.blockers),
+            ("REGISTRY_ABSENT",),
+        )
 
     def _run_json(self, argv: list[str]) -> tuple[int, dict[str, object], str]:
         with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
@@ -575,6 +576,518 @@ class FinalizationEndToEndTests(unittest.TestCase):
             "inventory": root / "data/v5_2_qd/historical/sources/source_inventory.json",
         }
         return root, orchestration.CommonArgs(root=root), request_bundle, replay, all_snapshots
+
+    def build_source_terminal_fixture(
+        self, parent: Path, *, with_disposition: bool = True
+    ) -> tuple[Path, orchestration.CommonArgs, object]:
+        """Create a bounded superseding source fixture for Task 9 gates.
+
+        The fixture copies the exact SourceRunSpec/contract into a temporary
+        Git repository, publishes a real five-stage append-only checkpoint
+        chain through the public registry writer, and injects the
+        already-verified 81-snapshot replay inputs.  No network work is
+        performed here.
+        """
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        fixture = ExecutionRegistryTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        root, run_spec = fixture.make_source_repo(parent)
+        fixture.registry.initialize_execution_registry(
+            root,
+            run_spec,
+            design_path=root
+            / "docs/superpowers/specs/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md",
+            plan_path=root
+            / "docs/superpowers/plans/2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md",
+            acquisition_contract_path=root
+            / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        fixture.registry.advance_execution_phase(
+            root,
+            run_spec,
+            expected_phase="DESIGN_ACCEPTED",
+            next_phase="ACQUIRING",
+            inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
+            validation_receipts=(),
+        )
+        dispositioned_query_id = (
+            fixture.install_source_terminal_checkpoint_chain(root, run_spec)
+        )
+        self.source_checkpoint_chain = fixture.source_checkpoint_chain
+        self.source_checkpoint_paths = fixture.source_checkpoint_paths
+        self.source_disposition_success_sha256 = (
+            fixture.source_disposition_success_sha256
+        )
+
+        def authority(relative: str) -> tuple[Path, str]:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            contents = canonical_json_bytes({"fixture_authority": relative}) + b"\n"
+            path.write_bytes(contents)
+            return path, hashlib.sha256(contents).hexdigest()
+
+        schedule_path, schedule_sha256 = authority(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "schedule_anchor_inventory.json"
+        )
+        game_path, game_sha256 = authority(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "game_evidence_inventory.json"
+        )
+        _seal_path, seal_sha256 = authority(
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            "venue_timezone_seal.json"
+        )
+
+        inputs = store_inputs(current_phase="ACQUIRING")
+        source_snapshots = tuple(
+            dataclasses.replace(
+                snapshot,
+                run_id=run_spec.run_id,
+                canonical_bytes=(
+                    canonical_json_bytes(
+                        {**snapshot.as_mapping(), "run_id": run_spec.run_id}
+                    )
+                    + b"\n"
+                ),
+            )
+            for snapshot in inputs.replay.game_snapshots
+        )
+        # Recompute the snapshot hashes after rebinding run_id.
+        source_snapshots = tuple(
+            dataclasses.replace(
+                snapshot,
+                sha256=hashlib.sha256(snapshot.canonical_bytes).hexdigest(),
+            )
+            for snapshot in source_snapshots
+        )
+        disposition = DuplicateGamePkDispositionBinding(
+            dispositioned_query_id,
+            AuthorityBinding(
+                "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                f"mlb_schedule_game_feed/{dispositioned_query_id}/success.json",
+                self.source_disposition_success_sha256,
+            ),
+            AuthorityBinding(
+                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json",
+                "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1",
+            ),
+        )
+        replay = dataclasses.replace(
+            inputs.replay,
+            run_id=run_spec.run_id,
+            game_snapshots=source_snapshots,
+            schedule_inventory=dataclasses.replace(
+                inputs.replay.schedule_inventory,
+                path=schedule_path,
+                sha256=schedule_sha256,
+            ),
+            game_inventory=dataclasses.replace(
+                inputs.replay.game_inventory,
+                path=game_path,
+                sha256=game_sha256,
+            ),
+            timezone_gate=dataclasses.replace(
+                inputs.replay.timezone_gate,
+                seal_sha256=seal_sha256,
+            ),
+            duplicate_gamepk_disposition=disposition if with_disposition else None,
+            dispositioned_query_ids=(dispositioned_query_id,) if with_disposition else (),
+        )
+        common = orchestration.CommonArgs(
+            root=root,
+            run_spec=root / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract=root / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+            protected_inventory=root / "audit/v5_1_bt/protected_raw_inventory.json",
+        )
+        return root, common, replay
+
+    def test_replay_inventory_and_sources_ready_require_disposition_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, common, replay = self.build_source_terminal_fixture(Path(directory))
+            self.assertFalse(
+                isinstance(
+                    orchestration.execution_registry._load_checkpoints_locked,
+                    Mock,
+                )
+            )
+            authenticated_checkpoint = (
+                orchestration.execution_registry.load_source_verification_checkpoint(
+                    root,
+                    load_source_run_spec(common.run_spec),
+                )
+            )
+            self.assertEqual(authenticated_checkpoint.stage, "REMAINING")
+            self.assertEqual(
+                authenticated_checkpoint.receipt_sha256,
+                self.source_checkpoint_chain[-1].receipt_sha256,
+            )
+
+            # The real loader rejects changed terminal bytes and a reordered
+            # membership name.  Exact restoration must make the same terminal
+            # checkpoint authenticate again.
+            terminal_checkpoint_path = self.source_checkpoint_paths[-1]
+            terminal_checkpoint_bytes = terminal_checkpoint_path.read_bytes()
+            terminal_checkpoint_path.write_bytes(
+                terminal_checkpoint_bytes.rstrip(b"\n") + b" \n"
+            )
+            with self.assertRaises(ValueError):
+                orchestration.execution_registry.load_source_verification_checkpoint(
+                    root,
+                    load_source_run_spec(common.run_spec),
+                )
+            terminal_checkpoint_path.write_bytes(terminal_checkpoint_bytes)
+
+            first_checkpoint_path = self.source_checkpoint_paths[0]
+            reordered_checkpoint_path = first_checkpoint_path.with_name(
+                f"00000009-{self.source_checkpoint_chain[0].receipt_sha256}.json"
+            )
+            first_checkpoint_path.rename(reordered_checkpoint_path)
+            with self.assertRaises(ValueError):
+                orchestration.execution_registry.load_source_verification_checkpoint(
+                    root,
+                    load_source_run_spec(common.run_spec),
+                )
+            reordered_checkpoint_path.rename(first_checkpoint_path)
+            self.assertEqual(
+                orchestration.execution_registry.load_source_verification_checkpoint(
+                    root,
+                    load_source_run_spec(common.run_spec),
+                ).receipt_sha256,
+                self.source_checkpoint_chain[-1].receipt_sha256,
+            )
+            self.assertIsNotNone(replay.duplicate_gamepk_disposition)
+            self.assertEqual(replay.dispositioned_query_ids, (replay.duplicate_gamepk_disposition.query_id,))
+            source_all_snapshots = tuple(
+                sorted(
+                    (
+                        dataclasses.replace(
+                            snapshot,
+                            run_id=replay.run_id,
+                            canonical_bytes=(
+                                canonical_json_bytes(
+                                    {**snapshot.as_mapping(), "run_id": replay.run_id}
+                                )
+                                + b"\n"
+                            ),
+                        )
+                        for snapshot in fake_81()
+                    ),
+                    key=snapshot_sort_key,
+                )
+            )
+            source_all_snapshots = tuple(
+                dataclasses.replace(
+                    snapshot,
+                    sha256=hashlib.sha256(snapshot.canonical_bytes).hexdigest(),
+                )
+                for snapshot in source_all_snapshots
+            )
+            # Bind the derived query ID into one retained schedule snapshot so
+            # the source inventory's global logical-query union authenticates
+            # the terminal disposition exactly as production does.
+            first_snapshot = source_all_snapshots[0]
+            first_payload = {
+                **first_snapshot.as_mapping(),
+                "logical_query_ids": [replay.dispositioned_query_ids[0]],
+            }
+            first_bytes = canonical_json_bytes(first_payload) + b"\n"
+            source_all_snapshots = (
+                dataclasses.replace(
+                    first_snapshot,
+                    logical_query_ids=(replay.dispositioned_query_ids[0],),
+                    canonical_bytes=first_bytes,
+                    sha256=hashlib.sha256(first_bytes).hexdigest(),
+                ),
+                *source_all_snapshots[1:],
+            )
+            with patch.object(
+                orchestration, "load_snapshot_replay_inputs", return_value=replay
+            ), patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=source_all_snapshots,
+            ), patch.object(
+                orchestration,
+                "verify_protected_raw_inventory",
+                return_value=object(),
+            ), patch.object(
+                orchestration,
+                "snapshot_protected_inventory_membership",
+                return_value=(),
+            ):
+                context = orchestration.build_context(common)
+            self.assertIsInstance(context.run_spec, SourceRunSpec)
+            self.assertEqual(
+                context.inventory.dispositioned_query_ids,
+                (replay.dispositioned_query_ids[0],),
+            )
+            self.assertEqual(context.phase, "ACQUIRING")
+            # Keep the bounded protected-inventory seam active across
+            # publish/preflight rebuilds; the temporary fixture deliberately
+            # does not copy the production 1,675-record legacy tree.
+            protected_patcher = patch.object(
+                orchestration, "verify_protected_raw_inventory", return_value=object()
+            )
+            membership_patcher = patch.object(
+                orchestration,
+                "snapshot_protected_inventory_membership",
+                return_value=(),
+            )
+            protected_patcher.start()
+            membership_patcher.start()
+            self.addCleanup(protected_patcher.stop)
+            self.addCleanup(membership_patcher.stop)
+            replay_patcher = patch.object(
+                orchestration, "load_snapshot_replay_inputs", return_value=replay
+            )
+            snapshot_patcher = patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=source_all_snapshots,
+            )
+            replay_patcher.start()
+            snapshot_patcher.start()
+            self.addCleanup(replay_patcher.stop)
+            self.addCleanup(snapshot_patcher.stop)
+            replay_payload = orchestration._clean_replay_payload(
+                context, context.inventory, "11111111-1111-4111-8111-111111111111"
+            )
+            replay_payload.update(
+                orchestration._source_disposition_payload_fields(
+                    context, context.inventory
+                )
+            )
+            self.assertEqual(
+                replay_payload["dispositioned_query_ids"],
+                [replay.dispositioned_query_ids[0]],
+            )
+            self.assertEqual(
+                replay_payload["duplicate_gamepk_disposition"],
+                replay.duplicate_gamepk_disposition.as_mapping(),
+            )
+
+            # Exercise the public source-finalization path against real
+            # temporary files, schemas, context rebuilds, and registry lock.
+            # The bounded fixture injects verified replay/protected-inventory
+            # seams instead of copying the production 500-query/legacy trees.
+            source_root = root / (
+                "data/v5_2_qd/historical_superseding_565534/sources"
+            )
+            acquisition_root = root / (
+                "audit/v5_2_qd/historical_superseding_565534/acquisition"
+            )
+            review_root = acquisition_root / "source_reviews"
+            replay_root = acquisition_root / "source_replays"
+            query_document = review_root / "task9-query-ids.json"
+            query_document.parent.mkdir(parents=True, exist_ok=True)
+            query_document.write_bytes(
+                canonical_json_bytes(
+                    {"query_ids": [context.inventory.logical_query_ids[0]]}
+                )
+                + b"\n"
+            )
+            publication = orchestration.publish_inventory(
+                context, lock_owner="task9-source-e2e"
+            )
+            self.assertEqual(publication.status, "PUBLISHED")
+            self.assertEqual(publication.snapshot_count, 81)
+            review = orchestration.write_review(
+                context,
+                orchestration.ReviewRequest(
+                    "independent-source-auditor",
+                    "independent-source-auditor",
+                    "APPROVED",
+                    query_document,
+                    review_root / "task9-review.json",
+                    review_root / "task9-review.commit.json",
+                ),
+            )
+            replays = tuple(
+                orchestration.write_replay(
+                    context,
+                    orchestration.ReplayRequest(
+                        replay_root / f"task9-replay-{index}.json",
+                        replay_root / f"task9-replay-{index}.commit.json",
+                    ),
+                )
+                for index in (1, 2)
+            )
+            for report in (review, *replays):
+                payload = json.loads(report.path.read_bytes())
+                self.assertEqual(
+                    payload["dispositioned_query_ids"],
+                    [replay.dispositioned_query_ids[0]],
+                )
+                self.assertEqual(
+                    payload["duplicate_gamepk_disposition"],
+                    replay.duplicate_gamepk_disposition.as_mapping(),
+                )
+
+            checkpoint_path = root / orchestration._checkpoint_path(
+                context.checkpoint, context.authority_context
+            )
+            inventory_path = source_root / "source_inventory.json"
+            advance_request = orchestration.AdvanceRequest(
+                (review.commit_path,),
+                (replays[0].commit_path, replays[1].commit_path),
+                checkpoint_path,
+                inventory_path,
+            )
+
+            wrong_checkpoint_request = dataclasses.replace(
+                advance_request,
+                checkpoint=self.source_checkpoint_paths[-2],
+            )
+            with self.assertRaises(orchestration.FinalizationError):
+                orchestration.advance_sources_ready(
+                    context,
+                    wrong_checkpoint_request,
+                )
+
+            # A review or commit marker changed after writing is rejected and
+            # does not mutate registry state.  Restore exact bytes and then
+            # perform the valid advance.
+            original_review = review.path.read_bytes()
+            tampered_review = json.loads(original_review)
+            tampered_review["dispositioned_query_ids"] = ["0" * 64]
+            review.path.write_bytes(canonical_json_bytes(tampered_review) + b"\n")
+            with self.assertRaises(orchestration.FinalizationError):
+                orchestration.advance_sources_ready(context, advance_request)
+            review.path.write_bytes(original_review)
+
+            original_marker = review.commit_path.read_bytes()
+            tampered_marker = json.loads(original_marker)
+            tampered_marker["duplicate_gamepk_disposition"]["query_id"] = "0" * 64
+            review.commit_path.write_bytes(canonical_json_bytes(tampered_marker) + b"\n")
+            with self.assertRaises(orchestration.FinalizationError):
+                orchestration.advance_sources_ready(context, advance_request)
+            review.commit_path.write_bytes(original_marker)
+
+            forged_success_marker = json.loads(original_marker)
+            forged_success_marker["duplicate_gamepk_disposition"][
+                "success_receipt"
+            ]["sha256"] = "f" * 64
+            review.commit_path.write_bytes(
+                canonical_json_bytes(forged_success_marker) + b"\n"
+            )
+            with self.assertRaises(orchestration.FinalizationError):
+                orchestration.advance_sources_ready(context, advance_request)
+            review.commit_path.write_bytes(original_marker)
+
+            advanced = orchestration.advance_sources_ready(context, advance_request)
+            self.assertEqual(advanced.phase, "SOURCES_READY")
+            state = orchestration.execution_registry.load_execution_registry(
+                root, context.run_spec
+            )
+            self.assertEqual(state.phase, "SOURCES_READY")
+            self.assertEqual(
+                state.inventory_sha256,
+                hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+            )
+            fresh = orchestration.build_context(common)
+            self.assertEqual(fresh.phase, "SOURCES_READY")
+            self.assertEqual(
+                fresh.checkpoint.dispositioned_query_ids,
+                (replay.dispositioned_query_ids[0],),
+            )
+            with self.assertRaises(orchestration.FinalizationError):
+                orchestration.advance_sources_ready(fresh, advance_request)
+            with self.assertRaisesRegex(ValueError, "immediate next|terminal"):
+                orchestration.execution_registry.quarantine_execution_transition(
+                    root,
+                    context.run_spec,
+                    attempted_phase="SOURCES_READY",
+                    validation_receipts=(review.commit_path,),
+                )
+
+            # Every source-only boundary must reject a missing, extra,
+            # tampered, cross-run, or stale disposition binding before I/O.
+            inventory = context.inventory
+            bindings = inventory.bindings
+            disposition = bindings.duplicate_gamepk_disposition
+            self.assertIsNotNone(disposition)
+            invalid_contexts = (
+                dataclasses.replace(
+                    context,
+                    inventory=dataclasses.replace(
+                        inventory,
+                        bindings=dataclasses.replace(
+                            bindings,
+                            duplicate_gamepk_disposition=None,
+                            dispositioned_query_ids=(),
+                        ),
+                    ),
+                ),
+                dataclasses.replace(
+                    context,
+                    inventory=dataclasses.replace(
+                        inventory,
+                        bindings=dataclasses.replace(
+                            bindings,
+                            dispositioned_query_ids=(
+                                replay.dispositioned_query_ids[0],
+                                "0" * 64,
+                            ),
+                        ),
+                    ),
+                ),
+                dataclasses.replace(
+                    context,
+                    inventory=dataclasses.replace(
+                        inventory,
+                        bindings=dataclasses.replace(
+                            bindings,
+                            duplicate_gamepk_disposition=dataclasses.replace(
+                                disposition,
+                                query_sidecar=AuthorityBinding(
+                                    disposition.query_sidecar.path,
+                                    "f" * 64,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                dataclasses.replace(
+                    context,
+                    checkpoint=dataclasses.replace(
+                        context.checkpoint,
+                        dispositioned_query_ids=(),
+                    ),
+                ),
+            )
+            for invalid in invalid_contexts:
+                with self.assertRaises(orchestration.FinalizationError):
+                    orchestration._source_disposition_payload_fields(
+                        invalid, invalid.inventory
+                    )
+
+            _root, missing_common, missing_replay = self.build_source_terminal_fixture(
+                Path(directory) / "missing", with_disposition=False
+            )
+            with patch.object(
+                orchestration,
+                "load_snapshot_replay_inputs",
+                return_value=missing_replay,
+            ), patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=source_all_snapshots,
+            ), patch.object(
+                orchestration,
+                "verify_protected_raw_inventory",
+                return_value=object(),
+            ), patch.object(
+                orchestration,
+                "snapshot_protected_inventory_membership",
+                return_value=(),
+            ), self.assertRaises(orchestration.FinalizationError) as raised:
+                orchestration.build_context(missing_common)
+            self.assertIn(
+                raised.exception.error_code,
+                {"AUTHORITY_BLOCKED", "AUTHORITY_MALFORMED", "CHECKPOINT_AUTHORITY_UNAVAILABLE"},
+            )
 
     def run_finalization_sequence(
         self,
@@ -2815,6 +3328,27 @@ class ReviewTests(unittest.TestCase):
         ))
         self.assertFalse(self.receipt_path.exists())
 
+    def test_review_rebinds_dependencies_before_receipt_write(self) -> None:
+        def mutate_after_schema(
+            _root: Path, *, schema_name: str, **_kwargs: object
+        ) -> None:
+            if schema_name == "v5_2_source_review_receipt.schema.json":
+                self.query_ids_path.write_bytes(
+                    canonical_json_bytes(
+                        {"query_ids": list(reversed(self.query_ids))}
+                    )
+                    + b"\n"
+                )
+
+        with self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write(validator_side_effect=mutate_after_schema)
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("POSTCONDITION_FAILED", 5),
+        )
+        self.assertFalse(self.receipt_path.exists())
+        self.assertFalse(self.commit_path.exists())
+
     def test_review_document_tamper_during_final_rebind_fails_closed(self) -> None:
         preflight = orchestration.PreflightReport(
             "ACQUIRING", "PASS", "x" * 64, len(self.inventory.snapshots), 0, ()
@@ -2886,6 +3420,29 @@ class ReviewTests(unittest.TestCase):
                 self.receipt_path.unlink()
                 if displaced.exists():
                     displaced.unlink()
+
+    def test_review_rebinds_source_receipt_after_marker_write(self) -> None:
+        """A post-O_EXCL source-receipt swap cannot leave a trusted marker."""
+        write_exclusive = orchestration._write_receipt_exclusive
+
+        def swap_after_marker(
+            root: Path, path: Path, raw: bytes, expected_prefix: str
+        ) -> str:
+            relative = write_exclusive(root, path, raw, expected_prefix)
+            if path == self.commit_path:
+                self.receipt_path.write_bytes(b"attacker-replacement\n")
+            return relative
+
+        with patch.object(
+            orchestration, "_write_receipt_exclusive", side_effect=swap_after_marker
+        ), self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("POSTCONDITION_FAILED", 5),
+        )
+        self.assertTrue(self.commit_path.is_file())
+        self.assertEqual(self.receipt_path.read_bytes(), b"attacker-replacement\n")
 
     def test_same_explicit_receipt_path_allows_one_concurrent_writer(self) -> None:
         outcomes: list[object] = []
@@ -3088,6 +3645,48 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse(self.first_path.exists())
         self.assertFalse(self.first_commit.exists())
 
+    def test_replay_rebinds_dependencies_before_receipt_write(self) -> None:
+        source_inventory = (
+            self.root
+            / "data/v5_2_qd/historical/sources/source_inventory.json"
+        )
+        preflight = orchestration.PreflightReport(
+            "ACQUIRING",
+            "PASS",
+            hashlib.sha256(inventory_bytes(self.inventory)).hexdigest(),
+            len(self.inventory.snapshots),
+            0,
+            (),
+        )
+        status = orchestration.StatusReport(
+            "ACQUIRING", None, True, True, True, False, ()
+        )
+
+        def mutate_after_schema(
+            _root: Path, *, schema_name: str, **_kwargs: object
+        ) -> None:
+            if schema_name == "v5_2_clean_source_replay_receipt.schema.json":
+                source_inventory.write_bytes(b"attacker replacement\n")
+
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration.execution_registry,
+                "validate_source_receipt_schema",
+                side_effect=mutate_after_schema,
+            ),
+            patch.object(orchestration, "read_status", return_value=status),
+            patch.object(orchestration, "run_preflight", return_value=preflight),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
+            orchestration.write_replay(self.context, self.request)
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("REPLAY_MISMATCH", 5),
+        )
+        self.assertFalse(self.first_path.exists())
+        self.assertFalse(self.first_commit.exists())
+
     def test_execution_id_is_uuid4_and_precedes_replay_loader(self) -> None:
         order: list[str] = []
         actual = orchestration.replay_verified_snapshots
@@ -3151,6 +3750,29 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse(self.first_commit.exists())
         self.assertEqual(self.first_path.read_bytes(), b"attacker-replacement\n")
         self.assertTrue(displaced.is_file())
+
+    def test_replay_rebinds_source_receipt_after_marker_write(self) -> None:
+        """The replay marker repeats its dependency rebind after O_EXCL write."""
+        write_exclusive = orchestration._write_receipt_exclusive
+
+        def swap_after_marker(
+            root: Path, path: Path, raw: bytes, expected_prefix: str
+        ) -> str:
+            relative = write_exclusive(root, path, raw, expected_prefix)
+            if path == self.first_commit:
+                self.first_path.write_bytes(b"attacker-replacement\n")
+            return relative
+
+        with patch.object(
+            orchestration, "_write_receipt_exclusive", side_effect=swap_after_marker
+        ), self.assertRaises(orchestration.FinalizationError) as raised:
+            self._write()
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("POSTCONDITION_FAILED", 5),
+        )
+        self.assertTrue(self.first_commit.is_file())
+        self.assertEqual(self.first_path.read_bytes(), b"attacker-replacement\n")
 
     def test_same_paths_allow_one_concurrent_writer(self) -> None:
         outcomes: list[object] = []

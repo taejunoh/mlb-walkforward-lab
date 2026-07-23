@@ -258,6 +258,19 @@ _SOURCE_REVIEW_PREFIX = (
 _SOURCE_REPLAY_PREFIX = (
     "audit/v5_2_qd/historical/acquisition/source_replays/"
 )
+_SOURCE_DISPOSITION_SIDECAR_PATH = (
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/query_sidecars/"
+    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json"
+)
+_SOURCE_DISPOSITION_SIDECAR_SHA256 = (
+    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1"
+)
+_SOURCE_DISPOSITION_SUCCESS_PATH = (
+    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+    "mlb_schedule_game_feed/"
+    "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/"
+    "success.json"
+)
 _SCHEDULE_INVENTORY_PATH = (
     "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
 )
@@ -762,9 +775,18 @@ def _sorted_string_list(value: object, label: str) -> tuple[str, ...]:
     return values
 
 
+@dataclass(frozen=True)
+class _SourceInventoryPayload:
+    snapshot_sha256s: tuple[str, ...]
+    logical_query_ids: tuple[str, ...]
+    duplicate_gamepk_disposition: Mapping[str, object] | None
+    dispositioned_query_ids: tuple[str, ...]
+    terminal_checkpoint: Mapping[str, object] | None
+
+
 def _source_inventory_payload(
     contents: bytes, *, run_id: str
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> _SourceInventoryPayload:
     payload = _canonical_object(contents, "source inventory")
     if (
         type(payload.get("schema_version")) is not int
@@ -777,10 +799,179 @@ def _source_inventory_payload(
         or payload.get("source_gate_ready") is not True
     ):
         raise ValueError("source inventory is not ready for the source gate")
-    return (
-        _sha256_list(payload.get("snapshot_sha256s"), "source snapshots"),
-        _sorted_string_list(payload.get("logical_query_ids"), "inventory query IDs"),
+    snapshots = _sha256_list(payload.get("snapshot_sha256s"), "source snapshots")
+    query_ids = _sorted_string_list(
+        payload.get("logical_query_ids"), "inventory query IDs"
     )
+    source_run = run_id == "historical_walkforward_500_superseding_565534"
+    disposition_present = {
+        "duplicate_gamepk_disposition",
+        "dispositioned_query_ids",
+    }.intersection(payload)
+    if not source_run:
+        if disposition_present:
+            raise ValueError("old source inventory contains disposition authority")
+        return _SourceInventoryPayload(snapshots, query_ids, None, (), None)
+    if disposition_present != {
+        "duplicate_gamepk_disposition",
+        "dispositioned_query_ids",
+    }:
+        raise ValueError("source inventory disposition authority is incomplete")
+    disposition = _exact_object(
+        payload["duplicate_gamepk_disposition"],
+        frozenset({"query_id", "query_sidecar", "success_receipt"}),
+        "source inventory disposition",
+    )
+    if disposition.get("query_id") != _DISPOSITIONED_QUERY_ID:
+        raise ValueError("source inventory disposition query differs")
+    sidecar = _validate_binding_value(
+        disposition.get("query_sidecar"), "source inventory disposition sidecar"
+    )
+    success = _validate_binding_value(
+        disposition.get("success_receipt"), "source inventory disposition success"
+    )
+    if (
+        sidecar != {
+            "path": _SOURCE_DISPOSITION_SIDECAR_PATH,
+            "sha256": _SOURCE_DISPOSITION_SIDECAR_SHA256,
+        }
+        or success.get("path") != _SOURCE_DISPOSITION_SUCCESS_PATH
+    ):
+        raise ValueError("source inventory disposition binding differs")
+    dispositioned = _checkpoint_sorted_sha_list(
+        payload.get("dispositioned_query_ids"),
+        "source inventory dispositioned query IDs",
+    )
+    if dispositioned != (_DISPOSITIONED_QUERY_ID,) or dispositioned[0] not in query_ids:
+        raise ValueError("source inventory dispositioned query IDs differ")
+    terminal = _exact_object(
+        payload.get("terminal_checkpoint"),
+        frozenset({"path", "sha256", "sequence", "stage"}),
+        "source inventory terminal checkpoint",
+    )
+    _validate_binding_value(
+        {"path": terminal.get("path"), "sha256": terminal.get("sha256")},
+        "source inventory terminal checkpoint",
+    )
+    if (
+        type(terminal.get("sequence")) is not int
+        or int(terminal["sequence"]) < 0
+        or terminal.get("stage") != "REMAINING"
+    ):
+        raise ValueError("source inventory terminal checkpoint differs")
+    return _SourceInventoryPayload(
+        snapshots,
+        query_ids,
+        dict(disposition),
+        dispositioned,
+        dict(terminal),
+    )
+
+
+def _capture_verified_source_disposition(
+    root: Path,
+    disposition_value: object,
+) -> tuple[_ArtifactSnapshot, _ArtifactSnapshot]:
+    """Capture and semantically authenticate the inode-bound 565534 receipt."""
+    disposition = _exact_object(
+        disposition_value,
+        frozenset({"query_id", "query_sidecar", "success_receipt"}),
+        "source inventory disposition",
+    )
+    sidecar_binding = _validate_binding_value(
+        disposition.get("query_sidecar"),
+        "source inventory disposition sidecar",
+    )
+    success_binding = _validate_binding_value(
+        disposition.get("success_receipt"),
+        "source inventory disposition success",
+    )
+    if (
+        disposition.get("query_id") != _DISPOSITIONED_QUERY_ID
+        or sidecar_binding
+        != {
+            "path": _SOURCE_DISPOSITION_SIDECAR_PATH,
+            "sha256": _SOURCE_DISPOSITION_SIDECAR_SHA256,
+        }
+        or success_binding.get("path") != _SOURCE_DISPOSITION_SUCCESS_PATH
+    ):
+        raise ValueError("source inventory disposition binding differs")
+
+    sidecar_snapshot = _capture_artifact(
+        root,
+        root / str(sidecar_binding["path"]),
+        "source inventory disposition sidecar",
+    )
+    success_snapshot = _capture_artifact(
+        root,
+        root / str(success_binding["path"]),
+        "source inventory disposition success",
+    )
+    if (
+        sidecar_snapshot.binding != dict(sidecar_binding)
+        or success_snapshot.binding != dict(success_binding)
+    ):
+        raise ValueError("source inventory disposition artifact binding differs")
+    _canonical_object(
+        sidecar_snapshot.contents,
+        "source inventory disposition sidecar",
+    )
+    _canonical_object(
+        success_snapshot.contents,
+        "source inventory disposition success",
+    )
+
+    # Lazy imports avoid the query-planner/orchestration import cycle.
+    from .v52_duplicate_gamepk_disposition import (
+        build_duplicate_disposition_authority,
+    )
+    from .v52_evidence import V52EvidenceStore, logical_query_id
+
+    authority = build_duplicate_disposition_authority(
+        root,
+        source_run_spec_path=root / _SOURCE_RUN_SPEC_PATH,
+        acquisition_contract_path=root / _SOURCE_CONTRACT_PATH,
+    )
+    if (
+        logical_query_id(authority.query) != _DISPOSITIONED_QUERY_ID
+        or authority.evidence_root
+        != root / "data/v5_2_qd/historical_superseding_565534/raw"
+    ):
+        raise ValueError("source inventory disposition authority differs")
+
+    def inspect(verified: object) -> None:
+        registered_query = getattr(verified, "registered_query", None)
+        published = getattr(verified, "published_evidence", None)
+        receipt = getattr(verified, "success_receipt", None)
+        query_sidecar = getattr(verified, "query_sidecar", None)
+        if (
+            registered_query is None
+            or published is None
+            or not isinstance(receipt, Mapping)
+            or not isinstance(query_sidecar, Mapping)
+            or logical_query_id(registered_query) != _DISPOSITIONED_QUERY_ID
+            or getattr(published, "storage_mode", None) != "DERIVED_DISPOSITION"
+            or getattr(published, "query_sidecar_sha256", None)
+            != _SOURCE_DISPOSITION_SIDECAR_SHA256
+            or receipt.get("query_id") != _DISPOSITIONED_QUERY_ID
+            or receipt.get("query_sidecar_sha256")
+            != _SOURCE_DISPOSITION_SIDECAR_SHA256
+            or receipt.get("storage_mode") != "DERIVED_DISPOSITION"
+            or canonical_json_bytes(dict(receipt)) + b"\n"
+            != success_snapshot.contents
+            or canonical_json_bytes(dict(query_sidecar)) + b"\n"
+            != sidecar_snapshot.contents
+        ):
+            raise ValueError(
+                "source inventory disposition verified semantics differ"
+            )
+
+    V52EvidenceStore.open_read_only(authority.evidence_root).inspect_verified_success(
+        authority.query,
+        inspect,
+        authority=authority,
+    )
+    return sidecar_snapshot, success_snapshot
 
 
 def _validate_bound_schema(
@@ -857,6 +1048,37 @@ def validate_source_receipt_schema(
     _verify_git_snapshot(root, trusted)
 
 
+def _require_source_receipt_disposition(
+    payload: Mapping[str, object],
+    inventory: _SourceInventoryPayload,
+    authority: Authority,
+    *,
+    label: str,
+) -> None:
+    source_run = isinstance(authority, SourceRunSpec)
+    fields = {"duplicate_gamepk_disposition", "dispositioned_query_ids"}
+    present = fields.intersection(payload)
+    if not source_run:
+        if present:
+            raise ValueError(f"{label} contains source disposition authority")
+        return
+    if inventory.duplicate_gamepk_disposition is None or present != fields:
+        raise ValueError(f"{label} disposition authority is incomplete")
+    disposition = _exact_object(
+        payload["duplicate_gamepk_disposition"],
+        frozenset({"query_id", "query_sidecar", "success_receipt"}),
+        f"{label} disposition",
+    )
+    query_ids = _checkpoint_sorted_sha_list(
+        payload["dispositioned_query_ids"], f"{label} dispositioned query IDs"
+    )
+    if (
+        dict(disposition) != dict(inventory.duplicate_gamepk_disposition)
+        or query_ids != inventory.dispositioned_query_ids
+    ):
+        raise ValueError(f"{label} disposition authority differs from inventory")
+
+
 def _uncommitted_source_receipt_payload(
     root: Path,
     contents: bytes,
@@ -870,6 +1092,7 @@ def _uncommitted_source_receipt_payload(
     acquisition_contract: Mapping[str, object],
     trusted_git: _GitSnapshot,
     authority: Authority,
+    source_inventory: _SourceInventoryPayload,
 ) -> tuple[str, tuple[str, ...], str | None, tuple[_ArtifactSnapshot, ...]]:
     payload = _canonical_object(contents, "source evidence receipt")
     schema_name = (
@@ -893,6 +1116,9 @@ def _uncommitted_source_receipt_payload(
         or payload["acquisition_contract"] != acquisition_contract
     ):
         raise ValueError("source evidence receipt protocol binding differs")
+    _require_source_receipt_disposition(
+        payload, source_inventory, authority, label="source evidence receipt"
+    )
     kind = payload["receipt_kind"]
     queries = _sorted_string_list(payload["reviewed_query_ids"], "reviewed query IDs")
     review_prefix = _acquisition_prefix(authority, "source_reviews")
@@ -960,6 +1186,7 @@ def _source_receipt_payload(
     acquisition_contract: Mapping[str, object],
     trusted_git: _GitSnapshot,
     authority: Authority,
+    source_inventory: _SourceInventoryPayload,
 ) -> tuple[
     str,
     tuple[str, ...],
@@ -991,6 +1218,9 @@ def _source_receipt_payload(
         or marker["acquisition_contract"] != acquisition_contract
     ):
         raise ValueError("source receipt commit marker authority binding differs")
+    _require_source_receipt_disposition(
+        marker, source_inventory, authority, label="source receipt commit marker"
+    )
     receipt_binding = _validate_binding_value(
         marker["source_receipt"], "committed source receipt"
     )
@@ -1015,6 +1245,7 @@ def _source_receipt_payload(
             acquisition_contract=acquisition_contract,
             trusted_git=trusted_git,
             authority=authority,
+            source_inventory=source_inventory,
         )
     )
     if kind != committed_kind:
@@ -1042,9 +1273,18 @@ def _validate_sources_ready_evidence(
 ) -> tuple[_ArtifactSnapshot, ...]:
     if inventory.path != _source_inventory_path(authority):
         raise ValueError("SOURCES_READY requires the canonical source inventory")
-    snapshots, inventory_query_ids = _source_inventory_payload(
-        inventory.contents, run_id=run_id
-    )
+    inventory_payload = _canonical_object(inventory.contents, "source inventory")
+    inventory_schema: _ArtifactSnapshot | None = None
+    if isinstance(authority, SourceRunSpec):
+        inventory_schema = _validate_bound_schema(
+            root,
+            trusted_git,
+            "v5_2_source_inventory.schema.json",
+            inventory_payload,
+        )
+    source_inventory = _source_inventory_payload(inventory.contents, run_id=run_id)
+    snapshots = source_inventory.snapshot_sha256s
+    inventory_query_ids = source_inventory.logical_query_ids
     reviews = 0
     replay_paths: set[str] = set()
     replay_hashes: set[str] = set()
@@ -1053,7 +1293,16 @@ def _validate_sources_ready_evidence(
     marker_hashes: set[str] = set()
     receipt_paths: set[str] = set()
     receipt_hashes: set[str] = set()
-    dependent_snapshots: list[_ArtifactSnapshot] = []
+    dependent_snapshots: list[_ArtifactSnapshot] = (
+        [inventory_schema] if inventory_schema is not None else []
+    )
+    if source_inventory.duplicate_gamepk_disposition is not None:
+        dependent_snapshots.extend(
+            _capture_verified_source_disposition(
+                root,
+                source_inventory.duplicate_gamepk_disposition,
+            )
+        )
     reviewed_query_ids: tuple[str, ...] | None = None
     seen_replay = False
     run_spec = _validate_binding_value(base["run_spec"], "run spec")
@@ -1083,6 +1332,7 @@ def _validate_sources_ready_evidence(
             acquisition_contract=acquisition_contract,
             trusted_git=trusted_git,
             authority=authority,
+            source_inventory=source_inventory,
         )
         if artifact.path in marker_paths or artifact.sha256 in marker_hashes:
             raise ValueError("source receipt commit marker is duplicated")
@@ -2715,14 +2965,24 @@ def _issue_source_checkpoint_authority(
     quarantined = tuple(validated["quarantined_query_ids"])  # type: ignore[arg-type]
     split = tuple(validated["split_query_ids"])  # type: ignore[arg-type]
     dispositioned = tuple(validated["dispositioned_query_ids"])  # type: ignore[arg-type]
+    completed_disposition = (
+        dispositioned == (_DISPOSITIONED_QUERY_ID,)
+        and _DISPOSITIONED_QUERY_ID in completed
+        and _DISPOSITIONED_QUERY_ID not in pending
+        and _DISPOSITIONED_QUERY_ID not in quarantined
+        and _DISPOSITIONED_QUERY_ID not in split
+    )
+    pending_disposition = (
+        not dispositioned
+        and _DISPOSITIONED_QUERY_ID in pending
+        and _DISPOSITIONED_QUERY_ID not in completed
+        and _DISPOSITIONED_QUERY_ID not in quarantined
+        and _DISPOSITIONED_QUERY_ID not in split
+    )
     if (
         not batches
         or batches[0]["stage"] != "STATIC_SCHEDULES"
-        or dispositioned != (_DISPOSITIONED_QUERY_ID,)
-        or _DISPOSITIONED_QUERY_ID not in completed
-        or _DISPOSITIONED_QUERY_ID in pending
-        or _DISPOSITIONED_QUERY_ID in quarantined
-        or _DISPOSITIONED_QUERY_ID in split
+        or not (completed_disposition or pending_disposition)
     ):
         raise ValueError("source checkpoint capability bootstrap differs")
     return _VerifiedSourceCheckpointAuthority(
@@ -4451,6 +4711,27 @@ def _require_source_terminal_disposition(
         )
 
 
+def _require_source_inventory_terminal_checkpoint(
+    authority: Authority,
+    inventory: _ArtifactSnapshot,
+    checkpoint_head: Mapping[str, object],
+) -> None:
+    """Bind the source inventory's selected checkpoint to the sealed head."""
+    if not isinstance(authority, SourceRunSpec):
+        return
+    source_inventory = _source_inventory_payload(
+        inventory.contents, run_id=authority.run_id
+    )
+    if source_inventory.terminal_checkpoint is None:
+        raise ValueError("source inventory terminal checkpoint is missing")
+    expected = {
+        key: checkpoint_head[key]
+        for key in ("path", "sha256", "sequence", "stage")
+    }
+    if dict(source_inventory.terminal_checkpoint) != expected:
+        raise ValueError("source inventory terminal checkpoint differs")
+
+
 def initialize_execution_registry(
     root: Path,
     run_spec: Authority,
@@ -4678,7 +4959,7 @@ def validate_sources_ready_evidence_set(
         validation_snapshots = _artifact_snapshots(
             paths.root, validation_receipts, "validation receipt"
         )
-        _validate_sources_ready_evidence(
+        source_evidence_snapshots = _validate_sources_ready_evidence(
             inventory_snapshot,
             validation_snapshots,
             run_id=run_spec.run_id,
@@ -4702,6 +4983,9 @@ def validate_sources_ready_evidence_set(
             paths, checkpoints, checkpoint_payloads, checkpoint_names
         )
         _require_source_terminal_disposition(run_spec, checkpoints[-1])
+        _require_source_inventory_terminal_checkpoint(
+            run_spec, inventory_snapshot, checkpoint_head
+        )
         supplied_checkpoint = _capture_artifact(
             paths.root, checkpoint_path, "terminal acquisition checkpoint"
         )
@@ -4712,7 +4996,12 @@ def validate_sources_ready_evidence_set(
             raise ValueError("terminal acquisition checkpoint differs")
         _verify_artifact_snapshots(
             paths.root,
-            (*validation_snapshots, inventory_snapshot, supplied_checkpoint),
+            (
+                *validation_snapshots,
+                inventory_snapshot,
+                supplied_checkpoint,
+                *source_evidence_snapshots,
+            ),
             "source evidence",
         )
         _verify_git_snapshot(paths.root, snapshot)
@@ -4981,6 +5270,16 @@ def _advance_execution_phase(
                 != [dict(item) for item in expected_validations]
             ):
                 raise ValueError("SOURCES_READY retry evidence differs")
+            source_evidence_snapshots = _validate_phase_evidence(
+                next_phase,
+                base,
+                inventory_snapshot,
+                validation_snapshots,
+                root=paths.root,
+                run_id=run_spec.run_id,
+                trusted_git=snapshot,
+                authority=run_spec,
+            )
             checkpoints, checkpoint_payloads, checkpoint_names = (
                 _load_checkpoints_locked(
                     paths,
@@ -4996,6 +5295,9 @@ def _advance_execution_phase(
                 paths, checkpoints, checkpoint_payloads, checkpoint_names
             )
             _require_source_terminal_disposition(run_spec, checkpoints[-1])
+            _require_source_inventory_terminal_checkpoint(
+                run_spec, inventory_snapshot, checkpoint_head
+            )
             if expected_checkpoint_path is not None:
                 expected_checkpoint = _capture_artifact(
                     paths.root, expected_checkpoint_path, "expected terminal acquisition checkpoint"
@@ -5009,6 +5311,11 @@ def _advance_execution_phase(
             _verify_artifact_snapshot(paths.root, inventory_snapshot, "phase inventory")
             _verify_artifact_snapshots(
                 paths.root, validation_snapshots, "validation receipt"
+            )
+            _verify_artifact_snapshots(
+                paths.root,
+                source_evidence_snapshots,
+                "source evidence",
             )
             _verify_git_snapshot(paths.root, snapshot)
             return transition_result(state, created=False)
@@ -5064,6 +5371,9 @@ def _advance_execution_phase(
                     checkpoint_names,
                 )
                 _require_source_terminal_disposition(run_spec, checkpoints[-1])
+                _require_source_inventory_terminal_checkpoint(
+                    run_spec, inventory_snapshot, checkpoint_head
+                )
                 checkpoint_snapshot = _capture_artifact(
                     paths.root,
                     paths.root / str(checkpoint_head["path"]),
@@ -5108,6 +5418,11 @@ def _advance_execution_phase(
                             "terminal acquisition checkpoint state changed"
                         )
                     _require_source_terminal_disposition(run_spec, verified[-1])
+                    _require_source_inventory_terminal_checkpoint(
+                        run_spec,
+                        inventory_snapshot,
+                        checkpoint_head,
+                    )
 
                 checkpoint_verifier = verify_checkpoint_state
             payload = {
