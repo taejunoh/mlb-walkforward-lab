@@ -153,37 +153,74 @@ def _statcast_root_batch_path(root: Path) -> Path:
     )
 
 
+def _superseding_legacy_decision_repository(
+    parent: Path,
+) -> tuple[Path, Path, Path]:
+    """Build a small authenticated legacy fixture for source-pair tests.
+
+    The checked-out repository intentionally does not carry the protected
+    legacy raw directory.  Keep this test hermetic by using the existing
+    synthetic protected catalog, then bind that catalog into a synthetic
+    superseding contract/schema pair.  The source authority remains genuine
+    (the frozen RunSpec, bindings, and supersedes metadata are unchanged),
+    while the protected inventory hash is local to this fixture.
+    """
+    root, _inventory_path, digest = _legacy_decision_repository(parent)
+    source_contract_path = root / (
+        "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+    )
+    source_contract = json.loads(source_contract_path.read_bytes())
+    source_contract["legacy_protection"]["protected_inventory_sha256"] = digest
+    source_contract_path.write_bytes(_canonical_json(source_contract))
+
+    schema_path = root / CONTRACT_SCHEMA_PATH
+    schema = json.loads(schema_path.read_bytes())
+    schema["oneOf"][1]["const"] = source_contract
+    schema_path.write_bytes(_canonical_json(schema))
+    (
+        root
+        / "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches"
+    ).mkdir(parents=True, exist_ok=True)
+    _git(
+        root,
+        "add",
+        source_contract_path.relative_to(root).as_posix(),
+        CONTRACT_SCHEMA_PATH.as_posix(),
+    )
+    _git(root, "commit", "-qm", "bind superseding protected legacy fixture")
+    return (
+        root,
+        root
+        / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+        source_contract_path,
+    )
+
+
 class V52LegacyDecisionInventoryTest(unittest.TestCase):
     def test_superseding_pair_authenticates_then_requires_source_batch(self) -> None:
         from mlb_backtest.v52_legacy_decision_inventory import (
             build_legacy_decision_inventory,
         )
 
-        source_run = (
-            ROOT
-            / "protocols/v5_2_qd/"
-            "historical_walkforward_500_superseding_565534.json"
-        )
-        source_contract = (
-            ROOT
-            / "protocols/v5_2_qd/"
-            "historical_source_acquisition_superseding_565534.json"
-        )
-        with self.assertRaisesRegex(
-            ValueError, "query batch|ancestors|missing|source"
-        ):
-            build_legacy_decision_inventory(
-                ROOT,
-                run_spec_path=source_run,
-                acquisition_contract_path=source_contract,
+        with tempfile.TemporaryDirectory() as directory:
+            root, source_run, source_contract = (
+                _superseding_legacy_decision_repository(Path(directory))
             )
-        with self.assertRaises(ValueError):
-            build_legacy_decision_inventory(
-                ROOT,
-                run_spec_path=source_run,
-                acquisition_contract_path=ROOT
-                / "protocols/v5_2_qd/historical_source_acquisition.json",
-            )
+            with self.assertRaisesRegex(
+                ValueError, "query batch|ancestors|missing|source"
+            ):
+                build_legacy_decision_inventory(
+                    root,
+                    run_spec_path=source_run,
+                    acquisition_contract_path=source_contract,
+                )
+            with self.assertRaises(ValueError):
+                build_legacy_decision_inventory(
+                    root,
+                    run_spec_path=source_run,
+                    acquisition_contract_path=root
+                    / "protocols/v5_2_qd/historical_source_acquisition.json",
+                )
 
     def test_public_api_schema_and_verified_record_are_closed(self) -> None:
         spec = importlib.util.find_spec(
