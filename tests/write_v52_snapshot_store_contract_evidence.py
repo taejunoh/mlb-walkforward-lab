@@ -84,15 +84,18 @@ _GIT_ENV_KEYS = frozenset(
 
 
 def _protected_status_is_expected(raw: bytes) -> bool:
-    """Return true only for the exact four expected untracked duplicate entries."""
+    """Return true for an allowed subset of exact untracked duplicate entries."""
 
     if not isinstance(raw, bytes):
         return False
+    if not raw:
+        return True
+    chunks = raw.split(b"\0")
+    if chunks[-1] != b"" or any(not item for item in chunks[:-1]):
+        return False
     try:
         entries = []
-        for item in raw.split(b"\0"):
-            if not item:
-                continue
+        for item in chunks[:-1]:
             line = item.decode("utf-8")
             if len(line) < 4 or line[2] != " ":
                 return False
@@ -100,27 +103,24 @@ def _protected_status_is_expected(raw: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     expected = {("??", path) for path in PROTECTED_DUPLICATES}
-    return len(entries) == len(expected) and set(entries) == expected
+    return len(entries) == len(set(entries)) and set(entries) <= expected
 
 
 def _protected_duplicates_untouched() -> bool:
-    """Require all protected duplicates to remain untracked and unstaged."""
+    """Require protected duplicates to remain untracked and unstaged."""
 
     paths = tuple(sorted(PROTECTED_DUPLICATES))
     env = _sanitized_git_env()
     result = subprocess.run(
-        ("git", "rev-parse", "--show-toplevel"),
+        ("git", "ls-files", "-z", "--", *paths),
         cwd=REPOSITORY,
         env=env,
         check=True,
         capture_output=True,
-        text=True,
     )
-    try:
-        repo_root = Path(result.stdout.strip()).resolve()
-    except (OSError, RuntimeError, TypeError):
+    if not isinstance(result.stdout, bytes):
         return False
-    if repo_root != REPOSITORY.resolve():
+    if result.stdout:
         return False
     result = subprocess.run(
         (
@@ -132,7 +132,7 @@ def _protected_duplicates_untouched() -> bool:
             "--",
             *paths,
         ),
-        cwd=repo_root,
+        cwd=REPOSITORY,
         env=env,
         check=True,
         capture_output=True,

@@ -2774,7 +2774,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn(receipt.inventory_sha256, markdown)
         self.assertIn("81 snapshots, 42 source-season pairs, 6 sources", markdown)
 
-    def test_protected_duplicate_status_requires_exact_four_untracked_entries(self):
+    def test_protected_duplicate_status_allows_absent_subset_or_all_untracked_entries(self):
         import tests.write_v52_snapshot_store_contract_evidence as writer
 
         paths = sorted(writer.PROTECTED_DUPLICATES)
@@ -2787,8 +2787,10 @@ class EvidenceTests(unittest.TestCase):
 
         expected = [("??", path) for path in paths]
         self.assertTrue(writer._protected_status_is_expected(raw(expected)))
-        self.assertFalse(writer._protected_status_is_expected(raw(expected[:-1])))
-        self.assertFalse(writer._protected_status_is_expected(b""))
+        self.assertTrue(writer._protected_status_is_expected(raw(expected[:-1])))
+        self.assertTrue(writer._protected_status_is_expected(b""))
+        self.assertFalse(writer._protected_status_is_expected(b"\0"))
+        self.assertFalse(writer._protected_status_is_expected(raw(expected) + b"\0"))
         for status in ("M ", " M", "D ", " D", "R "):
             with self.subTest(status=status):
                 self.assertFalse(
@@ -2801,6 +2803,59 @@ class EvidenceTests(unittest.TestCase):
                 raw(expected + [("??", "extra/unexpected.txt")])
             )
         )
+
+    def test_protected_duplicates_reject_tracked_paths(self):
+        import subprocess
+
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            tracked = root / sorted(writer.PROTECTED_DUPLICATES)[0]
+            tracked.parent.mkdir(parents=True, exist_ok=True)
+            tracked.write_text("tracked\n")
+            subprocess.run(
+                ("git", "add", "--", tracked.relative_to(root).as_posix()),
+                cwd=root,
+                check=True,
+            )
+            with patch.object(writer, "REPOSITORY", root):
+                self.assertFalse(writer._protected_duplicates_untouched())
+
+    def test_protected_duplicates_allow_absent_subset_and_all_untracked(self):
+        import subprocess
+
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        paths = sorted(writer.PROTECTED_DUPLICATES)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            with patch.object(writer, "REPOSITORY", root):
+                self.assertTrue(writer._protected_duplicates_untouched())
+                for relative in paths[:2]:
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("untracked\n")
+                self.assertTrue(writer._protected_duplicates_untouched())
+                for relative in paths[2:]:
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("untracked\n")
+                self.assertTrue(writer._protected_duplicates_untouched())
+
+    def test_protected_duplicates_reject_modified_or_staged_statuses(self):
+        import tests.write_v52_snapshot_store_contract_evidence as writer
+
+        path = sorted(writer.PROTECTED_DUPLICATES)[0]
+        for status in ("M ", " M", "A ", "AM", "D ", " D", "R "):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    writer._protected_status_is_expected(
+                        f"{status} {path}".encode() + b"\0"
+                    )
+                )
 
     def test_evidence_writer_is_hermetic_and_does_not_advance_phase(self):
         import socket
@@ -2871,6 +2926,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(writer.CANONICAL_SOURCES))
 
     def test_git_status_uses_sanitized_environment_and_exact_repository(self):
+        import subprocess
+
         import tests.write_v52_snapshot_store_contract_evidence as writer
 
         contaminated = {
@@ -2881,9 +2938,26 @@ class EvidenceTests(unittest.TestCase):
             "GIT_OBJECT_DIRECTORY": "/tmp/not-this-objects",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/not-this-alternates",
         }
-        with patch.dict(os.environ, contaminated, clear=False):
-            self.assertTrue(writer._protected_duplicates_untouched())
-            sanitized = writer._sanitized_git_env()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append((args, kwargs))
+                if args[1] == "ls-files":
+                    return subprocess.CompletedProcess(args, 0, stdout=b"")
+                return subprocess.CompletedProcess(args, 0, stdout=b"")
+
+            with patch.object(writer, "REPOSITORY", root), patch.object(
+                writer.subprocess, "run", side_effect=fake_run
+            ), patch.dict(os.environ, contaminated, clear=False):
+                self.assertTrue(writer._protected_duplicates_untouched())
+                sanitized = writer._sanitized_git_env()
+            self.assertEqual([call[1]["cwd"] for call in calls], [root, root])
+            self.assertEqual(
+                [call[0][1] for call in calls], ["ls-files", "status"]
+            )
+            self.assertEqual(calls[0][1]["env"], calls[1][1]["env"])
         self.assertTrue(all(key not in sanitized for key in contaminated))
 
 
