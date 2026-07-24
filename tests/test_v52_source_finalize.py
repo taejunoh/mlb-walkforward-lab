@@ -10,6 +10,7 @@ import os
 import ast
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ import time
 import urllib.request
 import unittest
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -42,38 +43,133 @@ from tests.v52_snapshot_store_fixture import fake_81, patched_store_replay, stor
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_LOCAL_DISPOSITION_SCHEMA_RELATIVES = (
+    Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),
+    Path("schemas/v5_2_derived_disposition_sidecar.schema.json"),
+    Path("schemas/v5_2_game_evidence_inventory.schema.json"),
+    Path("schemas/v5_2_source_inventory.schema.json"),
+    Path("schemas/v5_2_source_receipt_commit.schema.json"),
+    Path("schemas/v5_2_source_review_receipt.schema.json"),
+)
+
+def rebind_source_authority_fixture(root: Path) -> None:
+    """Bind copied source authority files to the temporary repository head."""
+    source_contract = root / (
+        "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+    )
+    contract = json.loads(source_contract.read_bytes())
+    plan_binding = contract["bindings"]["implementation_plan"]
+    plan_path = root / plan_binding["path"]
+    plan_binding["working_tree_sha256"] = hashlib.sha256(
+        plan_path.read_bytes()
+    ).hexdigest()
+    plan_binding["git_blob_id"] = subprocess.run(
+        ("git", "hash-object", str(plan_path)),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_contract.write_bytes(canonical_json_bytes(contract) + b"\n")
+    schema_path = root / "schemas/v5_2_acquisition_contract.schema.json"
+    schema = json.loads(schema_path.read_bytes())
+    schema["oneOf"][1]["const"] = contract
+    schema_path.write_bytes(canonical_json_bytes(schema) + b"\n")
+    subprocess.run(
+        (
+            "git",
+            "add",
+            str(source_contract.relative_to(root)),
+            str(schema_path.relative_to(root)),
+        ),
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-qm", "bind fixture authority"),
+        cwd=root,
+        check=True,
+    )
+
+def inventory_with_different_run_spec_binding(inventory: object) -> object:
+    """Keep fixture run identity valid while changing authenticated authority."""
+    bindings = dataclasses.replace(
+        inventory.bindings,  # type: ignore[attr-defined]
+        run_spec=dataclasses.replace(
+            inventory.bindings.run_spec,  # type: ignore[attr-defined]
+            sha256="0" * 64,
+        ),
+    )
+    return dataclasses.replace(inventory, bindings=bindings)
+
+def _replace_fixture_disposition_constants(
+    value: object, replacements: dict[str, str]
+) -> object:
+    """Rebind copied source schemas to a local disposition fixture."""
+    if isinstance(value, dict):
+        return {
+            key: _replace_fixture_disposition_constants(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_fixture_disposition_constants(item, replacements) for item in value
+        ]
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    return value
+
+
+
 
 class CliTests(unittest.TestCase):
     def test_superseding_cli_without_registry_is_absent_not_task6_blocked(self) -> None:
-        from mlb_backtest.v52_source_orchestration import (
-            CommonArgs,
-            build_context,
-        )
+        from mlb_backtest.v52_source_orchestration import CommonArgs, build_context
+        from tests.test_execution_registry import ExecutionRegistryTest
 
-        source_run = (
-            ROOT
-            / "protocols/v5_2_qd/"
-            "historical_walkforward_500_superseding_565534.json"
-        )
-        source_contract = (
-            ROOT
-            / "protocols/v5_2_qd/"
-            "historical_source_acquisition_superseding_565534.json"
-        )
-        context = build_context(
-            CommonArgs(
-                root=ROOT,
-                run_spec=source_run,
-                acquisition_contract=source_contract,
-                protected_inventory=ROOT
-                / "audit/v5_1_bt/protected_raw_inventory.json",
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            self.addCleanup(fixture.tearDown)
+            root, _run_spec = fixture.make_source_repo(Path(directory))
+            rebind_source_authority_fixture(root)
+            source_run = root / (
+                "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
             )
-        )
-        self.assertEqual(context.phase, "ABSENT")
-        self.assertEqual(
-            tuple(blocker.code for blocker in context.blockers),
-            ("REGISTRY_ABSENT",),
-        )
+            source_contract = root / (
+                "protocols/v5_2_qd/"
+                "historical_source_acquisition_superseding_565534.json"
+            )
+
+            before = tree_snapshot(root)
+            with (
+                patch.object(
+                    orchestration,
+                    "verify_protected_raw_inventory",
+                    return_value=object(),
+                ),
+                patch.object(
+                    orchestration,
+                    "snapshot_protected_inventory_membership",
+                    return_value=(),
+                ),
+            ):
+                context = build_context(
+                    CommonArgs(
+                        root=root,
+                        run_spec=source_run,
+                        acquisition_contract=source_contract,
+                        protected_inventory=root
+                        / "audit/v5_1_bt/protected_raw_inventory.json",
+                    )
+                )
+            self.assertEqual(context.phase, "ABSENT")
+            self.assertEqual(
+                tuple(blocker.code for blocker in context.blockers),
+                ("REGISTRY_ABSENT",),
+            )
+            self.assertEqual(tree_snapshot(root), before)
 
     def _run_json(self, argv: list[str]) -> tuple[int, dict[str, object], str]:
         with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch(
@@ -416,6 +512,448 @@ class CliTests(unittest.TestCase):
 
 
 class FinalizationEndToEndTests(unittest.TestCase):
+    def test_registry_disposition_copy_seam_is_exact_and_local(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with self._registry_disposition_copy_seam(root) as (
+                copy_fixture_artifact,
+                expected_pairs,
+                artifact_bytes,
+                copied_pairs,
+                published_sidecar_pairs,
+            ):
+                with self.assertRaisesRegex(AssertionError, "unexpected"):
+                    copy_fixture_artifact(
+                        ROOT / "unrelated.json", root / "unrelated.json"
+                    )
+                for source, target in expected_pairs:
+                    self.assertEqual(copy_fixture_artifact(source, target), target)
+                    self.assertEqual(target.read_bytes(), artifact_bytes[target])
+            self.assertEqual(copied_pairs, list(expected_pairs))
+            self.assertEqual(published_sidecar_pairs, [])
+            self._assert_local_disposition_artifacts(root, artifact_bytes)
+
+    def test_local_disposition_schema_rebinding_is_explicitly_bounded(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            self.addCleanup(fixture.tearDown)
+            for name in ("first", "second"):
+                root, _run_spec = fixture.make_source_repo(Path(directory) / name)
+                rebind_source_authority_fixture(root)
+                untouched = root / "schemas/v5_2_evidence_manifest.schema.json"
+                self.assertFalse(untouched.exists())
+                before = {
+                    path.relative_to(root): path.read_bytes()
+                    for path in (root / "schemas").glob("*.json")
+                }
+                self._prepare_local_disposition_fixture(root)
+                query_id, sidecar_sha256, sidecar_path, success_path = (
+                    self._fixture_disposition_values
+                )
+                self.assertEqual(
+                    {
+                        relative
+                        for relative, contents in before.items()
+                        if (root / relative).read_bytes() != contents
+                    },
+                    set(_LOCAL_DISPOSITION_SCHEMA_RELATIVES),
+                )
+                for relative in _LOCAL_DISPOSITION_SCHEMA_RELATIVES:
+                    contents = (root / relative).read_text()
+                    self.assertIn(query_id, contents)
+                    if sidecar_sha256 in before[relative].decode():
+                        self.assertIn(sidecar_sha256, contents)
+                    if sidecar_path in before[relative].decode():
+                        self.assertIn(sidecar_path, contents)
+                    if success_path in before[relative].decode():
+                        self.assertIn(success_path, contents)
+            self.assertEqual(
+                self._production_disposition_values,
+                (
+                    "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095",
+                    "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1",
+                    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                    "query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json",
+                    "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+                    "mlb_schedule_game_feed/8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095/"
+                    "success.json",
+                ),
+            )
+
+    @contextmanager
+    def _registry_disposition_copy_seam(self, root: Path):
+        """Install only the three unavailable legacy artifacts for one fixture.
+
+        This seam is deliberately local to ``test_execution_registry``'s call
+        site.  It does not patch ``shutil.copy2`` globally, and delegates the
+        later generated-sidecar copy to the original copier after the exact
+        three fixture artifacts were installed.
+        """
+        from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+        from tests import test_execution_registry as registry_tests
+
+        artifact_bytes: dict[Path, bytes] = {}
+        expected_pairs: list[tuple[Path, Path]] = []
+        for relative, artifact_kind in (
+            (disposition.OLD_REGISTRATION_RELATIVE, "query_registration"),
+            (disposition.OLD_QUARANTINE_RELATIVE, "quarantine_receipt"),
+            (disposition.OLD_RAW_RELATIVE, "quarantined_raw"),
+        ):
+            source = (ROOT / relative).resolve()
+            target = (root / relative).resolve()
+            contents = (
+                canonical_json_bytes(
+                    {
+                        "artifact_kind": artifact_kind,
+                        "disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+                        "fixture_kind": "LOCAL_UNAUTHENTICATED_SOURCE_FINALIZE",
+                        "relative_path": relative.as_posix(),
+                        "source_query_id": disposition.OLD_QUERY_ID,
+                    }
+                )
+                + b"\n"
+            )
+            expected_pairs.append((source, target))
+            artifact_bytes[target] = contents
+
+        copied_pairs: list[tuple[Path, Path]] = []
+        published_sidecar_pairs: list[tuple[Path, Path]] = []
+        original_shutil = registry_tests.shutil
+        real_copy2 = original_shutil.copy2
+        call_site_shutil = SimpleNamespace()
+
+        def copy_published_sidecar(
+            source: object, target: object, *args: object, **kwargs: object
+        ) -> Path:
+            try:
+                query_id, sidecar_sha256, sidecar_path, _success_path = (
+                    self._fixture_disposition_values
+                )
+            except AttributeError as exc:
+                raise AssertionError(
+                    "published sidecar copy preceded fixture binding"
+                ) from exc
+            expected_pair = (
+                (
+                    root
+                    / "data/v5_2_qd/historical_superseding_565534/raw/queries"
+                    / "mlb_schedule_game_feed"
+                    / query_id
+                    / "sidecars"
+                    / f"{sidecar_sha256}.json"
+                ).resolve(),
+                (root / sidecar_path).resolve(),
+            )
+            pair = (Path(source).resolve(), Path(target).resolve())
+            if args or kwargs or pair != expected_pair or published_sidecar_pairs:
+                raise AssertionError(f"unexpected published sidecar copy: {pair!r}")
+            published_sidecar_pairs.append(pair)
+            return real_copy2(source, target)
+
+        def copy_fixture_artifact(
+            source: object, target: object, *args: object, **kwargs: object
+        ) -> Path:
+            source_path = Path(source).resolve()
+            target_path = Path(target).resolve()
+            pair = (source_path, target_path)
+            if args or kwargs or pair not in expected_pairs:
+                raise AssertionError(f"unexpected fixture copy pair: {pair!r}")
+            if pair in copied_pairs or target_path.exists():
+                raise AssertionError(f"duplicate fixture copy pair: {pair!r}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(artifact_bytes[target_path])
+            copied_pairs.append(pair)
+            if len(copied_pairs) == len(expected_pairs):
+                call_site_shutil.copy2 = copy_published_sidecar
+            return target_path
+
+        call_site_shutil.copy2 = copy_fixture_artifact
+        with patch.object(registry_tests, "shutil", call_site_shutil):
+            yield (
+                copy_fixture_artifact,
+                tuple(expected_pairs),
+                artifact_bytes,
+                copied_pairs,
+                published_sidecar_pairs,
+            )
+        self.assertEqual(copied_pairs, expected_pairs)
+
+    def _assert_local_disposition_artifacts(
+        self, root: Path, artifact_bytes: dict[Path, bytes]
+    ) -> None:
+        from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+
+        expected_relatives = {
+            disposition.OLD_REGISTRATION_RELATIVE,
+            disposition.OLD_QUARANTINE_RELATIVE,
+            disposition.OLD_RAW_RELATIVE,
+        }
+        self.assertEqual(
+            {path.relative_to(root) for path in artifact_bytes}, expected_relatives
+        )
+        for path, expected in artifact_bytes.items():
+            relative = path.relative_to(root)
+            node = path.lstat()
+            self.assertTrue(stat.S_ISREG(node.st_mode), relative)
+            self.assertEqual(node.st_nlink, 1, relative)
+            self.assertEqual(path.read_bytes(), expected, relative)
+            self.assertEqual(
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                hashlib.sha256(expected).hexdigest(),
+                relative,
+            )
+            payload = json.loads(expected)
+            self.assertEqual(payload["relative_path"], relative.as_posix())
+            self.assertEqual(payload["source_query_id"], disposition.OLD_QUERY_ID)
+            self.assertEqual(payload["disposition"], "SCHEDULE_DUPLICATE_GAMEPK_565534")
+
+    def _local_disposition_boundary(self) -> dict[Path, object]:
+        """Install the fixture-only replacement for protected raw projection.
+
+        The real authority's exact 21MB forensic authentication is covered in
+        protected-evidence schedule tests.  This downstream test retains the
+        real evidence-store receipt/sidecar verification and all finalization
+        gates, but derives that local evidence from the fixed public predicate.
+        """
+        existing = getattr(self, "_fixture_disposition_authorities", None)
+        if existing is not None:
+            return existing
+
+        from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+
+        authorities: dict[Path, object] = {}
+        projection = disposition.ScheduleOccurrenceProjection(
+            occurrence_counts=disposition.EXPECTED_OCCURRENCE_COUNTS,
+            suppressed_position=disposition.SUPPRESSED_POSITION,
+            retained_position=disposition.RETAINED_POSITION,
+            normalized_games=(),
+            selected_raw_game_object_sha256s=(),
+            site_flags=(),
+        )
+        real_build = disposition.build_duplicate_disposition_authority
+        real_recompute = disposition.DuplicateGamePkDispositionAuthority.recompute
+
+        def build_fixture_authority(
+            root: Path,
+            *,
+            source_run_spec_path: Path,
+            acquisition_contract_path: Path,
+        ) -> object:
+            fixture = authorities.get(Path(root).resolve())
+            if fixture is None:
+                return real_build(
+                    root,
+                    source_run_spec_path=source_run_spec_path,
+                    acquisition_contract_path=acquisition_contract_path,
+                )
+            if fixture.source_run_spec_path != Path(
+                source_run_spec_path
+            ) or fixture.acquisition_contract_path != Path(acquisition_contract_path):
+                raise ValueError("fixture disposition authority path differs")
+            return fixture
+
+        def recompute_fixture_authority(authority: object) -> object:
+            fixture = authorities.get(authority.repository_root)
+            if fixture == authority:
+                return projection
+            return real_recompute(authority)
+
+        build_patcher = patch.object(
+            disposition,
+            "build_duplicate_disposition_authority",
+            side_effect=build_fixture_authority,
+        )
+        recompute_patcher = patch.object(
+            disposition.DuplicateGamePkDispositionAuthority,
+            "recompute",
+            side_effect=recompute_fixture_authority,
+            autospec=True,
+        )
+        build_patcher.start()
+        recompute_patcher.start()
+        self.addCleanup(build_patcher.stop)
+        self.addCleanup(recompute_patcher.stop)
+        self._fixture_disposition_authorities = authorities
+        return authorities
+
+    def _prepare_local_disposition_fixture(self, root: Path) -> None:
+        """Bind temporary schemas and registry constants to local evidence."""
+        from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+        from mlb_backtest import v52_query_plan
+        from mlb_backtest import v52_snapshot_store, v52_verify_sources
+        from mlb_backtest.v52_sources import history
+        from mlb_backtest.v52_evidence import LogicalQuery, logical_query_id
+
+        production_values = getattr(
+            self, "_production_disposition_values", None
+        )
+        if production_values is None:
+            production_values = (
+                orchestration.execution_registry._DISPOSITIONED_QUERY_ID,
+                orchestration.execution_registry._SOURCE_DISPOSITION_SIDECAR_SHA256,
+                orchestration.execution_registry._SOURCE_DISPOSITION_SIDECAR_PATH,
+                orchestration.execution_registry._SOURCE_DISPOSITION_SUCCESS_PATH,
+            )
+            self._production_disposition_values = production_values
+        (
+            old_query_id,
+            old_sidecar_sha256,
+            old_sidecar_path,
+            old_success_path,
+        ) = production_values
+        authorities = self._local_disposition_boundary()
+        context = v52_query_plan._load_static_contracts(
+            root
+            / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            root
+            / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+        query = LogicalQuery(
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=disposition.DISPOSITION_ENDPOINT,
+            parameters={},
+            requested_range=disposition._requested_range(),
+            expected_media_type="application/json",
+            parser_version="v5.2.1",
+            parent_query_id=None,
+            run_spec_sha256=context.authority_sha256,
+            acquisition_contract_sha256=context.acquisition_contract_sha256,
+        )
+        authority = disposition.DuplicateGamePkDispositionAuthority(
+            repository_root=root,
+            evidence_root=context.raw_root,
+            source_run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+            query=query,
+            old_raw_relative=disposition.OLD_RAW_RELATIVE,
+            _snapshots=(),
+        )
+        authorities[root.resolve()] = authority
+        semantics = disposition._sidecar_semantics(authority, authority.recompute())
+        query_id = logical_query_id(query)
+        sidecar = {
+            "grain": query.grain,
+            "parser_version": query.parser_version,
+            "query_id": query_id,
+            "schema_version": 1,
+            "semantics": semantics,
+            "source": query.source,
+            "storage_mode": "DERIVED_DISPOSITION",
+        }
+        sidecar_sha256 = hashlib.sha256(
+            canonical_json_bytes(sidecar) + b"\n"
+        ).hexdigest()
+        sidecar_path = (
+            "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+            f"query_sidecars/{sidecar_sha256}.json"
+        )
+        success_path = (
+            "data/v5_2_qd/historical_superseding_565534/raw/queries/"
+            f"mlb_schedule_game_feed/{query_id}/success.json"
+        )
+        replacements = {
+            old_query_id: query_id,
+            old_sidecar_sha256: sidecar_sha256,
+            old_sidecar_path: sidecar_path,
+            old_success_path: success_path,
+        }
+        schema_paths = tuple(
+            root / relative for relative in _LOCAL_DISPOSITION_SCHEMA_RELATIVES
+        )
+        self.assertTrue(all(path.is_file() for path in schema_paths))
+        for path in schema_paths:
+            schema = json.loads(path.read_bytes())
+            original = canonical_json_bytes(schema) + b"\n"
+            self.assertTrue(
+                old_query_id in original.decode()
+                or old_sidecar_sha256 in original.decode(),
+                path,
+            )
+            path.write_bytes(
+                canonical_json_bytes(
+                    _replace_fixture_disposition_constants(schema, replacements)
+                )
+                + b"\n"
+            )
+        subprocess.run(
+            ("git", "add", *(str(path.relative_to(root)) for path in schema_paths)),
+            cwd=root,
+            check=True,
+        )
+        staged = subprocess.run(
+            ("git", "diff", "--cached", "--quiet"),
+            cwd=root,
+            check=False,
+        )
+        if staged.returncode not in (0, 1):
+            raise RuntimeError("fixture schema staged-diff inspection failed")
+        if staged.returncode == 1:
+            subprocess.run(
+                ("git", "commit", "-qm", "bind local disposition fixture"),
+                cwd=root,
+                check=True,
+            )
+
+        sidecar_bytes = canonical_json_bytes(sidecar) + b"\n"
+        self.assertEqual(hashlib.sha256(sidecar_bytes).hexdigest(), sidecar_sha256)
+        self.assertEqual(query_id, logical_query_id(authority.query))
+        self.assertEqual(authority.query.endpoint, disposition.DISPOSITION_ENDPOINT)
+        self.assertEqual(
+            authority.query.requested_range["disposition"],
+            "SCHEDULE_DUPLICATE_GAMEPK_565534",
+        )
+        values = (query_id, sidecar_sha256, sidecar_path, success_path)
+        prior = getattr(self, "_fixture_disposition_values", None)
+        if prior is not None:
+            self.assertEqual(values, prior)
+            return
+        self._fixture_disposition_values = values
+        schema_path = root / "schemas/v5_2_source_inventory.schema.json"
+
+        def local_inventory_schema_validator() -> object:
+            from jsonschema import Draft202012Validator, FormatChecker
+
+            schema = json.loads(schema_path.read_bytes())
+            Draft202012Validator.check_schema(schema)
+            return Draft202012Validator(schema, format_checker=FormatChecker())
+
+        patchers = (
+            *(
+                patch.object(orchestration.execution_registry, attribute, value)
+                for attribute, value in (
+                    ("_DISPOSITIONED_QUERY_ID", query_id),
+                    ("_SOURCE_DISPOSITION_SIDECAR_SHA256", sidecar_sha256),
+                    ("_SOURCE_DISPOSITION_SIDECAR_PATH", sidecar_path),
+                    ("_SOURCE_DISPOSITION_SUCCESS_PATH", success_path),
+                )
+            ),
+            patch.object(history, "TASK10_DISPOSITION_QUERY_ID", query_id),
+            patch.object(history, "TASK10_DISPOSITION_SIDECAR_SHA256", sidecar_sha256),
+            patch.object(history, "TASK10_DISPOSITION_SIDECAR_PATH", sidecar_path),
+            patch.object(history, "TASK10_DISPOSITION_SUCCESS_PATH", success_path),
+            patch.object(v52_snapshot_store, "TASK10_DISPOSITION_QUERY_ID", query_id),
+            patch.object(v52_verify_sources, "TASK10_DISPOSITION_QUERY_ID", query_id),
+            patch.object(
+                v52_verify_sources,
+                "TASK10_DISPOSITION_SIDECAR_SHA256",
+                sidecar_sha256,
+            ),
+            patch.object(
+                v52_snapshot_store,
+                "_inventory_schema_validator",
+                side_effect=local_inventory_schema_validator,
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
     """The public services complete the staged source gate in a real Git repo."""
 
     @staticmethod
@@ -595,6 +1133,8 @@ class FinalizationEndToEndTests(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         self.addCleanup(fixture.tearDown)
         root, run_spec = fixture.make_source_repo(parent)
+        rebind_source_authority_fixture(root)
+        self._prepare_local_disposition_fixture(root)
         fixture.registry.initialize_execution_registry(
             root,
             run_spec,
@@ -613,13 +1153,30 @@ class FinalizationEndToEndTests(unittest.TestCase):
             inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
             validation_receipts=(),
         )
-        dispositioned_query_id = (
-            fixture.install_source_terminal_checkpoint_chain(root, run_spec)
-        )
+        with self._registry_disposition_copy_seam(root) as (
+            _copy_fixture_artifact,
+            expected_pairs,
+            artifact_bytes,
+            copied_pairs,
+            published_sidecar_pairs,
+        ):
+            dispositioned_query_id = fixture.install_source_terminal_checkpoint_chain(
+                root, run_spec
+            )
+        self.assertEqual(copied_pairs, list(expected_pairs))
+        self.assertEqual(len(published_sidecar_pairs), 1)
+        self._assert_local_disposition_artifacts(root, artifact_bytes)
+        self.assertEqual(dispositioned_query_id, self._fixture_disposition_values[0])
         self.source_checkpoint_chain = fixture.source_checkpoint_chain
         self.source_checkpoint_paths = fixture.source_checkpoint_paths
         self.source_disposition_success_sha256 = (
             fixture.source_disposition_success_sha256
+        )
+        self.source_disposition_sidecar_sha256 = (
+            fixture.registry._SOURCE_DISPOSITION_SIDECAR_SHA256
+        )
+        self.source_disposition_sidecar_path = (
+            fixture.registry._SOURCE_DISPOSITION_SIDECAR_PATH
         )
 
         def authority(relative: str) -> tuple[Path, str]:
@@ -672,9 +1229,8 @@ class FinalizationEndToEndTests(unittest.TestCase):
                 self.source_disposition_success_sha256,
             ),
             AuthorityBinding(
-                "audit/v5_2_qd/historical_superseding_565534/acquisition/"
-                "query_sidecars/0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1.json",
-                "0adfb798330b6539391d7d2e160ce9807bb411b01d07ea1a313ee110c57482f1",
+                self.source_disposition_sidecar_path,
+                self.source_disposition_sidecar_sha256,
             ),
         )
         replay = dataclasses.replace(
@@ -696,12 +1252,16 @@ class FinalizationEndToEndTests(unittest.TestCase):
                 seal_sha256=seal_sha256,
             ),
             duplicate_gamepk_disposition=disposition if with_disposition else None,
-            dispositioned_query_ids=(dispositioned_query_id,) if with_disposition else (),
+            dispositioned_query_ids=(dispositioned_query_id,)
+            if with_disposition
+            else (),
         )
         common = orchestration.CommonArgs(
             root=root,
-            run_spec=root / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
-            acquisition_contract=root / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+            run_spec=root
+            / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract=root
+            / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
             protected_inventory=root / "audit/v5_1_bt/protected_raw_inventory.json",
         )
         return root, common, replay
@@ -1516,16 +2076,26 @@ class _ContextBaseTests(unittest.TestCase):
             context.phase = "ACQUIRING"  # type: ignore[misc]
 
     def test_absent_status_context_is_read_only(self) -> None:
-        before = tree_snapshot(ROOT)
-        context = orchestration.build_context(orchestration.CommonArgs(root=ROOT))
-        self.assertEqual(context.phase, "ABSENT")
-        self.assertIsNone(context.registry)
-        self.assertIsNone(context.checkpoint)
-        self.assertIsNone(context.snapshot_inputs)
-        self.assertIsNone(context.inventory)
-        self.assertIn("REGISTRY_ABSENT", {item.code for item in context.blockers})
-        self.assertEqual(tree_snapshot(ROOT), before)
-        self.assertFalse((ROOT / "audit/v5_2_qd/historical/finalization").exists())
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            self.addCleanup(fixture.tearDown)
+            root, _run_spec = fixture.make_repo(
+                Path(directory), remaining_authority=True
+            )
+            before = tree_snapshot(root)
+            context = orchestration.build_context(orchestration.CommonArgs(root=root))
+            self.assertEqual(context.phase, "ABSENT")
+            self.assertIsNone(context.registry)
+            self.assertIsNone(context.checkpoint)
+            self.assertIsNone(context.snapshot_inputs)
+            self.assertIsNone(context.inventory)
+            self.assertIn("REGISTRY_ABSENT", {item.code for item in context.blockers})
+            self.assertEqual(tree_snapshot(root), before)
+            self.assertFalse((root / "audit/v5_2_qd/historical/finalization").exists())
 
     def test_safe_helpers_reject_symlink_ancestor_and_path_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2262,7 +2832,7 @@ class StatusAndPreflightTests(unittest.TestCase):
     def test_status_rejects_different_authenticated_published_inventory(self) -> None:
         source_root = self.root / "data/v5_2_qd/historical/sources"
         self._published_store(source_root)
-        candidate = dataclasses.replace(self.inventory, run_id="other-valid-run")
+        candidate = inventory_with_different_run_spec_binding(self.inventory)
         context = dataclasses.replace(self.context, inventory=candidate)
         self.assertNotEqual(inventory_bytes(self.inventory), inventory_bytes(candidate))
         before = tree_snapshot(self.root)
@@ -2693,16 +3263,24 @@ class PublishTests(StatusAndPreflightTests):
             self.assertNotEqual((root / "data").stat().st_ino, moved.stat().st_ino)
 
     def test_postcondition_mismatch_is_a_stable_failure(self) -> None:
-        different = dataclasses.replace(self.inventory, run_id="different-run")
-        with patched_store_replay(), patch.object(
-            orchestration, "run_preflight", return_value=self._passing_preflight()
-        ), patch.object(
-            orchestration, "load_snapshot_store_from_fd", return_value=SimpleNamespace(inventory=different)
-        ), self.assertRaises(orchestration.FinalizationError) as raised:
+        different = inventory_with_different_run_spec_binding(self.inventory)
+        with (
+            patched_store_replay(),
+            patch.object(
+                orchestration, "run_preflight", return_value=self._passing_preflight()
+            ),
+            patch.object(
+                orchestration,
+                "load_snapshot_store_from_fd",
+                return_value=SimpleNamespace(inventory=different),
+            ),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
             orchestration.publish_inventory(self.context, lock_owner="publish-service")
-        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
-            "POSTCONDITION_FAILED", 5
-        ))
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("POSTCONDITION_FAILED", 5),
+        )
 
     def test_unsafe_existing_inventory_and_stale_lock_fail_closed(self) -> None:
         source_root = self.root / "data/v5_2_qd/historical/sources"
@@ -3353,23 +3931,32 @@ class ReviewTests(unittest.TestCase):
         preflight = orchestration.PreflightReport(
             "ACQUIRING", "PASS", "x" * 64, len(self.inventory.snapshots), 0, ()
         )
-        calls = 0
+        write_exclusive = orchestration._write_receipt_exclusive
 
-        def mutate_on_final_rebind(_context: object) -> object:
-            nonlocal calls
-            calls += 1
-            if calls == 2:
+        def mutate_after_write(
+            root: Path, path: Path, raw: bytes, expected_prefix: str
+        ) -> str:
+            relative = write_exclusive(root, path, raw, expected_prefix)
+            if path == self.receipt_path:
                 self.query_ids_path.write_bytes(
                     canonical_json_bytes({"query_ids": list(reversed(self.query_ids))})
                     + b"\n"
                 )
-            return preflight
+            return relative
 
-        with self.assertRaises(orchestration.FinalizationError) as raised:
-            self._write(preflight_side_effect=mutate_on_final_rebind)
-        self.assertEqual((raised.exception.error_code, raised.exception.exit_code), (
-            "POSTCONDITION_FAILED", 5
-        ))
+        with (
+            patch.object(
+                orchestration,
+                "_write_receipt_exclusive",
+                side_effect=mutate_after_write,
+            ),
+            self.assertRaises(orchestration.FinalizationError) as raised,
+        ):
+            self._write(preflight_side_effect=lambda _context: preflight)
+        self.assertEqual(
+            (raised.exception.error_code, raised.exception.exit_code),
+            ("POSTCONDITION_FAILED", 5),
+        )
         self.assertTrue(self.receipt_path.is_file())
         self.assertFalse(self.commit_path.exists())
         payload = json.loads(self.receipt_path.read_bytes())
