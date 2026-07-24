@@ -1485,6 +1485,11 @@ def verify_html_payload(
         raise ValueError(
             "portable HTML identity or snapshot changed during verification"
         )
+    if completed.returncode != 0:
+        verifier_stderr = completed.stderr.strip()[-4_000:] or "no stderr output"
+        raise ValueError(
+            f"portable HTML verification failed: {verifier_stderr}"
+        )
     try:
         output_lines = [line for line in completed.stdout.splitlines() if line]
         verification = json.loads(output_lines[-1])
@@ -1522,8 +1527,7 @@ def verify_html_payload(
         )
     )
     if (
-        completed.returncode != 0
-        or not isinstance(verification, dict)
+        not isinstance(verification, dict)
         or set(verification) != verification_keys
         or verification.get("ok") is not True
         or verification.get("html") != str(FINAL_HTML_PATH)

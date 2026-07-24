@@ -694,6 +694,48 @@ class DesignVerificationTest(unittest.TestCase):
             ):
                 verify_html_payload(html_path, artifact_path, receipt_path)
 
+    def test_html_verifier_reports_stderr_when_node_fails_before_json_parse(self) -> None:
+        artifact = json.loads(
+            (ROOT / "reports/v5_1_bt/diagnostic_100_artifact.json").read_text()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory).resolve()
+            root = temporary_root / "repo"
+            output = temporary_root / "outputs"
+            artifact_path = root / "reports/v5_1_bt/diagnostic_100_artifact.json"
+            receipt_path = root / DELIVERY_RECEIPT_RELATIVE
+            html_path = output / "mlb_v5_1_100_pick_diagnostic.html"
+            artifact_path.parent.mkdir(parents=True)
+            output.mkdir()
+            artifact_path.write_bytes(canonical_json_bytes(artifact) + b"\n")
+            html_path.write_text("<!doctype html>", encoding="utf-8")
+            receipt = json.loads(
+                (ROOT / DELIVERY_RECEIPT_RELATIVE).read_text(encoding="utf-8")
+            )
+            receipt["html"] = str(html_path)
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_bytes(
+                json.dumps(receipt, separators=(",", ":")).encode() + b"\n"
+            )
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr='{"ok":false,"code":"browser_failed","error":"Chromium failed"}\n',
+            )
+            with (
+                patch("mlb_backtest.verify_v52_design.FINAL_HTML_PATH", html_path),
+                patch(
+                    "mlb_backtest.verify_v52_design.subprocess.run",
+                    return_value=completed,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"portable HTML verification failed:.*browser_failed",
+                ),
+            ):
+                verify_html_payload(html_path, artifact_path, receipt_path)
+
     def test_final_mode_rechecks_html_after_all_exit_checks(self) -> None:
         import mlb_backtest.verify_v52_design as verifier_module
 
