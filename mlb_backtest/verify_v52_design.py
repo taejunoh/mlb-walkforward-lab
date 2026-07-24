@@ -200,7 +200,7 @@ V51_REQUIRED_FILES = tuple(
 
 TASK7D_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "1f5c4e7a99c020c55474e971ca4659eb73d681f4340b8ec7553491aa048925b5"
+        "3943310b193c6873819d73983c35cac0bed63836b3abd3ad1b77e27d5a1082c6"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
         "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
@@ -209,10 +209,10 @@ TASK7D_SCHEMA_DOCUMENT_SHA256 = {
         "b9de7114410e036cd43a2530a8440dcdbc1b85d78699281e1c623d234102aeea"
     ),
     "schemas/v5_2_game_evidence_inventory.schema.json": (
-        "9460307dccfc65f82f5a0f837c0139eb4be7dc0337483a6337264c104f85bd70"
+        "c710b3ddb8648c083c0400ba33e944d4da0b1783942054ae255a73248c05bf34"
     ),
     "schemas/v5_2_schedule_anchor_inventory.schema.json": (
-        "66698b643ad186434d0930a7f369b3b292f664e1152ddaaa727e6d0003a13c31"
+        "c6dbc555ed35d14f29eaf2d7ec8f85c53eb3c7304cd73095ac35422743e317ab"
     ),
     "schemas/v5_2_timezone_candidate.schema.json": (
         "9cc9d49ec18a7e538d37e6b00bf8acb1185aaeeba4ad97e836e12f200ab5f91b"
@@ -973,7 +973,11 @@ def verify_contract_schemas(
             Draft202012Validator.check_schema(schema)
         except Exception as exc:
             raise ValueError(f"schema/parser disagreement: {relative}") from exc
-        if relative.endswith("v5_2_execution_receipt.schema.json"):
+        if relative in (
+            "schemas/v5_2_execution_receipt.schema.json",
+            "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_game_evidence_inventory.schema.json",
+        ):
             variants = schema.get("oneOf")
             closed = isinstance(variants, list) and bool(variants) and all(
                 isinstance(variant, Mapping)
@@ -990,6 +994,8 @@ def verify_contract_schemas(
         object_closure_exemptions = {
             "schemas/v5_2_acquisition_checkpoint.schema.json": {
                 (
+                    "oneOf",
+                    0,
                     "allOf",
                     0,
                     "then",
@@ -997,7 +1003,19 @@ def verify_contract_schemas(
                     "stage_evidence_receipts",
                     "contains",
                 )
-            }
+            },
+            "schemas/v5_2_schedule_anchor_inventory.schema.json": {
+                ("$defs", "anchorCore"),
+                ("$defs", "sourceAnchor", "allOf", 1),
+                (
+                    "oneOf",
+                    1,
+                    "$defs",
+                    "seasonSource",
+                    "properties",
+                    "occurrence_counts",
+                ),
+            },
         }.get(relative, set())
 
         def semantic_nodes_are_closed_and_formatted(
