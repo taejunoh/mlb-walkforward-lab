@@ -807,10 +807,11 @@ class SourceLegacyDecisionAuthorityTest(unittest.TestCase):
         from tests.test_v52_schedule_inventory import (
             ROOT as SCHEDULE_ROOT,
             SOURCE_RUN_SPEC_PATH,
+            _local_disposition_fixture_boundary,
             _source_registry_fixture,
         )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, _local_disposition_fixture_boundary():
             base = Path(directory)
             fixture = _source_registry_fixture(base / "source")
             legacy_root, inventory_path, inventory_sha256 = (

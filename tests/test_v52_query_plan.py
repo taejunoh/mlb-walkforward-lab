@@ -647,9 +647,12 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_source_batch_publication_uses_authenticated_namespace_without_fallback(self):
         import mlb_backtest.v52_query_plan as query_plan
-        from tests.test_v52_schedule_inventory import _source_fixture
+        from tests.test_v52_schedule_inventory import (
+            _local_disposition_fixture_boundary,
+            _source_fixture,
+        )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, _local_disposition_fixture_boundary():
             fixture = _source_fixture(Path(directory))
             root = fixture.root
             batch = query_plan.build_static_batch(
@@ -869,9 +872,12 @@ class V52QueryPlanTest(unittest.TestCase):
 
     def test_source_authority_failure_never_writes_old_batch_namespace(self):
         import mlb_backtest.v52_query_plan as query_plan
-        from tests.test_v52_schedule_inventory import _source_fixture
+        from tests.test_v52_schedule_inventory import (
+            _local_disposition_fixture_boundary,
+            _source_fixture,
+        )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, _local_disposition_fixture_boundary():
             fixture = _source_fixture(Path(directory))
             root = fixture.root
             batch = query_plan.build_static_batch(

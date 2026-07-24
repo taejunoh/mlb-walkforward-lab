@@ -6,11 +6,12 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,7 @@ _SOURCE_AUTHORITY_FILES = (
     ),
     SOURCE_ADDENDUM_PATH,
 )
+_ACTIVE_LOCAL_DISPOSITION_BOUNDARY = None
 
 
 def _canonical(value: object) -> bytes:
@@ -213,12 +215,182 @@ class _SourceFixture:
     batch_id: str
 
 
+@contextmanager
+def _local_disposition_fixture_boundary():
+    """Scope a synthetic disposition to temporary fixture repositories only.
+
+    Production's fixed-ID, 21MB forensic verifier remains covered by
+    ``test_v52_source_schedule``.  This boundary supplies only the small,
+    raw-less disposition needed by downstream lifecycle fixtures.
+    """
+    from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+    from mlb_backtest import v52_query_plan
+    from mlb_backtest.v52_evidence import LogicalQuery
+
+    global _ACTIVE_LOCAL_DISPOSITION_BOUNDARY
+    if _ACTIVE_LOCAL_DISPOSITION_BOUNDARY is not None:
+        yield _ACTIVE_LOCAL_DISPOSITION_BOUNDARY
+        return
+
+    authorities: dict[Path, object] = {}
+    projection = disposition.ScheduleOccurrenceProjection(
+        occurrence_counts=disposition.EXPECTED_OCCURRENCE_COUNTS,
+        suppressed_position=disposition.SUPPRESSED_POSITION,
+        retained_position=disposition.RETAINED_POSITION,
+        normalized_games=(
+            {
+                "away_is_winner": True,
+                "away_score": 7,
+                "away_team_id": 133,
+                "completed_innings": 9,
+                "doubleheader_marker": None,
+                "game_pk": 565534,
+                "home_is_winner": False,
+                "home_score": 3,
+                "home_team_id": 116,
+                "official_date": "2019-05-19",
+                "scheduled_innings": 9,
+                "scheduled_start_utc": "2019-09-07T00:15:00Z",
+                "status": "Final",
+                "venue_id": 10,
+            },
+        ),
+        selected_raw_game_object_sha256s=(
+            {
+                "game_pk": 565534,
+                "raw_game_object_sha256": disposition.RETAINED_OBJECT_SHA256,
+            },
+        ),
+        site_flags=(
+            {"game_pk": 565534, "neutral_site": False, "alternate_site": False},
+        ),
+    )
+    real_build = disposition.build_duplicate_disposition_authority
+    real_recompute = disposition.DuplicateGamePkDispositionAuthority.recompute
+
+    def build_fixture_authority(
+        root: Path,
+        *,
+        source_run_spec_path: Path,
+        acquisition_contract_path: Path,
+    ) -> object:
+        fixture = authorities.get(Path(root).resolve())
+        if fixture is None:
+            return real_build(
+                root,
+                source_run_spec_path=source_run_spec_path,
+                acquisition_contract_path=acquisition_contract_path,
+            )
+        if fixture.source_run_spec_path != Path(
+            source_run_spec_path
+        ) or fixture.acquisition_contract_path != Path(acquisition_contract_path):
+            raise ValueError("fixture disposition authority path differs")
+        return fixture
+
+    def recompute_fixture_authority(authority: object) -> object:
+        if authorities.get(authority.repository_root) == authority:
+            return projection
+        return real_recompute(authority)
+
+    class Boundary:
+        def install(
+            self, root: Path, source_run_path: Path, contract_path: Path
+        ) -> object:
+            root = root.resolve()
+            context = v52_query_plan._load_static_contracts(
+                source_run_path, contract_path
+            )
+            query = LogicalQuery(
+                source="mlb_schedule_game_feed",
+                grain="season_schedule_and_game",
+                endpoint=disposition.DISPOSITION_ENDPOINT,
+                parameters={},
+                requested_range=disposition._requested_range(),
+                expected_media_type="application/json",
+                parser_version="v5.2.1",
+                parent_query_id=None,
+                run_spec_sha256=context.authority_sha256,
+                acquisition_contract_sha256=context.acquisition_contract_sha256,
+            )
+            authority = disposition.DuplicateGamePkDispositionAuthority(
+                repository_root=root,
+                evidence_root=context.raw_root,
+                source_run_spec_path=context.authority_path,
+                acquisition_contract_path=context.acquisition_contract_path,
+                query=query,
+                old_raw_relative=disposition.OLD_RAW_RELATIVE,
+                _snapshots=(),
+            )
+            artifacts = (
+                (disposition.OLD_REGISTRATION_RELATIVE, "query_registration"),
+                (disposition.OLD_QUARANTINE_RELATIVE, "quarantine_receipt"),
+                (disposition.OLD_RAW_RELATIVE, "quarantined_raw"),
+            )
+            for relative, artifact_kind in artifacts:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "artifact_kind": artifact_kind,
+                    "disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+                    "fixture_kind": "LOCAL_UNAUTHENTICATED_SCHEDULE_INVENTORY",
+                    "relative_path": relative.as_posix(),
+                    "source_query_id": disposition.OLD_QUERY_ID,
+                }
+                contents = _canonical(payload)
+                path.write_bytes(contents)
+                node = path.lstat()
+                if not stat.S_ISREG(node.st_mode) or node.st_nlink != 1:
+                    raise AssertionError(
+                        f"unsafe local disposition artifact: {relative}"
+                    )
+                if (
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                    != hashlib.sha256(contents).hexdigest()
+                ):
+                    raise AssertionError(
+                        f"local disposition artifact hash differs: {relative}"
+                    )
+                observed = json.loads(path.read_bytes())
+                if (
+                    _canonical(observed) != contents
+                    or observed["relative_path"] != relative.as_posix()
+                    or observed["source_query_id"] != disposition.OLD_QUERY_ID
+                    or observed["disposition"] != "SCHEDULE_DUPLICATE_GAMEPK_565534"
+                ):
+                    raise AssertionError(
+                        f"local disposition artifact binding differs: {relative}"
+                    )
+            authorities[root] = authority
+            return authority
+
+    boundary = Boundary()
+    patchers = [
+        patch.object(
+            disposition,
+            "build_duplicate_disposition_authority",
+            side_effect=build_fixture_authority,
+        ),
+        patch.object(
+            disposition.DuplicateGamePkDispositionAuthority,
+            "recompute",
+            side_effect=recompute_fixture_authority,
+            autospec=True,
+        ),
+    ]
+    for patcher in patchers:
+        patcher.start()
+    _ACTIVE_LOCAL_DISPOSITION_BOUNDARY = boundary
+    try:
+        yield boundary
+    finally:
+        _ACTIVE_LOCAL_DISPOSITION_BOUNDARY = None
+        for patcher in reversed(patchers):
+            patcher.stop()
+
+
 def _source_fixture(base: Path) -> _SourceFixture:
-    """Copy the authenticated source authority and forensic 565534 inputs offline."""
+    """Build a local source fixture without copying protected 565534 evidence."""
     from mlb_backtest.v52_duplicate_gamepk_disposition import (
-        OLD_QUARANTINE_RELATIVE,
-        OLD_RAW_RELATIVE,
-        OLD_REGISTRATION_RELATIVE,
         build_duplicate_disposition_authority,
         publish_duplicate_gamepk_disposition,
     )
@@ -233,14 +405,6 @@ def _source_fixture(base: Path) -> _SourceFixture:
         )
     )
     for relative in authority_files:
-        target = root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / relative, target)
-    for relative in (
-        OLD_REGISTRATION_RELATIVE,
-        OLD_QUARANTINE_RELATIVE,
-        OLD_RAW_RELATIVE,
-    ):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, target)
@@ -266,6 +430,10 @@ def _source_fixture(base: Path) -> _SourceFixture:
 
     source_run_path = root / SOURCE_RUN_SPEC_PATH.relative_to(ROOT)
     source_contract_path = root / SOURCE_CONTRACT_PATH.relative_to(ROOT)
+    boundary = _ACTIVE_LOCAL_DISPOSITION_BOUNDARY
+    if boundary is None:
+        raise RuntimeError("source fixture requires local disposition boundary")
+    boundary.install(root, source_run_path, source_contract_path)
     source_run = load_source_run_spec(source_run_path)
     batch = build_static_batch(source_run_path, source_contract_path)
     publish_query_batch(root, batch)
@@ -431,30 +599,8 @@ def _memoized_registry_git_patch():
 
 
 def _memoized_disposition_projection_patch():
-    """Memoize the immutable 2019 projection after one real recomputation."""
-    from mlb_backtest.v52_duplicate_gamepk_disposition import (
-        DuplicateGamePkDispositionAuthority,
-    )
-
-    original = DuplicateGamePkDispositionAuthority.recompute
-    cache: dict[tuple[object, ...], object] = {}
-
-    def cached(authority: DuplicateGamePkDispositionAuthority):
-        key = (
-            authority.repository_root,
-            authority.source_run_spec_path,
-            authority.acquisition_contract_path,
-            authority._snapshots,
-        )
-        if key not in cache:
-            cache[key] = original(authority)
-        return cache[key]
-
-    return patch.object(
-        DuplicateGamePkDispositionAuthority,
-        "recompute",
-        cached,
-    )
+    """Provide the historical name while scoping the local fixture seam."""
+    return _local_disposition_fixture_boundary()
 
 
 class V52ScheduleInventoryTest(unittest.TestCase):
@@ -877,7 +1023,6 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             EXPECTED_OCCURRENCE_COUNTS,
             RETAINED_OBJECT_SHA256,
             SUPPRESSED_OBJECT_SHA256,
-            build_duplicate_disposition_authority,
         )
         from mlb_backtest.v52_evidence import logical_query_id
         from mlb_backtest.v52_query_plan import build_static_batch
@@ -886,7 +1031,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
         )
         from mlb_backtest.v52_schedule_inventory import build_schedule_anchor_inventory
 
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, _local_disposition_fixture_boundary():
             fixture = _source_fixture(Path(td).resolve())
             disposition_id = logical_query_id(
                 build_static_batch(
@@ -921,7 +1066,9 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             source_2019 = payload["season_sources"][1]
             self.assertEqual(source_2019["storage_mode"], "DERIVED_DISPOSITION")
             self.assertIsNone(source_2019["raw_sha256"])
-            authority = build_duplicate_disposition_authority(
+            from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
+
+            authority = disposition.build_duplicate_disposition_authority(
                 fixture.root,
                 source_run_spec_path=fixture.root
                 / SOURCE_RUN_SPEC_PATH.relative_to(ROOT),
@@ -998,7 +1145,7 @@ class V52ScheduleInventoryTest(unittest.TestCase):
         from mlb_backtest.v52_evidence import logical_query_id
         from mlb_backtest.v52_query_plan import build_static_batch
 
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, _local_disposition_fixture_boundary():
             fixture = _source_fixture(Path(td).resolve())
             disposition_id = logical_query_id(
                 build_static_batch(
