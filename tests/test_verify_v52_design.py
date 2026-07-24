@@ -1206,10 +1206,10 @@ class DesignVerificationTest(unittest.TestCase):
             verify_protected_inventory(ROOT, inventory_path)
 
     def test_absence_status_is_derived_not_hardcoded(self) -> None:
-        self.assertEqual(historical_execution_status(ROOT), "NOT_EXECUTED")
-        self.assertEqual(observation_namespace_status(ROOT), "NOT_STARTED")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
+            self.assertEqual(historical_execution_status(root), "NOT_EXECUTED")
+            self.assertEqual(observation_namespace_status(root), "NOT_STARTED")
             path = root / "audit/v5_2_qd/historical/nested/unexpected.bin"
             path.parent.mkdir(parents=True)
             path.write_text("x", encoding="utf-8")
@@ -1515,7 +1515,9 @@ class DesignVerificationTest(unittest.TestCase):
                 path = root / relative
                 schema = json.loads(path.read_bytes())
                 if mutation == "definition-closure":
-                    schema["$defs"]["anchor"]["additionalProperties"] = True
+                    schema["$defs"]["ordinarySeasonSource"][
+                        "additionalProperties"
+                    ] = True
                 elif mutation == "inline-counts-closure":
                     schema["properties"]["counts"]["additionalProperties"] = True
                 elif mutation == "inline-static-batch-closure":
@@ -1523,7 +1525,7 @@ class DesignVerificationTest(unittest.TestCase):
                         "additionalProperties"
                     ] = True
                 else:
-                    schema["$defs"]["anchor"]["properties"]["official_date"][
+                    schema["$defs"]["anchorCore"]["properties"]["official_date"][
                         "format"
                     ] = "unknown-date-format"
                 path.write_bytes(canonical_json_bytes(schema) + b"\n")
