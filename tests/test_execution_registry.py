@@ -153,8 +153,8 @@ OLD_CHECKPOINT_SHA256 = (
     "00b8b6eae2c0ba8de17f6ed1c05f0c9ddfb98e967e9b7ef0284581cc98b5ad06"
 )
 OLD_CHECKPOINT_RELATIVE = Path(
-    "audit/v5_2_qd/historical/execution/acquisition_checkpoints/"
-    f"00000000-{OLD_CHECKPOINT_SHA256}.json"
+    "tests/fixtures/v5_2_qd/legacy/"
+    f"old_acquisition_checkpoint_{OLD_CHECKPOINT_SHA256}.json"
 )
 ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 BASELINE_RELATIVE = Path("protocols/v5_2_qd/v51_protected_inventory.json")
