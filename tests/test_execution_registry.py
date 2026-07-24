@@ -244,8 +244,35 @@ def _sha256(path: Path) -> str:
 
 
 def _git(root: Path, *args: str) -> str:
+    command = ["git", *args]
+    if args and args[0] == "commit":
+        # Fixture repositories must not inherit developer signing or hooks.
+        # Keep this on the command line so hostile/global config cannot make
+        # these short-lived commits invoke an external signer or hook.
+        command = [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--no-gpg-sign",
+            *args[1:],
+        ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_EDITOR": "true",
+            "GIT_PAGER": "cat",
+            "GIT_SEQUENCE_EDITOR": "true",
+            "PAGER": "cat",
+        }
+    )
     return subprocess.run(
-        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+        command,
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
     ).stdout.strip()
 
 
@@ -331,6 +358,58 @@ def _source_checkpoint_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_fixture_git_commits_ignore_inherited_signing_config(self) -> None:
+        """Temporary fixture commits must never invoke a developer signer."""
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            signer = directory_path / "sentinel-gpg"
+            marker = directory_path / "signer-invoked"
+            signer.write_text(
+                '#!/bin/sh\nprintf invoked > "$GIT_FIXTURE_SIGNER_MARKER"\n'
+                "exit 97\n",
+                encoding="utf-8",
+            )
+            signer.chmod(0o700)
+            hostile_git_config = {
+                "GIT_CONFIG_COUNT": "3",
+                "GIT_CONFIG_KEY_0": "commit.gpgsign",
+                "GIT_CONFIG_VALUE_0": "true",
+                "GIT_CONFIG_KEY_1": "gpg.program",
+                "GIT_CONFIG_VALUE_1": signer.as_posix(),
+                "GIT_CONFIG_KEY_2": "gpg.format",
+                "GIT_CONFIG_VALUE_2": "openpgp",
+                "GIT_FIXTURE_SIGNER_MARKER": marker.as_posix(),
+            }
+            with patch.dict(os.environ, hostile_git_config, clear=False):
+                # Prove the hostile config really would invoke the signer if
+                # the fixture helper omitted its explicit no-gpg-sign flag.
+                probe = directory_path / "probe-repo"
+                probe.mkdir()
+                (probe / "input.txt").write_text("probe\n", encoding="utf-8")
+                _git(probe, "init", "-q")
+                _git(probe, "config", "user.email", "probe@example.test")
+                _git(probe, "config", "user.name", "Probe Test")
+                _git(probe, "add", "input.txt")
+                probe_environment = os.environ.copy()
+                completed = subprocess.run(
+                    ["git", "commit", "-qm", "unsigned probe"],
+                    cwd=probe,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=probe_environment,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertTrue(marker.exists())
+                marker.unlink()
+
+                root, _run_spec = self.make_repo(directory_path)
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    _git(root, "log", "-1", "--format=%s"),
+                    "fixture contract",
+                )
+
     def test_checkpoint_requires_exact_dispositioned_query_ids(self) -> None:
         schema = json.loads(
             (ROOT / "schemas/v5_2_acquisition_checkpoint.schema.json").read_bytes()
