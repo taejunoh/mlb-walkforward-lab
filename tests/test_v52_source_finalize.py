@@ -51,6 +51,41 @@ _LOCAL_DISPOSITION_SCHEMA_RELATIVES = (
     Path("schemas/v5_2_source_receipt_commit.schema.json"),
     Path("schemas/v5_2_source_review_receipt.schema.json"),
 )
+_LOCAL_DISPOSITION_CONTRACT_SHA256 = (
+    "48e883db5276abe3a34fb5bf805ad8ab68f31245798398e3bd12a6dd727aeada"
+)
+
+
+def _commit_fixture_changes(root: Path, message: str) -> None:
+    """Commit fixture-only changes without inheriting user signing or hooks."""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_AUTHOR_NAME": "MLB Fixture",
+            "GIT_AUTHOR_EMAIL": "mlb-fixture@example.test",
+            "GIT_COMMITTER_NAME": "MLB Fixture",
+            "GIT_COMMITTER_EMAIL": "mlb-fixture@example.test",
+        }
+    )
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-qm",
+            message,
+        ),
+        cwd=root,
+        check=True,
+        env=environment,
+    )
+
 
 def rebind_source_authority_fixture(root: Path) -> None:
     """Bind copied source authority files to the temporary repository head."""
@@ -70,26 +105,32 @@ def rebind_source_authority_fixture(root: Path) -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    source_contract.write_bytes(canonical_json_bytes(contract) + b"\n")
+    source_contract_bytes = canonical_json_bytes(contract) + b"\n"
     schema_path = root / "schemas/v5_2_acquisition_contract.schema.json"
     schema = json.loads(schema_path.read_bytes())
     schema["oneOf"][1]["const"] = contract
-    schema_path.write_bytes(canonical_json_bytes(schema) + b"\n")
+    schema_bytes = canonical_json_bytes(schema) + b"\n"
+    changed_paths: list[Path] = []
+    for path, data in (
+        (source_contract, source_contract_bytes),
+        (schema_path, schema_bytes),
+    ):
+        if path.read_bytes() == data:
+            continue
+        path.write_bytes(data)
+        changed_paths.append(path)
+    if not changed_paths:
+        return
     subprocess.run(
         (
             "git",
             "add",
-            str(source_contract.relative_to(root)),
-            str(schema_path.relative_to(root)),
+            *(str(path.relative_to(root)) for path in changed_paths),
         ),
         cwd=root,
         check=True,
     )
-    subprocess.run(
-        ("git", "commit", "-qm", "bind fixture authority"),
-        cwd=root,
-        check=True,
-    )
+    _commit_fixture_changes(root, "bind fixture authority")
 
 def inventory_with_different_run_spec_binding(inventory: object) -> object:
     """Keep fixture run identity valid while changing authenticated authority."""
@@ -123,6 +164,67 @@ def _replace_fixture_disposition_constants(
 
 
 class CliTests(unittest.TestCase):
+    def test_rebind_source_authority_fixture_is_idempotent(self) -> None:
+        """A second bind on an already-bound fixture must be a no-op."""
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            self.addCleanup(fixture.tearDown)
+            root, _run_spec = fixture.make_source_repo(Path(directory))
+
+            rebind_source_authority_fixture(root)
+            first_head = subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            first_tree = tree_snapshot(root)
+
+            rebind_source_authority_fixture(root)
+            second_head = subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(second_head, first_head)
+            self.assertEqual(tree_snapshot(root), first_tree)
+
+    def test_fixture_commit_ignores_repository_hooks(self) -> None:
+        from tests.test_execution_registry import ExecutionRegistryTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ExecutionRegistryTest()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            self.addCleanup(fixture.tearDown)
+            root, _run_spec = fixture.make_source_repo(Path(directory))
+            hooks = root / ".hooks"
+            hooks.mkdir()
+            sentinel = root / "hook-ran.txt"
+            post_commit = hooks / "post-commit"
+            post_commit.write_text(f"#!/bin/sh\nprintf hook-ran > {sentinel}\n")
+            post_commit.chmod(0o755)
+            subprocess.run(
+                ("git", "config", "core.hooksPath", ".hooks"),
+                cwd=root,
+                check=True,
+            )
+            marker = root / "fixture-marker.txt"
+            marker.write_text("marker\n")
+            subprocess.run(("git", "add", marker.name), cwd=root, check=True)
+
+            _commit_fixture_changes(root, "hook isolation fixture")
+
+            self.assertFalse(sentinel.exists())
+            self.assertEqual(marker.read_text(), "marker\n")
+
     def test_superseding_cli_without_registry_is_absent_not_task6_blocked(self) -> None:
         from mlb_backtest.v52_source_orchestration import CommonArgs, build_context
         from tests.test_execution_registry import ExecutionRegistryTest
@@ -541,6 +643,9 @@ class FinalizationEndToEndTests(unittest.TestCase):
             fixture.setUp()
             self.addCleanup(fixture.doCleanups)
             self.addCleanup(fixture.tearDown)
+            production_query_id = (
+                orchestration.execution_registry._DISPOSITIONED_QUERY_ID
+            )
             for name in ("first", "second"):
                 root, _run_spec = fixture.make_source_repo(Path(directory) / name)
                 rebind_source_authority_fixture(root)
@@ -550,9 +655,40 @@ class FinalizationEndToEndTests(unittest.TestCase):
                     path.relative_to(root): path.read_bytes()
                     for path in (root / "schemas").glob("*.json")
                 }
-                self._prepare_local_disposition_fixture(root)
+                authority_paths = (
+                    Path(
+                        "docs/superpowers/plans/"
+                        "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+                    ),
+                    Path(
+                        "protocols/v5_2_qd/"
+                        "historical_source_acquisition_superseding_565534.json"
+                    ),
+                    Path(
+                        "protocols/v5_2_qd/"
+                        "historical_walkforward_500_superseding_565534.json"
+                    ),
+                )
+                authority_before = {
+                    relative: (root / relative).read_bytes()
+                    for relative in authority_paths
+                }
+                self._prepare_local_disposition_fixture(
+                    root, synthetic_schema_identity=True
+                )
                 query_id, sidecar_sha256, sidecar_path, success_path = (
                     self._fixture_disposition_values
+                )
+                self.assertNotEqual(
+                    query_id,
+                    production_query_id,
+                )
+                self.assertEqual(
+                    {
+                        relative: (root / relative).read_bytes()
+                        for relative in authority_paths
+                    },
+                    authority_before,
                 )
                 self.assertEqual(
                     {
@@ -780,7 +916,12 @@ class FinalizationEndToEndTests(unittest.TestCase):
         self._fixture_disposition_authorities = authorities
         return authorities
 
-    def _prepare_local_disposition_fixture(self, root: Path) -> None:
+    def _prepare_local_disposition_fixture(
+        self,
+        root: Path,
+        *,
+        synthetic_schema_identity: bool = False,
+    ) -> None:
         """Bind temporary schemas and registry constants to local evidence."""
         from mlb_backtest import v52_duplicate_gamepk_disposition as disposition
         from mlb_backtest import v52_query_plan
@@ -822,7 +963,11 @@ class FinalizationEndToEndTests(unittest.TestCase):
             parser_version="v5.2.1",
             parent_query_id=None,
             run_spec_sha256=context.authority_sha256,
-            acquisition_contract_sha256=context.acquisition_contract_sha256,
+            acquisition_contract_sha256=(
+                _LOCAL_DISPOSITION_CONTRACT_SHA256
+                if synthetic_schema_identity
+                else context.acquisition_contract_sha256
+            ),
         )
         authority = disposition.DuplicateGamePkDispositionAuthority(
             repository_root=root,
@@ -893,11 +1038,7 @@ class FinalizationEndToEndTests(unittest.TestCase):
         if staged.returncode not in (0, 1):
             raise RuntimeError("fixture schema staged-diff inspection failed")
         if staged.returncode == 1:
-            subprocess.run(
-                ("git", "commit", "-qm", "bind local disposition fixture"),
-                cwd=root,
-                check=True,
-            )
+            _commit_fixture_changes(root, "bind local disposition fixture")
 
         sidecar_bytes = canonical_json_bytes(sidecar) + b"\n"
         self.assertEqual(hashlib.sha256(sidecar_bytes).hexdigest(), sidecar_sha256)
