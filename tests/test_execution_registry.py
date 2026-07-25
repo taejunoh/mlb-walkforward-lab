@@ -52,6 +52,9 @@ FORMAT_CHECKER.checkers = {
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_AUTHORITY_ROOT = Path(
+    os.environ.get("MLB_V52_SOURCE_AUTHORITY_ROOT", str(ROOT))
+).resolve()
 
 
 def _repository_module_path(root: Path, module: str) -> Path | None:
@@ -641,11 +644,13 @@ class ExecutionRegistryTest(unittest.TestCase):
             build_duplicate_disposition_authority,
         )
 
-        source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
+        source = load_source_run_spec(
+            SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC_RELATIVE
+        )
         authority = build_duplicate_disposition_authority(
-            ROOT,
-            source_run_spec_path=ROOT / SOURCE_RUN_SPEC_RELATIVE,
-            acquisition_contract_path=ROOT / SOURCE_CONTRACT_RELATIVE,
+            SOURCE_AUTHORITY_ROOT,
+            source_run_spec_path=SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC_RELATIVE,
+            acquisition_contract_path=SOURCE_AUTHORITY_ROOT / SOURCE_CONTRACT_RELATIVE,
         )
         query_id = self.registry._DISPOSITIONED_QUERY_ID
         batch_id = "9" * 64
@@ -1516,7 +1521,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         ):
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT / relative, target)
+            shutil.copy2(SOURCE_AUTHORITY_ROOT / relative, target)
         disposition_authority = build_duplicate_disposition_authority(
             root,
             source_run_spec_path=root / SOURCE_RUN_SPEC_RELATIVE,
@@ -3048,7 +3053,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             ):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(ROOT / relative, target)
+                shutil.copy2(SOURCE_AUTHORITY_ROOT / relative, target)
             authority = build_duplicate_disposition_authority(
                 root,
                 source_run_spec_path=root / SOURCE_RUN_SPEC_RELATIVE,
