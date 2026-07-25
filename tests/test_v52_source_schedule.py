@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -25,16 +26,40 @@ from mlb_backtest.v52_duplicate_gamepk_disposition import (
     EXPECTED_OCCURRENCE_COUNTS,
     NORMALIZED_GAMES_SHA256,
     SELECTED_RAW_GAME_OBJECT_SHA256S_SHA256,
-    build_duplicate_disposition_authority,
+    build_duplicate_disposition_authority as _build_duplicate_disposition_authority,
     publish_duplicate_gamepk_disposition,
     project_schedule_occurrences,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_AUTHORITY_ROOT = Path(
+    os.environ.get("MLB_V52_SOURCE_AUTHORITY_ROOT", str(ROOT))
+).resolve()
 FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
 SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
 DISPOSITION_FIXTURES = ROOT / "tests/fixtures/v52_duplicate_gamepk_565534"
+
+
+def build_duplicate_disposition_authority(
+    root: Path,
+    *args: object,
+    source_run_spec_path: Path,
+    acquisition_contract_path: Path,
+    **kwargs: object,
+) -> object:
+    """Route only the 565534 authority to the optional test evidence root."""
+    if root == ROOT:
+        root = SOURCE_AUTHORITY_ROOT
+        source_run_spec_path = SOURCE_AUTHORITY_ROOT / source_run_spec_path.relative_to(ROOT)
+        acquisition_contract_path = SOURCE_AUTHORITY_ROOT / acquisition_contract_path.relative_to(ROOT)
+    return _build_duplicate_disposition_authority(
+        root,
+        *args,
+        source_run_spec_path=source_run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+        **kwargs,
+    )
 
 
 def _query() -> LogicalQuery:
@@ -169,7 +194,7 @@ def _authenticated_filtered_view(payload: dict[str, object]) -> dict[str, object
 
 def _superseding_namespace_paths() -> tuple[Path, ...]:
     return tuple(
-        ROOT / relative
+        SOURCE_AUTHORITY_ROOT / relative
         for relative in (
             "data/v5_2_qd/historical_superseding_565534/raw",
             "data/v5_2_qd/historical_superseding_565534/sources",
@@ -240,9 +265,9 @@ def _mutate_565534_predicate(
 class V52ScheduleSourceTest(unittest.TestCase):
     def test_schedule_disposition_dispatch_requires_matching_authority_and_empty_raw(self) -> None:
         authority = build_duplicate_disposition_authority(
-            ROOT,
-            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
-            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+            SOURCE_AUTHORITY_ROOT,
+            source_run_spec_path=SOURCE_AUTHORITY_ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=SOURCE_AUTHORITY_ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
         semantics = recompute_query_sidecar(
             authority.query, b"", authority=authority
@@ -265,29 +290,29 @@ class V52ScheduleSourceTest(unittest.TestCase):
 
     def test_duplicate_disposition_is_rawless_and_has_no_attempt_or_reservation(self) -> None:
         authority = build_duplicate_disposition_authority(
-            ROOT,
-            source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
-            acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+            SOURCE_AUTHORITY_ROOT,
+            source_run_spec_path=SOURCE_AUTHORITY_ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=SOURCE_AUTHORITY_ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
         protected_old_files = (
-            ROOT / disposition_module.OLD_REGISTRATION_RELATIVE,
-            ROOT / disposition_module.OLD_QUARANTINE_RELATIVE,
-            ROOT / disposition_module.OLD_RAW_RELATIVE,
+            SOURCE_AUTHORITY_ROOT / disposition_module.OLD_REGISTRATION_RELATIVE,
+            SOURCE_AUTHORITY_ROOT / disposition_module.OLD_QUARANTINE_RELATIVE,
+            SOURCE_AUTHORITY_ROOT / disposition_module.OLD_RAW_RELATIVE,
         )
         old_snapshot = {
             path: (path.read_bytes(), hashlib.sha256(path.read_bytes()).hexdigest())
             for path in protected_old_files
         }
         self.assertEqual(
-            old_snapshot[ROOT / disposition_module.OLD_REGISTRATION_RELATIVE][1],
+            old_snapshot[SOURCE_AUTHORITY_ROOT / disposition_module.OLD_REGISTRATION_RELATIVE][1],
             disposition_module.OLD_REGISTRATION_SHA256,
         )
         self.assertEqual(
-            old_snapshot[ROOT / disposition_module.OLD_QUARANTINE_RELATIVE][1],
+            old_snapshot[SOURCE_AUTHORITY_ROOT / disposition_module.OLD_QUARANTINE_RELATIVE][1],
             disposition_module.OLD_QUARANTINE_SHA256,
         )
         self.assertEqual(
-            old_snapshot[ROOT / disposition_module.OLD_RAW_RELATIVE][1],
+            old_snapshot[SOURCE_AUTHORITY_ROOT / disposition_module.OLD_RAW_RELATIVE][1],
             disposition_module.OLD_RAW_SHA256,
         )
         self.assertEqual(authority._read_old_payload()["totalGames"], 2472)
@@ -551,7 +576,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
         pair = json.loads((DISPOSITION_FIXTURES / "exact_pair.json").read_text())
         self.assertEqual(authority.query.endpoint, DISPOSITION_ENDPOINT)
         with self.assertRaisesRegex(ValueError, "duplicate gamePk"):
-            parse_schedule((ROOT / authority.old_raw_relative).read_bytes())
+            parse_schedule((SOURCE_AUTHORITY_ROOT / authority.old_raw_relative).read_bytes())
         self.assertEqual(
             authority.query.requested_range["suppressed_occurrence"]["sha256"],
             pair["first"]["sha256"],
@@ -573,7 +598,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
             acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
-        raw_path = ROOT / authority.old_raw_relative
+        raw_path = SOURCE_AUTHORITY_ROOT / authority.old_raw_relative
         payload = json.loads(raw_path.read_bytes())
         negative = json.loads(
             (DISPOSITION_FIXTURES / "negative_cases.json").read_text()
@@ -617,7 +642,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
             acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
-        raw = json.loads((ROOT / authority.old_raw_relative).read_bytes())
+        raw = json.loads((SOURCE_AUTHORITY_ROOT / authority.old_raw_relative).read_bytes())
         expected_view = _authenticated_filtered_view(raw)
         expected_bytes = disposition_module.canonical_json_bytes(expected_view)
         parser_calls: list[tuple[bytes, list[dict]]] = []
@@ -687,7 +712,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
             acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
-        raw = json.loads((ROOT / authority.old_raw_relative).read_bytes())
+        raw = json.loads((SOURCE_AUTHORITY_ROOT / authority.old_raw_relative).read_bytes())
         ignored_copy = raw["dates"][4]["games"][14]
         self.assertEqual(ignored_copy["gamePk"], 565221)
         ignored_copy["calendarEventID"] = "tampered-ignored-copy"
@@ -742,7 +767,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             source_run_spec_path=ROOT / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
             acquisition_contract_path=ROOT / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
         )
-        payload = json.loads((ROOT / authority.old_raw_relative).read_bytes())
+        payload = json.loads((SOURCE_AUTHORITY_ROOT / authority.old_raw_relative).read_bytes())
         third = copy.deepcopy(payload)
         third["dates"][161]["games"].append(copy.deepcopy(third["dates"][161]["games"][12]))
         third["dates"][161]["totalGames"] += 1
@@ -787,7 +812,7 @@ class V52ScheduleSourceTest(unittest.TestCase):
             ],
             ordinary["ordinary_pair_count_after_special_suppression"],
         )
-        raw = json.loads((ROOT / authority.old_raw_relative).read_bytes())
+        raw = json.loads((SOURCE_AUTHORITY_ROOT / authority.old_raw_relative).read_bytes())
         for representative in ordinary["representatives"]:
             positions = representative["positions"]
             self.assertTrue(

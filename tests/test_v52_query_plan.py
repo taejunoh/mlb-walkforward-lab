@@ -28,6 +28,9 @@ from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_AUTHORITY_ROOT = Path(
+    os.environ.get("MLB_V52_SOURCE_AUTHORITY_ROOT", str(ROOT))
+).resolve()
 RUN_SPEC = ROOT / "protocols/v5_2_qd/historical_walkforward_500.json"
 CONTRACT = ROOT / "protocols/v5_2_qd/historical_source_acquisition.json"
 SOURCE_RUN_SPEC = (
@@ -618,12 +621,14 @@ class V52QueryPlanTest(unittest.TestCase):
         )
         from mlb_backtest.v52_query_plan import build_static_batch
 
+        source_run_spec = SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC.relative_to(ROOT)
+        source_contract = SOURCE_AUTHORITY_ROOT / SOURCE_CONTRACT.relative_to(ROOT)
         authority = build_duplicate_disposition_authority(
-            ROOT,
-            source_run_spec_path=SOURCE_RUN_SPEC,
-            acquisition_contract_path=SOURCE_CONTRACT,
+            SOURCE_AUTHORITY_ROOT,
+            source_run_spec_path=source_run_spec,
+            acquisition_contract_path=source_contract,
         )
-        batch = build_static_batch(SOURCE_RUN_SPEC, SOURCE_CONTRACT)
+        batch = build_static_batch(source_run_spec, source_contract)
 
         self.assertEqual(batch.stage, "STATIC_SCHEDULES")
         self.assertIsNone(batch.derived_from_sha256)
