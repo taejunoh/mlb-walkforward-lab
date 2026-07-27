@@ -739,7 +739,7 @@ class FinalizationEndToEndTests(unittest.TestCase):
             (disposition.OLD_QUARANTINE_RELATIVE, "quarantine_receipt"),
             (disposition.OLD_RAW_RELATIVE, "quarantined_raw"),
         ):
-            source = (ROOT / relative).resolve()
+            source = (registry_tests.SOURCE_AUTHORITY_ROOT / relative).resolve()
             target = (root / relative).resolve()
             contents = (
                 canonical_json_bytes(

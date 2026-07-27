@@ -4745,31 +4745,20 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
             barrier = threading.Barrier(2)
-            results = []
-            errors = []
 
-            def publish() -> None:
-                try:
-                    barrier.wait(timeout=5)
-                    results.append(
-                        self.publish_pending_checkpoint(
-                            root,
-                            run_spec,
-                            batch,
-                            query_ids,
-                            expected_prior=None,
-                        )
-                    )
-                except BaseException as exc:
-                    errors.append(exc)
+            def publish(_unused: int) -> object:
+                barrier.wait(timeout=5)
+                return self.publish_pending_checkpoint(
+                    root,
+                    run_spec,
+                    batch,
+                    query_ids,
+                    expected_prior=None,
+                )
 
-            threads = [threading.Thread(target=publish) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
-            self.assertEqual(errors, [])
-            self.assertEqual(len(results), 2)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(publish, range(2)))
+
             self.assertEqual(results[0], results[1])
             checkpoint_dir = (
                 root
