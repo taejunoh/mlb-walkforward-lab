@@ -37,6 +37,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_AUTHORITY_ROOT = Path(
     os.environ.get("MLB_V52_SOURCE_AUTHORITY_ROOT", str(ROOT))
 ).resolve()
+RECOVERY_PARENT_EVIDENCE_ROOT = Path(
+    os.environ.get("MLB_V52_RECOVERY_PARENT_EVIDENCE_ROOT", str(SOURCE_AUTHORITY_ROOT))
+).resolve()
 FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
 SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
 DISPOSITION_FIXTURES = ROOT / "tests/fixtures/v52_duplicate_gamepk_565534"
@@ -1213,7 +1216,8 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
 
         cls._temporary = tempfile.TemporaryDirectory()
         cls.repository, cls.run_spec, cls.contract = recovery_authority_fixture(
-            Path(cls._temporary.name), parent_evidence_root=SOURCE_AUTHORITY_ROOT
+            Path(cls._temporary.name),
+            parent_evidence_root=RECOVERY_PARENT_EVIDENCE_ROOT,
         )
         cls.catalog = build_recovery_schedule_conflict_catalog(
             cls.repository, cls.run_spec, cls.contract
