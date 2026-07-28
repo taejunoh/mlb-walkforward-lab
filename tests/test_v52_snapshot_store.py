@@ -153,6 +153,124 @@ def _source_store_case():
     )
 
 
+def _recovery_store_case():
+    """Build recovery-run inventory inputs with Task 8's real capability type."""
+    from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+        RecoveryDispositionBinding,
+        RecoveryDispositionCatalog,
+    )
+    from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+    from mlb_backtest.v52_snapshot_store import AuthorityBinding, AuthorityBindings
+    from mlb_backtest.v52_source_contracts import canonical_json_bytes
+
+    entries = (
+        RecoveryDispositionBinding(
+            565534, "1" * 64,
+            {"path": "fixture/565534-sidecar.json", "sha256": "1" * 64},
+            {"path": "fixture/565534-success.json", "sha256": "4" * 64},
+            "2019-09-07T17:05:00Z", None, None, ("5" * 64,), "6" * 64,
+            "7" * 64, "8" * 64, "9" * 64,
+        ),
+        RecoveryDispositionBinding(
+            630882, "2" * 64,
+            {"path": "fixture/630882-sidecar.json", "sha256": "2" * 64},
+            {"path": "fixture/630882-success.json", "sha256": "a" * 64},
+            "2020-08-14T21:05:00Z", "2020-08-14", "2020-08-14", ("b" * 64,), "c" * 64,
+            "d" * 64, "e" * 64, "f" * 64,
+        ),
+        RecoveryDispositionBinding(
+            633224, "3" * 64,
+            {"path": "fixture/633224-sidecar.json", "sha256": "3" * 64},
+            {"path": "fixture/633224-success.json", "sha256": "a" * 64},
+            "2021-09-25T00:10:00Z", "2021-09-24", "2021-09-24", ("b" * 64,), "c" * 64,
+            "d" * 64, "e" * 64, "f" * 64,
+        ),
+    )
+    catalog = object.__new__(RecoveryDispositionCatalog)
+    object.__setattr__(catalog, "entries", ())
+    mapping = RecoveryDispositionBindings(entries).as_mapping()
+
+    def fresh():
+        return RecoveryDispositionBindings.from_catalog_mapping(mapping, catalog)
+
+    loader = patch(
+        "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+        "load_recovery_disposition_bindings",
+        return_value=entries,
+    )
+    base = store_inputs(current_phase="ACQUIRING")
+    with loader:
+        capability = fresh()
+    bindings = AuthorityBindings(
+        run_spec=AuthorityBinding(
+            "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json",
+            "a" * 64,
+        ),
+        acquisition_contract=AuthorityBinding(
+            "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json",
+            "b" * 64,
+        ),
+        terminal_checkpoint=dataclasses.replace(
+            base.bindings.terminal_checkpoint,
+            path="audit/v5_2_qd/historical_recovery_schedule_conflicts/execution/checkpoint.json",
+        ),
+        schedule_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/"
+            "schedule_anchor_inventory.json",
+            "d" * 64,
+        ),
+        game_evidence_inventory=AuthorityBinding(
+            "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/"
+            "game_evidence_inventory.json",
+            "e" * 64,
+        ),
+        timezone_gate=AuthorityBinding(
+            "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/"
+            "venue_timezone_seal.json",
+            "f" * 64,
+        ),
+        schedule_conflict_dispositions=capability,
+        dispositioned_query_ids=tuple(sorted(capability.query_ids())),
+    )
+
+    def recovery_snapshot(snapshot):
+        boundary = (
+            capability
+            if snapshot.source in {"mlb_schedule_game_feed", "prior_schedule_history"}
+            else None
+        )
+        candidate = dataclasses.replace(
+            snapshot,
+            run_id="historical_walkforward_500_recovery_schedule_conflicts",
+            recovery_dispositions=boundary,
+        )
+        contents = canonical_json_bytes(candidate.as_mapping()) + b"\n"
+        return dataclasses.replace(
+            candidate,
+            canonical_bytes=contents,
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
+
+    replay = dataclasses.replace(
+        base.replay,
+        run_id="historical_walkforward_500_recovery_schedule_conflicts",
+        game_inventory=dataclasses.replace(
+            base.replay.game_inventory,
+            payload={"schedule_conflict_dispositions": mapping},
+        ),
+        schedule_inventory=dataclasses.replace(
+            base.replay.schedule_inventory,
+            payload={"schedule_conflict_dispositions": mapping},
+        ),
+        recovery_dispositions=capability,
+        dispositioned_query_ids=tuple(sorted(capability.query_ids())),
+    )
+    snapshots = tuple(
+        sorted((recovery_snapshot(snapshot) for snapshot in fake_81()), key=verifier.snapshot_sort_key)
+    )
+    return loader, fresh, dataclasses.replace(base, replay=replay, bindings=bindings), snapshots
+
+
 class ReplayTests(unittest.TestCase):
     def test_replay_uses_exact_sha_and_statcast_parent_coverage_key(self):
         expected = fake_81()
@@ -662,8 +780,129 @@ class InventoryTests(unittest.TestCase):
         self.assertNotIn("dispositioned_query_ids", old_payload)
         self.assertEqual(parse_inventory(inventory_bytes(old_inventory)), old_inventory)
 
+    def test_recovery_inventory_requires_the_fresh_three_entry_catalog(self):
+        """A recovery inventory cannot omit, copy, reorder, or stale-bind its catalog."""
+        from mlb_backtest.v52_snapshot_store import build_inventory
+
+        loader, _fresh, inputs, snapshots = _recovery_store_case()
+
+        def build(candidate):
+            with loader, patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=snapshots,
+            ):
+                return build_inventory(candidate)
+
+        inventory = build(inputs)
+        self.assertEqual(inventory.counts["snapshot_count"], 81)
+        self.assertEqual(inventory.counts["source_season_count"], 42)
+        self.assertEqual(inventory.counts["source_count"], 6)
+        self.assertEqual(
+            inventory.counts["by_source"]["mlb_schedule_game_feed"], 7
+        )
+        self.assertEqual(
+            len(inventory.schedule_conflict_dispositions.entries), 3
+        )
+
+        for label, candidate in (
+            (
+                "missing",
+                dataclasses.replace(
+                    inputs,
+                    bindings=dataclasses.replace(
+                        inputs.bindings, schedule_conflict_dispositions=None
+                    ),
+                ),
+            ),
+            (
+                "replay-missing",
+                dataclasses.replace(
+                    inputs,
+                    replay=dataclasses.replace(
+                        inputs.replay, recovery_dispositions=None
+                    ),
+                ),
+            ),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                (TypeError, ValueError), "recovery|catalog|binding|authority"
+            ):
+                build(candidate)
+
+    def test_recovery_inventory_rejects_noncanonical_catalog_population(self):
+        """Only the freshly reauthenticated, ordered three-entry catalog is live."""
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+        from mlb_backtest.v52_snapshot_store import build_inventory, inventory_bytes, parse_inventory
+
+        loader, fresh, inputs, snapshots = _recovery_store_case()
+
+        def build(candidate):
+            with loader, patch(
+                "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+                return_value=snapshots,
+            ):
+                return build_inventory(candidate)
+
+        with loader:
+            capability = fresh()
+        inventory = build(inputs)
+        with loader:
+            raw = inventory_bytes(inventory)
+        with self.assertRaisesRegex(ValueError, "inventory semantic contract"):
+            parse_inventory(raw)
+        with loader:
+            self.assertEqual(
+                parse_inventory(raw, recovery_dispositions=capability).as_mapping(),
+                inventory.as_mapping(),
+            )
+
+        def forged(entries):
+            candidate = object.__new__(RecoveryDispositionBindings)
+            object.__setattr__(candidate, "entries", entries)
+            object.__setattr__(candidate, "_authorization", None)
+            object.__setattr__(candidate, "_reauthenticate", None)
+            return candidate
+
+        entries = capability.entries
+        populations = {
+            "one": entries[:1],
+            "two": entries[:2],
+            "four": entries + entries[:1],
+            "duplicate": (entries[0], entries[0], entries[2]),
+            "reordered": tuple(reversed(entries)),
+            "stale": entries[:2] + (
+                dataclasses.replace(entries[2], sidecar_semantics_sha256="0" * 64),
+            ),
+            "copied": entries[:1] + (
+                dataclasses.replace(entries[1], success_receipt=entries[0].success_receipt),
+                entries[2],
+            ),
+        }
+        for label, population in populations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError, "recovery snapshot disposition bindings differ"
+            ):
+                build(
+                    dataclasses.replace(
+                        inputs,
+                        bindings=dataclasses.replace(
+                            inputs.bindings,
+                            schedule_conflict_dispositions=forged(population),
+                        ),
+                    )
+                )
+        with self.assertRaisesRegex(ValueError, "legacy run cannot carry"):
+            build(
+                dataclasses.replace(
+                    inputs,
+                    replay=dataclasses.replace(
+                        inputs.replay, run_id="historical_walkforward_500"
+                    ),
+                )
+            )
+
     def test_source_inventory_schema_exactly_separates_authority_branches(self):
-        from mlb_backtest.v52_snapshot_store import parse_inventory
+        from mlb_backtest.v52_snapshot_store import build_inventory, parse_inventory
 
         schema = json.loads(
             (
@@ -673,6 +912,25 @@ class InventoryTests(unittest.TestCase):
         )
         old = self._inventory().as_mapping()
         jsonschema.validate(old, schema)
+
+        loader, _fresh, recovery_inputs, recovery_snapshots = _recovery_store_case()
+        with loader, patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=recovery_snapshots,
+        ):
+            recovery = build_inventory(recovery_inputs).as_mapping()
+        jsonschema.validate(recovery, schema)
+        for label, mutation in (
+            ("one", lambda payload: payload["schedule_conflict_dispositions"].__setitem__("entries", payload["schedule_conflict_dispositions"]["entries"][:1])),
+            ("two", lambda payload: payload["schedule_conflict_dispositions"].__setitem__("entries", payload["schedule_conflict_dispositions"]["entries"][:2])),
+            ("four", lambda payload: payload["schedule_conflict_dispositions"]["entries"].append(payload["schedule_conflict_dispositions"]["entries"][0])),
+            ("reordered", lambda payload: payload["schedule_conflict_dispositions"]["entries"].reverse()),
+            ("cross-run", lambda payload: payload.__setitem__("run_id", "historical_walkforward_500")),
+        ):
+            candidate = json.loads(_canonical_raw(recovery))
+            mutation(candidate)
+            with self.subTest(recovery=label):
+                self.assertTrue(list(jsonschema.Draft202012Validator(schema).iter_errors(candidate)))
 
         disposition_id = (
             "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"

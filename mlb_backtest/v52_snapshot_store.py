@@ -28,6 +28,7 @@ from .v52_sources.history import (
     TASK10_DISPOSITION_QUERY_ID,
     validate_task10_disposition_binding,
 )
+from .v52_schedule_inventory import RecoveryDispositionBindings
 from .v52_verify_sources import (
     AuthorityBinding,
     DuplicateGamePkDispositionBinding,
@@ -42,6 +43,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OLD_RUN_ID = "historical_walkforward_500"
 _FIXTURE_RUN_ID = "fixture-run"
 _SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
 _SOURCE_TIMEZONE_GATE_PATH = (
     "audit/v5_2_qd/historical_superseding_565534/acquisition/"
     "venue_timezone_seal.json"
@@ -84,6 +86,7 @@ _OLD_TOP_LEVEL_KEYS = frozenset(
 _SOURCE_TOP_LEVEL_KEYS = _OLD_TOP_LEVEL_KEYS | {
     "duplicate_gamepk_disposition", "dispositioned_query_ids"
 }
+_RECOVERY_TOP_LEVEL_KEYS = _OLD_TOP_LEVEL_KEYS | {"schedule_conflict_dispositions"}
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ class AuthorityBindings:
     timezone_gate: AuthorityBinding
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
     dispositioned_query_ids: tuple[str, ...] = ()
+    schedule_conflict_dispositions: RecoveryDispositionBindings | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dispositioned_query_ids", tuple(self.dispositioned_query_ids))
@@ -286,6 +290,10 @@ class SourceInventory:
     def dispositioned_query_ids(self) -> tuple[str, ...]:
         return self.bindings.dispositioned_query_ids
 
+    @property
+    def schedule_conflict_dispositions(self) -> RecoveryDispositionBindings | None:
+        return self.bindings.schedule_conflict_dispositions
+
     def as_mapping(self) -> dict[str, object]:
         result = {
             "schema_version": self.schema_version,
@@ -311,6 +319,10 @@ class SourceInventory:
         if self.duplicate_gamepk_disposition is not None:
             result["duplicate_gamepk_disposition"] = self.duplicate_gamepk_disposition.as_mapping()
             result["dispositioned_query_ids"] = list(self.dispositioned_query_ids)
+        if self.schedule_conflict_dispositions is not None:
+            result["schedule_conflict_dispositions"] = (
+                self.schedule_conflict_dispositions.as_mapping()
+            )
         return result
 
 
@@ -333,12 +345,14 @@ def _validate_build_inputs(inputs: SnapshotStoreInputs) -> None:
         inputs.replay.duplicate_gamepk_disposition,
         inputs.replay.dispositioned_query_ids,
         "replay",
+        inputs.replay.recovery_dispositions,
     )
     _validate_run_disposition(
         inputs.replay.run_id,
         inputs.bindings.duplicate_gamepk_disposition,
         inputs.bindings.dispositioned_query_ids,
         "binding",
+        inputs.bindings.schedule_conflict_dispositions,
     )
     _validate_source_binding_paths(inputs.replay.run_id, inputs.bindings)
     if (
@@ -348,6 +362,12 @@ def _validate_build_inputs(inputs: SnapshotStoreInputs) -> None:
         != inputs.bindings.dispositioned_query_ids
     ):
         raise ValueError("replay disposition authority differs from bindings")
+    if inputs.replay.run_id == _RECOVERY_RUN_ID:
+        replay_catalog = _validate_recovery_snapshot_bindings(
+            inputs.bindings.schedule_conflict_dispositions
+        )
+        if inputs.replay.recovery_dispositions != replay_catalog:
+            raise ValueError("recovery snapshot disposition bindings differ")
 
 
 def _build_inventory_from_replayed(
@@ -381,7 +401,11 @@ def inventory_bytes(inventory: SourceInventory) -> bytes:
     return canonical_json_bytes(payload) + b"\n"
 
 
-def parse_inventory(raw: bytes) -> SourceInventory:
+def parse_inventory(
+    raw: bytes,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
+) -> SourceInventory:
     if not isinstance(raw, bytes):
         raise TypeError("inventory bytes must be bytes")
     try:
@@ -396,7 +420,9 @@ def parse_inventory(raw: bytes) -> SourceInventory:
         raise ValueError("inventory bytes are not canonical JSON with one final newline")
     _validate_schema(payload)
     try:
-        inventory = _inventory_from_mapping(payload)
+        inventory = _inventory_from_mapping(
+            payload, recovery_dispositions=recovery_dispositions
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("inventory semantic contract is invalid") from exc
     _validate_inventory(inventory)
@@ -447,9 +473,23 @@ def _freeze_counts(rows: tuple[SnapshotInventoryRow, ...]) -> Mapping[str, objec
     })
 
 
-def _inventory_from_mapping(payload: Mapping[str, object]) -> SourceInventory:
+def _inventory_from_mapping(
+    payload: Mapping[str, object],
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
+) -> SourceInventory:
     source_branch = "duplicate_gamepk_disposition" in payload or "dispositioned_query_ids" in payload
-    if set(payload) != (_SOURCE_TOP_LEVEL_KEYS if source_branch else _OLD_TOP_LEVEL_KEYS):
+    recovery_branch = "schedule_conflict_dispositions" in payload
+    if source_branch and recovery_branch:
+        raise ValueError("inventory authority branches differ")
+    expected_keys = (
+        _SOURCE_TOP_LEVEL_KEYS
+        if source_branch
+        else _RECOVERY_TOP_LEVEL_KEYS
+        if recovery_branch
+        else _OLD_TOP_LEVEL_KEYS
+    )
+    if set(payload) != expected_keys:
         raise ValueError("inventory top-level keys differ")
     disposition: DuplicateGamePkDispositionBinding | None = None
     dispositioned: tuple[str, ...] = ()
@@ -464,11 +504,17 @@ def _inventory_from_mapping(payload: Mapping[str, object]) -> SourceInventory:
             _binding_from_mapping(raw["query_sidecar"]),
         )
         dispositioned = tuple(_sha_values(payload["dispositioned_query_ids"], "dispositioned query IDs"))
+    recovery_catalog = None
+    if recovery_branch:
+        recovery_catalog = _require_recovery_dispositions(
+            payload["schedule_conflict_dispositions"], recovery_dispositions
+        )
+        dispositioned = tuple(sorted(recovery_catalog.query_ids()))
     bindings = AuthorityBindings(
         _binding_from_mapping(payload["run_spec"]), _binding_from_mapping(payload["acquisition_contract"]),
         _terminal_from_mapping(payload["terminal_checkpoint"]), _binding_from_mapping(payload["schedule_inventory"]),
         _binding_from_mapping(payload["game_evidence_inventory"]), _binding_from_mapping(payload["timezone_gate"]),
-        disposition, dispositioned,
+        disposition, dispositioned, recovery_catalog,
     )
     snapshots = tuple(_snapshot_row_from_mapping(value) for value in _array(payload["snapshots"], "snapshots"))
     seasons = tuple(_source_season_from_mapping(value) for value in _array(payload["source_seasons"], "source_seasons"))
@@ -489,6 +535,58 @@ def _binding_from_mapping(value: object) -> AuthorityBinding:
     if set(value) != {"path", "sha256"}:
         raise ValueError("binding keys differ")
     return AuthorityBinding(_literal(value["path"], str, "path"), _literal(value["sha256"], str, "sha256"))
+
+
+def _require_recovery_dispositions(
+    value: object,
+    supplied: RecoveryDispositionBindings | None,
+) -> RecoveryDispositionBindings:
+    """Bind serialized recovery inventory only to a fresh caller authority."""
+    payload = _mapping(value, "recovery disposition catalog")
+    if set(payload) != {"entries", "query_ids"}:
+        raise ValueError("recovery disposition catalog keys differ")
+    raw_entries = _array(payload["entries"], "recovery disposition entries")
+    if len(raw_entries) != 3:
+        raise ValueError("recovery snapshot disposition bindings differ")
+    keys = {
+        "game_pk", "query_id", "query_sidecar", "success_receipt",
+        "retained_scheduled_start_utc", "played_date", "result_available_on",
+        "raw_object_sha256s", "selected_raw_game_object_sha256s_sha256",
+        "normalized_games_sha256", "sidecar_semantics_sha256",
+    }
+    for raw in raw_entries:
+        item = _mapping(raw, "recovery disposition entry")
+        if set(item) != keys:
+            raise ValueError("recovery disposition entry keys differ")
+        _literal(item["game_pk"], int, "recovery game_pk")
+        query_id = _literal(item["query_id"], str, "recovery query ID")
+        _require_sha(query_id, "recovery query ID")
+        _binding_from_mapping(item["query_sidecar"])
+        _binding_from_mapping(item["success_receipt"])
+        _literal(item["retained_scheduled_start_utc"], str, "recovery start")
+        played = item["played_date"]
+        available = item["result_available_on"]
+        if played is not None and not isinstance(played, str):
+            raise ValueError("recovery played_date differs")
+        if available is not None and not isinstance(available, str):
+            raise ValueError("recovery result_available_on differs")
+        _sha_values(item["raw_object_sha256s"], "recovery raw hashes")
+        selected = _literal(item["selected_raw_game_object_sha256s_sha256"], str, "recovery selected hash")
+        normalized = _literal(item["normalized_games_sha256"], str, "recovery normalized hash")
+        semantics = _literal(item["sidecar_semantics_sha256"], str, "recovery semantics hash")
+        for digest in (selected, normalized, semantics):
+            _require_sha(digest, "recovery disposition hash")
+    if not isinstance(supplied, RecoveryDispositionBindings):
+        raise ValueError("recovery disposition authority is required")
+    try:
+        fresh = supplied.reauthenticate()
+    except ValueError as exc:
+        raise ValueError("recovery snapshot disposition bindings differ") from exc
+    if canonical_json_bytes(payload) != canonical_json_bytes(fresh.as_mapping()):
+        raise ValueError("recovery snapshot disposition bindings differ")
+    if _sha_values(payload["query_ids"], "recovery query IDs") != list(sorted(fresh.query_ids())):
+        raise ValueError("recovery disposition query IDs differ")
+    return fresh
 
 
 def _terminal_from_mapping(value: object) -> TerminalCheckpointBinding:
@@ -551,6 +649,7 @@ def _validate_inventory(inventory: SourceInventory) -> None:
         inventory.duplicate_gamepk_disposition,
         inventory.dispositioned_query_ids,
         "inventory",
+        inventory.schedule_conflict_dispositions,
     )
     _validate_source_binding_paths(inventory.run_id, inventory.bindings)
     rows = inventory.snapshots
@@ -630,6 +729,14 @@ def _validate_bindings(bindings: AuthorityBindings) -> None:
     _validate_binding(terminal)
     disposition = bindings.duplicate_gamepk_disposition
     ids = bindings.dispositioned_query_ids
+    recovery = bindings.schedule_conflict_dispositions
+    if recovery is not None:
+        if disposition is not None:
+            raise ValueError("recovery authority branches differ")
+        catalog = _validate_recovery_snapshot_bindings(recovery)
+        if ids != tuple(sorted(catalog.query_ids())):
+            raise ValueError("recovery disposition IDs differ")
+        return
     if disposition is None:
         if ids:
             raise ValueError("historical authority cannot carry disposition IDs")
@@ -645,19 +752,46 @@ def _validate_bindings(bindings: AuthorityBindings) -> None:
     _validate_binding(disposition.query_sidecar)
 
 
+def _validate_recovery_snapshot_bindings(
+    bindings: RecoveryDispositionBindings | None,
+) -> RecoveryDispositionBindings:
+    """Require the exact, freshly authenticated three-entry recovery catalog."""
+    if not isinstance(bindings, RecoveryDispositionBindings) or len(bindings.entries) != 3:
+        raise ValueError("recovery snapshot disposition bindings differ")
+    try:
+        fresh = bindings.reauthenticate()
+    except ValueError as exc:
+        raise ValueError("recovery snapshot disposition bindings differ") from exc
+    if (
+        not isinstance(fresh, RecoveryDispositionBindings)
+        or len(fresh.entries) != 3
+        or fresh.entries != bindings.entries
+    ):
+        raise ValueError("recovery snapshot disposition bindings differ")
+    return fresh
+
+
 def _validate_run_disposition(
     run_id: object,
     disposition: DuplicateGamePkDispositionBinding | None,
     dispositioned_query_ids: tuple[str, ...],
     label: str,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> None:
+    if run_id == _RECOVERY_RUN_ID:
+        if disposition is not None:
+            raise ValueError(f"{label} recovery run cannot carry source disposition authority")
+        catalog = _validate_recovery_snapshot_bindings(recovery_dispositions)
+        if dispositioned_query_ids != tuple(sorted(catalog.query_ids())):
+            raise ValueError(f"{label} recovery disposition IDs differ")
+        return
     if run_id in {_OLD_RUN_ID, _FIXTURE_RUN_ID}:
-        if disposition is not None or dispositioned_query_ids:
+        if disposition is not None or dispositioned_query_ids or recovery_dispositions is not None:
             raise ValueError(f"{label} legacy run cannot carry disposition authority")
         return
     if run_id != _SOURCE_RUN_ID:
         raise ValueError(f"{label} run_id differs")
-    if disposition is None or dispositioned_query_ids != (
+    if recovery_dispositions is not None or disposition is None or dispositioned_query_ids != (
         TASK10_DISPOSITION_QUERY_ID,
     ):
         raise ValueError(f"{label} superseding run requires disposition authority")
@@ -678,6 +812,17 @@ def _validate_source_binding_paths(
         and bindings.timezone_gate.path != _SOURCE_TIMEZONE_GATE_PATH
     ):
         raise ValueError("superseding timezone gate authority path differs")
+    if run_id == _RECOVERY_RUN_ID:
+        expected = {
+            "run_spec": "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json",
+            "acquisition_contract": "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json",
+            "schedule_inventory": "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/schedule_anchor_inventory.json",
+            "game_evidence_inventory": "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/game_evidence_inventory.json",
+            "timezone_gate": "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/venue_timezone_seal.json",
+        }
+        for name, path in expected.items():
+            if getattr(bindings, name).path != path:
+                raise ValueError("recovery authority path differs")
 
 
 def _validate_binding(binding: AuthorityBinding | TerminalCheckpointBinding) -> None:
@@ -912,7 +1057,7 @@ def _load_snapshot_store_held(
             raise PublishError("loader lock proof must be an owned lock capability")
         _authenticate_lock(owned_lock, root)
 
-    checksum, inventory_binding, inventory = _read_inventory_bindings(root)
+    checksum, inventory_binding, inventory = _read_inventory_bindings(root, inputs)
     _validate_loaded_authorities(inventory, inputs)
     directories = _open_inventory_directories(root, inventory)
     try:
@@ -934,7 +1079,9 @@ def _load_snapshot_store_held(
             raise PublishError("replay changed while loading snapshot store")
 
         _reject_unowned_lock(root) if owned_lock is None else _authenticate_lock(owned_lock, root)
-        final_checksum, final_inventory_binding, final_inventory = _read_inventory_bindings(root)
+        final_checksum, final_inventory_binding, final_inventory = _read_inventory_bindings(
+            root, inputs
+        )
         if (
             final_checksum != checksum
             or final_inventory_binding != inventory_binding
@@ -1034,7 +1181,9 @@ def _reject_unowned_lock(root: _HeldDirectory) -> None:
     raise LockHeld("snapshot store lock is already held")
 
 
-def _read_inventory_bindings(root: _HeldDirectory) -> tuple[_ReadBinding, _ReadBinding, SourceInventory]:
+def _read_inventory_bindings(
+    root: _HeldDirectory, inputs: SnapshotStoreInputs | None = None
+) -> tuple[_ReadBinding, _ReadBinding, SourceInventory]:
     checksum = _read_immutable_binding(root, "source_inventory.sha256")
     if re.fullmatch(rb"[0-9a-f]{64}\n", checksum.contents) is None:
         raise PublishError("inventory checksum must be lowercase SHA-256 plus newline")
@@ -1042,7 +1191,14 @@ def _read_inventory_bindings(root: _HeldDirectory) -> tuple[_ReadBinding, _ReadB
     if hashlib.sha256(raw_inventory.contents).hexdigest().encode("ascii") + b"\n" != checksum.contents:
         raise PublishError("inventory checksum differs from inventory bytes")
     try:
-        return checksum, raw_inventory, parse_inventory(raw_inventory.contents)
+        return checksum, raw_inventory, parse_inventory(
+            raw_inventory.contents,
+            recovery_dispositions=(
+                inputs.bindings.schedule_conflict_dispositions
+                if inputs is not None
+                else None
+            ),
+        )
     except (TypeError, ValueError) as exc:
         raise PublishError("stored inventory is invalid") from exc
 
@@ -1230,6 +1386,7 @@ def _freeze_replayed_snapshots(
                 snapshot.duplicate_gamepk_disposition
             ),
             dispositioned_query_ids=tuple(snapshot.dispositioned_query_ids),
+            recovery_dispositions=snapshot.recovery_dispositions,
         )
         if (
             copied.canonical_bytes != canonical_json_bytes(copied.as_mapping()) + b"\n"
