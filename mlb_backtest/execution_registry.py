@@ -52,6 +52,12 @@ _RECOVERY_RUN_SPEC_PATH = (
 _RECOVERY_CONTRACT_PATH = (
     "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json"
 )
+_RECOVERY_DESIGN_PATH = (
+    "docs/superpowers/specs/2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
+)
+_RECOVERY_PLAN_PATH = (
+    "docs/superpowers/plans/2026-07-28-v5-2-schedule-conflict-recovery-run.md"
+)
 _RECOVERY_AUDIT_PREFIX = "audit/v5_2_qd/historical_recovery_schedule_conflicts/"
 _RECOVERY_RAW_PREFIX = "data/v5_2_qd/historical_recovery_schedule_conflicts/raw/"
 _SOURCE_RUN_SPEC_PATH = (
@@ -1587,6 +1593,48 @@ def _supplemental_authority_binding(
             "ephemeral parse schedule equivalence addendum",
             plan=True,
         )
+    if contract.get("run_id") == _RECOVERY_RUN_ID:
+        if str(contract_binding["path"]) != _RECOVERY_CONTRACT_PATH:
+            raise ValueError("recovery acquisition contract path differs")
+        expected_run = _validate_binding_value(evidence["run_spec"], "run spec")
+        expected_design = _validate_binding_value(
+            evidence["approved_design"], "approved design"
+        )
+        expected_plan = _validate_binding_value(
+            evidence["implementation_plan"], "implementation plan", plan=True
+        )
+        contract_plan = dict(expected_plan)
+        contract_plan["working_tree_sha256"] = contract_plan.pop("sha256")
+        for key, expected, label in (
+            ("run_spec", expected_run, "recovery contract RunSpec"),
+            ("approved_design", expected_design, "recovery contract design"),
+        ):
+            value = bindings.get(key)
+            if not isinstance(value, Mapping):
+                raise ValueError("recovery acquisition contract bindings differ")
+            artifact = _validate_binding_value(
+                {"path": value.get("path"), "sha256": value.get("sha256")}, label
+            )
+            blob = value.get("git_blob_id")
+            if (
+                artifact != expected
+                or not isinstance(blob, str)
+                or not _GIT_HEAD.fullmatch(blob)
+                or _git(root, "rev-parse", f"HEAD:{artifact['path']}") != blob
+            ):
+                raise ValueError("recovery acquisition contract bindings differ")
+        if (
+            set(bindings) != {"run_spec", "approved_design", "implementation_plan"}
+            or bindings.get("implementation_plan") != contract_plan
+            or expected_run.get("path") != _RECOVERY_RUN_SPEC_PATH
+            or expected_design.get("path") != _RECOVERY_DESIGN_PATH
+            or expected_plan.get("path") != _RECOVERY_PLAN_PATH
+        ):
+            raise ValueError("recovery acquisition contract bindings differ")
+        _artifact_binding(root, expected_run, "recovery run spec")
+        _artifact_binding(root, expected_design, "recovery approved design")
+        _artifact_binding(root, expected_plan, "recovery implementation plan", plan=True)
+        return expected_design
     raise ValueError("acquisition contract authority differs")
 
 
@@ -2119,8 +2167,13 @@ def _validate_common_bindings(
     expected_plan = dict(payload["implementation_plan"])
     expected_plan["working_tree_sha256"] = expected_plan.pop("sha256")
     if (
-        bindings.get("approved_design") != payload["approved_design"]
-        or bindings.get("run_spec") != payload["run_spec"]
+        (
+            run_spec.run_id != _RECOVERY_RUN_ID
+            and (
+                bindings.get("approved_design") != payload["approved_design"]
+                or bindings.get("run_spec") != payload["run_spec"]
+            )
+        )
         or bindings.get("implementation_plan") != expected_plan
     ):
         raise ValueError("execution receipt differs from acquisition contract bindings")

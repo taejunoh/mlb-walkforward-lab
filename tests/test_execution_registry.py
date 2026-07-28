@@ -361,6 +361,137 @@ def _source_checkpoint_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_recovery_supplemental_binding_reauthenticates_closed_contract_bindings(
+        self,
+    ) -> None:
+        """A recovery receipt must bind its fixed design after contract replay."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run_path = root / (
+                "protocols/v5_2_qd/"
+                "historical_walkforward_500_recovery_schedule_conflicts.json"
+            )
+            contract_path = root / (
+                "protocols/v5_2_qd/"
+                "historical_source_acquisition_recovery_schedule_conflicts.json"
+            )
+            design_path = root / (
+                "docs/superpowers/specs/"
+                "2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
+            )
+            plan_path = root / (
+                "docs/superpowers/plans/"
+                "2026-07-28-v5-2-schedule-conflict-recovery-run.md"
+            )
+            baseline_path = root / "protocols/v5_2_qd/v51_protected_inventory.json"
+            protected_path = root / "audit/v5_1_bt/protected_raw_inventory.json"
+            for path, contents in (
+                (run_path, b'{"run":"recovery"}\n'),
+                (design_path, b"recovery design\n"),
+                (plan_path, b"recovery plan\n"),
+                (baseline_path, b'{"baseline":true}\n'),
+                (protected_path, b'{"protected":true}\n'),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+            _git(root, "init", "-q")
+            _git(root, "config", "user.email", "recovery@example.test")
+            _git(root, "config", "user.name", "Recovery")
+            _git(root, "add", ".")
+            _git(root, "commit", "-qm", "recovery authority")
+
+            def binding(path: Path, *, plan: bool = False) -> dict[str, str]:
+                result = {
+                    "path": path.relative_to(root).as_posix(),
+                    ("working_tree_sha256" if plan else "sha256"): _sha256(path),
+                    "git_blob_id": _git(
+                        root, "rev-parse", f"HEAD:{path.relative_to(root).as_posix()}"
+                    ),
+                }
+                return result
+
+            contract = {
+                "schema_version": 2,
+                "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+                "bindings": {
+                    "run_spec": binding(run_path),
+                    "approved_design": binding(design_path),
+                    "implementation_plan": binding(plan_path, plan=True),
+                },
+            }
+            contract_path.parent.mkdir(parents=True, exist_ok=True)
+            contract_path.write_bytes(canonical_json_bytes(contract) + b"\n")
+            plan = dict(contract["bindings"]["implementation_plan"])
+            evidence = {
+                "run_spec": {
+                    key: value
+                    for key, value in contract["bindings"]["run_spec"].items()
+                    if key != "git_blob_id"
+                },
+                "approved_design": {
+                    key: value
+                    for key, value in contract["bindings"]["approved_design"].items()
+                    if key != "git_blob_id"
+                },
+                "implementation_plan": {
+                    "path": plan["path"],
+                    "sha256": plan["working_tree_sha256"],
+                    "git_blob_id": plan["git_blob_id"],
+                },
+                "acquisition_contract": {
+                    "path": contract_path.relative_to(root).as_posix(),
+                    "sha256": _sha256(contract_path),
+                },
+                "task0_lineage": {
+                    "baseline_inventory": {
+                        "path": baseline_path.relative_to(root).as_posix(),
+                        "sha256": _sha256(baseline_path),
+                    },
+                    "protected_inventory": {
+                        "path": protected_path.relative_to(root).as_posix(),
+                        "sha256": _sha256(protected_path),
+                    },
+                },
+            }
+
+            self.assertEqual(
+                self.registry._supplemental_authority_binding(root, evidence),
+                evidence["approved_design"],
+            )
+            bound_paths = self.registry._git_bound_paths(root, evidence)
+            self.assertEqual(bound_paths.count(evidence["approved_design"]["path"]), 1)
+            self.assertTrue(
+                {
+                    evidence["run_spec"]["path"],
+                    evidence["approved_design"]["path"],
+                    evidence["implementation_plan"]["path"],
+                    evidence["acquisition_contract"]["path"],
+                }.issubset(bound_paths)
+            )
+            for field, mutation in (
+                (
+                    "mixed_run_path",
+                    lambda value: value["bindings"]["run_spec"].update(
+                        path=SOURCE_RUN_SPEC_RELATIVE.as_posix()
+                    ),
+                ),
+                (
+                    "forged_design_hash",
+                    lambda value: value["bindings"]["approved_design"].update(
+                        sha256="0" * 64
+                    ),
+                ),
+            ):
+                with self.subTest(field=field):
+                    forged = copy.deepcopy(contract)
+                    mutation(forged)
+                    contract_path.write_bytes(canonical_json_bytes(forged) + b"\n")
+                    with self.assertRaisesRegex(
+                        ValueError, "recovery acquisition contract"
+                    ):
+                        self.registry._supplemental_authority_binding(root, evidence)
+            contract_path.write_bytes(canonical_json_bytes(contract) + b"\n")
+
     def test_recovery_checkpoint_catalog_artifacts_are_snapshot_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
