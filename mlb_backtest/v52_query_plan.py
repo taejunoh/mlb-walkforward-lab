@@ -3170,6 +3170,7 @@ def _validate_query_batch_authority(
     *,
     read_only_progress: bool = False,
 ) -> None:
+    _validate_recovery_marked_batch_authority(repository_root, batch)
     _validate_recovery_parser_batch(repository_root, batch)
     _validate_source_static_batch_authority(repository_root, batch)
     _validate_reference_batch_authority(
@@ -3188,6 +3189,36 @@ def _validate_query_batch_authority(
         batch,
         read_only_progress=read_only_progress,
     )
+
+
+def _validate_recovery_marked_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    """Recovery parser/table markers have no historical or superseding fallback."""
+    recovery_only_endpoints = frozenset(
+        _RECOVERY_DISPOSITION_ENDPOINTS.values()
+    ) - {"disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"}
+    marked = any(
+        query.parser_version == "v5.2.2"
+        or query.endpoint in recovery_only_endpoints
+        for query in batch.queries
+    )
+    if not marked:
+        return
+    recovery_context = _recovery_context_if_present(repository_root)
+    if recovery_context is None:
+        raise ValueError("recovery query authority is unavailable")
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if pairs != {
+        (
+            recovery_context.authority_sha256,
+            recovery_context.acquisition_contract_sha256,
+        )
+    }:
+        raise ValueError("recovery query authority bindings differ")
 
 
 def _validate_recovery_parser_batch(repository_root: Path, batch: QueryBatch) -> None:

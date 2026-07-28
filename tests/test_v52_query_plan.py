@@ -817,6 +817,40 @@ class RecoveryAuthorityTests(unittest.TestCase):
                     }
                     self.assertEqual(after, before)
 
+    def test_recovery_static_markers_require_recovery_hash_pair_before_publish(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_path, contract_path = self._fixture(Path(directory))
+            recovery = query_plan.build_static_batch(run_path, contract_path)
+            historical_queries = tuple(
+                dataclasses.replace(
+                    query,
+                    run_spec_sha256=query_plan._HISTORICAL_RUN_SPEC_SHA256,
+                    acquisition_contract_sha256=query_plan._HISTORICAL_ACQUISITION_CONTRACT_SHA256,
+                )
+                for query in recovery.queries
+            )
+            forged = query_plan._make_batch(
+                "STATIC_SCHEDULES", None, historical_queries
+            )
+            mixed = dataclasses.replace(
+                recovery,
+                queries=(
+                    dataclasses.replace(
+                        recovery.queries[0],
+                        run_spec_sha256=query_plan._HISTORICAL_RUN_SPEC_SHA256,
+                    ),
+                    *recovery.queries[1:],
+                ),
+            )
+            for batch in (forged, mixed):
+                with self.subTest(batch=batch.batch_id), self.assertRaisesRegex(
+                    ValueError, "recovery.*authority|authority.*recovery"
+                ):
+                    query_plan.publish_query_batch(root, batch)
+            self.assertFalse((root / "audit").exists())
+
 
 class V52QueryPlanTest(unittest.TestCase):
     def test_source_authority_rejects_dirty_ephemeral_equivalence_addendum(self):
