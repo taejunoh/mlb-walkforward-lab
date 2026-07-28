@@ -298,42 +298,192 @@ def _safe_relative_parts(relative: Path, label: str) -> tuple[str, ...]:
 
 
 def _repository_root(root: Path) -> Path:
-    candidate = Path(root)
-    node = candidate.lstat()
+    candidate, _root_fd, descriptors, bindings = _open_authenticated_root(root)
+    try:
+        _assert_directory_bindings(bindings)
+    finally:
+        _close_descriptors(descriptors)
+    return candidate
+
+
+_DirectoryBinding = tuple[int, str, int, tuple[int, int, int, int], str]
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _file_identity(node: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        node.st_dev,
+        node.st_ino,
+        node.st_mode,
+        node.st_nlink,
+        node.st_size,
+    )
+
+
+def _directory_identity(node: os.stat_result) -> tuple[int, int, int, int]:
+    return (node.st_dev, node.st_ino, node.st_mode, node.st_nlink)
+
+
+def _require_directory(node: os.stat_result, label: str) -> None:
     if stat.S_ISLNK(node.st_mode) or not stat.S_ISDIR(node.st_mode):
-        raise ValueError("repository root must be a real directory")
-    return candidate.resolve(strict=True)
+        raise ValueError(f"{label} must be a real directory")
+
+
+def _close_descriptors(descriptors: list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _open_directory_component(
+    parent_fd: int, component: str, label: str
+) -> tuple[int, _DirectoryBinding]:
+    descriptor = -1
+    try:
+        linked_before = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+        _require_directory(linked_before, label)
+        descriptor = os.open(component, _directory_flags(), dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        linked_after = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+        _require_directory(opened, label)
+        _require_directory(linked_after, label)
+        if (
+            _directory_identity(linked_before) != _directory_identity(linked_after)
+            or _directory_identity(opened) != _directory_identity(linked_after)
+        ):
+            raise ValueError(f"{label} identity changed while opening")
+        return descriptor, (
+            parent_fd,
+            component,
+            descriptor,
+            _directory_identity(opened),
+            label,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be opened safely") from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _open_authenticated_root(
+    root: Path,
+) -> tuple[Path, int, list[int], list[_DirectoryBinding]]:
+    candidate = Path(os.path.abspath(os.fspath(root)))
+    descriptors: list[int] = []
+    bindings: list[_DirectoryBinding] = []
+    try:
+        current = os.open(os.sep, _directory_flags())
+        descriptors.append(current)
+        _require_directory(os.fstat(current), "repository filesystem root")
+        for component in candidate.parts[1:]:
+            child, binding = _open_directory_component(
+                current, component, "repository root ancestor"
+            )
+            descriptors.append(child)
+            bindings.append(binding)
+            current = child
+        return candidate, current, descriptors, bindings
+    except BaseException:
+        _close_descriptors(descriptors)
+        raise
+
+
+def _assert_directory_bindings(bindings: list[_DirectoryBinding]) -> None:
+    for parent_fd, component, child_fd, expected, label in bindings:
+        try:
+            linked = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            opened = os.fstat(child_fd)
+        except OSError as exc:
+            raise ValueError(f"{label} path binding changed") from exc
+        _require_directory(linked, label)
+        _require_directory(opened, label)
+        if (
+            _directory_identity(linked) != expected
+            or _directory_identity(opened) != expected
+        ):
+            raise ValueError(f"{label} path binding changed")
+
+
+def _require_directory_membership(
+    root: Path,
+    relative: Path,
+    expected_names: frozenset[str],
+    directory_names: frozenset[str],
+    label: str,
+) -> None:
+    parts = _safe_relative_parts(relative, label)
+    _root, directory_fd, descriptors, bindings = _open_authenticated_root(root)
+    try:
+        for component in parts:
+            child, binding = _open_directory_component(
+                directory_fd, component, f"{label} ancestor"
+            )
+            descriptors.append(child)
+            bindings.append(binding)
+            directory_fd = child
+        names_before = set(os.listdir(directory_fd))
+        if names_before != expected_names:
+            raise ValueError(f"{label} membership differs")
+        for name in expected_names:
+            node = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if name in directory_names:
+                _require_directory(node, f"{label} {name}")
+            elif (
+                stat.S_ISLNK(node.st_mode)
+                or not stat.S_ISREG(node.st_mode)
+                or node.st_nlink != 1
+            ):
+                raise ValueError(f"{label} {name} must be a regular single-link file")
+        _assert_directory_bindings(bindings)
+        if set(os.listdir(directory_fd)) != names_before:
+            raise ValueError(f"{label} membership changed while being read")
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be inspected safely") from exc
+    finally:
+        _close_descriptors(descriptors)
 
 
 def _read_regular_single_link(
     root: Path, relative: Path, label: str
 ) -> tuple[bytes, tuple[int, int]]:
     parts = _safe_relative_parts(relative, label)
-    root_node = root.lstat()
-    if stat.S_ISLNK(root_node.st_mode) or not stat.S_ISDIR(root_node.st_mode):
-        raise ValueError(f"{label} root is unsafe")
-    current = root
-    for part in parts[:-1]:
-        current = current / part
-        node = current.lstat()
-        if stat.S_ISLNK(node.st_mode) or not stat.S_ISDIR(node.st_mode):
-            raise ValueError(f"{label} has an unsafe ancestor")
-    target = root.joinpath(*parts)
-    linked_before = target.lstat()
-    if (
-        stat.S_ISLNK(linked_before.st_mode)
-        or not stat.S_ISREG(linked_before.st_mode)
-        or linked_before.st_nlink != 1
-    ):
-        raise ValueError(f"{label} must be a regular single-link file")
+    _root, parent_fd, descriptors, bindings = _open_authenticated_root(root)
+    descriptor = -1
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(target, flags)
     try:
+        for component in parts[:-1]:
+            child, binding = _open_directory_component(
+                parent_fd, component, f"{label} ancestor"
+            )
+            descriptors.append(child)
+            bindings.append(binding)
+            parent_fd = child
+        leaf = parts[-1]
+        linked_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(linked_before.st_mode)
+            or not stat.S_ISREG(linked_before.st_mode)
+            or linked_before.st_nlink != 1
+        ):
+            raise ValueError(f"{label} must be a regular single-link file")
+        descriptor = os.open(leaf, flags, dir_fd=parent_fd)
         opened_before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened_before.st_mode)
@@ -354,23 +504,9 @@ def _read_regular_single_link(
         if os.read(descriptor, 1):
             raise ValueError(f"{label} grew while being read")
         opened_after = os.fstat(descriptor)
-        linked_after = target.lstat()
-        before_identity = (
-            linked_before.st_dev,
-            linked_before.st_ino,
-            linked_before.st_mode,
-            linked_before.st_nlink,
-            linked_before.st_size,
-        )
-        after_identity = (
-            linked_after.st_dev,
-            linked_after.st_ino,
-            linked_after.st_mode,
-            linked_after.st_nlink,
-            linked_after.st_size,
-        )
+        linked_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
         if (
-            before_identity != after_identity
+            _file_identity(linked_before) != _file_identity(linked_after)
             or (opened_after.st_dev, opened_after.st_ino)
             != (linked_after.st_dev, linked_after.st_ino)
             or not stat.S_ISREG(opened_after.st_mode)
@@ -378,9 +514,12 @@ def _read_regular_single_link(
             or opened_after.st_size != linked_after.st_size
         ):
             raise ValueError(f"{label} identity changed while being read")
+        _assert_directory_bindings(bindings)
         return b"".join(chunks), (linked_after.st_dev, linked_after.st_ino)
     finally:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
+        _close_descriptors(descriptors)
 
 
 def _verify_file_contents(
@@ -458,6 +597,42 @@ def _authenticate_parent(
     )
     if set(relatives) != expected_artifacts:
         raise AssertionError("closed parent relative membership differs")
+    query_directory = relatives["registration"].parent
+    _require_directory_membership(
+        root,
+        query_directory,
+        frozenset({".query.lock", "attempts", "objects", "query.json", "sidecars"}),
+        frozenset({"attempts", "objects", "sidecars"}),
+        f"{name} query directory",
+    )
+    _require_directory_membership(
+        root,
+        query_directory / "attempts",
+        frozenset({"000001.json", "000001.reservation.json"}),
+        frozenset(),
+        f"{name} attempt directory",
+    )
+    _require_directory_membership(
+        root,
+        query_directory / "objects",
+        frozenset(),
+        frozenset(),
+        f"{name} object directory",
+    )
+    _require_directory_membership(
+        root,
+        query_directory / "sidecars",
+        frozenset(),
+        frozenset(),
+        f"{name} sidecar directory",
+    )
+    _require_directory_membership(
+        root,
+        relatives["quarantine"].parent,
+        frozenset({"000001.json", relatives["raw"].name}),
+        frozenset(),
+        f"{name} quarantine directory",
+    )
     registration, registration_payload = _artifact(
         root,
         relatives["registration"],

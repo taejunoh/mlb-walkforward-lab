@@ -6,6 +6,7 @@ the recovery execution helpers are introduced by later tasks.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from mlb_backtest.v52_recovery_parent_evidence import (
@@ -57,11 +58,24 @@ def parent_tree_fingerprints(root: Path = ROOT) -> tuple[TreeFingerprint, ...]:
     )
 
 
+def populate_isolated_parent_evidence(destination: Path, source: Path = ROOT) -> None:
+    """Copy only the closed parent-object directories into an isolated root."""
+    directories: set[Path] = set()
+    for relatives in PARENT_RELATIVES.values():
+        registration = relatives["registration"]
+        quarantine = relatives["quarantine"]
+        directories.add(registration.parent)
+        directories.add(quarantine.parent)
+    for relative in sorted(directories):
+        shutil.copytree(source / relative, destination / relative)
+
+
 __all__ = [
     "ORIGINAL_PARENT_TREE",
     "PARENT_RELATIVES",
     "ROOT",
     "SUPERSEDING_PARENT_TREE",
     "parent_tree_fingerprints",
+    "populate_isolated_parent_evidence",
     "recovery_parent_catalog",
 ]

@@ -150,6 +150,18 @@ def _tmp(value: str) -> Path:
 
 
 class RecoveryParentEvidenceTests(unittest.TestCase):
+    def _isolated_parent_root(self) -> Path:
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            ROOT as PARENT_ROOT,
+            populate_isolated_parent_evidence,
+        )
+
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        populate_isolated_parent_evidence(root, PARENT_ROOT)
+        self.addCleanup(temporary.cleanup)
+        return root
+
     def test_parent_catalog_rejects_caller_selected_paths(self) -> None:
         """A caller cannot substitute a different parent evidence authority."""
         from mlb_backtest.v52_recovery_parent_evidence import (
@@ -184,6 +196,118 @@ class RecoveryParentEvidenceTests(unittest.TestCase):
             ORIGINAL_PARENT_TREE + SUPERSEDING_PARENT_TREE,
         )
         self.assertEqual(before, parent_tree_fingerprints(PARENT_ROOT))
+
+    def test_parent_catalog_rejects_changed_approved_parent_byte(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            build_recovery_parent_catalog,
+        )
+
+        root = self._isolated_parent_root()
+        target = root / PARENT_RELATIVES["original_2019_565534"]["registration"]
+        target.write_bytes(target.read_bytes().replace(b'"source"', b'"Source"', 1))
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_final_symlink(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            build_recovery_parent_catalog,
+        )
+
+        root = self._isolated_parent_root()
+        target = root / PARENT_RELATIVES["original_2019_565534"]["registration"]
+        replacement = root / "replacement.json"
+        shutil.copyfile(target, replacement)
+        target.unlink()
+        target.symlink_to(replacement)
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_ancestor_symlink(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import build_recovery_parent_catalog
+
+        root = self._isolated_parent_root()
+        ancestor = root / "data/v5_2_qd/historical/raw/queries"
+        replacement = root / "queries-replacement"
+        ancestor.rename(replacement)
+        ancestor.symlink_to(replacement, target_is_directory=True)
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_hardlinked_artifact(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            build_recovery_parent_catalog,
+        )
+
+        root = self._isolated_parent_root()
+        target = root / PARENT_RELATIVES["original_2019_565534"]["registration"]
+        os.link(target, target.with_name("registration-copy.json"))
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_unexpected_parent_directory_member(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            build_recovery_parent_catalog,
+        )
+
+        root = self._isolated_parent_root()
+        registration = root / PARENT_RELATIVES["original_2019_565534"]["registration"]
+        registration.with_name("unexpected.json").write_text("{}\n", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_unexpected_nested_parent_member(self) -> None:
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            build_recovery_parent_catalog,
+        )
+
+        root = self._isolated_parent_root()
+        registration = root / PARENT_RELATIVES["original_2019_565534"]["registration"]
+        (registration.parent / "objects/unexpected.raw").write_bytes(b"unexpected")
+
+        with self.assertRaises(ValueError):
+            build_recovery_parent_catalog(root)
+
+    def test_parent_catalog_rejects_ancestor_swap_during_traversal(self) -> None:
+        from mlb_backtest import v52_recovery_parent_evidence
+        from mlb_backtest.v52_recovery_parent_evidence import build_recovery_parent_catalog
+
+        root = self._isolated_parent_root()
+        source_data = root / "data"
+        replacement_data = root / "replacement-data"
+        original_open = os.open
+        swapped = False
+
+        def swap_before_final_open(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal swapped
+            if str(path).endswith("/query.json") or path == "query.json":
+                if not swapped:
+                    swapped = True
+                    source_data.rename(replacement_data)
+                    source_data.symlink_to(replacement_data, target_is_directory=True)
+            if dir_fd is None:
+                return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with patch.object(v52_recovery_parent_evidence.os, "open", swap_before_final_open):
+            with self.assertRaises(ValueError):
+                build_recovery_parent_catalog(root)
+        self.assertTrue(swapped)
 
 
 def _legacy_fixture(
