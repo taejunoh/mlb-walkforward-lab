@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import hashlib
+import json
+import subprocess
 from pathlib import Path
 from types import MappingProxyType
 
@@ -124,6 +127,126 @@ def populate_isolated_parent_evidence(destination: Path, source: Path = ROOT) ->
         shutil.copytree(source / relative, destination / relative)
 
 
+def recovery_authority_fixture(
+    destination: Path, *, parent_evidence_root: Path = ROOT
+) -> tuple[Path, Path, Path]:
+    """Create the committed, rawless recovery authority used by catalog tests."""
+    from mlb_backtest import protocols
+    import mlb_backtest.v52_query_plan as query_plan
+
+    repository = (destination / "repo").resolve()
+    root = _TEST_REPOSITORY_ROOT
+    design = Path(
+        "docs/superpowers/specs/2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
+    )
+    plan = Path(
+        "docs/superpowers/plans/2026-07-28-v5-2-schedule-conflict-recovery-run.md"
+    )
+    run_relative = Path(
+        "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json"
+    )
+    contract_relative = Path(
+        "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json"
+    )
+    source_contract = root / "protocols/v5_2_qd/historical_source_acquisition.json"
+    for relative in (
+        design,
+        plan,
+        Path("schemas/v5_2_acquisition_contract.schema.json"),
+    ):
+        target = repository / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / relative, target)
+    run_path = repository / run_relative
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    run_path.write_bytes(
+        _canonical_json_bytes(protocols.expected_recovery_source_run())
+    )
+    populate_isolated_parent_evidence(repository, parent_evidence_root)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "recovery@example.test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Recovery Test"], cwd=repository, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "recovery authority fixture"],
+        cwd=repository,
+        check=True,
+    )
+
+    contract = json.loads(source_contract.read_bytes())
+    schedule = next(
+        source
+        for source in contract["sources"]
+        if source["name"] == "mlb_schedule_game_feed"
+    )
+    schedule["parser_version"] = "v5.2.2"
+    schedule["endpoints"] = [
+        "https://statsapi.mlb.com/api/v1/schedule",
+        "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore",
+        "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+        "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+        "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+    ]
+    contract.update(
+        {
+            "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+            "recovery_provenance": query_plan._RECOVERY_PROVENANCE,
+            "canonical_roots": {
+                "raw": "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+                "sources": "data/v5_2_qd/historical_recovery_schedule_conflicts/sources",
+                "acquisition_audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition",
+                "execution_audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution",
+            },
+            "bindings": {
+                "approved_design": _binding(repository, design, "sha256"),
+                "implementation_plan": _binding(
+                    repository, plan, "working_tree_sha256"
+                ),
+                "run_spec": _binding(repository, run_relative, "sha256"),
+            },
+        }
+    )
+    contract.pop("supersedes", None)
+    contract_path = repository / contract_relative
+    contract_path.write_bytes(_canonical_json_bytes(contract))
+    return repository, run_path, contract_path
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _binding(repository: Path, relative: Path, digest_key: str) -> dict[str, str]:
+    contents = (repository / relative).read_bytes()
+    blob = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{relative.as_posix()}"],
+        cwd=repository,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    return {
+        "path": relative.as_posix(),
+        digest_key: hashlib.sha256(contents).hexdigest(),
+        "git_blob_id": blob,
+    }
+
+
 __all__ = [
     "ORIGINAL_PARENT_TREE",
     "GOLDEN_PARENT_TREE_FINGERPRINTS",
@@ -134,5 +257,6 @@ __all__ = [
     "SUPERSEDING_PARENT_TREE",
     "parent_tree_fingerprints",
     "populate_isolated_parent_evidence",
+    "recovery_authority_fixture",
     "recovery_parent_catalog",
 ]

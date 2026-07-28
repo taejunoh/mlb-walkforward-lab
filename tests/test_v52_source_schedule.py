@@ -30,6 +30,7 @@ from mlb_backtest.v52_duplicate_gamepk_disposition import (
     publish_duplicate_gamepk_disposition,
     project_schedule_occurrences,
 )
+from tests.v52_recovery_schedule_conflict_fixture import recovery_authority_fixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1199,6 +1200,154 @@ class V52ScheduleSourceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "nonempty"):
             recompute_game_evidence_snapshot([], {})
+
+
+class RecoveryDispositionCatalogTests(unittest.TestCase):
+    """The recovery catalog is closed before any derived sidecar is published."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+        )
+
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.repository, cls.run_spec, cls.contract = recovery_authority_fixture(
+            Path(cls._temporary.name), parent_evidence_root=SOURCE_AUTHORITY_ROOT
+        )
+        cls.catalog = build_recovery_schedule_conflict_catalog(
+            cls.repository, cls.run_spec, cls.contract
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._temporary.cleanup()
+
+    def test_catalog_is_the_exact_gamepk_ordered_three_entry_set(self) -> None:
+        from mlb_backtest.v52_query_plan import build_static_batch
+
+        entries = self.catalog.entries
+        self.assertEqual(
+            tuple(entry.game_pk for entry in entries), (565534, 630882, 633224)
+        )
+        static = build_static_batch(self.run_spec, self.contract)
+        expected = tuple(
+            logical_query_id(query)
+            for query in static.queries
+            if query.endpoint.startswith("disposition://SCHEDULE_DUPLICATE_GAMEPK_")
+        )
+        self.assertEqual(self.catalog.query_ids(), expected)
+        self.assertEqual(
+            tuple(sorted(self.catalog.query_ids())), tuple(sorted(expected))
+        )
+        self.assertFalse(
+            (
+                self.repository
+                / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw"
+            ).exists()
+        )
+
+    def test_catalog_recomputes_exact_boundary_semantics_without_recovery_output(
+        self,
+    ) -> None:
+        by_game = {entry.game_pk: entry for entry in self.catalog.entries}
+        old, twenty, twenty_one = by_game[565534], by_game[630882], by_game[633224]
+        self.assertEqual(old.semantics.played_date, None)
+        self.assertEqual(old.semantics.result_available_on, None)
+        self.assertEqual(
+            twenty.semantics.retained_scheduled_start_utc, "2020-08-14T21:05:00Z"
+        )
+        self.assertEqual(twenty.semantics.played_date, "2020-08-14")
+        self.assertEqual(twenty.semantics.result_available_on, "2020-08-14")
+        self.assertEqual(
+            twenty_one.semantics.retained_scheduled_start_utc, "2021-09-25T00:10:00Z"
+        )
+        self.assertEqual(twenty_one.semantics.played_date, "2021-09-24")
+        self.assertEqual(twenty_one.semantics.result_available_on, "2021-09-24")
+        self.assertEqual(
+            twenty.semantics.raw_object_sha256s,
+            (
+                "2a5b251745546e643897cfc01eaa4c63c949bb8d8243b7fec44d3a23484f9be4",
+                "0d961f12abb78e3b833c9f5c5bbbff76cad80a5370f57786904c7b42e82b204e",
+            ),
+        )
+        self.assertEqual(
+            twenty_one.semantics.raw_object_sha256s,
+            (
+                "b5d52997a362f89e669e1454960b5230d4977f30370ad3f3ad7ca1b12be5221d",
+                "25f8ab0769219c592779cd800bb2b3278c9c75644647bd51ae5db3051bcf5a61",
+                "109a5d145731938e08f516f19345557894316b3a72687f4ac63029df07afe94c",
+            ),
+        )
+        self.assertEqual(twenty.semantics.result_available_on < "2020-08-15", True)
+        self.assertEqual(twenty_one.semantics.result_available_on < "2021-09-25", True)
+
+    def test_reauthentication_rejects_each_mutated_closed_semantic(self) -> None:
+        import dataclasses
+        from types import MappingProxyType
+
+        authority = self.catalog.for_game_pk(630882)
+        changed_semantics = (
+            dataclasses.replace(
+                authority.semantics,
+                query=dataclasses.replace(
+                    authority.query, endpoint="disposition://forged"
+                ),
+            ),
+            dataclasses.replace(authority.semantics, raw_object_sha256s=("0" * 64,)),
+            dataclasses.replace(
+                authority.semantics,
+                expected_sidecar_semantics=MappingProxyType(
+                    {"terminal_status": "Scheduled"}
+                ),
+            ),
+            dataclasses.replace(
+                authority.semantics,
+                expected_derived_sidecar=MappingProxyType(
+                    {"parent_query_id": "0" * 64}
+                ),
+            ),
+            dataclasses.replace(authority.semantics, played_date="2020-08-15"),
+            dataclasses.replace(authority.semantics, result_available_on="2020-08-15"),
+        )
+        for semantics in changed_semantics:
+            with self.subTest(semantics=semantics):
+                mutated = dataclasses.replace(authority, semantics=semantics)
+                with self.assertRaisesRegex(ValueError, "changed|differs|identity"):
+                    mutated.reauthenticate()
+
+    def test_lookup_fails_closed_for_unknown_or_duplicate_identity(self) -> None:
+        import dataclasses
+
+        with self.assertRaisesRegex(ValueError, "game_pk"):
+            self.catalog.for_game_pk(1)
+        with self.assertRaisesRegex(ValueError, "query"):
+            self.catalog.for_query(
+                dataclasses.replace(
+                    self.catalog.entries[0].query, endpoint="disposition://forged"
+                )
+            )
+        duplicate_entry = dataclasses.replace(
+            self.catalog.entries[1], query=self.catalog.entries[0].query
+        )
+        duplicate = dataclasses.replace(
+            self.catalog,
+            entries=(self.catalog.entries[0], duplicate_entry, self.catalog.entries[2]),
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            duplicate.for_query(self.catalog.entries[0].query)
+
+    def test_derived_sidecar_schema_has_three_closed_recovery_branches(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_derived_disposition_sidecar.schema.json").read_bytes()
+        )
+        self.assertEqual(len(schema["oneOf"]), 5)
+        for authority in self.catalog.entries:
+            sidecar = _plain_json(authority.semantics.expected_derived_sidecar)
+            jsonschema.validate(sidecar, schema)
+            sidecar["semantics"]["unexpected"] = True
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(sidecar, schema)
 
 
 if __name__ == "__main__":
