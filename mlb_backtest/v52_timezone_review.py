@@ -678,17 +678,36 @@ def _coverage(
 
 
 def _mapping_object(mapping: object) -> dict[str, object]:
-    if not isinstance(mapping, Mapping) or set(mapping) != {
+    expected_keys = {
         "artifact_kind",
         "schema_version",
         "timezone_rows",
-    }:
+    }
+    if not isinstance(mapping, Mapping) or set(mapping) not in (
+        expected_keys,
+        expected_keys | {"authority"},
+    ):
         raise ValueError("timezone mapping keys differ")
     if (
         mapping.get("artifact_kind") != "VENUE_TIMEZONE_MAPPING"
         or mapping.get("schema_version") != 1
     ):
         raise ValueError("timezone mapping identity differs")
+    authority = mapping.get("authority")
+    if authority is not None:
+        if not isinstance(authority, Mapping):
+            raise ValueError("timezone mapping recovery authority differs")
+        run_binding = authority.get("run_spec")
+        contract_binding = authority.get("acquisition_contract")
+        if (
+            not isinstance(run_binding, Mapping)
+            or not isinstance(contract_binding, Mapping)
+            or authority
+            != _recovery_authority_binding(
+                run_binding.get("sha256"), contract_binding.get("sha256")
+            )
+        ):
+            raise ValueError("timezone mapping recovery authority differs")
     return dict(mapping)
 
 
@@ -835,11 +854,14 @@ def _mapping_from_candidate(
         }
         normalized = _normalize_timezone_rows(projected, allow_null=False)
         _coverage(normalized, observed)
-    return {
+    mapping = {
         "artifact_kind": "VENUE_TIMEZONE_MAPPING",
         "schema_version": 1,
         "timezone_rows": projected,
     }
+    if "authority" in value:
+        mapping["authority"] = value["authority"]
+    return mapping
 
 
 def _relative_from_trusted(root: TrustedRoot, path: Path, label: str) -> Path:
@@ -1309,6 +1331,8 @@ def _seal_timezone_mapping(
     )
     if recovery_authority is not None and candidate.get("authority") != recovery_authority:
         raise ValueError("timezone candidate recovery authority differs")
+    if mapping.get("authority") != recovery_authority:
+        raise ValueError("timezone mapping recovery authority differs")
     for path in review_receipt_paths:
         review_path = _acquisition_audit_relative(
             root, path, "timezone review receipt"
@@ -1347,7 +1371,14 @@ def _seal_timezone_mapping(
         raise ValueError("timezone seal requires exactly one review per role")
     if len(identities) != 2:
         raise ValueError("timezone reviewer identity values must be distinct")
-    review_bindings.sort(key=lambda item: item["reviewer_role"])
+    if recovery_authority is None:
+        review_bindings.sort(key=lambda item: item["reviewer_role"])
+    else:
+        review_order = {
+            "TIMEZONE_SEMANTIC_REVIEW": 0,
+            "TIMEZONE_COVERAGE_REVIEW": 1,
+        }
+        review_bindings.sort(key=lambda item: review_order[item["reviewer_role"]])
     mapping_contents = _canonical_file_bytes(mapping)
     existing_seal = _read_safe_snapshot_from_trusted(
         root, receipt_output, "timezone mapping seal receipt", missing_ok=True
@@ -2120,18 +2151,17 @@ def _seal_object(contents: bytes) -> dict[str, object]:
             or set(authority) != {"acquisition_contract", "run_spec"}
         ):
             raise ValueError("timezone mapping seal receipt authority differs")
-        for label in ("acquisition_contract", "run_spec"):
-            binding = authority.get(label)
-            if (
-                not isinstance(binding, Mapping)
-                or set(binding) != {"path", "sha256"}
-                or not isinstance(binding.get("path"), str)
-            ):
-                raise ValueError("timezone mapping seal receipt authority differs")
-            _sha256_text(
-                binding.get("sha256"),
-                f"timezone mapping seal {label} SHA-256",
+        run_binding = authority.get("run_spec")
+        contract_binding = authority.get("acquisition_contract")
+        if (
+            not isinstance(run_binding, Mapping)
+            or not isinstance(contract_binding, Mapping)
+            or authority
+            != _recovery_authority_binding(
+                run_binding.get("sha256"), contract_binding.get("sha256")
             )
+        ):
+            raise ValueError("timezone mapping seal receipt authority differs")
     return value
 
 
@@ -2311,6 +2341,12 @@ def _load_verified_timezone_gate(
         )
     if len(identities) != 2:
         raise ValueError("timezone reviewer identity values must be distinct")
+    if recovery_authority is not None:
+        review_order = {
+            "TIMEZONE_SEMANTIC_REVIEW": 0,
+            "TIMEZONE_COVERAGE_REVIEW": 1,
+        }
+        review_bindings.sort(key=lambda item: review_order[item["reviewer_role"]])
 
     mapping_binding = {
         "path": _PRODUCTION_MAPPING.as_posix(),

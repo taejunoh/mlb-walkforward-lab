@@ -773,6 +773,28 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 timezone_review._candidate_object(candidate)["authority"],
                 candidate["authority"],
             )
+            mapping = {
+                "artifact_kind": "VENUE_TIMEZONE_MAPPING",
+                "authority": candidate["authority"],
+                "schema_version": 1,
+                "timezone_rows": [
+                    {
+                        "effective_end": "2024-12-31",
+                        "effective_start": "2018-01-01",
+                        "time_zone": "America/New_York",
+                        "venue_id": 31,
+                    }
+                ],
+            }
+            mapping_validator = jsonschema.Draft202012Validator(
+                json.loads(MAPPING_SCHEMA.read_bytes())
+            )
+            mapping_validator.validate(_mapping())
+            mapping_validator.validate(mapping)
+            self.assertEqual(
+                timezone_review._mapping_object(mapping)["authority"],
+                candidate["authority"],
+            )
             seal = {
                 "authority": {
                     "acquisition_contract": {
@@ -789,16 +811,27 @@ class V52TimezoneReviewTest(unittest.TestCase):
                 "occurred_at_utc": "2026-07-28T00:00:00.000000Z",
                 "receipt_kind": "TIMEZONE_MAPPING_SEAL",
                 "reviews": [
-                    {"path": paths.coverage_review.as_posix(), "reviewer_identity": "coverage", "reviewer_role": "TIMEZONE_COVERAGE_REVIEW", "sha256": "d" * 64},
                     {"path": paths.semantic_review.as_posix(), "reviewer_identity": "semantic", "reviewer_role": "TIMEZONE_SEMANTIC_REVIEW", "sha256": "e" * 64},
+                    {"path": paths.coverage_review.as_posix(), "reviewer_identity": "coverage", "reviewer_role": "TIMEZONE_COVERAGE_REVIEW", "sha256": "d" * 64},
                 ],
                 "schema_version": 1,
                 "venue_scope": [31],
             }
-            jsonschema.validate(seal, json.loads(SEAL_SCHEMA.read_bytes()))
+            validator = jsonschema.Draft202012Validator(
+                json.loads(SEAL_SCHEMA.read_bytes())
+            )
+            validator.validate(seal)
+            seal["candidate"]["path"] = FIXED_CANDIDATE.as_posix()
+            with self.assertRaises(jsonschema.ValidationError):
+                validator.validate(seal)
+            seal["candidate"]["path"] = paths.candidate.as_posix()
+            seal["reviews"].reverse()
+            with self.assertRaises(jsonschema.ValidationError):
+                validator.validate(seal)
+            seal["reviews"].reverse()
             seal["authority"]["run_spec"]["path"] = SOURCE_RUN_SPEC.as_posix()
             with self.assertRaises(jsonschema.ValidationError):
-                jsonschema.validate(seal, json.loads(SEAL_SCHEMA.read_bytes()))
+                validator.validate(seal)
 
     def test_source_gate_public_lifecycle_and_fail_closed_rebinds(self) -> None:
         import shutil
