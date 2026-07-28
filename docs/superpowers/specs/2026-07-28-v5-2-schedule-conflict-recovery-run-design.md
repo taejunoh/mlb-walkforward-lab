@@ -337,6 +337,13 @@ file.  A later code/authority commit, changed blob, dirty bound file, path
 race, or source identity change invalidates recovery loading/advancement; it
 does not authorize amendment of the recovery chain.
 
+The execution-closure seal is intentionally ordered: first bind and commit the
+recovery code, schemas, tests, and these two approval documents; then commit
+the canonical RunSpec; finally commit the contract containing the committed
+blob identities and digests. The exact-suite runner authenticates the two
+superseding parent chains through a separate API, so its legacy baseline input
+sets remain unchanged.
+
 The derived-sidecar schema preserves its existing branches and adds three
 closed recovery `oneOf` branches, one for each endpoint above.  Each new branch
 has exact parent authority, occurrence counts, retained/suppressed object

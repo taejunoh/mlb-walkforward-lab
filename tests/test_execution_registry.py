@@ -202,6 +202,9 @@ BOUND_SCHEMA_PATHS = (
     ACQUISITION_SCHEMA_RELATIVE,
     Path("schemas/v5_2_acquisition_checkpoint.schema.json"),
     Path("schemas/v5_2_derived_disposition_sidecar.schema.json"),
+    Path("schemas/v5_2_normalized_snapshot.schema.json"),
+    Path("schemas/v5_2_query_sidecar.schema.json"),
+    Path("schemas/v5_2_run_spec.schema.json"),
     Path("schemas/v5_2_schedule_anchor_inventory.schema.json"),
     Path("schemas/v5_2_execution_receipt.schema.json"),
     Path("schemas/v5_2_game_evidence_inventory.schema.json"),
@@ -221,6 +224,43 @@ BOUND_EXECUTION_CODE = (
     *BOUND_PYTHON_EXTRAS,
     *BOUND_SCHEMA_PATHS,
 )
+
+
+class RecoveryExecutionClosureTests(unittest.TestCase):
+    def test_recovery_catalog_and_parent_modules_are_bound_execution_code(self):
+        import mlb_backtest.execution_registry as registry
+
+        self.assertTrue(
+            {
+                "mlb_backtest/v52_schedule_conflict_recovery_disposition.py",
+                "mlb_backtest/v52_recovery_parent_evidence.py",
+            }
+            <= set(registry._BOUND_EXECUTION_CODE)
+        )
+
+    def test_recovery_schema_closure_is_explicit(self):
+        import mlb_backtest.execution_registry as registry
+
+        required = {
+            "schemas/v5_2_run_spec.schema.json",
+            "schemas/v5_2_acquisition_contract.schema.json",
+            "schemas/v5_2_derived_disposition_sidecar.schema.json",
+            "schemas/v5_2_query_sidecar.schema.json",
+            "schemas/v5_2_acquisition_checkpoint.schema.json",
+            "schemas/v5_2_schedule_anchor_inventory.schema.json",
+            "schemas/v5_2_game_evidence_inventory.schema.json",
+            "schemas/v5_2_normalized_snapshot.schema.json",
+            "schemas/v5_2_source_inventory.schema.json",
+            "schemas/v5_2_source_review_receipt.schema.json",
+            "schemas/v5_2_clean_source_replay_receipt.schema.json",
+            "schemas/v5_2_source_receipt_commit.schema.json",
+            "schemas/v5_2_execution_receipt.schema.json",
+            "schemas/v5_2_timezone_candidate.schema.json",
+            "schemas/v5_2_timezone_review_receipt.schema.json",
+            "schemas/v5_2_timezone_seal_receipt.schema.json",
+            "schemas/v5_2_venue_timezones.schema.json",
+        }
+        self.assertTrue(required <= set(registry._BOUND_EXECUTION_CODE))
 TIMEZONE_STAGE_EVIDENCE = (
     Path("audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"),
     Path("audit/v5_2_qd/historical/acquisition/timezone_reviews/coverage.json"),

@@ -23,6 +23,9 @@ from mlb_backtest.preflight import (  # noqa: E402
 )
 from mlb_backtest.protocols import load_run_spec  # noqa: E402
 from mlb_backtest.verify_v52_design import V51_REQUIRED_FILES  # noqa: E402
+from mlb_backtest.v52_recovery_parent_evidence import (  # noqa: E402
+    build_recovery_parent_catalog,
+)
 from mlb_backtest.v52_duplicate_gamepk_disposition import (  # noqa: E402
     OLD_RAW_BYTE_COUNT,
     OLD_RAW_SHA256,
@@ -95,6 +98,35 @@ def sha256_paths(root: Path, relatives: Iterable[str | Path]) -> dict[str, str]:
             _regular_file(root / relative, "input")
         )
     return result
+
+
+def validate_recovery_parent_inputs(repo: Path) -> Mapping[str, str]:
+    """Authenticate the fixed 2020/2021 recovery parent evidence separately.
+
+    This is deliberately independent of the legacy Task 13 input tuples: the
+    recovery chain requires each registration, attempt, quarantine receipt,
+    and raw body to be re-opened through its closed parent catalog.
+    """
+    catalog = build_recovery_parent_catalog(Path(repo).resolve(strict=True))
+    hashes: dict[str, str] = {}
+    for parent_name in (
+        "superseding_2020_630882",
+        "superseding_2021_633224",
+    ):
+        parent = catalog.parents[parent_name]
+        if parent.attempt is None:
+            raise ValueError("recovery parent attempt binding is missing")
+        for artifact, evidence in (
+            ("registration", parent.registration),
+            ("attempt", parent.attempt),
+            ("quarantine", parent.quarantine),
+        ):
+            catalog.read_json(parent_name, artifact)
+            hashes[evidence.relative.as_posix()] = evidence.sha256
+        catalog.read_raw(parent_name)
+        hashes[parent.raw.relative.as_posix()] = parent.raw.sha256
+    catalog.reauthenticate()
+    return hashes
 
 
 def copy_files_with_hashes(

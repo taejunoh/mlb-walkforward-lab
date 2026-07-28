@@ -40,6 +40,7 @@ from mlb_backtest.protocols import (
     V52Config,
     const_schema,
     expected_historical_run,
+    expected_recovery_source_run,
     expected_superseding_source_run,
     expected_prospective_spec,
     expected_v52_config,
@@ -200,31 +201,31 @@ V51_REQUIRED_FILES = tuple(
 
 TASK7D_SCHEMA_DOCUMENT_SHA256 = {
     "schemas/v5_2_acquisition_checkpoint.schema.json": (
-        "3943310b193c6873819d73983c35cac0bed63836b3abd3ad1b77e27d5a1082c6"
+        "4a45964fc0512fc17c57f1d6bc1f234492de428a465b953bbde7025b737d4e2e"
     ),
     "schemas/v5_2_execution_receipt.schema.json": (
-        "0b3c442248c8f64616f78ce4f755be2e97514aee178f9f6a7c9ac30f72ca427d"
+        "e4c4028164298d0a5a06fb3ca6b5ecd6b3029d7b785da95c8698af55e892edb3"
     ),
     "schemas/v5_2_split_receipt.schema.json": (
         "b9de7114410e036cd43a2530a8440dcdbc1b85d78699281e1c623d234102aeea"
     ),
     "schemas/v5_2_game_evidence_inventory.schema.json": (
-        "c710b3ddb8648c083c0400ba33e944d4da0b1783942054ae255a73248c05bf34"
+        "036476fa5dcd00ed70258256240a512b5350ac0c23be448db6c206120eb76924"
     ),
     "schemas/v5_2_schedule_anchor_inventory.schema.json": (
-        "c6dbc555ed35d14f29eaf2d7ec8f85c53eb3c7304cd73095ac35422743e317ab"
+        "2dbabe6edaa5e572d976b938918a3dad65f302d33c38651c6776897cd7fc99ba"
     ),
     "schemas/v5_2_timezone_candidate.schema.json": (
-        "9cc9d49ec18a7e538d37e6b00bf8acb1185aaeeba4ad97e836e12f200ab5f91b"
+        "6e57afd64964437bd703d48f0f44a98594f032f908d459697e5ffc389224270e"
     ),
     "schemas/v5_2_timezone_review_receipt.schema.json": (
-        "f809ef68ed1ececb70fd33ddad15e4728eab0ad821243303aa317e69c2d11727"
+        "f2d005d53dfa95769fab345f3ee70c23014e0109b8281da81082adf384404dc1"
     ),
     "schemas/v5_2_timezone_seal_receipt.schema.json": (
-        "4f63caad4371e39aa41fea81dc2825cd71b3a9de4087d14f2e590963cd763126"
+        "55ae297b407d1a2d32d16cec0e48315e5767efff8563c1978145d8347cc3a95b"
     ),
     "schemas/v5_2_venue_timezones.schema.json": (
-        "beb1469e4e6860b1670cbb05e0a3f4b59d82b3e753025701eb04ef25d6a026a0"
+        "4b8ece7727af1d80ffffb5a48ca39413f87805e74d92eaad8ddd2daf4a9f5b99"
     ),
 }
 
@@ -937,6 +938,15 @@ def verify_contract_schemas(
             "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
         )
     )
+    parsed_recovery_authority = load_source_run_spec(
+        require_regular_file(
+            root,
+            (
+                "protocols/v5_2_qd/"
+                "historical_walkforward_500_recovery_schedule_conflicts.json"
+            ),
+        )
+    )
     documents = {
         "schemas/v5_2_qd.schema.json": const_schema(v52_raw, V52_REQUIRED_KEYS),
         "schemas/v5_2_run_spec.schema.json": historical_authority_schema(),
@@ -949,6 +959,8 @@ def verify_contract_schemas(
         or parsed_old_authority.raw != deep_freeze(historical_raw)
         or parsed_source_authority.raw
         != deep_freeze(expected_superseding_source_run())
+        or parsed_recovery_authority.raw
+        != deep_freeze(expected_recovery_source_run())
         or prospective.raw != deep_freeze(prospective_raw)
         or set(preflight) != PREFLIGHT_REQUIRED_KEYS
     ):
@@ -1015,6 +1027,15 @@ def verify_contract_schemas(
                     "properties",
                     "occurrence_counts",
                 ),
+            },
+            "schemas/v5_2_timezone_candidate.schema.json": {
+                ("properties", "authority"),
+            },
+            "schemas/v5_2_timezone_review_receipt.schema.json": {
+                ("properties", "authority"),
+            },
+            "schemas/v5_2_venue_timezones.schema.json": {
+                ("properties", "authority"),
             },
         }.get(relative, set())
 

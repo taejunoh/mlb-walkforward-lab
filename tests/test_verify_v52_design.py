@@ -13,7 +13,8 @@ import unittest
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import mlb_backtest.protocols as protocol_module
 from mlb_backtest.diagnostics import canonical_json_bytes, sha256_file
@@ -76,6 +77,10 @@ class DesignVerificationTest(unittest.TestCase):
     HISTORICAL_AUTHORITY_RELATIVES = (
         "protocols/v5_2_qd/historical_walkforward_500.json",
         "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+        (
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_recovery_schedule_conflicts.json"
+        ),
     )
 
     def copy_historical_authorities(self, root: Path) -> None:
@@ -1427,6 +1432,11 @@ class DesignVerificationTest(unittest.TestCase):
             ROOT
             / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
         )
+        recovery = protocol_module.load_source_run_spec(
+            ROOT
+            / "protocols/v5_2_qd/"
+            "historical_walkforward_500_recovery_schedule_conflicts.json"
+        )
         prospective = load_prospective_spec(
             ROOT / "protocols/v5_2_qd/prospective_2026.json"
         )
@@ -1441,7 +1451,74 @@ class DesignVerificationTest(unittest.TestCase):
             canonical_json_bytes(source.raw),
             canonical_json_bytes(schema["oneOf"][1]["const"]),
         )
+        self.assertEqual(
+            canonical_json_bytes(recovery.raw),
+            canonical_json_bytes(schema["oneOf"][2]["const"]),
+        )
         verify_contract_schemas(ROOT, config, historical, prospective, preflight)
+
+    def test_task13_runner_validates_recovery_parents_separately(self) -> None:
+        import scripts.run_task13_exact_suite as runner
+
+        parent_names = (
+            "superseding_2020_630882",
+            "superseding_2021_633224",
+        )
+        catalog = SimpleNamespace(
+            parents={
+                name: SimpleNamespace(
+                    registration=SimpleNamespace(
+                        relative=Path(f"parent/{name}/registration.json"),
+                        sha256=f"{index}1" * 32,
+                    ),
+                    attempt=SimpleNamespace(
+                        relative=Path(f"parent/{name}/attempt.json"),
+                        sha256=f"{index}2" * 32,
+                    ),
+                    quarantine=SimpleNamespace(
+                        relative=Path(f"parent/{name}/quarantine.json"),
+                        sha256=f"{index}3" * 32,
+                    ),
+                    raw=SimpleNamespace(
+                        relative=Path(f"parent/{name}/body.raw"),
+                        sha256=f"{index}4" * 32,
+                    ),
+                )
+                for index, name in enumerate(parent_names, start=1)
+            },
+            read_json=Mock(),
+            read_raw=Mock(),
+            reauthenticate=Mock(),
+        )
+        with patch.object(runner, "build_recovery_parent_catalog", return_value=catalog):
+            observed = runner.validate_recovery_parent_inputs(ROOT)
+
+        self.assertEqual(
+            set(observed),
+            {
+                f"parent/{name}/{artifact}"
+                for name in parent_names
+                for artifact in (
+                    "registration.json",
+                    "attempt.json",
+                    "quarantine.json",
+                    "body.raw",
+                )
+            },
+        )
+        self.assertEqual(
+            catalog.read_json.call_args_list,
+            [
+                call(name, artifact)
+                for name in parent_names
+                for artifact in ("registration", "attempt", "quarantine")
+            ],
+        )
+        self.assertEqual(
+            catalog.read_raw.call_args_list,
+            [call(name) for name in parent_names],
+        )
+        catalog.reauthenticate.assert_called_once_with()
 
     def assert_missing_historical_authority_fails(self, missing: str) -> None:
         config = load_v52_config(ROOT / "config/v5_2_qd.json")

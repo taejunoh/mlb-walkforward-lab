@@ -880,6 +880,12 @@ git commit -m "feat: finalize recovery sources safely"
 
 ### Task 11: Seal the execution closure and preserve the exact baseline runner
 
+The closure is committed in three immutable stages: code/schema/test and the
+two approval documents; the canonical recovery RunSpec; then the contract
+which records only the committed blob identities and digests. The recovery
+parent-input check is a separate runner API and does not widen either legacy
+Task 13 input tuple.
+
 **Files:**
 - Modify: `mlb_backtest/execution_registry.py`
 - Modify: `mlb_backtest/verify_v52_design.py:43,937,951`
