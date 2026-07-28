@@ -25,6 +25,7 @@ from mlb_backtest.v52_recovery_parent_evidence import (
 
 _TEST_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_AUTHORITY_ROOT_ENV = "MLB_V52_SOURCE_AUTHORITY_ROOT"
+RECOVERY_PARENT_EVIDENCE_ROOT_ENV = "MLB_V52_RECOVERY_PARENT_EVIDENCE_ROOT"
 ORIGINAL_PARENT_TREE = (
     Path("data/v5_2_qd/historical"),
     Path("audit/v5_2_qd/historical"),
@@ -84,7 +85,9 @@ def _parent_evidence_root(checkout_root: Path = _TEST_REPOSITORY_ROOT) -> Path:
     """Use local evidence or the exact-runner authority-root configuration."""
     candidate = Path(checkout_root)
     if not _has_fixed_parent_evidence(candidate):
-        configured = os.environ.get(SOURCE_AUTHORITY_ROOT_ENV)
+        configured = os.environ.get(RECOVERY_PARENT_EVIDENCE_ROOT_ENV) or os.environ.get(
+            SOURCE_AUTHORITY_ROOT_ENV
+        )
         if not configured:
             raise ParentEvidenceConfigurationError(
                 "immutable recovery parent evidence is absent from this checkout; "
@@ -253,6 +256,7 @@ __all__ = [
     "PARENT_RELATIVES",
     "ParentEvidenceConfigurationError",
     "ROOT",
+    "RECOVERY_PARENT_EVIDENCE_ROOT_ENV",
     "SOURCE_AUTHORITY_ROOT_ENV",
     "SUPERSEDING_PARENT_TREE",
     "parent_tree_fingerprints",
