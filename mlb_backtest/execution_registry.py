@@ -831,7 +831,7 @@ def _source_inventory_payload(
     ):
         raise ValueError("source inventory is not ready for the source gate")
     snapshots = _sha256_list(payload.get("snapshot_sha256s"), "source snapshots")
-    query_ids = _sorted_string_list(
+    inventory_query_ids = _sorted_string_list(
         payload.get("logical_query_ids"), "inventory query IDs"
     )
     recovery_run = run_id == _RECOVERY_RUN_ID
@@ -845,7 +845,7 @@ def _source_inventory_payload(
             "recovery source inventory disposition catalog",
         )
         entries = catalog.get("entries")
-        query_ids = _checkpoint_sorted_sha_list(
+        catalog_query_ids = _checkpoint_sorted_sha_list(
             catalog.get("query_ids"), "recovery source inventory disposition query IDs"
         )
         if not isinstance(entries, list) or len(entries) != 3:
@@ -886,7 +886,11 @@ def _source_inventory_payload(
             if (value.get("played_date"), value.get("result_available_on")) != expected_available:
                 raise ValueError("recovery source inventory availability binding differs")
             normalized_entries.append(dict(value))
-        if query_ids != tuple(sorted(str(entry["query_id"]) for entry in normalized_entries)):
+        if (
+            catalog_query_ids
+            != tuple(sorted(str(entry["query_id"]) for entry in normalized_entries))
+            or not set(catalog_query_ids).issubset(inventory_query_ids)
+        ):
             raise ValueError("recovery source inventory disposition query IDs differ")
         terminal = _exact_object(
             payload.get("terminal_checkpoint"),
@@ -900,8 +904,8 @@ def _source_inventory_payload(
         if type(terminal.get("sequence")) is not int or terminal.get("stage") != "REMAINING":
             raise ValueError("recovery source inventory terminal checkpoint differs")
         return _SourceInventoryPayload(
-            snapshots, query_ids, None, query_ids, dict(terminal),
-            {"entries": normalized_entries, "query_ids": list(query_ids)},
+            snapshots, inventory_query_ids, None, catalog_query_ids, dict(terminal),
+            {"entries": normalized_entries, "query_ids": list(catalog_query_ids)},
         )
     disposition_present = {
         "duplicate_gamepk_disposition",
@@ -910,7 +914,7 @@ def _source_inventory_payload(
     if not source_run:
         if disposition_present:
             raise ValueError("old source inventory contains disposition authority")
-        return _SourceInventoryPayload(snapshots, query_ids, None, (), None)
+        return _SourceInventoryPayload(snapshots, inventory_query_ids, None, (), None)
     if disposition_present != {
         "duplicate_gamepk_disposition",
         "dispositioned_query_ids",
@@ -941,7 +945,7 @@ def _source_inventory_payload(
         payload.get("dispositioned_query_ids"),
         "source inventory dispositioned query IDs",
     )
-    if dispositioned != (_DISPOSITIONED_QUERY_ID,) or dispositioned[0] not in query_ids:
+    if dispositioned != (_DISPOSITIONED_QUERY_ID,) or dispositioned[0] not in inventory_query_ids:
         raise ValueError("source inventory dispositioned query IDs differ")
     terminal = _exact_object(
         payload.get("terminal_checkpoint"),
@@ -960,7 +964,7 @@ def _source_inventory_payload(
         raise ValueError("source inventory terminal checkpoint differs")
     return _SourceInventoryPayload(
         snapshots,
-        query_ids,
+        inventory_query_ids,
         dict(disposition),
         dispositioned,
         dict(terminal),

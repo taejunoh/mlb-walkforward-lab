@@ -361,6 +361,62 @@ def _source_checkpoint_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_recovery_inventory_retains_full_logical_query_set(self) -> None:
+        """Replacing full replay query IDs with the three catalog IDs is a gate bug."""
+        catalog_ids = ("1" * 64, "2" * 64, "3" * 64)
+        full_ids = ("0" * 64, *catalog_ids)
+
+        def entry(
+            game_pk: int, query_id: str, played: str | None
+        ) -> dict[str, object]:
+            return {
+                "game_pk": game_pk,
+                "query_id": query_id,
+                "query_sidecar": {"path": f"sidecars/{game_pk}.json", "sha256": "a" * 64},
+                "success_receipt": {"path": f"success/{game_pk}.json", "sha256": "b" * 64},
+                "retained_scheduled_start_utc": "2020-01-01T00:00:00Z",
+                "played_date": played,
+                "result_available_on": played,
+                "raw_object_sha256s": ["c" * 64],
+                "selected_raw_game_object_sha256s_sha256": "d" * 64,
+                "normalized_games_sha256": "e" * 64,
+                "sidecar_semantics_sha256": "f" * 64,
+            }
+
+        payload = {
+            "schema_version": 1,
+            "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+            "status": "READY_CANDIDATE",
+            "critical_errors": [],
+            "network_attempts": 0,
+            "source_gate_ready": True,
+            "snapshot_sha256s": ["9" * 64],
+            "logical_query_ids": list(full_ids),
+            "terminal_checkpoint": {
+                "path": "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution/acquisition_checkpoints/00000001-" + "8" * 64 + ".json",
+                "sha256": "8" * 64,
+                "sequence": 1,
+                "stage": "REMAINING",
+            },
+            "schedule_conflict_dispositions": {
+                "entries": [
+                    entry(565534, catalog_ids[0], None),
+                    entry(630882, catalog_ids[1], "2020-08-14"),
+                    entry(633224, catalog_ids[2], "2021-09-24"),
+                ],
+                "query_ids": list(catalog_ids),
+            },
+        }
+
+        parsed = self.registry._source_inventory_payload(
+            canonical_json_bytes(payload) + b"\n",
+            run_id="historical_walkforward_500_recovery_schedule_conflicts",
+        )
+        self.assertEqual(parsed.logical_query_ids, full_ids)
+        self.assertEqual(
+            parsed.schedule_conflict_dispositions["query_ids"], list(catalog_ids)
+        )
+
     def test_recovery_supplemental_binding_reauthenticates_closed_contract_bindings(
         self,
     ) -> None:
