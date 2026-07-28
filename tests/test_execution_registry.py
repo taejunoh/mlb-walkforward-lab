@@ -68,9 +68,7 @@ def _repository_module_path(root: Path, module: str) -> Path | None:
     return package if package.is_file() else None
 
 
-def _repository_local_imports(
-    root: Path, module: str, source: Path
-) -> frozenset[str]:
+def _repository_local_imports(root: Path, module: str, source: Path) -> frozenset[str]:
     tree = ast.parse(source.read_bytes(), filename=os.fspath(source))
     package = module if source.name == "__init__.py" else module.rpartition(".")[0]
     imports: set[str] = set()
@@ -85,9 +83,7 @@ def _repository_local_imports(
             else:
                 target = node.module or ""
             candidates.append(target)
-            candidates.extend(
-                f"{target}.{alias.name}" for alias in node.names
-            )
+            candidates.extend(f"{target}.{alias.name}" for alias in node.names)
         for candidate in candidates:
             if _repository_module_path(root, candidate) is not None:
                 imports.add(candidate)
@@ -123,9 +119,7 @@ RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
 DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
-PLAN_RELATIVE = Path(
-    "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
-)
+PLAN_RELATIVE = Path("docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md")
 AMENDMENT_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
 )
@@ -171,9 +165,7 @@ LEGACY_DECISION_SCHEMA_RELATIVE = Path(
 SOURCE_INVENTORY_RELATIVE = Path(
     "data/v5_2_qd/historical/sources/source_inventory.json"
 )
-RECEIPTS_RELATIVE = Path(
-    "audit/v5_2_qd/historical/execution/phase_receipts"
-)
+RECEIPTS_RELATIVE = Path("audit/v5_2_qd/historical/execution/phase_receipts")
 EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.execution_registry",
     "mlb_backtest.v52_acquire",
@@ -188,9 +180,7 @@ EXECUTION_IMPORT_ROOT_MODULES = (
     "mlb_backtest.v52_source_orchestration",
     "mlb_backtest.v52_timezone_review",
 )
-PASSIVE_IMPORT_CLOSURE_EXCLUSIONS = frozenset(
-    {Path("mlb_backtest/__init__.py")}
-)
+PASSIVE_IMPORT_CLOSURE_EXCLUSIONS = frozenset({Path("mlb_backtest/__init__.py")})
 EXECUTION_IMPORT_CLOSURE = tuple(
     sorted(
         _repository_local_import_closure(ROOT, EXECUTION_IMPORT_ROOT_MODULES)
@@ -233,10 +223,7 @@ PARTICIPANT_STAGE_EVIDENCE = tuple(
     sorted(
         (
             *TIMEZONE_STAGE_EVIDENCE,
-            Path(
-                "audit/v5_2_qd/historical/acquisition/"
-                "game_evidence_inventory.json"
-            ),
+            Path("audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"),
         )
     )
 )
@@ -343,9 +330,7 @@ def _source_checkpoint_payload(
                 "sha256": "c" * 64,
             },
             "dispositioned_query_ids": list(
-                dispositioned_query_ids
-                if dispositioned_query_ids is not None
-                else []
+                dispositioned_query_ids if dispositioned_query_ids is not None else []
             ),
         }
     )
@@ -361,6 +346,42 @@ def _source_checkpoint_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_recovery_static_checkpoint_requires_three_sorted_dispositions(
+        self,
+    ) -> None:
+        query_ids = ("c" * 64, "a" * 64, "b" * 64)
+        bindings = tuple(
+            SimpleNamespace(query_id=query_id) for query_id in sorted(query_ids)
+        )
+
+        self.assertEqual(
+            self.registry._validate_recovery_disposition_population(
+                tuple(sorted(query_ids)), bindings
+            ),
+            tuple(sorted(query_ids)),
+        )
+
+    def test_recovery_disposition_catalog_rejects_wrong_cardinality_and_duplicates(
+        self,
+    ) -> None:
+        def bindings(count: int, *, duplicate: bool = False):
+            ids = [f"{index:x}" * 64 for index in range(count)]
+            if duplicate and ids:
+                ids[-1] = ids[0]
+            return tuple(SimpleNamespace(query_id=query_id) for query_id in ids)
+
+        for count in (1, 2, 4):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "three"):
+                    self.registry._validate_recovery_disposition_population(
+                        (), bindings(count)
+                    )
+        with self.assertRaisesRegex(ValueError, "differ"):
+            self.registry._validate_recovery_disposition_population(
+                tuple(sorted(binding.query_id for binding in bindings(3, duplicate=True))),
+                bindings(3, duplicate=True),
+            )
+
     def test_fixture_git_commits_ignore_inherited_signing_config(self) -> None:
         """Temporary fixture commits must never invoke a developer signer."""
         with tempfile.TemporaryDirectory() as directory:
@@ -368,8 +389,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             signer = directory_path / "sentinel-gpg"
             marker = directory_path / "signer-invoked"
             signer.write_text(
-                '#!/bin/sh\nprintf invoked > "$GIT_FIXTURE_SIGNER_MARKER"\n'
-                "exit 97\n",
+                '#!/bin/sh\nprintf invoked > "$GIT_FIXTURE_SIGNER_MARKER"\nexit 97\n',
                 encoding="utf-8",
             )
             signer.chmod(0o700)
@@ -427,11 +447,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         self.assertIn("historical_walkforward_500", branches)
         self.assertIn(SOURCE_RUN_ID, branches)
         self.assertNotIn(
-            "dispositioned_query_ids", branches["historical_walkforward_500"]["required"]
+            "dispositioned_query_ids",
+            branches["historical_walkforward_500"]["required"],
         )
-        self.assertIn(
-            "dispositioned_query_ids", branches[SOURCE_RUN_ID]["required"]
-        )
+        self.assertIn("dispositioned_query_ids", branches[SOURCE_RUN_ID]["required"])
 
         source = load_source_run_spec(ROOT / SOURCE_RUN_SPEC_RELATIVE)
         valid = _source_checkpoint_payload()
@@ -493,16 +512,12 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         validated = self.registry._validate_checkpoint_payload(payload, source)
         checkpoint = self.registry._checkpoint_from_payload(validated, "d" * 64)
-        self.assertEqual(
-            checkpoint.dispositioned_query_ids, (dispositioned_query_id,)
-        )
+        self.assertEqual(checkpoint.dispositioned_query_ids, (dispositioned_query_id,))
 
         semantic = self.registry._checkpoint_semantic_projection(validated)
 
         self.assertIn("dispositioned_query_ids", semantic)
-        self.assertEqual(
-            semantic["dispositioned_query_ids"], [dispositioned_query_id]
-        )
+        self.assertEqual(semantic["dispositioned_query_ids"], [dispositioned_query_id])
 
     def test_source_checkpoint_schema_rejects_duplicate_disposition_ids(
         self,
@@ -633,9 +648,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(ValueError, "recorded|time|regress"):
-            self.registry._validate_checkpoint_progression(
-                previous, regressed, source
-            )
+            self.registry._validate_checkpoint_progression(previous, regressed, source)
 
     def test_source_pending_disposition_replay_uses_authority_when_disposition_list_is_empty(
         self,
@@ -644,9 +657,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             build_duplicate_disposition_authority,
         )
 
-        source = load_source_run_spec(
-            SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC_RELATIVE
-        )
+        source = load_source_run_spec(SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC_RELATIVE)
         authority = build_duplicate_disposition_authority(
             SOURCE_AUTHORITY_ROOT,
             source_run_spec_path=SOURCE_AUTHORITY_ROOT / SOURCE_RUN_SPEC_RELATIVE,
@@ -703,7 +714,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             published_evidence=None,
             quarantines=(),
         )
-        store = SimpleNamespace(read_verified_query_progress=Mock(return_value=progress))
+        store = SimpleNamespace(
+            read_verified_query_progress=Mock(return_value=progress)
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -764,7 +777,9 @@ class ExecutionRegistryTest(unittest.TestCase):
     ) -> None:
         immutable_path = ROOT / OLD_CHECKPOINT_RELATIVE
         immutable_bytes = immutable_path.read_bytes()
-        self.assertEqual(hashlib.sha256(immutable_bytes).hexdigest(), OLD_CHECKPOINT_SHA256)
+        self.assertEqual(
+            hashlib.sha256(immutable_bytes).hexdigest(), OLD_CHECKPOINT_SHA256
+        )
         immutable_payload = json.loads(immutable_bytes)
         immutable_validated = self.registry._validate_checkpoint_payload(
             immutable_payload, self.old_run_spec
@@ -802,9 +817,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
                 / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
             )
-            self.assertNotIn(
-                b'"dispositioned_query_ids"', checkpoint_path.read_bytes()
-            )
+            self.assertNotIn(b'"dispositioned_query_ids"', checkpoint_path.read_bytes())
 
     def test_checkpoint_value_retains_stage_evidence_paths(self) -> None:
         payload = {
@@ -1044,9 +1057,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 root / SOURCE_PLAN_RELATIVE,
                 root / SOURCE_CONTRACT_RELATIVE,
             )
-            (root / SOURCE_ADDENDUM_RELATIVE).write_text(
-                "tampered\n", encoding="utf-8"
-            )
+            (root / SOURCE_ADDENDUM_RELATIVE).write_text("tampered\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "addendum.*hash|binding"):
                 self.registry._validate_common_bindings(root, evidence, authority)
 
@@ -1062,14 +1073,16 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             contract_path = root / SOURCE_CONTRACT_RELATIVE
             contract = json.loads(contract_path.read_bytes())
-            contract["bindings"][
-                "ephemeral_parse_schedule_equivalence_addendum"
-            ]["git_blob_id"] = "0" * 40
+            contract["bindings"]["ephemeral_parse_schedule_equivalence_addendum"][
+                "git_blob_id"
+            ] = "0" * 40
             contract_path.write_bytes(canonical_json_bytes(contract) + b"\n")
             with self.assertRaisesRegex(ValueError, "addendum.*Git blob"):
                 self.registry._git_bound_paths(root, evidence)
 
-    def test_source_git_snapshot_final_rebind_rejects_addendum_replacement(self) -> None:
+    def test_source_git_snapshot_final_rebind_rejects_addendum_replacement(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, authority = self.make_source_repo(Path(directory))
             evidence = self.registry._initial_evidence(
@@ -1086,7 +1099,6 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bound Git evidence"):
                 self.registry._verify_git_snapshot(root, snapshot)
 
-
     def test_source_authority_uses_its_audit_registry_and_terminal_phases(
         self,
     ) -> None:
@@ -1101,13 +1113,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             self.assertEqual(state.phase, "DESIGN_ACCEPTED")
             self.assertTrue(
-                any(
-                    (root / SOURCE_EXECUTION_RELATIVE / "phase_receipts").iterdir()
-                )
+                any((root / SOURCE_EXECUTION_RELATIVE / "phase_receipts").iterdir())
             )
-            self.assertFalse(
-                (root / "audit/v5_2_qd/historical/execution").exists()
-            )
+            self.assertFalse((root / "audit/v5_2_qd/historical/execution").exists())
             self.assertEqual(
                 self.registry.load_execution_registry(root, authority), state
             )
@@ -1162,9 +1170,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "validation_receipts": [success["run_spec"]],
             }
             with self.assertRaisesRegex(ValueError, "receipt schema"):
-                self.registry._validate_quarantine_receipt(
-                    quarantine, authority
-                )
+                self.registry._validate_quarantine_receipt(quarantine, authority)
 
     def test_source_run_registry_stops_at_sources_ready_and_rejects_later_phase_receipts(
         self,
@@ -1211,9 +1217,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             receipt_root = root / SOURCE_EXECUTION_RELATIVE / "phase_receipts"
             quarantine_root = root / SOURCE_EXECUTION_RELATIVE / "quarantine"
             before_receipts = sorted(path.name for path in receipt_root.iterdir())
-            before_quarantine = sorted(
-                path.name for path in quarantine_root.iterdir()
-            )
+            before_quarantine = sorted(path.name for path in quarantine_root.iterdir())
             missing = root / "must-not-be-snapshotted.json"
             with self.assertRaisesRegex(ValueError, "immediate next"):
                 self.registry.advance_execution_phase(
@@ -1258,9 +1262,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     self.registry.Authority,
                 )
         self.assertEqual(
-            typing.get_type_hints(self.registry.advance_execution_phase)[
-                "run_spec"
-            ],
+            typing.get_type_hints(self.registry.advance_execution_phase)["run_spec"],
             self.registry.Authority,
         )
 
@@ -1289,8 +1291,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             for relative in BOUND_EXECUTION_CODE
             if relative not in BOUND_SCHEMA_PATHS
         )
-        with tempfile.TemporaryDirectory() as directory, patch(
-            f"{__name__}.BOUND_EXECUTION_CODE", without_schemas
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(f"{__name__}.BOUND_EXECUTION_CODE", without_schemas),
         ):
             root, _run_spec = self.make_repo(Path(directory))
             for relative in BOUND_SCHEMA_PATHS:
@@ -1440,8 +1443,7 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def install_terminal_checkpoint_stub(self, root: Path) -> None:
         checkpoint_dir = (
-            root
-            / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+            root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
         )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         contents = canonical_json_bytes({"fixture": "terminal-checkpoint"}) + b"\n"
@@ -1504,15 +1506,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         import mlb_backtest.v52_query_plan as query_plan
 
-        audit_root = (
-            root
-            / "audit/v5_2_qd/historical_superseding_565534/acquisition"
-        )
+        audit_root = root / "audit/v5_2_qd/historical_superseding_565534/acquisition"
         batch_root = audit_root / "query_batches"
         batch_root.mkdir(parents=True, exist_ok=True)
-        evidence_root = (
-            root / "data/v5_2_qd/historical_superseding_565534/raw"
-        )
+        evidence_root = root / "data/v5_2_qd/historical_superseding_565534/raw"
         evidence_root.mkdir(parents=True, exist_ok=True)
         for relative in (
             OLD_REGISTRATION_RELATIVE,
@@ -1553,9 +1550,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             / "sidecars"
             / f"{published_disposition.query_sidecar_sha256}.json"
         )
-        audit_sidecar = (
-            root / self.registry._SOURCE_DISPOSITION_SIDECAR_PATH
-        )
+        audit_sidecar = root / self.registry._SOURCE_DISPOSITION_SIDECAR_PATH
         audit_sidecar.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(raw_sidecar, audit_sidecar)
 
@@ -1592,9 +1587,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             requested_range={"fixture_stage": "REMAINING"},
         )
         reference_batch = fixture_batch("REFERENCE_INPUTS", reference_query)
-        participant_batch = fixture_batch(
-            "PARTICIPANT_DERIVED", participant_query
-        )
+        participant_batch = fixture_batch("PARTICIPANT_DERIVED", participant_query)
         remaining_batch = fixture_batch("REMAINING", remaining_query)
         batches = (
             static_batch,
@@ -1740,9 +1733,7 @@ class ExecutionRegistryTest(unittest.TestCase):
 
         all_ids = tuple(
             sorted(
-                logical_query_id(query)
-                for batch in batches
-                for query in batch.queries
+                logical_query_id(query) for batch in batches for query in batch.queries
             )
         )
         checkpoint_chain = []
@@ -1779,8 +1770,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         self.source_checkpoint_chain = tuple(checkpoint_chain)
         self.source_checkpoint_paths = tuple(
-            root
-            / "audit/v5_2_qd/historical_superseding_565534/execution/"
+            root / "audit/v5_2_qd/historical_superseding_565534/execution/"
             "acquisition_checkpoints"
             / f"{checkpoint.sequence:08d}-{checkpoint.receipt_sha256}.json"
             for checkpoint in checkpoint_chain
@@ -1807,9 +1797,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
         batch = build_static_batch(root / RUN_SPEC_RELATIVE, root / CONTRACT_RELATIVE)
         publish_query_batch(root, batch)
-        query_ids = tuple(
-            sorted(logical_query_id(query) for query in batch.queries)
-        )
+        query_ids = tuple(sorted(logical_query_id(query) for query in batch.queries))
         return batch, query_ids
 
     def publish_pending_checkpoint(
@@ -1954,9 +1942,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             expected_prior_checkpoint_sha256=expected_prior,
             stage="REFERENCE_INPUTS",
             query_batch_ids=(static_batch.batch_id, reference_batch.batch_id),
-            completed_query_ids=tuple(
-                sorted((*static_ids, *completed_reference_ids))
-            ),
+            completed_query_ids=tuple(sorted((*static_ids, *completed_reference_ids))),
             pending_query_ids=tuple(
                 query_id
                 for query_id in reference_ids
@@ -1996,13 +1982,12 @@ class ExecutionRegistryTest(unittest.TestCase):
             store,
         ) = fixture
         schedule_inventory = json.loads(inventory.path.read_bytes())
-        anchors = {
-            int(row["game_pk"]): row for row in schedule_inventory["anchors"]
-        }
+        anchors = {int(row["game_pk"]): row for row in schedule_inventory["anchors"]}
         for query in reference_batch.queries:
             if query.endpoint.startswith("https://statsapi.mlb.com/api/v1/venues/"):
                 venue_id = int(query.requested_range["venue_id"])
-                raw = canonical_json_bytes(
+                raw = (
+                    canonical_json_bytes(
                     {
                         "venues": [
                             {
@@ -2018,11 +2003,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                             }
                         ]
                     }
-                ) + b"\n"
-            elif query.endpoint.endswith("/boxscore"):
-                raw = _boxscore_raw(
-                    anchors[int(query.requested_range["game_pk"])]
                 )
+                    + b"\n"
+                )
+            elif query.endpoint.endswith("/boxscore"):
+                raw = _boxscore_raw(anchors[int(query.requested_range["game_pk"])])
             elif query.endpoint == "https://statsapi.mlb.com/api/v1/stats":
                 raw = _pitching_raw()
             elif query.endpoint == "https://statsapi.mlb.com/api/v1/teams":
@@ -2272,9 +2257,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             quarantined_query_ids=tuple(sorted(quarantined_participant_ids)),
             split_query_ids=tuple(sorted(split_participant_ids)),
             stage_evidence_receipts=(
-                participant_evidence
-                if stage_evidence is None
-                else stage_evidence
+                participant_evidence if stage_evidence is None else stage_evidence
             ),
         )
 
@@ -2303,9 +2286,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             run_spec,
             participant_fixture,
             expected_prior=timezone.receipt_sha256,
-            completed_participant_ids=(
-                participant_ids if terminal_participant else ()
-            ),
+            completed_participant_ids=(participant_ids if terminal_participant else ()),
         )
         root_batch = build_statcast_root_batch(root)
         publish_query_batch(root, root_batch)
@@ -2505,9 +2486,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         for run_id, branch in branches.items():
             with self.subTest(closed_branch=run_id):
                 self.assertFalse(branch["additionalProperties"])
-                self.assertEqual(
-                    set(branch["properties"]), set(branch["required"])
-                )
+                self.assertEqual(set(branch["properties"]), set(branch["required"]))
         self.assertEqual(set(legacy["properties"]), canonical_legacy_fields)
         self.assertNotIn("dispositioned_query_ids", legacy["required"])
         self.assertEqual(
@@ -2524,9 +2503,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
         self.assertIs(publish_hints["run_spec"], self.registry.Authority)
         self.assertIs(load_hints["run_spec"], self.registry.Authority)
-        self.assertIs(
-            publish_hints["return"], self.registry.AcquisitionCheckpoint
-        )
+        self.assertIs(publish_hints["return"], self.registry.AcquisitionCheckpoint)
         self.assertEqual(
             load_hints["return"], self.registry.AcquisitionCheckpoint | None
         )
@@ -2627,9 +2604,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$",
                 )
                 for definition_name in ("sha256", "gitHead", "timestamp"):
-                    self.assertEqual(
-                        schema["$defs"][definition_name]["type"], "string"
-                    )
+                    self.assertEqual(schema["$defs"][definition_name]["type"], "string")
                 self.assertEqual(binding["type"], "object")
                 self.assertEqual(
                     binding["properties"]["path"],
@@ -2639,9 +2614,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                         "type": "string",
                     },
                 )
-                self.assertEqual(
-                    schema["properties"]["schema_version"], {"const": 1}
-                )
+                self.assertEqual(schema["properties"]["schema_version"], {"const": 1})
                 self.assertEqual(
                     schema["properties"]["run_id"],
                     {"const": "historical_walkforward_500"},
@@ -2671,9 +2644,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                         schema["properties"]["receipt_kind"],
                         {"const": "CLEAN_SOURCE_REPLAY"},
                     )
-                    self.assertEqual(
-                        schema["properties"]["status"], {"const": "PASS"}
-                    )
+                    self.assertEqual(schema["properties"]["status"], {"const": "PASS"})
                     self.assertEqual(
                         schema["properties"]["network_attempts"], {"const": 0}
                     )
@@ -2780,11 +2751,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                         ),
                         (
                             "empty binding path",
-                            lambda payload: payload["query_ids_document"].update(path=""),
+                            lambda payload: payload["query_ids_document"].update(
+                                path=""
+                            ),
                         ),
                         (
                             "non-string binding path",
-                            lambda payload: payload["query_ids_document"].update(path=123),
+                            lambda payload: payload["query_ids_document"].update(
+                                path=123
+                            ),
                         ),
                         (
                             "unsafe binding path ../x",
@@ -2843,7 +2818,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                     mutations = (
                         (
                             "wrong receipt_kind",
-                            lambda payload: payload.update(receipt_kind="SOURCE_REVIEW"),
+                            lambda payload: payload.update(
+                                receipt_kind="SOURCE_REVIEW"
+                            ),
                         ),
                         (
                             "schema_version is not fixed",
@@ -2921,7 +2898,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                         ),
                         (
                             "unsafe absolute binding path",
-                            lambda payload: payload["run_spec"].update(path="/absolute"),
+                            lambda payload: payload["run_spec"].update(
+                                path="/absolute"
+                            ),
                         ),
                         (
                             "unsafe backslash binding path",
@@ -2961,7 +2940,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                         with self.assertRaises(jsonschema.ValidationError):
                             validator.validate(candidate)
 
-    def test_source_inventory_and_receipt_schemas_have_exact_disposition_branch(self) -> None:
+    def test_source_inventory_and_receipt_schemas_have_exact_disposition_branch(
+        self,
+    ) -> None:
         """Superseding artifacts freeze identity/path but accept an authentic dynamic receipt SHA."""
         source_id = SOURCE_RUN_ID
         for relative in (
@@ -2978,9 +2959,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 (
                     branch
                     for branch in branches
-                    if branch.get("properties", {})
-                    .get("run_id", {})
-                    .get("const")
+                    if branch.get("properties", {}).get("run_id", {}).get("const")
                     == source_id
                 ),
                 None,
@@ -3020,16 +2999,17 @@ class ExecutionRegistryTest(unittest.TestCase):
             legacy = next(
                 branch
                 for branch in branches
-                if branch.get("properties", {})
-                .get("run_id", {})
-                .get("const") == "historical_walkforward_500"
+                if branch.get("properties", {}).get("run_id", {}).get("const")
+                == "historical_walkforward_500"
                 or "historical_walkforward_500"
                 in branch.get("properties", {}).get("run_id", {}).get("enum", ())
             )
             self.assertNotIn("duplicate_gamepk_disposition", legacy["required"])
             self.assertNotIn("dispositioned_query_ids", legacy["required"])
 
-    def test_source_gate_semantically_verifies_dynamic_disposition_receipts(self) -> None:
+    def test_source_gate_semantically_verifies_dynamic_disposition_receipts(
+        self,
+    ) -> None:
         """Two inode-bound receipts are valid; forged or mutated receipt bytes are not."""
         from mlb_backtest.v52_duplicate_gamepk_disposition import (
             OLD_QUARANTINE_RELATIVE,
@@ -3042,9 +3022,7 @@ class ExecutionRegistryTest(unittest.TestCase):
 
         def publish_case(parent: Path) -> tuple[Path, dict[str, object], Path]:
             root, _run_spec = self.make_source_repo(parent)
-            evidence_root = (
-                root / "data/v5_2_qd/historical_superseding_565534/raw"
-            )
+            evidence_root = root / "data/v5_2_qd/historical_superseding_565534/raw"
             evidence_root.mkdir(parents=True, exist_ok=True)
             for relative in (
                 OLD_REGISTRATION_RELATIVE,
@@ -3075,10 +3053,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                 / f"{sidecar_sha256}.json"
             )
             audit_sidecar = (
-                root
-                / "audit/v5_2_qd/historical_superseding_565534/acquisition/"
-                "query_sidecars"
-                / f"{sidecar_sha256}.json"
+                root / "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+                "query_sidecars" / f"{sidecar_sha256}.json"
             )
             audit_sidecar.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(raw_sidecar, audit_sidecar)
@@ -3097,16 +3073,13 @@ class ExecutionRegistryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             cases = tuple(
-                publish_case(Path(directory) / f"case-{index}")
-                for index in (1, 2)
+                publish_case(Path(directory) / f"case-{index}") for index in (1, 2)
             )
             verified_hashes = set()
             for root, disposition, _success in cases:
-                snapshots = (
-                    self.registry._capture_verified_source_disposition(
+                snapshots = self.registry._capture_verified_source_disposition(
                         root, disposition
                     )
-                )
                 self.assertEqual(len(snapshots), 2)
                 verified_hashes.add(
                     disposition["success_receipt"]["sha256"]  # type: ignore[index]
@@ -3133,9 +3106,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     contents
                 ).hexdigest()
                 with self.subTest(field=field), self.assertRaises(ValueError):
-                    self.registry._capture_verified_source_disposition(
-                        root, rebound
-                    )
+                    self.registry._capture_verified_source_disposition(root, rebound)
                 success.write_bytes(original)
 
             noncanonical = original.rstrip(b"\n") + b" \n"
@@ -3158,9 +3129,16 @@ class ExecutionRegistryTest(unittest.TestCase):
             # exact branch closure and disposition fields are asserted above.
             return
         expected = {
-            "schema_version", "receipt_kind", "committed_receipt_kind", "run_id",
-            "critical_errors", "source_receipt", "run_spec",
-            "acquisition_contract", "git_head", "occurred_at_utc",
+            "schema_version",
+            "receipt_kind",
+            "committed_receipt_kind",
+            "run_id",
+            "critical_errors",
+            "source_receipt",
+            "run_spec",
+            "acquisition_contract",
+            "git_head",
+            "occurred_at_utc",
         }
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(set(schema["properties"]), expected)
@@ -3228,9 +3206,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             sorted(
                 (
                     PROTECTED_RELATIVE.as_posix(),
-                    *(
-                        path.as_posix() for path in PARTICIPANT_STAGE_EVIDENCE
-                    ),
+                    *(path.as_posix() for path in PARTICIPANT_STAGE_EVIDENCE),
                     LEGACY_DECISION_RELATIVE.as_posix(),
                     (
                         "audit/v5_2_qd/historical/acquisition/query_batches/"
@@ -3532,9 +3508,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             self.assertTrue(loader.call_args.kwargs["verify_latest_progress"])
             self.assertTrue(loader.call_args.kwargs["read_only_progress"])
-            self.assertTrue(
-                registry_loader.call_args.kwargs["read_only_progress"]
-            )
+            self.assertTrue(registry_loader.call_args.kwargs["read_only_progress"])
 
         with (
             patch.object(
@@ -3679,31 +3653,23 @@ class ExecutionRegistryTest(unittest.TestCase):
                         side_effect=load_checkpoints,
                     ) as checkpoint_loader,
                 ):
-                    loaded = (
-                        self.registry.load_source_verification_checkpoint(
+                    loaded = self.registry.load_source_verification_checkpoint(
                             root,
                             self.old_run_spec,
                         )
-                    )
                     self.assertIs(loaded, checkpoint)
                     self.assertEqual(
                         loaded.split_query_ids,
                         ("split-parent",),
                     )
                     self.assertTrue(
-                        registry_loader.call_args.kwargs[
-                            "read_only_progress"
-                        ]
+                        registry_loader.call_args.kwargs["read_only_progress"]
                     )
                     self.assertTrue(
-                        checkpoint_loader.call_args.kwargs[
-                            "read_only_progress"
-                        ]
+                        checkpoint_loader.call_args.kwargs["read_only_progress"]
                     )
                     self.assertTrue(
-                        checkpoint_loader.call_args.kwargs[
-                            "verify_latest_progress"
-                        ]
+                        checkpoint_loader.call_args.kwargs["verify_latest_progress"]
                     )
                     registry_lock.assert_called_once_with(
                         paths,
@@ -3929,9 +3895,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     self.old_run_spec,
                 )
 
-            self.assertTrue(
-                checkpoint_loader.call_args.kwargs["read_only_progress"]
-            )
+            self.assertTrue(checkpoint_loader.call_args.kwargs["read_only_progress"])
             registry_lock.assert_called_once_with(
                 SimpleNamespace(root=root),
                 create=False,
@@ -3966,9 +3930,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ),
                 state,
             )
-            self.assertFalse(
-                loader.call_args.kwargs.get("read_only_progress", False)
-            )
+            self.assertFalse(loader.call_args.kwargs.get("read_only_progress", False))
 
         with (
             patch.object(
@@ -3999,14 +3961,10 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             )
             self.assertFalse(
-                registry_loader.call_args.kwargs.get(
-                    "read_only_progress", False
-                )
+                registry_loader.call_args.kwargs.get("read_only_progress", False)
             )
             self.assertFalse(
-                checkpoint_loader.call_args.kwargs.get(
-                    "read_only_progress", False
-                )
+                checkpoint_loader.call_args.kwargs.get("read_only_progress", False)
             )
 
     def test_checkpoint_progress_read_only_phase_table(self) -> None:
@@ -4151,10 +4109,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
 
             query_root = (
-                evidence_root
-                / "queries"
-                / query.source
-                / logical_query_id(query)
+                evidence_root / "queries" / query.source / logical_query_id(query)
             )
             self.assertTrue(
                 any(
@@ -4163,9 +4118,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             )
             self.assertEqual(
-                self.registry.load_latest_acquisition_checkpoint(
-                    root, run_spec
-                ),
+                self.registry.load_latest_acquisition_checkpoint(root, run_spec),
                 checkpoint,
             )
             self.assertFalse(
@@ -4257,13 +4210,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
                 )
             )
-            child_ids = tuple(
-                logical_query_id(query) for query in child_batch.queries
-            )
+            child_ids = tuple(logical_query_id(query) for query in child_batch.queries)
             active_ids = tuple(
                 sorted(
                     (
-                        *(query_id for query_id in partition_ids if query_id != parent_id),
+                        *(
+                            query_id
+                            for query_id in partition_ids
+                            if query_id != parent_id
+                        ),
                         *child_ids,
                     )
                 )
@@ -4623,8 +4578,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 second,
             )
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             self.assertEqual(len(list(checkpoint_dir.iterdir())), 2)
 
@@ -4683,15 +4637,17 @@ class ExecutionRegistryTest(unittest.TestCase):
         self,
     ) -> None:
         for attack in ("gap", "tamper", "unknown"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 batch, query_ids = self.checkpoint_fixture(root, run_spec)
                 self.publish_pending_checkpoint(
                     root, run_spec, batch, query_ids, expected_prior=None
                 )
                 checkpoint_dir = (
-                    root
-                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
                 )
                 receipt = next(checkpoint_dir.iterdir())
                 if attack == "gap":
@@ -4705,7 +4661,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ):
                     self.registry.load_latest_acquisition_checkpoint(root, run_spec)
 
-    def test_acquisition_checkpoint_partial_write_cleans_and_retry_succeeds(self) -> None:
+    def test_acquisition_checkpoint_partial_write_cleans_and_retry_succeeds(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
@@ -4720,17 +4678,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                 raise OSError("injected checkpoint interruption")
 
             with (
-                patch.object(
-                    self.registry.os, "write", side_effect=interrupted_write
-                ),
+                patch.object(self.registry.os, "write", side_effect=interrupted_write),
                 self.assertRaisesRegex(ValueError, "published|publication|receipt"),
             ):
                 self.publish_pending_checkpoint(
                     root, run_spec, batch, query_ids, expected_prior=None
                 )
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             self.assertEqual(list(checkpoint_dir.iterdir()), [])
             self.assertEqual(
@@ -4740,7 +4695,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 0,
             )
 
-    def test_acquisition_checkpoint_concurrent_identical_publish_converges(self) -> None:
+    def test_acquisition_checkpoint_concurrent_identical_publish_converges(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
@@ -4761,8 +4718,7 @@ class ExecutionRegistryTest(unittest.TestCase):
 
             self.assertEqual(results[0], results[1])
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             self.assertEqual(len(list(checkpoint_dir.iterdir())), 1)
 
@@ -4792,8 +4748,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 root, run_spec, batch, query_ids, expected_prior=None
             )
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             next(checkpoint_dir.iterdir()).unlink()
             self.assertIsNone(
@@ -5013,9 +4968,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                 split_ids,
             ),
         }
-        for attack, (forged_batches, forged_receipts, forged_split_ids) in (
-            attacks.items()
-        ):
+        for attack, (
+            forged_batches,
+            forged_receipts,
+            forged_split_ids,
+        ) in attacks.items():
             with (
                 self.subTest(attack=attack),
                 self.assertRaisesRegex(ValueError, "split|DAG|batch|parent|child"),
@@ -5103,9 +5060,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             load_split.assert_called_once_with(
                 root,
                 parent,
-                evidence_root=(
-                    root / run_spec.raw["namespaces"]["raw"]
-                ),
+                evidence_root=(root / run_spec.raw["namespaces"]["raw"]),
                 read_only_progress=False,
             )
 
@@ -5118,9 +5073,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
 
             def mutate_evidence() -> None:
-                stage_evidence.write_bytes(
-                    canonical_json_bytes({"version": 2}) + b"\n"
-                )
+                stage_evidence.write_bytes(canonical_json_bytes({"version": 2}) + b"\n")
 
             with (
                 patch.object(
@@ -5143,8 +5096,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     stage_evidence_receipts=(stage_evidence,),
                 )
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             self.assertEqual(list(checkpoint_dir.iterdir()), [])
             self.assertIsNone(
@@ -5156,8 +5108,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             unknown = checkpoint_dir / "unknown.json"
 
@@ -5192,8 +5143,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             batch, query_ids = self.checkpoint_fixture(root, run_spec)
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             unknown = checkpoint_dir / "unknown.json"
 
@@ -5249,9 +5199,12 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "PARTICIPANT_DERIVED",
                 "REMAINING",
             ):
-                with self.subTest(stage=stage), self.assertRaisesRegex(
+                with (
+                    self.subTest(stage=stage),
+                    self.assertRaisesRegex(
                     ValueError,
                     rf"\Acheckpoint {stage} stage lacks its batch\Z",
+                    ),
                 ):
                     self.registry.publish_acquisition_checkpoint(
                         root,
@@ -5309,7 +5262,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         )
 
         for attack in ("nonterminal", "extra-evidence", "new-batch"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 fixture = self.reference_checkpoint_fixture(root, run_spec)
                 *_, static_checkpoint, _ = fixture
@@ -5417,8 +5373,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             candidate.write_bytes(original)
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             self.assertEqual(
                 sorted(path.name for path in checkpoint_dir.iterdir()),
@@ -5437,9 +5392,7 @@ class ExecutionRegistryTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
-            participant_fixture = self.participant_checkpoint_fixture(
-                root, run_spec
-            )
+            participant_fixture = self.participant_checkpoint_fixture(root, run_spec)
             (
                 fixture,
                 timezone,
@@ -5493,12 +5446,8 @@ class ExecutionRegistryTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
-            participant_fixture = self.participant_checkpoint_fixture(
-                root, run_spec
-            )
-            _, timezone, _, participant_batch, participant_ids, _ = (
-                participant_fixture
-            )
+            participant_fixture = self.participant_checkpoint_fixture(root, run_spec)
+            _, timezone, _, participant_batch, participant_ids, _ = participant_fixture
             partial = self.publish_participant_checkpoint(
                 root,
                 run_spec,
@@ -5630,9 +5579,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 participant_fixture = self.participant_checkpoint_fixture(
                     root, run_spec
                 )
-                _, timezone, inventory, participant_batch, *_ = (
-                    participant_fixture
-                )
+                _, timezone, inventory, participant_batch, *_ = participant_fixture
                 checkpoint = self.publish_participant_checkpoint(
                     root,
                     run_spec,
@@ -5642,9 +5589,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 if authority == "inventory":
                     payload = json.loads(inventory.path.read_bytes())
                     payload["counts"]["game_count"] += 1
-                    inventory.path.write_bytes(
-                        canonical_json_bytes(payload) + b"\n"
-                    )
+                    inventory.path.write_bytes(canonical_json_bytes(payload) + b"\n")
                 else:
                     batch_path = (
                         root
@@ -5658,8 +5603,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 ):
                     self.registry.load_latest_acquisition_checkpoint(root, run_spec)
                 checkpoint_dir = (
-                    root
-                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
                 )
                 self.assertTrue(
                     any(
@@ -5673,14 +5617,11 @@ class ExecutionRegistryTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
-            participant_fixture = self.participant_checkpoint_fixture(
-                root, run_spec
-            )
+            participant_fixture = self.participant_checkpoint_fixture(root, run_spec)
             _, timezone, inventory, *_ = participant_fixture
             original = inventory.path.read_bytes()
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             before = sorted(path.name for path in checkpoint_dir.iterdir())
 
@@ -5718,7 +5659,15 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             fixture = self.reference_checkpoint_fixture(root, run_spec)
-            static_batch, reference_batch, static_ids, reference_ids, inventory, static_checkpoint, _ = fixture
+            (
+                static_batch,
+                reference_batch,
+                static_ids,
+                reference_ids,
+                inventory,
+                static_checkpoint,
+                _,
+            ) = fixture
             checkpoint = self.publish_reference_checkpoint(
                 root,
                 run_spec,
@@ -5742,13 +5691,27 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
 
     def test_reference_checkpoint_rejects_noncanonical_batches_and_stage_evidence(self):
-        from mlb_backtest.v52_query_plan import build_statcast_root_batch, publish_query_batch
+        from mlb_backtest.v52_query_plan import (
+            build_statcast_root_batch,
+            publish_query_batch,
+        )
 
         for attack in ("omitted", "extra", "missing-evidence", "extra-evidence"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 fixture = self.reference_checkpoint_fixture(root, run_spec)
-                static_batch, reference_batch, static_ids, reference_ids, inventory, static_checkpoint, _ = fixture
+                (
+                    static_batch,
+                    reference_batch,
+                    static_ids,
+                    reference_ids,
+                    inventory,
+                    static_checkpoint,
+                    _,
+                ) = fixture
                 batch_ids = (static_batch.batch_id, reference_batch.batch_id)
                 stage_evidence = (inventory.path,)
                 if attack == "omitted":
@@ -5783,13 +5746,20 @@ class ExecutionRegistryTest(unittest.TestCase):
                         stage_evidence_receipts=stage_evidence,
                     )
 
-    def test_reference_checkpoint_authority_mutation_cleans_new_receipt_and_load_fails(self):
+    def test_reference_checkpoint_authority_mutation_cleans_new_receipt_and_load_fails(
+        self,
+    ):
         for operation in ("publish-pre", "publish-post", "load"):
-            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 fixture = self.reference_checkpoint_fixture(root, run_spec)
                 *_, inventory, static_checkpoint, _ = fixture
-                checkpoint_dir = root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                checkpoint_dir = (
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                )
 
                 def mutate_inventory() -> None:
                     payload = json.loads(inventory.path.read_bytes())
@@ -5809,7 +5779,10 @@ class ExecutionRegistryTest(unittest.TestCase):
                     ):
                         self.registry.load_latest_acquisition_checkpoint(root, run_spec)
                     self.assertTrue(
-                        any(checkpoint.receipt_sha256 in path.name for path in checkpoint_dir.iterdir())
+                        any(
+                            checkpoint.receipt_sha256 in path.name
+                            for path in checkpoint_dir.iterdir()
+                        )
                     )
                     continue
                 hook = (
@@ -5832,9 +5805,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
                 self.assertEqual(
                     sorted(path.name for path in checkpoint_dir.iterdir()),
-                    [
-                        f"00000000-{static_checkpoint.receipt_sha256}.json"
-                    ],
+                    [f"00000000-{static_checkpoint.receipt_sha256}.json"],
                 )
 
     def test_reference_terminal_progress_is_repeatable_stop_after_authority(self):
@@ -5896,10 +5867,21 @@ class ExecutionRegistryTest(unittest.TestCase):
         from mlb_backtest.v52_evidence import AttemptCapture
 
         for attack in ("success-path", "quarantine-path", "wrong-query"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 fixture = self.reference_checkpoint_fixture(root, run_spec)
-                _, reference_batch, _, reference_ids, inventory, static_checkpoint, store = fixture
+                (
+                    _,
+                    reference_batch,
+                    _,
+                    reference_ids,
+                    inventory,
+                    static_checkpoint,
+                    store,
+                ) = fixture
                 completed_reference_ids: tuple[str, ...] = ()
                 if attack == "wrong-query":
                     query = reference_batch.queries[0]
@@ -5933,7 +5915,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                     expected_prior=static_checkpoint.receipt_sha256,
                     completed_reference_ids=completed_reference_ids,
                 )
-                checkpoint_dir = root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                checkpoint_dir = (
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                )
                 receipt = next(
                     path
                     for path in checkpoint_dir.iterdir()
@@ -5994,7 +5978,10 @@ class ExecutionRegistryTest(unittest.TestCase):
         from mlb_backtest.v52_evidence import AttemptCapture, logical_query_id
 
         for status in ("QUARANTINED", "SUCCESS"):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 fixture = self.reference_checkpoint_fixture(root, run_spec)
                 _, reference_batch, _, _, _, static_checkpoint, store = fixture
@@ -6102,8 +6089,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 root, terminal_checkpoint=False
             )
             checkpoint_dir = (
-                root
-                / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
             )
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             first_contents = canonical_json_bytes({"fixture": "interior"}) + b"\n"
@@ -6147,7 +6133,10 @@ class ExecutionRegistryTest(unittest.TestCase):
 
             def load_chain(*args: object, **kwargs: object):
                 del args, kwargs
-                if tuple(sorted(path.name for path in checkpoint_dir.iterdir())) != names:
+                if (
+                    tuple(sorted(path.name for path in checkpoint_dir.iterdir()))
+                    != names
+                ):
                     raise self.registry._ReceiptMembershipError(
                         "checkpoint membership changed"
                     )
@@ -6184,7 +6173,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
             )
 
-    def test_sources_ready_rejects_consistent_review_ids_unrelated_to_inventory(self) -> None:
+    def test_sources_ready_rejects_consistent_review_ids_unrelated_to_inventory(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -6204,7 +6195,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                     inventory_path=inventory,
                     validation_receipts=evidence,
                 )
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
 
     def test_sources_ready_allows_audited_review_subset_with_full_replays(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6237,15 +6230,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.registry.load_execution_registry(root, run_spec), state
             )
 
-    def test_sources_ready_rejects_invalid_review_subset_or_partial_replay(self) -> None:
+    def test_sources_ready_rejects_invalid_review_subset_or_partial_replay(
+        self,
+    ) -> None:
         cases = ("empty", "outside", "duplicate", "unsorted", "partial_replay")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 review_marker, replay_one_marker, replay_two_marker = evidence
                 target_marker = (
@@ -6279,21 +6272,33 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def test_dynamic_phase_evidence_is_stable_through_publication(self) -> None:
         for artifact_kind in ("inventory", "review", "replay"):
-            with self.subTest(artifact_kind=artifact_kind), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(artifact_kind=artifact_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
                 initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
-                target = inventory if artifact_kind == "inventory" else evidence[0 if artifact_kind == "review" else 1]
+                target = (
+                    inventory
+                    if artifact_kind == "inventory"
+                    else evidence[0 if artifact_kind == "review" else 1]
+                )
 
                 def mutate_evidence() -> None:
                     target.write_bytes(target.read_bytes() + b" ")
 
-                with patch.object(
+                with (
+                    patch.object(
                     self.registry,
                     "_before_registry_publish",
                     side_effect=mutate_evidence,
-                ), self.assertRaisesRegex(ValueError, "evidence|identity|snapshot|changed"):
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "evidence|identity|snapshot|changed"
+                    ),
+                ):
                     self.registry.advance_execution_phase(
                         root,
                         run_spec,
@@ -6304,18 +6309,29 @@ class ExecutionRegistryTest(unittest.TestCase):
                     )
                 self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 2)
                 target.write_bytes(target.read_bytes()[:-1])
-                self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+                self.assertEqual(
+                    self.registry.load_execution_registry(root, run_spec), initial
+                )
 
-    def test_publication_rejects_receipt_parent_or_file_replacement_after_hook(self) -> None:
+    def test_publication_rejects_receipt_parent_or_file_replacement_after_hook(
+        self,
+    ) -> None:
         for attack in ("parent", "file"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 initial = self.initialize(root, run_spec)
                 receipts = root / RECEIPTS_RELATIVE
                 displaced = receipts.with_name("phase_receipts-displaced")
 
                 def replace_published_path() -> None:
-                    published = next(path for path in receipts.iterdir() if path.name.startswith("000001-"))
+                    published = next(
+                        path
+                        for path in receipts.iterdir()
+                        if path.name.startswith("000001-")
+                    )
                     if attack == "parent":
                         receipts.rename(displaced)
                         receipts.mkdir()
@@ -6324,11 +6340,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                         replacement.write_bytes(published.read_bytes())
                         os.replace(replacement, published)
 
-                with patch.object(
+                with (
+                    patch.object(
                     self.registry,
                     "_after_registry_publish",
                     side_effect=replace_published_path,
-                ), self.assertRaisesRegex(ValueError, "identity|receipt|publication"):
+                    ),
+                    self.assertRaisesRegex(ValueError, "identity|receipt|publication"),
+                ):
                     self.registry.advance_execution_phase(
                         root,
                         run_spec,
@@ -6342,9 +6361,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                     self.assertEqual(len(list(displaced.iterdir())), 1)
                 self.assertEqual(initial.phase, "DESIGN_ACCEPTED")
 
-    def test_publication_final_rebind_rejects_disappeared_or_replaced_receipt(self) -> None:
+    def test_publication_final_rebind_rejects_disappeared_or_replaced_receipt(
+        self,
+    ) -> None:
         for attack in ("disappear", "replace"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 initial = self.initialize(root, run_spec)
                 receipts = root / RECEIPTS_RELATIVE
@@ -6362,18 +6386,19 @@ class ExecutionRegistryTest(unittest.TestCase):
                         replacement.write_bytes(b"tampered\n")
                         os.replace(replacement, published)
 
-                hook = getattr(
-                    self.registry, "_after_registry_receipt_read", None
-                )
+                hook = getattr(self.registry, "_after_registry_receipt_read", None)
                 self.assertIsNotNone(
                     hook, "final receipt read/rebind race hook is missing"
                 )
-                with patch.object(
+                with (
+                    patch.object(
                     self.registry,
                     "_after_registry_receipt_read",
                     side_effect=attack_after_final_read,
-                ), self.assertRaisesRegex(
+                    ),
+                    self.assertRaisesRegex(
                     ValueError, "identity|receipt|publication|cleanup"
+                    ),
                 ):
                     self.registry.advance_execution_phase(
                         root,
@@ -6473,11 +6498,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                 fork_path = receipts / f"000001-ACQUIRING-{digest}.json"
                 fork_path.write_bytes(contents)
 
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_after_registry_receipt_read",
                 side_effect=add_valid_same_sequence_fork,
-            ), self.assertRaisesRegex(ValueError, "fork|receipt|membership|chain"):
+                ),
+                self.assertRaisesRegex(ValueError, "fork|receipt|membership|chain"),
+            ):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
@@ -6501,7 +6529,10 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def test_partial_write_or_fsync_failure_removes_created_receipt(self) -> None:
         for failure in ("partial_write", "fsync"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 initial = self.initialize(root, run_spec)
                 receipts = root / RECEIPTS_RELATIVE
@@ -6521,7 +6552,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                             return original_write(descriptor, bytes(contents[:8]))
                         raise OSError("injected partial write failure")
 
-                    context = patch.object(self.registry.os, "write", side_effect=fail_write)
+                    context = patch.object(
+                        self.registry.os, "write", side_effect=fail_write
+                    )
                 else:
                     original_fsync = os.fsync
 
@@ -6531,9 +6564,16 @@ class ExecutionRegistryTest(unittest.TestCase):
                             raise OSError("injected receipt fsync failure")
                         original_fsync(descriptor)
 
-                    context = patch.object(self.registry.os, "fsync", side_effect=fail_receipt_fsync)
+                    context = patch.object(
+                        self.registry.os, "fsync", side_effect=fail_receipt_fsync
+                    )
                 try:
-                    with context, self.assertRaisesRegex(ValueError, "published|publication|safely"):
+                    with (
+                        context,
+                        self.assertRaisesRegex(
+                            ValueError, "published|publication|safely"
+                        ),
+                    ):
                         self.registry._write_exclusive(
                             execution_fd,
                             Path("phase_receipts/injected.json"),
@@ -6544,24 +6584,33 @@ class ExecutionRegistryTest(unittest.TestCase):
                 finally:
                     self.registry._close_directories(descriptors)
                 self.assertEqual(len(list(receipts.iterdir())), 1)
-                self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+                self.assertEqual(
+                    self.registry.load_execution_registry(root, run_spec), initial
+                )
 
-    def test_git_binding_cannot_change_between_evidence_validation_and_capture(self) -> None:
+    def test_git_binding_cannot_change_between_evidence_validation_and_capture(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             original_capture = self.registry._capture_git_snapshot
 
             def mutate_and_commit(repo: Path, evidence: object):
-                (root / DESIGN_RELATIVE).write_bytes((root / DESIGN_RELATIVE).read_bytes() + b"changed\n")
+                (root / DESIGN_RELATIVE).write_bytes(
+                    (root / DESIGN_RELATIVE).read_bytes() + b"changed\n"
+                )
                 _git(root, "add", DESIGN_RELATIVE.as_posix())
                 _git(root, "commit", "-qm", "racing design")
                 return original_capture(repo, evidence)
 
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_capture_git_snapshot",
                 side_effect=mutate_and_commit,
-            ), self.assertRaisesRegex(ValueError, "binding|Git|snapshot|design"):
+                ),
+                self.assertRaisesRegex(ValueError, "binding|Git|snapshot|design"),
+            ):
                 self.initialize(root, run_spec)
             self.assertEqual(list((root / RECEIPTS_RELATIVE).iterdir()), [])
 
@@ -6597,15 +6646,16 @@ class ExecutionRegistryTest(unittest.TestCase):
             with patch.object(self.registry.os, "fstat", side_effect=fail_child):
                 for _ in range(20):
                     with self.assertRaises(OSError):
-                        self.registry._open_directory(
-                            root, Path("child"), create=False
-                        )
+                        self.registry._open_directory(root, Path("child"), create=False)
             self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     @unittest.skipUnless(Path("/dev/fd").is_dir(), "/dev/fd is unavailable")
     def test_registry_lock_flock_errors_close_every_descriptor(self) -> None:
         for failure in ("acquire", "release"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
                 paths = self.registry._paths(root, run_spec)
@@ -6617,9 +6667,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                         raise OSError(f"injected {failure} flock failure")
                     original_flock(descriptor, operation)
 
-                with patch.object(
-                    self.registry.fcntl, "flock", side_effect=fail_flock
-                ):
+                with patch.object(self.registry.fcntl, "flock", side_effect=fail_flock):
                     for _ in range(20):
                         with self.assertRaisesRegex(
                             OSError, f"injected {failure} flock failure"
@@ -6635,15 +6683,23 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
             self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
-            receipt = next(path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000001-"))
-            unrelated = self.write_artifact(root, "unrelated-inventory.json", {"rows": 1})
+            receipt = next(
+                path
+                for path in (root / RECEIPTS_RELATIVE).iterdir()
+                if path.name.startswith("000001-")
+            )
+            unrelated = self.write_artifact(
+                root, "unrelated-inventory.json", {"rows": 1}
+            )
             payload = json.loads(receipt.read_bytes())
             payload["inventory"] = {
                 "path": unrelated.relative_to(root).as_posix(),
                 "sha256": _sha256(unrelated),
             }
             self.replace_receipt_payload(receipt, payload)
-            with self.assertRaisesRegex(ValueError, "ACQUIRING|phase|inventory|evidence"):
+            with self.assertRaisesRegex(
+                ValueError, "ACQUIRING|phase|inventory|evidence"
+            ):
                 self.registry.load_execution_registry(root, run_spec)
 
     def test_load_rejects_forged_sources_ready_review_ids(self) -> None:
@@ -6666,7 +6722,11 @@ class ExecutionRegistryTest(unittest.TestCase):
             review_payload["reviewed_query_ids"] = ["unrelated-query"]
             review.write_bytes(canonical_json_bytes(review_payload) + b"\n")
             self.rebind_source_marker(review_marker, review)
-            receipt = next(path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000002-"))
+            receipt = next(
+                path
+                for path in (root / RECEIPTS_RELATIVE).iterdir()
+                if path.name.startswith("000002-")
+            )
             payload = json.loads(receipt.read_bytes())
             payload["validation_receipts"][0]["sha256"] = _sha256(review_marker)
             self.replace_receipt_payload(receipt, payload)
@@ -6701,7 +6761,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(payload["validation_receipts"], [])
             self.assertEqual(state.phase, "ACQUIRING")
 
-    def test_sources_ready_binds_real_inventory_review_and_two_clean_replays(self) -> None:
+    def test_sources_ready_binds_real_inventory_review_and_two_clean_replays(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -6729,17 +6791,20 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             payload = json.loads(receipt.read_bytes())
             self.assertEqual(state.phase, "SOURCES_READY")
-            self.assertEqual(
-                payload["inventory"]["sha256"], _sha256(inventory)
-            )
+            self.assertEqual(payload["inventory"]["sha256"], _sha256(inventory))
             self.assertEqual(
                 [item["sha256"] for item in payload["validation_receipts"]],
                 [_sha256(path) for path in evidence],
             )
 
-    def test_rejects_inventory_and_validation_through_external_symlink_alias(self) -> None:
+    def test_rejects_inventory_and_validation_through_external_symlink_alias(
+        self,
+    ) -> None:
         for artifact_kind in ("inventory", "validation"):
-            with self.subTest(artifact_kind=artifact_kind), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(artifact_kind=artifact_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 base = Path(directory).resolve()
                 root, run_spec = self.make_repo(base)
                 self.initialize(root, run_spec)
@@ -6775,7 +6840,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                     self.registry.load_execution_registry(root, run_spec), initial
                 )
 
-    def advance(self, root: Path, run_spec: object, expected: str, phase: str, *, stem: str = "phase"):
+    def advance(
+        self,
+        root: Path,
+        run_spec: object,
+        expected: str,
+        phase: str,
+        *,
+        stem: str = "phase",
+    ):
         del stem
         if phase == "ACQUIRING":
             inventory = root / PROTECTED_RELATIVE
@@ -6807,9 +6880,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 review_marker, replay_one_marker, replay_two_marker = evidence
                 review = self.source_receipt_from_marker(root, review_marker)
@@ -6871,12 +6942,16 @@ class ExecutionRegistryTest(unittest.TestCase):
                 quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
                 self.assertEqual(len(list(quarantine.iterdir())), 1)
 
-    def test_invalid_acquiring_inventory_quarantines_without_validation_receipts(self) -> None:
+    def test_invalid_acquiring_inventory_quarantines_without_validation_receipts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             initial = self.initialize(root, run_spec)
             inventory = self.write_artifact(
-                root, "audit/v5_2_qd/historical/acquisition/wrong_inventory.json", {"wrong": True}
+                root,
+                "audit/v5_2_qd/historical/acquisition/wrong_inventory.json",
+                {"wrong": True},
             )
             with self.assertRaisesRegex(ValueError, "artifact|evidence"):
                 self.registry.advance_execution_phase(
@@ -6907,9 +6982,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             self.assertEqual(payload["attempted_phase"], "ACQUIRING")
             self.assertEqual(payload["current_phase"], "DESIGN_ACCEPTED")
-            self.assertEqual(
-                payload["current_receipt_sha256"], initial.receipt_sha256
-            )
+            self.assertEqual(payload["current_receipt_sha256"], initial.receipt_sha256)
             self.assertEqual(payload["git_head"], _git(root, "rev-parse", "HEAD"))
             schema = json.loads(
                 (root / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
@@ -6936,16 +7009,18 @@ class ExecutionRegistryTest(unittest.TestCase):
                     inventory_path=inventory,
                     validation_receipts=raw_receipts,
                 )
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
 
-    def test_source_commit_marker_binding_and_underlying_uniqueness_are_enforced(self) -> None:
+    def test_source_commit_marker_binding_and_underlying_uniqueness_are_enforced(
+        self,
+    ) -> None:
         for case in ("tampered_hash", "duplicate_underlying"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 _review_marker, replay_one_marker, replay_two_marker = evidence
                 payload = json.loads(replay_two_marker.read_bytes())
@@ -6976,9 +7051,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             ):
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 marker = evidence[0]
                 receipt = self.source_receipt_from_marker(root, marker)
@@ -7003,9 +7076,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                     payload = json.loads(marker.read_bytes())
                     payload["source_receipt"] = {
                         "path": alias.relative_to(root).as_posix(),
-                        "sha256": (
-                            _sha256(receipt) if attack != "fifo" else "a" * 64
-                        ),
+                        "sha256": (_sha256(receipt) if attack != "fifo" else "a" * 64),
                     }
                     marker.write_bytes(canonical_json_bytes(payload) + b"\n")
                 with self.assertRaisesRegex(
@@ -7023,13 +7094,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.assertEqual(
                     self.registry.load_execution_registry(root, run_spec), initial
                 )
-    def test_sources_ready_missing_receipts_quarantines_with_inventory_binding(self) -> None:
+
+    def test_sources_ready_missing_receipts_quarantines_with_inventory_binding(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
-            initial = self.advance(
-                root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-            )
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, _evidence = self.write_real_source_evidence(root)
             with self.assertRaisesRegex(ValueError, "artifact|evidence"):
                 self.registry.advance_execution_phase(
@@ -7064,9 +7136,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
-            initial = self.advance(
-                root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-            )
+            initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
             review, replay_one, replay_two = evidence
             with self.assertRaisesRegex(ValueError, "artifact|evidence"):
@@ -7117,7 +7187,9 @@ class ExecutionRegistryTest(unittest.TestCase):
         inventory: Path,
         evidence: tuple[Path, ...],
     ) -> None:
-        with self.assertRaisesRegex(ValueError, "schema|source|evidence|review|replay|binding"):
+        with self.assertRaisesRegex(
+            ValueError, "schema|source|evidence|review|replay|binding"
+        ):
             self.registry.advance_execution_phase(
                 root,
                 run_spec,
@@ -7148,9 +7220,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 review_marker, replay_one_marker, _replay_two_marker = evidence
                 target_marker = (
@@ -7190,7 +7260,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             replay_one = self.source_receipt_from_marker(root, replay_one_marker)
             replay_two = self.source_receipt_from_marker(root, replay_two_marker)
             payload = json.loads(replay_two.read_bytes())
-            payload["execution_id"] = json.loads(replay_one.read_bytes())["execution_id"]
+            payload["execution_id"] = json.loads(replay_one.read_bytes())[
+                "execution_id"
+            ]
             replay_two.write_bytes(canonical_json_bytes(payload) + b"\n")
             self.rebind_source_marker(replay_two_marker, replay_two)
             self._assert_sources_ready_rejected_and_quarantined(
@@ -7207,9 +7279,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
-                initial = self.advance(
-                    root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING"
-                )
+                initial = self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
                 inventory, evidence = self.write_real_source_evidence(root)
                 review_marker, _replay_one_marker, _replay_two_marker = evidence
                 review = self.source_receipt_from_marker(root, review_marker)
@@ -7264,7 +7334,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             strict = schema_path.read_bytes()
             original = self.registry._validate_bound_schema
 
-            def replace_schema_during_validation(*args: object, **kwargs: object) -> object:
+            def replace_schema_during_validation(
+                *args: object, **kwargs: object
+            ) -> object:
                 if "v5_2_clean_source_replay_receipt.schema.json" not in args:
                     return original(*args, **kwargs)
                 permissive = json.loads(strict)
@@ -7275,11 +7347,16 @@ class ExecutionRegistryTest(unittest.TestCase):
                 finally:
                     schema_path.write_bytes(strict)
 
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_validate_bound_schema",
                 side_effect=replace_schema_during_validation,
-            ), self.assertRaisesRegex(ValueError, "schema|source|evidence|binding|Git"):
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "schema|source|evidence|binding|Git"
+                ),
+            ):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
@@ -7288,9 +7365,13 @@ class ExecutionRegistryTest(unittest.TestCase):
                     inventory_path=inventory,
                     validation_receipts=evidence,
                 )
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
             self.assertEqual(
-                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            self.assertEqual(
+                list(
+                    (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+                ),
                 [],
             )
 
@@ -7343,11 +7424,14 @@ class ExecutionRegistryTest(unittest.TestCase):
                 hook_calls += 1
                 schema_path.write_bytes(strict)
 
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_before_registry_publish",
                 side_effect=replace_schema_once,
-            ), self.assertRaisesRegex(ValueError, "bound Git file identity changed"):
+                ),
+                self.assertRaisesRegex(ValueError, "bound Git file identity changed"),
+            ):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
@@ -7357,9 +7441,13 @@ class ExecutionRegistryTest(unittest.TestCase):
                     validation_receipts=evidence,
                 )
             self.assertEqual(hook_calls, 1)
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
             self.assertEqual(
-                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            self.assertEqual(
+                list(
+                    (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+                ),
                 [],
             )
 
@@ -7392,28 +7480,31 @@ class ExecutionRegistryTest(unittest.TestCase):
                 nonlocal hook_calls
                 hook_calls += 1
 
-            def preserve_old_inventory_contract(
-                *args: object, **kwargs: object
-            ):
+            def preserve_old_inventory_contract(*args: object, **kwargs: object):
                 nonlocal inventory_schema_calls
                 schema_name = args[2] if len(args) > 2 else kwargs["schema_name"]
                 if schema_name == "v5_2_source_inventory.schema.json":
                     inventory_schema_calls += 1
                 return original_schema_validation(*args, **kwargs)
 
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_verify_artifact_snapshots",
                 side_effect=mutate_after_dynamic_rebind,
-            ), patch.object(
+                ),
+                patch.object(
                 self.registry,
                 "_validate_bound_schema",
                 side_effect=preserve_old_inventory_contract,
-            ), patch.object(
+                ),
+                patch.object(
                 self.registry,
                 "_before_registry_publish",
                 side_effect=count_hook,
-            ), self.assertRaisesRegex(ValueError, "late source evidence"):
+                ),
+                self.assertRaisesRegex(ValueError, "late source evidence"),
+            ):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
@@ -7425,9 +7516,13 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertTrue(mutated)
             self.assertEqual(hook_calls, 1)
             self.assertEqual(inventory_schema_calls, 0)
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
             self.assertEqual(
-                list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()),
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
+            self.assertEqual(
+                list(
+                    (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+                ),
                 [],
             )
 
@@ -7463,7 +7558,10 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def test_publication_rejects_replaced_execution_namespace(self) -> None:
         for operation in ("initialize", "advance", "quarantine"):
-            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 initial = None
                 if operation != "initialize":
@@ -7475,17 +7573,18 @@ class ExecutionRegistryTest(unittest.TestCase):
                     execution.rename(displaced)
                     (execution / "phase_receipts").mkdir(parents=True)
                     (execution / "quarantine").mkdir()
-                    (displaced / ".registry.lock").rename(
-                        execution / ".registry.lock"
-                    )
+                    (displaced / ".registry.lock").rename(execution / ".registry.lock")
 
                 hook = getattr(self.registry, "_before_registry_publish", None)
                 self.assertIsNotNone(hook, "registry publish race hook is missing")
-                with patch.object(
+                with (
+                    patch.object(
                     self.registry,
                     "_before_registry_publish",
                     side_effect=replace_namespace,
-                ), self.assertRaisesRegex(ValueError, "identity|namespace|lock"):
+                    ),
+                    self.assertRaisesRegex(ValueError, "identity|namespace|lock"),
+                ):
                     if operation == "initialize":
                         self.initialize(root, run_spec)
                     elif operation == "advance":
@@ -7510,15 +7609,11 @@ class ExecutionRegistryTest(unittest.TestCase):
 
                 self.assertEqual(list((execution / "phase_receipts").iterdir()), [])
                 self.assertEqual(list((execution / "quarantine").iterdir()), [])
-                (execution / ".registry.lock").rename(
-                    displaced / ".registry.lock"
-                )
+                (execution / ".registry.lock").rename(displaced / ".registry.lock")
                 shutil.rmtree(execution)
                 displaced.rename(execution)
                 if initial is None:
-                    self.assertEqual(
-                        list((execution / "phase_receipts").iterdir()), []
-                    )
+                    self.assertEqual(list((execution / "phase_receipts").iterdir()), [])
                 else:
                     self.assertEqual(
                         self.registry.load_execution_registry(root, run_spec),
@@ -7536,17 +7631,18 @@ class ExecutionRegistryTest(unittest.TestCase):
                 execution.rename(displaced)
                 (execution / "phase_receipts").mkdir(parents=True)
                 (execution / "quarantine").mkdir()
-                (displaced / ".registry.lock").rename(
-                    execution / ".registry.lock"
-                )
+                (displaced / ".registry.lock").rename(execution / ".registry.lock")
 
             hook = getattr(self.registry, "_after_registry_publish", None)
             self.assertIsNotNone(hook, "late registry publish hook is missing")
-            with patch.object(
+            with (
+                patch.object(
                 self.registry,
                 "_after_registry_publish",
                 side_effect=replace_namespace,
-            ), self.assertRaisesRegex(ValueError, "identity|namespace|lock"):
+                ),
+                self.assertRaisesRegex(ValueError, "identity|namespace|lock"),
+            ):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
@@ -7557,9 +7653,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 )
 
             self.assertEqual(list((execution / "phase_receipts").iterdir()), [])
-            self.assertEqual(
-                len(list((displaced / "phase_receipts").iterdir())), 1
-            )
+            self.assertEqual(len(list((displaced / "phase_receipts").iterdir())), 1)
             (execution / ".registry.lock").rename(displaced / ".registry.lock")
             shutil.rmtree(execution)
             displaced.rename(execution)
@@ -7577,8 +7671,20 @@ class ExecutionRegistryTest(unittest.TestCase):
             def race():
                 _git(root, "commit", "--allow-empty", "-qm", "racing head")
 
-            with patch.object(self.registry, "_before_registry_publish", side_effect=race), self.assertRaisesRegex(ValueError, "HEAD|identity|snapshot"):
-                self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=root / PROTECTED_RELATIVE, validation_receipts=())
+            with (
+                patch.object(
+                    self.registry, "_before_registry_publish", side_effect=race
+                ),
+                self.assertRaisesRegex(ValueError, "HEAD|identity|snapshot"),
+            ):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
             self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 1)
             with self.assertRaisesRegex(ValueError, "Git HEAD|snapshot"):
                 self.registry.load_execution_registry(root, run_spec)
@@ -7596,8 +7702,20 @@ class ExecutionRegistryTest(unittest.TestCase):
                 lock.write_bytes(b"")
                 return contents
 
-            with patch.object(self.registry, "_success_contents", side_effect=replace_lock), self.assertRaisesRegex(ValueError, "lock.*identity|lock.*replaced"):
-                self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=root / PROTECTED_RELATIVE, validation_receipts=())
+            with (
+                patch.object(
+                    self.registry, "_success_contents", side_effect=replace_lock
+                ),
+                self.assertRaisesRegex(ValueError, "lock.*identity|lock.*replaced"),
+            ):
+                self.registry.advance_execution_phase(
+                    root,
+                    run_spec,
+                    expected_phase="DESIGN_ACCEPTED",
+                    next_phase="ACQUIRING",
+                    inventory_path=root / PROTECTED_RELATIVE,
+                    validation_receipts=(),
+                )
             self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 1)
 
     def test_rejects_root_with_symlink_ancestor(self) -> None:
@@ -7665,7 +7783,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                     inventory_path=inventory,
                     validation_receipts=(),
                 )
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
             quarantine = root / "audit/v5_2_qd/historical/execution/quarantine"
             self.assertEqual(list(quarantine.iterdir()), [])
 
@@ -7683,15 +7803,29 @@ class ExecutionRegistryTest(unittest.TestCase):
                 validation_receipts=(),
             )
             receipt_path = next(
-                path for path in (root / RECEIPTS_RELATIVE).iterdir() if path.name.startswith("000001-")
+                path
+                for path in (root / RECEIPTS_RELATIVE).iterdir()
+                if path.name.startswith("000001-")
             )
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["prior_receipt_sha256"], initial.receipt_sha256)
             self.assertEqual(payload["git_head"], _git(root, "rev-parse", "HEAD"))
-            self.assertEqual(payload["run_spec"], {"path": RUN_SPEC_RELATIVE.as_posix(), "sha256": _sha256(root / RUN_SPEC_RELATIVE)})
-            self.assertEqual(payload["inventory"], {"path": PROTECTED_RELATIVE.as_posix(), "sha256": _sha256(inventory)})
+            self.assertEqual(
+                payload["run_spec"],
+                {
+                    "path": RUN_SPEC_RELATIVE.as_posix(),
+                    "sha256": _sha256(root / RUN_SPEC_RELATIVE),
+                },
+            )
+            self.assertEqual(
+                payload["inventory"],
+                {"path": PROTECTED_RELATIVE.as_posix(), "sha256": _sha256(inventory)},
+            )
             self.assertEqual(payload["validation_receipts"], [])
-            self.assertEqual(payload["implementation_plan"]["git_blob_id"], _git(root, "rev-parse", f"HEAD:{PLAN_RELATIVE}"))
+            self.assertEqual(
+                payload["implementation_plan"]["git_blob_id"],
+                _git(root, "rev-parse", f"HEAD:{PLAN_RELATIVE}"),
+            )
             self.assertEqual(state.inventory_sha256, _sha256(inventory))
 
     def test_failed_validation_quarantines_without_advancing(self) -> None:
@@ -7706,7 +7840,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 validation_receipts=(failed,),
             )
             self.assertIn("execution/quarantine", path.as_posix())
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), initial)
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), initial
+            )
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["attempted_phase"], "ACQUIRING")
             self.assertEqual(payload["git_head"], _git(root, "rev-parse", "HEAD"))
@@ -7714,22 +7850,45 @@ class ExecutionRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "quarantine.*hash"):
                 self.registry.load_execution_registry(root, run_spec)
 
-    def test_rejects_chain_gap_fork_tamper_symlink_hardlink_special_and_rollback(self) -> None:
-        attacks = ("gap", "fork", "tamper", "symlink", "hardlink", "special", "rollback")
+    def test_rejects_chain_gap_fork_tamper_symlink_hardlink_special_and_rollback(
+        self,
+    ) -> None:
+        attacks = (
+            "gap",
+            "fork",
+            "tamper",
+            "symlink",
+            "hardlink",
+            "special",
+            "rollback",
+        )
         for attack in attacks:
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 self.initialize(root, run_spec)
                 receipts = root / RECEIPTS_RELATIVE
                 first = next(receipts.iterdir())
                 if attack == "rollback":
-                    self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING", stem="one")
-                    self.advance(root, run_spec, "ACQUIRING", "SOURCES_READY", stem="two")
-                    next(path for path in receipts.iterdir() if path.name.startswith("000001-")).unlink()
+                    self.advance(
+                        root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING", stem="one"
+                    )
+                    self.advance(
+                        root, run_spec, "ACQUIRING", "SOURCES_READY", stem="two"
+                    )
+                    next(
+                        path
+                        for path in receipts.iterdir()
+                        if path.name.startswith("000001-")
+                    ).unlink()
                 elif attack == "gap":
                     first.rename(receipts / first.name.replace("000000", "000001", 1))
                 elif attack == "fork":
-                    shutil.copy2(first, receipts / f"000000-DESIGN_ACCEPTED-{'0' * 64}.json")
+                    shutil.copy2(
+                        first, receipts / f"000000-DESIGN_ACCEPTED-{'0' * 64}.json"
+                    )
                 elif attack == "tamper":
                     first.write_bytes(first.read_bytes()[:-2] + b"X\n")
                 else:
@@ -7759,14 +7918,23 @@ class ExecutionRegistryTest(unittest.TestCase):
             def transition():
                 barrier.wait()
                 try:
-                    state = self.registry.advance_execution_phase(root, run_spec, expected_phase="DESIGN_ACCEPTED", next_phase="ACQUIRING", inventory_path=inventory, validation_receipts=())
+                    state = self.registry.advance_execution_phase(
+                        root,
+                        run_spec,
+                        expected_phase="DESIGN_ACCEPTED",
+                        next_phase="ACQUIRING",
+                        inventory_path=inventory,
+                        validation_receipts=(),
+                    )
                 except ValueError as exc:
                     return "failure", str(exc)
                 return "success", state
 
             with ThreadPoolExecutor(max_workers=2) as pool:
                 outcomes = list(pool.map(lambda _: transition(), range(2)))
-            self.assertEqual(sorted(outcome[0] for outcome in outcomes), ["failure", "success"])
+            self.assertEqual(
+                sorted(outcome[0] for outcome in outcomes), ["failure", "success"]
+            )
             self.assertEqual(len(list((root / RECEIPTS_RELATIVE).iterdir())), 2)
 
     def test_identical_transition_replay_is_rejected(self) -> None:
@@ -7791,13 +7959,35 @@ class ExecutionRegistryTest(unittest.TestCase):
             root, run_spec = self.make_repo(Path(directory))
             expected = self.initialize(root, run_spec)
             execution = root / "audit/v5_2_qd/historical/execution"
-            before = {path.relative_to(execution): (path.lstat().st_ino, path.lstat().st_size, path.lstat().st_mtime_ns, path.read_bytes() if path.is_file() else None) for path in execution.rglob("*")}
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), expected)
-            after = {path.relative_to(execution): (path.lstat().st_ino, path.lstat().st_size, path.lstat().st_mtime_ns, path.read_bytes() if path.is_file() else None) for path in execution.rglob("*")}
+            before = {
+                path.relative_to(execution): (
+                    path.lstat().st_ino,
+                    path.lstat().st_size,
+                    path.lstat().st_mtime_ns,
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in execution.rglob("*")
+            }
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), expected
+            )
+            after = {
+                path.relative_to(execution): (
+                    path.lstat().st_ino,
+                    path.lstat().st_size,
+                    path.lstat().st_mtime_ns,
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in execution.rglob("*")
+            }
             self.assertEqual(after, before)
 
     def test_schema_is_closed_and_receipts_are_canonical(self) -> None:
-        schema = json.loads((ROOT / "schemas/v5_2_execution_receipt.schema.json").read_text(encoding="utf-8"))
+        schema = json.loads(
+            (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
         jsonschema.Draft202012Validator.check_schema(schema)
         for branch in schema["oneOf"]:
             self.assertFalse(branch["additionalProperties"])
@@ -7808,7 +7998,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             receipt = next((root / RECEIPTS_RELATIVE).iterdir())
             payload = json.loads(receipt.read_bytes())
             jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
-            self.assertEqual(receipt.read_bytes(), canonical_json_bytes(payload) + b"\n")
+            self.assertEqual(
+                receipt.read_bytes(), canonical_json_bytes(payload) + b"\n"
+            )
 
             failed = self.write_artifact(root, "failed.json", {"status": "FAIL"})
             quarantine = self.registry.quarantine_execution_transition(
@@ -7842,7 +8034,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                 format_checker=FORMAT_CHECKER,
             )
 
-    def test_schema_rejects_impossible_phase_sequence_and_prior_combinations(self) -> None:
+    def test_schema_rejects_impossible_phase_sequence_and_prior_combinations(
+        self,
+    ) -> None:
         schema = json.loads(
             (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_text(
                 encoding="utf-8"
@@ -7862,14 +8056,15 @@ class ExecutionRegistryTest(unittest.TestCase):
                 },
             )
             for payload in impossible:
-                with self.subTest(payload=payload), self.assertRaises(
-                    jsonschema.ValidationError
+                with (
+                    self.subTest(payload=payload),
+                    self.assertRaises(jsonschema.ValidationError),
                 ):
-                    jsonschema.validate(
-                        payload, schema, format_checker=FORMAT_CHECKER
-                    )
+                    jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
 
-    def test_automatic_quarantine_schema_and_runtime_enforce_phase_classification_parity(self) -> None:
+    def test_automatic_quarantine_schema_and_runtime_enforce_phase_classification_parity(
+        self,
+    ) -> None:
         schema = json.loads(
             (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
         )
@@ -7892,9 +8087,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             payload = json.loads(quarantine.read_bytes())
             payload["error_classification"] = "SOURCE_GATE_EVIDENCE_INVALID"
             with self.assertRaises(jsonschema.ValidationError):
-                jsonschema.validate(
-                    payload, schema, format_checker=FORMAT_CHECKER
-                )
+                jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
             with self.assertRaisesRegex(ValueError, "classification|phase|schema"):
                 self.registry._validate_quarantine_receipt(payload)
 
@@ -7907,7 +8100,9 @@ class ExecutionRegistryTest(unittest.TestCase):
                     format_checker=FORMAT_CHECKER,
                 )
 
-    def test_automatic_quarantine_schema_accepts_only_supported_phase_mapping(self) -> None:
+    def test_automatic_quarantine_schema_accepts_only_supported_phase_mapping(
+        self,
+    ) -> None:
         schema = json.loads(
             (ROOT / "schemas/v5_2_execution_receipt.schema.json").read_bytes()
         )
@@ -7934,9 +8129,7 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "error_classification": "SOURCE_GATE_EVIDENCE_INVALID",
             }
             for valid in (acquiring, sources_ready):
-                jsonschema.validate(
-                    valid, schema, format_checker=FORMAT_CHECKER
-                )
+                jsonschema.validate(valid, schema, format_checker=FORMAT_CHECKER)
             invalid = (
                 {**acquiring, "attempted_phase": "OOF_SEALED"},
                 {
@@ -7949,12 +8142,11 @@ class ExecutionRegistryTest(unittest.TestCase):
                 },
             )
             for payload in invalid:
-                with self.subTest(payload=payload), self.assertRaises(
-                    jsonschema.ValidationError
+                with (
+                    self.subTest(payload=payload),
+                    self.assertRaises(jsonschema.ValidationError),
                 ):
-                    jsonschema.validate(
-                        payload, schema, format_checker=FORMAT_CHECKER
-                    )
+                    jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
 
     def test_rejects_invalid_receipt_paths_on_emit_and_load(self) -> None:
         schema = json.loads(
@@ -7997,14 +8189,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             (root / invalid_path).write_bytes((root / PROTECTED_RELATIVE).read_bytes())
             payload["inventory"]["path"] = invalid_path
             with self.assertRaises(jsonschema.ValidationError):
-                jsonschema.validate(
-                    payload, schema, format_checker=FORMAT_CHECKER
-                )
+                jsonschema.validate(payload, schema, format_checker=FORMAT_CHECKER)
             contents = canonical_json_bytes(payload) + b"\n"
             digest = hashlib.sha256(contents).hexdigest()
-            replacement = receipt.with_name(
-                f"000000-DESIGN_ACCEPTED-{digest}.json"
-            )
+            replacement = receipt.with_name(f"000000-DESIGN_ACCEPTED-{digest}.json")
             receipt.unlink()
             replacement.write_bytes(contents)
             with self.assertRaisesRegex(ValueError, "path|backslash|schema"):
@@ -8012,7 +8200,10 @@ class ExecutionRegistryTest(unittest.TestCase):
 
     def test_rejects_dirty_bound_execution_code_but_not_unrelated_files(self) -> None:
         for relative in BOUND_EXECUTION_CODE:
-            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(relative=relative),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 with (root / relative).open("a", encoding="utf-8") as handle:
                     handle.write("\n")
@@ -8030,7 +8221,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             Path("schemas/v5_2_source_receipt_commit.schema.json"),
         )
         for relative in finalization_authority:
-            with self.subTest(untracked_relative=relative), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(untracked_relative=relative),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root, run_spec = self.make_repo(Path(directory))
                 _git(root, "rm", "--cached", "--", relative.as_posix())
                 with self.assertRaisesRegex(ValueError, "execution code|dirty"):
@@ -8062,9 +8256,7 @@ class ExecutionRegistryTest(unittest.TestCase):
         self.assertEqual(set(self.registry._BOUND_EXECUTION_CODE), required)
 
     def test_bound_execution_import_closure_is_computed_and_exact(self) -> None:
-        computed = _repository_local_import_closure(
-            ROOT, EXECUTION_IMPORT_ROOT_MODULES
-        )
+        computed = _repository_local_import_closure(ROOT, EXECUTION_IMPORT_ROOT_MODULES)
         self.assertEqual(
             computed & PASSIVE_IMPORT_CLOSURE_EXCLUSIONS,
             PASSIVE_IMPORT_CLOSURE_EXCLUSIONS,
@@ -8103,12 +8295,8 @@ class ExecutionRegistryTest(unittest.TestCase):
                 root, ("mlb_backtest.acquisition",)
             )
 
-            (package / "new_dependency.py").write_text(
-                "VALUE = 2\n", encoding="utf-8"
-            )
-            acquisition.write_text(
-                "from . import new_dependency\n", encoding="utf-8"
-            )
+            (package / "new_dependency.py").write_text("VALUE = 2\n", encoding="utf-8")
+            acquisition.write_text("from . import new_dependency\n", encoding="utf-8")
             after = _repository_local_import_closure(
                 root, ("mlb_backtest.acquisition",)
             )
@@ -8130,9 +8318,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             package = root / "mlb_backtest"
             package.mkdir()
             (package / "__init__.py").write_text("", encoding="utf-8")
-            (package / "new_dependency.py").write_text(
-                "VALUE = 2\n", encoding="utf-8"
-            )
+            (package / "new_dependency.py").write_text("VALUE = 2\n", encoding="utf-8")
             (package / "acquisition.py").write_text(
                 "def acquire():\n"
                 "    if True:\n"
@@ -8266,9 +8452,13 @@ class ExecutionRegistryTest(unittest.TestCase):
                 os.replace(replacement, receipt)
                 return data
 
-            with patch.object(self.registry, "_read_fd_all", side_effect=replace_after_read), self.assertRaisesRegex((ValueError, RuntimeError), "changed|identity"):
+            with (
+                patch.object(
+                    self.registry, "_read_fd_all", side_effect=replace_after_read
+                ),
+                self.assertRaisesRegex((ValueError, RuntimeError), "changed|identity"),
+            ):
                 self.registry.load_execution_registry(root, run_spec)
-
 
     def test_plan_a_amendment_binding_is_rehashed_on_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8277,7 +8467,9 @@ class ExecutionRegistryTest(unittest.TestCase):
             (root / AMENDMENT_RELATIVE).write_bytes(
                 (root / AMENDMENT_RELATIVE).read_bytes() + b"tampered\n"
             )
-            with self.assertRaisesRegex(ValueError, "amendment|binding|hash|dirty|worktree"):
+            with self.assertRaisesRegex(
+                ValueError, "amendment|binding|hash|dirty|worktree"
+            ):
                 self.registry.load_execution_registry(root, run_spec)
 
     def test_sources_ready_allows_multiple_consistent_approved_reviews(self) -> None:
@@ -8312,22 +8504,35 @@ class ExecutionRegistryTest(unittest.TestCase):
                 expected_phase="ACQUIRING",
                 next_phase="SOURCES_READY",
                 inventory_path=inventory,
-                validation_receipts=(review_marker, extra_marker, replay_one, replay_two),
+                validation_receipts=(
+                    review_marker,
+                    extra_marker,
+                    replay_one,
+                    replay_two,
+                ),
             )
             self.assertEqual(state.phase, "SOURCES_READY")
 
-    def test_public_sources_ready_prevalidator_is_read_only_for_valid_evidence(self) -> None:
+    def test_public_sources_ready_prevalidator_is_read_only_for_valid_evidence(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
             self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
             checkpoint = next(
-                (root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints").iterdir()
+                (
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                ).iterdir()
             )
             before = tuple(
                 sorted(
-                    (path.relative_to(root).as_posix(), path.lstat().st_ino, path.read_bytes())
+                    (
+                        path.relative_to(root).as_posix(),
+                        path.lstat().st_ino,
+                        path.read_bytes(),
+                    )
                     for path in (root / "audit/v5_2_qd/historical/execution").rglob("*")
                     if path.is_file()
                 )
@@ -8341,7 +8546,11 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             after = tuple(
                 sorted(
-                    (path.relative_to(root).as_posix(), path.lstat().st_ino, path.read_bytes())
+                    (
+                        path.relative_to(root).as_posix(),
+                        path.lstat().st_ino,
+                        path.read_bytes(),
+                    )
                     for path in (root / "audit/v5_2_qd/historical/execution").rglob("*")
                     if path.is_file()
                 )
@@ -8358,8 +8567,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             inventory, evidence = self.write_real_source_evidence(root)
             checkpoint = next(
                 (
-                    root
-                    / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
                 ).iterdir()
             )
             dependency_paths = (
@@ -8368,9 +8576,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             for index, path in enumerate(dependency_paths):
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(
-                    canonical_json_bytes({"dependency": index}) + b"\n"
-                )
+                path.write_bytes(canonical_json_bytes({"dependency": index}) + b"\n")
             original_validate = self.registry._validate_sources_ready_evidence
             original_terminal = self.registry._terminal_checkpoint_head
             mutated = False
@@ -8440,9 +8646,7 @@ class ExecutionRegistryTest(unittest.TestCase):
             )
             for index, path in enumerate(dependency_paths):
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(
-                    canonical_json_bytes({"dependency": index}) + b"\n"
-                )
+                path.write_bytes(canonical_json_bytes({"dependency": index}) + b"\n")
             original_validate = self.registry._validate_phase_evidence
             mutated = False
 
@@ -8484,17 +8688,23 @@ class ExecutionRegistryTest(unittest.TestCase):
                 self.registry.load_execution_registry(root, run_spec), first
             )
 
-    def test_public_sources_ready_prevalidator_rejects_duplicate_markers_without_writing(self) -> None:
+    def test_public_sources_ready_prevalidator_rejects_duplicate_markers_without_writing(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
             self.advance(root, run_spec, "DESIGN_ACCEPTED", "ACQUIRING")
             inventory, evidence = self.write_real_source_evidence(root)
             checkpoint = next(
-                (root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints").iterdir()
+                (
+                    root / "audit/v5_2_qd/historical/execution/acquisition_checkpoints"
+                ).iterdir()
             )
             receipts = root / RECEIPTS_RELATIVE
-            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+            before = tuple(
+                sorted((path.name, path.read_bytes()) for path in receipts.iterdir())
+            )
             with self.assertRaises(ValueError):
                 self.registry.validate_sources_ready_evidence_set(
                     root,
@@ -8504,11 +8714,17 @@ class ExecutionRegistryTest(unittest.TestCase):
                     validation_receipts=(evidence[0], evidence[1], evidence[1]),
                 )
             self.assertEqual(
-                tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())),
+                tuple(
+                    sorted(
+                        (path.name, path.read_bytes()) for path in receipts.iterdir()
+                    )
+                ),
                 before,
             )
 
-    def test_sources_ready_exact_retry_returns_existing_without_new_receipt(self) -> None:
+    def test_sources_ready_exact_retry_returns_existing_without_new_receipt(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -8520,17 +8736,29 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "inventory_path": inventory,
                 "validation_receipts": evidence,
             }
-            advanced = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            advanced = self.registry.advance_execution_phase(
+                root, run_spec, **arguments
+            )
             receipts = root / RECEIPTS_RELATIVE
-            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
-            existing = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            before = tuple(
+                sorted((path.name, path.read_bytes()) for path in receipts.iterdir())
+            )
+            existing = self.registry.advance_execution_phase(
+                root, run_spec, **arguments
+            )
             self.assertEqual(existing, advanced)
             self.assertEqual(
-                tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())),
+                tuple(
+                    sorted(
+                        (path.name, path.read_bytes()) for path in receipts.iterdir()
+                    )
+                ),
                 before,
             )
 
-    def test_sources_ready_retry_rejects_reordered_or_changed_evidence_without_quarantine(self) -> None:
+    def test_sources_ready_retry_rejects_reordered_or_changed_evidence_without_quarantine(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -8542,14 +8770,21 @@ class ExecutionRegistryTest(unittest.TestCase):
                 "inventory_path": inventory,
                 "validation_receipts": evidence,
             }
-            advanced = self.registry.advance_execution_phase(root, run_spec, **arguments)
+            advanced = self.registry.advance_execution_phase(
+                root, run_spec, **arguments
+            )
             receipts = root / RECEIPTS_RELATIVE
-            before = tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir()))
+            before = tuple(
+                sorted((path.name, path.read_bytes()) for path in receipts.iterdir())
+            )
             with self.assertRaisesRegex(ValueError, "retry evidence differs"):
                 self.registry.advance_execution_phase(
                     root,
                     run_spec,
-                    **{**arguments, "validation_receipts": (evidence[0], evidence[2], evidence[1])},
+                    **{
+                        **arguments,
+                        "validation_receipts": (evidence[0], evidence[2], evidence[1]),
+                    },
                 )
             for changed in (evidence[:2], (*evidence, evidence[0])):
                 with self.subTest(changed=len(changed)), self.assertRaises(ValueError):
@@ -8558,16 +8793,46 @@ class ExecutionRegistryTest(unittest.TestCase):
                         run_spec,
                         **{**arguments, "validation_receipts": changed},
                     )
-            self.assertEqual(self.registry.load_execution_registry(root, run_spec), advanced)
-            self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
-            self.assertEqual(list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()), [])
+            self.assertEqual(
+                self.registry.load_execution_registry(root, run_spec), advanced
+            )
+            self.assertEqual(
+                tuple(
+                    sorted(
+                        (path.name, path.read_bytes()) for path in receipts.iterdir()
+                    )
+                ),
+                before,
+            )
+            self.assertEqual(
+                list(
+                    (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+                ),
+                [],
+            )
             inventory.write_bytes(inventory.read_bytes() + b" ")
-            with self.assertRaisesRegex(ValueError, "retry evidence differs|phase inventory"):
+            with self.assertRaisesRegex(
+                ValueError, "retry evidence differs|phase inventory"
+            ):
                 self.registry.advance_execution_phase(root, run_spec, **arguments)
-            self.assertEqual(tuple(sorted((path.name, path.read_bytes()) for path in receipts.iterdir())), before)
-            self.assertEqual(list((root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()), [])
+            self.assertEqual(
+                tuple(
+                    sorted(
+                        (path.name, path.read_bytes()) for path in receipts.iterdir()
+                    )
+                ),
+                before,
+            )
+            self.assertEqual(
+                list(
+                    (root / "audit/v5_2_qd/historical/execution/quarantine").iterdir()
+                ),
+                [],
+            )
 
-    def test_concurrent_identical_sources_ready_requests_converge_to_one_receipt(self) -> None:
+    def test_concurrent_identical_sources_ready_requests_converge_to_one_receipt(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, run_spec = self.make_repo(Path(directory))
             self.initialize(root, run_spec)
@@ -8591,7 +8856,13 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertEqual(outcomes[0], outcomes[1])
             self.assertEqual(outcomes[0].phase, "SOURCES_READY")
             self.assertEqual(
-                len([path for path in (root / RECEIPTS_RELATIVE).iterdir() if "SOURCES_READY" in path.name]),
+                len(
+                    [
+                        path
+                        for path in (root / RECEIPTS_RELATIVE).iterdir()
+                        if "SOURCES_READY" in path.name
+                    ]
+                ),
                 1,
             )
 
@@ -8607,21 +8878,39 @@ class ExecutionRegistryTest(unittest.TestCase):
                 barrier.wait()
                 try:
                     return self.registry.advance_execution_phase(
-                        root, run_spec, expected_phase="ACQUIRING", next_phase="SOURCES_READY",
-                        inventory_path=inventory, validation_receipts=receipts,
+                        root,
+                        run_spec,
+                        expected_phase="ACQUIRING",
+                        next_phase="SOURCES_READY",
+                        inventory_path=inventory,
+                        validation_receipts=receipts,
                     )
                 except ValueError as exc:
                     return exc
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                outcomes = list(pool.map(advance_once, (evidence, (evidence[0], evidence[2], evidence[1]))))
+                outcomes = list(
+                    pool.map(
+                        advance_once,
+                        (evidence, (evidence[0], evidence[2], evidence[1])),
+                    )
+                )
             self.assertEqual(
-                sum(isinstance(item, self.registry.ExecutionRegistryState) for item in outcomes),
+                sum(
+                    isinstance(item, self.registry.ExecutionRegistryState)
+                    for item in outcomes
+                ),
                 1,
             )
             self.assertEqual(sum(isinstance(item, ValueError) for item in outcomes), 1)
             self.assertEqual(
-                len([path for path in (root / RECEIPTS_RELATIVE).iterdir() if "SOURCES_READY" in path.name]),
+                len(
+                    [
+                        path
+                        for path in (root / RECEIPTS_RELATIVE).iterdir()
+                        if "SOURCES_READY" in path.name
+                    ]
+                ),
                 1,
             )
 

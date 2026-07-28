@@ -1089,8 +1089,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     )
                 )
                 checkpoint = SimpleNamespace(
-                    receipt_sha256=("e" if stage == "STATIC_SCHEDULES" else "f")
-                    * 64,
+                    receipt_sha256=("e" if stage == "STATIC_SCHEDULES" else "f") * 64,
                     stage=stage,
                     query_batch_ids=tuple(batch.batch_id for batch in batches),
                     completed_query_ids=query_ids,
@@ -1131,8 +1130,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 "schedule_anchor_inventory.json"
             )
             old_relative = Path(
-                "audit/v5_2_qd/historical/acquisition/"
-                "schedule_anchor_inventory.json"
+                "audit/v5_2_qd/historical/acquisition/schedule_anchor_inventory.json"
             )
             self.assertEqual(
                 _schedule_inventory_relative(fixture.run_spec), source_relative
@@ -1147,8 +1145,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             )
 
             old_run = load_run_spec(
-                fixture.root
-                / "protocols/v5_2_qd/historical_walkforward_500.json"
+                fixture.root / "protocols/v5_2_qd/historical_walkforward_500.json"
             )
             self.assertEqual(_schedule_inventory_relative(old_run), old_relative)
             self.assertEqual(
@@ -1185,9 +1182,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             source_run = load_source_run_spec(
                 fixture.root / SOURCE_RUN_SPEC_PATH.relative_to(INVENTORY_ROOT)
             )
-            self.assertEqual(
-                _schedule_inventory_relative(source_run), source_relative
-            )
+            self.assertEqual(_schedule_inventory_relative(source_run), source_relative)
 
     def test_source_timezone_continuation_uses_exact_authority_and_evidence(
         self,
@@ -1202,13 +1197,11 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         source_run = load_source_run_spec(
-            ROOT
-            / "protocols/v5_2_qd/"
+            ROOT / "protocols/v5_2_qd/"
             "historical_walkforward_500_superseding_565534.json"
         )
         source_contract = Path(
-            "protocols/v5_2_qd/"
-            "historical_source_acquisition_superseding_565534.json"
+            "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
         )
         static_query = _query()
         reference_query = dataclasses.replace(
@@ -1223,9 +1216,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             queries=(reference_query,),
         )
         completed_ids = tuple(
-            sorted(
-                (logical_query_id(static_query), logical_query_id(reference_query))
-            )
+            sorted((logical_query_id(static_query), logical_query_id(reference_query)))
         )
         dispositioned_id = logical_query_id(static_query)
         latest = SimpleNamespace(
@@ -1252,8 +1243,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 acquisition_contract_path=root / source_contract,
             )
             inventory = SimpleNamespace(
-                path=root
-                / "audit/v5_2_qd/historical_superseding_565534/"
+                path=root / "audit/v5_2_qd/historical_superseding_565534/"
                 "acquisition/schedule_anchor_inventory.json",
                 sha256="1" * 64,
             )
@@ -1307,7 +1297,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     )
                 )
                 stack.enter_context(
-                    patch("mlb_backtest.v52_acquire.V52EvidenceStore", return_value=object())
+                    patch(
+                        "mlb_backtest.v52_acquire.V52EvidenceStore",
+                        return_value=object(),
+                    )
                 )
                 stack.enter_context(
                     patch(
@@ -1353,7 +1346,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     )
                 )
                 stack.enter_context(
-                    patch("mlb_backtest.v52_acquire._validate_schedule_inventory_schema")
+                    patch(
+                        "mlb_backtest.v52_acquire._validate_schedule_inventory_schema"
+                    )
                 )
                 stack.enter_context(
                     patch(
@@ -1394,13 +1389,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
 
             candidate.assert_called_once_with(
                 root=root,
-                evidence_root=(
-                    root / "data/v5_2_qd/historical_superseding_565534/raw"
-                ),
+                evidence_root=(root / "data/v5_2_qd/historical_superseding_565534/raw"),
                 batch_ids=(static.batch_id, reference.batch_id),
                 run_spec_path=(
-                    root
-                    / "protocols/v5_2_qd/"
+                    root / "protocols/v5_2_qd/"
                     "historical_walkforward_500_superseding_565534.json"
                 ),
                 acquisition_contract_path=root / source_contract,
@@ -1410,8 +1402,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             game_inventory.assert_called_once_with(
                 root,
                 run_spec_path=(
-                    root
-                    / "protocols/v5_2_qd/"
+                    root / "protocols/v5_2_qd/"
                     "historical_walkforward_500_superseding_565534.json"
                 ),
                 acquisition_contract_path=root / source_contract,
@@ -1419,9 +1410,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             publish.assert_called_once()
             self.assertEqual(len(checkpoint_calls), 1)
             self.assertEqual(checkpoint_calls[0]["stage"], "TIMEZONE_REVIEW")
-            self.assertEqual(
-                checkpoint_calls[0]["stage_evidence_receipts"], evidence
-            )
+            self.assertEqual(checkpoint_calls[0]["stage_evidence_receipts"], evidence)
             self.assertEqual(
                 checkpoint_calls[0]["dispositioned_query_ids"],
                 (dispositioned_id,),
@@ -1471,9 +1460,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 if path.is_file()
             }
             before_directories = {
-                path.relative_to(root)
-                for path in root.rglob("*")
-                if path.is_dir()
+                path.relative_to(root) for path in root.rglob("*") if path.is_dir()
             }
             summary = acquire_sources(
                 root,
@@ -1494,9 +1481,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 if path.is_file()
             }
             after_directories = {
-                path.relative_to(root)
-                for path in root.rglob("*")
-                if path.is_dir()
+                path.relative_to(root) for path in root.rglob("*") if path.is_dir()
             }
             self.assertEqual(after, before)
             self.assertEqual(after_directories, before_directories)
@@ -1885,7 +1870,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             plan = _AcquisitionPlan(
                 "a" * 64,
                 ("b" * 64, "c" * 64, "d" * 64),
-                ("PROMOTED", *('FETCH_REQUIRED' for _ in range(47))),
+                ("PROMOTED", *("FETCH_REQUIRED" for _ in range(47))),
             )
             checkpoint = SimpleNamespace(
                 stage="REMAINING",
@@ -1933,9 +1918,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 _real_replay_terminal(request, plan)
 
             self.assertEqual(calls, [True])
-            self.assertEqual(
-                (marker.read_bytes(), marker.stat().st_ino), before
-            )
+            self.assertEqual((marker.read_bytes(), marker.stat().st_ino), before)
 
     def test_pre_network_gate_reauthenticates_pending_authority_then_checks_disk(
         self,
@@ -2136,7 +2119,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 batches=(batch,),
                 stage_evidence=(),
                 expected_prior=result.checkpoint.receipt_sha256,
-                fetcher=lambda *_args, **_kwargs: self.fail("verified success refetched"),
+                fetcher=lambda *_args, **_kwargs: self.fail(
+                    "verified success refetched"
+                ),
                 checkpoint_publisher=publish,
                 query_acquirer=lambda *_args, **_kwargs: self.fail(
                     "verified success reacquired"
@@ -2147,7 +2132,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(events, ["checkpoint"])
-            self.assertEqual((rerun.fetched, rerun.resumed, rerun.network_attempts), (0, 1, 0))
+            self.assertEqual(
+                (rerun.fetched, rerun.resumed, rerun.network_attempts), (0, 1, 0)
+            )
 
     def test_stage_quarantine_publishes_nonterminal_checkpoint_and_blocks(self) -> None:
         from mlb_backtest.v52_acquire import (
@@ -2200,7 +2187,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             (logical_query_id(query),),
         )
 
-    def test_real_stage_runner_seals_static_before_inventory_and_reference(self) -> None:
+    def test_real_stage_runner_seals_static_before_inventory_and_reference(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             _AcquisitionPlan,
             _RunnerGuard,
@@ -2250,7 +2239,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             quarantined_query_ids=(),
             split_query_ids=(),
         )
-        inventory = SimpleNamespace(path=request.root / "schedule.json", sha256="1" * 64)
+        inventory = SimpleNamespace(
+            path=request.root / "schedule.json", sha256="1" * 64
+        )
         events: list[str] = []
         runner_guard = _RunnerGuard(10, 11, request.root)
 
@@ -2288,8 +2279,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             ),
             patch(
                 "mlb_backtest.v52_schedule_inventory.publish_schedule_anchor_inventory",
-                side_effect=lambda *_args, **_kwargs: events.append("inventory")
-                or inventory,
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("inventory") or inventory
+                ),
             ),
             patch(
                 "mlb_backtest.v52_acquire._validate_schedule_inventory_schema",
@@ -2297,22 +2289,33 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             ),
             patch(
                 "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
-                side_effect=lambda *_args, **_kwargs: events.append("build-reference")
-                or reference,
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("build-reference") or reference
+                ),
             ),
             patch("mlb_backtest.v52_acquire._execute_stage", side_effect=execute),
         ):
             summary = _real_run_stages(request, plan)
 
-        self.assertLess(events.index("execute:STATIC_SCHEDULES"), events.index("inventory"))
+        self.assertLess(
+            events.index("execute:STATIC_SCHEDULES"), events.index("inventory")
+        )
         self.assertLess(events.index("inventory"), events.index("schema"))
         self.assertLess(events.index("schema"), events.index("build-reference"))
-        self.assertLess(events.index("publish:reference"), events.index("execute:REFERENCE_INPUTS"))
-        self.assertEqual(summary.query_batch_sha256s, (static.batch_id, reference.batch_id))
-        self.assertEqual((summary.fetched, summary.resumed, summary.network_attempts), (18, 2, 18))
+        self.assertLess(
+            events.index("publish:reference"), events.index("execute:REFERENCE_INPUTS")
+        )
+        self.assertEqual(
+            summary.query_batch_sha256s, (static.batch_id, reference.batch_id)
+        )
+        self.assertEqual(
+            (summary.fetched, summary.resumed, summary.network_attempts), (18, 2, 18)
+        )
         self.assertEqual((summary.pending, summary.quarantined), (0, 0))
 
-    def test_preseason_disposition_completes_without_gate_or_network_attempt(self) -> None:
+    def test_preseason_disposition_completes_without_gate_or_network_attempt(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
 
         query = LogicalQuery(
@@ -2340,7 +2343,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         checkpoints: list[SimpleNamespace] = []
 
         def publish(**values):
-            result = SimpleNamespace(receipt_sha256=f"{len(checkpoints) + 1:064x}", **values)
+            result = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
             checkpoints.append(result)
             return result
 
@@ -2361,9 +2366,13 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             verified = store.read_verified_success(query)
         self.assertEqual(result.network_attempts, 0)
         self.assertEqual(result.fetched, 0)
-        self.assertEqual(verified.published_evidence.storage_mode, "DERIVED_DISPOSITION")
+        self.assertEqual(
+            verified.published_evidence.storage_mode, "DERIVED_DISPOSITION"
+        )
 
-    def test_schedule_disposition_does_not_receive_generic_reason_semantics(self) -> None:
+    def test_schedule_disposition_does_not_receive_generic_reason_semantics(
+        self,
+    ) -> None:
         from contextlib import nullcontext
 
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
@@ -2474,7 +2483,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             selected = _source_disposition_authorities(request, (batch,))
         self.assertEqual(
             selected,
-            {logical_query_id(query): authority for query, authority in zip(queries, authorities)},
+            {
+                logical_query_id(query): authority
+                for query, authority in zip(queries, authorities)
+            },
         )
 
     def test_legacy_v521_disposition_never_builds_recovery_catalog(self) -> None:
@@ -2494,8 +2506,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         request = dataclasses.replace(
             self._request(plan_only=True),
             run_spec=load_source_run_spec(
-                ROOT
-                / "protocols/v5_2_qd/"
+                ROOT / "protocols/v5_2_qd/"
                 "historical_walkforward_500_superseding_565534.json"
             ),
         )
@@ -2515,7 +2526,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             selected = _source_disposition_authorities(request, (batch,))
         self.assertEqual(selected, {logical_query_id(query): legacy_authority})
 
-    def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(self) -> None:
+    def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
 
         stats_queries = tuple(
@@ -2562,7 +2575,11 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
 
         def fetcher(query, *, timeout, max_bytes):
             del timeout, max_bytes
-            host = "baseballsavant.mlb.com" if "savant" in query.endpoint else "statsapi.mlb.com"
+            host = (
+                "baseballsavant.mlb.com"
+                if "savant" in query.endpoint
+                else "statsapi.mlb.com"
+            )
             with lock:
                 active[host] += 1
                 peak[host] = max(peak[host], active[host])
@@ -2614,7 +2631,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(events.count("checkpoint"), 2)
         self.assertEqual(events[-1], "checkpoint")
 
-    def test_stage_unexpected_runtime_error_is_not_relabelled_or_checkpointed(self) -> None:
+    def test_stage_unexpected_runtime_error_is_not_relabelled_or_checkpointed(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
 
         query = _query()
@@ -2689,7 +2708,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
 
         for fatal_type in (RuntimeError, KeyboardInterrupt):
-            with self.subTest(fatal_type=fatal_type.__name__), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(fatal_type=fatal_type.__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 rendezvous = threading.Barrier(2)
                 lock = threading.Lock()
                 reservations: list[str] = []
@@ -2745,15 +2767,14 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         batches=(batch,),
                         stage_evidence=(),
                         expected_prior=None,
-                        fetcher=lambda item, **_kwargs: fetches.append(
-                            logical_query_id(item)
-                        )
-                        or _capture(),
+                        fetcher=lambda item, **_kwargs: (
+                            fetches.append(logical_query_id(item)) or _capture()
+                        ),
                         checkpoint_publisher=publish,
                         query_acquirer=acquire,
                         parser=parser,
-                        network_gate=lambda _request, _plan, *, query, **_kwargs: gates.append(
-                            logical_query_id(query)
+                        network_gate=lambda _request, _plan, *, query, **_kwargs: (
+                            gates.append(logical_query_id(query))
                         ),
                         disk_budget=TrackingBudget(),
                     )
@@ -2823,10 +2844,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     batches=(batch,),
                     stage_evidence=(),
                     expected_prior=None,
-                    fetcher=lambda item, **_kwargs: fetches.append(
-                        logical_query_id(item)
-                    )
-                    or _capture(),
+                    fetcher=lambda item, **_kwargs: (
+                        fetches.append(logical_query_id(item)) or _capture()
+                    ),
                     checkpoint_publisher=publish,
                     query_acquirer=acquire,
                     parser=parser,
@@ -2861,7 +2881,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         selected: list[str] = []
 
         for delays in ((0.1, 0.05, 0.0), (0.0, 0.05, 0.1)):
-            with self.subTest(delays=delays), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(delays=delays),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 rendezvous = threading.Barrier(3)
                 delay_by_id = {
                     logical_query_id(query): delay
@@ -2962,7 +2985,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         batch = SimpleNamespace(batch_id="e" * 64, queries=(savant, *stats))
 
         for interrupt_site in ("submission", "as_completed"):
-            with self.subTest(site=interrupt_site), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(site=interrupt_site),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 gates: list[str] = []
                 fetches: list[str] = []
                 checkpoints: list[SimpleNamespace] = []
@@ -3025,15 +3051,14 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         batches=(batch,),
                         stage_evidence=(),
                         expected_prior=None,
-                        fetcher=lambda item, **_kwargs: fetches.append(
-                            logical_query_id(item)
-                        )
-                        or _capture(),
+                        fetcher=lambda item, **_kwargs: (
+                            fetches.append(logical_query_id(item)) or _capture()
+                        ),
                         checkpoint_publisher=publish,
                         query_acquirer=acquire,
                         parser=lambda _raw, _query: {},
-                        network_gate=lambda _request, _plan, *, query, **_kwargs: gates.append(
-                            logical_query_id(query)
+                        network_gate=lambda _request, _plan, *, query, **_kwargs: (
+                            gates.append(logical_query_id(query))
                         ),
                     )
                 self.assertEqual(gates, [])
@@ -3061,8 +3086,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         request = self._request(plan_only=False, resume=True)
         budget = _DiskBudget(
             request,
-            free_bytes=lambda _root: request.reserve_bytes
-            + 2 * fetch_limits(sleeping).max_bytes,
+            free_bytes=lambda _root: (
+                request.reserve_bytes + 2 * fetch_limits(sleeping).max_bytes
+            ),
         )
         sleeper_entered = threading.Event()
         checkpoints: list[SimpleNamespace] = []
@@ -3127,10 +3153,13 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         selected: list[str] = []
 
         for trust_delay, programmer_delay in ((0.05, 0.0), (0.0, 0.05)):
-            with self.subTest(
+            with (
+                self.subTest(
                 trust_delay=trust_delay,
                 programmer_delay=programmer_delay,
-            ), tempfile.TemporaryDirectory() as directory:
+                ),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 admitted: list[str] = []
                 operational_completed = threading.Event()
                 trust_admitted = threading.Event()
@@ -3218,7 +3247,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 )
         self.assertFalse(published)
 
-    def test_remaining_wave_joins_every_worker_before_returning_sorted_splits(self) -> None:
+    def test_remaining_wave_joins_every_worker_before_returning_sorted_splits(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             SplitRequired,
             _AcquisitionPlan,
@@ -3228,7 +3259,11 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         split = _query(statcast=True)
         completed = dataclasses.replace(
             _query(statcast=True),
-            parameters={**dict(_query(statcast=True).parameters), "game_date_gt": "2024-06-01", "game_date_lt": "2024-06-01"},
+            parameters={
+                **dict(_query(statcast=True).parameters),
+                "game_date_gt": "2024-06-01",
+                "game_date_lt": "2024-06-01",
+            },
             requested_range={
                 "year": 2024,
                 "start_date": "2024-06-01",
@@ -3279,7 +3314,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             ((logical_query_id(split), SplitRequired("TIMEOUT", 6)),),
         )
 
-    def test_remaining_stage_evidence_is_the_exact_sorted_ten_path_authority(self) -> None:
+    def test_remaining_stage_evidence_is_the_exact_sorted_ten_path_authority(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import _remaining_stage_evidence
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3321,7 +3358,11 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         parent = _query(statcast=True)
         child = dataclasses.replace(
             _query(statcast=True),
-            parameters={**dict(_query(statcast=True).parameters), "game_date_gt": "2024-06-01", "game_date_lt": "2024-06-01"},
+            parameters={
+                **dict(_query(statcast=True).parameters),
+                "game_date_gt": "2024-06-01",
+                "game_date_lt": "2024-06-01",
+            },
             requested_range={
                 "year": 2024,
                 "start_date": "2024-06-01",
@@ -3344,7 +3385,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(quarantined, ())
         self.assertEqual(split, (parent_id,))
 
-    def test_remaining_decisions_require_exact_fresh_one_of_forty_eight_promotion(self) -> None:
+    def test_remaining_decisions_require_exact_fresh_one_of_forty_eight_promotion(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
             _validate_remaining_decisions,
@@ -3378,8 +3421,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             )
             promoted = _validate_remaining_decisions(partition, inventory, catalog)
             self.assertEqual(len(promoted), 1)
-            self.assertEqual(promoted[0][0].requested_range["acquisition"],
-                             "PROTECTED_LEGACY_REFERENCE")
+            self.assertEqual(
+                promoted[0][0].requested_range["acquisition"],
+                "PROTECTED_LEGACY_REFERENCE",
+            )
 
             payload = dict(inventory.payload)
             decisions = list(payload["decisions"])
@@ -3389,7 +3434,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             with self.assertRaisesRegex(TrustIntegrityError, "decision"):
                 _validate_remaining_decisions(partition, forged, catalog)
 
-    def test_remaining_promotion_failure_is_trust_and_has_no_fetch_fallback(self) -> None:
+    def test_remaining_promotion_failure_is_trust_and_has_no_fetch_fallback(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
             _promote_remaining,
@@ -3466,9 +3513,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         ),
                     )
                     context = (
-                        self.assertRaisesRegex(
-                            TrustIntegrityError, "promotion|storage"
-                        )
+                        self.assertRaisesRegex(TrustIntegrityError, "promotion|storage")
                         if error is not None
                         else nullcontext()
                     )
@@ -3501,7 +3546,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            root, _inventory_path, _digest = _legacy_decision_repository(
+                Path(directory)
+            )
             request = dataclasses.replace(
                 self._request(plan_only=False, resume=True),
                 root=root,
@@ -3512,12 +3559,15 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             # Preview construction is authenticated by the production helper; this
             # placeholder merely gives the plan its already-sealed partition ID.
             from mlb_backtest.v52_legacy import load_protected_legacy_catalog
-            from mlb_backtest.v52_legacy_decision_inventory import preview_legacy_decisions
+            from mlb_backtest.v52_legacy_decision_inventory import (
+                preview_legacy_decisions,
+            )
 
             catalog = load_protected_legacy_catalog(
                 root,
                 legacy_root=root / "data/v5_1_bt/raw",
-                protected_inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
+                protected_inventory_path=root
+                / "audit/v5_1_bt/protected_raw_inventory.json",
                 protected_inventory_sha256=_digest,
             )
             preview = preview_legacy_decisions(
@@ -3603,7 +3653,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     plan,
                     store,
                     fixed_prefix=fixed,
-                    participant_evidence=tuple(root / f"evidence-{index}" for index in range(7)),
+                    participant_evidence=tuple(
+                        root / f"evidence-{index}" for index in range(7)
+                    ),
                     latest=latest,
                     evidence_root=store.root,
                     runner_guard=_RunnerGuard(10, 11, root),
@@ -3612,12 +3664,16 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         free_bytes=lambda _root: request.reserve_bytes + 10**10,
                     ),
                 )
-        self.assertEqual(events, ["checkpoint", "promote", "checkpoint", "fetch-wave", "checkpoint"])
+        self.assertEqual(
+            events, ["checkpoint", "promote", "checkpoint", "fetch-wave", "checkpoint"]
+        )
         self.assertEqual(result.promoted, 1)
         self.assertEqual(result.fetched, 47)
         self.assertEqual(len(result.query_batch_ids), 4)
 
-    def test_remaining_split_materializes_child_before_receipt_and_reconciles(self) -> None:
+    def test_remaining_split_materializes_child_before_receipt_and_reconciles(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             SplitRequired,
             _materialize_remaining_split,
@@ -3635,7 +3691,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            root, _inventory_path, _digest = _legacy_decision_repository(
+                Path(directory)
+            )
             publish_query_batch(root, build_statcast_root_batch(root))
             publish_legacy_decision_inventory(root)
             partition = build_legacy_partition_batch(root)
@@ -3757,7 +3815,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(recursive_child.derived_from_sha256, child.batch_id)
         self.assertEqual(recursive_receipt.depth, 2)
 
-    def test_terminal_remaining_replay_is_byte_idempotent_and_zero_network(self) -> None:
+    def test_terminal_remaining_replay_is_byte_idempotent_and_zero_network(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
             _AcquisitionPlan,
@@ -3779,7 +3839,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            root, _inventory_path, _digest = _legacy_decision_repository(
+                Path(directory)
+            )
             statcast_root = build_statcast_root_batch(root)
             publish_query_batch(root, statcast_root)
             publish_legacy_decision_inventory(root)
@@ -3795,7 +3857,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             latest = SimpleNamespace(
                 stage="REMAINING",
                 receipt_sha256="5" * 64,
-                query_batch_ids=(*tuple(batch.batch_id for batch in fixed), partition.batch_id),
+                query_batch_ids=(
+                    *tuple(batch.batch_id for batch in fixed),
+                    partition.batch_id,
+                ),
                 completed_query_ids=completed,
                 pending_query_ids=(),
                 quarantined_query_ids=(),
@@ -3810,8 +3875,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             promoted_query = next(
                 query
                 for query in partition.queries
-                if query.requested_range["acquisition"]
-                == "PROTECTED_LEGACY_REFERENCE"
+                if query.requested_range["acquisition"] == "PROTECTED_LEGACY_REFERENCE"
             )
             terminal_mode = {"value": "FETCHED_RAW"}
 
@@ -3827,6 +3891,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         storage_mode=terminal_mode["value"],
                     ),
                 )
+
             before = {
                 path.relative_to(root): (path.read_bytes(), path.stat().st_ino)
                 for path in root.rglob("*")
@@ -3855,9 +3920,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     side_effect=AssertionError("terminal network wave reached"),
                 ),
             ):
-                with self.assertRaisesRegex(
-                    TrustIntegrityError, "promotion|storage"
-                ):
+                with self.assertRaisesRegex(TrustIntegrityError, "promotion|storage"):
                     _run_remaining_stage(
                         request,
                         _AcquisitionPlan(
@@ -3899,7 +3962,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     ),
                     store,
                     fixed_prefix=fixed,
-                    participant_evidence=tuple(root / f"evidence-{index}" for index in range(7)),
+                    participant_evidence=tuple(
+                        root / f"evidence-{index}" for index in range(7)
+                    ),
                     latest=latest,
                     evidence_root=store.root,
                     runner_guard=_RunnerGuard(10, 11, root),
@@ -3917,7 +3982,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.query_batch_ids, latest.query_batch_ids)
         self.assertEqual((result.fetched, result.network_attempts), (0, 0))
 
-    def test_remaining_repairs_stale_pending_once_after_terminal_checkpoint_crash(self) -> None:
+    def test_remaining_repairs_stale_pending_once_after_terminal_checkpoint_crash(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             _AcquisitionPlan,
             _DiskBudget,
@@ -3938,7 +4005,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            root, _inventory_path, _digest = _legacy_decision_repository(Path(directory))
+            root, _inventory_path, _digest = _legacy_decision_repository(
+                Path(directory)
+            )
             statcast_root = build_statcast_root_batch(root)
             publish_query_batch(root, statcast_root)
             publish_legacy_decision_inventory(root)
@@ -4108,7 +4177,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual((corrected.fetched, corrected.network_attempts), (0, 0))
         self.assertEqual((replayed.fetched, replayed.network_attempts), (0, 0))
 
-    def test_remaining_receipt_checkpoint_child_fetch_barriers_resume_after_crash(self) -> None:
+    def test_remaining_receipt_checkpoint_child_fetch_barriers_resume_after_crash(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             _AcquisitionPlan,
             _DiskBudget,
@@ -4132,7 +4203,8 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             catalog = load_protected_legacy_catalog(
                 root,
                 legacy_root=root / "data/v5_1_bt/raw",
-                protected_inventory_path=root / "audit/v5_1_bt/protected_raw_inventory.json",
+                protected_inventory_path=root
+                / "audit/v5_1_bt/protected_raw_inventory.json",
                 protected_inventory_sha256=digest,
             )
             preview = preview_legacy_decisions(
@@ -4179,8 +4251,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             promoted_id = next(
                 logical_query_id(query)
                 for query in preview.partition_batch.queries
-                if query.requested_range["acquisition"]
-                == "PROTECTED_LEGACY_REFERENCE"
+                if query.requested_range["acquisition"] == "PROTECTED_LEGACY_REFERENCE"
             )
             complete: set[str] = set()
             durable_checkpoints: list[SimpleNamespace] = []
@@ -4324,7 +4395,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(wave_calls, 1)
         self.assertEqual(len(result.query_batch_ids), 5)
 
-    def test_mixed_split_quarantine_repairs_split_before_operational_resume(self) -> None:
+    def test_mixed_split_quarantine_repairs_split_before_operational_resume(
+        self,
+    ) -> None:
         from mlb_backtest import v52_legacy_decision_inventory as inventory_module
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
@@ -4475,9 +4548,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         quarantine_capture,
                         error_classification="PERMANENT_HTTP",
                     )
-                raise TerminalAcquisitionFailure(
-                    "PERMANENT_HTTP", quarantine_attempt
-                )
+                raise TerminalAcquisitionFailure("PERMANENT_HTTP", quarantine_attempt)
 
             artifact_root = root / "repair-artifacts"
 
@@ -4830,7 +4901,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     {},
                 )
             before = {
-                path.relative_to(store.root): (path.read_bytes(), path.stat().st_mtime_ns)
+                path.relative_to(store.root): (
+                    path.read_bytes(),
+                    path.stat().st_mtime_ns,
+                )
                 for path in store.root.rglob("*")
                 if path.is_file()
             }
@@ -4858,13 +4932,18 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 network_gate=lambda *_args, **_kwargs: self.fail("success gated"),
             )
             after = {
-                path.relative_to(store.root): (path.read_bytes(), path.stat().st_mtime_ns)
+                path.relative_to(store.root): (
+                    path.read_bytes(),
+                    path.stat().st_mtime_ns,
+                )
                 for path in store.root.rglob("*")
                 if path.is_file()
             }
         self.assertEqual(after, before)
         self.assertEqual(len(checkpoints), 1)
-        self.assertEqual((result.fetched, result.resumed, result.network_attempts), (0, 1, 0))
+        self.assertEqual(
+            (result.fetched, result.resumed, result.network_attempts), (0, 1, 0)
+        )
 
     def test_raw_parent_bootstrap_rejects_nofollow_ancestor_attack(self) -> None:
         from mlb_backtest.v52_acquire import (
@@ -4944,12 +5023,16 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     run_stages=stages,
                 ),
             )
-            timezone_root = root / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
+            timezone_root = (
+                root / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
+            )
             self.assertFalse(timezone_root.exists())
         self.assertEqual(actual, summary)
         self.assertEqual(state["phase"], "ACQUIRING")
 
-    def test_full_run_requires_manual_gate_then_runs_exact_participant_stage(self) -> None:
+    def test_full_run_requires_manual_gate_then_runs_exact_participant_stage(
+        self,
+    ) -> None:
         from mlb_backtest import v52_game_evidence_inventory as game_inventory_module
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
@@ -5006,7 +5089,11 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             participant_checkpoint = SimpleNamespace(
                 receipt_sha256="7" * 64,
                 stage="PARTICIPANT_DERIVED",
-                query_batch_ids=(static.batch_id, reference.batch_id, participant.batch_id),
+                query_batch_ids=(
+                    static.batch_id,
+                    reference.batch_id,
+                    participant.batch_id,
+                ),
                 completed_query_ids=all_ids,
                 pending_query_ids=(),
                 quarantined_query_ids=(),
@@ -5033,17 +5120,13 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 root
                 / "audit/v5_2_qd/historical/acquisition/timezone_reviews/semantic.json",
                 candidate_path,
-                root
-                / "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
+                root / "audit/v5_2_qd/historical/acquisition/venue_timezone_seal.json",
                 root / "config/v5_2_qd/venue_timezones.json",
             )
             schedule.path.parent.mkdir(parents=True, exist_ok=True)
             schedule.path.write_text("{}\n")
             candidate_path.write_text("{}\n")
-            (
-                root
-                / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
-            ).mkdir()
+            (root / "audit/v5_2_qd/historical/acquisition/timezone_reviews").mkdir()
             checkpoint_calls: list[Mapping[str, object]] = []
             published_checkpoints: list[SimpleNamespace] = []
             execute_calls: list[Mapping[str, object]] = []
@@ -5079,29 +5162,125 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 return _StageResult(participant_checkpoint, 1, 0, 1)
 
             with ExitStack() as stack:
-                stack.enter_context(patch("mlb_backtest.v52_acquire._real_authenticate", return_value=plan))
-                stack.enter_context(patch("mlb_backtest.v52_acquire._current_runner_guard", return_value=_RunnerGuard(10, 11, root)))
-                stack.enter_context(patch("mlb_backtest.v52_acquire._ensure_canonical_raw_parent", return_value=root / "raw"))
-                stack.enter_context(patch("mlb_backtest.v52_acquire.V52EvidenceStore", return_value=object()))
-                load_latest = stack.enter_context(patch("mlb_backtest.execution_registry.load_latest_acquisition_checkpoint", return_value=latest))
-                stack.enter_context(patch("mlb_backtest.execution_registry.publish_acquisition_checkpoint", side_effect=checkpoint))
-                stack.enter_context(patch("mlb_backtest.v52_query_plan.build_static_batch", return_value=static))
-                stack.enter_context(patch("mlb_backtest.v52_query_plan.load_query_batch", side_effect=lambda _root, batch_id: {
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._real_authenticate", return_value=plan
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._current_runner_guard",
+                        return_value=_RunnerGuard(10, 11, root),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._ensure_canonical_raw_parent",
+                        return_value=root / "raw",
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire.V52EvidenceStore",
+                        return_value=object(),
+                    )
+                )
+                load_latest = stack.enter_context(
+                    patch(
+                        "mlb_backtest.execution_registry.load_latest_acquisition_checkpoint",
+                        return_value=latest,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.execution_registry.publish_acquisition_checkpoint",
+                        side_effect=checkpoint,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.build_static_batch",
+                        return_value=static,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.load_query_batch",
+                        side_effect=lambda _root, batch_id: {
                     static.batch_id: static,
                     reference.batch_id: reference,
                     participant.batch_id: participant,
-                }[batch_id]))
-                stack.enter_context(patch("mlb_backtest.v52_schedule_inventory.load_verified_schedule_anchor_inventory", return_value=schedule))
-                stack.enter_context(patch("mlb_backtest.v52_acquire._validate_schedule_inventory_schema"))
-                stack.enter_context(patch("mlb_backtest.v52_query_plan.build_schedule_reference_batch", return_value=reference))
-                stack.enter_context(patch("mlb_backtest.v52_acquire._stage_populations", side_effect=lambda _store, batches: ((prefix_ids if len(batches) == 2 else all_ids), (), ())))
-                candidate = stack.enter_context(patch("mlb_backtest.v52_timezone_review.publish_timezone_candidate", return_value=candidate_path))
-                stack.enter_context(patch("mlb_backtest.v52_timezone_review.load_verified_timezone_gate"))
-                load_game = stack.enter_context(patch("mlb_backtest.v52_game_evidence_inventory.load_verified_game_evidence_inventory", return_value=game))
-                publish_game = stack.enter_context(patch("mlb_backtest.v52_game_evidence_inventory.publish_game_evidence_inventory", side_effect=lambda _root: events.append("game-inventory") or game))
-                build_participant = stack.enter_context(patch("mlb_backtest.v52_query_plan.build_participant_derived_batch", side_effect=lambda _root: events.append("participant-batch") or participant))
-                publish_batch = stack.enter_context(patch("mlb_backtest.v52_query_plan.publish_query_batch"))
-                execute_stage = stack.enter_context(patch("mlb_backtest.v52_acquire._execute_stage", side_effect=execute))
+                        }[batch_id],
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_schedule_inventory.load_verified_schedule_anchor_inventory",
+                        return_value=schedule,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._validate_schedule_inventory_schema"
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.build_schedule_reference_batch",
+                        return_value=reference,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._stage_populations",
+                        side_effect=lambda _store, batches: (
+                            (prefix_ids if len(batches) == 2 else all_ids),
+                            (),
+                            (),
+                        ),
+                    )
+                )
+                candidate = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_timezone_review.publish_timezone_candidate",
+                        return_value=candidate_path,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_timezone_review.load_verified_timezone_gate"
+                    )
+                )
+                load_game = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_game_evidence_inventory.load_verified_game_evidence_inventory",
+                        return_value=game,
+                    )
+                )
+                publish_game = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_game_evidence_inventory.publish_game_evidence_inventory",
+                        side_effect=lambda _root: (
+                            events.append("game-inventory") or game
+                        ),
+                    )
+                )
+                build_participant = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_query_plan.build_participant_derived_batch",
+                        side_effect=lambda _root: (
+                            events.append("participant-batch") or participant
+                        ),
+                    )
+                )
+                publish_batch = stack.enter_context(
+                    patch("mlb_backtest.v52_query_plan.publish_query_batch")
+                )
+                execute_stage = stack.enter_context(
+                    patch(
+                        "mlb_backtest.v52_acquire._execute_stage", side_effect=execute
+                    )
+                )
                 stack.enter_context(
                     patch(
                         "mlb_backtest.v52_acquire._run_remaining_stage",
@@ -5126,7 +5305,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text("{}\n")
 
-                publish_game.side_effect = KeyboardInterrupt("after timezone checkpoint")
+                publish_game.side_effect = KeyboardInterrupt(
+                    "after timezone checkpoint"
+                )
                 with self.assertRaises(KeyboardInterrupt):
                     _real_run_stages(request, plan)
                 self.assertEqual(len(checkpoint_calls), 1)
@@ -5143,9 +5324,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 symlink_target.write_bytes(original_schedule)
                 schedule.path.unlink()
                 schedule.path.symlink_to(symlink_target)
-                with self.assertRaisesRegex(
-                    TrustIntegrityError, "timezone checkpoint"
-                ):
+                with self.assertRaisesRegex(TrustIntegrityError, "timezone checkpoint"):
                     _real_run_stages(request, plan)
                 self.assertEqual(publish_game.call_count, blocked_game_calls)
                 self.assertEqual(execute_stage.call_count, blocked_execute_calls)
@@ -5156,9 +5335,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 hardlink_target.write_bytes(original_schedule)
                 schedule.path.unlink()
                 os.link(hardlink_target, schedule.path)
-                with self.assertRaisesRegex(
-                    TrustIntegrityError, "timezone checkpoint"
-                ):
+                with self.assertRaisesRegex(TrustIntegrityError, "timezone checkpoint"):
                     _real_run_stages(request, plan)
                 self.assertEqual(publish_game.call_count, blocked_game_calls)
                 self.assertEqual(execute_stage.call_count, blocked_execute_calls)
@@ -5184,9 +5361,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         "mlb_backtest.v52_acquire.os.read",
                         side_effect=rebind_during_read,
                     ),
-                    self.assertRaisesRegex(
-                        TrustIntegrityError, "timezone checkpoint"
-                    ),
+                    self.assertRaisesRegex(TrustIntegrityError, "timezone checkpoint"),
                 ):
                     _real_run_stages(request, plan)
                 self.assertTrue(rebound)
@@ -5194,8 +5369,8 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 self.assertEqual(execute_stage.call_count, blocked_execute_calls)
                 displaced.unlink()
 
-                publish_game.side_effect = (
-                    lambda _root: events.append("game-inventory") or game
+                publish_game.side_effect = lambda _root: (
+                    events.append("game-inventory") or game
                 )
                 build_participant.side_effect = KeyboardInterrupt(
                     "after game inventory"
@@ -5203,8 +5378,8 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     _real_run_stages(request, plan)
 
-                build_participant.side_effect = (
-                    lambda _root: events.append("participant-batch") or participant
+                build_participant.side_effect = lambda _root: (
+                    events.append("participant-batch") or participant
                 )
                 with self.assertRaisesRegex(OperationalBlock, "REMAINING"):
                     _real_run_stages(request, plan)
@@ -5221,8 +5396,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 load_game.assert_called_once_with(root)
 
             self.assertEqual(checkpoint_calls[0]["stage"], "TIMEZONE_REVIEW")
-            self.assertEqual(checkpoint_calls[0]["query_batch_ids"],
-                             (static.batch_id, reference.batch_id))
+            self.assertEqual(
+                checkpoint_calls[0]["query_batch_ids"],
+                (static.batch_id, reference.batch_id),
+            )
             self.assertEqual(
                 checkpoint_calls[0]["stage_evidence_receipts"],
                 expected_timezone_evidence,
@@ -5232,11 +5409,19 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 execute_calls[0]["stage_evidence"],
                 tuple(sorted((*expected_timezone_evidence, game.path), key=os.fspath)),
             )
-            self.assertLess(events.index("timezone-checkpoint"), events.index("game-inventory"))
-            self.assertLess(events.index("game-inventory"), events.index("participant-batch"))
-            self.assertLess(events.index("participant-batch"), events.index("participant-execute"))
+            self.assertLess(
+                events.index("timezone-checkpoint"), events.index("game-inventory")
+            )
+            self.assertLess(
+                events.index("game-inventory"), events.index("participant-batch")
+            )
+            self.assertLess(
+                events.index("participant-batch"), events.index("participant-execute")
+            )
 
-    def test_timezone_gate_classifies_missing_as_operational_and_tamper_as_trust(self) -> None:
+    def test_timezone_gate_classifies_missing_as_operational_and_tamper_as_trust(
+        self,
+    ) -> None:
         from mlb_backtest.v52_source_contracts import canonical_json_bytes
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
@@ -5244,6 +5429,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             _load_required_timezone_gate,
         )
         from tests.test_v52_timezone_review import _fixed_verified_gate_fixture
+
         old_run_spec = self._request(plan_only=True).run_spec
 
         with tempfile.TemporaryDirectory() as directory:
@@ -5270,8 +5456,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             review_parent = (
-                root
-                / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
+                root / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
             )
             review_parent.mkdir(parents=True)
             with (
@@ -5367,8 +5552,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             review_parent = (
-                root
-                / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
+                root / "audit/v5_2_qd/historical/acquisition/timezone_reviews"
             )
             review_parent.mkdir(parents=True)
             outside = root / "coverage-source.json"
@@ -5383,12 +5567,15 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             ):
                 _load_required_timezone_gate(root, old_run_spec)
 
-    def test_resumed_timezone_checkpoint_requires_exact_boundary_before_inventory(self) -> None:
+    def test_resumed_timezone_checkpoint_requires_exact_boundary_before_inventory(
+        self,
+    ) -> None:
         from mlb_backtest.execution_registry import AcquisitionCheckpoint
         from mlb_backtest.v52_acquire import (
             TrustIntegrityError,
             _validate_resumed_timezone_checkpoint,
         )
+
         old_run_spec = self._request(plan_only=True).run_spec
 
         with tempfile.TemporaryDirectory() as directory:
@@ -5424,8 +5611,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                 query_batch_sha256s=("5" * 64, "6" * 64),
                 query_evidence_receipt_sha256s=(),
                 stage_evidence_receipt_sha256s=tuple(
-                    hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in evidence
+                    hashlib.sha256(path.read_bytes()).hexdigest() for path in evidence
                 ),
                 split_receipt_sha256s=(),
                 completed_query_ids=completed,
@@ -5446,27 +5632,22 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             cases = {
                 "extra batch": {"query_batch_ids": (*batches, "e" * 64)},
                 "missing batch": {"query_batch_ids": batches[:1]},
-                "extra completed": {
-                    "completed_query_ids": (*completed, "e" * 64)
-                },
+                "extra completed": {"completed_query_ids": (*completed, "e" * 64)},
                 "missing completed": {"completed_query_ids": completed[:1]},
                 "pending": {"pending_query_ids": ("e" * 64,)},
                 "quarantine": {"quarantined_query_ids": ("e" * 64,)},
                 "split": {"split_query_ids": ("e" * 64,)},
                 "split receipt": {"split_receipt_sha256s": ("e" * 64,)},
                 "evidence path": {
-                    "stage_evidence_receipt_paths": tuple(
-                        reversed(relative_evidence)
-                    )
+                    "stage_evidence_receipt_paths": tuple(reversed(relative_evidence))
                 },
-                "evidence hash": {
-                    "stage_evidence_receipt_sha256s": ("f" * 64,) * 6
-                },
+                "evidence hash": {"stage_evidence_receipt_sha256s": ("f" * 64,) * 6},
             }
             for label, mutation in cases.items():
                 forged = dataclasses.replace(checkpoint, **mutation)
-                with self.subTest(label=label), self.assertRaisesRegex(
-                    TrustIntegrityError, "timezone checkpoint"
+                with (
+                    self.subTest(label=label),
+                    self.assertRaisesRegex(TrustIntegrityError, "timezone checkpoint"),
                 ):
                     _validate_resumed_timezone_checkpoint(
                         forged,
@@ -5477,7 +5658,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                         run_spec=old_run_spec,
                     )
 
-    def test_shared_disk_budget_prevents_cross_pool_overcommit_and_releases(self) -> None:
+    def test_shared_disk_budget_prevents_cross_pool_overcommit_and_releases(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
             _AcquisitionPlan,
@@ -5559,7 +5742,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(budget.reserved_bytes, 0)
         self.assertEqual(len(checkpoints), 1)
 
-    def test_disk_budget_stays_reserved_across_retries_and_releases_on_errors(self) -> None:
+    def test_disk_budget_stays_reserved_across_retries_and_releases_on_errors(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
             SplitRequired,
@@ -5581,7 +5766,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             (RuntimeError("worker bug"), RuntimeError),
         )
         for error, expected in error_cases:
-            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 budget = _DiskBudget(
                     request,
                     free_bytes=lambda _root: request.reserve_bytes + max_bytes,
@@ -5669,7 +5857,9 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.network_attempts, 0)
         self.assertEqual(budget.reserved_bytes, 0)
 
-    def test_exhausted_dangling_reservations_checkpoint_and_report_pending(self) -> None:
+    def test_exhausted_dangling_reservations_checkpoint_and_report_pending(
+        self,
+    ) -> None:
         from mlb_backtest.v52_acquire import (
             OperationalBlock,
             _AcquisitionPlan,
@@ -5716,9 +5906,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
                     fetcher=lambda *_args, **_kwargs: self.fail("exhausted fetched"),
                     checkpoint_publisher=publish,
                     parser=lambda _raw, _query: {},
-                    network_gate=lambda *_args, **_kwargs: self.fail(
-                        "exhausted gated"
-                    ),
+                    network_gate=lambda *_args, **_kwargs: self.fail("exhausted gated"),
                     disk_budget=budget,
                 )
         self.assertEqual(len(checkpoints), 2)
@@ -5758,9 +5946,7 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             + "a" * 64
             + '","fetched":2,"network_attempts":0,"pending":0,'
             '"planned_fetch_required":4,"planned_promoted":3,"promoted":1,'
-            '"quarantined":0,"query_batch_sha256s":["'
-            + "b" * 64
-            + '"],"resumed":0}\n'
+            '"quarantined":0,"query_batch_sha256s":["' + "b" * 64 + '"],"resumed":0}\n'
         )
         self.assertEqual(output.getvalue(), expected)
 
@@ -5802,12 +5988,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
 
         source_run_spec = Path(
-            "protocols/v5_2_qd/"
-            "historical_walkforward_500_superseding_565534.json"
+            "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
         )
         source_contract = Path(
-            "protocols/v5_2_qd/"
-            "historical_source_acquisition_superseding_565534.json"
+            "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
         )
         legacy_root = ROOT / "data/v5_1_bt/raw"
         created_legacy_root = not legacy_root.exists()

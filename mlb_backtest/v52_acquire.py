@@ -93,9 +93,7 @@ _SCHEDULE_INVENTORY_SCHEMA_RELATIVE = Path(
     "schemas/v5_2_schedule_anchor_inventory.schema.json"
 )
 _AUDIT_RELATIVE = Path("audit/v5_2_qd/historical")
-_SOURCE_AUDIT_RELATIVE = Path(
-    "audit/v5_2_qd/historical_superseding_565534"
-)
+_SOURCE_AUDIT_RELATIVE = Path("audit/v5_2_qd/historical_superseding_565534")
 _RECOVERY_AUDIT_RELATIVE = Path("audit/v5_2_qd/historical_recovery_schedule_conflicts")
 _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
     64 * 1024 * 1024,
@@ -165,6 +163,8 @@ def _timezone_stage_evidence_relatives(
         audit_relative / "acquisition/venue_timezone_seal.json",
         Path("config/v5_2_qd/venue_timezones.json"),
     )
+
+
 _DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
 )
@@ -838,13 +838,42 @@ class _AcquireOps:
 
 
 def _require_source_terminal_disposition(checkpoint: object) -> None:
+    recovery_bindings = getattr(checkpoint, "recovery_disposition_bindings", ())
+    if recovery_bindings:
+        raw_query_ids = tuple(
+            binding.get("query_id")
+            if isinstance(binding, Mapping)
+            else getattr(binding, "query_id", None)
+            for binding in recovery_bindings
+        )
+        query_ids = (
+            tuple(sorted(raw_query_ids))
+            if all(isinstance(query_id, str) for query_id in raw_query_ids)
+            else ()
+        )
+        if (
+            len(recovery_bindings) != 3
+            or tuple(getattr(checkpoint, "dispositioned_query_ids", ())) != query_ids
+            or getattr(checkpoint, "stage", None) != "STATIC_SCHEDULES"
+            or len(getattr(checkpoint, "completed_query_ids", ())) != 7
+            or getattr(checkpoint, "pending_query_ids", ())
+            or getattr(checkpoint, "quarantined_query_ids", ())
+            or getattr(checkpoint, "split_query_ids", ())
+            or any(
+                query_id not in getattr(checkpoint, "completed_query_ids", ())
+                for query_id in query_ids
+            )
+        ):
+            raise TrustIntegrityError(
+                "recovery terminal checkpoint requires seven completed static queries"
+            )
+        return
     if (
         getattr(checkpoint, "dispositioned_query_ids", ())
         != (_SOURCE_DISPOSITION_QUERY_ID,)
         or _SOURCE_DISPOSITION_QUERY_ID
         not in getattr(checkpoint, "completed_query_ids", ())
-        or _SOURCE_DISPOSITION_QUERY_ID
-        in getattr(checkpoint, "pending_query_ids", ())
+        or _SOURCE_DISPOSITION_QUERY_ID in getattr(checkpoint, "pending_query_ids", ())
         or _SOURCE_DISPOSITION_QUERY_ID
         in getattr(checkpoint, "quarantined_query_ids", ())
         or _SOURCE_DISPOSITION_QUERY_ID in getattr(checkpoint, "split_query_ids", ())
@@ -916,9 +945,7 @@ def _run_acquisition(
             or summary.pending
             or summary.quarantined
         ):
-            raise TrustIntegrityError(
-                "SOURCES_READY terminal replay summary differs"
-            )
+            raise TrustIntegrityError("SOURCES_READY terminal replay summary differs")
         return summary
 
     later_phases = {
@@ -1202,12 +1229,7 @@ def _validate_lock_directory(
 def _safe_lock_parent(
     root: Path, lock_relative: Path = _RUNNER_LOCK_RELATIVE
 ) -> Iterator[int]:
-    flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_CLOEXEC
-        | os.O_NOFOLLOW
-    )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptors: list[int] = []
     identities: list[tuple[int, str | Path, int | None]] = []
     try:
@@ -1240,9 +1262,7 @@ def _safe_lock_parent(
                     "runner lock directory is unavailable"
                 ) from exc
             descriptors.append(child_descriptor)
-            identities.append(
-                (child_descriptor, component, current_descriptor)
-            )
+            identities.append((child_descriptor, component, current_descriptor))
             _validate_lock_directory(
                 child_descriptor,
                 component,
@@ -1304,17 +1324,11 @@ def _real_runner_lock(request: _AcquisitionRequest) -> Iterator[None]:
     if not isinstance(audit, str):
         raise TrustIntegrityError("runner lock audit namespace differs")
     lock_relative = Path(audit) / "execution/.acquisition-runner.lock"
-    if (
-        lock_relative.is_absolute()
-        or any(part in {"", ".", ".."} for part in lock_relative.parts)
+    if lock_relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in lock_relative.parts
     ):
         raise TrustIntegrityError("runner lock path differs")
-    flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | os.O_CLOEXEC
-        | os.O_NOFOLLOW
-    )
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
     with _safe_lock_parent(root, lock_relative) as parent_descriptor:
         _acquire_runner_flock(parent_descriptor)
         try:
@@ -1327,17 +1341,11 @@ def _real_runner_lock(request: _AcquisitionRequest) -> Iterator[None]:
         except OSError as exc:
             raise TrustIntegrityError("runner lock is unavailable") from exc
         try:
-            _validate_runner_lock(
-                descriptor, parent_descriptor, lock_relative.name
-            )
+            _validate_runner_lock(descriptor, parent_descriptor, lock_relative.name)
             _acquire_runner_flock(descriptor)
-            _validate_runner_lock(
-                descriptor, parent_descriptor, lock_relative.name
-            )
+            _validate_runner_lock(descriptor, parent_descriptor, lock_relative.name)
             token = _ACTIVE_RUNNER.set(
-                _RunnerGuard(
-                    descriptor, parent_descriptor, root, lock_relative.name
-                )
+                _RunnerGuard(descriptor, parent_descriptor, root, lock_relative.name)
             )
             try:
                 yield
@@ -1404,13 +1412,13 @@ def _real_before_network(
         or checkpoint.query_batch_ids != query_batch_ids
         or query_id not in checkpoint.pending_query_ids
     ):
-        raise TrustIntegrityError("query is not pending under current checkpoint authority")
+        raise TrustIntegrityError(
+            "query is not pending under current checkpoint authority"
+        )
     occurrences = 0
     try:
         for batch_id in query_batch_ids:
-            batch = load_query_batch_for_authority(
-                root, batch_id, request.run_spec
-            )
+            batch = load_query_batch_for_authority(root, batch_id, request.run_spec)
             occurrences += sum(item == query for item in batch.queries)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise TrustIntegrityError("query batch authority changed before fetch") from exc
@@ -1561,11 +1569,9 @@ def _source_disposition_authorities(
         if isinstance(query, LogicalQuery)
         and query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
     )
-    authenticated_recovery = (
-        isinstance(request.run_spec, SourceRunSpec)
-        and request.run_spec
-        == parse_source_run_spec(expected_recovery_source_run())
-    )
+    authenticated_recovery = isinstance(
+        request.run_spec, SourceRunSpec
+    ) and request.run_spec == parse_source_run_spec(expected_recovery_source_run())
     recovery_queries = tuple(
         query
         for query in endpoint_queries
@@ -1646,7 +1652,9 @@ def _remaining_stage_evidence(
     if (
         not isinstance(statcast_root_batch_id, str)
         or len(statcast_root_batch_id) != 64
-        or any(character not in "0123456789abcdef" for character in statcast_root_batch_id)
+        or any(
+            character not in "0123456789abcdef" for character in statcast_root_batch_id
+        )
     ):
         raise TrustIntegrityError("Statcast root batch ID differs")
     root = Path(os.path.abspath(os.fspath(root)))
@@ -1659,7 +1667,9 @@ def _remaining_stage_evidence(
                 *participant,
                 root / _PROTECTED_INVENTORY_RELATIVE,
                 root / audit_relative / "acquisition/legacy_decision_inventory.json",
-                root / audit_relative / "acquisition/query_batches"
+                root
+                / audit_relative
+                / "acquisition/query_batches"
                 / f"{statcast_root_batch_id}.json",
             ),
             key=os.fspath,
@@ -1932,7 +1942,9 @@ def _run_remaining_wave(
         raise TrustIntegrityError("remaining active-leaf authority differs")
     routes = {logical_query_id(query): _query_host(query) for query in selected_queries}
     if any(host is None for host in routes.values()):
-        raise TrustIntegrityError("remaining active leaves must require network evidence")
+        raise TrustIntegrityError(
+            "remaining active leaves must require network evidence"
+        )
 
     resumed = 0
     by_host: dict[str, list[LogicalQuery]] = {host: [] for host in _HOST_WORKERS}
@@ -2153,7 +2165,9 @@ def _execute_stage(
         if recovery_context is None:
             from .v52_query_plan import _load_static_contracts
 
-            if request.run_spec != parse_source_run_spec(expected_recovery_source_run()):
+            if request.run_spec != parse_source_run_spec(
+                expected_recovery_source_run()
+            ):
                 raise TrustIntegrityError("recovery schedule query authority differs")
             root = Path(os.path.abspath(os.fspath(request.root)))
             run_path, contract_path = _request_authority_paths(request, root)
@@ -2389,9 +2403,7 @@ def _execute_stage(
             if future.cancelled():
                 continue
             error = future.exception()
-            if stop.is_set() or (
-                error is not None and _is_fatal_stage_error(error)
-            ):
+            if stop.is_set() or (error is not None and _is_fatal_stage_error(error)):
                 stop.set()
                 cancel_all()
                 break
@@ -2532,7 +2544,9 @@ def _validate_schedule_inventory_schema(
         jsonschema.Draft202012Validator.check_schema(schema)
         jsonschema.Draft202012Validator(schema).validate(payload)
     except (jsonschema.SchemaError, jsonschema.ValidationError) as exc:
-        raise TrustIntegrityError("schedule inventory schema validation failed") from exc
+        raise TrustIntegrityError(
+            "schedule inventory schema validation failed"
+        ) from exc
 
 
 def _revalidate_gate_directory(
@@ -2560,9 +2574,7 @@ def _revalidate_gate_directory(
 def _required_gate_leaf_exists(root: Path, relative: Path) -> bool:
     if relative.is_absolute() or not relative.parts:
         raise TrustIntegrityError("timezone gate path differs")
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    )
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     absolute_root = Path(os.path.abspath(os.fspath(root)))
     descriptors: list[int] = []
@@ -2651,9 +2663,7 @@ def _load_required_timezone_gate(
     )
     for relative in required_gate_paths:
         if not _required_gate_leaf_exists(root, relative):
-            raise OperationalBlock(
-                "timezone review approvals and seal are required"
-            )
+            raise OperationalBlock("timezone review approvals and seal are required")
     return _integrity_boundary(
         "timezone gate",
         lambda: (
@@ -2699,9 +2709,7 @@ def _read_timezone_checkpoint_evidence_snapshot(
     if not relative.parts or max_bytes < 0:
         raise ValueError("timezone checkpoint evidence path or bound differs")
 
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    )
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     descriptors: list[int] = []
     directories: list[tuple[int, str | Path, int | None]] = []
@@ -2728,9 +2736,7 @@ def _read_timezone_checkpoint_evidence_snapshot(
             or not stat.S_ISDIR(linked.st_mode)
             or not _same_identity(opened, linked)
         ):
-            raise ValueError(
-                "timezone checkpoint evidence ancestor identity differs"
-            )
+            raise ValueError("timezone checkpoint evidence ancestor identity differs")
 
     try:
         try:
@@ -2791,9 +2797,7 @@ def _read_timezone_checkpoint_evidence_snapshot(
         while chunk := os.read(file_descriptor, 64 * 1024):
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(
-                    "timezone checkpoint evidence exceeds its read bound"
-                )
+                raise ValueError("timezone checkpoint evidence exceeds its read bound")
             chunks.append(chunk)
 
         try:
@@ -2812,9 +2816,7 @@ def _read_timezone_checkpoint_evidence_snapshot(
             before_identity != after_identity
             or after_identity != _timezone_checkpoint_file_identity(rebound)
         ):
-            raise ValueError(
-                "timezone checkpoint evidence changed while reading"
-            )
+            raise ValueError("timezone checkpoint evidence changed while reading")
         for descriptor, component, parent in directories:
             revalidate_directory(descriptor, component, parent)
         return b"".join(chunks)
@@ -3245,9 +3247,7 @@ def _run_remaining_stage(
         if quarantined:
             if tuple(quarantined) != getattr(current, "quarantined_query_ids", ()):
                 publish_current()
-            error = OperationalBlock(
-                "REMAINING contains quarantined query evidence"
-            )
+            error = OperationalBlock("REMAINING contains quarantined query evidence")
             if terminal_failure is not None:
                 raise error from terminal_failure
             raise error
@@ -3256,9 +3256,7 @@ def _run_remaining_stage(
                 "REMAINING terminal failure has no quarantined authority"
             ) from terminal_failure
         active_pending = tuple(
-            query
-            for query in active_queries
-            if logical_query_id(query) in set(pending)
+            query for query in active_queries if logical_query_id(query) in set(pending)
         )
         if not active_pending:
             if (
@@ -3343,8 +3341,7 @@ def _validate_resumed_timezone_checkpoint(
         tuple(sorted(stage_evidence, key=os.fspath)) != stage_evidence
         or getattr(checkpoint, "stage", None) != "TIMEZONE_REVIEW"
         or getattr(checkpoint, "query_batch_ids", None) != batch_ids
-        or getattr(checkpoint, "completed_query_ids", None)
-        != completed_query_ids
+        or getattr(checkpoint, "completed_query_ids", None) != completed_query_ids
         or getattr(checkpoint, "pending_query_ids", None) != ()
         or getattr(checkpoint, "quarantined_query_ids", None) != ()
         or getattr(checkpoint, "split_query_ids", None) != ()
@@ -3378,7 +3375,9 @@ def _real_run_stages(
     )
 
     if _real_authenticate(request) != plan:
-        raise TrustIntegrityError("acquisition authority changed before stage execution")
+        raise TrustIntegrityError(
+            "acquisition authority changed before stage execution"
+        )
     runner_guard = _current_runner_guard(request)
     root = Path(os.path.abspath(os.fspath(request.root)))
     run_path, contract_path = _request_authority_paths(request, root)
@@ -3431,9 +3430,7 @@ def _real_run_stages(
             stage="STATIC_SCHEDULES",
             batches=(static,),
             stage_evidence=(),
-            expected_prior=(
-                None if latest is None else latest.receipt_sha256
-            ),
+            expected_prior=(None if latest is None else latest.receipt_sha256),
             fetcher=request.fetcher,
             runner_guard=runner_guard,
             disk_budget=disk_budget,
@@ -3536,7 +3533,11 @@ def _real_run_stages(
 
     cumulative_batches = (static, reference)
     cumulative_ids = tuple(
-        sorted(logical_query_id(query) for batch in cumulative_batches for query in batch.queries)
+        sorted(
+            logical_query_id(query)
+            for batch in cumulative_batches
+            for query in batch.queries
+        )
     )
     terminal_reference = (
         latest.stage
@@ -3871,11 +3872,7 @@ def _real_begin_runtime(
                 root,
                 request.run_spec,
                 design_path=root
-                / (
-                    _SOURCE_DESIGN_RELATIVE
-                    if source_run
-                    else _DESIGN_RELATIVE
-                ),
+                / (_SOURCE_DESIGN_RELATIVE if source_run else _DESIGN_RELATIVE),
                 plan_path=root
                 / (_SOURCE_PLAN_RELATIVE if source_run else _PLAN_RELATIVE),
                 acquisition_contract_path=root
