@@ -82,7 +82,7 @@ from .v52_sources.history import (
 )
 from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
-    validate_recovery_statcast_game_dates,
+    validate_recovery_statcast_game_date_groups,
     validate_statcast_child_coverage,
 )
 from .v52_sources.pitching import (
@@ -821,6 +821,14 @@ def _validate_normalized_snapshot_mapping(
                     or row.get("result_available_on") != expected_played
                 ):
                     raise ValueError("normalized recovery history availability differs")
+                if recovery_dispositions is None:
+                    raise ValueError("normalized recovery availability capability is required")
+                try:
+                    recovery_dispositions.require_boundary(row)
+                except ValueError as exc:
+                    raise ValueError(
+                        "normalized recovery history availability boundary differs"
+                    ) from exc
             cutoff = _canonical_day(row.get("history_cutoff"), "history cutoff")
             game_pk = row.get("game_pk")
             if (
@@ -3091,14 +3099,15 @@ def _build_statcast_normalized_snapshots(
             sorted(played_by_root[root_id]),
         )
         if recovery_dispositions is not None:
-            for _record, sidecar in leaves:
-                semantics = sidecar.get("semantics")
-                if isinstance(semantics, Mapping) and isinstance(
-                    semantics.get("games"), Sequence
-                ):
-                    validate_recovery_statcast_game_dates(
-                        semantics["games"], recovery_dispositions
-                    )
+            game_groups = [
+                semantics["games"]
+                for _record, sidecar in leaves
+                if isinstance((semantics := sidecar.get("semantics")), Mapping)
+                and isinstance(semantics.get("games"), Sequence)
+            ]
+            validate_recovery_statcast_game_date_groups(
+                game_groups, recovery_dispositions
+            )
         snapshots.append(
             _statcast_normalized_snapshot(
                 run_id,

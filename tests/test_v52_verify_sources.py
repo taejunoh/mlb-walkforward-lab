@@ -1121,6 +1121,146 @@ class RecoveryReplayCapabilityTests(unittest.TestCase):
                 history.as_mapping(),
             )
 
+    def test_recovery_history_rows_bind_exact_schedule_sidecars(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.v52_source_contracts import canonical_sha256
+
+        entries, mapping, catalog, binding_type = self._recovery_bindings()
+        loader, factory = self._published_capability(
+            mapping, catalog, entries, binding_type
+        )
+
+        def snapshot(entry):
+            official = {
+                630882: "2020-08-09",
+                633224: "2021-07-21",
+            }[entry.game_pk]
+            row = {
+                "away_team_id": 1,
+                "completed_innings": 9,
+                "doubleheader_order": 1,
+                "game_pk": entry.game_pk,
+                "history_cutoff": (
+                    "2020-08-08" if entry.game_pk == 630882 else "2021-07-20"
+                ),
+                "home_team_id": 2,
+                "official_date": official,
+                "played_date": entry.played_date,
+                "result_available_on": entry.result_available_on,
+                "schedule_query_sidecar_sha256": entry.query_sidecar["sha256"],
+                "scheduled_innings": 9,
+                "scheduled_start_utc": entry.retained_scheduled_start_utc,
+                "source_game_sha256": "d" * 64,
+                "terminal_status": "Final",
+                "venue_id": 1,
+            }
+            row["projection_sha256"] = canonical_sha256(row)
+            return {
+                "schema_version": 1,
+                "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+                "season": int(official[:4]),
+                "source": "prior_schedule_history",
+                "grain": "verified_game_projection",
+                "status": "READY",
+                "logical_query_ids": ["a" * 64],
+                "source_query_sidecar_sha256s": ["b" * 64],
+                "split_receipt_sha256s": [],
+                "schedule_conflict_dispositions": mapping,
+                "payload": {
+                    "schema_version": 1,
+                    "grain": "verified_game_projection",
+                    "source_snapshot_sha256": "c" * 64,
+                    "source_game_sha256s": ["d" * 64],
+                    "games": [row],
+                },
+            }
+
+        with loader:
+            capability = factory()
+            for entry in entries[1:]:
+                valid = snapshot(entry)
+                with self.subTest(game_pk=entry.game_pk):
+                    self.assertEqual(
+                        verifier._validate_normalized_snapshot_mapping(
+                            valid, recovery_dispositions=capability
+                        ),
+                        valid,
+                    )
+                    forged = json.loads(canonical_json_bytes(valid))
+                    row = forged["payload"]["games"][0]
+                    row["schedule_query_sidecar_sha256"] = "f" * 64
+                    row["projection_sha256"] = canonical_sha256(
+                        {key: value for key, value in row.items() if key != "projection_sha256"}
+                    )
+                    with self.assertRaisesRegex(ValueError, "availability boundary"):
+                        verifier._validate_normalized_snapshot_mapping(
+                            forged, recovery_dispositions=capability
+                        )
+
+    def test_statcast_no_target_skips_recovery_reauthentication(self) -> None:
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+        from mlb_backtest.v52_sources.statcast import (
+            validate_recovery_statcast_game_dates,
+        )
+
+        entries, mapping, catalog, binding_type = self._recovery_bindings()
+        loader, factory = self._published_capability(
+            mapping, catalog, entries, binding_type
+        )
+        original = RecoveryDispositionBindings.reauthenticate
+        with loader, patch.object(
+            RecoveryDispositionBindings,
+            "reauthenticate",
+            autospec=True,
+            side_effect=original,
+        ) as reauthenticate:
+            capability = factory()
+            reauthenticate.reset_mock()
+            validate_recovery_statcast_game_dates(
+                [{"game_pk": 9001, "game_date": "2021-07-21"}], capability
+            )
+            reauthenticate.assert_not_called()
+            validate_recovery_statcast_game_dates(
+                [{"game_pk": 630882, "game_date": "2020-08-14"}], capability
+            )
+            self.assertEqual(reauthenticate.call_count, 1)
+
+    def test_statcast_family_uses_one_authentication_and_final_rebind(self) -> None:
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+        from mlb_backtest.v52_sources.statcast import (
+            validate_recovery_statcast_game_date_groups,
+        )
+
+        entries, mapping, catalog, binding_type = self._recovery_bindings()
+        loader, factory = self._published_capability(
+            mapping, catalog, entries, binding_type
+        )
+        original = RecoveryDispositionBindings.reauthenticate
+        with loader, patch.object(
+            RecoveryDispositionBindings,
+            "reauthenticate",
+            autospec=True,
+            side_effect=original,
+        ) as reauthenticate:
+            capability = factory()
+            reauthenticate.reset_mock()
+            validate_recovery_statcast_game_date_groups(
+                [
+                    [{"game_pk": 9001, "game_date": "2021-07-21"}],
+                    [{"game_pk": 630882, "game_date": "2020-08-14"}],
+                    [{"game_pk": 633224, "game_date": "2021-09-24"}],
+                ],
+                capability,
+            )
+            self.assertEqual(reauthenticate.call_count, 2)
+            reauthenticate.reset_mock()
+            with self.assertRaisesRegex(ValueError, "played_date"):
+                validate_recovery_statcast_game_date_groups(
+                    [[{"game_pk": 630882, "game_date": "2020-08-09"}]],
+                    capability,
+                )
+            self.assertEqual(reauthenticate.call_count, 1)
+
     def test_recovery_non_schedule_families_reject_schedule_catalog_injection(
         self,
     ) -> None:

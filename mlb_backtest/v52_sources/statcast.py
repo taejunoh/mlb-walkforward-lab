@@ -42,17 +42,52 @@ def validate_recovery_statcast_game_dates(
     capability: "RecoveryDispositionBindings | None",
 ) -> None:
     """Require Savant's raw local game date for the two resumed games only."""
-    if capability is not None and not isinstance(capability, RecoveryDispositionBindings):
+    targets = _recovery_statcast_targets(games)
+    if not targets:
+        return
+    if not isinstance(capability, RecoveryDispositionBindings):
         raise ValueError("recovery Statcast availability capability is required")
-    authenticated = capability.reauthenticate() if capability is not None else None
+    _validate_recovery_statcast_targets(targets, capability.reauthenticate())
+
+
+def validate_recovery_statcast_game_date_groups(
+    groups: Sequence[Sequence[Mapping[str, object]]],
+    capability: "RecoveryDispositionBindings | None",
+) -> None:
+    """Validate one Statcast family with one fresh catalog authentication."""
+    targets = [
+        target
+        for games in groups
+        for target in _recovery_statcast_targets(games)
+    ]
+    if not targets:
+        return
+    if not isinstance(capability, RecoveryDispositionBindings):
+        raise ValueError("recovery Statcast availability capability is required")
+    authenticated = capability.reauthenticate()
+    _validate_recovery_statcast_targets(targets, authenticated)
+    authenticated.reauthenticate()
+
+
+def _recovery_statcast_targets(
+    games: Sequence[Mapping[str, object]],
+) -> list[Mapping[str, object]]:
+    targets: list[Mapping[str, object]] = []
     for game in games:
         if not isinstance(game, Mapping):
             raise ValueError("Statcast game projection must be a mapping")
         game_pk = game.get("game_pk")
-        if game_pk not in {630882, 633224}:
-            continue
-        if authenticated is None:
-            raise ValueError("recovery Statcast availability capability is required")
+        if game_pk in {630882, 633224}:
+            targets.append(game)
+    return targets
+
+
+def _validate_recovery_statcast_targets(
+    targets: Sequence[Mapping[str, object]],
+    authenticated: RecoveryDispositionBindings,
+) -> None:
+    for game in targets:
+        game_pk = game["game_pk"]
         entry = next(entry for entry in authenticated.entries if entry.game_pk == game_pk)
         if game.get("game_date") != entry.played_date:
             raise ValueError("recovery Statcast game_date differs from played_date")
