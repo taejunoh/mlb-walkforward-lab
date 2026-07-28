@@ -363,6 +363,9 @@ def _validate_static_schedule_stage(
             "STATIC_SCHEDULES stage must contain the seven canonical season roots"
         )
     _validate_shared_query_bindings(queries, "STATIC_SCHEDULES")
+    if any(query.parser_version == "v5.2.2" for query in queries):
+        _validate_recovery_static_schedule_queries(queries)
+        return
     for query, year in zip(queries, years):
         first, last = SEASON_BOUNDARIES[year]
         if year == 2019 and query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
@@ -452,6 +455,63 @@ def _validate_static_schedule_stage(
                 "STATIC_SCHEDULES queries must be the ordered canonical "
                 "2018-2024 season roots"
             )
+
+
+_RECOVERY_DISPOSITION_ENDPOINTS = {
+    2019: "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+    2020: "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+    2021: "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+}
+
+
+def _validate_recovery_static_schedule_queries(
+    queries: Sequence[LogicalQuery],
+    *,
+    run_spec_sha256: str | None = None,
+    acquisition_contract_sha256: str | None = None,
+) -> None:
+    """Validate only the design-fixed recovery schedule query table."""
+    if len(queries) != 7:
+        raise ValueError("recovery STATIC_SCHEDULES requires exactly seven queries")
+    for query, year in zip(queries, range(2018, 2025), strict=True):
+        first, last = SEASON_BOUNDARIES[year]
+        endpoint = _RECOVERY_DISPOSITION_ENDPOINTS.get(year, _SCHEDULE_ENDPOINT)
+        expected_parameters: Mapping[str, object]
+        if year in _RECOVERY_DISPOSITION_ENDPOINTS:
+            expected_parameters = {}
+        else:
+            expected_parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": first.isoformat(),
+                "endDate": last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or query.endpoint != endpoint
+            or dict(query.parameters) != expected_parameters
+            or dict(query.requested_range)
+            != {
+                "year": year,
+                "start_date": first.isoformat(),
+                "end_date": last.isoformat(),
+            }
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.2"
+            or query.parent_query_id is not None
+            or (
+                run_spec_sha256 is not None
+                and query.run_spec_sha256 != run_spec_sha256
+            )
+            or (
+                acquisition_contract_sha256 is not None
+                and query.acquisition_contract_sha256
+                != acquisition_contract_sha256
+            )
+        ):
+            raise ValueError("recovery STATIC_SCHEDULES query table differs")
 
 
 def _validate_remaining_stage(
@@ -1766,6 +1826,15 @@ def build_static_batch(
 ) -> QueryBatch:
     inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
     context = _load_static_contracts(run_spec_path, acquisition_contract_path)
+    if (
+        isinstance(context.authority, SourceRunSpec)
+        and context.authority.run_id == _RECOVERY_RUN_ID
+    ):
+        return _make_batch(
+            "STATIC_SCHEDULES",
+            None,
+            _build_recovery_static_schedule_queries(inputs),
+        )
     disposition_query: LogicalQuery | None = None
     if isinstance(context.authority, SourceRunSpec):
         from .v52_duplicate_gamepk_disposition import (
@@ -1807,6 +1876,45 @@ def build_static_batch(
             )
         )
     return _make_batch("STATIC_SCHEDULES", None, queries)
+
+
+def _build_recovery_static_schedule_queries(
+    inputs: _StaticQueryInputs,
+) -> tuple[LogicalQuery, ...]:
+    queries: list[LogicalQuery] = []
+    for season in inputs.seasons:
+        endpoint = _RECOVERY_DISPOSITION_ENDPOINTS.get(
+            season.year, _SCHEDULE_ENDPOINT
+        )
+        parameters: Mapping[str, object]
+        if season.year in _RECOVERY_DISPOSITION_ENDPOINTS:
+            parameters = {}
+        else:
+            parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": season.first.isoformat(),
+                "endDate": season.last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        queries.append(
+            _logical_query(
+                source="mlb_schedule_game_feed",
+                grain=inputs.schedule_grain,
+                endpoint=endpoint,
+                parameters=parameters,
+                requested_range={
+                    "year": season.year,
+                    "start_date": season.first.isoformat(),
+                    "end_date": season.last.isoformat(),
+                },
+                expected_media_type="application/json",
+                parser_version=inputs.schedule_parser_version,
+                run_spec_sha256=inputs.run_spec_sha256,
+                acquisition_contract_sha256=inputs.acquisition_contract_sha256,
+            )
+        )
+    return tuple(queries)
 
 
 def _build_statcast_root_batch(
@@ -3132,6 +3240,12 @@ def _validate_recovery_parser_batch(repository_root: Path, batch: QueryBatch) ->
                 "recovery v5.2.2 queries are limited to STATIC_SCHEDULES "
                 "schedule authority"
             )
+    if any(query.parser_version == "v5.2.2" for query in batch.queries):
+        _validate_recovery_static_schedule_queries(
+            batch.queries,
+            run_spec_sha256=recovery_context.authority_sha256,
+            acquisition_contract_sha256=recovery_context.acquisition_contract_sha256,
+        )
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:

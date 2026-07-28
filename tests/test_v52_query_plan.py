@@ -754,6 +754,69 @@ class RecoveryAuthorityTests(unittest.TestCase):
                 query_plan._RECOVERY_ACQUISITION_BATCH_ROOT,
             )
 
+    def test_recovery_public_static_batch_has_only_the_seven_design_queries(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_path, contract_path = self._fixture(Path(directory))
+            batch = query_plan.build_static_batch(run_path, contract_path)
+            self.assertEqual(batch.stage, "STATIC_SCHEDULES")
+            self.assertEqual(
+                [query.requested_range["year"] for query in batch.queries],
+                list(range(2018, 2025)),
+            )
+            self.assertEqual(
+                [query.endpoint for query in batch.queries],
+                [
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                    "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+                    "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+                    "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                ],
+            )
+            self.assertTrue(all(query.parser_version == "v5.2.2" for query in batch.queries))
+            published = query_plan.publish_query_batch(root, batch)
+            self.assertEqual(
+                published.parent,
+                root / "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/query_batches",
+            )
+            self.assertFalse((root / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw").exists())
+
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            mutations = (
+                (batch.queries[1], batch.queries[0], *batch.queries[2:]),
+                (
+                    dataclasses.replace(batch.queries[0], parser_version="v5.2.1"),
+                    *batch.queries[1:],
+                ),
+                (
+                    dataclasses.replace(
+                        batch.queries[0], endpoint="https://statsapi.mlb.com/api/v1/stats"
+                    ),
+                    *batch.queries[1:],
+                ),
+            )
+            for queries in mutations:
+                with self.subTest(queries=queries):
+                    mutated = dataclasses.replace(batch, queries=queries)
+                    with self.assertRaisesRegex(
+                        ValueError, "recovery.*STATIC|STATIC.*recovery"
+                    ):
+                        query_plan.publish_query_batch(root, mutated)
+                    after = {
+                        path.relative_to(root): path.read_bytes()
+                        for path in root.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(after, before)
+
 
 class V52QueryPlanTest(unittest.TestCase):
     def test_source_authority_rejects_dirty_ephemeral_equivalence_addendum(self):
