@@ -600,7 +600,15 @@ def _validate_normalized_snapshot_mapping(
     has_disposition = bool(disposition_keys & set(envelope))
     recovery_catalog = envelope.get("schedule_conflict_dispositions")
     has_recovery_catalog = "schedule_conflict_dispositions" in envelope
-    if envelope["run_id"] == _RECOVERY_RUN_ID:
+    recovery_schedule_lineage = (
+        envelope["run_id"] == _RECOVERY_RUN_ID
+        and (source, grain)
+        in {
+            ("mlb_schedule_game_feed", "season_game_evidence_snapshot"),
+            ("prior_schedule_history", "verified_game_projection"),
+        }
+    )
+    if recovery_schedule_lineage:
         if not has_recovery_catalog or not isinstance(recovery_catalog, Mapping):
             raise ValueError("normalized recovery disposition binding differs")
         if recovery_dispositions is None:

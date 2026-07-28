@@ -1121,6 +1121,150 @@ class RecoveryReplayCapabilityTests(unittest.TestCase):
                 history.as_mapping(),
             )
 
+    def test_recovery_non_schedule_families_reject_schedule_catalog_injection(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        first, second = authority.records[:2]
+        first_hash = first.query_sidecar_sha256
+        recovery_run = "historical_walkforward_500_recovery_schedule_conflicts"
+        statcast = verifier._statcast_normalized_snapshot(
+            recovery_run,
+            2018,
+            (first,),
+            (),
+            {
+                "schema_version": 1,
+                "grain": "pitch",
+                "parent_coverage": {
+                    "inclusive_start": "2018-04-01",
+                    "inclusive_end": "2018-04-30",
+                },
+                "children": [
+                    {
+                        "inclusive_start": "2018-04-01",
+                        "inclusive_end": "2018-04-30",
+                        "query_sidecar_sha256": first_hash,
+                        "split_disposition": "READY",
+                    }
+                ],
+                "child_query_sidecar_sha256s": [first_hash],
+                "played_game_pks": [],
+                "statcast_game_pks": [],
+                "unique_pitch_count": 0,
+                "split_state": "READY_COMPLETE",
+            },
+        )
+        pitching = verifier._pitching_normalized_snapshot(
+            recovery_run,
+            2018,
+            (first,),
+            {
+                "schema_version": 1,
+                "grain": "season_d1_league_pitching_reference",
+                "query_sidecar_sha256s": [first_hash],
+                "records": [
+                    {
+                        "as_of_date": "2018-03-28",
+                        "consumer_cutoff_dates": {"1": "2018-03-28"},
+                        "consuming_game_pks": [1],
+                        "query_sidecar_sha256": first_hash,
+                        "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                    }
+                ],
+            },
+        )
+        ordered = sorted((first, second), key=lambda record: record.query_sidecar_sha256)
+        reference = verifier._reference_normalized_snapshot(
+            recovery_run,
+            2018,
+            tuple(ordered),
+            {
+                "schema_version": 1,
+                "grain": "effective_dated_venue_team_reference",
+                "team_payload_sha256s": [ordered[0].query_sidecar_sha256],
+                "venue_payload_sha256s": [ordered[1].query_sidecar_sha256],
+                "teams": [
+                    {
+                        "home_venue_id": 1,
+                        "location_name": "City",
+                        "team_id": 1,
+                        "team_name": "Club",
+                    }
+                ],
+                "venues": [
+                    {
+                        "city": "City",
+                        "latitude": 0.0,
+                        "longitude": 0.0,
+                        "venue_id": 1,
+                        "venue_name": "Park",
+                    }
+                ],
+                "timezone_rows": [
+                    {
+                        "effective_start": "2018-01-01",
+                        "effective_end": "2018-12-31",
+                        "time_zone": "America/New_York",
+                        "venue_id": 1,
+                    }
+                ],
+                "observed_venue_date_mappings": [
+                    {
+                        "alternate_site": False,
+                        "neutral_site": False,
+                        "official_date": "2018-04-01",
+                        "time_zone": "America/New_York",
+                        "venue_id": 1,
+                    }
+                ],
+            },
+        )
+        career = verifier._career_normalized_snapshot(
+            recovery_run,
+            2018,
+            {
+                "schema_version": 1,
+                "grain": "player_career_batters_faced_reference",
+                "records": [
+                    {
+                        "baseline_batters_faced": 0,
+                        "baseline_inclusive_end_date": "2017-12-31",
+                        "baseline_query_sidecar_sha256": first_hash,
+                        "consumer_cutoff_date": "2018-04-01",
+                        "game_pk": 1,
+                        "pitcher_id": 1,
+                        "statcast_ready_leaf_sidecar_sha256s": [],
+                        "statcast_split_receipt_sha256s": [],
+                        "total_batters_faced": 0,
+                        "verified_statcast_bf": 0,
+                    }
+                ],
+            },
+            {first_hash: first},
+        )
+
+        for snapshot in (statcast, pitching, reference, career):
+            with self.subTest(source=snapshot.source):
+                mapping = snapshot.as_mapping()
+                self.assertNotIn("schedule_conflict_dispositions", mapping)
+                self.assertEqual(
+                    verifier._validate_normalized_snapshot_mapping(mapping), mapping
+                )
+                injected = json.loads(canonical_json_bytes(mapping))
+                injected["schedule_conflict_dispositions"] = {
+                    "entries": [],
+                    "query_ids": [],
+                }
+                with self.assertRaisesRegex(ValueError, "rejects recovery"):
+                    verifier._validate_normalized_snapshot_mapping(injected)
+                boundary = json.loads(canonical_json_bytes(mapping))
+                boundary["payload"]["played_date"] = "2018-04-01"
+                with self.assertRaises(ValueError):
+                    verifier._validate_normalized_snapshot_mapping(boundary)
+
     def test_replay_rejects_missing_tampered_reordered_and_cross_bound_catalogs(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
 
