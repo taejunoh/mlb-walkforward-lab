@@ -3984,6 +3984,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.plan_only and args.resume:
         _parser().error("--plan-only and --resume are mutually exclusive")
     try:
+        canonical_root = Path(os.path.abspath(os.fspath(args.root)))
         run_spec_path = _cli_exact_run_spec(args.root, args.run_spec)
         try:
             run_spec = (
@@ -4005,9 +4006,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             reserve_bytes=args.reserve_bytes,
             plan_only=args.plan_only,
             acquisition_contract_path=(
-                args.acquisition_contract
+                _absolute_supplied(args.acquisition_contract, canonical_root)
                 if args.acquisition_contract is not None
-                else args.root
+                else canonical_root
                 / (
                     _SOURCE_ACQUISITION_CONTRACT_RELATIVE
                     if isinstance(run_spec, SourceRunSpec)

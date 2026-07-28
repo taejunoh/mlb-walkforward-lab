@@ -5639,6 +5639,75 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
             main(["--root", str(ROOT)])
         self.assertEqual(misuse.exception.code, 2)
 
+    def test_cli_normalizes_relative_superseding_contract_before_authentication(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_acquire import (
+            _AcquisitionPlan,
+            _REAL_OPS,
+            _validate_request_contract,
+            main,
+        )
+
+        source_run_spec = Path(
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_superseding_565534.json"
+        )
+        source_contract = Path(
+            "protocols/v5_2_qd/"
+            "historical_source_acquisition_superseding_565534.json"
+        )
+        legacy_root = ROOT / "data/v5_1_bt/raw"
+        created_legacy_root = not legacy_root.exists()
+        legacy_root.mkdir(parents=True, exist_ok=True)
+        previous_cwd = Path.cwd()
+
+        def authenticate(request):
+            _root, _contract, contract_contents = _validate_request_contract(request)
+            return _AcquisitionPlan(
+                contract_sha256=hashlib.sha256(contract_contents).hexdigest(),
+                query_batch_ids=("a" * 64,),
+                legacy_dispositions=("PROMOTED",),
+            )
+
+        argv = [
+            "--root",
+            ".",
+            "--run-spec",
+            source_run_spec.as_posix(),
+            "--acquisition-contract",
+            source_contract.as_posix(),
+            "--years",
+            "2018:2024",
+            "--mode",
+            "hybrid",
+            "--legacy-root",
+            "data/v5_1_bt/raw",
+            "--protected-inventory",
+            "audit/v5_1_bt/protected_raw_inventory.json",
+            "--plan-only",
+        ]
+        output = io.StringIO()
+        try:
+            os.chdir(ROOT)
+            fake_ops = dataclasses.replace(_REAL_OPS, authenticate=authenticate)
+            with (
+                patch("mlb_backtest.v52_acquire._REAL_OPS", fake_ops),
+                patch("sys.stdout", output),
+            ):
+                self.assertEqual(main(argv), 0)
+        finally:
+            os.chdir(previous_cwd)
+            if created_legacy_root:
+                legacy_root.rmdir()
+
+        payload = json.loads(output.getvalue())
+        expected_contract_sha256 = hashlib.sha256(
+            (ROOT / source_contract).read_bytes()
+        ).hexdigest()
+        self.assertEqual(payload["contract_sha256"], expected_contract_sha256)
+        self.assertEqual(payload["query_batch_sha256s"], ["a" * 64])
+
     def _cli_argv(self) -> list[str]:
         return [
             "--root",
