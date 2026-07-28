@@ -309,6 +309,117 @@ class RecoveryParentEvidenceTests(unittest.TestCase):
                 build_recovery_parent_catalog(root)
         self.assertTrue(swapped)
 
+    def test_tree_fingerprint_rejects_member_added_after_enumeration(self) -> None:
+        from mlb_backtest import v52_recovery_parent_evidence
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            capture_tree_fingerprint,
+        )
+
+        root = self._isolated_parent_root()
+        relative = PARENT_RELATIVES["original_2019_565534"]["registration"].parent
+        tree = root / relative
+        original_scandir = os.scandir
+        mutated = False
+
+        def add_member_after_enumeration(path: str | os.PathLike[str] | int):
+            scanner = original_scandir(path)
+
+            class Scanner:
+                def __enter__(self):
+                    return scanner.__enter__()
+
+                def __exit__(self, *args: object) -> object:
+                    nonlocal mutated
+                    result = scanner.__exit__(*args)
+                    if not mutated:
+                        mutated = True
+                        (tree / "unexpected-after-enumeration.json").write_text(
+                            "{}\n", encoding="utf-8"
+                        )
+                    return result
+
+            return Scanner()
+
+        with patch.object(v52_recovery_parent_evidence.os, "scandir", add_member_after_enumeration):
+            with self.assertRaises(ValueError):
+                capture_tree_fingerprint(root, relative)
+        self.assertTrue(mutated)
+
+    def test_tree_fingerprint_rejects_ancestor_swap_after_enumeration(self) -> None:
+        from mlb_backtest import v52_recovery_parent_evidence
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            PARENT_RELATIVES,
+            capture_tree_fingerprint,
+        )
+
+        root = self._isolated_parent_root()
+        relative = PARENT_RELATIVES["original_2019_565534"]["registration"].parent
+        source_data = root / "data"
+        replacement_data = root / "replacement-data"
+        original_scandir = os.scandir
+        swapped = False
+
+        def swap_ancestor_after_enumeration(path: str | os.PathLike[str] | int):
+            scanner = original_scandir(path)
+
+            class Scanner:
+                def __enter__(self):
+                    return scanner.__enter__()
+
+                def __exit__(self, *args: object) -> object:
+                    nonlocal swapped
+                    result = scanner.__exit__(*args)
+                    if not swapped:
+                        swapped = True
+                        source_data.rename(replacement_data)
+                        source_data.symlink_to(replacement_data, target_is_directory=True)
+                    return result
+
+            return Scanner()
+
+        with patch.object(
+            v52_recovery_parent_evidence.os, "scandir", swap_ancestor_after_enumeration
+        ):
+            with self.assertRaises(ValueError):
+                capture_tree_fingerprint(root, relative)
+        self.assertTrue(swapped)
+
+    def test_directory_component_post_open_stat_failure_closes_descriptor(self) -> None:
+        from mlb_backtest import v52_recovery_parent_evidence
+
+        root = self._isolated_parent_root()
+        parent_fd = os.open(root, v52_recovery_parent_evidence._directory_flags())
+        original_stat = os.stat
+        before = len(os.listdir("/dev/fd"))
+        try:
+            for _index in range(32):
+                stat_calls = 0
+
+                def fail_after_open(
+                    path: str | os.PathLike[str],
+                    *,
+                    dir_fd: int | None = None,
+                    follow_symlinks: bool = True,
+                ) -> os.stat_result:
+                    nonlocal stat_calls
+                    if path == "data" and dir_fd == parent_fd:
+                        stat_calls += 1
+                        if stat_calls == 2:
+                            raise OSError("injected post-open stat failure")
+                    return original_stat(
+                        path, dir_fd=dir_fd, follow_symlinks=follow_symlinks
+                    )
+
+                with patch.object(v52_recovery_parent_evidence.os, "stat", fail_after_open):
+                    with self.assertRaises(ValueError):
+                        v52_recovery_parent_evidence._open_directory_component(
+                            parent_fd, "data", "injected directory"
+                        )
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
+        finally:
+            os.close(parent_fd)
+
 
 def _legacy_fixture(
     base: Path,

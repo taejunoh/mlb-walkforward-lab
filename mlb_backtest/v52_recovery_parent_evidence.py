@@ -370,6 +370,11 @@ def _open_directory_component(
             label,
         )
     except OSError as exc:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise ValueError(f"{label} cannot be opened safely") from exc
     except BaseException:
         if descriptor >= 0:
@@ -718,52 +723,166 @@ def build_recovery_parent_catalog(root: Path) -> RecoveryParentCatalog:
     return RecoveryParentCatalog(repository_root, MappingProxyType(parents))
 
 
-def _tree_file_records(root: Path, tree: Path, relative: Path) -> list[dict[str, str]]:
-    node = tree.lstat()
-    if stat.S_ISLNK(node.st_mode) or not stat.S_ISDIR(node.st_mode):
-        raise ValueError("fingerprint tree must be a real directory")
-    records: list[dict[str, str]] = []
-    with os.scandir(tree) as entries:
-        children = sorted(entries, key=lambda item: item.name)
-    for child in children:
-        child_path = tree / child.name
-        child_node = child_path.lstat()
-        child_relative = relative / child.name
-        if stat.S_ISLNK(child_node.st_mode):
-            raise ValueError("fingerprint tree contains a symlink")
-        if stat.S_ISDIR(child_node.st_mode):
-            records.extend(_tree_file_records(root, child_path, child_relative))
-            continue
-        if not stat.S_ISREG(child_node.st_mode) or child_node.st_nlink != 1:
-            raise ValueError("fingerprint tree contains a non-single-link file")
-        contents, _identity = _read_regular_single_link(
-            root, child_relative, "fingerprint tree file"
+@dataclass(frozen=True)
+class _TreeEntry:
+    name: str
+    identity: tuple[int, int, int, int, int]
+    is_directory: bool
+
+
+def _snapshot_tree_directory(
+    directory_fd: int, label: str
+) -> tuple[_TreeEntry, ...]:
+    scan_fd = os.dup(directory_fd)
+    scanner: os.ScandirIterator[str] | None = None
+    entries: list[_TreeEntry] = []
+    try:
+        scanner = os.scandir(scan_fd)
+        with scanner as active_scanner:
+            for entry in active_scanner:
+                if entry.name in {"", ".", ".."} or "/" in entry.name:
+                    raise ValueError("fingerprint tree has an unsafe member name")
+                node = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(node.st_mode):
+                    raise ValueError("fingerprint tree contains a symlink")
+                if stat.S_ISDIR(node.st_mode):
+                    entries.append(_TreeEntry(entry.name, _file_identity(node), True))
+                elif stat.S_ISREG(node.st_mode) and node.st_nlink == 1:
+                    entries.append(_TreeEntry(entry.name, _file_identity(node), False))
+                else:
+                    raise ValueError("fingerprint tree contains an unsafe member")
+    except OSError as exc:
+        if scanner is None:
+            os.close(scan_fd)
+        raise ValueError(f"{label} cannot be enumerated safely") from exc
+    return tuple(sorted(entries, key=lambda entry: entry.name))
+
+
+def _assert_tree_directory_membership(
+    directory_fd: int, expected: tuple[_TreeEntry, ...], label: str
+) -> None:
+    if _snapshot_tree_directory(directory_fd, label) != expected:
+        raise ValueError(f"{label} membership changed while being fingerprinted")
+
+
+def _read_tree_file(
+    parent_fd: int,
+    entry: _TreeEntry,
+    label: str,
+) -> bytes:
+    descriptor = -1
+    try:
+        linked_before = os.stat(entry.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(linked_before.st_mode)
+            or linked_before.st_nlink != 1
+            or _file_identity(linked_before) != entry.identity
+        ):
+            raise ValueError(f"{label} identity differs before reading")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
         )
+        descriptor = os.open(entry.name, flags, dir_fd=parent_fd)
+        opened_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or opened_before.st_nlink != 1
+            or _file_identity(opened_before) != entry.identity
+        ):
+            raise ValueError(f"{label} identity differs after opening")
+        remaining = opened_before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"{label} ended before its snapshot byte count")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError(f"{label} grew while being read")
+        opened_after = os.fstat(descriptor)
+        linked_after = os.stat(entry.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _file_identity(linked_after) != entry.identity
+            or _file_identity(opened_after) != entry.identity
+        ):
+            raise ValueError(f"{label} identity changed while being read")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _tree_file_records(
+    directory_fd: int,
+    relative: Path,
+    bindings: list[_DirectoryBinding],
+) -> list[dict[str, str]]:
+    expected = _snapshot_tree_directory(directory_fd, "fingerprint tree directory")
+    records: list[dict[str, str]] = []
+    for entry in expected:
+        child_relative = relative / entry.name
+        if entry.is_directory:
+            child_fd, binding = _open_directory_component(
+                directory_fd, entry.name, "fingerprint tree directory"
+            )
+            try:
+                if _file_identity(os.fstat(child_fd)) != entry.identity:
+                    raise ValueError("fingerprint directory identity differs")
+                records.extend(
+                    _tree_file_records(child_fd, child_relative, bindings + [binding])
+                )
+                _assert_directory_bindings([binding])
+            finally:
+                os.close(child_fd)
+            continue
+        contents = _read_tree_file(directory_fd, entry, "fingerprint tree file")
         records.append(
             {
                 "path": child_relative.as_posix(),
                 "sha256": hashlib.sha256(contents).hexdigest(),
             }
         )
+    _assert_tree_directory_membership(
+        directory_fd, expected, "fingerprint tree directory"
+    )
+    _assert_directory_bindings(bindings)
     return records
 
 
 def capture_tree_fingerprint(root: Path, relative: Path) -> TreeFingerprint:
     """Return a canonical file-count/path/content digest for a fixed tree."""
     repository_root = _repository_root(root)
-    _safe_relative_parts(relative, "fingerprint tree")
-    tree = repository_root / relative
-    records = _tree_file_records(repository_root, tree, relative)
-    records.sort(key=lambda record: record["path"])
-    digest = hashlib.sha256(
-        canonical_json_bytes({"file_count": len(records), "files": records})
-    ).hexdigest()
-    return TreeFingerprint(
-        relative=relative,
-        file_count=len(records),
-        paths=tuple(record["path"] for record in records),
-        sha256=digest,
+    parts = _safe_relative_parts(relative, "fingerprint tree")
+    _root, directory_fd, descriptors, bindings = _open_authenticated_root(
+        repository_root
     )
+    try:
+        for component in parts:
+            child_fd, binding = _open_directory_component(
+                directory_fd, component, "fingerprint tree ancestor"
+            )
+            descriptors.append(child_fd)
+            bindings.append(binding)
+            directory_fd = child_fd
+        records = _tree_file_records(directory_fd, relative, bindings)
+        records.sort(key=lambda record: record["path"])
+        digest = hashlib.sha256(
+            canonical_json_bytes({"file_count": len(records), "files": records})
+        ).hexdigest()
+        return TreeFingerprint(
+            relative=relative,
+            file_count=len(records),
+            paths=tuple(record["path"] for record in records),
+            sha256=digest,
+        )
+    finally:
+        _close_descriptors(descriptors)
 
 
 __all__ = [
