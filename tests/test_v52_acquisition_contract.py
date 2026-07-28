@@ -376,14 +376,36 @@ class V52SupersedingAcquisitionContractTest(unittest.TestCase):
             else:
                 self.assertEqual(new_sources[name], old_source)
 
-    def test_acquisition_schema_has_two_exact_closed_branches(self):
-        self.assertEqual(len(self.schema["oneOf"]), 2)
+    def test_acquisition_schema_has_three_closed_authority_branches(self):
+        self.assertEqual(len(self.schema["oneOf"]), 3)
         old = json.loads(CONTRACT_PATH.read_bytes())
         for branch, instance in zip(
-            self.schema["oneOf"], (old, self.contract), strict=True
+            self.schema["oneOf"][:2], (old, self.contract), strict=True
         ):
             self.assertEqual(branch["const"], instance)
             _assert_schema_closes_instance(self, instance, branch, "contract")
+
+    def test_recovery_schema_base_is_closed_without_permissive_values(self):
+        recovery = self.schema["oneOf"][2]
+
+        def assert_closed(value: object, path: str) -> None:
+            self.assertIsInstance(value, dict, path)
+            self.assertNotEqual(value, {}, path)
+            if "const" in value:
+                self.assertEqual(set(value), {"const"}, path)
+                return
+            self.assertEqual(value.get("type"), "object", path)
+            self.assertFalse(value.get("additionalProperties"), path)
+            properties = value.get("properties")
+            self.assertIsInstance(properties, dict, path)
+            self.assertEqual(set(properties), set(value.get("required", [])), path)
+            for key, child in properties.items():
+                if child.get("type") == "string":
+                    self.assertEqual(set(child), {"type", "pattern"}, f"{path}.{key}")
+                else:
+                    assert_closed(child, f"{path}.{key}")
+
+        assert_closed(recovery, "recovery")
 
     def test_old_default_authorities_keep_authoritative_sha256s(self):
         self.assertEqual(_sha256(ROOT / RUN_SPEC_PATH), self.OLD["run_spec_sha256"])

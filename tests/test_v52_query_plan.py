@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -40,6 +41,24 @@ SOURCE_RUN_SPEC = (
 SOURCE_CONTRACT = (
     ROOT
     / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+RECOVERY_RUN_SPEC = (
+    ROOT
+    / "protocols/v5_2_qd/"
+    "historical_walkforward_500_recovery_schedule_conflicts.json"
+)
+RECOVERY_CONTRACT = (
+    ROOT
+    / "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts.json"
+)
+RECOVERY_DESIGN = Path(
+    "docs/superpowers/specs/"
+    "2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
+)
+RECOVERY_PLAN = Path(
+    "docs/superpowers/plans/"
+    "2026-07-28-v5-2-schedule-conflict-recovery-run.md"
 )
 SOURCE_ADDENDUM = Path(
     "docs/superpowers/specs/"
@@ -439,6 +458,189 @@ def _split_batches(root: Path):
     query_plan.publish_query_batch(root, child_batch)
     attempt_number = _record_split_attempt(root, parent, "TIMEOUT")
     return parent_batch, parent, child_batch, attempt_number
+
+
+class RecoveryAuthorityTests(unittest.TestCase):
+    """The recovery source authority is a third, exact path-paired branch."""
+
+    @staticmethod
+    def _canonical_bytes(value: object) -> bytes:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+
+    def _fixture(self, parent: Path) -> tuple[Path, Path, Path]:
+        from mlb_backtest import protocols
+        import mlb_backtest.v52_query_plan as query_plan
+
+        root = (parent / "repo").resolve()
+        for relative in (
+            RECOVERY_DESIGN,
+            RECOVERY_PLAN,
+            Path("schemas/v5_2_acquisition_contract.schema.json"),
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+        run_path = root / RECOVERY_RUN_SPEC.relative_to(ROOT)
+        run_path.parent.mkdir(parents=True, exist_ok=True)
+        run_path.write_bytes(self._canonical_bytes(protocols.expected_recovery_source_run()))
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "recovery@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Recovery Test"], cwd=root, check=True)
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "recovery authority fixture"], cwd=root, check=True)
+
+        contract = json.loads(SOURCE_CONTRACT.read_bytes())
+        schedule = next(
+            source
+            for source in contract["sources"]
+            if source["name"] == "mlb_schedule_game_feed"
+        )
+        schedule["parser_version"] = "v5.2.2"
+        schedule["endpoints"] = [
+            "https://statsapi.mlb.com/api/v1/schedule",
+            "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+        ]
+        contract.update(
+            {
+                "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+                "recovery_provenance": query_plan._RECOVERY_PROVENANCE,
+                "canonical_roots": {
+                    "raw": "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+                    "sources": "data/v5_2_qd/historical_recovery_schedule_conflicts/sources",
+                    "acquisition_audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition",
+                    "execution_audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution",
+                },
+                "bindings": {
+                    "approved_design": {
+                        "path": RECOVERY_DESIGN.as_posix(),
+                        "sha256": hashlib.sha256((root / RECOVERY_DESIGN).read_bytes()).hexdigest(),
+                        "git_blob_id": subprocess.run(
+                            ["git", "rev-parse", f"HEAD:{RECOVERY_DESIGN.as_posix()}"],
+                            cwd=root, check=True, text=True, capture_output=True,
+                        ).stdout.strip(),
+                    },
+                    "implementation_plan": {
+                        "path": RECOVERY_PLAN.as_posix(),
+                        "working_tree_sha256": hashlib.sha256((root / RECOVERY_PLAN).read_bytes()).hexdigest(),
+                        "git_blob_id": subprocess.run(
+                            ["git", "rev-parse", f"HEAD:{RECOVERY_PLAN.as_posix()}"],
+                            cwd=root, check=True, text=True, capture_output=True,
+                        ).stdout.strip(),
+                    },
+                    "run_spec": {
+                        "path": RECOVERY_RUN_SPEC.relative_to(ROOT).as_posix(),
+                        "sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
+                        "git_blob_id": subprocess.run(
+                            ["git", "rev-parse", f"HEAD:{RECOVERY_RUN_SPEC.relative_to(ROOT).as_posix()}"],
+                            cwd=root, check=True, text=True, capture_output=True,
+                        ).stdout.strip(),
+                    },
+                },
+            }
+        )
+        contract.pop("supersedes")
+        contract_path = root / RECOVERY_CONTRACT.relative_to(ROOT)
+        contract_path.write_bytes(self._canonical_bytes(contract))
+        return root, run_path, contract_path
+
+    def test_recovery_contract_requires_the_closed_three_parent_provenance_entries(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_path, contract_path = self._fixture(Path(directory))
+            contract = json.loads(contract_path.read_bytes())
+            self.assertEqual(
+                list(contract["recovery_provenance"]),
+                [
+                    "original_2019_565534",
+                    "superseding_2020_630882",
+                    "superseding_2021_633224",
+                ],
+            )
+            broken = dict(contract)
+            broken["recovery_provenance"] = {}
+            contract_path.write_bytes(self._canonical_bytes(broken))
+            with self.assertRaisesRegex(ValueError, "recovery provenance differs"):
+                query_plan._load_static_contracts(run_path, contract_path)
+
+    def test_recovery_authority_accepts_only_the_exact_path_pair_and_roots(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_path, contract_path = self._fixture(Path(directory))
+            context = query_plan._load_static_contracts(run_path, contract_path)
+            self.assertIsInstance(context.authority, SourceRunSpec)
+            self.assertEqual(
+                context.run_id,
+                "historical_walkforward_500_recovery_schedule_conflicts",
+            )
+            self.assertEqual(
+                context.raw_root,
+                root / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+            )
+            with self.assertRaisesRegex(ValueError, "pair|path"):
+                query_plan._load_static_contracts(run_path, root / CONTRACT.relative_to(ROOT))
+
+    def test_recovery_contract_rejects_fixed_field_and_parent_mutations(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, run_path, contract_path = self._fixture(Path(directory))
+            original = json.loads(contract_path.read_bytes())
+            mutations = {
+                "unknown": lambda value: value.__setitem__("unknown", True),
+                "root": lambda value: value["canonical_roots"].__setitem__(
+                    "raw", "data/v5_2_qd/historical/raw"
+                ),
+                "namespace_overlap": lambda value: value["canonical_roots"].__setitem__(
+                    "sources",
+                    "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+                ),
+                "arbitrary_run": lambda value: value.__setitem__(
+                    "run_id", "historical_walkforward_500_recovery_anything"
+                ),
+                "non_schedule_v522": lambda value: value["sources"][0].__setitem__(
+                    "parser_version", "v5.2.2"
+                ),
+                "missing_attempt": lambda value: value["recovery_provenance"][
+                    "superseding_2020_630882"
+                ].pop("attempt"),
+                "changed_parent_hash": lambda value: value["recovery_provenance"][
+                    "superseding_2021_633224"
+                ]["raw"].__setitem__("sha256", "0" * 64),
+                "changed_parent_size": lambda value: value["recovery_provenance"][
+                    "original_2019_565534"
+                ]["raw"].__setitem__("byte_count", 1),
+                "changed_parent_path": lambda value: value["recovery_provenance"][
+                    "original_2019_565534"
+                ]["raw"].__setitem__("path", "data/other.raw"),
+                "wrong_run_blob": lambda value: value["bindings"]["run_spec"].__setitem__(
+                    "git_blob_id", "0" * 40
+                ),
+                "wrong_design_blob": lambda value: value["bindings"][
+                    "approved_design"
+                ].__setitem__("git_blob_id", "0" * 40),
+                "wrong_plan_blob": lambda value: value["bindings"][
+                    "implementation_plan"
+                ].__setitem__("git_blob_id", "0" * 40),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(original)
+                    mutate(changed)
+                    contract_path.write_bytes(self._canonical_bytes(changed))
+                    with self.assertRaises(ValueError):
+                        query_plan._load_static_contracts(run_path, contract_path)
+            contract_path.write_bytes(self._canonical_bytes(original))
 
 
 class V52QueryPlanTest(unittest.TestCase):

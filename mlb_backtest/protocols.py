@@ -1007,14 +1007,23 @@ def load_run_spec(path: Path) -> RunSpec:
 def parse_source_run_spec(raw: object) -> SourceRunSpec:
     obj = require_exact_keys(raw, SOURCE_RUN_REQUIRED_KEYS, "source_run")
     try:
-        _validate_literal(
-            obj,
-            expected_superseding_source_run(),
-            "source_run",
-        )
+        if obj.get("run_id") == "historical_walkforward_500_superseding_565534":
+            _validate_literal(
+                obj,
+                expected_superseding_source_run(),
+                "source_run",
+            )
+        elif obj.get("run_id") == "historical_walkforward_500_recovery_schedule_conflicts":
+            _validate_literal(
+                obj,
+                expected_recovery_source_run(),
+                "recovery_source_run",
+            )
+        else:
+            raise ValueError("source run ID differs from a frozen authority")
     except ValueError as exc:
         raise ValueError(
-            "superseding source run differs from frozen values"
+            "source run differs from frozen values"
         ) from exc
     return SourceRunSpec(
         schema_version=obj["schema_version"],
@@ -6098,6 +6107,48 @@ def expected_superseding_source_run() -> dict[str, object]:
     }
 
 
+def expected_recovery_source_run() -> dict[str, object]:
+    """The third, source-only authority for the closed schedule recovery."""
+    return {
+        "schema_version": 1,
+        "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+        "model_version": "v5.2-QD",
+        "label": "Historical source acquisition recovery schedule conflicts",
+        "authority_scope": "SOURCE_ONLY_THROUGH_SOURCES_READY",
+        "required_source_years": [2018, 2019, 2020, 2021, 2022, 2023, 2024],
+        "forbidden_source_years": [2025],
+        "source_requirements": {
+            "minimum": list(MINIMUM_SOURCE_NAMES),
+            "optional": list(OPTIONAL_SOURCE_NAMES),
+        },
+        "parser_policy": {
+            "existing_source_parser_version": "v5.2.1",
+            "recovery_schedule_parser_version": "v5.2.2",
+            "schedule_duplicate_dispositions": [
+                "SCHEDULE_DUPLICATE_GAMEPK_565534",
+                "SCHEDULE_DUPLICATE_GAMEPK_630882",
+                "SCHEDULE_DUPLICATE_GAMEPK_633224",
+            ],
+        },
+        "namespaces": {
+            "raw": "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+            "sources": "data/v5_2_qd/historical_recovery_schedule_conflicts/sources",
+            "audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts",
+            "reports": "reports/v5_2_qd/historical_recovery_schedule_conflicts",
+        },
+        "downstream_authority": {
+            "features": False,
+            "locks": False,
+            "outcomes": False,
+            "oof": False,
+            "model_cards": False,
+            "targets": False,
+            "selections": False,
+            "reports_500": False,
+        },
+    }
+
+
 def validate_run(run: RunSpec) -> None:
     if (
         not isinstance(run.run_id, str)
@@ -6590,10 +6641,13 @@ def historical_authority_schema() -> dict[str, object]:
     source_raw = expected_superseding_source_run()
     source = _closed_shape_schema(source_raw)
     source["const"] = source_raw
+    recovery_raw = expected_recovery_source_run()
+    recovery = _closed_shape_schema(recovery_raw)
+    recovery["const"] = recovery_raw
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$defs": definitions,
-        "oneOf": [historical, source],
+        "oneOf": [historical, source, recovery],
     }
 
 

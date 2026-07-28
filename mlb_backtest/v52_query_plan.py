@@ -29,6 +29,7 @@ from .v52_evidence import (
     canonical_query_bytes,
     logical_query_id,
 )
+from .v52_recovery_parent_evidence import PARENT_RELATIVES, _PARENT_SPECS
 from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
 
 
@@ -48,6 +49,13 @@ _SOURCE_RUN_SPEC_RELATIVE = Path(
 )
 _SOURCE_ACQUISITION_CONTRACT_RELATIVE = Path(
     "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+_RECOVERY_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json"
+)
+_RECOVERY_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts.json"
 )
 _APPROVED_DESIGN_RELATIVE = Path(
     "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
@@ -70,10 +78,20 @@ _SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE = Path(
     "docs/superpowers/specs/"
     "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
 )
+_RECOVERY_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
+)
+_RECOVERY_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/2026-07-28-v5-2-schedule-conflict-recovery-run.md"
+)
 _ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
 _ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
 _SOURCE_ACQUISITION_BATCH_ROOT = Path(
     "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches"
+)
+_RECOVERY_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/query_batches"
 )
 _SOURCE_SCHEDULE_INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical_superseding_565534/acquisition/"
@@ -168,6 +186,7 @@ class _AuthorityBranch:
     amendment_relative: Path | None
     addendum_relative: Path | None
     schema_index: int
+    recovery: bool = False
 
 
 _AUTHORITY_BRANCHES = (
@@ -188,6 +207,16 @@ _AUTHORITY_BRANCHES = (
         None,
         _SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE,
         1,
+    ),
+    _AuthorityBranch(
+        _RECOVERY_RUN_SPEC_RELATIVE,
+        _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        _RECOVERY_APPROVED_DESIGN_RELATIVE,
+        _RECOVERY_IMPLEMENTATION_PLAN_RELATIVE,
+        None,
+        None,
+        2,
+        True,
     ),
 )
 
@@ -212,6 +241,54 @@ _SOURCE_ACQUISITION_CONTRACT_SHA256 = (
 _SOURCE_STATIC_BATCH_ID = (
     "d4d07954d69d91d7f721aee9554e83b925c8d3c3cd60f7dc7efeba9f5ed5c661"
 )
+
+
+def _recovery_provenance() -> dict[str, object]:
+    """Materialize the Task 1 catalog without accepting caller-selected facts."""
+    provenance: dict[str, object] = {}
+    for name, relatives in PARENT_RELATIVES.items():
+        spec = _PARENT_SPECS[name]
+        entry: dict[str, object] = {
+            "query_id": spec.query_id,
+            "parent_query_id": None,
+            "registration": {
+                "path": relatives["registration"].as_posix(),
+                "sha256": spec.registration_sha256,
+                "byte_count": spec.registration_byte_count,
+            },
+            "quarantine": {
+                "path": relatives["quarantine"].as_posix(),
+                "sha256": spec.quarantine_sha256,
+                "byte_count": spec.quarantine_byte_count,
+            },
+            "raw": {
+                "path": relatives["raw"].as_posix(),
+                "sha256": spec.raw_sha256,
+                "byte_count": spec.raw_byte_count,
+            },
+        }
+        if spec.attempt_sha256 is not None:
+            entry["attempt"] = {
+                "path": relatives["attempt"].as_posix(),
+                "sha256": spec.attempt_sha256,
+                "byte_count": spec.attempt_byte_count,
+            }
+        provenance[name] = entry
+    return provenance
+
+
+_RECOVERY_PROVENANCE = _recovery_provenance()
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
+_RECOVERY_CANONICAL_ROOTS = {
+    "raw": "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+    "sources": "data/v5_2_qd/historical_recovery_schedule_conflicts/sources",
+    "acquisition_audit": (
+        "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition"
+    ),
+    "execution_audit": (
+        "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution"
+    ),
+}
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -994,11 +1071,12 @@ def _verify_frozen_acquisition_schema(
     selected = variants[schema_index]
     required = selected.get("required")
     properties = selected.get("properties")
+    exact_const = selected.get("const")
     if (
         selected.get("additionalProperties") is not False
         or selected.get("type") != "object"
-        or _canonical_json_bytes(selected.get("const"))
-        != _canonical_json_bytes(contract)
+        or (schema_index != 2 and _canonical_json_bytes(exact_const)
+            != _canonical_json_bytes(contract))
         or not isinstance(required, list)
         or set(required) != set(contract)
         or len(required) != len(contract)
@@ -1012,6 +1090,48 @@ def _verify_frozen_acquisition_schema(
         contents,
         "acquisition contract schema",
     )
+    if schema_index == 2:
+        _validate_closed_recovery_schema(contract, selected, "acquisition contract")
+
+
+def _validate_closed_recovery_schema(
+    value: object, schema: Mapping[str, object], label: str
+) -> None:
+    """Validate the recovery base without accepting an open schema fragment."""
+    if "const" in schema:
+        if value != schema["const"]:
+            if label.endswith(".recovery_provenance"):
+                raise ValueError("recovery provenance differs")
+            raise ValueError(f"{label} differs from its closed recovery schema")
+        return
+    schema_type = schema.get("type")
+    if schema_type != "object" or schema.get("additionalProperties") is not False:
+        raise ValueError(f"{label} recovery schema is not closed")
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} differs from its closed recovery schema")
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if (
+        not isinstance(properties, Mapping)
+        or not isinstance(required, list)
+        or set(properties) != set(required)
+        or set(value) != set(required)
+    ):
+        raise ValueError(f"{label} differs from its closed recovery schema")
+    for key in required:
+        child = properties[key]
+        if not isinstance(key, str) or not isinstance(child, Mapping):
+            raise ValueError(f"{label} recovery schema is not closed")
+        if child.get("type") == "string" and "pattern" in child:
+            pattern = child["pattern"]
+            if not isinstance(value[key], str) or not isinstance(pattern, str) or not re.fullmatch(
+                pattern, value[key]
+            ):
+                raise ValueError(f"{label}.{key} differs from its closed recovery schema")
+            if set(child) != {"type", "pattern"}:
+                raise ValueError(f"{label}.{key} recovery schema is not closed")
+            continue
+        _validate_closed_recovery_schema(value[key], child, f"{label}.{key}")
 
 
 def _namespace_relative(value: object, label: str) -> Path:
@@ -1118,6 +1238,77 @@ def _context_roots(
     return tuple(root / relative for relative in relatives)  # type: ignore[return-value]
 
 
+def _validate_recovery_acquisition_contract(
+    contract: Mapping[str, object], bindings: Mapping[str, object]
+) -> None:
+    """Authenticate the only non-serialized recovery authority surface.
+
+    The recovery contract itself is intentionally not committed until execution
+    closure.  Its schema consequently closes its shape, while these fixed
+    authority facts close the values that cannot participate in the hash cycle.
+    """
+    expected_keys = {
+        "bindings",
+        "canonical_roots",
+        "forbidden_years",
+        "host_concurrency",
+        "legacy_protection",
+        "minimum_free_space_reserve_bytes",
+        "request_timeout_seconds",
+        "required_years",
+        "response_byte_limits",
+        "response_completeness_limits",
+        "run_id",
+        "schema_version",
+        "season_boundaries",
+        "sources",
+        "timezone_mapping_path",
+        "recovery_provenance",
+    }
+    if (
+        set(contract) != expected_keys
+        or contract.get("run_id") != _RECOVERY_RUN_ID
+        or contract.get("schema_version") != 2
+        or contract.get("canonical_roots") != _RECOVERY_CANONICAL_ROOTS
+        or set(bindings) != {"approved_design", "implementation_plan", "run_spec"}
+    ):
+        raise ValueError("recovery acquisition authority differs")
+    if contract.get("recovery_provenance") != _RECOVERY_PROVENANCE:
+        raise ValueError("recovery provenance differs")
+    sources = contract.get("sources")
+    if not isinstance(sources, list) or len(sources) != 6:
+        raise ValueError("recovery sources differ")
+    schedule = next(
+        (
+            source
+            for source in sources
+            if isinstance(source, Mapping)
+            and source.get("name") == "mlb_schedule_game_feed"
+        ),
+        None,
+    )
+    if not isinstance(schedule, Mapping) or schedule != {
+        "name": "mlb_schedule_game_feed",
+        "grain": "season_schedule_and_game",
+        "parser_version": "v5.2.2",
+        "endpoints": [
+            _SCHEDULE_ENDPOINT,
+            "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+        ],
+    }:
+        raise ValueError("recovery schedule source differs")
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise ValueError("recovery sources differ")
+        if source.get("name") != "mlb_schedule_game_feed" and source.get(
+            "parser_version"
+        ) != "v5.2.1":
+            raise ValueError("recovery non-schedule parser differs")
+
+
 def _load_static_contracts(
     run_spec_path: Path, acquisition_contract_path: Path
 ) -> SourceAuthorityContext:
@@ -1153,15 +1344,36 @@ def _load_static_contracts(
         bindings.get("run_spec"),
         expected_path=branch.authority_relative,
         label="RunSpec",
+        extra_keys=frozenset({"git_blob_id"}) if branch.recovery else frozenset(),
     )
     if verified_run_spec != run_spec_contents:
         raise ValueError("acquisition contract RunSpec binding differs")
-    _verify_repository_binding(
+    design_contents = _verify_repository_binding(
         root,
         bindings.get("approved_design"),
         expected_path=branch.design_relative,
         label="approved design",
+        extra_keys=frozenset({"git_blob_id"}) if branch.recovery else frozenset(),
     )
+    if branch.recovery:
+        run_binding = bindings.get("run_spec")
+        design_binding = bindings.get("approved_design")
+        if not isinstance(run_binding, dict) or not isinstance(design_binding, dict):
+            raise AssertionError("validated recovery bindings must be objects")
+        _verify_head_blob(
+            root,
+            branch.authority_relative,
+            verified_run_spec,
+            "RunSpec",
+            expected_blob=run_binding.get("git_blob_id"),
+        )
+        _verify_head_blob(
+            root,
+            branch.design_relative,
+            design_contents,
+            "approved design",
+            expected_blob=design_binding.get("git_blob_id"),
+        )
     plan_binding = bindings.get("implementation_plan")
     plan_contents = _verify_repository_binding(
         root,
@@ -1176,7 +1388,9 @@ def _load_static_contracts(
     _verify_implementation_plan_git_blob(
         root, branch.plan_relative, plan_binding, plan_contents
     )
-    if branch.addendum_relative is None:
+    if branch.recovery:
+        _validate_recovery_acquisition_contract(contract, bindings)
+    elif branch.addendum_relative is None:
         if branch.amendment_relative is None:
             raise AssertionError("default authority amendment path is missing")
         _verify_repository_binding(

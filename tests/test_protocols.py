@@ -4697,15 +4697,19 @@ class HistoricalRunSpecTest(unittest.TestCase):
             )
         )
 
-    def test_combined_run_schema_writer_preserves_both_exact_branches(self):
+    def test_combined_run_schema_writer_preserves_all_exact_branches(self):
         schema = protocols.historical_authority_schema()
         self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
-        self.assertEqual(len(schema["oneOf"]), 2)
+        self.assertEqual(len(schema["oneOf"]), 3)
         old_raw = expected_historical_run()
         source_raw = protocols.expected_superseding_source_run()
+        recovery_raw = protocols.expected_recovery_source_run()
         self.assertEqual(schema["oneOf"][0]["const"], old_raw)
         self.assertEqual(schema["oneOf"][1]["const"], source_raw)
-        for raw, branch in zip((old_raw, source_raw), schema["oneOf"], strict=True):
+        self.assertEqual(schema["oneOf"][2]["const"], recovery_raw)
+        for raw, branch in zip(
+            (old_raw, source_raw, recovery_raw), schema["oneOf"], strict=True
+        ):
             self.assertEqual(set(branch["required"]), set(raw))
             self.assertEqual(set(branch["properties"]), set(raw))
             self.assertFalse(branch["additionalProperties"])
