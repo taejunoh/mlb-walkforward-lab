@@ -241,6 +241,10 @@ _SOURCE_ACQUISITION_CONTRACT_SHA256 = (
 _SOURCE_STATIC_BATCH_ID = (
     "d4d07954d69d91d7f721aee9554e83b925c8d3c3cd60f7dc7efeba9f5ed5c661"
 )
+_HISTORICAL_RUN_SPEC_SHA256 = _SOURCE_SUPERSEDES["run_spec_sha256"]
+_HISTORICAL_ACQUISITION_CONTRACT_SHA256 = _SOURCE_SUPERSEDES[
+    "acquisition_contract_sha256"
+]
 
 
 def _recovery_provenance() -> dict[str, object]:
@@ -1441,6 +1445,19 @@ def _load_static_contracts(
     raw_root, sources_root, acquisition_root, execution_root, report_root = (
         _context_roots(root, authority, contract)
     )
+    if branch.recovery:
+        _rebind_recovery_authority(
+            root,
+            branch,
+            run_spec_contents,
+            contract_contents,
+            design_contents,
+            plan_contents,
+            contract,
+        )
+        raw_root, sources_root, acquisition_root, execution_root, report_root = (
+            _context_roots(root, authority, contract)
+        )
     return SourceAuthorityContext(
         repository_root=root,
         authority=authority,
@@ -1456,6 +1473,94 @@ def _load_static_contracts(
         execution_audit_root=execution_root,
         report_root=report_root,
     )
+
+
+def _rebind_recovery_authority(
+    root: Path,
+    branch: _AuthorityBranch,
+    run_spec_contents: bytes,
+    contract_contents: bytes,
+    design_contents: bytes,
+    plan_contents: bytes,
+    contract: Mapping[str, object],
+) -> None:
+    """Re-open every recovery binding after its Git identity has been checked."""
+    if not branch.recovery:
+        raise AssertionError("recovery rebind requires the recovery authority")
+    rebound_contract = _read_repository_file(
+        root, branch.contract_relative, "acquisition contract"
+    )
+    if rebound_contract != contract_contents:
+        raise ValueError("recovery acquisition contract binding differs")
+    rebound_run = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("run_spec")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.authority_relative,
+        label="RunSpec",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    rebound_design = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("approved_design")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.design_relative,
+        label="approved design",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    rebound_plan = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("implementation_plan")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.plan_relative,
+        label="implementation plan",
+        digest_key="working_tree_sha256",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    if (
+        rebound_run != run_spec_contents
+        or rebound_design != design_contents
+        or rebound_plan != plan_contents
+    ):
+        raise ValueError("recovery authority bytes changed during rebind")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise AssertionError("validated recovery bindings must be an object")
+    for relative, contents, label, binding in (
+        (branch.authority_relative, rebound_run, "RunSpec", bindings.get("run_spec")),
+        (
+            branch.design_relative,
+            rebound_design,
+            "approved design",
+            bindings.get("approved_design"),
+        ),
+        (
+            branch.plan_relative,
+            rebound_plan,
+            "implementation plan",
+            bindings.get("implementation_plan"),
+        ),
+    ):
+        if not isinstance(binding, Mapping):
+            raise AssertionError("validated recovery binding must be an object")
+        _verify_head_blob(
+            root,
+            relative,
+            contents,
+            label,
+            expected_blob=binding.get("git_blob_id"),
+        )
+    for relative, contents, label in (
+        (branch.contract_relative, contract_contents, "acquisition contract"),
+        (branch.authority_relative, rebound_run, "RunSpec"),
+        (branch.design_relative, rebound_design, "approved design"),
+        (branch.plan_relative, rebound_plan, "implementation plan"),
+    ):
+        if _read_repository_file(root, relative, label) != contents:
+            raise ValueError(f"{label} bytes changed after recovery rebind")
 
 
 def _validate_run_bound_acquisition_contract(
@@ -1802,25 +1907,57 @@ def _batch_root_for_batch(root: Path, batch: QueryBatch) -> Path:
     """Select only the authenticated authority namespace of this batch."""
     if not batch.queries:
         raise ValueError("query batch must contain authority-bound queries")
-    source_bound = all(
-        query.run_spec_sha256 == _SOURCE_RUN_SPEC_SHA256
-        and query.acquisition_contract_sha256
-        == _SOURCE_ACQUISITION_CONTRACT_SHA256
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
         for query in batch.queries
-    )
-    if not source_bound:
-        return _ACQUISITION_BATCH_ROOT
-    source_context = _load_static_contracts(
-        root / _SOURCE_RUN_SPEC_RELATIVE,
-        root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
-    )
-    if (
-        source_context.authority_sha256 != _SOURCE_RUN_SPEC_SHA256
-        or source_context.acquisition_contract_sha256
-        != _SOURCE_ACQUISITION_CONTRACT_SHA256
+    }
+    if len(pairs) != 1:
+        raise ValueError("query batch authority hash pairs differ")
+    pair = pairs.pop()
+    if pair == (
+        _HISTORICAL_RUN_SPEC_SHA256,
+        _HISTORICAL_ACQUISITION_CONTRACT_SHA256,
     ):
-        raise ValueError("query batch source authority differs")
-    return _SOURCE_ACQUISITION_BATCH_ROOT
+        return _ACQUISITION_BATCH_ROOT
+    if pair == (_SOURCE_RUN_SPEC_SHA256, _SOURCE_ACQUISITION_CONTRACT_SHA256):
+        source_context = _load_static_contracts(
+            root / _SOURCE_RUN_SPEC_RELATIVE,
+            root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if (
+            source_context.authority_sha256 != _SOURCE_RUN_SPEC_SHA256
+            or source_context.acquisition_contract_sha256
+            != _SOURCE_ACQUISITION_CONTRACT_SHA256
+        ):
+            raise ValueError("query batch source authority differs")
+        return _SOURCE_ACQUISITION_BATCH_ROOT
+    recovery_context = _recovery_context_if_present(root)
+    if recovery_context is not None and pair == (
+        recovery_context.authority_sha256,
+        recovery_context.acquisition_contract_sha256,
+    ):
+        return _RECOVERY_ACQUISITION_BATCH_ROOT
+    raise ValueError("query batch authority hash pair differs")
+
+
+def _recovery_context_if_present(root: Path) -> SourceAuthorityContext | None:
+    run_path = root / _RECOVERY_RUN_SPEC_RELATIVE
+    contract_path = root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+    present: list[bool] = []
+    for path in (run_path, contract_path):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            present.append(False)
+        except OSError as exc:
+            raise ValueError("recovery authority path identity is unavailable") from exc
+        else:
+            present.append(True)
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("recovery authority path pair differs")
+    return _load_static_contracts(run_path, contract_path)
 
 
 def _source_reference_batch_id(root: Path) -> str | None:
@@ -1880,11 +2017,19 @@ def _batch_root_for_authority(
     if isinstance(authority, RunSpec):
         return _ACQUISITION_BATCH_ROOT
     if isinstance(authority, SourceRunSpec):
-        context = _load_static_contracts(
-            root / _SOURCE_RUN_SPEC_RELATIVE,
-            root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
-        )
-        expected = _SOURCE_ACQUISITION_BATCH_ROOT
+        if authority.run_id == _SOURCE_RUN_ID:
+            context = _load_static_contracts(
+                root / _SOURCE_RUN_SPEC_RELATIVE,
+                root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            expected = _SOURCE_ACQUISITION_BATCH_ROOT
+        elif authority.run_id == _RECOVERY_RUN_ID:
+            context = _recovery_context_if_present(root)
+            if context is None:
+                raise ValueError("recovery authority path pair differs")
+            expected = _RECOVERY_ACQUISITION_BATCH_ROOT
+        else:
+            raise ValueError("query batch source authority differs")
     else:
         raise TypeError("query batch authority must be a RunSpec or SourceRunSpec")
     if context.authority != authority:
@@ -1893,16 +2038,21 @@ def _batch_root_for_authority(
 
 
 def _reject_batch_shadow(root: Path, selected_root: Path, batch_id: str) -> None:
-    alternate = (
-        _SOURCE_ACQUISITION_BATCH_ROOT
-        if selected_root == _ACQUISITION_BATCH_ROOT
-        else _ACQUISITION_BATCH_ROOT
+    roots = (
+        _ACQUISITION_BATCH_ROOT,
+        _SOURCE_ACQUISITION_BATCH_ROOT,
+        _RECOVERY_ACQUISITION_BATCH_ROOT,
     )
-    try:
-        os.lstat(root / alternate / f"{batch_id}.json")
-    except FileNotFoundError:
-        return
-    raise ValueError("query batch is shadowed across authority namespaces")
+    if selected_root not in roots:
+        raise ValueError("query batch authority namespace differs")
+    for alternate in roots:
+        if alternate == selected_root:
+            continue
+        try:
+            os.lstat(root / alternate / f"{batch_id}.json")
+        except FileNotFoundError:
+            continue
+        raise ValueError("query batch is shadowed across authority namespaces")
 
 
 def _rebind_batch_namespace(

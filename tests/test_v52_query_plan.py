@@ -642,6 +642,59 @@ class RecoveryAuthorityTests(unittest.TestCase):
                         query_plan._load_static_contracts(run_path, contract_path)
             contract_path.write_bytes(self._canonical_bytes(original))
 
+    def test_unknown_recovery_hash_pair_cannot_publish_into_historical_batches(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, _, _ = self._fixture(Path(directory))
+            query = LogicalQuery(
+                source="mlb_stats_pitching",
+                grain="season_d1_league_pitching_reference",
+                endpoint="https://statsapi.mlb.com/api/v1/stats",
+                parameters={"season": 2024},
+                requested_range={"year": 2024},
+                expected_media_type="application/json",
+                parser_version="v5.2.2",
+                parent_query_id=None,
+                run_spec_sha256="a" * 64,
+                acquisition_contract_sha256="b" * 64,
+            )
+            batch = query_plan._make_batch("TIMEZONE_REVIEW", None, (query,))
+            with self.assertRaisesRegex(ValueError, "authority|namespace"):
+                query_plan.publish_query_batch(root, batch)
+            mixed = dataclasses.replace(
+                query,
+                run_spec_sha256=query_plan._HISTORICAL_RUN_SPEC_SHA256,
+                acquisition_contract_sha256=query_plan._SOURCE_ACQUISITION_CONTRACT_SHA256,
+            )
+            mixed_batch = query_plan._make_batch("TIMEZONE_REVIEW", None, (mixed,))
+            with self.assertRaisesRegex(ValueError, "authority|namespace"):
+                query_plan.publish_query_batch(root, mixed_batch)
+            self.assertFalse((root / "audit").exists())
+
+    def test_recovery_loader_rebinds_run_spec_after_git_blob_verification(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, run_path, contract_path = self._fixture(Path(directory))
+            original = query_plan._verify_head_blob
+
+            def replace_after_run_blob(root, relative, contents, label, **kwargs):
+                result = original(root, relative, contents, label, **kwargs)
+                if relative == query_plan._RECOVERY_RUN_SPEC_RELATIVE:
+                    run_path.write_bytes(b'{"tampered":true}\n')
+                return result
+
+            with (
+                mock.patch.object(
+                    query_plan,
+                    "_verify_head_blob",
+                    side_effect=replace_after_run_blob,
+                ),
+                self.assertRaisesRegex(ValueError, "RunSpec.*binding|RunSpec.*hash"),
+            ):
+                query_plan._load_static_contracts(run_path, contract_path)
+
 
 class V52QueryPlanTest(unittest.TestCase):
     def test_source_authority_rejects_dirty_ephemeral_equivalence_addendum(self):
