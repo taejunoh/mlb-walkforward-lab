@@ -3062,6 +3062,7 @@ def _validate_query_batch_authority(
     *,
     read_only_progress: bool = False,
 ) -> None:
+    _validate_recovery_parser_batch(repository_root, batch)
     _validate_source_static_batch_authority(repository_root, batch)
     _validate_reference_batch_authority(
         repository_root,
@@ -3079,6 +3080,58 @@ def _validate_query_batch_authority(
         batch,
         read_only_progress=read_only_progress,
     )
+
+
+def _validate_recovery_parser_batch(repository_root: Path, batch: QueryBatch) -> None:
+    """Keep the v5.2.2 parser inside the recovery static-schedule boundary."""
+    recovery_context = _recovery_context_if_present(repository_root)
+    if recovery_context is None or not batch.queries:
+        return
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if pairs != {
+        (
+            recovery_context.authority_sha256,
+            recovery_context.acquisition_contract_sha256,
+        )
+    }:
+        return
+    sources = recovery_context.contract.get("sources")
+    if not isinstance(sources, tuple):
+        raise AssertionError("validated recovery sources must be frozen")
+    schedule = next(
+        (
+            source
+            for source in sources
+            if isinstance(source, Mapping)
+            and source.get("name") == "mlb_schedule_game_feed"
+        ),
+        None,
+    )
+    if not isinstance(schedule, Mapping):
+        raise AssertionError("validated recovery schedule source is missing")
+    declared_endpoints = schedule.get("endpoints")
+    if not isinstance(declared_endpoints, tuple):
+        raise AssertionError("validated recovery schedule endpoints must be frozen")
+    for query in batch.queries:
+        if query.parser_version != "v5.2.2":
+            continue
+        is_disposition = (
+            query.endpoint.startswith("disposition://SCHEDULE_DUPLICATE_GAMEPK_")
+            and query.endpoint in declared_endpoints
+        )
+        if (
+            batch.stage != "STATIC_SCHEDULES"
+            or query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or (query.endpoint != _SCHEDULE_ENDPOINT and not is_disposition)
+        ):
+            raise ValueError(
+                "recovery v5.2.2 queries are limited to STATIC_SCHEDULES "
+                "schedule authority"
+            )
 
 
 def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:

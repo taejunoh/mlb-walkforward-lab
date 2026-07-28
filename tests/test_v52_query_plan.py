@@ -695,6 +695,65 @@ class RecoveryAuthorityTests(unittest.TestCase):
             ):
                 query_plan._load_static_contracts(run_path, contract_path)
 
+    def test_recovery_v522_parser_queries_are_static_schedule_only(self):
+        import mlb_backtest.v52_query_plan as query_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_path, contract_path = self._fixture(Path(directory))
+            context = query_plan._load_static_contracts(run_path, contract_path)
+            cases = (
+                (
+                    "timezone_statcast",
+                    "TIMEZONE_REVIEW",
+                    "baseball_savant_statcast",
+                    "pitch",
+                    "https://baseballsavant.mlb.com/statcast_search/csv",
+                ),
+                (
+                    "timezone_schedule",
+                    "TIMEZONE_REVIEW",
+                    "mlb_schedule_game_feed",
+                    "season_schedule_and_game",
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                ),
+            )
+            for label, stage, source, grain, endpoint in cases:
+                with self.subTest(label=label):
+                    query = LogicalQuery(
+                        source=source,
+                        grain=grain,
+                        endpoint=endpoint,
+                        parameters={},
+                        requested_range={"year": 2024},
+                        expected_media_type="application/json",
+                        parser_version="v5.2.2",
+                        parent_query_id=None,
+                        run_spec_sha256=context.authority_sha256,
+                        acquisition_contract_sha256=context.acquisition_contract_sha256,
+                    )
+                    batch = query_plan._make_batch(stage, None, (query,))
+                    with self.assertRaisesRegex(ValueError, "recovery.*v5.2.2|STATIC"):
+                        query_plan.publish_query_batch(root, batch)
+                    self.assertFalse((root / "audit").exists())
+
+            ordinary = LogicalQuery(
+                source="baseball_savant_statcast",
+                grain="pitch",
+                endpoint="https://baseballsavant.mlb.com/statcast_search/csv",
+                parameters={},
+                requested_range={"year": 2024},
+                expected_media_type="text/csv",
+                parser_version="v5.2.1",
+                parent_query_id=None,
+                run_spec_sha256=context.authority_sha256,
+                acquisition_contract_sha256=context.acquisition_contract_sha256,
+            )
+            ordinary_batch = query_plan._make_batch("TIMEZONE_REVIEW", None, (ordinary,))
+            self.assertEqual(
+                query_plan._batch_root_for_batch(root, ordinary_batch),
+                query_plan._RECOVERY_ACQUISITION_BATCH_ROOT,
+            )
+
 
 class V52QueryPlanTest(unittest.TestCase):
     def test_source_authority_rejects_dirty_ephemeral_equivalence_addendum(self):
