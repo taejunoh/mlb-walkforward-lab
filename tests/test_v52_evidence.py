@@ -149,6 +149,43 @@ def _tmp(value: str) -> Path:
     return Path(value).resolve()
 
 
+class RecoveryParentEvidenceTests(unittest.TestCase):
+    def test_parent_catalog_rejects_caller_selected_paths(self) -> None:
+        """A caller cannot substitute a different parent evidence authority."""
+        from mlb_backtest.v52_recovery_parent_evidence import (
+            build_recovery_parent_catalog,
+        )
+
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'parent_paths'"):
+            build_recovery_parent_catalog(ROOT, parent_paths={})  # type: ignore[call-arg]
+
+    def test_parent_catalog_preserves_both_immutable_parent_authorities(self) -> None:
+        """Catalog construction may read, but cannot mutate, either parent authority."""
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            ORIGINAL_PARENT_TREE,
+            ROOT as PARENT_ROOT,
+            SUPERSEDING_PARENT_TREE,
+            parent_tree_fingerprints,
+            recovery_parent_catalog,
+        )
+
+        before = parent_tree_fingerprints(PARENT_ROOT)
+        catalog = recovery_parent_catalog(PARENT_ROOT)
+        self.assertEqual(
+            tuple(catalog.parents),
+            (
+                "original_2019_565534",
+                "superseding_2020_630882",
+                "superseding_2021_633224",
+            ),
+        )
+        self.assertEqual(
+            tuple(fingerprint.relative for fingerprint in before),
+            ORIGINAL_PARENT_TREE + SUPERSEDING_PARENT_TREE,
+        )
+        self.assertEqual(before, parent_tree_fingerprints(PARENT_ROOT))
+
+
 def _legacy_fixture(
     base: Path,
 ) -> tuple[V52EvidenceStore, LogicalQuery, dict[str, object]]:
