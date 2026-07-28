@@ -2134,12 +2134,39 @@ def _execute_stage(
         "source disposition authority",
         lambda: _source_disposition_authorities(request, batches),
     )
+    recovery_context: object | None = None
+
+    def recovery_schedule_context(query: LogicalQuery) -> object | None:
+        nonlocal recovery_context
+        if (
+            query.parser_version != "v5.2.2"
+            or query.endpoint != "https://statsapi.mlb.com/api/v1/schedule"
+        ):
+            return None
+        if recovery_context is None:
+            from .v52_query_plan import _load_static_contracts
+
+            if request.run_spec != parse_source_run_spec(expected_recovery_source_run()):
+                raise TrustIntegrityError("recovery schedule query authority differs")
+            root = Path(os.path.abspath(os.fspath(request.root)))
+            run_path, contract_path = _request_authority_paths(request, root)
+            try:
+                recovery_context = _load_static_contracts(run_path, contract_path)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise TrustIntegrityError(
+                    "recovery schedule authority authentication failed"
+                ) from exc
+            if recovery_context.authority != request.run_spec:
+                raise TrustIntegrityError("recovery schedule authority differs")
+        return recovery_context
+
     selected_parser = (
         (
             lambda raw, query: recompute_query_sidecar(
                 query,
                 raw,
                 authority=disposition_authorities.get(logical_query_id(query)),
+                context=recovery_schedule_context(query),
             )
         )
         if parser is None

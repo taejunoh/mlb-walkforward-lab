@@ -32,6 +32,7 @@ from mlb_backtest.v52_duplicate_gamepk_disposition import (
     project_schedule_occurrences,
 )
 from tests.v52_recovery_schedule_conflict_fixture import (
+    PARENT_RELATIVES,
     matching_source_authority_root,
     recovery_authority_fixture,
 )
@@ -281,61 +282,135 @@ class V52ScheduleSourceTest(unittest.TestCase):
         """Changing raw duplicate accounting must not change normalized selection."""
         from collections import Counter
 
-        from mlb_backtest.source_parsers.schedule import parse_schedule_occurrences
+        from mlb_backtest.source_parsers.schedule import (
+            parse_schedule,
+            parse_schedule_occurrences,
+        )
 
+        raw_paths = {
+            2018: Path(
+                "data/v5_2_qd/historical/raw/quarantine/mlb_schedule_game_feed/"
+                "93163d5f3fa9a4d75116664d319c492c57b4505ec2e147c236040e6433aab4a4/"
+                "5bb08ed84b5928be5231419591f99820f157e2e5064e035f189d5b446a71875f.raw"
+            ),
+            2022: Path(
+                "data/v5_2_qd/historical_superseding_565534/raw/quarantine/"
+                "mlb_schedule_game_feed/09c51b6670fe7e8c2d0822d752fd46f6068597ad29ff79513615e8d13fa2b03e/"
+                "d577ae55106e8ddfca3e5832c0554c896d10d63397c50a396b8046fa1e9a6edf.raw"
+            ),
+            2023: Path(
+                "data/v5_2_qd/historical_superseding_565534/raw/quarantine/"
+                "mlb_schedule_game_feed/0ffb733ea25caa4a5ca9dde6c2c9abe11451168fef7afe8e03df4e124c8880f2/"
+                "bbc0cd022364dd9cc8d296946a581434a620e30b4c435905981b45f42790dcec.raw"
+            ),
+            2024: Path(
+                "data/v5_2_qd/historical_superseding_565534/raw/quarantine/"
+                "mlb_schedule_game_feed/040137af7d63a7187a28d254f9356f48bbeaf897b4f0eabc1ce18ebb6fdd8f3d/"
+                "f68a9b238d742d498f016ae3659d2c7180ccfbcb46b0050dd6ffe9dac56946d9.raw"
+            ),
+        }
         expected = {
             2018: (2485, 2430, 53, 108, 55),
             2022: (2479, 2430, 49, 98, 49),
             2023: (2475, 2430, 45, 90, 45),
             2024: (2469, 2430, 37, 76, 39),
         }
-        for year, (raw_total, normalized, duplicate_ids, duplicate_members, extras) in expected.items():
+        for year, raw_path in raw_paths.items():
             with self.subTest(year=year):
-                duplicate_population = list(range(1, duplicate_ids + 1))
-                duplicate_population.extend(range(1, extras - duplicate_ids + 1))
-                game_pks = list(range(1, normalized + 1)) + duplicate_population
-                payload = {
-                    "totalGames": raw_total,
-                    "dates": [
-                        {
-                            "date": f"{year}-04-01",
-                            "totalGames": raw_total,
-                            "games": [
-                                {"gamePk": game_pk, "gameType": "R"}
-                                for game_pk in game_pks
-                            ],
-                        }
-                    ],
-                }
-                occurrences = parse_schedule_occurrences(
-                    json.dumps(payload, separators=(",", ":")).encode()
-                )
+                raw = (RECOVERY_PARENT_EVIDENCE_ROOT / raw_path).read_bytes()
+                occurrences = parse_schedule_occurrences(raw)
                 multiplicities = Counter(game["gamePk"] for game in occurrences)
                 self.assertEqual(
                     (
                         len(occurrences),
-                        len(multiplicities),
+                        len(parse_schedule(raw)),
                         sum(count > 1 for count in multiplicities.values()),
                         sum(count for count in multiplicities.values() if count > 1),
                         len(occurrences) - len(multiplicities),
                     ),
-                    (raw_total, normalized, duplicate_ids, duplicate_members, extras),
+                    expected[year],
                 )
 
-    def test_v522_accepts_ordinary_raw_duplicates_after_raw_count_validation(self) -> None:
+    def test_v522_schedule_recompute_requires_exact_authenticated_context(self) -> None:
+        from mlb_backtest.v52_query_plan import _load_static_contracts
         from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
 
-        payload = _schedule_payload()
-        payload["dates"][0]["games"].append(
-            copy.deepcopy(payload["dates"][0]["games"][0])
-        )
-        payload["dates"][0]["totalGames"] = 3
-        payload["totalGames"] = 3
         query = dataclasses.replace(_query(), parser_version="v5.2.2")
-        sidecar = recompute_schedule_anchor_sidecar(
-            json.dumps(payload, separators=(",", ":")).encode(), query
-        )
-        self.assertEqual(sidecar["semantics"]["unique_game_count"], 2)
+        with self.assertRaisesRegex(ValueError, "recovery.*context|authority"):
+            recompute_schedule_anchor_sidecar(_schedule_raw(), query)
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec, contract = recovery_authority_fixture(
+                Path(directory), parent_evidence_root=RECOVERY_PARENT_EVIDENCE_ROOT
+            )
+            context = _load_static_contracts(run_spec, contract)
+            exact_query = dataclasses.replace(
+                query,
+                run_spec_sha256=context.authority_sha256,
+                acquisition_contract_sha256=context.acquisition_contract_sha256,
+            )
+            sidecar = recompute_schedule_anchor_sidecar(
+                _schedule_raw(), exact_query, context=context
+            )
+            self.assertEqual(sidecar["semantics"]["unique_game_count"], 2)
+            duplicate_payload = _schedule_payload()
+            duplicate_payload["dates"][0]["games"].append(
+                copy.deepcopy(duplicate_payload["dates"][0]["games"][0])
+            )
+            duplicate_payload["dates"][0]["totalGames"] = 3
+            duplicate_payload["totalGames"] = 3
+            duplicate = recompute_schedule_anchor_sidecar(
+                json.dumps(duplicate_payload, separators=(",", ":")).encode(),
+                exact_query,
+                context=context,
+            )
+            self.assertEqual(duplicate["semantics"]["unique_game_count"], 2)
+            forged = dataclasses.replace(context, authority_sha256="f" * 64)
+            with self.assertRaisesRegex(ValueError, "recovery.*authority"):
+                recompute_schedule_anchor_sidecar(
+                    _schedule_raw(), exact_query, context=forged
+                )
+
+    def test_v522_http_terminal_conflicts_remain_rejected(self) -> None:
+        from mlb_backtest.v52_query_plan import _load_static_contracts
+        from mlb_backtest.v52_seasons import SEASON_BOUNDARIES
+        from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
+
+        cases = {
+            2020: PARENT_RELATIVES["superseding_2020_630882"]["raw"],
+            2021: PARENT_RELATIVES["superseding_2021_633224"]["raw"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec, contract = recovery_authority_fixture(
+                Path(directory), parent_evidence_root=RECOVERY_PARENT_EVIDENCE_ROOT
+            )
+            context = _load_static_contracts(run_spec, contract)
+            for year, raw_relative in cases.items():
+                with self.subTest(year=year):
+                    first, last = SEASON_BOUNDARIES[year]
+                    query = dataclasses.replace(
+                        _query(),
+                        parameters={
+                            "sportId": 1,
+                            "gameType": "R",
+                            "startDate": first.isoformat(),
+                            "endDate": last.isoformat(),
+                            "hydrate": "probablePitcher,lineups,venue,linescore",
+                        },
+                        requested_range={
+                            "year": year,
+                            "start_date": first.isoformat(),
+                            "end_date": last.isoformat(),
+                        },
+                        parser_version="v5.2.2",
+                        run_spec_sha256=context.authority_sha256,
+                        acquisition_contract_sha256=context.acquisition_contract_sha256,
+                    )
+                    with self.assertRaisesRegex(ValueError, "conflicting duplicate gamePk"):
+                        recompute_schedule_anchor_sidecar(
+                            (RECOVERY_PARENT_EVIDENCE_ROOT / raw_relative).read_bytes(),
+                            query,
+                            context=context,
+                        )
 
     def test_schedule_disposition_dispatch_requires_matching_authority_and_empty_raw(self) -> None:
         authority = build_duplicate_disposition_authority(

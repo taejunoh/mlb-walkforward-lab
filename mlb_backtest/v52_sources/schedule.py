@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
+from pathlib import Path
 
 from ..source_parsers.schedule import (
     parse_schedule,
@@ -20,7 +21,6 @@ from ..v52_source_contracts import (
     canonical_sha256,
     query_sidecar,
     require_query,
-    require_schedule_query,
 )
 
 
@@ -95,7 +95,9 @@ def _official_optional_bool(
     return value
 
 
-def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int, int]:
+def _raw_schedule_metadata(
+    raw: bytes, *, allow_duplicate_game_pks: bool
+) -> tuple[dict[int, dict[str, bool]], int, int]:
     payload = _json_object(raw, "schedule")
     total_games = payload.get("totalGames")
     if type(total_games) is not int or total_games < 0:
@@ -124,6 +126,8 @@ def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int,
                 "alternate_site": alternate,
                 "neutral_site": neutral,
             }
+            if game_pk in site_flags and not allow_duplicate_game_pks:
+                raise ValueError("schedule contains duplicate gamePk")
             prior = site_flags.setdefault(game_pk, flags)
             if prior != flags:
                 raise ValueError("schedule duplicate gamePk site flags differ")
@@ -156,16 +160,47 @@ def _schedule_range(query: LogicalQuery) -> tuple[int, date, date]:
 
 
 def recompute_schedule_anchor_sidecar(
-    raw: bytes, query: LogicalQuery
+    raw: bytes,
+    query: LogicalQuery,
+    *,
+    context: object | None = None,
 ) -> Mapping[str, object]:
     """Seal a complete schedule response without depending on boxscores."""
-    require_schedule_query(
-        query,
-        endpoint=_SCHEDULE_ENDPOINT,
-        expected_media_type="application/json",
-    )
+    if query.parser_version == "v5.2.1":
+        if context is not None:
+            raise ValueError("context is only valid for a recovery schedule query")
+        require_query(
+            query,
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=_SCHEDULE_ENDPOINT,
+            expected_media_type="application/json",
+        )
+    elif query.parser_version == "v5.2.2":
+        if context is None:
+            raise ValueError("recovery schedule context is required")
+        from ..v52_query_plan import _load_static_contracts, _require_recovery_schedule_query
+
+        authority_path = getattr(context, "authority_path", None)
+        contract_path = getattr(context, "acquisition_contract_path", None)
+        if not isinstance(authority_path, Path) or not isinstance(contract_path, Path):
+            raise ValueError("recovery schedule context authority differs")
+        rebound = _load_static_contracts(authority_path, contract_path)
+        if rebound != context:
+            raise ValueError("recovery schedule context authority differs")
+        _require_recovery_schedule_query(query, rebound)
+    else:
+        require_query(
+            query,
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=_SCHEDULE_ENDPOINT,
+            expected_media_type="application/json",
+        )
     year, first, last = _schedule_range(query)
-    site_flags, declared_total, raw_occurrence_count = _raw_schedule_metadata(raw)
+    site_flags, declared_total, raw_occurrence_count = _raw_schedule_metadata(
+        raw, allow_duplicate_game_pks=query.parser_version == "v5.2.2"
+    )
     validate_schedule_query_coverage(raw, first.isoformat(), last.isoformat())
     games = parse_schedule(raw)
     if not games:
