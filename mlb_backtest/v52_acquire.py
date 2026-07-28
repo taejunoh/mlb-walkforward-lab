@@ -2179,7 +2179,8 @@ def _execute_stage(
 
     for query in derived:
         semantics = dict(selected_parser(b"", query))
-        semantics["reason"] = query.requested_range.get("reason")
+        if query.endpoint == "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING":
+            semantics["reason"] = query.requested_range.get("reason")
 
         def publish_derived() -> PublishedEvidence:
             with store.acquire_query(query):

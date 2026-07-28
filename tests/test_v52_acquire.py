@@ -2363,6 +2363,79 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.fetched, 0)
         self.assertEqual(verified.published_evidence.storage_mode, "DERIVED_DISPOSITION")
 
+    def test_schedule_disposition_does_not_receive_generic_reason_semantics(self) -> None:
+        from contextlib import nullcontext
+
+        from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
+
+        query = dataclasses.replace(
+            _query(),
+            endpoint="disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            requested_range={"year": 2019},
+        )
+        query_id = logical_query_id(query)
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        request = self._request(plan_only=False, resume=True)
+        plan = _AcquisitionPlan("a" * 64, ("b" * 64,), ("FETCH_REQUIRED",))
+        expected_semantics = {
+            "disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "game_pk": 565534,
+            "old_authority": {},
+            "fixed_game_facts": {},
+            "suppressed_occurrence": {},
+            "retained_occurrence": {},
+            "occurrence_counts": {},
+            "normalized_games_sha256": "1" * 64,
+            "selected_raw_game_object_sha256s_sha256": "2" * 64,
+        }
+        checkpoints: list[SimpleNamespace] = []
+
+        def publish(**values):
+            checkpoint = SimpleNamespace(
+                receipt_sha256=f"{len(checkpoints) + 1:064x}", **values
+            )
+            checkpoints.append(checkpoint)
+            return checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = V52EvidenceStore(Path(directory).resolve() / "raw")
+            pending = SimpleNamespace(status="PENDING")
+            success = SimpleNamespace(status="SUCCESS")
+            with (
+                patch(
+                    "mlb_backtest.v52_acquire._source_disposition_authorities",
+                    return_value={query_id: object()},
+                ),
+                patch.object(
+                    store,
+                    "read_verified_query_progress",
+                    side_effect=(pending, pending, success, success),
+                ),
+                patch.object(store, "acquire_query", return_value=nullcontext()),
+                patch.object(
+                    store,
+                    "publish_derived_disposition",
+                    return_value=SimpleNamespace(query_id=query_id),
+                ) as derived_writer,
+            ):
+                _execute_stage(
+                    request,
+                    plan,
+                    store,
+                    stage="STATIC_SCHEDULES",
+                    batches=(batch,),
+                    stage_evidence=(),
+                    expected_prior=None,
+                    fetcher=lambda *_args, **_kwargs: self.fail(
+                        "schedule disposition must not fetch"
+                    ),
+                    checkpoint_publisher=publish,
+                    parser=lambda _raw, _query: expected_semantics,
+                )
+
+        derived_writer.assert_called_once()
+        self.assertEqual(derived_writer.call_args.args[1], expected_semantics)
+
     def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(self) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
 
