@@ -2436,6 +2436,41 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         derived_writer.assert_called_once()
         self.assertEqual(derived_writer.call_args.args[1], expected_semantics)
 
+    def test_recovery_dispositions_select_the_three_catalog_authorities(self) -> None:
+        from mlb_backtest.v52_acquire import _source_disposition_authorities
+
+        endpoints = (
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+        )
+        queries = tuple(
+            dataclasses.replace(
+                _query(),
+                source="mlb_schedule_game_feed",
+                grain="season_schedule_and_game",
+                endpoint=endpoint,
+                parameters={},
+                requested_range={"year": 2020 + index},
+                parser_version="v5.2.2",
+            )
+            for index, endpoint in enumerate(endpoints)
+        )
+        authorities = tuple(SimpleNamespace(query=query) for query in queries)
+        batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
+        with patch(
+            "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+            "build_recovery_schedule_conflict_catalog",
+            return_value=SimpleNamespace(entries=authorities),
+        ):
+            selected = _source_disposition_authorities(
+                self._request(plan_only=True), (batch,)
+            )
+        self.assertEqual(
+            selected,
+            {logical_query_id(query): authority for query, authority in zip(queries, authorities)},
+        )
+
     def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(self) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
 

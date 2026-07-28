@@ -66,7 +66,11 @@ class RecoveryDispositionAuthority:
 
     def sidecar_semantics(self) -> Mapping[str, object]:
         rebound = self.reauthenticate()
-        return rebound.semantics.expected_sidecar_semantics
+        return _plain(rebound.semantics.expected_sidecar_semantics)  # type: ignore[return-value]
+
+    def derived_sidecar(self) -> Mapping[str, object]:
+        rebound = self.reauthenticate()
+        return _plain(rebound.semantics.expected_derived_sidecar)  # type: ignore[return-value]
 
     def reauthenticate(self) -> RecoveryDispositionAuthority:
         rebound = build_recovery_schedule_conflict_catalog(
@@ -114,6 +118,120 @@ class RecoveryDispositionCatalog:
 
 
 @dataclass(frozen=True)
+class RecoveryDispositionBinding:
+    game_pk: int
+    query_id: str
+    query_sidecar: Mapping[str, str]
+    success_receipt: Mapping[str, str]
+    retained_scheduled_start_utc: str
+    played_date: str | None
+    result_available_on: str | None
+    raw_object_sha256s: tuple[str, ...]
+    selected_raw_game_object_sha256s_sha256: str
+    normalized_games_sha256: str
+    sidecar_semantics_sha256: str
+    expected_derived_sidecar_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("query_sidecar", "success_receipt"):
+            value = getattr(self, name)
+            if set(value) != {"path", "sha256"} or not all(
+                isinstance(item, str) for item in value.values()
+            ):
+                raise ValueError(f"recovery disposition {name} binding differs")
+            object.__setattr__(self, name, deep_freeze(dict(value)))
+
+
+def load_recovery_disposition_bindings(
+    catalog: RecoveryDispositionCatalog,
+) -> tuple[RecoveryDispositionBinding, ...]:
+    if not isinstance(catalog, RecoveryDispositionCatalog):
+        raise TypeError("recovery disposition catalog is required")
+    authorities = tuple(entry.reauthenticate() for entry in catalog.entries)
+    if authorities != catalog.entries:
+        raise ValueError("recovery disposition catalog changed before binding load")
+    roots = {entry.evidence_root for entry in authorities}
+    if len(roots) != 1:
+        raise ValueError("recovery disposition evidence roots differ")
+    from .v52_evidence import V52EvidenceStore
+
+    try:
+        store = V52EvidenceStore.open_read_only(next(iter(roots)))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("recovery disposition success evidence is unavailable") from exc
+
+    def read(authority: RecoveryDispositionAuthority) -> RecoveryDispositionBinding:
+        try:
+            verified = store.read_verified_success(
+                authority.query, authority=authority
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "recovery disposition success evidence is unavailable"
+            ) from exc
+        published = verified.published_evidence
+        sidecar = verified.query_sidecar
+        success = verified.success_receipt
+        expected_sidecar = _plain(authority.semantics.expected_derived_sidecar)
+        if (
+            published.storage_mode != "DERIVED_DISPOSITION"
+            or published.raw_sha256 is not None
+            or verified.raw_bytes is not None
+            or verified.attempt_receipts
+            or sidecar != expected_sidecar
+            or _sha256_canonical_file(sidecar) != published.query_sidecar_sha256
+            or _sha256_canonical(expected_sidecar)
+            != authority.semantics.expected_derived_sidecar_sha256
+        ):
+            raise ValueError("recovery disposition sidecar binding differs")
+        query_id = logical_query_id(authority.query)
+        sidecar_path = (
+            f"queries/{authority.query.source}/{query_id}/sidecars/"
+            f"{published.query_sidecar_sha256}.json"
+        )
+        success_path = f"queries/{authority.query.source}/{query_id}/success.json"
+        if (
+            success.get("storage_mode") != "DERIVED_DISPOSITION"
+            or success.get("query_id") != query_id
+            or success.get("query_sidecar_path") != sidecar_path
+            or success.get("query_sidecar_sha256") != published.query_sidecar_sha256
+        ):
+            raise ValueError("recovery disposition success binding differs")
+        return RecoveryDispositionBinding(
+            game_pk=authority.game_pk,
+            query_id=query_id,
+            query_sidecar={"path": sidecar_path, "sha256": published.query_sidecar_sha256},
+            success_receipt={
+                "path": success_path,
+                "sha256": _sha256_canonical_file(success),
+            },
+            retained_scheduled_start_utc=authority.semantics.retained_scheduled_start_utc,
+            played_date=authority.semantics.played_date,
+            result_available_on=authority.semantics.result_available_on,
+            raw_object_sha256s=authority.semantics.raw_object_sha256s,
+            selected_raw_game_object_sha256s_sha256=(
+                authority.semantics.selected_raw_game_object_sha256s_sha256
+            ),
+            normalized_games_sha256=authority.semantics.normalized_games_sha256,
+            sidecar_semantics_sha256=authority.semantics.sidecar_semantics_sha256,
+            expected_derived_sidecar_sha256=(
+                authority.semantics.expected_derived_sidecar_sha256
+            ),
+        )
+
+    bindings = tuple(read(authority) for authority in authorities)
+    if tuple(binding.game_pk for binding in bindings) != (565534, 630882, 633224):
+        raise ValueError("recovery disposition binding order differs")
+    final_authorities = tuple(entry.reauthenticate() for entry in catalog.entries)
+    if final_authorities != authorities:
+        raise ValueError("recovery disposition catalog changed during binding load")
+    final = tuple(read(authority) for authority in final_authorities)
+    if final != bindings:
+        raise ValueError("recovery disposition bindings changed during final replay")
+    return bindings
+
+
+@dataclass(frozen=True)
 class _DispositionSpec:
     game_pk: int
     parent_name: str
@@ -144,6 +262,14 @@ def _plain(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
     return value
+
+
+def _sha256_canonical(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(_plain(value))).hexdigest()
+
+
+def _sha256_canonical_file(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(_plain(value)) + b"\n").hexdigest()
 
 
 def _freeze_logical_query(query: LogicalQuery) -> LogicalQuery:
@@ -737,7 +863,9 @@ def build_recovery_schedule_conflict_catalog(
 __all__ = [
     "RECOVERY_DISPOSITION_ENDPOINTS",
     "RecoveryDispositionAuthority",
+    "RecoveryDispositionBinding",
     "RecoveryDispositionCatalog",
     "RecoveryDispositionSemantics",
     "build_recovery_schedule_conflict_catalog",
+    "load_recovery_disposition_bindings",
 ]

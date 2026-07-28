@@ -2939,6 +2939,26 @@ class V52EvidenceTest(unittest.TestCase):
                         query, too_early_semantics
                     )
 
+    def test_recovery_disposition_rejects_missing_authority_before_sidecar_write(self):
+        query = _derived_query(
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint="disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            parameters={},
+            requested_range={"year": 2020},
+            parser_version="v5.2.2",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _tmp(td) / "raw"
+            store = V52EvidenceStore(root)
+            with store.acquire_query(query):
+                with self.assertRaisesRegex(TypeError, "authenticated authority"):
+                    store.publish_derived_disposition(query, {})
+            folder = root / "queries" / query.source / logical_query_id(query)
+            self.assertEqual(list((folder / "sidecars").iterdir()), [])
+            self.assertEqual(list((folder / "attempts").iterdir()), [])
+            self.assertEqual(list((folder / "objects").iterdir()), [])
+
     def test_canonical_parameter_ordering_and_identity_field_sensitivity(self) -> None:
         first = _query(
             parameters={"z": [3, 2, 1], "a": {"two": 2, "one": 1}},

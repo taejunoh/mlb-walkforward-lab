@@ -2775,7 +2775,41 @@ class V52EvidenceStore:
         self, query: LogicalQuery, *, authority: object | None = None
     ) -> None:
         """Reject an unauthenticated derived disposition before any I/O cleanup."""
-        if query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
+        from .v52_schedule_conflict_recovery_disposition import (
+            RECOVERY_DISPOSITION_ENDPOINTS,
+            RecoveryDispositionAuthority,
+        )
+
+        if query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS and query.parser_version == "v5.2.2":
+            if not isinstance(authority, RecoveryDispositionAuthority):
+                raise TypeError(
+                    "recovery schedule disposition requires its authenticated authority"
+                )
+            expected_game_pks = dict(
+                zip(RECOVERY_DISPOSITION_ENDPOINTS, (565534, 630882, 633224))
+            )
+            if (
+                authority.query != query
+                or authority.semantics.query != query
+                or authority.evidence_root != self.root
+                or query.source != "mlb_schedule_game_feed"
+                or query.grain != "season_schedule_and_game"
+                or query.expected_media_type != "application/json"
+                or query.parser_version != "v5.2.2"
+                or expected_game_pks.get(query.endpoint) != authority.game_pk
+            ):
+                raise ValueError("recovery schedule disposition authority binding differs")
+            rebound = authority.reauthenticate()
+            if (
+                not isinstance(rebound, RecoveryDispositionAuthority)
+                or rebound != authority
+                or rebound.query != query
+                or rebound.semantics.query != query
+                or rebound.evidence_root != self.root
+                or expected_game_pks.get(rebound.query.endpoint) != rebound.game_pk
+            ):
+                raise ValueError("recovery schedule disposition authority rebind differs")
+        elif query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
             from .v52_duplicate_gamepk_disposition import (
                 DuplicateGamePkDispositionAuthority,
             )
@@ -4388,6 +4422,27 @@ class V52EvidenceStore:
         from .v52_seasons import SEASON_BOUNDARIES
         from .v52_source_contracts import recompute_query_sidecar
 
+        from .v52_schedule_conflict_recovery_disposition import (
+            RECOVERY_DISPOSITION_ENDPOINTS,
+            RecoveryDispositionAuthority,
+        )
+
+        if query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS and query.parser_version == "v5.2.2":
+            if not isinstance(authority, RecoveryDispositionAuthority):
+                raise TypeError(
+                    "recovery schedule disposition requires its authenticated authority"
+                )
+            self._admit_derived_authority(query, authority=authority)
+            expected = dict(
+                recompute_query_sidecar(query, b"", authority=authority)
+            )
+            supplied = _normalized_json_object(
+                semantics, "derived query_sidecar"
+            )
+            if supplied != expected:
+                raise ValueError("recovery derived disposition semantics differ from query")
+            return expected
+
         if query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
             from .v52_duplicate_gamepk_disposition import (
                 DuplicateGamePkDispositionAuthority,
@@ -4477,6 +4532,25 @@ class V52EvidenceStore:
             "source": query.source,
             "storage_mode": "DERIVED_DISPOSITION",
         }
+        from .v52_schedule_conflict_recovery_disposition import (
+            RECOVERY_DISPOSITION_ENDPOINTS,
+            RecoveryDispositionAuthority,
+        )
+
+        if query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS and query.parser_version == "v5.2.2":
+            if not isinstance(authority, RecoveryDispositionAuthority):
+                raise TypeError(
+                    "recovery schedule disposition requires its authenticated authority"
+                )
+            expected = _normalized_json_object(
+                authority.derived_sidecar(), "expected recovery derived sidecar"
+            )
+            if sidecar != expected:
+                raise ValueError("recovery derived sidecar differs from Task 3 authority")
+            if _sha256_bytes(_canonical_json_bytes(expected)) != (
+                authority.semantics.expected_derived_sidecar_sha256
+            ):
+                raise ValueError("recovery derived sidecar digest differs from Task 3 authority")
         contents = _canonical_file_bytes(sidecar)
         digest = _sha256_bytes(contents)
         return f"{digest}.json", digest, contents
@@ -5102,12 +5176,30 @@ class V52EvidenceStore:
             raise RuntimeError(
                 "pending failure transaction recovered; success publication refused"
             )
-        self._ensure_unpublished(query, authority=authority)
         sidecar_name, sidecar_sha256, sidecar_contents = (
             self._derived_sidecar_artifact(
                 query, query_sidecar, authority=authority
             )
         )
+        from .v52_schedule_conflict_recovery_disposition import (
+            RECOVERY_DISPOSITION_ENDPOINTS,
+        )
+
+        is_recovery_disposition = (
+            query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
+            and query.parser_version == "v5.2.2"
+        )
+        existing = self.load_success(query, authority=authority)
+        if existing is not None:
+            if (
+                not is_recovery_disposition
+                or existing.storage_mode != "DERIVED_DISPOSITION"
+                or existing.raw_sha256 is not None
+                or existing.query_sidecar_sha256 != sidecar_sha256
+            ):
+                raise RuntimeError("query success is already published and terminal")
+            self._require_lease(query)
+            return existing
         query_id, descriptors = self._query_fds(query, create=False)
         try:
             query_fd = descriptors[-1]
@@ -5212,6 +5304,7 @@ class V52EvidenceStore:
                     self._derived_semantics(
                         query, query_sidecar, authority=authority
                     )
+                    self._admit_derived_authority(query, authority=authority)
                     _write_once_at(
                         query_fd,
                         "success.json",
@@ -5232,9 +5325,12 @@ class V52EvidenceStore:
                             "derived disposition sidecar",
                             missing_ok=True,
                         )
+                        from .v52_schedule_conflict_recovery_disposition import (
+                            RECOVERY_DISPOSITION_ENDPOINTS,
+                        )
+
                         is_schedule_disposition = (
-                            query.endpoint
-                            == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+                            query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
                         )
                         should_cleanup = (
                             current_sidecar is not None
@@ -5760,6 +5856,7 @@ class V52EvidenceStore:
                             raise ValueError(
                                 "protected legacy membership changed during read"
                             )
+                    self._admit_derived_authority(query, authority=authority)
 
                 if inspection is None:
                     rebind_verified_read()

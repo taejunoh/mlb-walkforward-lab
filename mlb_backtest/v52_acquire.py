@@ -1520,6 +1520,41 @@ def _source_disposition_authorities(
     batches: Sequence[object],
 ) -> Mapping[str, object]:
     """Build the one exact disposition authority for every source-run replay."""
+    root = Path(os.path.abspath(os.fspath(request.root)))
+    from .v52_schedule_conflict_recovery_disposition import (
+        RECOVERY_DISPOSITION_ENDPOINTS,
+        build_recovery_schedule_conflict_catalog,
+    )
+
+    recovery_queries = tuple(
+        query
+        for batch in batches
+        for query in getattr(batch, "queries", ())
+        if isinstance(query, LogicalQuery)
+        and query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
+    )
+    if recovery_queries:
+        catalog = build_recovery_schedule_conflict_catalog(
+            root,
+            root / "protocols/v5_2_qd/"
+            "historical_walkforward_500_recovery_schedule_conflicts.json",
+            root / "protocols/v5_2_qd/"
+            "historical_source_acquisition_recovery_schedule_conflicts.json",
+        )
+        by_query = {logical_query_id(entry.query): entry for entry in catalog.entries}
+        if len({logical_query_id(query) for query in recovery_queries}) != len(
+            recovery_queries
+        ) or any(
+            by_query.get(logical_query_id(query), None) is None
+            or by_query[logical_query_id(query)].query != query
+            for query in recovery_queries
+        ):
+            raise TrustIntegrityError("recovery disposition query authority differs")
+        return {
+            logical_query_id(query): by_query[logical_query_id(query)]
+            for query in recovery_queries
+        }
+
     if not isinstance(request.run_spec, SourceRunSpec):
         return {}
     from .v52_duplicate_gamepk_disposition import (
@@ -1527,7 +1562,6 @@ def _source_disposition_authorities(
         build_duplicate_disposition_authority,
     )
 
-    root = Path(os.path.abspath(os.fspath(request.root)))
     authority = build_duplicate_disposition_authority(
         root,
         source_run_spec_path=(

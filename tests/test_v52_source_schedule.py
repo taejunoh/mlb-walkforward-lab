@@ -1536,6 +1536,69 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
                 },
             )
 
+class RecoveryDerivedEvidenceTests(unittest.TestCase):
+    def test_catalog_loader_requires_all_three_published_bindings(self) -> None:
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionAuthority,
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository, run_spec, contract = recovery_authority_fixture(
+                Path(directory), parent_evidence_root=RECOVERY_PARENT_EVIDENCE_ROOT
+            )
+            catalog = build_recovery_schedule_conflict_catalog(
+                repository, run_spec, contract
+            )
+            evidence_parent = Path(directory).resolve() / "evidence"
+            evidence_parent.mkdir()
+            store = V52EvidenceStore(evidence_parent / "raw")
+            isolated = dataclasses.replace(
+                catalog,
+                entries=tuple(
+                    dataclasses.replace(entry, evidence_root=store.root)
+                    for entry in catalog.entries
+                ),
+            )
+            with patch.object(
+                RecoveryDispositionAuthority,
+                "reauthenticate",
+                autospec=True,
+                side_effect=lambda authority: authority,
+            ):
+                with self.assertRaisesRegex(
+                    (RuntimeError, ValueError), "success|binding"
+                ):
+                    load_recovery_disposition_bindings(isolated)
+                for authority in isolated.entries:
+                    semantics = recompute_query_sidecar(
+                        authority.query, b"", authority=authority
+                    )
+                    with store.acquire_query(authority.query):
+                        published = store.publish_derived_disposition(
+                            authority.query, semantics, authority=authority
+                        )
+                    self.assertIsNone(published.raw_sha256)
+                    folder = (
+                        store.root
+                        / "queries"
+                        / authority.query.source
+                        / logical_query_id(authority.query)
+                    )
+                    self.assertEqual(list((folder / "attempts").iterdir()), [])
+                    self.assertEqual(list((folder / "objects").iterdir()), [])
+                    with store.acquire_query(authority.query):
+                        retried = store.publish_derived_disposition(
+                            authority.query, semantics, authority=authority
+                        )
+                    self.assertEqual(retried, published)
+                bindings = load_recovery_disposition_bindings(isolated)
+                self.assertEqual(
+                    tuple(binding.query_id for binding in bindings), isolated.query_ids()
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

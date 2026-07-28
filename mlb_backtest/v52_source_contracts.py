@@ -98,6 +98,7 @@ def recompute_query_sidecar(
         key == ("mlb_schedule_game_feed", "season_schedule_and_game")
         and query.endpoint
         == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"
+        and query.parser_version == "v5.2.1"
     ):
         from .v52_duplicate_gamepk_disposition import (
             DuplicateGamePkDispositionAuthority,
@@ -113,6 +114,31 @@ def recompute_query_sidecar(
         rebound = authority.reauthenticate()
         projection = rebound.recompute()
         return _sidecar_semantics(rebound, projection)
+    if (
+        key == ("mlb_schedule_game_feed", "season_schedule_and_game")
+        and query.endpoint
+        in {
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+        }
+    ):
+        from .v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionAuthority,
+        )
+
+        if not isinstance(authority, RecoveryDispositionAuthority):
+            raise TypeError(
+                "recovery schedule disposition requires its authenticated authority"
+            )
+        if authority.query != query or authority.semantics.query != query:
+            raise ValueError("recovery schedule disposition authority query differs")
+        if raw != b"":
+            raise ValueError("recovery schedule disposition must not claim raw bytes")
+        rebound = authority.reauthenticate()
+        if rebound != authority:
+            raise ValueError("recovery schedule disposition authority rebind differs")
+        return rebound.sidecar_semantics()
     if authority is not None:
         raise ValueError("authority is only valid for the schedule disposition")
     if key == ("mlb_schedule_game_feed", "season_schedule_and_game"):
