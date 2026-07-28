@@ -197,6 +197,33 @@ class RecoveryParentEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(before, parent_tree_fingerprints(PARENT_ROOT))
 
+    def test_parent_evidence_root_requires_explicit_authority_configuration(self) -> None:
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            ParentEvidenceConfigurationError,
+            _parent_evidence_root,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"MLB_V52_SOURCE_AUTHORITY_ROOT": ""}):
+                with self.assertRaisesRegex(
+                    ParentEvidenceConfigurationError,
+                    "MLB_V52_SOURCE_AUTHORITY_ROOT",
+                ):
+                    _parent_evidence_root(Path(directory))
+
+    def test_parent_authority_tree_fingerprints_match_golden_values(self) -> None:
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            GOLDEN_PARENT_TREE_FINGERPRINTS,
+            ROOT as PARENT_ROOT,
+            parent_tree_fingerprints,
+        )
+
+        for fingerprint in parent_tree_fingerprints(PARENT_ROOT):
+            expected = GOLDEN_PARENT_TREE_FINGERPRINTS[fingerprint.relative]
+            self.assertEqual(fingerprint.file_count, expected["file_count"])
+            self.assertEqual(fingerprint.path_sha256, expected["path_sha256"])
+            self.assertEqual(fingerprint.sha256, expected["sha256"])
+
     def test_parent_catalog_rejects_changed_approved_parent_byte(self) -> None:
         from mlb_backtest.v52_recovery_parent_evidence import (
             PARENT_RELATIVES,

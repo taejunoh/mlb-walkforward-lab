@@ -286,6 +286,7 @@ class TreeFingerprint:
     relative: Path
     file_count: int
     paths: tuple[str, ...]
+    path_sha256: str
     sha256: str
 
 
@@ -765,11 +766,11 @@ def _assert_tree_directory_membership(
         raise ValueError(f"{label} membership changed while being fingerprinted")
 
 
-def _read_tree_file(
+def _hash_tree_file(
     parent_fd: int,
     entry: _TreeEntry,
     label: str,
-) -> bytes:
+) -> str:
     descriptor = -1
     try:
         linked_before = os.stat(entry.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -794,12 +795,12 @@ def _read_tree_file(
         ):
             raise ValueError(f"{label} identity differs after opening")
         remaining = opened_before.st_size
-        chunks: list[bytes] = []
+        digest = hashlib.sha256()
         while remaining:
             chunk = os.read(descriptor, min(1024 * 1024, remaining))
             if not chunk:
                 raise ValueError(f"{label} ended before its snapshot byte count")
-            chunks.append(chunk)
+            digest.update(chunk)
             remaining -= len(chunk)
         if os.read(descriptor, 1):
             raise ValueError(f"{label} grew while being read")
@@ -810,7 +811,7 @@ def _read_tree_file(
             or _file_identity(opened_after) != entry.identity
         ):
             raise ValueError(f"{label} identity changed while being read")
-        return b"".join(chunks)
+        return digest.hexdigest()
     except OSError as exc:
         raise ValueError(f"{label} cannot be read safely") from exc
     finally:
@@ -841,11 +842,11 @@ def _tree_file_records(
             finally:
                 os.close(child_fd)
             continue
-        contents = _read_tree_file(directory_fd, entry, "fingerprint tree file")
+        digest = _hash_tree_file(directory_fd, entry, "fingerprint tree file")
         records.append(
             {
                 "path": child_relative.as_posix(),
-                "sha256": hashlib.sha256(contents).hexdigest(),
+                "sha256": digest,
             }
         )
     _assert_tree_directory_membership(
@@ -872,13 +873,18 @@ def capture_tree_fingerprint(root: Path, relative: Path) -> TreeFingerprint:
             directory_fd = child_fd
         records = _tree_file_records(directory_fd, relative, bindings)
         records.sort(key=lambda record: record["path"])
+        paths = tuple(record["path"] for record in records)
+        path_sha256 = hashlib.sha256(
+            canonical_json_bytes({"paths": paths})
+        ).hexdigest()
         digest = hashlib.sha256(
             canonical_json_bytes({"file_count": len(records), "files": records})
         ).hexdigest()
         return TreeFingerprint(
             relative=relative,
             file_count=len(records),
-            paths=tuple(record["path"] for record in records),
+            paths=paths,
+            path_sha256=path_sha256,
             sha256=digest,
         )
     finally:
