@@ -540,11 +540,14 @@ def _authority_namespace(authority: Authority, key: str) -> Path:
 def _paths(root: Path, run_spec: Authority) -> _RegistryPaths:
     root_path = _root_path(root)
     audit = _authority_namespace(run_spec, "audit")
-    expected_audit = (
-        Path("audit/v5_2_qd/historical_superseding_565534")
-        if isinstance(run_spec, SourceRunSpec)
-        else Path("audit/v5_2_qd/historical")
-    )
+    if isinstance(run_spec, SourceRunSpec):
+        expected_audit = (
+            Path("audit/v5_2_qd/historical_recovery_schedule_conflicts")
+            if run_spec.run_id == _RECOVERY_RUN_ID
+            else Path("audit/v5_2_qd/historical_superseding_565534")
+        )
+    else:
+        expected_audit = Path("audit/v5_2_qd/historical")
     if audit != expected_audit:
         raise ValueError("execution registry requires the frozen audit namespace")
     execution = audit / "execution"

@@ -417,10 +417,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             parsed.schedule_conflict_dispositions["query_ids"], list(catalog_ids)
         )
 
-    def test_recovery_supplemental_binding_reauthenticates_closed_contract_bindings(
+    def test_recovery_public_gate_reauthenticates_contract_and_rejects_mixed_paths(
         self,
     ) -> None:
-        """A recovery receipt must bind its fixed design after contract replay."""
+        """The public recovery gate accepts only its bound authority namespace."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             run_path = root / (
@@ -450,6 +450,10 @@ class ExecutionRegistryTest(unittest.TestCase):
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(contents)
+            for relative in BOUND_EXECUTION_CODE:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
             _git(root, "init", "-q")
             _git(root, "config", "user.email", "recovery@example.test")
             _git(root, "config", "user.name", "Recovery")
@@ -477,6 +481,8 @@ class ExecutionRegistryTest(unittest.TestCase):
             }
             contract_path.parent.mkdir(parents=True, exist_ok=True)
             contract_path.write_bytes(canonical_json_bytes(contract) + b"\n")
+            _git(root, "add", contract_path.relative_to(root).as_posix())
+            _git(root, "commit", "-qm", "recovery contract")
             plan = dict(contract["bindings"]["implementation_plan"])
             evidence = {
                 "run_spec": {
@@ -523,6 +529,105 @@ class ExecutionRegistryTest(unittest.TestCase):
                     evidence["implementation_plan"]["path"],
                     evidence["acquisition_contract"]["path"],
                 }.issubset(bound_paths)
+            )
+            snapshot = self.registry._capture_git_snapshot(root, evidence)
+            self.assertEqual(snapshot.head, _git(root, "rev-parse", "HEAD"))
+            from mlb_backtest.protocols import (
+                expected_recovery_source_run,
+                parse_source_run_spec,
+            )
+
+            authority = parse_source_run_spec(expected_recovery_source_run())
+            mixed_namespaces = {
+                **authority.namespaces,
+                "audit": "audit/v5_2_qd/historical_superseding_565534",
+            }
+            mixed_authority = replace(
+                authority,
+                namespaces=mixed_namespaces,
+                raw={**authority.raw, "namespaces": mixed_namespaces},
+            )
+            paths = self.registry._paths(root, authority)
+            inventory = root / self.registry._source_inventory_path(authority)
+            checkpoint = root / paths.checkpoints_relative / (
+                "00000001-" + "7" * 64 + ".json"
+            )
+            review = root / self.registry._acquisition_prefix(
+                authority, "source_reviews"
+            ) / "review.commit.json"
+            replay_one = root / self.registry._acquisition_prefix(
+                authority, "source_replays"
+            ) / "one.commit.json"
+            replay_two = root / self.registry._acquisition_prefix(
+                authority, "source_replays"
+            ) / "two.commit.json"
+            for path in (inventory, checkpoint, review, replay_one, replay_two):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"{}\n")
+            checkpoint_binding = {
+                "count": 2,
+                "path": checkpoint.relative_to(root).as_posix(),
+                "sequence": 1,
+                "sha256": _sha256(checkpoint),
+                "stage": "REMAINING",
+            }
+
+            @contextlib.contextmanager
+            def public_gate_lock(*_args: object, **_kwargs: object):
+                yield SimpleNamespace()
+
+            with (
+                patch.object(self.registry, "_registry_lock", public_gate_lock),
+                patch.object(
+                    self.registry,
+                    "_load_locked",
+                    return_value=(
+                        self.registry.ExecutionRegistryState(
+                            "ACQUIRING", 1, "6" * 64, _sha256(inventory)
+                        ),
+                        (evidence,),
+                    ),
+                ),
+                patch.object(
+                    self.registry,
+                    "_validate_sources_ready_evidence",
+                    return_value=(),
+                ) as source_gate,
+                patch.object(
+                    self.registry,
+                    "_load_checkpoints_locked",
+                    return_value=((SimpleNamespace(),), (), ()),
+                ),
+                patch.object(
+                    self.registry,
+                    "_terminal_checkpoint_head",
+                    return_value=checkpoint_binding,
+                ),
+                patch.object(self.registry, "_require_source_terminal_disposition"),
+                patch.object(
+                    self.registry, "_require_source_inventory_terminal_checkpoint"
+                ),
+            ):
+                self.registry.validate_sources_ready_evidence_set(
+                    root,
+                    authority,
+                    inventory_path=inventory,
+                    checkpoint_path=checkpoint,
+                    validation_receipts=(review, replay_one, replay_two),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "frozen audit namespace"
+                ):
+                    self.registry.validate_sources_ready_evidence_set(
+                        root,
+                        mixed_authority,
+                        inventory_path=inventory,
+                        checkpoint_path=checkpoint,
+                        validation_receipts=(review, replay_one, replay_two),
+                    )
+            self.assertEqual(source_gate.call_count, 1)
+            self.assertEqual(
+                source_gate.call_args.kwargs["run_id"], authority.run_id
             )
             for field, mutation in (
                 (
