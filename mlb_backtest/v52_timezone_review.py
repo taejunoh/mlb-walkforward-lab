@@ -2505,16 +2505,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=_ACQUISITION_CONTRACT_PATH,
     )
     arguments = parser.parse_args(argv)
-    run_spec_path = arguments.root / arguments.run_spec
-    acquisition_contract_path = arguments.root / arguments.acquisition_contract
+    root = Path(os.path.abspath(os.fspath(arguments.root)))
+    run_spec_path = root / arguments.run_spec
+    acquisition_contract_path = root / arguments.acquisition_contract
     context = _explicit_authority_context(
-        arguments.root, run_spec_path, acquisition_contract_path
+        root, run_spec_path, acquisition_contract_path
     )
     if arguments.command == "candidate":
         if arguments.output != _timezone_paths(context).candidate:
             raise ValueError("timezone candidate output must be the canonical path")
         publish_timezone_candidate(
-            root=arguments.root,
+            root=root,
             evidence_root=arguments.evidence_root,
             batch_ids=arguments.batch_id,
             run_spec_path=run_spec_path,
@@ -2523,7 +2524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "review":
         write_timezone_review_receipt(
-            arguments.root,
+            root,
             candidate_path=arguments.candidate,
             output=arguments.output,
             reviewer_identity=arguments.reviewer_identity,
@@ -2535,7 +2536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "seal":
         seal_timezone_mapping(
-            arguments.root,
+            root,
             candidate_path=arguments.candidate,
             review_receipt_paths=arguments.review_receipt,
             output=arguments.output,

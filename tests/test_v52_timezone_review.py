@@ -680,6 +680,114 @@ def _finish_source_verified_gate_fixture(
 
 
 class V52TimezoneReviewTest(unittest.TestCase):
+    def test_cli_normalizes_literal_dot_root_for_historical_and_recovery(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+        from tests.test_v52_query_plan import RecoveryAuthorityTests
+
+        commands = (
+            (
+                "candidate",
+                [
+                    "--evidence-root",
+                    "data/v5_2_qd/historical/raw",
+                    "--batch-id",
+                    "a" * 64,
+                    "--output",
+                    FIXED_CANDIDATE.as_posix(),
+                ],
+                "publish_timezone_candidate",
+            ),
+            (
+                "review",
+                [
+                    "--candidate",
+                    FIXED_CANDIDATE.as_posix(),
+                    "--output",
+                    FIXED_COVERAGE_REVIEW.as_posix(),
+                    "--reviewer-identity",
+                    "historical-reviewer",
+                    "--reviewer-role",
+                    "TIMEZONE_COVERAGE_REVIEW",
+                    "--decision",
+                    "APPROVED",
+                ],
+                "write_timezone_review_receipt",
+            ),
+            (
+                "seal",
+                [
+                    "--candidate",
+                    FIXED_CANDIDATE.as_posix(),
+                    "--review-receipt",
+                    FIXED_SEMANTIC_REVIEW.as_posix(),
+                    "--review-receipt",
+                    FIXED_COVERAGE_REVIEW.as_posix(),
+                    "--output",
+                    "config/v5_2_qd/venue_timezones.json",
+                    "--receipt-output",
+                    FIXED_SEAL.as_posix(),
+                ],
+                "seal_timezone_mapping",
+            ),
+        )
+
+        def exercise(root: Path, extra: list[str]) -> None:
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                for command, arguments, function in commands:
+                    command_arguments = [
+                        (
+                            (
+                                RECOVERY_AUDIT_NAMESPACE
+                                / Path(value).relative_to(AUDIT_NAMESPACE)
+                            ).as_posix()
+                            if extra
+                            and value.startswith(AUDIT_NAMESPACE.as_posix())
+                            else value
+                        )
+                        for value in arguments
+                    ]
+                    with patch.object(
+                        timezone_review,
+                        function,
+                        return_value=(root / "unused", root / "unused"),
+                    ) as invoked:
+                        self.assertEqual(
+                            timezone_review.main(
+                                [
+                                    command,
+                                    "--root",
+                                    ".",
+                                    *command_arguments,
+                                    *extra,
+                                ]
+                            ),
+                            0,
+                        )
+                    self.assertEqual(invoked.call_args.args[0] if function != "publish_timezone_candidate" else invoked.call_args.kwargs["root"], root)
+                    self.assertEqual(
+                        invoked.call_args.kwargs["run_spec_path"],
+                        root / (RECOVERY_RUN_SPEC if extra else RUN_SPEC.relative_to(ROOT)),
+                    )
+            finally:
+                os.chdir(previous)
+
+        exercise(ROOT, [])
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec_path, contract_path = RecoveryAuthorityTests()._fixture(
+                Path(directory)
+            )
+            exercise(
+                root,
+                [
+                    "--run-spec",
+                    run_spec_path.relative_to(root).as_posix(),
+                    "--acquisition-contract",
+                    contract_path.relative_to(root).as_posix(),
+                ],
+            )
+
     def test_recovery_authority_uses_closed_timezone_paths_and_cli_pair(self) -> None:
         import mlb_backtest.v52_timezone_review as timezone_review
         from mlb_backtest.v52_query_plan import _load_static_contracts
