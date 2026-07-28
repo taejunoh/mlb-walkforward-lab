@@ -68,6 +68,17 @@ _SOURCE_RUN_SPEC_PATH = Path(
 _SOURCE_ACQUISITION_CONTRACT_PATH = Path(
     "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
 )
+_RECOVERY_ACQUISITION_AUDIT = Path(
+    "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition"
+)
+_RECOVERY_RUN_SPEC_PATH = Path(
+    "protocols/v5_2_qd/"
+    "historical_walkforward_500_recovery_schedule_conflicts.json"
+)
+_RECOVERY_ACQUISITION_CONTRACT_PATH = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts.json"
+)
 _SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
 _VENUE_ENDPOINT_PREFIX = "https://statsapi.mlb.com/api/v1/venues/"
 _MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
@@ -130,20 +141,32 @@ def _timezone_paths(
         contract = context.acquisition_contract_path.relative_to(
             context.repository_root
         )
-        expected = (
-            (
-                Path("audit/v5_2_qd/historical_superseding_565534/acquisition"),
-                _SOURCE_RUN_SPEC_PATH,
-                _SOURCE_ACQUISITION_CONTRACT_PATH,
+        if isinstance(context.authority, SourceRunSpec):
+            expected_paths = (
+                (
+                    Path(
+                        "audit/v5_2_qd/"
+                        "historical_superseding_565534/acquisition"
+                    ),
+                    _SOURCE_RUN_SPEC_PATH,
+                    _SOURCE_ACQUISITION_CONTRACT_PATH,
+                ),
+                (
+                    _RECOVERY_ACQUISITION_AUDIT,
+                    _RECOVERY_RUN_SPEC_PATH,
+                    _RECOVERY_ACQUISITION_CONTRACT_PATH,
+                ),
             )
-            if isinstance(context.authority, SourceRunSpec)
-            else (
-                _ACQUISITION_AUDIT,
-                _RUN_SPEC_PATH,
-                _ACQUISITION_CONTRACT_PATH,
+        else:
+            expected_paths = (
+                (
+                    _ACQUISITION_AUDIT,
+                    _RUN_SPEC_PATH,
+                    _ACQUISITION_CONTRACT_PATH,
+                ),
             )
-        )
-        if (audit, run_spec, contract) != expected:
+        expected = (audit, run_spec, contract)
+        if expected not in expected_paths:
             raise ValueError("timezone authority paths differ")
     return _TimezonePaths(
         acquisition_audit=audit,
@@ -162,6 +185,26 @@ _OLD_TIMEZONE_PATHS = _timezone_paths(None)
 _ACTIVE_TIMEZONE_PATHS: ContextVar[_TimezonePaths] = ContextVar(
     "v52_timezone_paths", default=_OLD_TIMEZONE_PATHS
 )
+
+
+def _recovery_authority_binding(
+    run_spec_sha256: object, acquisition_contract_sha256: object
+) -> dict[str, object]:
+    return {
+        "acquisition_contract": {
+            "path": _RECOVERY_ACQUISITION_CONTRACT_PATH.as_posix(),
+            "sha256": _sha256_text(
+                acquisition_contract_sha256,
+                "recovery acquisition contract SHA-256",
+            ),
+        },
+        "run_spec": {
+            "path": _RECOVERY_RUN_SPEC_PATH.as_posix(),
+            "sha256": _sha256_text(
+                run_spec_sha256, "recovery RunSpec SHA-256"
+            ),
+        },
+    }
 
 
 def _before_review_final_rebind() -> None:
@@ -673,7 +716,10 @@ def _candidate_object(value: object) -> dict[str, object]:
         "venue_sidecar_sha256s",
         "venues",
     }
-    if not isinstance(value, Mapping) or set(value) != expected_keys:
+    if not isinstance(value, Mapping) or set(value) not in (
+        expected_keys,
+        expected_keys | {"authority"},
+    ):
         raise ValueError("timezone candidate keys differ")
     if (
         value.get("artifact_kind") != "VENUE_TIMEZONE_CANDIDATE"
@@ -696,6 +742,11 @@ def _candidate_object(value: object) -> dict[str, object]:
         value.get("acquisition_contract_sha256"),
         "candidate acquisition_contract_sha256",
     )
+    authority = value.get("authority")
+    if authority is not None and authority != _recovery_authority_binding(
+        value["run_spec_sha256"], value["acquisition_contract_sha256"]
+    ):
+        raise ValueError("timezone candidate recovery authority differs")
     scope = value.get("venue_scope")
     if not isinstance(scope, list) or scope != sorted(set(scope)) or any(
         isinstance(item, bool) or not isinstance(item, int) or item <= 0
@@ -1100,6 +1151,8 @@ def _write_timezone_review_receipt(
         "reviewer_role": reviewer_role,
         "schema_version": 1,
     }
+    if "authority" in candidate:
+        receipt["authority"] = candidate["authority"]
     path, output_snapshot = _write_safe_from_trusted(
         root,
         output_relative,
@@ -1122,7 +1175,7 @@ def _write_timezone_review_receipt(
 
 def _review_object(contents: bytes) -> dict[str, object]:
     value = _json_object(contents, "timezone review receipt", canonical=True)
-    if set(value) != {
+    expected_keys = {
         "candidate",
         "decision",
         "occurred_at_utc",
@@ -1131,7 +1184,8 @@ def _review_object(contents: bytes) -> dict[str, object]:
         "reviewer_identity",
         "reviewer_role",
         "schema_version",
-    }:
+    }
+    if set(value) not in (expected_keys, expected_keys | {"authority"}):
         raise ValueError("timezone review receipt keys differ")
     candidate = value.get("candidate")
     if (
@@ -1150,6 +1204,21 @@ def _review_object(contents: bytes) -> dict[str, object]:
         or not _SHA256.fullmatch(str(candidate.get("sha256")))
     ):
         raise ValueError("timezone review receipt identity differs")
+    authority = value.get("authority")
+    if authority is not None:
+        if not isinstance(authority, Mapping):
+            raise ValueError("timezone review receipt recovery authority differs")
+        run_binding = authority.get("run_spec")
+        contract_binding = authority.get("acquisition_contract")
+        if (
+            not isinstance(run_binding, Mapping)
+            or not isinstance(contract_binding, Mapping)
+            or authority
+            != _recovery_authority_binding(
+                run_binding.get("sha256"), contract_binding.get("sha256")
+            )
+        ):
+            raise ValueError("timezone review receipt recovery authority differs")
     scope = value.get("reviewed_venue_ids")
     if not isinstance(scope, list) or scope != sorted(set(scope)) or any(
         isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in scope
@@ -1229,6 +1298,17 @@ def _seal_timezone_mapping(
         "path": candidate_relative.as_posix(),
         "sha256": _sha256(candidate_contents),
     }
+    paths = _ACTIVE_TIMEZONE_PATHS.get()
+    recovery_authority = (
+        _recovery_authority_binding(
+            candidate["run_spec_sha256"],
+            candidate["acquisition_contract_sha256"],
+        )
+        if paths.run_spec == _RECOVERY_RUN_SPEC_PATH
+        else None
+    )
+    if recovery_authority is not None and candidate.get("authority") != recovery_authority:
+        raise ValueError("timezone candidate recovery authority differs")
     for path in review_receipt_paths:
         review_path = _acquisition_audit_relative(
             root, path, "timezone review receipt"
@@ -1251,6 +1331,8 @@ def _seal_timezone_mapping(
             raise ValueError("timezone review candidate hash binding differs")
         if review["reviewed_venue_ids"] != scope:
             raise ValueError("timezone review scope differs from candidate")
+        if review.get("authority") != recovery_authority:
+            raise ValueError("timezone review recovery authority differs")
         identities.add(review["reviewer_identity"])
         roles.add(review["reviewer_role"])
         review_bindings.append(
@@ -1295,6 +1377,8 @@ def _seal_timezone_mapping(
         "schema_version": 1,
         "venue_scope": scope,
     }
+    if recovery_authority is not None:
+        seal["authority"] = recovery_authority
     seal_contents = _canonical_file_bytes(seal)
     def rebind_inputs() -> None:
         _rebind_safe_snapshot_from_trusted(
@@ -1542,6 +1626,15 @@ def _build_timezone_candidate(
             query_batch_ids=sorted(contributing_batch_ids),
             run_spec_sha256=binding[0],
             acquisition_contract_sha256=binding[1],
+        )
+    if (
+        authority_context is not None
+        and _timezone_paths(authority_context).run_spec == _RECOVERY_RUN_SPEC_PATH
+    ):
+        candidate = dict(candidate)
+        candidate["authority"] = _recovery_authority_binding(
+            candidate["run_spec_sha256"],
+            candidate["acquisition_contract_sha256"],
         )
     root.assert_bound()
     return candidate
@@ -1968,6 +2061,10 @@ def _current_timezone_authority(
         "venue_sidecar_sha256s": venue_sidecar_sha256s,
         "venues": [venues[venue_id] for venue_id in sorted(venues)],
     }
+    if paths.run_spec == _RECOVERY_RUN_SPEC_PATH:
+        source_projection["authority"] = _recovery_authority_binding(
+            run_sha, contract_sha
+        )
     root.assert_bound()
     return _CurrentTimezoneAuthority(
         source_projection=source_projection,
@@ -1993,7 +2090,7 @@ def _seal_object(contents: bytes) -> dict[str, object]:
         "timezone mapping seal receipt",
         canonical=True,
     )
-    if set(value) != {
+    base_keys = {
         "candidate",
         "mapping",
         "occurred_at_utc",
@@ -2001,7 +2098,8 @@ def _seal_object(contents: bytes) -> dict[str, object]:
         "reviews",
         "schema_version",
         "venue_scope",
-    }:
+    }
+    if set(value) not in (base_keys, base_keys | {"authority"}):
         raise ValueError("timezone mapping seal receipt keys differ")
     if (
         value.get("schema_version") != 1
@@ -2015,6 +2113,25 @@ def _seal_object(contents: bytes) -> dict[str, object]:
         or not isinstance(value.get("venue_scope"), list)
     ):
         raise ValueError("timezone mapping seal receipt identity differs")
+    authority = value.get("authority")
+    if authority is not None:
+        if (
+            not isinstance(authority, Mapping)
+            or set(authority) != {"acquisition_contract", "run_spec"}
+        ):
+            raise ValueError("timezone mapping seal receipt authority differs")
+        for label in ("acquisition_contract", "run_spec"):
+            binding = authority.get(label)
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"path", "sha256"}
+                or not isinstance(binding.get("path"), str)
+            ):
+                raise ValueError("timezone mapping seal receipt authority differs")
+            _sha256_text(
+                binding.get("sha256"),
+                f"timezone mapping seal {label} SHA-256",
+            )
     return value
 
 
@@ -2146,6 +2263,16 @@ def _load_verified_timezone_gate(
         "path": paths.candidate.as_posix(),
         "sha256": _sha256(candidate_snapshot.contents),
     }
+    recovery_authority = (
+        _recovery_authority_binding(
+            authority.run_spec_sha256,
+            authority.acquisition_contract_sha256,
+        )
+        if paths.run_spec == _RECOVERY_RUN_SPEC_PATH
+        else None
+    )
+    if candidate.get("authority") != recovery_authority:
+        raise ValueError("timezone candidate recovery authority differs")
     roles_and_reviews = (
         (
             "TIMEZONE_COVERAGE_REVIEW",
@@ -2168,6 +2295,7 @@ def _load_verified_timezone_gate(
             or review["reviewer_role"] != expected_role
             or review["candidate"] != candidate_binding
             or review["reviewed_venue_ids"] != candidate["venue_scope"]
+            or review.get("authority") != recovery_authority
         ):
             raise ValueError("timezone review approval authority differs")
         identity = str(review["reviewer_identity"])
@@ -2189,6 +2317,12 @@ def _load_verified_timezone_gate(
         "sha256": _sha256(mapping_snapshot.contents),
     }
     seal = _seal_object(seal_snapshot.contents)
+    if paths.run_spec == _RECOVERY_RUN_SPEC_PATH:
+        expected_authority = recovery_authority
+        if seal.get("authority") != expected_authority:
+            raise ValueError("timezone mapping seal recovery authority differs")
+    elif "authority" in seal:
+        raise ValueError("timezone mapping seal authority differs")
     if (
         seal["candidate"] != candidate_binding
         or seal["mapping"] != mapping_binding
@@ -2295,6 +2429,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--batch-id", action="append", required=True
     )
     candidate_parser.add_argument("--output", type=Path, required=True)
+    candidate_parser.add_argument(
+        "--run-spec", type=Path, default=_RUN_SPEC_PATH
+    )
+    candidate_parser.add_argument(
+        "--acquisition-contract",
+        type=Path,
+        default=_ACQUISITION_CONTRACT_PATH,
+    )
     review_parser = subparsers.add_parser("review")
     review_parser.add_argument("--root", type=Path, required=True)
     review_parser.add_argument("--candidate", type=Path, required=True)
@@ -2306,6 +2448,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     review_parser.add_argument(
         "--decision", choices=sorted(_DECISIONS), required=True
     )
+    review_parser.add_argument("--run-spec", type=Path, default=_RUN_SPEC_PATH)
+    review_parser.add_argument(
+        "--acquisition-contract",
+        type=Path,
+        default=_ACQUISITION_CONTRACT_PATH,
+    )
     seal_parser = subparsers.add_parser("seal")
     seal_parser.add_argument("--root", type=Path, required=True)
     seal_parser.add_argument("--candidate", type=Path, required=True)
@@ -2314,14 +2462,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     seal_parser.add_argument("--output", type=Path, required=True)
     seal_parser.add_argument("--receipt-output", type=Path, required=True)
+    seal_parser.add_argument("--run-spec", type=Path, default=_RUN_SPEC_PATH)
+    seal_parser.add_argument(
+        "--acquisition-contract",
+        type=Path,
+        default=_ACQUISITION_CONTRACT_PATH,
+    )
     arguments = parser.parse_args(argv)
+    run_spec_path = arguments.root / arguments.run_spec
+    acquisition_contract_path = arguments.root / arguments.acquisition_contract
+    context = _explicit_authority_context(
+        arguments.root, run_spec_path, acquisition_contract_path
+    )
     if arguments.command == "candidate":
-        if arguments.output != _CANDIDATE_PATH:
+        if arguments.output != _timezone_paths(context).candidate:
             raise ValueError("timezone candidate output must be the canonical path")
         publish_timezone_candidate(
             root=arguments.root,
             evidence_root=arguments.evidence_root,
             batch_ids=arguments.batch_id,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
         )
         return 0
     if arguments.command == "review":
@@ -2332,6 +2493,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             reviewer_identity=arguments.reviewer_identity,
             reviewer_role=arguments.reviewer_role,
             decision=arguments.decision,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
         )
         return 0
     if arguments.command == "seal":
@@ -2341,6 +2504,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             review_receipt_paths=arguments.review_receipt,
             output=arguments.output,
             receipt_output=arguments.receipt_output,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
         )
         return 0
     raise AssertionError("unreachable timezone review command")

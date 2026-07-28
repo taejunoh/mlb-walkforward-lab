@@ -47,6 +47,17 @@ SOURCE_RUN_SPEC = Path(
 SOURCE_CONTRACT = Path(
     "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
 )
+RECOVERY_AUDIT_NAMESPACE = Path(
+    "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition"
+)
+RECOVERY_RUN_SPEC = Path(
+    "protocols/v5_2_qd/"
+    "historical_walkforward_500_recovery_schedule_conflicts.json"
+)
+RECOVERY_CONTRACT = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts.json"
+)
 PROVENANCE = {
     "query_batch_ids": ["c" * 64, "d" * 64],
     "run_spec_sha256": "a" * 64,
@@ -669,6 +680,126 @@ def _finish_source_verified_gate_fixture(
 
 
 class V52TimezoneReviewTest(unittest.TestCase):
+    def test_recovery_authority_uses_closed_timezone_paths_and_cli_pair(self) -> None:
+        import mlb_backtest.v52_timezone_review as timezone_review
+        from mlb_backtest.v52_query_plan import _load_static_contracts
+        from tests.test_v52_query_plan import RecoveryAuthorityTests
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec_path, contract_path = RecoveryAuthorityTests()._fixture(
+                Path(directory)
+            )
+            context = _load_static_contracts(run_spec_path, contract_path)
+            paths = timezone_review._timezone_paths(context)
+            self.assertEqual(paths.acquisition_audit, RECOVERY_AUDIT_NAMESPACE)
+            self.assertEqual(paths.candidate, RECOVERY_AUDIT_NAMESPACE / "venue_timezone_candidate.json")
+            self.assertEqual(
+                paths.schedule_inventory,
+                RECOVERY_AUDIT_NAMESPACE / "schedule_anchor_inventory.json",
+            )
+            self.assertEqual(
+                paths.query_batch_root,
+                RECOVERY_AUDIT_NAMESPACE / "query_batches",
+            )
+            with patch.object(
+                timezone_review,
+                "publish_timezone_candidate",
+                return_value=root / paths.candidate,
+            ) as publish:
+                self.assertEqual(
+                    timezone_review.main(
+                        [
+                            "candidate",
+                            "--root",
+                            str(root),
+                            "--evidence-root",
+                            str(context.raw_root),
+                            "--batch-id",
+                            "a" * 64,
+                            "--output",
+                            paths.candidate.as_posix(),
+                            "--run-spec",
+                            run_spec_path.relative_to(root).as_posix(),
+                            "--acquisition-contract",
+                            contract_path.relative_to(root).as_posix(),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                publish.call_args.kwargs["run_spec_path"], run_spec_path
+            )
+            self.assertEqual(
+                publish.call_args.kwargs["acquisition_contract_path"], contract_path
+            )
+            for changed in (
+                replace(
+                    context,
+                    acquisition_audit_root=root / AUDIT_NAMESPACE,
+                ),
+                replace(
+                    context,
+                    authority_path=root / SOURCE_RUN_SPEC,
+                ),
+                replace(
+                    context,
+                    acquisition_contract_path=root / SOURCE_CONTRACT,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "authority paths"):
+                    timezone_review._timezone_paths(changed)
+            schedules, venues = _inputs()
+            candidate = timezone_review._project_timezone_candidate(
+                schedules,
+                venues,
+                query_batch_ids=["c" * 64, "d" * 64],
+                run_spec_sha256=hashlib.sha256(run_spec_path.read_bytes()).hexdigest(),
+                acquisition_contract_sha256="a" * 64,
+            )
+            candidate["authority"] = {
+                "acquisition_contract": {
+                    "path": RECOVERY_CONTRACT.as_posix(),
+                    "sha256": "a" * 64,
+                },
+                "run_spec": {
+                    "path": RECOVERY_RUN_SPEC.as_posix(),
+                    "sha256": candidate["run_spec_sha256"],
+                },
+            }
+            jsonschema.validate(
+                candidate, json.loads(CANDIDATE_SCHEMA.read_bytes())
+            )
+            self.assertEqual(
+                timezone_review._candidate_object(candidate)["authority"],
+                candidate["authority"],
+            )
+            seal = {
+                "authority": {
+                    "acquisition_contract": {
+                        "path": RECOVERY_CONTRACT.as_posix(),
+                        "sha256": "a" * 64,
+                    },
+                    "run_spec": {
+                        "path": RECOVERY_RUN_SPEC.as_posix(),
+                        "sha256": hashlib.sha256(run_spec_path.read_bytes()).hexdigest(),
+                    },
+                },
+                "candidate": {"path": paths.candidate.as_posix(), "sha256": "b" * 64},
+                "mapping": {"path": "config/v5_2_qd/venue_timezones.json", "sha256": "c" * 64},
+                "occurred_at_utc": "2026-07-28T00:00:00.000000Z",
+                "receipt_kind": "TIMEZONE_MAPPING_SEAL",
+                "reviews": [
+                    {"path": paths.coverage_review.as_posix(), "reviewer_identity": "coverage", "reviewer_role": "TIMEZONE_COVERAGE_REVIEW", "sha256": "d" * 64},
+                    {"path": paths.semantic_review.as_posix(), "reviewer_identity": "semantic", "reviewer_role": "TIMEZONE_SEMANTIC_REVIEW", "sha256": "e" * 64},
+                ],
+                "schema_version": 1,
+                "venue_scope": [31],
+            }
+            jsonschema.validate(seal, json.loads(SEAL_SCHEMA.read_bytes()))
+            seal["authority"]["run_spec"]["path"] = SOURCE_RUN_SPEC.as_posix()
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(seal, json.loads(SEAL_SCHEMA.read_bytes()))
+
     def test_source_gate_public_lifecycle_and_fail_closed_rebinds(self) -> None:
         import shutil
 
