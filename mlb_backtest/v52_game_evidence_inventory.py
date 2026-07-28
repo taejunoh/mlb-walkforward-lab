@@ -849,6 +849,13 @@ def _validate_game_projection(
     run_id: str,
     recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> None:
+    if (
+        recovery_dispositions is not None
+        and not isinstance(recovery_dispositions, RecoveryDispositionBindings)
+    ):
+        raise ValueError("recovery game availability capability is required")
+    if recovery_dispositions is not None:
+        recovery_dispositions = recovery_dispositions.reauthenticate()
     if set(snapshot) != {
         "games",
         "grain",

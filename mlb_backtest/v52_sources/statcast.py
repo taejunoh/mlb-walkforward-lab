@@ -9,7 +9,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
-from typing import TYPE_CHECKING
+from ..v52_schedule_inventory import RecoveryDispositionBindings
 
 from ..source_parsers.statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
 from ..v52_evidence import LogicalQuery, canonical_query_bytes
@@ -20,10 +20,6 @@ from ..v52_source_contracts import (
     query_sidecar,
     require_query,
 )
-
-if TYPE_CHECKING:
-    from ..v52_schedule_inventory import RecoveryDispositionBindings
-
 
 _STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -46,6 +42,8 @@ def validate_recovery_statcast_game_dates(
     capability: "RecoveryDispositionBindings | None",
 ) -> None:
     """Require Savant's raw local game date for the two resumed games only."""
+    if capability is not None and not isinstance(capability, RecoveryDispositionBindings):
+        raise ValueError("recovery Statcast availability capability is required")
     authenticated = capability.reauthenticate() if capability is not None else None
     for game in games:
         if not isinstance(game, Mapping):

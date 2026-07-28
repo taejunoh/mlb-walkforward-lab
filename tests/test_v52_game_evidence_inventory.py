@@ -822,6 +822,20 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
                 ):
                     inventory_module.publish_game_evidence_inventory(root)
 
+    def test_game_projection_rejects_duck_typed_recovery_capability(self) -> None:
+        from mlb_backtest import v52_game_evidence_inventory as inventory_module
+
+        class Capability:
+            def reauthenticate(self):
+                return self
+
+        with self.assertRaisesRegex(ValueError, "availability capability"):
+            inventory_module._validate_game_projection(
+                {},
+                run_id="historical_walkforward_500_recovery_schedule_conflicts",
+                recovery_dispositions=Capability(),
+            )
+
     def test_source_provenance_hash_mutation_is_rejected_at_runtime_or_final_rebind(
         self,
     ) -> None:

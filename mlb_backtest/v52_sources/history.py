@@ -270,7 +270,9 @@ def _availability_date(
         return _day(row.get("official_date"), "official_date")
     if capability is None:
         raise ValueError("unapproved schedule availability boundary")
-    return capability.require_boundary(row)
+    if not isinstance(capability, RecoveryDispositionBindings):
+        raise ValueError("recovery availability capability is required")
+    return capability.reauthenticate().require_boundary(row)
 
 
 def recompute_prior_history_sidecar(

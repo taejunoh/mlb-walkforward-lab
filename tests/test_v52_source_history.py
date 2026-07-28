@@ -110,7 +110,7 @@ def _task10_disposition() -> dict[str, object]:
 
 
 class V52HistorySourceTest(unittest.TestCase):
-    def test_statcast_exception_uses_authenticated_local_played_dates_only(self) -> None:
+    def test_statcast_exception_rejects_duck_typed_capability(self) -> None:
         from types import SimpleNamespace
 
         from mlb_backtest.v52_sources.statcast import (
@@ -128,24 +128,10 @@ class V52HistorySourceTest(unittest.TestCase):
                 return Capability()
 
         capability = Capability()
-        validate_recovery_statcast_game_dates(
-            [
-                {"game_pk": 630882, "game_date": "2020-08-14"},
-                {"game_pk": 633224, "game_date": "2021-09-24"},
-                {"game_pk": 9001, "game_date": "2021-07-21"},
-            ],
-            capability,
-        )
-        for game_pk, wrong_date in (
-            (630882, "2020-08-09"),
-            (633224, "2021-09-25"),
-        ):
-            with self.subTest(game_pk=game_pk), self.assertRaisesRegex(
-                ValueError, "played_date"
-            ):
-                validate_recovery_statcast_game_dates(
-                    [{"game_pk": game_pk, "game_date": wrong_date}], capability
-                )
+        with self.assertRaisesRegex(ValueError, "availability capability"):
+            validate_recovery_statcast_game_dates(
+                [{"game_pk": 630882, "game_date": "2020-08-14"}], capability
+            )
 
     def test_public_history_rejects_unbound_availability_fields(self) -> None:
         from mlb_backtest.v52_sources.history import _availability_date

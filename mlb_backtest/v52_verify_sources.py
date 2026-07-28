@@ -403,10 +403,16 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
     if not isinstance(inputs, SnapshotReplayInputs):
         raise TypeError("snapshot replay inputs must be SnapshotReplayInputs")
     recovery_dispositions = inputs.recovery_dispositions
+    if (
+        recovery_dispositions is not None
+        and not isinstance(recovery_dispositions, RecoveryDispositionBindings)
+    ):
+        raise ValueError("recovery replay requires availability capability")
+    if recovery_dispositions is not None:
+        recovery_dispositions = recovery_dispositions.reauthenticate()
     if inputs.run_id == _RECOVERY_RUN_ID:
         if recovery_dispositions is None:
             raise ValueError("recovery replay requires availability capability")
-        recovery_dispositions = recovery_dispositions.reauthenticate()
         if (
             inputs.schedule_inventory.payload.get("schedule_conflict_dispositions")
             != recovery_dispositions.as_mapping()
@@ -526,6 +532,13 @@ def _validate_normalized_snapshot_mapping(
     *,
     recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> dict[str, object]:
+    if (
+        recovery_dispositions is not None
+        and not isinstance(recovery_dispositions, RecoveryDispositionBindings)
+    ):
+        raise ValueError("normalized recovery availability capability is required")
+    if recovery_dispositions is not None:
+        recovery_dispositions = recovery_dispositions.reauthenticate()
     if not isinstance(value, Mapping) or set(value) not in {
         _NORMALIZED_ENVELOPE_KEYS,
         _NORMALIZED_ENVELOPE_KEYS
@@ -567,9 +580,8 @@ def _validate_normalized_snapshot_mapping(
         if not has_recovery_catalog or not isinstance(recovery_catalog, Mapping):
             raise ValueError("normalized recovery disposition binding differs")
         if recovery_dispositions is not None:
-            fresh = recovery_dispositions.reauthenticate()
             if canonical_json_bytes(recovery_catalog) != canonical_json_bytes(
-                fresh.as_mapping()
+                recovery_dispositions.as_mapping()
             ):
                 raise ValueError("normalized recovery disposition binding differs")
     elif has_recovery_catalog:

@@ -244,7 +244,7 @@ def build_task10(target, history):
 
 
 class FeatureEngineTest(unittest.TestCase):
-    def test_schedule_history_uses_strict_capability_availability_for_indexing(self):
+    def test_schedule_history_rejects_duck_typed_capability(self):
         expected = {
             "game_pk": 633224,
             "official_date": "2021-07-21",
@@ -268,12 +268,11 @@ class FeatureEngineTest(unittest.TestCase):
             "away_team_id": 1, "home_team_id": 2,
             "venue_name": "Park", "innings": 9,
         }
-        history = ScheduleHistory(
-            [row], coverage_start="2021-04-01", coverage_end="2021-10-03",
-            coverage_complete=True, recovery_dispositions=capability,
-        )
-        self.assertIsNone(history.max_before(date(2021, 9, 24)))
-        self.assertEqual(history.max_before(date(2021, 9, 25)), date(2021, 9, 24))
+        with self.assertRaisesRegex(ValueError, "availability capability"):
+            ScheduleHistory(
+                [row], coverage_start="2021-04-01", coverage_end="2021-10-03",
+                coverage_complete=True, recovery_dispositions=capability,
+            )
 
     def test_schedule_history_rejects_public_availability_fields(self):
         with self.assertRaisesRegex(ValueError, "unapproved schedule availability"):
