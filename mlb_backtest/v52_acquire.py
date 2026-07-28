@@ -23,7 +23,14 @@ from pathlib import Path
 from typing import ContextManager, Literal, TypeVar
 from urllib.parse import urlparse
 
-from .protocols import RunSpec, SourceRunSpec, load_run_spec, load_source_run_spec
+from .protocols import (
+    RunSpec,
+    SourceRunSpec,
+    expected_recovery_source_run,
+    load_run_spec,
+    load_source_run_spec,
+    parse_source_run_spec,
+)
 from .v52_evidence import (
     AttemptBudgetSnapshot,
     AttemptCapture,
@@ -1526,14 +1533,34 @@ def _source_disposition_authorities(
         build_recovery_schedule_conflict_catalog,
     )
 
-    recovery_queries = tuple(
+    endpoint_queries = tuple(
         query
         for batch in batches
         for query in getattr(batch, "queries", ())
         if isinstance(query, LogicalQuery)
         and query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
     )
-    if recovery_queries:
+    authenticated_recovery = (
+        isinstance(request.run_spec, SourceRunSpec)
+        and request.run_spec
+        == parse_source_run_spec(expected_recovery_source_run())
+    )
+    recovery_queries = tuple(
+        query
+        for query in endpoint_queries
+        if (
+            query.source == "mlb_schedule_game_feed"
+            and query.grain == "season_schedule_and_game"
+            and query.expected_media_type == "application/json"
+            and query.parser_version == "v5.2.2"
+        )
+    )
+    if endpoint_queries and (
+        authenticated_recovery
+        or any(query.parser_version == "v5.2.2" for query in endpoint_queries)
+    ):
+        if not authenticated_recovery or recovery_queries != endpoint_queries:
+            raise TrustIntegrityError("recovery disposition query authority differs")
         catalog = build_recovery_schedule_conflict_catalog(
             root,
             root / "protocols/v5_2_qd/"

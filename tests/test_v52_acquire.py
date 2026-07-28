@@ -2437,6 +2437,10 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(derived_writer.call_args.args[1], expected_semantics)
 
     def test_recovery_dispositions_select_the_three_catalog_authorities(self) -> None:
+        from mlb_backtest.protocols import (
+            expected_recovery_source_run,
+            parse_source_run_spec,
+        )
         from mlb_backtest.v52_acquire import _source_disposition_authorities
 
         endpoints = (
@@ -2458,18 +2462,58 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         )
         authorities = tuple(SimpleNamespace(query=query) for query in queries)
         batch = SimpleNamespace(batch_id="e" * 64, queries=queries)
+        request = dataclasses.replace(
+            self._request(plan_only=True),
+            run_spec=parse_source_run_spec(expected_recovery_source_run()),
+        )
         with patch(
             "mlb_backtest.v52_schedule_conflict_recovery_disposition."
             "build_recovery_schedule_conflict_catalog",
             return_value=SimpleNamespace(entries=authorities),
         ):
-            selected = _source_disposition_authorities(
-                self._request(plan_only=True), (batch,)
-            )
+            selected = _source_disposition_authorities(request, (batch,))
         self.assertEqual(
             selected,
             {logical_query_id(query): authority for query, authority in zip(queries, authorities)},
         )
+
+    def test_legacy_v521_disposition_never_builds_recovery_catalog(self) -> None:
+        from mlb_backtest.protocols import load_source_run_spec
+        from mlb_backtest.v52_acquire import _source_disposition_authorities
+
+        query = dataclasses.replace(
+            _query(),
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint="disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            parameters={},
+            requested_range={"year": 2019},
+            parser_version="v5.2.1",
+        )
+        legacy_authority = SimpleNamespace(query=query)
+        request = dataclasses.replace(
+            self._request(plan_only=True),
+            run_spec=load_source_run_spec(
+                ROOT
+                / "protocols/v5_2_qd/"
+                "historical_walkforward_500_superseding_565534.json"
+            ),
+        )
+        batch = SimpleNamespace(batch_id="e" * 64, queries=(query,))
+        with (
+            patch(
+                "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+                "build_recovery_schedule_conflict_catalog",
+                side_effect=AssertionError("legacy disposition selected recovery"),
+            ),
+            patch(
+                "mlb_backtest.v52_duplicate_gamepk_disposition."
+                "build_duplicate_disposition_authority",
+                return_value=legacy_authority,
+            ),
+        ):
+            selected = _source_disposition_authorities(request, (batch,))
+        self.assertEqual(selected, {logical_query_id(query): legacy_authority})
 
     def test_stage_uses_exact_host_pools_and_publishes_only_after_workers_join(self) -> None:
         from mlb_backtest.v52_acquire import _AcquisitionPlan, _execute_stage
