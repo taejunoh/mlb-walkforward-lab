@@ -1215,7 +1215,14 @@ def _converge_identical_locked_publish(
         except FinalizationError as load_error:
             try:
                 _assert_trusted_root(handle)
-                inventory = read_inventory_from_fd(handle.descriptors[-1])
+                inventory = read_inventory_from_fd(
+                    handle.descriptors[-1],
+                    recovery_dispositions=(
+                        context.snapshot_inputs.bindings.schedule_conflict_dispositions
+                        if context.snapshot_inputs is not None
+                        else None
+                    ),
+                )
                 _assert_trusted_root(handle)
             except LockHeld:
                 time.sleep(0.02)

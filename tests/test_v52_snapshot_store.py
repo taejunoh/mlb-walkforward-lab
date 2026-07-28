@@ -901,6 +901,85 @@ class InventoryTests(unittest.TestCase):
                 )
             )
 
+    def test_recovery_convergence_fallback_forwards_fresh_capability(self):
+        from types import SimpleNamespace
+
+        from mlb_backtest import v52_source_orchestration as orchestration
+        from mlb_backtest.v52_snapshot_store import (
+            SnapshotStoreError,
+            build_inventory,
+            inventory_bytes,
+        )
+
+        loader, fresh, inputs, snapshots = _recovery_store_case()
+        with loader, patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=snapshots,
+        ):
+            capability = fresh()
+            inventory = build_inventory(inputs)
+            expected = inventory_bytes(inventory)
+            context = SimpleNamespace(snapshot_inputs=inputs)
+            handle = SimpleNamespace(descriptors=(17,))
+            bound_capability = inputs.bindings.schedule_conflict_dispositions
+            load_error = orchestration.FinalizationError(
+                "POSTCONDITION_FAILED", "unsafe", (), 5
+            )
+
+            def fallback(descriptor, *, recovery_dispositions=None):
+                self.assertEqual(descriptor, 17)
+                if recovery_dispositions is not bound_capability:
+                    raise SnapshotStoreError("forged recovery authority")
+                return inventory
+
+            with patch.object(
+                orchestration, "_assert_trusted_root"
+            ), patch.object(
+                orchestration,
+                "_load_published_inventory_from_handle",
+                side_effect=load_error,
+            ), patch.object(
+                orchestration,
+                "read_inventory_from_fd",
+                side_effect=fallback,
+            ) as reader:
+                report = orchestration._converge_identical_locked_publish(
+                    handle, context, expected
+                )
+            self.assertEqual(report.status, "EXISTING")
+            reader.assert_called_once_with(
+                17, recovery_dispositions=bound_capability
+            )
+
+            forged = object.__new__(type(capability))
+            object.__setattr__(forged, "entries", capability.entries)
+            object.__setattr__(forged, "_authorization", None)
+            object.__setattr__(forged, "_reauthenticate", None)
+            forged_inputs = dataclasses.replace(
+                inputs,
+                bindings=dataclasses.replace(
+                    inputs.bindings, schedule_conflict_dispositions=forged
+                ),
+            )
+            with patch.object(
+                orchestration, "_assert_trusted_root"
+            ), patch.object(
+                orchestration,
+                "_load_published_inventory_from_handle",
+                side_effect=load_error,
+            ), patch.object(
+                orchestration,
+                "read_inventory_from_fd",
+                side_effect=fallback,
+            ), self.assertRaisesRegex(
+                orchestration.FinalizationError, "unsafe"
+            ):
+                orchestration._converge_identical_locked_publish(
+                    handle,
+                    SimpleNamespace(snapshot_inputs=forged_inputs),
+                    expected,
+                )
+
     def test_source_inventory_schema_exactly_separates_authority_branches(self):
         from mlb_backtest.v52_snapshot_store import build_inventory, parse_inventory
 
@@ -1610,6 +1689,48 @@ class LoaderTests(unittest.TestCase):
                 canonical_json_bytes(actual.as_mapping()) + b"\n",
             )
             self.assertEqual(actual.sha256, original.sha256)
+
+    def test_recovery_read_requires_explicit_fresh_capability(self):
+        from mlb_backtest.v52_snapshot_store import (
+            PublishError,
+            build_inventory,
+            publish_snapshot_store,
+            read_inventory,
+            read_inventory_from_fd,
+        )
+
+        loader, fresh, inputs, snapshots = _recovery_store_case()
+        with tempfile.TemporaryDirectory() as directory, loader, patch(
+            "mlb_backtest.v52_snapshot_store.replay_verified_snapshots",
+            return_value=snapshots,
+        ):
+            root = Path(directory).resolve()
+            capability = fresh()
+            inventory = build_inventory(inputs)
+            publish_snapshot_store(
+                root, inventory, inputs, lock_owner="recovery-read"
+            )
+            with self.assertRaises(PublishError):
+                read_inventory(root)
+            forged = object.__new__(type(capability))
+            object.__setattr__(forged, "entries", capability.entries)
+            object.__setattr__(forged, "_authorization", None)
+            object.__setattr__(forged, "_reauthenticate", None)
+            with self.assertRaises(PublishError):
+                read_inventory(root, recovery_dispositions=forged)
+            self.assertEqual(
+                read_inventory(root, recovery_dispositions=capability), inventory
+            )
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(
+                    read_inventory_from_fd(
+                        descriptor, recovery_dispositions=capability
+                    ),
+                    inventory,
+                )
+            finally:
+                os.close(descriptor)
 
     def test_publisher_verifies_with_its_owned_lock_before_release(self):
         import mlb_backtest.v52_snapshot_store as store

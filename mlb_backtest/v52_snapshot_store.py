@@ -960,24 +960,35 @@ def validate_expected_root(root: Path, expected_root: Path | None) -> None:
 
 
 def read_inventory(
-    root: Path, *, expected_root: Path | None = None
+    root: Path,
+    *,
+    expected_root: Path | None = None,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> SourceInventory:
     """Read and canonically parse the committed inventory without mutating the store."""
     validate_expected_root(root, expected_root)
     with _open_path_capability(root) as trusted:
-        inventory = read_inventory_from_fd(trusted.root_fd)
+        inventory = read_inventory_from_fd(
+            trusted.root_fd, recovery_dispositions=recovery_dispositions
+        )
         _load_test_hook("before_read_inventory_return")
         _recheck_unowned_lock(trusted)
         _assert_path_capability(trusted)
         return inventory
 
 
-def read_inventory_from_fd(source_root_fd: int) -> SourceInventory:
+def read_inventory_from_fd(
+    source_root_fd: int,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
+) -> SourceInventory:
     """Read the committed inventory relative to a caller-owned directory FD."""
     held = _duplicate_directory_capability(source_root_fd)
     try:
         _reject_unowned_lock(held)
-        _, _, inventory = _read_inventory_bindings(held)
+        _, _, inventory = _read_inventory_bindings(
+            held, recovery_dispositions=recovery_dispositions
+        )
         _reject_unowned_lock(held)
         return inventory
     finally:
@@ -1182,7 +1193,10 @@ def _reject_unowned_lock(root: _HeldDirectory) -> None:
 
 
 def _read_inventory_bindings(
-    root: _HeldDirectory, inputs: SnapshotStoreInputs | None = None
+    root: _HeldDirectory,
+    inputs: SnapshotStoreInputs | None = None,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[_ReadBinding, _ReadBinding, SourceInventory]:
     checksum = _read_immutable_binding(root, "source_inventory.sha256")
     if re.fullmatch(rb"[0-9a-f]{64}\n", checksum.contents) is None:
@@ -1196,7 +1210,7 @@ def _read_inventory_bindings(
             recovery_dispositions=(
                 inputs.bindings.schedule_conflict_dispositions
                 if inputs is not None
-                else None
+                else recovery_dispositions
             ),
         )
     except (TypeError, ValueError) as exc:
