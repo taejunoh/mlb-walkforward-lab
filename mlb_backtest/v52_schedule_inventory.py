@@ -11,6 +11,7 @@ import secrets
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from types import MappingProxyType
 
@@ -149,6 +150,36 @@ class RecoveryDispositionBindings:
 
     def query_ids(self) -> tuple[str, str, str]:
         return tuple(entry.query_id for entry in self.entries)
+
+    def require_boundary(self, row: Mapping[str, object]) -> date:
+        """Return the only two catalog-authenticated resumed-result dates."""
+        if not isinstance(row, Mapping):
+            raise ValueError("availability boundary differs")
+        game_pk = row.get("game_pk")
+        if type(game_pk) is not int or game_pk not in {630882, 633224}:
+            raise ValueError("availability boundary differs")
+        entry = next(entry for entry in self.entries if entry.game_pk == game_pk)
+        expected_official = {
+            630882: "2020-08-09",
+            633224: "2021-07-21",
+        }[game_pk]
+        expected = {
+            "official_date": expected_official,
+            "scheduled_start_utc": entry.retained_scheduled_start_utc,
+            "schedule_query_sidecar_sha256": entry.query_sidecar["sha256"],
+            "played_date": entry.played_date,
+            "result_available_on": entry.result_available_on,
+        }
+        if (
+            entry.played_date is None
+            or entry.result_available_on is None
+            or any(row.get(name) != value for name, value in expected.items())
+        ):
+            raise ValueError("availability boundary differs")
+        try:
+            return date.fromisoformat(entry.result_available_on)
+        except ValueError as exc:  # defensive: binding construction is external.
+            raise ValueError("availability boundary differs") from exc
 
     def as_mapping(self) -> dict[str, object]:
         return {

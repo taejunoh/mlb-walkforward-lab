@@ -16,7 +16,8 @@ from .features.context import schedule_score
 from .features.starter import expected_innings
 from .prepare import assert_pregame_history
 from .statcast import StatcastData, identify_pitcher_roles
-from .v52_sources.history import validate_schedule_neutralizations
+from .v52_sources.history import _availability_date, validate_schedule_neutralizations
+from .v52_schedule_inventory import RecoveryDispositionBindings
 
 
 OUT_EVENTS = frozenset(
@@ -110,6 +111,7 @@ class ScheduleHistory:
         coverage_end: str | None,
         coverage_complete: bool,
         schedule_neutralizations: Iterable[Mapping[str, object]] = (),
+        recovery_dispositions: RecoveryDispositionBindings | None = None,
     ) -> None:
         if not isinstance(coverage_complete, bool):
             raise ValueError("schedule coverage_complete must be boolean")
@@ -147,9 +149,10 @@ class ScheduleHistory:
                 )
             seen_game_pks.add(game_pk)
             raw_date = row.get("official_date", row.get("game_date"))
-            scheduled = _day(raw_date, "schedule date")
-            if not isinstance(raw_date, str) or scheduled.isoformat() != raw_date:
+            official = _day(raw_date, "schedule date")
+            if not isinstance(raw_date, str) or official.isoformat() != raw_date:
                 raise ValueError("schedule history date must be canonical ISO")
+            scheduled = _availability_date(row, recovery_dispositions)
             team_codes = row.get("team_codes")
             if (
                 isinstance(team_codes, (str, bytes))
@@ -225,7 +228,7 @@ class ScheduleHistory:
             sorted(
                 validated,
                 key=lambda row: (
-                    str(row.get("official_date", row.get("game_date", ""))),
+                    _availability_date(row, recovery_dispositions).isoformat(),
                     int(row.get("game_pk", 0)),
                 ),
             )
@@ -235,9 +238,7 @@ class ScheduleHistory:
         team_id_by_game_date_code: dict[tuple[int, str, str], int] = {}
         dated = []
         for row in canonical:
-            scheduled = _day(
-                row.get("official_date", row.get("game_date")), "schedule date"
-            )
+            scheduled = _availability_date(row, recovery_dispositions)
             dated.append(scheduled)
             for team_code in row.get("team_codes", ()):
                 code = str(team_code)
@@ -263,7 +264,7 @@ class ScheduleHistory:
         self.game_dates = MappingProxyType(
             {
                 int(row["game_pk"]): _day(
-                    row.get("official_date", row.get("game_date")), "schedule date"
+                    _availability_date(row, recovery_dispositions).isoformat(), "schedule date"
                 )
                 for row in canonical
             }
@@ -1003,11 +1004,11 @@ def _schedule_component(
     prior = [
         r
         for r in history.schedule_history.by_team.get(team_code, ())
-        if _day(r.get("official_date", r.get("game_date")), "schedule date") < target
+        if history.schedule_history.game_dates[int(r["game_pk"])] < target
     ]
     prior.sort(
         key=lambda r: (
-            _day(r.get("official_date", r.get("game_date")), "schedule date"),
+            history.schedule_history.game_dates[int(r["game_pk"])],
             int(r["game_pk"]),
         ),
         reverse=True,

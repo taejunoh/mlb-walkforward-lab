@@ -110,6 +110,63 @@ def _task10_disposition() -> dict[str, object]:
 
 
 class V52HistorySourceTest(unittest.TestCase):
+    def test_recovery_availability_requires_exact_authenticated_boundary(self) -> None:
+        """Changing a resumed-result boundary must keep it out of prior history."""
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionBinding,
+        )
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+        from mlb_backtest.v52_sources.history import _availability_date
+
+        def binding(game_pk: int, official: str, played: str | None):
+            return RecoveryDispositionBinding(
+                game_pk=game_pk,
+                query_id=f"{game_pk:064x}",
+                query_sidecar={"path": f"queries/{game_pk}.json", "sha256": "a" * 64},
+                success_receipt={"path": f"queries/{game_pk}/success.json", "sha256": "b" * 64},
+                retained_scheduled_start_utc=f"{official}T20:00:00Z",
+                played_date=played,
+                result_available_on=played,
+                raw_object_sha256s=("c" * 64,),
+                selected_raw_game_object_sha256s_sha256="d" * 64,
+                normalized_games_sha256="e" * 64,
+                sidecar_semantics_sha256="f" * 64,
+                expected_derived_sidecar_sha256="0" * 64,
+            )
+
+        capability = RecoveryDispositionBindings(
+            (
+                binding(565534, "2019-05-20", None),
+                binding(630882, "2020-08-09", "2020-08-14"),
+                binding(633224, "2021-07-21", "2021-09-24"),
+            )
+        )
+        row = {
+            "game_pk": 630882,
+            "official_date": "2020-08-09",
+            "scheduled_start_utc": "2020-08-09T20:00:00Z",
+            "schedule_query_sidecar_sha256": "a" * 64,
+            "played_date": "2020-08-14",
+            "result_available_on": "2020-08-14",
+        }
+        self.assertEqual(_availability_date(row, capability), date(2020, 8, 14))
+        self.assertEqual(
+            _availability_date(
+                {
+                    **row,
+                    "game_pk": 633224,
+                    "official_date": "2021-07-21",
+                    "scheduled_start_utc": "2021-07-21T20:00:00Z",
+                    "played_date": "2021-09-24",
+                    "result_available_on": "2021-09-24",
+                },
+                capability,
+            ),
+            date(2021, 9, 24),
+        )
+        with self.assertRaisesRegex(ValueError, "availability boundary"):
+            _availability_date({**row, "played_date": "2020-08-13"}, capability)
+
     def test_three_exact_duplicate_dependency_neutralizations_and_no_others(
         self,
     ) -> None:

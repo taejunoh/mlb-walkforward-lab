@@ -9,6 +9,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
 
 from ..source_parsers.statcast import REQUIRED_FIELDS, STATCAST_ROW_CAP, parse_statcast
 from ..v52_evidence import LogicalQuery, canonical_query_bytes
@@ -19,6 +20,9 @@ from ..v52_source_contracts import (
     query_sidecar,
     require_query,
 )
+
+if TYPE_CHECKING:
+    from ..v52_schedule_inventory import RecoveryDispositionBindings
 
 
 _STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
@@ -35,6 +39,24 @@ def _day(value: object, label: str) -> date:
     if parsed.isoformat() != value:
         raise ValueError(f"{label} must be a canonical ISO date")
     return parsed
+
+
+def validate_recovery_statcast_game_dates(
+    games: Sequence[Mapping[str, object]],
+    capability: "RecoveryDispositionBindings | None",
+) -> None:
+    """Require Savant's raw local game date for the two resumed games only."""
+    for game in games:
+        if not isinstance(game, Mapping):
+            raise ValueError("Statcast game projection must be a mapping")
+        game_pk = game.get("game_pk")
+        if game_pk not in {630882, 633224}:
+            continue
+        if capability is None:
+            raise ValueError("recovery Statcast availability capability is required")
+        entry = next(entry for entry in capability.entries if entry.game_pk == game_pk)
+        if game.get("game_date") != entry.played_date:
+            raise ValueError("recovery Statcast game_date differs from played_date")
 
 
 def _raw_row_count_and_fields(raw: bytes) -> tuple[int, list[str]]:
@@ -57,7 +79,10 @@ def _raw_row_count_and_fields(raw: bytes) -> tuple[int, list[str]]:
 
 
 def recompute_statcast_sidecar(
-    raw: bytes, query: LogicalQuery
+    raw: bytes,
+    query: LogicalQuery,
+    *,
+    recovery_dispositions: "RecoveryDispositionBindings | None" = None,
 ) -> Mapping[str, object]:
     require_query(
         query,
@@ -136,6 +161,8 @@ def recompute_statcast_sidecar(
                 "terminal_plate_appearance_count": len(terminals),
             }
         )
+    if recovery_dispositions is not None:
+        validate_recovery_statcast_game_dates(games, recovery_dispositions)
     semantics = {
         "batter_ids": sorted({int(row["batter_id"]) for row in parsed.pitches}),
         "canonical_query": json.loads(canonical_query_bytes(query)),

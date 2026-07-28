@@ -21,7 +21,8 @@ from .sources import (
     schedule_url,
     validate_schedule_query_coverage,
 )
-from .v52_sources.history import validate_schedule_neutralizations
+from .v52_sources.history import _availability_date, validate_schedule_neutralizations
+from .v52_schedule_inventory import RecoveryDispositionBindings
 
 _EVIDENCE_TOKEN = object()
 PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
@@ -182,6 +183,7 @@ class ScheduleHistoryBuild:
     expected_game_pks: tuple[int, ...]
     provenance: Mapping[str, object] = dataclass_field(default_factory=dict)
     schedule_neutralizations: tuple[Mapping[str, object], ...] = ()
+    recovery_dispositions: RecoveryDispositionBindings | None = None
 
     def __post_init__(self) -> None:
         if type(self.coverage_complete) is not bool:
@@ -204,6 +206,7 @@ class ScheduleHistoryBuild:
             official = _canonical_day(
                 row.get("official_date"), "schedule history official_date"
             )
+            _availability_date(row, self.recovery_dispositions)
             if not first <= official <= last:
                 raise ValueError("schedule history row is outside coverage bounds")
             actual.add(game_pk)
@@ -1201,6 +1204,7 @@ def schedule_history_rows(
     evidence: VerifiedScheduleEvidence,
     *,
     verified_catalog=None,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> ScheduleHistoryBuild:
     """Convert normalized schedules into source-backed ScheduleHistory rows."""
     if not isinstance(venue_reference, Mapping):
@@ -1274,6 +1278,7 @@ def schedule_history_rows(
         if not first <= official_text <= last:
             raise ValueError("schedule row is outside explicit coverage bounds")
         official = date.fromisoformat(official_text)
+        _availability_date(game, recovery_dispositions)
         away_code, home_code = game.get("away_team_code"), game.get("home_team_code")
         if (
             not isinstance(away_code, str)
@@ -1306,6 +1311,13 @@ def schedule_history_rows(
             "final_outs": game.get("final_outs"),
             "doubleheader_marker": game.get("doubleheader_marker"),
         }
+        if game.get("played_date") is not None or game.get("result_available_on") is not None:
+            row["scheduled_start_utc"] = game.get("scheduled_start_utc")
+            row["schedule_query_sidecar_sha256"] = game.get(
+                "schedule_query_sidecar_sha256"
+            )
+            row["played_date"] = game.get("played_date")
+            row["result_available_on"] = game.get("result_available_on")
         if row["away_team_id"] == row["home_team_id"]:
             raise ValueError("schedule history requires distinct numeric team identities")
         if row["doubleheader_marker"] not in {None, "GAME1", "GAME2"}:
@@ -1367,6 +1379,7 @@ def schedule_history_rows(
         evidence.manifest_sha256,
         tuple(sorted(played_expected)),
         provenance,
+        recovery_dispositions=recovery_dispositions,
     )
 
 
@@ -1435,6 +1448,7 @@ def build_feature_history(
             }
             for record in schedule_build.schedule_neutralizations
         ),
+        recovery_dispositions=schedule_build.recovery_dispositions,
     )
     for name, value in tuple(vars(frozen_schedule).items()):
         object.__setattr__(

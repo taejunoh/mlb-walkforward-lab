@@ -244,6 +244,47 @@ def build_task10(target, history):
 
 
 class FeatureEngineTest(unittest.TestCase):
+    def test_schedule_history_indexes_resumed_result_on_availability_date(self):
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionBinding,
+        )
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+
+        def binding(game_pk, official, played):
+            return RecoveryDispositionBinding(
+                game_pk=game_pk, query_id=f"{game_pk:064x}",
+                query_sidecar={"path": f"q/{game_pk}", "sha256": "a" * 64},
+                success_receipt={"path": f"q/{game_pk}/success", "sha256": "b" * 64},
+                retained_scheduled_start_utc=f"{official}T20:00:00Z",
+                played_date=played, result_available_on=played,
+                raw_object_sha256s=("c" * 64,),
+                selected_raw_game_object_sha256s_sha256="d" * 64,
+                normalized_games_sha256="e" * 64,
+                sidecar_semantics_sha256="f" * 64,
+                expected_derived_sidecar_sha256="0" * 64,
+            )
+
+        capability = RecoveryDispositionBindings((
+            binding(565534, "2019-05-20", None),
+            binding(630882, "2020-08-09", "2020-08-14"),
+            binding(633224, "2021-07-21", "2021-09-24"),
+        ))
+        row = {
+            "game_pk": 630882, "official_date": "2020-08-09",
+            "scheduled_start_utc": "2020-08-09T20:00:00Z",
+            "schedule_query_sidecar_sha256": "a" * 64,
+            "played_date": "2020-08-14", "result_available_on": "2020-08-14",
+            "team_codes": ["AWY", "HOM"], "away_team_code": "AWY",
+            "home_team_code": "HOM", "away_team_id": 1, "home_team_id": 2,
+            "venue_name": "Park", "innings": 9,
+        }
+        history = ScheduleHistory(
+            [row], coverage_start="2020-07-23", coverage_end="2020-09-27",
+            coverage_complete=True, recovery_dispositions=capability,
+        )
+        self.assertIsNone(history.max_before(date(2020, 8, 14)))
+        self.assertEqual(history.max_before(date(2020, 8, 15)), date(2020, 8, 14))
+
     def test_historical_full_raw_output_characterization(self):
         rows = [
             pa(1, "2025-04-01", 10, 201, "strikeout", xwoba=0.1, outs=1),

@@ -775,6 +775,7 @@ def _recovery_schedule_adapter(
 def _replace_recovery_disposition_lineage(
     snapshot: Mapping[str, object],
     replacements: Mapping[int, tuple[str, str]],
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> dict[str, object]:
     """Replace private adapters with the three authenticated Task 4 sidecars."""
     result = json.loads(_canonical_file_bytes(snapshot))
@@ -792,6 +793,17 @@ def _replace_recovery_disposition_lineage(
         if game.get("schedule_query_sidecar_sha256") != adapter_sha256:
             raise ValueError("recovery game disposition adapter lineage differs")
         game["schedule_query_sidecar_sha256"] = derived_sha256
+        if game.get("game_pk") in {630882, 633224}:
+            if recovery_dispositions is None:
+                raise ValueError("recovery availability capability is required")
+            binding = next(
+                entry
+                for entry in recovery_dispositions.entries
+                if entry.game_pk == game["game_pk"]
+            )
+            game["played_date"] = binding.played_date
+            game["result_available_on"] = binding.result_available_on
+            recovery_dispositions.require_boundary(game)
         lineage: dict[str, object] = {
             "anchor_sidecar_sha256": derived_sha256,
             "game": {
@@ -858,6 +870,11 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
         expected_keys = _COMMON_GAME_KEYS | (
             {"boxscore_query_sidecar_sha256"} if played is True else set()
         )
+        recovery_boundary = (
+            run_id == _RECOVERY_RUN_ID and row.get("game_pk") in {630882, 633224}
+        )
+        if recovery_boundary:
+            expected_keys |= {"played_date", "result_available_on"}
         if run_id == _SOURCE_RUN_ID and played is True:
             expected_keys |= {
                 "raw_game_object_sha256",
@@ -888,6 +905,9 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
         ):
             raise ValueError("game participant site flags differ")
         official = _canonical_date(row.get("official_date"), "official date")
+        if recovery_boundary:
+            if row.get("played_date") != row.get("result_available_on"):
+                raise ValueError("recovery game availability boundary differs")
         season_start = _canonical_date(
             row.get("season_start_date"), "season start date"
         )
@@ -1382,7 +1402,7 @@ def _build_current_authority(
         if set(recovery_adapters) != {2019, 2020, 2021}:
             raise ValueError("game evidence recovery disposition adapter population differs")
         game_snapshot = _replace_recovery_disposition_lineage(
-            game_snapshot, recovery_adapters
+            game_snapshot, recovery_adapters, recovery_dispositions
         )
         from .v52_schedule_conflict_recovery_disposition import (
             build_recovery_schedule_conflict_catalog,

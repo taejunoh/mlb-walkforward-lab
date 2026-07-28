@@ -17,12 +17,15 @@ from .execution_registry import (
 )
 from .v52_game_evidence_inventory import (
     VerifiedGameEvidenceInventory,
+    _recovery_schedule_adapter,
+    _replace_recovery_disposition_lineage,
     _replace_source_disposition_lineage,
     load_verified_game_evidence_inventory,
     validate_source_normalized_anchor_provenance,
     validate_game_evidence_snapshot,
 )
 from .v52_schedule_inventory import (
+    RecoveryDispositionBindings,
     VerifiedScheduleAnchorInventory,
     build_schedule_anchor_provenance,
     load_verified_schedule_anchor_inventory,
@@ -79,6 +82,7 @@ from .v52_sources.history import (
 )
 from .v52_sources.statcast import (
     recompute_statcast_season_snapshot,
+    validate_recovery_statcast_game_dates,
     validate_statcast_child_coverage,
 )
 from .v52_sources.pitching import (
@@ -105,6 +109,7 @@ _BOXSCORE_ENDPOINT = re.compile(
 )
 _GAME_SEASONS = tuple(range(2018, 2025))
 _SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
 _NORMALIZED_ENVELOPE_KEYS = frozenset(
     {
         "grain",
@@ -151,6 +156,11 @@ _HISTORY_GAME_KEYS = frozenset(
         "venue_id",
     }
 )
+_RECOVERY_AVAILABILITY_GAME_PKS = frozenset({630882, 633224})
+_RECOVERY_AVAILABILITY = {
+    630882: ("2020-08-09", "2020-08-14"),
+    633224: ("2021-07-21", "2021-09-24"),
+}
 _STATCAST_PAYLOAD_KEYS = frozenset(
     {
         "child_query_sidecar_sha256s",
@@ -353,6 +363,7 @@ class SnapshotReplayInputs:
     schedule_inventory: VerifiedScheduleAnchorInventory
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
     dispositioned_query_ids: tuple[str, ...] = ()
+    recovery_dispositions: RecoveryDispositionBindings | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dispositioned_query_ids", tuple(self.dispositioned_query_ids))
@@ -397,7 +408,11 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
     if schedule != inputs.game_snapshots:
         raise ValueError("upstream game snapshot authority differs")
     statcast = _build_statcast_normalized_snapshots(
-        inputs.run_id, inputs.records, inputs.graph, schedule
+        inputs.run_id,
+        inputs.records,
+        inputs.graph,
+        schedule,
+        recovery_dispositions=inputs.recovery_dispositions,
     )
     pitching = _build_pitching_normalized_snapshots(
         inputs.run_id, inputs.records, inputs.graph, schedule
@@ -414,6 +429,7 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         schedule,
         duplicate_gamepk_disposition=inputs.duplicate_gamepk_disposition,
         dispositioned_query_ids=inputs.dispositioned_query_ids,
+        recovery_dispositions=inputs.recovery_dispositions,
     )
     career = _build_career_bf_normalized_snapshots(
         inputs.run_id, inputs.records, inputs.graph, schedule
@@ -577,6 +593,21 @@ def _validate_normalized_snapshot_mapping(
         for game in games:
             if not isinstance(game, Mapping) or game.get("season") != season:
                 raise ValueError("normalized snapshot game season differs")
+            game_pk = game.get("game_pk")
+            recovery_boundary = (
+                envelope["run_id"] == _RECOVERY_RUN_ID
+                and game_pk in _RECOVERY_AVAILABILITY_GAME_PKS
+            )
+            if recovery_boundary:
+                official, played = _RECOVERY_AVAILABILITY[game_pk]
+                if (
+                    game.get("official_date") != official
+                    or game.get("played_date") != played
+                    or game.get("result_available_on") != played
+                ):
+                    raise ValueError("normalized recovery availability boundary differs")
+            elif "played_date" in game or "result_available_on" in game:
+                raise ValueError("normalized snapshot rejects availability boundary")
             if envelope["run_id"] == _SOURCE_RUN_ID:
                 played = game.get("verification_status") == "VERIFIED"
                 provenance_fields = {
@@ -589,7 +620,20 @@ def _validate_normalized_snapshot_mapping(
                     raise ValueError("normalized source game provenance keys differ")
                 if played:
                     validate_source_normalized_anchor_provenance(game)
-        validate_game_evidence_snapshot(payload, run_id=envelope["run_id"])
+        validation_payload = payload
+        if envelope["run_id"] == _RECOVERY_RUN_ID:
+            validation_payload = {
+                **payload,
+                "games": [
+                    {
+                        key: item
+                        for key, item in game.items()
+                        if key not in {"played_date", "result_available_on"}
+                    }
+                    for game in games
+                ],
+            }
+        validate_game_evidence_snapshot(validation_payload, run_id=envelope["run_id"])
         return envelope
 
     if source == "prior_schedule_history" and grain == "verified_game_projection":
@@ -653,13 +697,32 @@ def _validate_normalized_snapshot_mapping(
         seen_game_pks: set[int] = set()
         projected_hashes: list[str] = []
         for row_value in games:
+            expected_history_keys = _HISTORY_GAME_KEYS | (
+                {"played_date", "result_available_on", "schedule_query_sidecar_sha256"}
+                if envelope["run_id"] == _RECOVERY_RUN_ID
+                and isinstance(row_value, Mapping)
+                and row_value.get("game_pk") in _RECOVERY_AVAILABILITY_GAME_PKS
+                else set()
+            )
             if (
                 not isinstance(row_value, Mapping)
-                or set(row_value) != _HISTORY_GAME_KEYS
+                or set(row_value) != expected_history_keys
             ):
                 raise ValueError("normalized snapshot history projection keys differ")
             row = dict(row_value)
             official = _canonical_day(row.get("official_date"), "history official date")
+            game_pk = row.get("game_pk")
+            if (
+                envelope["run_id"] == _RECOVERY_RUN_ID
+                and game_pk in _RECOVERY_AVAILABILITY_GAME_PKS
+            ):
+                expected_official, expected_played = _RECOVERY_AVAILABILITY[game_pk]
+                if (
+                    row.get("official_date") != expected_official
+                    or row.get("played_date") != expected_played
+                    or row.get("result_available_on") != expected_played
+                ):
+                    raise ValueError("normalized recovery history availability differs")
             cutoff = _canonical_day(row.get("history_cutoff"), "history cutoff")
             game_pk = row.get("game_pk")
             if (
@@ -1500,6 +1563,16 @@ def _game_inventory_disposition_binding(
         raise ValueError("game inventory run_id binding differs")
     binding_value = payload.get("duplicate_gamepk_disposition")
     ids_value = payload.get("dispositioned_query_ids")
+    if run_id == _RECOVERY_RUN_ID:
+        if (
+            binding_value is not None
+            or not isinstance(ids_value, list)
+            or len(ids_value) != 3
+            or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in ids_value)
+            or len(set(ids_value)) != 3
+        ):
+            raise ValueError("recovery game inventory disposition authority differs")
+        return None, tuple(ids_value)
     if run_id != _SOURCE_RUN_ID:
         if binding_value is not None or ids_value is not None:
             raise ValueError("non-source game inventory must omit disposition authority")
@@ -1599,7 +1672,9 @@ def load_snapshot_replay_inputs(
     )
     store = V52EvidenceStore.open_read_only(evidence_root)
     disposition_authority: DuplicateGamePkDispositionAuthority | None = None
-    if isinstance(run_spec, SourceRunSpec):
+    recovery_dispositions: RecoveryDispositionBindings | None = None
+    recovery_authorities: dict[str, object] = {}
+    if isinstance(run_spec, SourceRunSpec) and run_spec.run_id == _SOURCE_RUN_ID:
         if context is None:
             raise ValueError("source replay requires authenticated disposition authority")
         disposition_authority = build_duplicate_disposition_authority(
@@ -1607,24 +1682,52 @@ def load_snapshot_replay_inputs(
             source_run_spec_path=context.authority_path,
             acquisition_contract_path=context.acquisition_contract_path,
         )
-    records = tuple(
-        _recompute_verified_query_records(store, graph.completed_queries)
-        if disposition_authority is None
-        else _recompute_verified_query_records(
+    if context is not None and run_spec.run_id == _RECOVERY_RUN_ID:
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+
+        catalog = build_recovery_schedule_conflict_catalog(
+            authenticated_root,
+            context.authority_path,
+            context.acquisition_contract_path,
+        )
+        bindings = load_recovery_disposition_bindings(catalog)
+        recovery_dispositions = RecoveryDispositionBindings.from_mapping(
+            schedule.payload.get("schedule_conflict_dispositions"), bindings
+        )
+        if RecoveryDispositionBindings.from_mapping(
+            games.payload.get("schedule_conflict_dispositions"), bindings
+        ) != recovery_dispositions:
+            raise ValueError("recovery game inventory disposition capability differs")
+        recovery_authorities = {
+            logical_query_id(authority.query): authority for authority in catalog.entries
+        }
+    records = (
+        _recompute_verified_query_records(
             store,
             graph.completed_queries,
             duplicate_gamepk_disposition_authority=disposition_authority,
         )
+        if disposition_authority is not None
+        else _recompute_verified_query_records(
+            store,
+            graph.completed_queries,
+            recovery_disposition_authorities=recovery_authorities,
+        )
+        if recovery_authorities
+        else _recompute_verified_query_records(store, graph.completed_queries)
     )
+    game_kwargs: dict[str, object] = {
+        "duplicate_gamepk_disposition": disposition,
+        "dispositioned_query_ids": dispositioned,
+    }
+    if recovery_dispositions is not None:
+        game_kwargs["recovery_dispositions"] = recovery_dispositions
     game_snapshots = tuple(
         _build_game_normalized_snapshots(
-            run_spec.run_id,
-            records,
-            games,
-            timezone,
-            schedule,
-            duplicate_gamepk_disposition=disposition,
-            dispositioned_query_ids=dispositioned,
+            run_spec.run_id, records, games, timezone, schedule, **game_kwargs
         )
     )
     if isinstance(run_spec, SourceRunSpec) and (
@@ -1641,6 +1744,11 @@ def load_snapshot_replay_inputs(
         schedule,
         disposition,
         dispositioned,
+        **(
+            {"recovery_dispositions": recovery_dispositions}
+            if recovery_dispositions is not None
+            else {}
+        ),
     )
 
 
@@ -1661,6 +1769,7 @@ def _recompute_verified_query_records(
     duplicate_gamepk_disposition_authority: (
         DuplicateGamePkDispositionAuthority | None
     ) = None,
+    recovery_disposition_authorities: Mapping[str, object] = {},
 ) -> tuple[VerifiedQueryRecord, ...]:
     records: list[VerifiedQueryRecord] = []
     for query in sorted(queries, key=logical_query_id):
@@ -1676,7 +1785,16 @@ def _recompute_verified_query_records(
                 ),
             )
         else:
-            record = _read_verified_query_record(store, query)
+            recovery_authority = recovery_disposition_authorities.get(
+                logical_query_id(query)
+            )
+            record = (
+                _read_verified_query_record(
+                    store, query, recovery_disposition_authority=recovery_authority
+                )
+                if recovery_authority is not None
+                else _read_verified_query_record(store, query)
+            )
         records.append(record)
     return tuple(records)
 
@@ -1909,6 +2027,7 @@ def _build_game_normalized_snapshots(
     *,
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
     dispositioned_query_ids: tuple[str, ...] = (),
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Reduce already loader-verified authorities without filesystem access.
 
@@ -1933,7 +2052,7 @@ def _build_game_normalized_snapshots(
         or tuple(dispositioned_query_ids) != expected_disposition_ids
     ):
         raise ValueError("game snapshot disposition capability differs")
-    if run_id == _SOURCE_RUN_ID:
+    if run_id in {_SOURCE_RUN_ID, _RECOVERY_RUN_ID}:
         raw_source_anchors = schedule_inventory.payload.get("anchors")
         if (
             isinstance(raw_source_anchors, (str, bytes))
@@ -1952,12 +2071,19 @@ def _build_game_normalized_snapshots(
         query = record.query
         if record.storage_mode == "DERIVED_DISPOSITION":
             if (
-                run_id != _SOURCE_RUN_ID
-                or duplicate_gamepk_disposition is None
-                or record.query_id != duplicate_gamepk_disposition.query_id
+                run_id == _SOURCE_RUN_ID
+                and (
+                    duplicate_gamepk_disposition is None
+                    or record.query_id != duplicate_gamepk_disposition.query_id
+                )
             ):
                 raise ValueError("game snapshot schedule disposition differs")
-            season = 2019
+            if run_id == _RECOVERY_RUN_ID:
+                if recovery_dispositions is None:
+                    raise ValueError("recovery game snapshot capability is required")
+                season = query.requested_range.get("year")
+            else:
+                season = 2019
             sidecar = {}  # Adapted once the exact season anchors are available.
         else:
             sidecar = _verified_sidecar(record)
@@ -2021,12 +2147,20 @@ def _build_game_normalized_snapshots(
             for anchor in raw_source_anchors
             if anchor.get("season") == season
         ]
-        schedule_sidecar, adapter_sha256 = _verified_schedule_sidecar(
-            schedule_record,
-            run_id,
-            duplicate_gamepk_disposition,
-            source_anchors,
-        )
+        if run_id == _RECOVERY_RUN_ID and schedule_record.storage_mode == "DERIVED_DISPOSITION":
+            schedule_sidecar = _recovery_schedule_adapter(
+                schedule_record.query, source_anchors, season=season
+            )
+            adapter_sha256 = hashlib.sha256(
+                canonical_json_bytes(schedule_sidecar) + b"\n"
+            ).hexdigest()
+        else:
+            schedule_sidecar, adapter_sha256 = _verified_schedule_sidecar(
+                schedule_record,
+                run_id,
+                duplicate_gamepk_disposition,
+                source_anchors,
+            )
         schedule_records[season] = schedule_record
         schedule_sidecars.append(schedule_sidecar)
         boxscores: dict[int, tuple[bytes, str]] = {}
@@ -2046,7 +2180,7 @@ def _build_game_normalized_snapshots(
             )
         season_provenance = (
             build_schedule_anchor_provenance(source_anchors)
-            if run_id == _SOURCE_RUN_ID
+            if run_id in {_SOURCE_RUN_ID, _RECOVERY_RUN_ID}
             else None
         )
         payload = dict(
@@ -2057,11 +2191,20 @@ def _build_game_normalized_snapshots(
             )
         )
         if adapter_sha256 is not None:
-            payload = _replace_source_disposition_lineage(
-                payload,
-                synthetic_sidecar_sha256=adapter_sha256,
-                derived_sidecar_sha256=schedule_record.query_sidecar_sha256,
-            )
+            if run_id == _RECOVERY_RUN_ID:
+                if recovery_dispositions is None:
+                    raise ValueError("recovery game snapshot capability is required")
+                payload = _replace_recovery_disposition_lineage(
+                    payload,
+                    {season: (adapter_sha256, schedule_record.query_sidecar_sha256)},
+                    recovery_dispositions,
+                )
+            else:
+                payload = _replace_source_disposition_lineage(
+                    payload,
+                    synthetic_sidecar_sha256=adapter_sha256,
+                    derived_sidecar_sha256=schedule_record.query_sidecar_sha256,
+                )
         inputs = tuple(record for record, _sidecar in season_records)
         snapshot_inputs[season] = inputs
         payloads.append(payload)
@@ -2108,6 +2251,9 @@ def _build_game_normalized_snapshots(
         != (
             _SOURCE_GAME_INVENTORY_KEYS
             if game_payload.get("run_id") == _SOURCE_RUN_ID
+            else _OLD_GAME_INVENTORY_KEYS
+            | {"dispositioned_query_ids", "schedule_conflict_dispositions"}
+            if game_payload.get("run_id") == _RECOVERY_RUN_ID
             else _OLD_GAME_INVENTORY_KEYS
         )
         or (
@@ -2362,6 +2508,7 @@ def _build_history_normalized_snapshots(
     *,
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
     dispositioned_query_ids: tuple[str, ...] = (),
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Project seven authenticated game snapshots into prior history without I/O."""
     if not isinstance(run_id, str) or not run_id:
@@ -2437,6 +2584,7 @@ def _build_history_normalized_snapshots(
                 if run_id == _SOURCE_RUN_ID and season == 2019
                 else None
             ),
+            recovery_dispositions=recovery_dispositions,
         )
         snapshots.append(_history_normalized_snapshot(run_id, game_snapshot, payload))
     return tuple(snapshots)
@@ -2500,6 +2648,8 @@ def _build_statcast_normalized_snapshots(
     records: Sequence[VerifiedQueryRecord],
     graph: _TerminalQueryGraph,
     game_snapshots: Sequence[NormalizedSnapshot],
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Build the 46 sealed monthly Statcast candidates without I/O."""
     if not isinstance(run_id, str) or not run_id:
@@ -2746,15 +2896,15 @@ def _build_statcast_normalized_snapshots(
             if game["played"] is not True:  # type: ignore[index]
                 continue
             game_pk = game["game_pk"]  # type: ignore[index]
-            official = _canonical_day(
-                game["official_date"],
+            schedule_date = _canonical_day(
+                game.get("played_date", game["official_date"]),
                 "Statcast played game official_date",  # type: ignore[index]
             )
             matches = [
                 root_id
                 for root_id, root in root_by_id.items()
                 if validate_statcast_query(root)[0]
-                <= official
+                <= schedule_date
                 <= validate_statcast_query(root)[1]
             ]
             if (
@@ -2797,6 +2947,15 @@ def _build_statcast_normalized_snapshots(
             [sidecar for _record, sidecar in leaves],
             sorted(played_by_root[root_id]),
         )
+        if recovery_dispositions is not None:
+            for _record, sidecar in leaves:
+                semantics = sidecar.get("semantics")
+                if isinstance(semantics, Mapping) and isinstance(
+                    semantics.get("games"), Sequence
+                ):
+                    validate_recovery_statcast_game_dates(
+                        semantics["games"], recovery_dispositions
+                    )
         snapshots.append(
             _statcast_normalized_snapshot(
                 run_id,
@@ -4090,6 +4249,7 @@ def _read_verified_query_record(
     duplicate_gamepk_disposition_authority: (
         DuplicateGamePkDispositionAuthority | None
     ) = None,
+    recovery_disposition_authority: object | None = None,
 ) -> VerifiedQueryRecord:
     if not isinstance(store, V52EvidenceStore) or not store._read_only:
         raise ValueError("source verification requires a read-only evidence store")
@@ -4130,6 +4290,14 @@ def _read_verified_query_record(
                         query,
                         b"",
                         authority=duplicate_gamepk_disposition_authority,
+                    )
+                )
+            elif recovery_disposition_authority is not None:
+                if query != getattr(recovery_disposition_authority, "query", None):
+                    raise ValueError("recovery disposition authority query differs")
+                semantics = dict(
+                    recompute_query_sidecar(
+                        query, b"", authority=recovery_disposition_authority
                     )
                 )
             else:
@@ -4185,13 +4353,17 @@ def _read_verified_query_record(
             retained_raw_bytes=retained_raw,
         )
 
-    if duplicate_gamepk_disposition_authority is None:
+    if duplicate_gamepk_disposition_authority is None and recovery_disposition_authority is None:
         store.inspect_verified_success(query, recompute_verified_read)
     else:
         store.inspect_verified_success(
             query,
             recompute_verified_read,
-            authority=duplicate_gamepk_disposition_authority,
+            authority=(
+                duplicate_gamepk_disposition_authority
+                if duplicate_gamepk_disposition_authority is not None
+                else recovery_disposition_authority
+            ),
         )
     if result is None:
         raise AssertionError("verified success inspection did not produce a result")

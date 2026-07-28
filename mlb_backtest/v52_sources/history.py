@@ -8,11 +8,13 @@ from datetime import date, datetime, timedelta
 from types import MappingProxyType
 
 from ..v52_source_contracts import canonical_sha256
+from ..v52_schedule_inventory import RecoveryDispositionBindings
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
 EXPECTED_NEUTRALIZATIONS: tuple[tuple[str, str, int, str, int], ...] = (
     (
         "35b92c2f65d844a4e66574c23cf1ba4b8c2c30c8823024cf94378c67fda8c2ab",
@@ -252,12 +254,32 @@ def _day(value: object, label: str) -> date:
     return parsed
 
 
+def _availability_date(
+    row: Mapping[str, object], capability: RecoveryDispositionBindings | None
+) -> date:
+    """Project a row only on its authenticated result-availability boundary."""
+    value = row.get("result_available_on")
+    played_date = row.get("played_date")
+    if value is None:
+        if (
+            played_date is not None
+            or "played_date" in row
+            or "result_available_on" in row
+        ):
+            raise ValueError("unapproved schedule availability boundary")
+        return _day(row.get("official_date"), "official_date")
+    if capability is None:
+        raise ValueError("unapproved schedule availability boundary")
+    return capability.require_boundary(row)
+
+
 def recompute_prior_history_sidecar(
     schedule_sidecar: Mapping[str, object],
     *,
     source_snapshot_sha256: str,
     run_id: str,
     duplicate_gamepk_disposition: Mapping[str, object] | None = None,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> Mapping[str, object]:
     if (
         not isinstance(source_snapshot_sha256, str)
@@ -309,6 +331,7 @@ def recompute_prior_history_sidecar(
         elif has_provenance:
             raise ValueError("unplayed source game has provenance")
         official = _day(raw.get("official_date"), "history official date")
+        _availability_date(raw, recovery_dispositions)
         cutoff = _day(raw.get("feature_history_cutoff"), "history cutoff")
         if cutoff != official - timedelta(days=1):
             raise ValueError("every feature history cutoff must equal D-1")
@@ -331,6 +354,12 @@ def recompute_prior_history_sidecar(
             "terminal_status": raw.get("terminal_status"),
             "venue_id": _positive(raw.get("venue_id"), "venue id"),
         }
+        if raw.get("played_date") is not None or raw.get("result_available_on") is not None:
+            projection["schedule_query_sidecar_sha256"] = raw.get(
+                "schedule_query_sidecar_sha256"
+            )
+            projection["played_date"] = raw.get("played_date")
+            projection["result_available_on"] = raw.get("result_available_on")
         for field in ("completed_innings", "scheduled_innings"):
             value = projection[field]
             if value is not None and (
@@ -355,10 +384,16 @@ def recompute_prior_history_sidecar(
         source_hashes.append(source_hash)
     if len(source_hashes) != len(set(source_hashes)):
         raise ValueError("prior history contains duplicate source game hashes")
-    games.sort(key=lambda row: (row["official_date"], row["game_pk"]))
+    games.sort(
+        key=lambda row: (
+            _availability_date(row, recovery_dispositions), row["game_pk"]
+        )
+    )
     if run_id != SOURCE_RUN_ID:
         if duplicate_gamepk_disposition is not None:
             raise ValueError("non-source history rejects duplicate disposition")
+        if run_id != RECOVERY_RUN_ID and recovery_dispositions is not None:
+            raise ValueError("non-recovery history rejects availability capability")
         return {
             "games": games,
             "grain": "verified_game_projection",
@@ -446,6 +481,7 @@ __all__ = [
     "TASK10_DISPOSITION_SIDECAR_PATH",
     "TASK10_DISPOSITION_SIDECAR_SHA256",
     "TASK10_DISPOSITION_SUCCESS_PATH",
+    "_availability_date",
     "recompute_prior_history_sidecar",
     "validate_task10_disposition_binding",
     "validate_schedule_neutralizations",
