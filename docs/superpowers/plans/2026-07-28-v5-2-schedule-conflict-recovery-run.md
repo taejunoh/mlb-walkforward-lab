@@ -99,34 +99,45 @@ git add mlb_backtest/v52_recovery_parent_evidence.py tests/v52_recovery_schedule
 git commit -m "test: characterize recovery parent evidence"
 ```
 
-### Task 2: Add the third authority and all closed schema families
+> **Schema-ownership amendment:** A recovery payload schema is added only by the
+> task that creates and reauthenticates that payload's model. Task 2 closes the
+> authority base, not future sidecar, checkpoint, inventory, replay, review, or
+> finalization payloads. This prevents an unverified placeholder shape from
+> becoming authority.
+
+### Task 2: Add the third authority base and its closed base schemas
 
 **Files:**
 - Declare paths only; create in Task 11 closure sequence: `protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json`, `protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json`
 - Modify: `mlb_backtest/protocols.py:635,1007,1035,6065,6573,6624`
 - Modify: `mlb_backtest/v52_query_plan.py:163,1121`
-- Modify: `schemas/v5_2_run_spec.schema.json`, `schemas/v5_2_acquisition_contract.schema.json`, `schemas/v5_2_derived_disposition_sidecar.schema.json`, `schemas/v5_2_query_sidecar.schema.json`, `schemas/v5_2_acquisition_checkpoint.schema.json`, `schemas/v5_2_schedule_anchor_inventory.schema.json`, `schemas/v5_2_game_evidence_inventory.schema.json`, `schemas/v5_2_normalized_snapshot.schema.json`, `schemas/v5_2_source_inventory.schema.json`, `schemas/v5_2_source_review_receipt.schema.json`, `schemas/v5_2_clean_source_replay_receipt.schema.json`, `schemas/v5_2_source_receipt_commit.schema.json`, `schemas/v5_2_execution_receipt.schema.json`, `schemas/v5_2_timezone_candidate.schema.json`, `schemas/v5_2_timezone_review_receipt.schema.json`, `schemas/v5_2_timezone_seal_receipt.schema.json`, `schemas/v5_2_venue_timezones.schema.json`
+- Modify: `schemas/v5_2_run_spec.schema.json`, `schemas/v5_2_acquisition_contract.schema.json`
 - Modify: `tests/test_protocols.py`, `tests/test_v52_acquisition_contract.py`, `tests/test_v52_query_plan.py`
+
+`schemas/v5_2_query_sidecar.schema.json` remains unchanged: recovery HTTP
+queries use the existing raw-response envelope, while raw-less dispositions use
+the separate derived-disposition schema introduced by Task 3.
 
 - [ ] **Step 1: Add a TestCase RED test**
 
 ```python
 class RecoveryAuthorityTests(unittest.TestCase):
-    def test_contract_requires_three_named_parent_objects(self) -> None:
-        contract = recovery_contract()
+    def test_recovery_base_contract_requires_three_named_parent_objects(self) -> None:
+        root, run_spec, contract = committed_recovery_base_fixture()
         self.assertEqual(tuple(contract["recovery_provenance"]), (
             "original_2019_565534", "superseding_2020_630882", "superseding_2021_633224"))
-        broken = RECOVERY_CONTRACT_FIXTURE.with_name("broken-contract.json")
+        broken = root / "broken-contract.json"
         broken.write_bytes(canonical_json_bytes({**contract, "recovery_provenance": {}}) + b"\n")
         with self.assertRaisesRegex(ValueError, "recovery provenance differs"):
-            _load_static_contracts(RECOVERY_RUN_SPEC, broken)
+            _load_static_contracts(run_spec, broken)
 ```
 
 - [ ] **Step 2: Run RED**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols tests.test_v52_acquisition_contract tests.test_v52_query_plan -v`
 
-Expected: FAIL because schemas contain only the historical and superseding branches.
+Expected: FAIL because the third authority base and its two closed base schema
+branches are absent.
 
 - [ ] **Step 3: Add exact branch constants and schema branches**
 
@@ -137,7 +148,19 @@ _RECOVERY_DESIGN_RELATIVE = Path("docs/superpowers/specs/2026-07-28-v5-2-schedul
 _RECOVERY_PLAN_RELATIVE = Path("docs/superpowers/plans/2026-07-28-v5-2-schedule-conflict-recovery-run.md")
 ```
 
-Append one `_AuthorityBranch`. Add closed recovery `oneOf` branches: RunSpec 2 to 3, acquisition contract 2 to 3, derived sidecar 2 to 5, checkpoint 2 to 3, anchor 2 to 3, game evidence 2 to 3, source inventory 2 to 3, review 2 to 3, replay 2 to 3, receipt commit 2 to 3, and execution receipt recovery branch. Add recovery family branches to normalized snapshot. Keep every old branch byte-identical.
+Append one `_AuthorityBranch` and the exact recovery `SourceRunSpec` literal.
+Add only the RunSpec 2-to-3 and acquisition-contract 2-to-3 closed base
+branches. The acquisition-contract branch fixes every design/Task-1-derived
+field (including roots, source table, and the three named parent objects).
+Its design/plan/RunSpec SHA-256 and Git-blob fields remain typed cryptographic
+bindings and are immediately re-read and rebound; they are never `{}`
+placeholders or an open common-property subset. Keep every old branch
+byte-identical.
+
+Do not add payload branches here. Task 3 owns derived-disposition sidecars;
+Task 6 checkpoints; Task 7 schedule/game inventories; Task 8 their availability
+subbranches and normalized snapshots; Task 9 source inventory and clean replay;
+and Task 10 review, commit, execution, and timezone payloads.
 
 Task 2 deliberately does not write or commit either recovery protocol artifact:
 their canonical bytes depend on the committed design/plan/RunSpec blob sequence
@@ -148,12 +171,14 @@ payloads named in the file map, never an uncommitted production contract.
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_protocols tests.test_v52_acquisition_contract tests.test_v52_query_plan -v`
 
-Expected: PASS; mismatched paths, prefixes, absent parent attempt, and unknown properties fail.
+Expected: PASS; old branches are unchanged, and mismatched path pairs, prefixes,
+unknown properties, altered fixed roots/sources, an absent 2020/2021 parent
+attempt, or a mismatched dynamic binding fail.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mlb_backtest/protocols.py mlb_backtest/v52_query_plan.py schemas tests/test_protocols.py tests/test_v52_acquisition_contract.py tests/test_v52_query_plan.py
+git add mlb_backtest/protocols.py mlb_backtest/v52_query_plan.py schemas/v5_2_run_spec.schema.json schemas/v5_2_acquisition_contract.schema.json tests/test_protocols.py tests/test_v52_acquisition_contract.py tests/test_v52_query_plan.py
 git commit -m "feat: add recovery source authority branch"
 ```
 
@@ -161,6 +186,7 @@ git commit -m "feat: add recovery source authority branch"
 
 **Files:**
 - Create: `mlb_backtest/v52_schedule_conflict_recovery_disposition.py`
+- Modify: `schemas/v5_2_derived_disposition_sidecar.schema.json`
 - Modify: `tests/test_v52_source_schedule.py`
 
 - [ ] **Step 1: Add TestCase RED tests**
@@ -245,7 +271,9 @@ both fields.
 catalog before returning it. Thus `retained_scheduled_start_utc`,
 `raw_object_sha256s`, `selected_raw_game_object_sha256s_sha256`,
 `normalized_games_sha256`, and `sidecar_semantics_sha256` are never caller
-inputs.
+inputs. This task also adds the three closed derived-disposition sidecar schema
+branches from these exact catalog semantics; it does not modify the ordinary
+query-sidecar schema.
 
 - [ ] **Step 4: Run PASS**
 
@@ -256,7 +284,7 @@ Expected: PASS; changed index, digest, status, linkage, or boundary fails.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mlb_backtest/v52_schedule_conflict_recovery_disposition.py tests/test_v52_source_schedule.py
+git add mlb_backtest/v52_schedule_conflict_recovery_disposition.py schemas/v5_2_derived_disposition_sidecar.schema.json tests/test_v52_source_schedule.py
 git commit -m "feat: add recovery disposition catalog"
 ```
 
@@ -267,6 +295,10 @@ git commit -m "feat: add recovery disposition catalog"
 - Modify: `mlb_backtest/v52_source_contracts.py:67,90`
 - Modify: `mlb_backtest/v52_acquire.py:1525,2092,3014,3552`
 - Modify: `tests/test_v52_evidence.py`, `tests/test_v52_acquire.py`
+
+The query-sidecar schema remains unchanged in this task. Task 4 validates the
+Task 3 derived-sidecar branches through the evidence-store lease API; it does
+not invent a recovery-specific raw-query payload shape.
 
 - [ ] **Step 1: Add TestCase RED test using the store API**
 
@@ -427,7 +459,8 @@ and requires all three IDs. Extend `_validate_checkpoint_payload`,
 the checkpoint writer at `execution_registry.py:5010` to carry the three exact
 binding objects: parent raw/object digest, selected-object digest, sidecar
 semantics digest, sidecar path/SHA-256, and success path/SHA-256. Terminal static
-stage has seven completed and no pending, quarantine, or split IDs.
+stage has seven completed and no pending, quarantine, or split IDs. This task
+owns the resulting closed acquisition-checkpoint schema branch.
 
 - [ ] **Step 4: Run PASS**
 
@@ -519,7 +552,9 @@ and its matching loader. Require seven season sources, retained anchors for
 `from_mapping()` rejects an omitted/extra key, noncanonical key order, a
 reordered entry, or any field that differs from `catalog.bindings()`; it returns
 only the freshly reauthenticated projection. Reference-batch construction reads
-the binding catalog only after authenticated inventory loading.
+the binding catalog only after authenticated inventory loading. This task owns
+the closed schedule-anchor and game-evidence inventory schema branches; Task 8
+adds their boundary-bearing subbranches once the availability model exists.
 
 - [ ] **Step 4: Run PASS**
 
@@ -604,7 +639,10 @@ only on the recovery-gated `prepare.py` and `feature_engine.py` path; their
 ordinary public inputs reject availability fields. Index `ScheduleHistory`,
 `last_before`, D-1 rest, travel, home-city, innings, and latest-game calculations
 by `_availability_date(row, capability)`. Preserve all three existing 2019
-neutralization records unchanged.
+neutralization records unchanged. This task owns the `played_date` and
+`result_available_on` inventory subbranches and the closed normalized-snapshot
+recovery branches, because it is the first task with an authenticated boundary
+projection.
 
 - [ ] **Step 4: Run PASS**
 
@@ -624,7 +662,7 @@ git commit -m "feat: enforce resumed result availability"
 **Files:**
 - Modify: `mlb_backtest/v52_verify_sources.py:248,344,384`
 - Modify: `mlb_backtest/v52_snapshot_store.py:44,101,248,317,450,620,651,817,1247`
-- Modify: `schemas/v5_2_normalized_snapshot.schema.json`, `schemas/v5_2_source_inventory.schema.json`, `schemas/v5_2_clean_source_replay_receipt.schema.json`
+- Modify: `schemas/v5_2_source_inventory.schema.json`, `schemas/v5_2_clean_source_replay_receipt.schema.json`
 - Modify: `tests/test_v52_verify_sources.py`, `tests/test_v52_snapshot_store.py`
 
 - [ ] **Step 1: Add TestCase RED cardinality test**
@@ -657,9 +695,12 @@ def _validate_recovery_snapshot_bindings(bindings: AuthorityBindings) -> None:
 
 Add `schedule_conflict_dispositions: RecoveryDispositionBindings | None` to
 `AuthorityBindings`; carry it into `SnapshotStoreInputs`, `SourceInventory`, and
-`NormalizedSnapshot`. Require `snapshot_count == 81`, `source_season_count == 42`,
+the already boundary-shaped `NormalizedSnapshot`. Require `snapshot_count == 81`,
+`source_season_count == 42`,
 `source_count == 6`, seven `mlb_schedule_game_feed` season partitions, and three
 catalog sidecar/success bindings on every recovery inventory/replay envelope.
+This task owns the closed source-inventory and clean-source-replay-receipt
+schema branches.
 
 - [ ] **Step 4: Run PASS**
 
@@ -670,7 +711,7 @@ Expected: PASS; one, two, four, stale, or reordered binding fails.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mlb_backtest/v52_verify_sources.py mlb_backtest/v52_snapshot_store.py schemas/v5_2_normalized_snapshot.schema.json schemas/v5_2_source_inventory.schema.json schemas/v5_2_clean_source_replay_receipt.schema.json tests/test_v52_verify_sources.py tests/test_v52_snapshot_store.py
+git add mlb_backtest/v52_verify_sources.py mlb_backtest/v52_snapshot_store.py schemas/v5_2_source_inventory.schema.json schemas/v5_2_clean_source_replay_receipt.schema.json tests/test_v52_verify_sources.py tests/test_v52_snapshot_store.py
 git commit -m "feat: seal recovery source inventory"
 ```
 
@@ -680,7 +721,7 @@ git commit -m "feat: seal recovery source inventory"
 - Modify: `mlb_backtest/v52_source_finalize.py:86,196,289`
 - Modify: `mlb_backtest/v52_source_orchestration.py:76,91,700,835,961,1238,1525`
 - Modify: `mlb_backtest/v52_timezone_review.py:44,90,118,1197,1289,1961,2288`
-- Modify: `schemas/v5_2_source_review_receipt.schema.json`, `schemas/v5_2_clean_source_replay_receipt.schema.json`, `schemas/v5_2_source_receipt_commit.schema.json`, `schemas/v5_2_execution_receipt.schema.json`, `schemas/v5_2_timezone_candidate.schema.json`, `schemas/v5_2_timezone_review_receipt.schema.json`, `schemas/v5_2_timezone_seal_receipt.schema.json`, `schemas/v5_2_venue_timezones.schema.json`
+- Modify: `schemas/v5_2_source_review_receipt.schema.json`, `schemas/v5_2_source_receipt_commit.schema.json`, `schemas/v5_2_execution_receipt.schema.json`, `schemas/v5_2_timezone_candidate.schema.json`, `schemas/v5_2_timezone_review_receipt.schema.json`, `schemas/v5_2_timezone_seal_receipt.schema.json`, `schemas/v5_2_venue_timezones.schema.json`
 - Modify: `tests/test_v52_source_finalize.py`, `tests/test_execution_registry.py`, `tests/test_v52_timezone_review.py`
 
 - [ ] **Step 1: Add TestCase RED finalization test**
@@ -723,7 +764,9 @@ review, replay, and advance payload creation. The review command records reviewe
 identity `independent-source-auditor` and role `independent-source-auditor`.
 Advance accepts one or more review receipts and exactly two replay receipts with
 distinct canonical UUIDv4 execution IDs, then rebinds checkpoint, inventory,
-catalog, and Git head.
+catalog, and Git head. This task owns closed review, receipt-commit, execution,
+and timezone payload branches; it consumes the Task 9 clean-replay branch rather
+than redefining it.
 
 `_exact_authority_branch()` selects only the exact RunSpec/contract path pair;
 it must dispatch historical and superseding paths before reading recovery-only
@@ -760,7 +803,7 @@ Expected: PASS; finalization rejects invalid reviewer role, replay UUID, stale c
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mlb_backtest/v52_source_finalize.py mlb_backtest/v52_source_orchestration.py mlb_backtest/v52_timezone_review.py schemas/v5_2_source_review_receipt.schema.json schemas/v5_2_clean_source_replay_receipt.schema.json schemas/v5_2_source_receipt_commit.schema.json schemas/v5_2_execution_receipt.schema.json schemas/v5_2_timezone_candidate.schema.json schemas/v5_2_timezone_review_receipt.schema.json schemas/v5_2_timezone_seal_receipt.schema.json schemas/v5_2_venue_timezones.schema.json tests/test_v52_source_finalize.py tests/test_execution_registry.py tests/test_v52_timezone_review.py
+git add mlb_backtest/v52_source_finalize.py mlb_backtest/v52_source_orchestration.py mlb_backtest/v52_timezone_review.py schemas/v5_2_source_review_receipt.schema.json schemas/v5_2_source_receipt_commit.schema.json schemas/v5_2_execution_receipt.schema.json schemas/v5_2_timezone_candidate.schema.json schemas/v5_2_timezone_review_receipt.schema.json schemas/v5_2_timezone_seal_receipt.schema.json schemas/v5_2_venue_timezones.schema.json tests/test_v52_source_finalize.py tests/test_execution_registry.py tests/test_v52_timezone_review.py
 git commit -m "feat: finalize recovery sources safely"
 ```
 
@@ -792,8 +835,8 @@ Add the recovery catalog module and schema consumers to `_BOUND_EXECUTION_CODE`.
 Bind `mlb_backtest/v52_recovery_parent_evidence.py` and every changed recovery
 schema explicitly, including `schemas/v5_2_run_spec.schema.json`,
 `schemas/v5_2_acquisition_contract.schema.json`,
-`schemas/v5_2_derived_disposition_sidecar.schema.json`,
-`schemas/v5_2_query_sidecar.schema.json`,
+`schemas/v5_2_derived_disposition_sidecar.schema.json`; retain the unchanged
+existing `schemas/v5_2_query_sidecar.schema.json` binding; and bind
 `schemas/v5_2_acquisition_checkpoint.schema.json`,
 `schemas/v5_2_schedule_anchor_inventory.schema.json`,
 `schemas/v5_2_game_evidence_inventory.schema.json`,
