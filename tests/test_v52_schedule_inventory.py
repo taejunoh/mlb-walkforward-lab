@@ -1562,7 +1562,7 @@ class RecoveryDispositionBindingsTests(unittest.TestCase):
             patch.object(inventory, "_deep_freeze", return_value=payload),
             patch.object(
                 inventory.RecoveryDispositionBindings,
-                "from_mapping",
+                "from_catalog_mapping",
                 return_value=object(),
             ),
         ):
@@ -1626,7 +1626,7 @@ class RecoveryDispositionBindingsTests(unittest.TestCase):
                     store=object(),
                 )
 
-    def test_mapping_requires_exact_three_canonically_ordered_bindings(self) -> None:
+    def test_only_catalog_factory_can_authenticate_recovery_bindings(self) -> None:
         from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
             RecoveryDispositionBinding,
         )
@@ -1653,39 +1653,46 @@ class RecoveryDispositionBindingsTests(unittest.TestCase):
             binding(630882, "a" * 64),
             binding(633224, "c" * 64),
         )
-        expected = RecoveryDispositionBindings(entries)
-        mapping = expected.as_mapping()
+        direct = RecoveryDispositionBindings(entries)
+        mapping = direct.as_mapping()
         self.assertEqual(mapping["query_ids"], ["a" * 64, "b" * 64, "c" * 64])
-        self.assertEqual(
-            RecoveryDispositionBindings.from_mapping(mapping, entries), expected
-        )
+        with self.assertRaisesRegex(ValueError, "authority differs"):
+            direct.reauthenticate()
+        with self.assertRaisesRegex(ValueError, "authority differs"):
+            RecoveryDispositionBindings.from_mapping(mapping, entries)
+        with self.assertRaises((TypeError, ValueError)):
+            RecoveryDispositionBindings(
+                entries,
+                _authenticated=True,
+                _reauthenticate=lambda: entries,
+            )
         reordered = copy.deepcopy(mapping)
         reordered["entries"].reverse()
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(reordered, entries)
         missing = copy.deepcopy(mapping)
         del missing["entries"]
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(missing, entries)
         extra = copy.deepcopy(mapping)
         extra["extra"] = True
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(extra, entries)
         copied = copy.deepcopy(mapping)
         copied["entries"][1]["success_receipt"] = copied["entries"][0][
             "success_receipt"
         ]
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(copied, entries)
         cross_run = copy.deepcopy(mapping)
         cross_run["entries"][0]["query_sidecar"]["path"] = (
             "other-run/sidecar.json"
         )
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(cross_run, entries)
         stale = copy.deepcopy(mapping)
         stale["entries"][2]["sidecar_semantics_sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "bindings differ"):
+        with self.assertRaisesRegex(ValueError, "authority differs"):
             RecoveryDispositionBindings.from_mapping(stale, entries)
 
 

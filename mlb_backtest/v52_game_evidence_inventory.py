@@ -778,6 +778,8 @@ def _replace_recovery_disposition_lineage(
     recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> dict[str, object]:
     """Replace private adapters with the three authenticated Task 4 sidecars."""
+    if recovery_dispositions is not None:
+        recovery_dispositions = recovery_dispositions.reauthenticate()
     result = json.loads(_canonical_file_bytes(snapshot))
     if not isinstance(result, dict) or not isinstance(result.get("games"), list):
         raise ValueError("recovery game evidence projection differs")
@@ -841,7 +843,12 @@ def _batch_binding(
     }
 
 
-def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) -> None:
+def _validate_game_projection(
+    snapshot: Mapping[str, object],
+    *,
+    run_id: str,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
+) -> None:
     if set(snapshot) != {
         "games",
         "grain",
@@ -906,8 +913,13 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
             raise ValueError("game participant site flags differ")
         official = _canonical_date(row.get("official_date"), "official date")
         if recovery_boundary:
-            if row.get("played_date") != row.get("result_available_on"):
-                raise ValueError("recovery game availability boundary differs")
+            if recovery_dispositions is None:
+                raise ValueError("recovery game availability capability is required")
+            # This validates the exact gamePk, official date, retained UTC start,
+            # derived-sidecar hash, and both resume-date fields after a fresh
+            # catalog reauthentication.  It is the sole admission path for the
+            # deliberately non-local UTC start of a resumed game.
+            recovery_dispositions.require_boundary(row)
         season_start = _canonical_date(
             row.get("season_start_date"), "season start date"
         )
@@ -930,11 +942,12 @@ def _validate_game_projection(snapshot: Mapping[str, object], *, run_id: str) ->
             )
         except ValueError as exc:
             raise ValueError("scheduled start date-time is invalid") from exc
-        if parsed_start.date() not in {
+        ordinary_start_date = parsed_start.date() in {
             official - timedelta(days=1),
             official,
             official + timedelta(days=1),
-        }:
+        }
+        if not ordinary_start_date and not recovery_boundary:
             raise ValueError("scheduled start date differs from official date")
         for field in (
             "away_score",
@@ -1053,12 +1066,17 @@ def validate_source_normalized_anchor_provenance(game: Mapping[str, object]) -> 
 
 
 def validate_game_evidence_snapshot(
-    snapshot: Mapping[str, object], *, run_id: str
+    snapshot: Mapping[str, object],
+    *,
+    run_id: str,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> None:
     """Validate a normalized game snapshot with the inventory authority rules."""
     if not isinstance(snapshot, Mapping):
         raise TypeError("game evidence snapshot must be a mapping")
-    _validate_game_projection(snapshot, run_id=run_id)
+    _validate_game_projection(
+        snapshot, run_id=run_id, recovery_dispositions=recovery_dispositions
+    )
 
 
 def _build_current_authority(
@@ -1128,15 +1146,13 @@ def _build_current_authority(
     if context.run_id == _RECOVERY_RUN_ID:
         from .v52_schedule_conflict_recovery_disposition import (
             build_recovery_schedule_conflict_catalog,
-            load_recovery_disposition_bindings,
         )
 
         catalog = build_recovery_schedule_conflict_catalog(
             root, context.authority_path, context.acquisition_contract_path
         )
-        recovery_dispositions = RecoveryDispositionBindings.from_mapping(
-            verified_schedule.payload.get("schedule_conflict_dispositions"),
-            load_recovery_disposition_bindings(catalog),
+        recovery_dispositions = RecoveryDispositionBindings.from_catalog_mapping(
+            verified_schedule.payload.get("schedule_conflict_dispositions"), catalog
         )
         recovery_authorities = {
             logical_query_id(authority.query): authority for authority in catalog.entries
@@ -1406,18 +1422,21 @@ def _build_current_authority(
         )
         from .v52_schedule_conflict_recovery_disposition import (
             build_recovery_schedule_conflict_catalog,
-            load_recovery_disposition_bindings,
         )
 
         rebound_catalog = build_recovery_schedule_conflict_catalog(
             root, context.authority_path, context.acquisition_contract_path
         )
-        rebound = RecoveryDispositionBindings(
-            tuple(load_recovery_disposition_bindings(rebound_catalog))
+        rebound = RecoveryDispositionBindings.from_catalog_mapping(
+            recovery_dispositions.as_mapping(), rebound_catalog
         )
         if rebound.as_mapping() != recovery_dispositions.as_mapping():
             raise ValueError("game evidence recovery disposition bindings changed")
-    _validate_game_projection(game_snapshot, run_id=context.run_id)
+    _validate_game_projection(
+        game_snapshot,
+        run_id=context.run_id,
+        recovery_dispositions=recovery_dispositions,
+    )
     games = game_snapshot["games"]
     if not isinstance(games, list):
         raise AssertionError("validated game evidence games must be a list")

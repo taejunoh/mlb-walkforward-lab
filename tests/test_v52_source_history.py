@@ -110,62 +110,104 @@ def _task10_disposition() -> dict[str, object]:
 
 
 class V52HistorySourceTest(unittest.TestCase):
-    def test_recovery_availability_requires_exact_authenticated_boundary(self) -> None:
-        """Changing a resumed-result boundary must keep it out of prior history."""
-        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
-            RecoveryDispositionBinding,
+    def test_statcast_exception_uses_authenticated_local_played_dates_only(self) -> None:
+        from types import SimpleNamespace
+
+        from mlb_backtest.v52_sources.statcast import (
+            validate_recovery_statcast_game_dates,
         )
-        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+
+        class Capability:
+            entries = (
+                SimpleNamespace(game_pk=565534, played_date=None),
+                SimpleNamespace(game_pk=630882, played_date="2020-08-14"),
+                SimpleNamespace(game_pk=633224, played_date="2021-09-24"),
+            )
+
+            def reauthenticate(self):
+                return Capability()
+
+        capability = Capability()
+        validate_recovery_statcast_game_dates(
+            [
+                {"game_pk": 630882, "game_date": "2020-08-14"},
+                {"game_pk": 633224, "game_date": "2021-09-24"},
+                {"game_pk": 9001, "game_date": "2021-07-21"},
+            ],
+            capability,
+        )
+        for game_pk, wrong_date in (
+            (630882, "2020-08-09"),
+            (633224, "2021-09-25"),
+        ):
+            with self.subTest(game_pk=game_pk), self.assertRaisesRegex(
+                ValueError, "played_date"
+            ):
+                validate_recovery_statcast_game_dates(
+                    [{"game_pk": game_pk, "game_date": wrong_date}], capability
+                )
+
+    def test_public_history_rejects_unbound_availability_fields(self) -> None:
         from mlb_backtest.v52_sources.history import _availability_date
 
-        def binding(game_pk: int, official: str, played: str | None):
-            return RecoveryDispositionBinding(
-                game_pk=game_pk,
-                query_id=f"{game_pk:064x}",
-                query_sidecar={"path": f"queries/{game_pk}.json", "sha256": "a" * 64},
-                success_receipt={"path": f"queries/{game_pk}/success.json", "sha256": "b" * 64},
-                retained_scheduled_start_utc=f"{official}T20:00:00Z",
-                played_date=played,
-                result_available_on=played,
-                raw_object_sha256s=("c" * 64,),
-                selected_raw_game_object_sha256s_sha256="d" * 64,
-                normalized_games_sha256="e" * 64,
-                sidecar_semantics_sha256="f" * 64,
-                expected_derived_sidecar_sha256="0" * 64,
-            )
-
-        capability = RecoveryDispositionBindings(
-            (
-                binding(565534, "2019-05-20", None),
-                binding(630882, "2020-08-09", "2020-08-14"),
-                binding(633224, "2021-07-21", "2021-09-24"),
-            )
-        )
-        row = {
-            "game_pk": 630882,
-            "official_date": "2020-08-09",
-            "scheduled_start_utc": "2020-08-09T20:00:00Z",
-            "schedule_query_sidecar_sha256": "a" * 64,
-            "played_date": "2020-08-14",
-            "result_available_on": "2020-08-14",
-        }
-        self.assertEqual(_availability_date(row, capability), date(2020, 8, 14))
-        self.assertEqual(
+        with self.assertRaisesRegex(ValueError, "unapproved schedule availability"):
             _availability_date(
                 {
-                    **row,
-                    "game_pk": 633224,
+                    "game_pk": 9001,
                     "official_date": "2021-07-21",
-                    "scheduled_start_utc": "2021-07-21T20:00:00Z",
-                    "played_date": "2021-09-24",
-                    "result_available_on": "2021-09-24",
+                    "played_date": "2021-07-21",
+                    "result_available_on": "2021-07-21",
                 },
-                capability,
-            ),
-            date(2021, 9, 24),
+                None,
+            )
+
+    def test_recovery_availability_requires_exact_authenticated_boundary(self) -> None:
+        """Changing a resumed-result boundary must keep it out of prior history."""
+        from mlb_backtest.v52_sources.history import _availability_date
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            published_recovery_capability,
         )
-        with self.assertRaisesRegex(ValueError, "availability boundary"):
-            _availability_date({**row, "played_date": "2020-08-13"}, capability)
+
+        with published_recovery_capability() as capability:
+            by_game = {entry.game_pk: entry for entry in capability.entries}
+            entry = by_game[630882]
+            row = {
+                "game_pk": 630882, "official_date": "2020-08-09",
+                "scheduled_start_utc": entry.retained_scheduled_start_utc,
+                "schedule_query_sidecar_sha256": entry.query_sidecar["sha256"],
+                "played_date": entry.played_date,
+                "result_available_on": entry.result_available_on,
+            }
+            self.assertEqual(_availability_date(row, capability), date(2020, 8, 14))
+            other = by_game[633224]
+            self.assertEqual(_availability_date({
+                "game_pk": 633224, "official_date": "2021-07-21",
+                "scheduled_start_utc": other.retained_scheduled_start_utc,
+                "schedule_query_sidecar_sha256": other.query_sidecar["sha256"],
+                "played_date": other.played_date,
+                "result_available_on": other.result_available_on,
+            }, capability), date(2021, 9, 24))
+            with self.assertRaisesRegex(ValueError, "availability boundary"):
+                _availability_date({**row, "played_date": "2020-08-13"}, capability)
+            with self.assertRaisesRegex(ValueError, "availability boundary"):
+                _availability_date({**row, "schedule_query_sidecar_sha256": other.query_sidecar["sha256"]}, capability)
+
+    def test_recovery_statcast_dates_require_authenticated_played_dates(self) -> None:
+        from mlb_backtest.v52_sources.statcast import (
+            validate_recovery_statcast_game_dates,
+        )
+        from tests.v52_recovery_schedule_conflict_fixture import published_recovery_capability
+
+        with published_recovery_capability() as capability:
+            by_game = {entry.game_pk: entry for entry in capability.entries}
+            validate_recovery_statcast_game_dates(
+                [{"game_pk": 630882, "game_date": by_game[630882].played_date},
+                 {"game_pk": 633224, "game_date": by_game[633224].played_date},
+                 {"game_pk": 9001, "game_date": "2021-07-21"}], capability)
+            for game_pk, game_date in ((630882, "2020-08-09"), (633224, "2021-09-25")):
+                with self.subTest(game_pk=game_pk), self.assertRaisesRegex(ValueError, "played_date"):
+                    validate_recovery_statcast_game_dates(
+                        [{"game_pk": game_pk, "game_date": game_date}], capability)
 
     def test_three_exact_duplicate_dependency_neutralizations_and_no_others(
         self,

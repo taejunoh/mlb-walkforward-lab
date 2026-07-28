@@ -938,6 +938,176 @@ def _authenticated_source_game_authority() -> SimpleNamespace:
     )
 
 
+class RecoveryReplayCapabilityTests(unittest.TestCase):
+    def test_normalized_runtime_rejects_catalog_mapping_attacks(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        snapshot = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )[0].as_mapping()
+        mapping = {
+            "entries": [
+                {"game_pk": 565534, "query_sidecar": {"sha256": "a" * 64}},
+                {"game_pk": 630882, "query_sidecar": {"sha256": "b" * 64}},
+                {"game_pk": 633224, "query_sidecar": {"sha256": "c" * 64}},
+            ],
+            "query_ids": ["a" * 64, "b" * 64, "c" * 64],
+        }
+
+        class Capability:
+            def as_mapping(self):
+                return mapping
+
+            def reauthenticate(self):
+                return Capability()
+
+        snapshot["run_id"] = "historical_walkforward_500_recovery_schedule_conflicts"
+        snapshot["schedule_conflict_dispositions"] = mapping
+        self.assertEqual(
+            verifier._validate_normalized_snapshot_mapping(
+                snapshot, recovery_dispositions=Capability()
+            ),
+            snapshot,
+        )
+        attacks = []
+        for mutate in (
+            lambda value: value.pop("entries"),
+            lambda value: value["entries"].append({"game_pk": 999999}),
+            lambda value: value["entries"].reverse(),
+            lambda value: value["entries"].__setitem__(
+                1, value["entries"][2]
+            ),
+        ):
+            attack = json.loads(canonical_json_bytes(snapshot))
+            mutate(attack["schedule_conflict_dispositions"])
+            attacks.append(attack)
+        for attack in attacks:
+            with self.subTest(attack=attack), self.assertRaisesRegex(
+                ValueError, "recovery disposition binding differs"
+            ):
+                verifier._validate_normalized_snapshot_mapping(
+                    attack, recovery_dispositions=Capability()
+                )
+
+    def test_replay_rejects_missing_tampered_reordered_and_cross_bound_catalogs(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        mapping = {
+            "entries": [
+                {"game_pk": 565534, "query_sidecar": {"sha256": "a" * 64}},
+                {"game_pk": 630882, "query_sidecar": {"sha256": "b" * 64}},
+                {"game_pk": 633224, "query_sidecar": {"sha256": "c" * 64}},
+            ],
+            "query_ids": ["a" * 64, "b" * 64, "c" * 64],
+        }
+
+        class Capability:
+            def as_mapping(self):
+                return mapping
+
+            def reauthenticate(self):
+                return Capability()
+
+        attacks = []
+        missing = json.loads(canonical_json_bytes(mapping))
+        del missing["entries"]
+        attacks.append(missing)
+        extra = json.loads(canonical_json_bytes(mapping))
+        extra["entries"].append({"game_pk": 999999})
+        attacks.append(extra)
+        reordered = json.loads(canonical_json_bytes(mapping))
+        reordered["entries"].reverse()
+        attacks.append(reordered)
+        cross_bound = json.loads(canonical_json_bytes(mapping))
+        cross_bound["entries"][1]["query_sidecar"] = cross_bound["entries"][2]["query_sidecar"]
+        attacks.append(cross_bound)
+
+        for attack in attacks:
+            with self.subTest(attack=attack), self.assertRaisesRegex(
+                ValueError, "disposition capability differs"
+            ):
+                verifier.replay_verified_snapshots(
+                    verifier.SnapshotReplayInputs(
+                        "historical_walkforward_500_recovery_schedule_conflicts",
+                        SimpleNamespace(), (), (),
+                        SimpleNamespace(payload={"schedule_conflict_dispositions": attack}),
+                        SimpleNamespace(),
+                        SimpleNamespace(payload={"schedule_conflict_dispositions": mapping}),
+                        recovery_dispositions=Capability(),
+                    )
+                )
+
+    def test_replay_passes_distinct_fresh_capabilities_to_derived_adapters(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        mapping = {"entries": [], "query_ids": []}
+        reauthenticated: list[object] = []
+
+        class Capability:
+            def as_mapping(self):
+                return mapping
+
+            def reauthenticate(self):
+                fresh = Capability()
+                reauthenticated.append(fresh)
+                return fresh
+
+        snapshots = tuple(
+            SimpleNamespace(
+                sha256=f"{index:064x}",
+                season=index % 7 + 2018,
+                source=f"source-{index % 6}",
+                grain="fixture",
+                payload={},
+            )
+            for index in range(81)
+        )
+        inputs = verifier.SnapshotReplayInputs(
+            "historical_walkforward_500_recovery_schedule_conflicts",
+            SimpleNamespace(), (), snapshots,
+            SimpleNamespace(payload={"schedule_conflict_dispositions": mapping}),
+            SimpleNamespace(),
+            SimpleNamespace(payload={"schedule_conflict_dispositions": mapping}),
+            recovery_dispositions=Capability(),
+        )
+        with patch.multiple(
+            verifier,
+            _build_game_normalized_snapshots=DEFAULT,
+            _build_statcast_normalized_snapshots=DEFAULT,
+            _build_pitching_normalized_snapshots=DEFAULT,
+            _build_reference_normalized_snapshots=DEFAULT,
+            _build_history_normalized_snapshots=DEFAULT,
+            _build_career_bf_normalized_snapshots=DEFAULT,
+        ) as builders:
+            builders["_build_game_normalized_snapshots"].return_value = snapshots
+            for name in (
+                "_build_statcast_normalized_snapshots",
+                "_build_pitching_normalized_snapshots",
+                "_build_reference_normalized_snapshots",
+                "_build_history_normalized_snapshots",
+                "_build_career_bf_normalized_snapshots",
+            ):
+                builders[name].return_value = ()
+            verifier.replay_verified_snapshots(inputs)
+
+        passed = [
+            builders[name].call_args.kwargs["recovery_dispositions"]
+            for name in (
+                "_build_game_normalized_snapshots",
+                "_build_statcast_normalized_snapshots",
+                "_build_history_normalized_snapshots",
+            )
+        ]
+        self.assertEqual(len({id(value) for value in passed}), 3)
+        self.assertTrue(all(value is not inputs.recovery_dispositions for value in passed))
+        self.assertGreaterEqual(len(reauthenticated), 5)
+
+
 class SnapshotReplayInputFactoryTests(unittest.TestCase):
     def setUp(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier

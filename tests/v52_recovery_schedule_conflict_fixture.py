@@ -12,6 +12,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
 
@@ -397,6 +398,37 @@ def recovery_authority_fixture(
     return repository, run_path, contract_path
 
 
+@contextmanager
+def published_recovery_capability():
+    """Yield the real, published Task 4 capability for boundary tests.
+
+    The catalog intentionally cannot authenticate from merely materialized
+    protocol files: it requires the three raw-less published success records.
+    Reuse the Task 4 fixture that creates precisely those records instead of
+    manufacturing an internal capability in a test.
+    """
+    from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+        build_recovery_schedule_conflict_catalog,
+        load_recovery_disposition_bindings,
+    )
+    from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+    from tests.test_v52_schedule_inventory import RecoveryDispositionBindingsTests
+
+    with tempfile.TemporaryDirectory(prefix="v52-published-recovery-") as directory:
+        builder = RecoveryDispositionBindingsTests()
+        root, _run_spec, contract, _batch_id, _evidence = (
+            builder._published_recovery_schedule_fixture(Path(directory))
+        )
+        run_path = root / (
+            "protocols/v5_2_qd/"
+            "historical_walkforward_500_recovery_schedule_conflicts.json"
+        )
+        catalog = build_recovery_schedule_conflict_catalog(root, run_path, contract)
+        entries = load_recovery_disposition_bindings(catalog)
+        mapping = RecoveryDispositionBindings(tuple(entries)).as_mapping()
+        yield RecoveryDispositionBindings.from_catalog_mapping(mapping, catalog)
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return (
         json.dumps(
@@ -441,5 +473,6 @@ __all__ = [
     "parent_tree_fingerprints",
     "populate_isolated_parent_evidence",
     "recovery_authority_fixture",
+    "published_recovery_capability",
     "recovery_parent_catalog",
 ]

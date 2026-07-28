@@ -2746,16 +2746,14 @@ def build_schedule_reference_batch(
     if authority_branch.recovery:
         from .v52_schedule_conflict_recovery_disposition import (
             build_recovery_schedule_conflict_catalog,
-            load_recovery_disposition_bindings,
         )
         from .v52_schedule_inventory import RecoveryDispositionBindings
 
         catalog = build_recovery_schedule_conflict_catalog(
             repository_root, run_spec_path, acquisition_contract_path
         )
-        RecoveryDispositionBindings.from_mapping(
-            verified.payload.get("schedule_conflict_dispositions"),
-            load_recovery_disposition_bindings(catalog),
+        RecoveryDispositionBindings.from_catalog_mapping(
+            verified.payload.get("schedule_conflict_dispositions"), catalog
         )
     return _build_schedule_reference_batch_from_inventory(
         verified.payload,

@@ -326,6 +326,7 @@ class NormalizedSnapshot:
     sha256: str
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None
     dispositioned_query_ids: tuple[str, ...] = ()
+    recovery_dispositions: RecoveryDispositionBindings | None = None
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -345,6 +346,11 @@ class NormalizedSnapshot:
                     "dispositioned_query_ids": list(self.dispositioned_query_ids),
                 }
                 if self.duplicate_gamepk_disposition is not None
+                else {}
+            ),
+            **(
+                {"schedule_conflict_dispositions": self.recovery_dispositions.as_mapping()}
+                if self.recovery_dispositions is not None
                 else {}
             ),
         }
@@ -396,6 +402,33 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
     """Purely replay all six normalized snapshot families from sealed inputs."""
     if not isinstance(inputs, SnapshotReplayInputs):
         raise TypeError("snapshot replay inputs must be SnapshotReplayInputs")
+    recovery_dispositions = inputs.recovery_dispositions
+    if inputs.run_id == _RECOVERY_RUN_ID:
+        if recovery_dispositions is None:
+            raise ValueError("recovery replay requires availability capability")
+        recovery_dispositions = recovery_dispositions.reauthenticate()
+        if (
+            inputs.schedule_inventory.payload.get("schedule_conflict_dispositions")
+            != recovery_dispositions.as_mapping()
+            or inputs.game_inventory.payload.get("schedule_conflict_dispositions")
+            != recovery_dispositions.as_mapping()
+        ):
+            raise ValueError("recovery replay disposition capability differs")
+    schedule_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
+    statcast_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
+    history_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
     schedule = _build_game_normalized_snapshots(
         inputs.run_id,
         inputs.records,
@@ -404,6 +437,7 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         inputs.schedule_inventory,
         duplicate_gamepk_disposition=inputs.duplicate_gamepk_disposition,
         dispositioned_query_ids=inputs.dispositioned_query_ids,
+        recovery_dispositions=schedule_dispositions,
     )
     if schedule != inputs.game_snapshots:
         raise ValueError("upstream game snapshot authority differs")
@@ -412,7 +446,7 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         inputs.records,
         inputs.graph,
         schedule,
-        recovery_dispositions=inputs.recovery_dispositions,
+        recovery_dispositions=statcast_dispositions,
     )
     pitching = _build_pitching_normalized_snapshots(
         inputs.run_id, inputs.records, inputs.graph, schedule
@@ -429,7 +463,7 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         schedule,
         duplicate_gamepk_disposition=inputs.duplicate_gamepk_disposition,
         dispositioned_query_ids=inputs.dispositioned_query_ids,
-        recovery_dispositions=inputs.recovery_dispositions,
+        recovery_dispositions=history_dispositions,
     )
     career = _build_career_bf_normalized_snapshots(
         inputs.run_id, inputs.records, inputs.graph, schedule
@@ -446,6 +480,11 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         or len({(snapshot.season, snapshot.source) for snapshot in snapshots}) != 42
     ):
         raise ValueError("replay cardinality must be 81 unique snapshots and 42 source-seasons")
+    if recovery_dispositions is not None:
+        # The boundary projections reauthenticate while they are constructed;
+        # rebind once more after every downstream reducer has consumed them so
+        # a catalog A -> B -> A race cannot return a seemingly valid replay.
+        recovery_dispositions.reauthenticate()
     return snapshots
 
 
@@ -484,11 +523,14 @@ def _sorted_unique_sha256s(
 
 def _validate_normalized_snapshot_mapping(
     value: object,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) not in {
         _NORMALIZED_ENVELOPE_KEYS,
         _NORMALIZED_ENVELOPE_KEYS
         | {"duplicate_gamepk_disposition", "dispositioned_query_ids"},
+        _NORMALIZED_ENVELOPE_KEYS | {"schedule_conflict_dispositions"},
     }:
         raise ValueError("normalized snapshot envelope keys differ")
     envelope = dict(value)
@@ -519,6 +561,21 @@ def _validate_normalized_snapshot_mapping(
         "dispositioned_query_ids",
     }
     has_disposition = bool(disposition_keys & set(envelope))
+    recovery_catalog = envelope.get("schedule_conflict_dispositions")
+    has_recovery_catalog = "schedule_conflict_dispositions" in envelope
+    if envelope["run_id"] == _RECOVERY_RUN_ID:
+        if not has_recovery_catalog or not isinstance(recovery_catalog, Mapping):
+            raise ValueError("normalized recovery disposition binding differs")
+        if recovery_dispositions is not None:
+            fresh = recovery_dispositions.reauthenticate()
+            if canonical_json_bytes(recovery_catalog) != canonical_json_bytes(
+                fresh.as_mapping()
+            ):
+                raise ValueError("normalized recovery disposition binding differs")
+    elif has_recovery_catalog:
+        raise ValueError("normalized snapshot rejects recovery disposition binding")
+    if has_recovery_catalog and has_disposition:
+        raise ValueError("normalized snapshot disposition authority differs")
     if has_disposition:
         if (
             disposition_keys - set(envelope)
@@ -620,20 +677,16 @@ def _validate_normalized_snapshot_mapping(
                     raise ValueError("normalized source game provenance keys differ")
                 if played:
                     validate_source_normalized_anchor_provenance(game)
-        validation_payload = payload
-        if envelope["run_id"] == _RECOVERY_RUN_ID:
-            validation_payload = {
-                **payload,
-                "games": [
-                    {
-                        key: item
-                        for key, item in game.items()
-                        if key not in {"played_date", "result_available_on"}
-                    }
-                    for game in games
-                ],
-            }
-        validate_game_evidence_snapshot(validation_payload, run_id=envelope["run_id"])
+        # Runtime recovery construction supplies the capability and therefore
+        # reauthenticates the exact boundary.  The structural decoder remains
+        # usable for sealed mappings (whose capability lives on the snapshot)
+        # without offering a second caller-controlled admission path.
+        if envelope["run_id"] != _RECOVERY_RUN_ID or recovery_dispositions is not None:
+            validate_game_evidence_snapshot(
+                payload,
+                run_id=envelope["run_id"],
+                recovery_dispositions=recovery_dispositions,
+            )
         return envelope
 
     if source == "prior_schedule_history" and grain == "verified_game_projection":
@@ -1685,7 +1738,6 @@ def load_snapshot_replay_inputs(
     if context is not None and run_spec.run_id == _RECOVERY_RUN_ID:
         from .v52_schedule_conflict_recovery_disposition import (
             build_recovery_schedule_conflict_catalog,
-            load_recovery_disposition_bindings,
         )
 
         catalog = build_recovery_schedule_conflict_catalog(
@@ -1693,12 +1745,11 @@ def load_snapshot_replay_inputs(
             context.authority_path,
             context.acquisition_contract_path,
         )
-        bindings = load_recovery_disposition_bindings(catalog)
-        recovery_dispositions = RecoveryDispositionBindings.from_mapping(
-            schedule.payload.get("schedule_conflict_dispositions"), bindings
+        recovery_dispositions = RecoveryDispositionBindings.from_catalog_mapping(
+            schedule.payload.get("schedule_conflict_dispositions"), catalog
         )
-        if RecoveryDispositionBindings.from_mapping(
-            games.payload.get("schedule_conflict_dispositions"), bindings
+        if RecoveryDispositionBindings.from_catalog_mapping(
+            games.payload.get("schedule_conflict_dispositions"), catalog
         ) != recovery_dispositions:
             raise ValueError("recovery game inventory disposition capability differs")
         recovery_authorities = {
@@ -1911,6 +1962,7 @@ def _normalized_snapshot(
     payload: Mapping[str, object],
     duplicate_gamepk_disposition: DuplicateGamePkDispositionBinding | None = None,
     dispositioned_query_ids: tuple[str, ...] = (),
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> NormalizedSnapshot:
     query_ids = tuple(sorted({record.query_id for record in records}))
     hashes_value = payload.get("source_query_sidecar_sha256s")
@@ -1946,8 +1998,15 @@ def _normalized_snapshot(
             if duplicate_gamepk_disposition is not None
             else {}
         ),
+        **(
+            {"schedule_conflict_dispositions": recovery_dispositions.as_mapping()}
+            if recovery_dispositions is not None
+            else {}
+        ),
     }
-    envelope = _validate_normalized_snapshot_mapping(envelope)
+    envelope = _validate_normalized_snapshot_mapping(
+        envelope, recovery_dispositions=recovery_dispositions
+    )
     contents = canonical_json_bytes(envelope) + b"\n"
     digest = hashlib.sha256(contents).hexdigest()
     if digest in set(query_ids) | set(sidecar_hashes):
@@ -1970,6 +2029,7 @@ def _normalized_snapshot(
         sha256=digest,
         duplicate_gamepk_disposition=duplicate_gamepk_disposition,
         dispositioned_query_ids=dispositioned_query_ids,
+        recovery_dispositions=recovery_dispositions,
     )
 
 
@@ -2363,6 +2423,7 @@ def _build_game_normalized_snapshots(
                     dispositioned_query_ids
                     if season == 2019 else ()
                 ),
+                recovery_dispositions if run_id == _RECOVERY_RUN_ID else None,
             )
         )
     return tuple(snapshots)
@@ -2445,6 +2506,7 @@ def _history_normalized_snapshot(
         raise ValueError("history upstream source snapshot SHA-256 differs")
     source_2019 = run_id == _SOURCE_RUN_ID and game_snapshot.season == 2019
     disposition = game_snapshot.duplicate_gamepk_disposition
+    recovery_dispositions = game_snapshot.recovery_dispositions
     if source_2019 != (disposition is not None):
         raise ValueError("history source disposition authority differs")
     if source_2019 != bool(game_snapshot.dispositioned_query_ids):
@@ -2470,8 +2532,15 @@ def _history_normalized_snapshot(
             if source_2019
             else {}
         ),
+        **(
+            {"schedule_conflict_dispositions": recovery_dispositions.as_mapping()}
+            if recovery_dispositions is not None
+            else {}
+        ),
     }
-    envelope = _validate_normalized_snapshot_mapping(envelope)
+    envelope = _validate_normalized_snapshot_mapping(
+        envelope, recovery_dispositions=recovery_dispositions
+    )
     contents = canonical_json_bytes(envelope) + b"\n"
     digest = hashlib.sha256(contents).hexdigest()
     components = set(game_snapshot.logical_query_ids) | set(
@@ -2499,6 +2568,7 @@ def _history_normalized_snapshot(
         dispositioned_query_ids=(
             game_snapshot.dispositioned_query_ids if source_2019 else ()
         ),
+        recovery_dispositions=recovery_dispositions,
     )
 
 
@@ -2532,7 +2602,10 @@ def _build_history_normalized_snapshots(
             or snapshot.status != "READY"
             or snapshot.season in game_by_season
             or mapping is None
-            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or _validate_normalized_snapshot_mapping(
+                mapping, recovery_dispositions=recovery_dispositions
+            )
+            != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
             or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
@@ -2884,7 +2957,9 @@ def _build_statcast_normalized_snapshots(
             or snapshot.source != "mlb_schedule_game_feed"
             or snapshot.grain != "season_game_evidence_snapshot"
             or snapshot.season in game_by_season
-            or _validate_normalized_snapshot_mapping(snapshot.as_mapping())
+            or _validate_normalized_snapshot_mapping(
+                snapshot.as_mapping(), recovery_dispositions=recovery_dispositions
+            )
             != snapshot.as_mapping()
             or snapshot.canonical_bytes
             != canonical_json_bytes(snapshot.as_mapping()) + b"\n"

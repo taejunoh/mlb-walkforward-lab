@@ -9,8 +9,8 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from types import MappingProxyType
@@ -105,6 +105,7 @@ _SEASON_SOURCE_KEYS = frozenset(
 )
 _DERIVED_SEASON_SOURCE_KEYS = _SEASON_SOURCE_KEYS | {"occurrence_counts"}
 _PLAYED_STATUSES = frozenset({"Final", "Completed Early"})
+_RECOVERY_BINDINGS_AUTHORIZATION = object()
 
 # Preserve the module seam used by authority-ordering tests while routing the
 # actual read through the authority-explicit namespace selector.
@@ -138,6 +139,12 @@ class RecoveryDispositionBindings:
         RecoveryDispositionBinding,
         RecoveryDispositionBinding,
     ]
+    _authorization: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _reauthenticate: Callable[[], "RecoveryDispositionBindings"] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -147,18 +154,43 @@ class RecoveryDispositionBindings:
             or tuple(entry.game_pk for entry in self.entries) != (565534, 630882, 633224)
         ):
             raise ValueError("recovery disposition bindings differ")
+        if (
+            self._authorization is not None
+            and self._authorization is not _RECOVERY_BINDINGS_AUTHORIZATION
+        ):
+            raise ValueError("recovery disposition authority differs")
 
     def query_ids(self) -> tuple[str, str, str]:
         return tuple(entry.query_id for entry in self.entries)
+
+    def reauthenticate(self) -> "RecoveryDispositionBindings":
+        """Fail closed unless the three published bindings are still identical."""
+        if (
+            self._authorization is not _RECOVERY_BINDINGS_AUTHORIZATION
+            or self._reauthenticate is None
+        ):
+            raise ValueError("recovery disposition authority differs")
+        fresh = self._reauthenticate()
+        if (
+            not isinstance(fresh, RecoveryDispositionBindings)
+            or fresh is self
+            or fresh.entries != self.entries
+        ):
+            raise ValueError("recovery disposition authority differs")
+        return fresh
 
     def require_boundary(self, row: Mapping[str, object]) -> date:
         """Return the only two catalog-authenticated resumed-result dates."""
         if not isinstance(row, Mapping):
             raise ValueError("availability boundary differs")
+        try:
+            bindings = self.reauthenticate()
+        except ValueError as exc:
+            raise ValueError("availability boundary differs") from exc
         game_pk = row.get("game_pk")
         if type(game_pk) is not int or game_pk not in {630882, 633224}:
             raise ValueError("availability boundary differs")
-        entry = next(entry for entry in self.entries if entry.game_pk == game_pk)
+        entry = next(entry for entry in bindings.entries if entry.game_pk == game_pk)
         expected_official = {
             630882: "2020-08-09",
             633224: "2021-07-21",
@@ -208,9 +240,31 @@ class RecoveryDispositionBindings:
         value: Mapping[str, object],
         bindings: Sequence[RecoveryDispositionBinding],
     ) -> "RecoveryDispositionBindings":
+        del value, bindings
+        raise ValueError("recovery disposition authority differs")
+
+    @classmethod
+    def from_catalog_mapping(
+        cls, value: Mapping[str, object], catalog: object
+    ) -> "RecoveryDispositionBindings":
+        """Bind a recovery mapping to the catalog's fresh evidence replay."""
+        from .v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionCatalog,
+            load_recovery_disposition_bindings,
+        )
+
+        if not isinstance(catalog, RecoveryDispositionCatalog):
+            raise TypeError("recovery disposition catalog is required")
+        bindings = load_recovery_disposition_bindings(catalog)
         expected = cls(tuple(bindings))  # type: ignore[arg-type]
         if canonical_json_bytes(value) != canonical_json_bytes(expected.as_mapping()):
             raise ValueError("recovery disposition bindings differ")
+        object.__setattr__(expected, "_authorization", _RECOVERY_BINDINGS_AUTHORIZATION)
+        object.__setattr__(
+            expected,
+            "_reauthenticate",
+            lambda: cls.from_catalog_mapping(value, catalog),
+        )
         return expected
 
 
@@ -873,9 +927,11 @@ def _validate_payload(
     if run_id == _RECOVERY_RUN_ID:
         if recovery_bindings is None:
             raise ValueError("recovery disposition bindings are required")
-        bindings = RecoveryDispositionBindings.from_mapping(
-            payload.get("schedule_conflict_dispositions"), recovery_bindings
-        )
+        bindings = RecoveryDispositionBindings(tuple(recovery_bindings))
+        if canonical_json_bytes(payload.get("schedule_conflict_dispositions")) != canonical_json_bytes(
+            bindings.as_mapping()
+        ):
+            raise ValueError("recovery disposition bindings differ")
         by_game = {entry.game_pk: entry for entry in bindings.entries}
         for game_pk in (565534, 630882, 633224):
             matches = [anchor for anchor in anchors if anchor["game_pk"] == game_pk]
@@ -1543,9 +1599,8 @@ def load_verified_schedule_anchor_inventory(
         rebound_catalog = build_recovery_schedule_conflict_catalog(
             root, context.authority_path, context.acquisition_contract_path
         )
-        rebound_bindings = load_recovery_disposition_bindings(rebound_catalog)
-        RecoveryDispositionBindings.from_mapping(
-            validated.get("schedule_conflict_dispositions"), rebound_bindings
+        RecoveryDispositionBindings.from_catalog_mapping(
+            validated.get("schedule_conflict_dispositions"), rebound_catalog
         )
     frozen = _deep_freeze(validated)
     if not isinstance(frozen, Mapping):

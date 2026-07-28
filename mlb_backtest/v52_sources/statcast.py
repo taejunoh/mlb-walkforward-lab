@@ -46,15 +46,16 @@ def validate_recovery_statcast_game_dates(
     capability: "RecoveryDispositionBindings | None",
 ) -> None:
     """Require Savant's raw local game date for the two resumed games only."""
+    authenticated = capability.reauthenticate() if capability is not None else None
     for game in games:
         if not isinstance(game, Mapping):
             raise ValueError("Statcast game projection must be a mapping")
         game_pk = game.get("game_pk")
         if game_pk not in {630882, 633224}:
             continue
-        if capability is None:
+        if authenticated is None:
             raise ValueError("recovery Statcast availability capability is required")
-        entry = next(entry for entry in capability.entries if entry.game_pk == game_pk)
+        entry = next(entry for entry in authenticated.entries if entry.game_pk == game_pk)
         if game.get("game_date") != entry.played_date:
             raise ValueError("recovery Statcast game_date differs from played_date")
 

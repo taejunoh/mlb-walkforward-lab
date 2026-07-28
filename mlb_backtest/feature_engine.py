@@ -138,6 +138,7 @@ class ScheduleHistory:
         self.coverage_complete = coverage_complete
         validated = []
         seen_game_pks = set()
+        availability_by_game_pk: dict[int, date] = {}
         for raw in rows:
             if not isinstance(raw, Mapping):
                 raise ValueError("schedule history rows must be mappings")
@@ -153,6 +154,7 @@ class ScheduleHistory:
             if not isinstance(raw_date, str) or official.isoformat() != raw_date:
                 raise ValueError("schedule history date must be canonical ISO")
             scheduled = _availability_date(row, recovery_dispositions)
+            availability_by_game_pk[game_pk] = scheduled
             team_codes = row.get("team_codes")
             if (
                 isinstance(team_codes, (str, bytes))
@@ -228,7 +230,7 @@ class ScheduleHistory:
             sorted(
                 validated,
                 key=lambda row: (
-                    _availability_date(row, recovery_dispositions).isoformat(),
+                    availability_by_game_pk[int(row["game_pk"])].isoformat(),
                     int(row.get("game_pk", 0)),
                 ),
             )
@@ -238,7 +240,7 @@ class ScheduleHistory:
         team_id_by_game_date_code: dict[tuple[int, str, str], int] = {}
         dated = []
         for row in canonical:
-            scheduled = _availability_date(row, recovery_dispositions)
+            scheduled = availability_by_game_pk[int(row["game_pk"])]
             dated.append(scheduled)
             for team_code in row.get("team_codes", ()):
                 code = str(team_code)
@@ -263,9 +265,7 @@ class ScheduleHistory:
         self._dates = tuple(dated)
         self.game_dates = MappingProxyType(
             {
-                int(row["game_pk"]): _day(
-                    _availability_date(row, recovery_dispositions).isoformat(), "schedule date"
-                )
+                int(row["game_pk"]): availability_by_game_pk[int(row["game_pk"])]
                 for row in canonical
             }
         )

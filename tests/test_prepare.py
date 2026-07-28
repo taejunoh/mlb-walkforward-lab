@@ -994,6 +994,24 @@ class PrepareBoundaryTest(unittest.TestCase):
                     **changes,
                 )
 
+    def test_schedule_history_build_rejects_public_availability_fields(self):
+        with self.assertRaisesRegex(ValueError, "unapproved schedule availability"):
+            ScheduleHistoryBuild(
+                rows=(
+                    {
+                        "game_pk": 1,
+                        "official_date": "2024-04-01",
+                        "played_date": "2024-04-01",
+                        "result_available_on": "2024-04-01",
+                    },
+                ),
+                coverage_start="2024-04-01",
+                coverage_end="2024-04-02",
+                coverage_complete=True,
+                source_manifest_sha256="a" * 64,
+                expected_game_pks=(1,),
+            )
+
     def test_build_pregame_history_builds_one_full_source_index_for_as_of_queries(self):
         parsed = parse_statcast(STATCAST)
         target_game = {"game_pk": 1002, "official_date": "2024-04-02"}
