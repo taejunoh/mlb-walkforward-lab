@@ -5860,6 +5860,53 @@ class AcquisitionOrchestrationTests(unittest.TestCase):
         self.assertEqual(payload["contract_sha256"], expected_contract_sha256)
         self.assertEqual(payload["query_batch_sha256s"], ["a" * 64])
 
+    def test_cli_defaults_recovery_run_to_recovery_contract(self) -> None:
+        from mlb_backtest.protocols import (
+            expected_recovery_source_run,
+            parse_source_run_spec,
+        )
+        from mlb_backtest.v52_acquire import (
+            AcquisitionSummary,
+            _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            _RECOVERY_RUN_SPEC_RELATIVE,
+            main,
+        )
+
+        recovery_run = parse_source_run_spec(expected_recovery_source_run())
+        summary = AcquisitionSummary(
+            contract_sha256="a" * 64,
+            query_batch_sha256s=("b" * 64,),
+            promoted=0,
+            fetched=0,
+            planned_promoted=0,
+            planned_fetch_required=0,
+            resumed=0,
+            quarantined=0,
+            pending=0,
+            network_attempts=0,
+        )
+        argv = self._cli_argv()
+        argv[argv.index("--run-spec") + 1] = str(ROOT / _RECOVERY_RUN_SPEC_RELATIVE)
+        with (
+            patch(
+                "mlb_backtest.v52_acquire._cli_exact_run_spec",
+                return_value=ROOT / _RECOVERY_RUN_SPEC_RELATIVE,
+            ),
+            patch(
+                "mlb_backtest.v52_acquire.load_source_run_spec",
+                return_value=recovery_run,
+            ),
+            patch(
+                "mlb_backtest.v52_acquire.acquire_sources",
+                return_value=summary,
+            ) as acquire,
+        ):
+            self.assertEqual(main(argv), 0)
+        self.assertEqual(
+            acquire.call_args.kwargs["acquisition_contract_path"],
+            ROOT / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        )
+
     def _cli_argv(self) -> list[str]:
         return [
             "--root",

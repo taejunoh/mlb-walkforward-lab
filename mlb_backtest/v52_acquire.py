@@ -107,12 +107,12 @@ _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
 )
 
 
-def _request_authority_paths(
-    request: _AcquisitionRequest, root: Path
+def _authority_paths_for_run_spec(
+    run_spec: RunSpec | SourceRunSpec, root: Path
 ) -> tuple[Path, Path]:
-    """Return the exact RunSpec/contract pair selected by this invocation."""
-    if isinstance(request.run_spec, SourceRunSpec):
-        if request.run_spec == parse_source_run_spec(expected_recovery_source_run()):
+    """Return the closed authority pair for one already-authenticated RunSpec."""
+    if isinstance(run_spec, SourceRunSpec):
+        if run_spec == parse_source_run_spec(expected_recovery_source_run()):
             return (
                 root / _RECOVERY_RUN_SPEC_RELATIVE,
                 root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
@@ -121,9 +121,16 @@ def _request_authority_paths(
             root / _SOURCE_RUN_SPEC_RELATIVE,
             root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
         )
-    if isinstance(request.run_spec, RunSpec):
+    if isinstance(run_spec, RunSpec):
         return root / _RUN_SPEC_RELATIVE, root / _ACQUISITION_CONTRACT_RELATIVE
     raise TypeError("acquisition request authority differs")
+
+
+def _request_authority_paths(
+    request: _AcquisitionRequest, root: Path
+) -> tuple[Path, Path]:
+    """Return the exact RunSpec/contract pair selected by this invocation."""
+    return _authority_paths_for_run_spec(request.run_spec, root)
 
 
 def _authority_audit_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
@@ -4100,6 +4107,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (OSError, ValueError) as exc:
             raise TrustIntegrityError("run spec trust failed") from exc
+        _, default_contract_path = _authority_paths_for_run_spec(
+            run_spec, canonical_root
+        )
         summary = acquire_sources(
             args.root,
             run_spec,
@@ -4114,12 +4124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             acquisition_contract_path=(
                 _absolute_supplied(args.acquisition_contract, canonical_root)
                 if args.acquisition_contract is not None
-                else canonical_root
-                / (
-                    _SOURCE_ACQUISITION_CONTRACT_RELATIVE
-                    if isinstance(run_spec, SourceRunSpec)
-                    else _ACQUISITION_CONTRACT_RELATIVE
-                )
+                else default_contract_path
             ),
         )
     except KeyboardInterrupt:
