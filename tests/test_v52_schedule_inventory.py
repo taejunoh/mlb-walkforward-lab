@@ -1443,6 +1443,189 @@ class V52ScheduleInventoryTest(unittest.TestCase):
         )
 
 class RecoveryDispositionBindingsTests(unittest.TestCase):
+    def _published_recovery_schedule_fixture(self, directory: Path):
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            recovery_authority_fixture,
+        )
+        from mlb_backtest.protocols import load_source_run_spec
+        from mlb_backtest.v52_evidence import V52EvidenceStore
+        from mlb_backtest.v52_query_plan import _load_static_contracts
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+        )
+        from mlb_backtest.v52_source_contracts import recompute_query_sidecar
+
+        root, run_path, contract_path = recovery_authority_fixture(directory)
+        run_spec = load_source_run_spec(run_path)
+        batch = build_static_batch(run_path, contract_path)
+        publish_query_batch(root, batch)
+        context = _load_static_contracts(run_path, contract_path)
+        context.raw_root.mkdir(parents=True)
+        store = V52EvidenceStore(context.raw_root)
+        catalog = build_recovery_schedule_conflict_catalog(
+            root, run_path, contract_path
+        )
+        by_query = {
+            logical_query_id(authority.query): authority
+            for authority in catalog.entries
+        }
+        for index, query in enumerate(batch.queries):
+            authority = by_query.get(logical_query_id(query))
+            if authority is not None:
+                with store.acquire_query(query):
+                    store.publish_derived_disposition(
+                        query,
+                        recompute_query_sidecar(query, b"", authority=authority),
+                        authority=authority,
+                    )
+                continue
+            raw = _schedule_raw(query, index)
+            with store.acquire_query(query) as lease:
+                store.publish_fetched(
+                    query,
+                    store.next_attempt_number(lease),
+                    _capture(raw),
+                    recompute_query_sidecar(query, raw, context=context),
+                )
+        return root, run_spec, contract_path, batch.batch_id, context.raw_root
+
+    def test_recovery_schedule_publish_then_verified_load_rebinds_all_bindings(
+        self,
+    ) -> None:
+        from mlb_backtest.v52_schedule_inventory import (
+            load_verified_schedule_anchor_inventory,
+            publish_schedule_anchor_inventory,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec, contract, batch_id, evidence = (
+                self._published_recovery_schedule_fixture(Path(directory))
+            )
+            published = publish_schedule_anchor_inventory(
+                root,
+                run_spec,
+                acquisition_contract_path=contract,
+                static_batch_id=batch_id,
+                evidence_root=evidence,
+            )
+            loaded = load_verified_schedule_anchor_inventory(
+                root,
+                run_spec,
+                acquisition_contract_path=contract,
+                static_batch_id=batch_id,
+                evidence_root=evidence,
+            )
+            self.assertEqual(loaded, published)
+            catalog = loaded.payload["schedule_conflict_dispositions"]
+            self.assertEqual(len(catalog["entries"]), 3)
+            self.assertEqual(catalog["query_ids"], sorted(catalog["query_ids"]))
+
+    def test_verified_recovery_load_passes_fresh_published_bindings_to_validation(
+        self,
+    ) -> None:
+        from mlb_backtest import v52_schedule_inventory as inventory
+
+        context = SimpleNamespace(
+            acquisition_audit_root=Path("/repo/audit"),
+            acquisition_contract_path=Path("/repo/contract.json"),
+            authority_path=Path("/repo/run.json"),
+            run_id="historical_walkforward_500_recovery_schedule_conflicts",
+        )
+        bindings = object()
+        payload = {"schedule_conflict_dispositions": {"entries": [], "query_ids": []}}
+        with (
+            patch.object(inventory, "_absolute", return_value=Path("/repo")),
+            patch.object(inventory, "_authenticate", return_value=context),
+            patch.object(inventory, "_read_inventory_contents", return_value=b"{}\n"),
+            patch.object(inventory.json, "loads", return_value=payload),
+            patch.object(
+                inventory,
+                "_canonical_file_bytes",
+                return_value=b"{}\n",
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+                "build_recovery_schedule_conflict_catalog",
+                return_value=object(),
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+                "load_recovery_disposition_bindings",
+                return_value=bindings,
+            ),
+            patch.object(
+                inventory, "_validate_payload", return_value=payload
+            ) as validate,
+            patch.object(
+                inventory, "build_schedule_anchor_inventory", return_value=payload
+            ),
+            patch.object(inventory, "_deep_freeze", return_value=payload),
+            patch.object(
+                inventory.RecoveryDispositionBindings,
+                "from_mapping",
+                return_value=object(),
+            ),
+        ):
+            inventory.load_verified_schedule_anchor_inventory(
+                Path("/repo"),
+                object(),
+                acquisition_contract_path=Path("/repo/contract.json"),
+                static_batch_id="0" * 64,
+                evidence_root=Path("/repo/raw"),
+            )
+        self.assertIs(validate.call_args.kwargs["recovery_bindings"], bindings)
+
+    def test_recovery_projection_rebind_rejects_catalog_a_raw_b_restore_a_race(
+        self,
+    ) -> None:
+        """The initial projection binds raw B; the final catalog sees raw A."""
+        from mlb_backtest import v52_schedule_inventory as inventory
+
+        query = SimpleNamespace(
+            query_id="recovery-query", requested_range={"year": "2019"}
+        )
+        authority = SimpleNamespace(query=query)
+        catalog = SimpleNamespace(entries=(authority,))
+        context = SimpleNamespace(
+            authority_path=Path("/repo/run.json"),
+            acquisition_contract_path=Path("/repo/contract.json"),
+        )
+        raw_b_projection = ([{"game_pk": 565534, "raw": "B"}], {"565534": 1})
+        raw_a_projection = ([{"game_pk": 565534, "raw": "A"}], {"565534": 1})
+        with (
+            patch.object(
+                inventory,
+                "logical_query_id",
+                side_effect=lambda item: item.query_id,
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+                "build_recovery_schedule_conflict_catalog",
+                return_value=catalog,
+            ),
+            patch(
+                "mlb_backtest.v52_schedule_conflict_recovery_disposition."
+                "load_recovery_disposition_bindings",
+                return_value=(),
+            ),
+            patch.object(
+                inventory,
+                "_recovery_projection_anchors",
+                return_value=raw_a_projection,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "recovery disposition projection changed before return"
+            ):
+                inventory._rebind_recovery_schedule_projections(
+                    Path("/repo"),
+                    context,
+                    {"recovery-query": raw_b_projection},
+                    (),
+                    evidence_relative=Path("data/raw"),
+                    store=object(),
+                )
+
     def test_mapping_requires_exact_three_canonically_ordered_bindings(self) -> None:
         from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
             RecoveryDispositionBinding,

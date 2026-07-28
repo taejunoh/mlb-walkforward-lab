@@ -645,6 +645,59 @@ def _recovery_projection_anchors(
     return bound, dict(counts)
 
 
+def _rebind_recovery_schedule_projections(
+    root: Path,
+    context: object,
+    recovery_projections: Mapping[
+        str, tuple[list[dict[str, object]], Mapping[str, int]]
+    ],
+    season_sources: Sequence[Mapping[str, object]],
+    *,
+    evidence_relative: Path,
+    store: V52EvidenceStore,
+) -> tuple[RecoveryDispositionBinding, ...]:
+    """Replay recovery parent authority and every derived projection once."""
+    from .v52_schedule_conflict_recovery_disposition import (
+        build_recovery_schedule_conflict_catalog,
+        load_recovery_disposition_bindings,
+    )
+
+    rebound_catalog = build_recovery_schedule_conflict_catalog(
+        root, context.authority_path, context.acquisition_contract_path
+    )
+    rebound = load_recovery_disposition_bindings(rebound_catalog)
+    rebound_authorities = {
+        logical_query_id(entry.query): entry for entry in rebound_catalog.entries
+    }
+    if set(rebound_authorities) != set(recovery_projections):
+        raise ValueError("recovery disposition projection population changed")
+    for query_id, (initial_anchors, initial_counts) in recovery_projections.items():
+        authority = rebound_authorities[query_id]
+        rebound_anchors, rebound_counts = _recovery_projection_anchors(
+            root, authority, context
+        )
+        if (
+            rebound_anchors != initial_anchors
+            or dict(rebound_counts) != dict(initial_counts)
+        ):
+            raise ValueError("recovery disposition projection changed before return")
+        query = authority.query
+        verified = store.read_verified_success(query, authority=authority)
+        source = season_sources[int(query.requested_range["year"]) - 2018]
+        expected_source = _derived_source_binding(
+            root,
+            evidence_relative,
+            query,
+            verified,
+            rebound_anchors,
+            rebound_counts,
+            season=int(query.requested_range["year"]),
+        )
+        if source != expected_source:
+            raise ValueError("recovery disposition source binding changed before return")
+    return tuple(rebound)
+
+
 def build_schedule_anchor_provenance(
     anchors: Sequence[Mapping[str, object]],
 ) -> Mapping[int, Mapping[str, object]]:
@@ -925,6 +978,9 @@ def build_schedule_anchor_inventory(
     recovery_catalog = None
     recovery_bindings: tuple[RecoveryDispositionBinding, ...] | None = None
     recovery_authorities: dict[str, object] = {}
+    recovery_projections: dict[
+        str, tuple[list[dict[str, object]], Mapping[str, int]]
+    ] = {}
     if isinstance(run_spec, SourceRunSpec) and context.run_id == _SOURCE_RUN_ID:
         from .v52_duplicate_gamepk_disposition import (
             build_duplicate_disposition_authority,
@@ -962,6 +1018,7 @@ def build_schedule_anchor_inventory(
             if query.endpoint.startswith("disposition://")
         }:
             raise ValueError("recovery static batch disposition queries differ")
+        _before_recovery_schedule_projection()
 
     store = (
         V52EvidenceStore.open_read_only(_absolute(evidence_root))
@@ -1007,6 +1064,10 @@ def build_schedule_anchor_inventory(
         if recovery_authority is not None:
             anchors, occurrence_counts = _recovery_projection_anchors(
                 root, recovery_authority, context
+            )
+            recovery_projections[logical_query_id(query)] = (
+                anchors,
+                occurrence_counts,
             )
             if verified.raw_bytes is not None:
                 raise ValueError("recovery derived schedule success must not expose raw bytes")
@@ -1137,12 +1198,16 @@ def build_schedule_anchor_inventory(
         if rebound_checkpoint != source_checkpoint:
             raise ValueError("schedule disposition checkpoint changed before return")
     if recovery_catalog is not None:
-        from .v52_schedule_conflict_recovery_disposition import (
-            load_recovery_disposition_bindings,
+        rebound = _rebind_recovery_schedule_projections(
+            root,
+            context,
+            recovery_projections,
+            season_sources,
+            evidence_relative=evidence_relative,
+            store=store,
         )
-
-        rebound = load_recovery_disposition_bindings(recovery_catalog)
-        if RecoveryDispositionBindings(tuple(rebound)).as_mapping() != payload[
+        rebound_capability = RecoveryDispositionBindings(tuple(rebound))
+        if rebound_capability.as_mapping() != payload[
             "schedule_conflict_dispositions"
         ]:
             raise ValueError("recovery disposition bindings changed before return")
@@ -1221,6 +1286,10 @@ def _read_final(
 
 def _before_schedule_inventory_publish() -> None:
     """Deterministic interruption/race test hook; production does nothing."""
+
+
+def _before_recovery_schedule_projection() -> None:
+    """Deterministic recovery-parent race-test hook; production does nothing."""
 
 
 def _after_schedule_inventory_rebind() -> None:
@@ -1404,7 +1473,23 @@ def load_verified_schedule_anchor_inventory(
         raise ValueError("schedule inventory must be UTF-8 JSON") from exc
     if contents != _canonical_file_bytes(payload):
         raise ValueError("schedule inventory must be canonical JSON with one newline")
-    validated = _validate_payload(payload, run_id=context.run_id)
+    recovery_catalog = None
+    recovery_bindings: tuple[RecoveryDispositionBinding, ...] | None = None
+    if context.run_id == _RECOVERY_RUN_ID:
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+
+        recovery_catalog = build_recovery_schedule_conflict_catalog(
+            root, context.authority_path, context.acquisition_contract_path
+        )
+        recovery_bindings = load_recovery_disposition_bindings(recovery_catalog)
+    validated = _validate_payload(
+        payload,
+        run_id=context.run_id,
+        recovery_bindings=recovery_bindings,
+    )
     current = build_schedule_anchor_inventory(
         root,
         run_spec,
@@ -1418,6 +1503,19 @@ def load_verified_schedule_anchor_inventory(
     rebound = _read_inventory_contents(root, inventory_relative)
     if rebound != contents:
         raise ValueError("schedule inventory bytes changed during verified load")
+    if recovery_catalog is not None:
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+
+        rebound_catalog = build_recovery_schedule_conflict_catalog(
+            root, context.authority_path, context.acquisition_contract_path
+        )
+        rebound_bindings = load_recovery_disposition_bindings(rebound_catalog)
+        RecoveryDispositionBindings.from_mapping(
+            validated.get("schedule_conflict_dispositions"), rebound_bindings
+        )
     frozen = _deep_freeze(validated)
     if not isinstance(frozen, Mapping):
         raise AssertionError("verified schedule inventory must freeze to a mapping")
