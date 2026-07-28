@@ -26,8 +26,18 @@ from unittest.mock import Mock, call, patch
 
 from mlb_backtest import v52_source_finalize as cli
 from mlb_backtest import v52_source_orchestration as orchestration
+from mlb_backtest import v52_schedule_inventory as schedule_inventory
 from mlb_backtest.execution_registry import AcquisitionCheckpoint, ExecutionRegistryState
-from mlb_backtest.protocols import SourceRunSpec, load_source_run_spec
+from mlb_backtest.protocols import (
+    SourceRunSpec,
+    expected_recovery_source_run,
+    load_source_run_spec,
+)
+from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+    RecoveryDispositionBinding,
+)
+from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+from mlb_backtest.v52_query_plan import SourceAuthorityContext
 from mlb_backtest.v52_snapshot_store import (
     AuthorityBinding,
     LoadedSnapshotStore,
@@ -42,6 +52,120 @@ from tests.v52_snapshot_store_fixture import fake_81, patched_store_replay, stor
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class RecoveryDispositionPayloadTests(unittest.TestCase):
+    """The recovery receipt branch must carry its complete three-entry catalog."""
+
+    def test_recovery_payload_reauthenticates_and_emits_exact_catalog(self) -> None:
+        """Removing a recovery catalog rebind must make this receipt proof fail."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run_path = root / (
+                "protocols/v5_2_qd/"
+                "historical_walkforward_500_recovery_schedule_conflicts.json"
+            )
+            contract_path = root / (
+                "protocols/v5_2_qd/"
+                "historical_source_acquisition_recovery_schedule_conflicts.json"
+            )
+            run_path.parent.mkdir(parents=True)
+            run_path.write_bytes(canonical_json_bytes(expected_recovery_source_run()))
+            run_spec = load_source_run_spec(run_path)
+            entries = tuple(
+                RecoveryDispositionBinding(
+                    game_pk,
+                    f"{index + 1:x}" * 64,
+                    {"path": f"sidecars/{game_pk}.json", "sha256": "a" * 64},
+                    {"path": f"success/{game_pk}.json", "sha256": "b" * 64},
+                    f"202{index}-01-01T00:00:00Z",
+                    None if game_pk == 565534 else f"202{index}-08-14",
+                    None if game_pk == 565534 else f"202{index}-08-14",
+                    ("c" * 64,),
+                    "d" * 64,
+                    "e" * 64,
+                    "f" * 64,
+                    "0" * 64,
+                )
+                for index, game_pk in enumerate((565534, 630882, 633224))
+            )
+
+            def fresh() -> RecoveryDispositionBindings:
+                candidate = RecoveryDispositionBindings(entries)
+                object.__setattr__(
+                    candidate,
+                    "_authorization",
+                    schedule_inventory._RECOVERY_BINDINGS_AUTHORIZATION,
+                )
+                object.__setattr__(candidate, "_reauthenticate", fresh)
+                return candidate
+
+            bindings = fresh()
+            checkpoint_bindings = tuple(
+                {
+                    "game_pk": entry.game_pk,
+                    "query_id": entry.query_id,
+                    "query_sidecar": dict(entry.query_sidecar),
+                    "success_receipt": dict(entry.success_receipt),
+                    "retained_scheduled_start_utc": entry.retained_scheduled_start_utc,
+                    "played_date": entry.played_date,
+                    "result_available_on": entry.result_available_on,
+                    "raw_object_sha256s": list(entry.raw_object_sha256s),
+                    "selected_raw_game_object_sha256s_sha256": entry.selected_raw_game_object_sha256s_sha256,
+                    "normalized_games_sha256": entry.normalized_games_sha256,
+                    "sidecar_semantics_sha256": entry.sidecar_semantics_sha256,
+                    "expected_derived_sidecar_sha256": entry.expected_derived_sidecar_sha256,
+                }
+                for entry in entries
+            )
+            query_ids = tuple(sorted(entry.query_id for entry in entries))
+            context = orchestration.FinalizationContext(
+                root,
+                run_path,
+                contract_path,
+                root / "audit/v5_1_bt/protected_raw_inventory.json",
+                run_spec,
+                SimpleNamespace(phase="ACQUIRING"),
+                SimpleNamespace(
+                    stage="REMAINING",
+                    dispositioned_query_ids=query_ids,
+                    completed_query_ids=query_ids,
+                    pending_query_ids=(),
+                    quarantined_query_ids=(),
+                    split_query_ids=(),
+                    recovery_disposition_bindings=checkpoint_bindings,
+                ),
+                SimpleNamespace(
+                    replay=SimpleNamespace(recovery_dispositions=bindings),
+                    bindings=SimpleNamespace(schedule_conflict_dispositions=bindings),
+                ),
+                SimpleNamespace(schedule_conflict_dispositions=bindings),
+                "ACQUIRING",
+                "1" * 40,
+                (),
+                SourceAuthorityContext(
+                    root,
+                    run_spec,
+                    run_path,
+                    "2" * 64,
+                    contract_path,
+                    "3" * 64,
+                    {},
+                    run_spec.run_id,
+                    root / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw",
+                    root / "data/v5_2_qd/historical_recovery_schedule_conflicts/sources",
+                    root / "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition",
+                    root / "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution",
+                    root / "reports/v5_2_qd/historical_recovery_schedule_conflicts",
+                ),
+            )
+
+            self.assertEqual(
+                orchestration._source_disposition_payload_fields(
+                    context, context.inventory
+                ),
+                {"schedule_conflict_dispositions": bindings.as_mapping()},
+            )
 
 _LOCAL_DISPOSITION_SCHEMA_RELATIVES = (
     Path("schemas/v5_2_clean_source_replay_receipt.schema.json"),

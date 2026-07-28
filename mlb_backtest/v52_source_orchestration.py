@@ -51,6 +51,7 @@ from .v52_snapshot_store import (
     publish_snapshot_store_from_fd,
     read_inventory_from_fd,
 )
+from .v52_schedule_inventory import RecoveryDispositionBindings
 from .v52_source_contracts import canonical_json_bytes
 from .v52_verify_sources import (
     NormalizedSnapshot,
@@ -68,6 +69,19 @@ _TIMEZONE_SEAL = Path("audit/v5_2_qd/historical/acquisition/venue_timezone_seal.
 _SOURCE_ROOT_RELATIVE = Path("data/v5_2_qd/historical/sources")
 _SOURCE_REVIEW_PREFIX = "audit/v5_2_qd/historical/acquisition/source_reviews/"
 _SOURCE_REPLAY_PREFIX = "audit/v5_2_qd/historical/acquisition/source_replays/"
+_HISTORICAL_AUTHORITY_PAIR = (
+    "protocols/v5_2_qd/historical_walkforward_500.json",
+    "protocols/v5_2_qd/historical_source_acquisition.json",
+)
+_SUPERSEDING_565534_AUTHORITY_PAIR = (
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+)
+_RECOVERY_SCHEDULE_CONFLICTS_AUTHORITY_PAIR = (
+    "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json",
+    "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json",
+)
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_QUERY_IDS_DOCUMENT_BYTES = 1024 * 1024
 
@@ -958,18 +972,139 @@ def _checkpoint_status(checkpoint: AcquisitionCheckpoint | None) -> Mapping[str,
     }
 
 
+def _exact_authority_branch(context: FinalizationContext) -> str:
+    """Resolve only one immutable RunSpec/contract path pair.
+
+    The ordering is intentional: old authorities never inspect recovery-only
+    capabilities, so their receipt bytes retain their historical shape.
+    """
+    try:
+        pair = (
+            context.run_spec_path.relative_to(context.root).as_posix(),
+            context.acquisition_contract_path.relative_to(context.root).as_posix(),
+        )
+    except ValueError as exc:
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED", "source authority paths differ", (), 4
+        ) from exc
+    if pair == _HISTORICAL_AUTHORITY_PAIR:
+        return "historical"
+    if pair == _SUPERSEDING_565534_AUTHORITY_PAIR:
+        return "superseding_565534"
+    if pair == _RECOVERY_SCHEDULE_CONFLICTS_AUTHORITY_PAIR:
+        return "recovery_schedule_conflicts"
+    raise FinalizationError(
+        "AUTHORITY_BLOCKED", "source authority path pair differs", (), 4
+    )
+
+
+def _recovery_checkpoint_binding(entry: object) -> dict[str, object]:
+    return {
+        "game_pk": entry.game_pk,
+        "query_id": entry.query_id,
+        "query_sidecar": dict(entry.query_sidecar),
+        "success_receipt": dict(entry.success_receipt),
+        "retained_scheduled_start_utc": entry.retained_scheduled_start_utc,
+        "played_date": entry.played_date,
+        "result_available_on": entry.result_available_on,
+        "raw_object_sha256s": list(entry.raw_object_sha256s),
+        "selected_raw_game_object_sha256s_sha256": (
+            entry.selected_raw_game_object_sha256s_sha256
+        ),
+        "normalized_games_sha256": entry.normalized_games_sha256,
+        "sidecar_semantics_sha256": entry.sidecar_semantics_sha256,
+        "expected_derived_sidecar_sha256": entry.expected_derived_sidecar_sha256,
+    }
+
+
+def _recovery_disposition_payload_fields(
+    context: FinalizationContext, inventory: SourceInventory | None
+) -> dict[str, object]:
+    if inventory is None or context.snapshot_inputs is None or context.checkpoint is None:
+        raise FinalizationError(
+            "AUTHORITY_MISSING", "recovery disposition authority is missing", (), 3
+        )
+    catalog = inventory.schedule_conflict_dispositions
+    if not isinstance(catalog, RecoveryDispositionBindings):
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED", "recovery disposition catalog differs", (), 4
+        )
+    try:
+        fresh = catalog.reauthenticate()
+    except ValueError as exc:
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED", "recovery disposition catalog differs", (), 4
+        ) from exc
+    if not isinstance(fresh, RecoveryDispositionBindings) or fresh is catalog:
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED", "recovery disposition catalog differs", (), 4
+        )
+    expected = fresh.as_mapping()
+    query_ids = tuple(expected["query_ids"])
+    entries = fresh.entries
+    checkpoint_bindings = tuple(
+        _recovery_checkpoint_binding(entry) for entry in entries
+    )
+    availability_entries = tuple(
+        entry for entry in entries if entry.played_date is not None or entry.result_available_on is not None
+    )
+    replay = context.snapshot_inputs.replay
+    bindings = context.snapshot_inputs.bindings
+    if (
+        len(entries) != 3
+        or tuple(entry.game_pk for entry in entries) != (565534, 630882, 633224)
+        or any(
+            (entry.game_pk in {630882, 633224})
+            != (entry.played_date is not None and entry.result_available_on is not None)
+            for entry in entries
+        )
+        or len(availability_entries) != 2
+        or tuple(entry.game_pk for entry in availability_entries) != (630882, 633224)
+        or bindings.schedule_conflict_dispositions is None
+        or replay.recovery_dispositions is None
+        or bindings.schedule_conflict_dispositions.as_mapping() != expected
+        or replay.recovery_dispositions.as_mapping() != expected
+        or context.checkpoint.stage != "REMAINING"
+        or context.checkpoint.dispositioned_query_ids != query_ids
+        or tuple(context.checkpoint.recovery_disposition_bindings) != checkpoint_bindings
+        or any(
+            query_id not in context.checkpoint.completed_query_ids
+            for query_id in query_ids
+        )
+        or context.checkpoint.pending_query_ids
+        or context.checkpoint.quarantined_query_ids
+        or context.checkpoint.split_query_ids
+    ):
+        raise FinalizationError(
+            "AUTHORITY_BLOCKED", "recovery disposition authority differs", (), 4
+        )
+    return {"schedule_conflict_dispositions": expected}
+
+
 def _source_disposition_payload_fields(
     context: FinalizationContext, inventory: SourceInventory | None
 ) -> dict[str, object]:
-    """Return the closed superseding disposition binding for receipt payloads.
-
-    Old-run source receipts intentionally retain their existing byte shape.  A
-    SourceRunSpec, in contrast, cannot reach any mutation or evidence writer
-    unless the replay, inventory, and selected terminal checkpoint all carry
-    the same one-query disposition authority.
-    """
-    if not isinstance(context.run_spec, SourceRunSpec):
+    """Return the closed branch-specific disposition receipt binding."""
+    branch = _exact_authority_branch(context)
+    if branch == "historical":
         return {}
+    if branch == "recovery_schedule_conflicts":
+        authority = context.authority_context
+        if (
+            not isinstance(context.run_spec, SourceRunSpec)
+            or context.run_spec.run_id != _RECOVERY_RUN_ID
+            or not isinstance(authority, SourceAuthorityContext)
+            or authority.authority != context.run_spec
+            or authority.repository_root != context.root
+            or authority.authority_path != context.run_spec_path
+            or authority.acquisition_contract_path != context.acquisition_contract_path
+        ):
+            raise FinalizationError(
+                "AUTHORITY_BLOCKED", "recovery source authority differs", (), 4
+            )
+        return _recovery_disposition_payload_fields(context, inventory)
+    if branch != "superseding_565534" or not isinstance(context.run_spec, SourceRunSpec):
+        raise FinalizationError("AUTHORITY_BLOCKED", "source authority differs", (), 4)
     authority = context.authority_context
     if (
         not isinstance(authority, SourceAuthorityContext)
@@ -1039,6 +1174,7 @@ def _has_terminal_checkpoint(checkpoint: AcquisitionCheckpoint | None) -> bool:
         and checkpoint.stage == "REMAINING"
         and not checkpoint.pending_query_ids
         and not checkpoint.quarantined_query_ids
+        and not checkpoint.split_query_ids
     )
 
 
@@ -1165,8 +1301,10 @@ def run_preflight(context: FinalizationContext) -> PreflightReport:
         return PreflightReport(
             context.phase, "BLOCKED", None, 0, 0, context.blockers
         )
+    _source_disposition_payload_fields(context, context.inventory)
     first = inventory_bytes(context.inventory)
     rebound = _rebuild_context_inventory(context)
+    _source_disposition_payload_fields(context, rebound)
     second = inventory_bytes(rebound)
     if first != second:
         raise FinalizationError(

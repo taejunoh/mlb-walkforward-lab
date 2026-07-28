@@ -806,6 +806,7 @@ class _SourceInventoryPayload:
     duplicate_gamepk_disposition: Mapping[str, object] | None
     dispositioned_query_ids: tuple[str, ...]
     terminal_checkpoint: Mapping[str, object] | None
+    schedule_conflict_dispositions: Mapping[str, object] | None = None
 
 
 def _source_inventory_payload(
@@ -827,7 +828,75 @@ def _source_inventory_payload(
     query_ids = _sorted_string_list(
         payload.get("logical_query_ids"), "inventory query IDs"
     )
+    recovery_run = run_id == _RECOVERY_RUN_ID
     source_run = run_id == "historical_walkforward_500_superseding_565534"
+    if recovery_run:
+        if {"duplicate_gamepk_disposition", "dispositioned_query_ids"}.intersection(payload):
+            raise ValueError("recovery source inventory contains superseding disposition authority")
+        catalog = _exact_object(
+            payload.get("schedule_conflict_dispositions"),
+            frozenset({"entries", "query_ids"}),
+            "recovery source inventory disposition catalog",
+        )
+        entries = catalog.get("entries")
+        query_ids = _checkpoint_sorted_sha_list(
+            catalog.get("query_ids"), "recovery source inventory disposition query IDs"
+        )
+        if not isinstance(entries, list) or len(entries) != 3:
+            raise ValueError("recovery source inventory requires three disposition bindings")
+        expected_games = (565534, 630882, 633224)
+        normalized_entries: list[dict[str, object]] = []
+        for game_pk, entry in zip(expected_games, entries):
+            value = _exact_object(
+                entry,
+                frozenset({
+                    "game_pk", "query_id", "query_sidecar", "success_receipt",
+                    "retained_scheduled_start_utc", "played_date", "result_available_on",
+                    "raw_object_sha256s", "selected_raw_game_object_sha256s_sha256",
+                    "normalized_games_sha256", "sidecar_semantics_sha256",
+                }),
+                "recovery source inventory disposition binding",
+            )
+            if value.get("game_pk") != game_pk:
+                raise ValueError("recovery source inventory disposition catalog order differs")
+            query_id = value.get("query_id")
+            if not isinstance(query_id, str) or not _SHA256.fullmatch(query_id):
+                raise ValueError("recovery source inventory disposition query differs")
+            for name in ("query_sidecar", "success_receipt"):
+                _validate_binding_value(value.get(name), "recovery source inventory disposition binding")
+            if (
+                not isinstance(value.get("retained_scheduled_start_utc"), str)
+                or not isinstance(value.get("raw_object_sha256s"), list)
+                or not value["raw_object_sha256s"]
+                or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in value["raw_object_sha256s"])
+                or any(not isinstance(value.get(name), str) or not _SHA256.fullmatch(value[name]) for name in ("selected_raw_game_object_sha256s_sha256", "normalized_games_sha256", "sidecar_semantics_sha256"))
+            ):
+                raise ValueError("recovery source inventory disposition binding differs")
+            expected_available = {
+                565534: (None, None),
+                630882: ("2020-08-14", "2020-08-14"),
+                633224: ("2021-09-24", "2021-09-24"),
+            }[game_pk]
+            if (value.get("played_date"), value.get("result_available_on")) != expected_available:
+                raise ValueError("recovery source inventory availability binding differs")
+            normalized_entries.append(dict(value))
+        if query_ids != tuple(sorted(str(entry["query_id"]) for entry in normalized_entries)):
+            raise ValueError("recovery source inventory disposition query IDs differ")
+        terminal = _exact_object(
+            payload.get("terminal_checkpoint"),
+            frozenset({"path", "sha256", "sequence", "stage"}),
+            "recovery source inventory terminal checkpoint",
+        )
+        _validate_binding_value(
+            {"path": terminal.get("path"), "sha256": terminal.get("sha256")},
+            "recovery source inventory terminal checkpoint",
+        )
+        if type(terminal.get("sequence")) is not int or terminal.get("stage") != "REMAINING":
+            raise ValueError("recovery source inventory terminal checkpoint differs")
+        return _SourceInventoryPayload(
+            snapshots, query_ids, None, query_ids, dict(terminal),
+            {"entries": normalized_entries, "query_ids": list(query_ids)},
+        )
     disposition_present = {
         "duplicate_gamepk_disposition",
         "dispositioned_query_ids",
@@ -1079,6 +1148,21 @@ def _require_source_receipt_disposition(
     *,
     label: str,
 ) -> None:
+    if _is_recovery_source_run(authority):
+        present = {
+            "duplicate_gamepk_disposition",
+            "dispositioned_query_ids",
+            "schedule_conflict_dispositions",
+        }.intersection(payload)
+        if present != {"schedule_conflict_dispositions"}:
+            raise ValueError(f"{label} recovery disposition authority is incomplete")
+        if (
+            inventory.schedule_conflict_dispositions is None
+            or payload["schedule_conflict_dispositions"]
+            != inventory.schedule_conflict_dispositions
+        ):
+            raise ValueError(f"{label} recovery disposition authority differs")
+        return
     source_run = isinstance(authority, SourceRunSpec)
     fields = {"duplicate_gamepk_disposition", "dispositioned_query_ids"}
     present = fields.intersection(payload)
@@ -1318,6 +1402,38 @@ def _validate_sources_ready_evidence(
     dependent_snapshots: list[_ArtifactSnapshot] = (
         [inventory_schema] if inventory_schema is not None else []
     )
+    if _is_recovery_source_run(authority):
+        recovery_bindings, _ = _recovery_disposition_catalog_bindings(
+            _paths(root, authority),
+            authority,
+            _validate_binding_value(base["run_spec"], "run spec"),
+            _validate_binding_value(base["acquisition_contract"], "acquisition contract"),
+        )
+        expected_catalog = {
+            "entries": [
+                {
+                    key: value
+                    for key, value in binding.items()
+                    if key != "expected_derived_sidecar_sha256"
+                }
+                for binding in recovery_bindings
+            ],
+            "query_ids": sorted(str(binding["query_id"]) for binding in recovery_bindings),
+        }
+        if source_inventory.schedule_conflict_dispositions != expected_catalog:
+            raise ValueError("recovery source inventory disposition catalog differs")
+        for binding in recovery_bindings:
+            for key in ("query_sidecar", "success_receipt"):
+                item = _validate_binding_value(
+                    binding[key], "recovery source inventory disposition binding"
+                )
+                dependent_snapshots.append(
+                    _capture_artifact(
+                        root,
+                        root / str(item["path"]),
+                        "recovery source inventory disposition artifact",
+                    )
+                )
     if source_inventory.duplicate_gamepk_disposition is not None:
         dependent_snapshots.extend(
             _capture_verified_source_disposition(
@@ -5163,8 +5279,7 @@ def _require_source_terminal_disposition(
             checkpoint.dispositioned_query_ids, bindings
         )
         if (
-            checkpoint.stage != "STATIC_SCHEDULES"
-            or len(checkpoint.completed_query_ids) != 7
+            checkpoint.stage != "REMAINING"
             or checkpoint.pending_query_ids
             or checkpoint.quarantined_query_ids
             or checkpoint.split_query_ids
