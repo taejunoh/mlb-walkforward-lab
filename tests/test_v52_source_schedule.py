@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -1237,17 +1238,22 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
         cls._temporary.cleanup()
 
     def test_catalog_is_the_exact_gamepk_ordered_three_entry_set(self) -> None:
-        from mlb_backtest.v52_query_plan import build_static_batch
-
         entries = self.catalog.entries
         self.assertEqual(
             tuple(entry.game_pk for entry in entries), (565534, 630882, 633224)
         )
-        static = build_static_batch(self.run_spec, self.contract)
-        expected = tuple(
-            logical_query_id(query)
-            for query in static.queries
-            if query.endpoint.startswith("disposition://SCHEDULE_DUPLICATE_GAMEPK_")
+        self.assertEqual(
+            tuple(entry.query.endpoint for entry in entries),
+            (
+                "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+                "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+                "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+            ),
+        )
+        expected = (
+            "0e78edae7dfcb7341630a9d1882447ea3c980aad6b9e5def3b2948cb5736eef4",
+            "e37636eeed54bd168873c2430030eb587e4bb499ac90d95e94ef7e0625b9b1a8",
+            "fac8d359619c60238b0af63ca12b6d08f8f6372cf25a47e491d0ef4e566dc095",
         )
         self.assertEqual(self.catalog.query_ids(), expected)
         self.assertEqual(
@@ -1259,6 +1265,18 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
                 / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw"
             ).exists()
         )
+
+    def test_catalog_queries_are_immediately_deeply_immutable(self) -> None:
+        for authority in self.catalog.entries:
+            with self.subTest(game_pk=authority.game_pk):
+                query = authority.query
+                query_id = logical_query_id(query)
+                self.assertEqual(query, authority.semantics.query)
+                with self.assertRaises(TypeError):
+                    query.parameters["forged"] = True
+                with self.assertRaises(TypeError):
+                    query.requested_range["year"] = 1900
+                self.assertEqual(logical_query_id(query), query_id)
 
     def test_catalog_recomputes_exact_boundary_semantics_without_recovery_output(
         self,
@@ -1325,9 +1343,8 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
         )
         for semantics in changed_semantics:
             with self.subTest(semantics=semantics):
-                mutated = dataclasses.replace(authority, semantics=semantics)
                 with self.assertRaisesRegex(ValueError, "changed|differs|identity"):
-                    mutated.reauthenticate()
+                    dataclasses.replace(authority, semantics=semantics).reauthenticate()
 
     def test_reauthentication_rejects_nested_occurrence_parent_and_count_mutations(
         self,
@@ -1381,7 +1398,12 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
                 )
             )
         duplicate_entry = dataclasses.replace(
-            self.catalog.entries[1], query=self.catalog.entries[0].query
+            self.catalog.entries[1],
+            query=self.catalog.entries[0].query,
+            semantics=dataclasses.replace(
+                self.catalog.entries[1].semantics,
+                query=self.catalog.entries[0].query,
+            ),
         )
         duplicate = dataclasses.replace(
             self.catalog,
@@ -1404,6 +1426,7 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
 
     def test_stale_source_authority_is_materialized_without_mutating_evidence(self) -> None:
         from tests.v52_recovery_schedule_conflict_fixture import (
+            PARENT_RELATIVES,
             matching_source_authority_root,
         )
 
@@ -1416,18 +1439,102 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
             if path.is_file()
         )
         before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
-        materialized = matching_source_authority_root(ROOT, original)
-        self.assertNotEqual(materialized, original)
-        self.assertTrue(
-            (materialized / "data/v5_2_qd/historical/raw").is_dir()
-        )
-        self.assertFalse(
-            (materialized / "data/v5_2_qd/historical_superseding_565534/raw").exists()
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / "stale-source-authority"
+            shutil.copytree(
+                ROOT,
+                stale,
+                ignore=shutil.ignore_patterns(
+                    ".pytest_cache", ".ruff_cache", "__pycache__", ".task3-review.*"
+                ),
+            )
+            for relative in {
+                path.parent
+                for path in PARENT_RELATIVES["original_2019_565534"].values()
+            }:
+                shutil.copytree(original / relative, stale / relative)
+            stale_schema = stale / "schemas/v5_2_acquisition_contract.schema.json"
+            schema = json.loads(stale_schema.read_bytes())
+            schema["oneOf"] = schema["oneOf"][:-1]
+            stale_schema.write_text(
+                json.dumps(
+                    schema,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stale_before = hashlib.sha256(stale_schema.read_bytes()).hexdigest()
+            materialized = matching_source_authority_root(ROOT, stale)
+            self.assertNotEqual(materialized, stale)
+            self.assertTrue(
+                (materialized / "data/v5_2_qd/historical/raw").is_dir()
+            )
+            self.assertFalse(
+                (
+                    materialized
+                    / "data/v5_2_qd/historical_superseding_565534/raw"
+                ).exists()
+            )
+            self.assertEqual(
+                stale_before, hashlib.sha256(stale_schema.read_bytes()).hexdigest()
+            )
         self.assertEqual(
             before,
             {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected},
         )
+
+    def test_recovery_authority_fixture_ignores_hostile_git_environment_and_hooks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            side_effect = root / "hook-side-effect"
+            hooks = root / "hooks"
+            hooks.mkdir()
+            hook = hooks / "pre-commit"
+            hook.write_text(f"#!/bin/sh\ntouch {side_effect}\n", encoding="utf-8")
+            hook.chmod(0o755)
+            config = root / "hostile.gitconfig"
+            config.write_text(
+                f"[core]\n\thooksPath = {hooks}\n[init]\n\ttemplateDir = {hooks}\n",
+                encoding="utf-8",
+            )
+            protected = tuple(
+                path
+                for path in RECOVERY_PARENT_EVIDENCE_ROOT.glob(
+                    "data/v5_2_qd/**/mlb_schedule_game_feed/**/*"
+                )
+                if path.is_file()
+            )
+            before = {
+                path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root / "hostile-home"),
+                    "GIT_CONFIG_GLOBAL": str(config),
+                    "GIT_TEMPLATE_DIR": str(hooks),
+                    "GIT_ASKPASS": "/bin/false",
+                },
+                clear=False,
+            ):
+                recovery_authority_fixture(
+                    root / "fixture",
+                    parent_evidence_root=RECOVERY_PARENT_EVIDENCE_ROOT,
+                )
+            self.assertFalse(side_effect.exists())
+            self.assertEqual(
+                before,
+                {
+                    path: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in protected
+                },
+            )
 
 
 if __name__ == "__main__":

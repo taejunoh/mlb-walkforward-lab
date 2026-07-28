@@ -56,6 +56,10 @@ class RecoveryDispositionAuthority:
     query: LogicalQuery
     semantics: RecoveryDispositionSemantics
 
+    def __post_init__(self) -> None:
+        if self.query != self.semantics.query:
+            raise ValueError("recovery disposition authority query differs from semantics")
+
     @property
     def game_pk(self) -> int:
         return self.semantics.game_pk
@@ -140,6 +144,26 @@ def _plain(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
     return value
+
+
+def _freeze_logical_query(query: LogicalQuery) -> LogicalQuery:
+    """Copy the Task 2 identity into JSON-compatible immutable mappings."""
+    if not isinstance(query, LogicalQuery):
+        raise TypeError("recovery disposition query must be a LogicalQuery")
+    parameters = _frozen(query.parameters)
+    requested_range = _frozen(query.requested_range)
+    return LogicalQuery(
+        source=query.source,
+        grain=query.grain,
+        endpoint=query.endpoint,
+        parameters=parameters,
+        requested_range=requested_range,
+        expected_media_type=query.expected_media_type,
+        parser_version=query.parser_version,
+        parent_query_id=query.parent_query_id,
+        run_spec_sha256=query.run_spec_sha256,
+        acquisition_contract_sha256=query.acquisition_contract_sha256,
+    )
 
 
 _SPECS = (
@@ -657,7 +681,7 @@ def build_recovery_schedule_conflict_catalog(
         context.authority_path, context.acquisition_contract_path
     )
     queries = {
-        query.endpoint: query
+        query.endpoint: _freeze_logical_query(query)
         for query in static.queries
         if query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS
     }

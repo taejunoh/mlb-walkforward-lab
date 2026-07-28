@@ -25,6 +25,20 @@ from mlb_backtest.v52_recovery_parent_evidence import (
 
 
 _TEST_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_SAFE_GIT_PATHS = (
+    Path("/usr/bin/git"),
+    Path("/opt/homebrew/bin/git"),
+    Path("/usr/local/bin/git"),
+)
+_GIT_EXECUTABLE = next(
+    (path for path in _SAFE_GIT_PATHS if path.is_file() and os.access(path, os.X_OK)),
+    None,
+)
+if _GIT_EXECUTABLE is None:  # pragma: no cover - supported runners have Git.
+    raise RuntimeError("a system Git executable is required for recovery fixtures")
+_SAFE_PATH = os.pathsep.join(
+    (str(_GIT_EXECUTABLE.parent), "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+)
 SOURCE_AUTHORITY_ROOT_ENV = "MLB_V52_SOURCE_AUTHORITY_ROOT"
 RECOVERY_PARENT_EVIDENCE_ROOT_ENV = "MLB_V52_RECOVERY_PARENT_EVIDENCE_ROOT"
 ORIGINAL_PARENT_TREE = (
@@ -72,6 +86,51 @@ GOLDEN_PARENT_TREE_FINGERPRINTS = MappingProxyType(
 
 class ParentEvidenceConfigurationError(RuntimeError):
     """The exact immutable parent authority was not configured for this runner."""
+
+
+def _git_run(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    home: Path,
+    capture_output: bool = False,
+    text: bool = False,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    """Run Git with no inherited configuration, hooks, templates, or filters."""
+    home.mkdir(parents=True, exist_ok=True)
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "HOME": str(home),
+            "PATH": _SAFE_PATH,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return subprocess.run(
+        [
+            str(_GIT_EXECUTABLE),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "init.templateDir=",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+            *arguments,
+        ],
+        cwd=cwd,
+        check=True,
+        env=environment,
+        capture_output=capture_output,
+        text=text,
+    )
 
 
 def _has_fixed_parent_evidence(root: Path) -> bool:
@@ -141,15 +200,16 @@ def _has_original_2019_evidence(root: Path) -> bool:
     )
 
 
-def _git_head(root: Path) -> str | None:
+def _git_head(root: Path, *, home: Path) -> str | None:
     try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+        completed = _git_run(
+            ["rev-parse", "HEAD"],
             cwd=root,
-            check=True,
+            home=home,
             text=True,
             capture_output=True,
-        ).stdout.strip()
+        )
+        return completed.stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
 
@@ -157,8 +217,12 @@ def _git_head(root: Path) -> str | None:
 def _is_matching_source_authority(checkout_root: Path, candidate: Path) -> bool:
     if not _has_original_2019_evidence(candidate):
         return False
-    if _git_head(checkout_root) != _git_head(candidate):
-        return False
+    with tempfile.TemporaryDirectory(
+        prefix="v52-git-head-", dir=checkout_root.parent
+    ) as directory:
+        home = Path(directory) / "home"
+        if _git_head(checkout_root, home=home) != _git_head(candidate, home=home):
+            return False
     try:
         from mlb_backtest.v52_query_plan import _load_static_contracts
 
@@ -209,9 +273,14 @@ def matching_source_authority_root(
         prefix="v52-source-authority-", dir=checkout.parent
     )
     repository = Path(temporary.name) / "repo"
+    git_home = Path(temporary.name) / "home"
     try:
-        subprocess.run(["git", "clone", "-q", checkout, repository], check=True)
-        if _git_head(repository) != _git_head(checkout):
+        _git_run(
+            ["clone", "--no-local", "-q", str(checkout), str(repository)],
+            cwd=Path(temporary.name),
+            home=git_home,
+        )
+        if _git_head(repository, home=git_home) != _git_head(checkout, home=git_home):
             raise ParentEvidenceConfigurationError(
                 "materialized source authority HEAD differs from the supplied checkout"
             )
@@ -242,6 +311,7 @@ def recovery_authority_fixture(
     import mlb_backtest.v52_query_plan as query_plan
 
     repository = (destination / "repo").resolve()
+    git_home = repository.parent / ".git-home"
     root = _TEST_REPOSITORY_ROOT
     design = Path(
         "docs/superpowers/specs/2026-07-28-v5-2-schedule-conflict-recovery-run-design.md"
@@ -270,20 +340,22 @@ def recovery_authority_fixture(
         _canonical_json_bytes(protocols.expected_recovery_source_run())
     )
     populate_isolated_parent_evidence(repository, parent_evidence_root)
-    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "recovery@example.test"],
+    _git_run(["init", "-q"], cwd=repository, home=git_home)
+    _git_run(
+        ["config", "--local", "user.email", "recovery@example.test"],
         cwd=repository,
-        check=True,
+        home=git_home,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Recovery Test"], cwd=repository, check=True
-    )
-    subprocess.run(["git", "add", "."], cwd=repository, check=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "recovery authority fixture"],
+    _git_run(
+        ["config", "--local", "user.name", "Recovery Test"],
         cwd=repository,
-        check=True,
+        home=git_home,
+    )
+    _git_run(["add", "."], cwd=repository, home=git_home)
+    _git_run(
+        ["commit", "-qm", "recovery authority fixture"],
+        cwd=repository,
+        home=git_home,
     )
 
     contract = json.loads(source_contract.read_bytes())
@@ -311,11 +383,11 @@ def recovery_authority_fixture(
                 "execution_audit": "audit/v5_2_qd/historical_recovery_schedule_conflicts/execution",
             },
             "bindings": {
-                "approved_design": _binding(repository, design, "sha256"),
+                "approved_design": _binding(repository, design, "sha256", git_home),
                 "implementation_plan": _binding(
-                    repository, plan, "working_tree_sha256"
+                    repository, plan, "working_tree_sha256", git_home
                 ),
-                "run_spec": _binding(repository, run_relative, "sha256"),
+                "run_spec": _binding(repository, run_relative, "sha256", git_home),
             },
         }
     )
@@ -338,12 +410,14 @@ def _canonical_json_bytes(value: object) -> bytes:
     )
 
 
-def _binding(repository: Path, relative: Path, digest_key: str) -> dict[str, str]:
+def _binding(
+    repository: Path, relative: Path, digest_key: str, git_home: Path
+) -> dict[str, str]:
     contents = (repository / relative).read_bytes()
-    blob = subprocess.run(
-        ["git", "rev-parse", f"HEAD:{relative.as_posix()}"],
+    blob = _git_run(
+        ["rev-parse", f"HEAD:{relative.as_posix()}"],
         cwd=repository,
-        check=True,
+        home=git_home,
         text=True,
         capture_output=True,
     ).stdout.strip()
