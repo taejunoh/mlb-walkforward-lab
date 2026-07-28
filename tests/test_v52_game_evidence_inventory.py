@@ -1645,6 +1645,50 @@ class V52GameEvidenceInventoryTest(unittest.TestCase):
             ):
                 jsonschema.validate(candidate, schema)
 
+class RecoveryGameInventorySchemaTests(unittest.TestCase):
+    def test_private_recovery_adapter_hash_is_not_projected(self) -> None:
+        from mlb_backtest.v52_game_evidence_inventory import (
+            _replace_recovery_disposition_lineage,
+        )
+
+        adapter = "a" * 64
+        published = "b" * 64
+        snapshot = {
+            "games": [
+                {
+                    "season": 2019,
+                    "played": False,
+                    "schedule_query_sidecar_sha256": adapter,
+                    "source_game_sha256": "c" * 64,
+                }
+            ],
+            "grain": "season_game_evidence_snapshot",
+            "schema_version": 1,
+            "source_query_sidecar_sha256s": [adapter],
+        }
+        rebound = _replace_recovery_disposition_lineage(
+            snapshot, {2019: (adapter, published)}
+        )
+        self.assertEqual(
+            rebound["games"][0]["schedule_query_sidecar_sha256"], published
+        )
+        self.assertNotIn(adapter, rebound["source_query_sidecar_sha256s"])
+        self.assertEqual(rebound["source_query_sidecar_sha256s"], [published])
+
+    def test_schema_has_closed_recovery_binding_branch(self) -> None:
+        schema = json.loads(SCHEMA.read_bytes())
+        branches = schema["oneOf"]
+        recovery = next(
+            branch
+            for branch in branches
+            if branch.get("properties", {}).get("run_id", {}).get("const")
+            == "historical_walkforward_500_recovery_schedule_conflicts"
+        )
+        self.assertEqual(
+            recovery["properties"]["dispositioned_query_ids"]["minItems"], 3
+        )
+        self.assertIn("schedule_conflict_dispositions", recovery["required"])
+
 
 if __name__ == "__main__":
     unittest.main()

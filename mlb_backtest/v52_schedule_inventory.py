@@ -23,6 +23,7 @@ from .v52_evidence import (
 )
 from .v52_query_plan import (
     _ACQUISITION_CONTRACT_RELATIVE,
+    _RECOVERY_RUN_SPEC_RELATIVE,
     _RUN_SPEC_RELATIVE,
     _SOURCE_RUN_SPEC_RELATIVE,
     _load_query_batch_for_authority,
@@ -30,6 +31,8 @@ from .v52_query_plan import (
     _read_repository_file,
     _validate_run_bound_acquisition_contract,
 )
+from .v52_schedule_conflict_recovery_disposition import RecoveryDispositionBinding
+from .v52_source_contracts import canonical_json_bytes
 from .v52_sources.schedule import recompute_schedule_anchor_sidecar
 
 
@@ -40,6 +43,7 @@ _BATCH_RELATIVE = Path("audit/v5_2_qd/historical/acquisition/query_batches")
 _ARTIFACT_KIND = "SCHEDULE_ANCHOR_INVENTORY"
 _RUN_ID = "historical_walkforward_500"
 _SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts"
 _SEASONS = tuple(range(2018, 2025))
 _MAX_INVENTORY_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -82,6 +86,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "venue_ids",
     }
 )
+_RECOVERY_TOP_LEVEL_KEYS = _TOP_LEVEL_KEYS | {"schedule_conflict_dispositions"}
 _SEASON_SOURCE_KEYS = frozenset(
     {
         "game_count",
@@ -121,6 +126,61 @@ class _ScheduleAuthority:
     run_id: str
     raw_root: Path
     acquisition_audit_root: Path
+
+
+@dataclass(frozen=True)
+class RecoveryDispositionBindings:
+    """Exact, reauthenticated Task 4 disposition evidence for recovery only."""
+
+    entries: tuple[
+        RecoveryDispositionBinding,
+        RecoveryDispositionBinding,
+        RecoveryDispositionBinding,
+    ]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.entries, tuple)
+            or len(self.entries) != 3
+            or not all(isinstance(entry, RecoveryDispositionBinding) for entry in self.entries)
+            or tuple(entry.game_pk for entry in self.entries) != (565534, 630882, 633224)
+        ):
+            raise ValueError("recovery disposition bindings differ")
+
+    def query_ids(self) -> tuple[str, str, str]:
+        return tuple(entry.query_id for entry in self.entries)
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            "entries": [
+                {
+                    "game_pk": entry.game_pk,
+                    "query_id": entry.query_id,
+                    "query_sidecar": dict(entry.query_sidecar),
+                    "success_receipt": dict(entry.success_receipt),
+                    "retained_scheduled_start_utc": entry.retained_scheduled_start_utc,
+                    "played_date": entry.played_date,
+                    "result_available_on": entry.result_available_on,
+                    "raw_object_sha256s": list(entry.raw_object_sha256s),
+                    "selected_raw_game_object_sha256s_sha256": entry.selected_raw_game_object_sha256s_sha256,
+                    "normalized_games_sha256": entry.normalized_games_sha256,
+                    "sidecar_semantics_sha256": entry.sidecar_semantics_sha256,
+                }
+                for entry in self.entries
+            ],
+            "query_ids": list(sorted(self.query_ids())),
+        }
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, object],
+        bindings: Sequence[RecoveryDispositionBinding],
+    ) -> "RecoveryDispositionBindings":
+        expected = cls(tuple(bindings))  # type: ignore[arg-type]
+        if canonical_json_bytes(value) != canonical_json_bytes(expected.as_mapping()):
+            raise ValueError("recovery disposition bindings differ")
+        return expected
 
 
 def _load_required_source_checkpoint(
@@ -288,7 +348,9 @@ def _authenticate(
             acquisition_audit_root=root / _INVENTORY_RELATIVE.parent,
         )
     run_relative = (
-        _SOURCE_RUN_SPEC_RELATIVE
+        _RECOVERY_RUN_SPEC_RELATIVE
+        if isinstance(run_spec, SourceRunSpec) and run_spec.run_id == _RECOVERY_RUN_ID
+        else _SOURCE_RUN_SPEC_RELATIVE
         if isinstance(run_spec, SourceRunSpec)
         else _RUN_SPEC_RELATIVE
     )
@@ -360,6 +422,8 @@ def _derived_source_binding(
     verified: VerifiedEvidenceRead,
     anchors: Sequence[Mapping[str, object]],
     occurrence_counts: Mapping[str, int],
+    *,
+    season: int = 2019,
 ) -> dict[str, object]:
     published = verified.published_evidence
     if published.storage_mode != "DERIVED_DISPOSITION" or published.raw_sha256 is not None:
@@ -385,7 +449,7 @@ def _derived_source_binding(
         "query_id": logical_query_id(query),
         "query_sidecar": sidecar_binding,
         "raw_sha256": None,
-        "season": 2019,
+        "season": season,
         "storage_mode": "DERIVED_DISPOSITION",
         "success_receipt": receipt_binding,
         "unplayed_game_count": len(anchors) - played_count,
@@ -500,6 +564,87 @@ def _derived_projection_anchors(
     return anchors, projection.occurrence_counts
 
 
+def _recovery_projection_anchors(
+    root: Path,
+    authority: object,
+    context: object,
+) -> tuple[list[dict[str, object]], Mapping[str, int]]:
+    """Project one Task 4 parent schedule after its closed suppressions."""
+    from .v52_schedule_conflict_recovery_disposition import (
+        RecoveryDispositionAuthority,
+    )
+
+    if not isinstance(authority, RecoveryDispositionAuthority):
+        raise TypeError("recovery schedule disposition authority differs")
+    disposition_semantics = authority.semantics.expected_sidecar_semantics
+    if not isinstance(disposition_semantics, Mapping):
+        raise ValueError("recovery schedule disposition semantics differ")
+    suppressed = disposition_semantics.get("suppressed_occurrences")
+    if suppressed is None:
+        suppressed = [disposition_semantics.get("suppressed_occurrence")]
+    if not isinstance(suppressed, list) or not suppressed:
+        raise ValueError("recovery schedule suppressed occurrences differ")
+    positions: list[tuple[int, int]] = []
+    for item in suppressed:
+        if not isinstance(item, Mapping):
+            raise ValueError("recovery schedule suppressed occurrence differs")
+        date_index = item.get("date_index")
+        game_index = item.get("game_index")
+        if (
+            isinstance(date_index, bool)
+            or not isinstance(date_index, int)
+            or date_index < 0
+            or isinstance(game_index, bool)
+            or not isinstance(game_index, int)
+            or game_index < 0
+        ):
+            raise ValueError("recovery schedule suppressed occurrence differs")
+        positions.append((date_index, game_index))
+    parent = disposition_semantics.get("old_authority")
+    raw = parent.get("raw") if isinstance(parent, Mapping) else None
+    raw_path = raw.get("path") if isinstance(raw, Mapping) else None
+    if not isinstance(raw_path, str):
+        raise ValueError("recovery schedule parent raw binding differs")
+    raw_bytes = _read_repository_file(root, Path(raw_path), "recovery schedule parent raw")
+    try:
+        payload = json.loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("recovery schedule parent raw differs") from exc
+    dates = payload.get("dates") if isinstance(payload, dict) else None
+    if not isinstance(dates, list) or not isinstance(payload.get("totalGames"), int):
+        raise ValueError("recovery schedule parent raw differs")
+    for date_index, game_index in sorted(positions, reverse=True):
+        try:
+            date_entry = dates[date_index]
+            games = date_entry["games"]
+            del games[game_index]
+            date_entry["totalGames"] -= 1
+            payload["totalGames"] -= 1
+        except (IndexError, KeyError, TypeError) as exc:
+            raise ValueError("recovery schedule suppressed occurrence differs") from exc
+    filtered = canonical_json_bytes(payload)
+    sidecar = recompute_schedule_anchor_sidecar(filtered, authority.query, context=context)
+    sidecar_semantics = sidecar.get("semantics")
+    anchors = (
+        sidecar_semantics.get("anchors")
+        if isinstance(sidecar_semantics, Mapping)
+        else None
+    )
+    counts = disposition_semantics.get("occurrence_counts")
+    if not isinstance(anchors, list) or not isinstance(counts, Mapping):
+        raise ValueError("recovery schedule projection differs")
+    bound = _bind_raw_game_object_sha256s(
+        [dict(anchor) for anchor in anchors if isinstance(anchor, Mapping)],
+        _selected_raw_game_object_sha256s(filtered),
+    )
+    if len(bound) != len(anchors):
+        raise ValueError("recovery schedule projection differs")
+    special = [anchor for anchor in bound if anchor["game_pk"] == authority.game_pk]
+    if len(special) != 1 or special[0]["scheduled_start_utc"] != authority.semantics.retained_scheduled_start_utc:
+        raise ValueError("recovery schedule retained anchor differs")
+    return bound, dict(counts)
+
+
 def build_schedule_anchor_provenance(
     anchors: Sequence[Mapping[str, object]],
 ) -> Mapping[int, Mapping[str, object]]:
@@ -554,9 +699,15 @@ def _validate_binding(value: object, label: str) -> None:
 
 
 def _validate_payload(
-    payload: object, *, run_id: str = _RUN_ID
+    payload: object,
+    *,
+    run_id: str = _RUN_ID,
+    recovery_bindings: Sequence[RecoveryDispositionBinding] | None = None,
 ) -> dict[str, object]:
-    if not isinstance(payload, dict) or set(payload) != _TOP_LEVEL_KEYS:
+    expected_top_level_keys = (
+        _RECOVERY_TOP_LEVEL_KEYS if run_id == _RECOVERY_RUN_ID else _TOP_LEVEL_KEYS
+    )
+    if not isinstance(payload, dict) or set(payload) != expected_top_level_keys:
         raise ValueError("schedule inventory top-level keys differ")
     if (
         payload.get("artifact_kind") != _ARTIFACT_KIND
@@ -583,7 +734,9 @@ def _validate_payload(
     per_season: dict[int, list[dict[str, object]]] = {season: [] for season in _SEASONS}
     for index, anchor in enumerate(anchors):
         expected_anchor_keys = (
-            _SOURCE_ANCHOR_KEYS if run_id == _SOURCE_RUN_ID else _OLD_ANCHOR_KEYS
+            _SOURCE_ANCHOR_KEYS
+            if run_id in {_SOURCE_RUN_ID, _RECOVERY_RUN_ID}
+            else _OLD_ANCHOR_KEYS
         )
         if not isinstance(anchor, dict) or set(anchor) != expected_anchor_keys:
             raise ValueError("schedule inventory anchor keys differ")
@@ -600,7 +753,7 @@ def _validate_payload(
         game_pks.add(game_pk)
         if type(anchor.get("played")) is not bool:
             raise ValueError("schedule inventory played partition differs")
-        if run_id == _SOURCE_RUN_ID and (
+        if run_id in {_SOURCE_RUN_ID, _RECOVERY_RUN_ID} and (
             not isinstance(anchor.get("raw_game_object_sha256"), str)
             or _SHA256.fullmatch(anchor["raw_game_object_sha256"]) is None
         ):
@@ -633,6 +786,24 @@ def _validate_payload(
             or retained[0].get("raw_game_object_sha256") != RETAINED_OBJECT_SHA256
         ):
             raise ValueError("schedule inventory retained 565534 anchor differs")
+    if run_id == _RECOVERY_RUN_ID:
+        if recovery_bindings is None:
+            raise ValueError("recovery disposition bindings are required")
+        bindings = RecoveryDispositionBindings.from_mapping(
+            payload.get("schedule_conflict_dispositions"), recovery_bindings
+        )
+        by_game = {entry.game_pk: entry for entry in bindings.entries}
+        for game_pk in (565534, 630882, 633224):
+            matches = [anchor for anchor in anchors if anchor["game_pk"] == game_pk]
+            binding = by_game[game_pk]
+            if (
+                len(matches) != 1
+                or matches[0].get("scheduled_start_utc")
+                != binding.retained_scheduled_start_utc
+                or matches[0].get("raw_game_object_sha256")
+                not in binding.raw_object_sha256s
+            ):
+                raise ValueError("schedule inventory retained recovery anchor differs")
 
     team_ids = payload.get("team_ids")
     venue_ids = payload.get("venue_ids")
@@ -653,8 +824,11 @@ def _validate_payload(
         raise ValueError("schedule inventory requires exactly seven season sources")
     for season, source in zip(_SEASONS, season_sources, strict=True):
         derived_2019 = run_id == _SOURCE_RUN_ID and season == 2019
+        recovery_derived = run_id == _RECOVERY_RUN_ID and season in {2019, 2020, 2021}
         expected_keys = (
-            _DERIVED_SEASON_SOURCE_KEYS if derived_2019 else _SEASON_SOURCE_KEYS
+            _DERIVED_SEASON_SOURCE_KEYS
+            if derived_2019 or recovery_derived
+            else _SEASON_SOURCE_KEYS
         )
         if not isinstance(source, dict) or set(source) != expected_keys:
             raise ValueError("schedule inventory season source keys differ")
@@ -678,6 +852,22 @@ def _validate_payload(
                 or source.get("storage_mode") != "DERIVED_DISPOSITION"
                 or source.get("raw_sha256") is not None
                 or source.get("occurrence_counts") != dict(EXPECTED_OCCURRENCE_COUNTS)
+            )
+        elif recovery_derived:
+            if recovery_bindings is None:
+                raise ValueError("recovery disposition bindings are required")
+            binding = next(
+                entry
+                for entry in RecoveryDispositionBindings(tuple(recovery_bindings)).entries
+                if entry.game_pk == {2019: 565534, 2020: 630882, 2021: 633224}[season]
+            )
+            invalid = (
+                common_invalid
+                or source.get("storage_mode") != "DERIVED_DISPOSITION"
+                or source.get("raw_sha256") is not None
+                or source.get("query_id") != binding.query_id
+                or source.get("query_sidecar") != dict(binding.query_sidecar)
+                or source.get("success_receipt") != dict(binding.success_receipt)
             )
         else:
             invalid = (
@@ -732,7 +922,10 @@ def build_schedule_anchor_inventory(
     derived_verified: VerifiedEvidenceRead | None = None
     derived_anchors: list[dict[str, object]] | None = None
     derived_occurrence_counts: Mapping[str, int] | None = None
-    if isinstance(run_spec, SourceRunSpec):
+    recovery_catalog = None
+    recovery_bindings: tuple[RecoveryDispositionBinding, ...] | None = None
+    recovery_authorities: dict[str, object] = {}
+    if isinstance(run_spec, SourceRunSpec) and context.run_id == _SOURCE_RUN_ID:
         from .v52_duplicate_gamepk_disposition import (
             build_duplicate_disposition_authority,
         )
@@ -750,6 +943,25 @@ def build_schedule_anchor_inventory(
             static_batch_id=batch.batch_id,
             disposition_query_id=logical_query_id(disposition_authority.query),
         )
+    elif context.run_id == _RECOVERY_RUN_ID:
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+
+        recovery_catalog = build_recovery_schedule_conflict_catalog(
+            root, context.authority_path, context.acquisition_contract_path
+        )
+        recovery_bindings = load_recovery_disposition_bindings(recovery_catalog)
+        recovery_authorities = {
+            logical_query_id(entry.query): entry for entry in recovery_catalog.entries
+        }
+        if set(recovery_authorities) != {
+            logical_query_id(query)
+            for query in batch.queries
+            if query.endpoint.startswith("disposition://")
+        }:
+            raise ValueError("recovery static batch disposition queries differ")
 
     store = (
         V52EvidenceStore.open_read_only(_absolute(evidence_root))
@@ -764,8 +976,13 @@ def build_schedule_anchor_inventory(
             if disposition_authority is not None and query == disposition_authority.query
             else None
         )
+        recovery_authority = recovery_authorities.get(logical_query_id(query))
+        if authority is not None and recovery_authority is not None:
+            raise AssertionError("schedule disposition authority branch overlaps")
         try:
-            verified = store.read_verified_success(query, authority=authority)
+            verified = store.read_verified_success(
+                query, authority=authority or recovery_authority
+            )
         except FileNotFoundError as exc:
             raise RuntimeError("schedule verified success is missing") from exc
         if authority is not None:
@@ -787,6 +1004,25 @@ def build_schedule_anchor_inventory(
             derived_occurrence_counts = occurrence_counts
             all_anchors.extend(anchors)
             continue
+        if recovery_authority is not None:
+            anchors, occurrence_counts = _recovery_projection_anchors(
+                root, recovery_authority, context
+            )
+            if verified.raw_bytes is not None:
+                raise ValueError("recovery derived schedule success must not expose raw bytes")
+            season_sources.append(
+                _derived_source_binding(
+                    root,
+                    evidence_relative,
+                    query,
+                    verified,
+                    anchors,
+                    occurrence_counts,
+                    season=int(query.requested_range["year"]),
+                )
+            )
+            all_anchors.extend(anchors)
+            continue
         if verified.published_evidence.storage_mode not in {
             "FETCHED_RAW",
             "PROTECTED_LEGACY_REFERENCE",
@@ -794,7 +1030,11 @@ def build_schedule_anchor_inventory(
             raise ValueError("schedule success is not fetched or protected evidence")
         if verified.raw_bytes is None:
             raise ValueError("schedule success lacks verified raw bytes")
-        recomputed = recompute_schedule_anchor_sidecar(verified.raw_bytes, query)
+        recomputed = recompute_schedule_anchor_sidecar(
+            verified.raw_bytes,
+            query,
+            context=context if context.run_id == _RECOVERY_RUN_ID else None,
+        )
         if recomputed != verified.query_sidecar:
             raise ValueError("schedule sidecar differs from raw recomputation")
         semantics = recomputed.get("semantics")
@@ -852,8 +1092,14 @@ def build_schedule_anchor_inventory(
         "team_ids": team_ids,
         "venue_ids": venue_ids,
     }
-    validated = _validate_payload(payload, run_id=context.run_id)
-    if isinstance(run_spec, SourceRunSpec):
+    if recovery_bindings is not None:
+        payload["schedule_conflict_dispositions"] = RecoveryDispositionBindings(
+            tuple(recovery_bindings)
+        ).as_mapping()
+    validated = _validate_payload(
+        payload, run_id=context.run_id, recovery_bindings=recovery_bindings
+    )
+    if isinstance(run_spec, SourceRunSpec) and context.run_id == _SOURCE_RUN_ID:
         if (
             disposition_authority is None
             or source_checkpoint is None
@@ -890,6 +1136,16 @@ def build_schedule_anchor_inventory(
         )
         if rebound_checkpoint != source_checkpoint:
             raise ValueError("schedule disposition checkpoint changed before return")
+    if recovery_catalog is not None:
+        from .v52_schedule_conflict_recovery_disposition import (
+            load_recovery_disposition_bindings,
+        )
+
+        rebound = load_recovery_disposition_bindings(recovery_catalog)
+        if RecoveryDispositionBindings(tuple(rebound)).as_mapping() != payload[
+            "schedule_conflict_dispositions"
+        ]:
+            raise ValueError("recovery disposition bindings changed before return")
     return validated
 
 
@@ -1173,6 +1429,7 @@ def load_verified_schedule_anchor_inventory(
 
 
 __all__ = [
+    "RecoveryDispositionBindings",
     "VerifiedScheduleAnchorInventory",
     "build_schedule_anchor_inventory",
     "build_schedule_anchor_provenance",

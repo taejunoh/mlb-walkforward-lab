@@ -2219,6 +2219,9 @@ _SCHEDULE_INVENTORY_KEYS = frozenset(
         "venue_ids",
     }
 )
+_RECOVERY_SCHEDULE_INVENTORY_KEYS = _SCHEDULE_INVENTORY_KEYS | {
+    "schedule_conflict_dispositions"
+}
 _SOURCE_SCHEDULE_ANCHOR_KEYS = frozenset(
     {
         "alternate_site",
@@ -2302,26 +2305,39 @@ def _validated_schedule_inventory_anchors(
         != inventory_sha256
     ):
         raise ValueError("schedule inventory SHA-256 differs from canonical bytes")
-    if set(anchor_inventory) != _SCHEDULE_INVENTORY_KEYS:
-        raise ValueError("schedule inventory top-level keys differ")
     run_id = anchor_inventory.get("run_id")
     source_branch = run_id == _SOURCE_RUN_ID
+    recovery_branch = run_id == _RECOVERY_RUN_ID
+    if set(anchor_inventory) != (
+        _RECOVERY_SCHEDULE_INVENTORY_KEYS
+        if recovery_branch
+        else _SCHEDULE_INVENTORY_KEYS
+    ):
+        raise ValueError("schedule inventory top-level keys differ")
     if (
         anchor_inventory.get("artifact_kind") != "SCHEDULE_ANCHOR_INVENTORY"
         or anchor_inventory.get("schema_version") != 1
-        or run_id not in {"historical_walkforward_500", _SOURCE_RUN_ID}
+        or run_id not in {"historical_walkforward_500", _SOURCE_RUN_ID, _RECOVERY_RUN_ID}
     ):
         raise ValueError("schedule inventory identity differs")
     expected_run_path = (
-        _SOURCE_RUN_SPEC_RELATIVE if source_branch else _RUN_SPEC_RELATIVE
+        _RECOVERY_RUN_SPEC_RELATIVE
+        if recovery_branch
+        else _SOURCE_RUN_SPEC_RELATIVE
+        if source_branch
+        else _RUN_SPEC_RELATIVE
     ).as_posix()
     expected_contract_path = (
-        _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+        _RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        if recovery_branch
+        else _SOURCE_ACQUISITION_CONTRACT_RELATIVE
         if source_branch
         else _ACQUISITION_CONTRACT_RELATIVE
     ).as_posix()
     batch_root = (
-        Path("audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches")
+        _RECOVERY_ACQUISITION_BATCH_ROOT
+        if recovery_branch
+        else Path("audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches")
         if source_branch
         else _ACQUISITION_BATCH_ROOT
     )
@@ -2373,7 +2389,7 @@ def _validated_schedule_inventory_anchors(
     for raw in raw_anchors:
         expected_anchor_keys = (
             _SOURCE_SCHEDULE_ANCHOR_KEYS
-            if source_branch
+            if source_branch or recovery_branch
             else _OLD_SCHEDULE_ANCHOR_KEYS
         )
         if not isinstance(raw, Mapping) or set(raw) != expected_anchor_keys:
@@ -2398,7 +2414,7 @@ def _validated_schedule_inventory_anchors(
             raise ValueError("schedule inventory anchor season differs")
         if type(raw.get("played")) is not bool:
             raise ValueError("schedule inventory anchor played differs")
-        if source_branch:
+        if source_branch or recovery_branch:
             _validate_sha256(
                 raw.get("raw_game_object_sha256"),
                 "schedule inventory raw-object provenance",
@@ -2475,9 +2491,10 @@ def _validated_schedule_inventory_anchors(
         raise ValueError("schedule inventory season sources differ")
     for season, source in zip(range(2018, 2025), sources, strict=True):
         derived_2019 = source_branch and season == 2019
+        recovery_derived = recovery_branch and season in {2019, 2020, 2021}
         expected_keys = (
             _DERIVED_SCHEDULE_SOURCE_KEYS
-            if derived_2019
+            if derived_2019 or recovery_derived
             else _SCHEDULE_SOURCE_KEYS
         )
         if not isinstance(source, Mapping) or set(source) != expected_keys:
@@ -2506,6 +2523,12 @@ def _validated_schedule_inventory_anchors(
                 != dict(EXPECTED_OCCURRENCE_COUNTS)
             ):
                 raise ValueError("schedule inventory derived 2019 source differs")
+        elif recovery_derived:
+            if (
+                source.get("storage_mode") != "DERIVED_DISPOSITION"
+                or source.get("raw_sha256") is not None
+            ):
+                raise ValueError("recovery schedule inventory derived source differs")
         else:
             if source.get("storage_mode") not in {
                 "FETCHED_RAW",
@@ -2720,6 +2743,20 @@ def build_schedule_reference_batch(
         contract_binding, Mapping
     ):
         raise ValueError("verified schedule inventory authority bindings differ")
+    if authority_branch.recovery:
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+            load_recovery_disposition_bindings,
+        )
+        from .v52_schedule_inventory import RecoveryDispositionBindings
+
+        catalog = build_recovery_schedule_conflict_catalog(
+            repository_root, run_spec_path, acquisition_contract_path
+        )
+        RecoveryDispositionBindings.from_mapping(
+            verified.payload.get("schedule_conflict_dispositions"),
+            load_recovery_disposition_bindings(catalog),
+        )
     return _build_schedule_reference_batch_from_inventory(
         verified.payload,
         inventory_sha256=verified.sha256,
@@ -2866,12 +2903,28 @@ def _validate_reference_batch_authority(
 ) -> None:
     if batch.stage != "REFERENCE_INPUTS":
         return
+    batch_root = _batch_root_for_batch(repository_root, batch)
     expected = (
-        _load_source_reference_batch_authority(
+        build_schedule_reference_batch(
+            repository_root,
+            repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+            acquisition_contract_path=repository_root
+            / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            static_batch_id=build_static_batch(
+                repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+                repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            ).batch_id,
+            evidence_root=_load_static_contracts(
+                repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+                repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            ).raw_root,
+            read_only_progress=read_only_progress,
+        )
+        if batch_root == _RECOVERY_ACQUISITION_BATCH_ROOT
+        else _load_source_reference_batch_authority(
             repository_root, read_only_progress=read_only_progress
         )
-        if _batch_root_for_batch(repository_root, batch)
-        == _SOURCE_ACQUISITION_BATCH_ROOT
+        if batch_root == _SOURCE_ACQUISITION_BATCH_ROOT
         else _load_fixed_reference_batch_authority(
             repository_root, read_only_progress=read_only_progress
         )

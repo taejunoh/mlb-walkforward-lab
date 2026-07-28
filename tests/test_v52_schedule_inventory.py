@@ -1415,7 +1415,11 @@ class V52ScheduleInventoryTest(unittest.TestCase):
         }
         self.assertEqual(
             set(by_run),
-            {"historical_walkforward_500", "historical_walkforward_500_superseding_565534"},
+            {
+                "historical_walkforward_500",
+                "historical_walkforward_500_superseding_565534",
+                "historical_walkforward_500_recovery_schedule_conflicts",
+            },
         )
         old_branch = by_run["historical_walkforward_500"]
         source_branch = by_run["historical_walkforward_500_superseding_565534"]
@@ -1431,6 +1435,75 @@ class V52ScheduleInventoryTest(unittest.TestCase):
             source_season["properties"]["storage_mode"]["enum"],
             ["FETCHED_RAW", "DERIVED_DISPOSITION"],
         )
+        recovery_branch = by_run[
+            "historical_walkforward_500_recovery_schedule_conflicts"
+        ]
+        self.assertEqual(
+            recovery_branch["required"], ["schedule_conflict_dispositions"]
+        )
+
+class RecoveryDispositionBindingsTests(unittest.TestCase):
+    def test_mapping_requires_exact_three_canonically_ordered_bindings(self) -> None:
+        from mlb_backtest.v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionBinding,
+        )
+        from mlb_backtest.v52_schedule_inventory import RecoveryDispositionBindings
+
+        def binding(game_pk: int, query_id: str) -> RecoveryDispositionBinding:
+            return RecoveryDispositionBinding(
+                game_pk=game_pk,
+                query_id=query_id,
+                query_sidecar={"path": f"sidecars/{query_id}.json", "sha256": "a" * 64},
+                success_receipt={"path": f"queries/{query_id}/success.json", "sha256": "b" * 64},
+                retained_scheduled_start_utc="2020-08-14T21:05:00Z",
+                played_date=None,
+                result_available_on=None,
+                raw_object_sha256s=("c" * 64,),
+                selected_raw_game_object_sha256s_sha256="d" * 64,
+                normalized_games_sha256="e" * 64,
+                sidecar_semantics_sha256="f" * 64,
+                expected_derived_sidecar_sha256="0" * 64,
+            )
+
+        entries = (
+            binding(565534, "b" * 64),
+            binding(630882, "a" * 64),
+            binding(633224, "c" * 64),
+        )
+        expected = RecoveryDispositionBindings(entries)
+        mapping = expected.as_mapping()
+        self.assertEqual(mapping["query_ids"], ["a" * 64, "b" * 64, "c" * 64])
+        self.assertEqual(
+            RecoveryDispositionBindings.from_mapping(mapping, entries), expected
+        )
+        reordered = copy.deepcopy(mapping)
+        reordered["entries"].reverse()
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(reordered, entries)
+        missing = copy.deepcopy(mapping)
+        del missing["entries"]
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(missing, entries)
+        extra = copy.deepcopy(mapping)
+        extra["extra"] = True
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(extra, entries)
+        copied = copy.deepcopy(mapping)
+        copied["entries"][1]["success_receipt"] = copied["entries"][0][
+            "success_receipt"
+        ]
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(copied, entries)
+        cross_run = copy.deepcopy(mapping)
+        cross_run["entries"][0]["query_sidecar"]["path"] = (
+            "other-run/sidecar.json"
+        )
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(cross_run, entries)
+        stale = copy.deepcopy(mapping)
+        stale["entries"][2]["sidecar_semantics_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "bindings differ"):
+            RecoveryDispositionBindings.from_mapping(stale, entries)
 
 
 if __name__ == "__main__":
