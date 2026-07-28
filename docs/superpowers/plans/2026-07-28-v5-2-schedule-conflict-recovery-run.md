@@ -214,18 +214,19 @@ RECOVERY_DISPOSITION_ENDPOINTS = (
 )
 
 @dataclass(frozen=True)
-class RecoveryDispositionBinding:
+class RecoveryDispositionSemantics:
     game_pk: int
-    query_id: str
-    query_sidecar: Mapping[str, str]
-    success_receipt: Mapping[str, str]
+    query: LogicalQuery
+    expected_sidecar_semantics: Mapping[str, object]
+    sidecar_semantics_sha256: str
+    expected_derived_sidecar: Mapping[str, object]
+    expected_derived_sidecar_sha256: str
     retained_scheduled_start_utc: str
     played_date: str | None
     result_available_on: str | None
     raw_object_sha256s: tuple[str, ...]
     selected_raw_game_object_sha256s_sha256: str
     normalized_games_sha256: str
-    sidecar_semantics_sha256: str
 
 @dataclass(frozen=True)
 class RecoveryDispositionAuthority:
@@ -235,12 +236,14 @@ class RecoveryDispositionAuthority:
     parent_catalog: RecoveryParentCatalog
     evidence_root: Path
     query: LogicalQuery
-    game_pk: int
-    played_date: str | None
-    result_available_on: str | None
+    semantics: RecoveryDispositionSemantics
+
+    @property
+    def game_pk(self) -> int:
+        return self.semantics.game_pk
 
     def sidecar_semantics(self) -> Mapping[str, object]:
-        return _recompute_catalog_semantics(self.parent_catalog, self.game_pk)
+        return self.semantics.expected_sidecar_semantics
 
     def reauthenticate(self) -> "RecoveryDispositionAuthority":
         return build_recovery_schedule_conflict_catalog(
@@ -257,29 +260,36 @@ class RecoveryDispositionCatalog:
     def for_query(self, query: LogicalQuery) -> RecoveryDispositionAuthority:
         return next(entry for entry in self.entries if entry.query == query)
 
-    def bindings(self) -> tuple[RecoveryDispositionBinding, RecoveryDispositionBinding, RecoveryDispositionBinding]:
-        return tuple(_binding_for(entry) for entry in self.entries)
+    def query_ids(self) -> tuple[str, str, str]:
+        return tuple(logical_query_id(entry.query) for entry in self.entries)
 ```
 
 `entries` is permanently in gamePk order `(565534, 630882, 633224)`. Every
-checkpoint `dispositioned_query_ids` is the separately sorted tuple of the three
-`binding.query_id` values. Validate all exact object indices/digests/counts.
+checkpoint `dispositioned_query_ids` is later the separately sorted tuple of the
+three catalog query IDs. Validate all exact object indices/digests/counts.
 Only 630882 emits `2020-08-14`; only 633224 emits `2021-09-24`; 565534 rejects
 both fields.
 
-`_binding_for()` recomputes every binding field from the authenticated parent
-catalog before returning it. Thus `retained_scheduled_start_utc`,
-`raw_object_sha256s`, `selected_raw_game_object_sha256s_sha256`,
-`normalized_games_sha256`, and `sidecar_semantics_sha256` are never caller
-inputs. This task also adds the three closed derived-disposition sidecar schema
-branches from these exact catalog semantics; it does not modify the ordinary
+The catalog recomputes `expected_sidecar_semantics`, its canonical digest, the
+complete canonical derived-sidecar payload and its SHA-256,
+`retained_scheduled_start_utc`, `raw_object_sha256s`,
+`selected_raw_game_object_sha256s_sha256`, `normalized_games_sha256`, and the
+availability fields from authenticated parents. These are never caller inputs.
+Each authority requires `query == semantics.query`; the catalog exposes that
+exact `LogicalQuery` identity and gamePk order, but it must not
+read, require, or synthesize a query-sidecar file, a `success.json`, or a
+published `RecoveryDispositionBinding`; publication begins only in Task 4.
+This task adds the three closed derived-disposition sidecar schema branches from
+the exact expected payload semantics. It does not modify the ordinary
 query-sidecar schema.
 
 - [ ] **Step 4: Run PASS**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_v52_source_schedule.RecoveryDispositionCatalogTests -v`
 
-Expected: PASS; changed index, digest, status, linkage, or boundary fails.
+Expected: PASS; changed query identity, index, digest, status, linkage, or
+boundary fails, and catalog construction succeeds with no recovery sidecar or
+success receipt present.
 
 - [ ] **Step 5: Commit**
 
@@ -291,10 +301,11 @@ git commit -m "feat: add recovery disposition catalog"
 ### Task 4: Use the real V52 evidence-store lease API for raw-less publication
 
 **Files:**
+- Modify: `mlb_backtest/v52_schedule_conflict_recovery_disposition.py`
 - Modify: `mlb_backtest/v52_evidence.py:2778,4391,4429,5237`
 - Modify: `mlb_backtest/v52_source_contracts.py:67,90`
 - Modify: `mlb_backtest/v52_acquire.py:1525,2092,3014,3552`
-- Modify: `tests/test_v52_evidence.py`, `tests/test_v52_acquire.py`
+- Modify: `tests/test_v52_source_schedule.py`, `tests/test_v52_evidence.py`, `tests/test_v52_acquire.py`
 
 The query-sidecar schema remains unchanged in this task. Task 4 validates the
 Task 3 derived-sidecar branches through the evidence-store lease API; it does
@@ -310,13 +321,25 @@ class RecoveryDerivedEvidenceTests(unittest.TestCase):
         with store.acquire_query(authority.query):
             published = store.publish_derived_disposition(authority.query, authority.sidecar_semantics(), authority=authority)
         self.assertIsNone(published.raw_sha256)
+
+    def test_published_binding_reauthenticates_catalog_and_evidence(self) -> None:
+        catalog = recovery_catalog()
+        for authority in catalog.entries:
+            store = V52EvidenceStore(authority.evidence_root)
+            with store.acquire_query(authority.query):
+                store.publish_derived_disposition(
+                    authority.query, authority.sidecar_semantics(), authority=authority
+                )
+        bindings = load_recovery_disposition_bindings(catalog)
+        self.assertEqual(tuple(item.query_id for item in bindings), catalog.query_ids())
 ```
 
 - [ ] **Step 2: Run RED**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_v52_evidence.RecoveryDerivedEvidenceTests -v`
 
-Expected: FAIL because derived admission recognizes only the old singleton authority.
+Expected: FAIL because derived admission recognizes only the old singleton
+authority and no published-binding loader exists.
 
 - [ ] **Step 3: Extend exact authority dispatch**
 
@@ -332,18 +355,58 @@ if query.endpoint in RECOVERY_DISPOSITION_ENDPOINTS:
         raise ValueError("recovery schedule disposition rebind differs")
 ```
 
+```python
+@dataclass(frozen=True)
+class RecoveryDispositionBinding:
+    game_pk: int
+    query_id: str
+    query_sidecar: Mapping[str, str]
+    success_receipt: Mapping[str, str]
+    retained_scheduled_start_utc: str
+    played_date: str | None
+    result_available_on: str | None
+    raw_object_sha256s: tuple[str, ...]
+    selected_raw_game_object_sha256s_sha256: str
+    normalized_games_sha256: str
+    sidecar_semantics_sha256: str
+    expected_derived_sidecar_sha256: str
+
+def load_recovery_disposition_bindings(
+    catalog: RecoveryDispositionCatalog,
+) -> tuple[RecoveryDispositionBinding, RecoveryDispositionBinding, RecoveryDispositionBinding]:
+    return tuple(
+        _load_published_recovery_binding(catalog.for_game_pk(game_pk))
+        for game_pk in (565534, 630882, 633224)
+    )
+```
+
 Use this guard in `_admit_derived_authority`, `_derived_semantics`, and `recompute_query_sidecar`. Publication remains inside `with store.acquire_query(query):`; reauthenticate immediately before `success.json`. Cleanup removes only a newly-owned sidecar inode.
+
+After `publish_derived_disposition()` has succeeded, define
+`RecoveryDispositionBinding` and `load_recovery_disposition_bindings(catalog)`.
+Each binding joins one reauthenticated Task 3 semantics entry to the actual
+Task 4 query-sidecar path/SHA-256 and `success.json` path/SHA-256, retaining its
+Task 3 semantics digest, expected complete-sidecar digest, selected-object
+digest, raw-object digest tuple, and availability fields. The loader reads all
+three evidence records with the same
+no-follow/path/inode/hash checks, verifies each sidecar's canonical bytes equal
+the catalog expectation, verifies `success.json` is raw-less, and returns only
+the permanently gamePk-ordered triple. A retry returns the same triple only
+when both published files are byte-identical; a changed parent, sidecar,
+receipt, or final-rebind race fails closed.
 
 - [ ] **Step 4: Run PASS**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_v52_evidence tests.test_v52_acquire -v`
 
-Expected: PASS; no raw object, attempt, reservation, retry, or network operation is created for any catalog entry.
+Expected: PASS; no raw object, attempt, reservation, retry, or network operation
+is created for any catalog entry; only post-publication loading yields the three
+published bindings, and idempotence/race reauthentication failures are closed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mlb_backtest/v52_evidence.py mlb_backtest/v52_source_contracts.py mlb_backtest/v52_acquire.py tests/test_v52_evidence.py tests/test_v52_acquire.py
+git add mlb_backtest/v52_schedule_conflict_recovery_disposition.py mlb_backtest/v52_evidence.py mlb_backtest/v52_source_contracts.py mlb_backtest/v52_acquire.py tests/test_v52_source_schedule.py tests/test_v52_evidence.py tests/test_v52_acquire.py
 git commit -m "feat: publish recovery dispositions under a lease"
 ```
 
@@ -443,14 +506,17 @@ Expected: FAIL because the writer validates one singleton disposition.
 - [ ] **Step 3: Implement recovery-only catalog binding**
 
 ```python
-def _validate_recovery_disposition_population(ids: Sequence[str], catalog: RecoveryDispositionCatalog) -> tuple[str, str, str]:
-    expected = tuple(sorted(binding.query_id for binding in catalog.bindings()))
+def _validate_recovery_disposition_population(
+    ids: Sequence[str], bindings: Sequence[RecoveryDispositionBinding]
+) -> tuple[str, str, str]:
+    expected = tuple(sorted(binding.query_id for binding in bindings))
     if tuple(ids) != expected:
         raise ValueError("recovery checkpoint dispositioned query IDs differ")
     return expected
 ```
 
-Call this only for a recovery checkpoint after at least one disposition is
+Load the published bindings through the Task 4 reauthenticator before calling
+this for a recovery checkpoint after at least one disposition is
 completed. `publish_acquisition_checkpoint()` receives `dispositioned_query_ids=()`
 only for the genesis STATIC_SCHEDULES checkpoint with seven pending IDs. Its
 post-publication and later loader path calls `_validate_recovery_disposition_population`
@@ -537,9 +603,10 @@ class RecoveryDispositionBindings:
 
     @classmethod
     def from_mapping(
-        cls, value: Mapping[str, object], catalog: RecoveryDispositionCatalog
+        cls, value: Mapping[str, object],
+        bindings: Sequence[RecoveryDispositionBinding],
     ) -> "RecoveryDispositionBindings":
-        expected = cls(catalog.bindings())
+        expected = cls(tuple(bindings))
         if canonical_json_bytes(value) != canonical_json_bytes(expected.as_mapping()):
             raise ValueError("recovery disposition bindings differ")
         return expected
@@ -550,9 +617,11 @@ acquisition_contract_path, static_batch_id, evidence_root, read_only_progress=Fa
 and its matching loader. Require seven season sources, retained anchors for
 565534/630882/633224, and no child edge derived from a suppressed object.
 `from_mapping()` rejects an omitted/extra key, noncanonical key order, a
-reordered entry, or any field that differs from `catalog.bindings()`; it returns
-only the freshly reauthenticated projection. Reference-batch construction reads
-the binding catalog only after authenticated inventory loading. This task owns
+reordered entry, or any field that differs from the Task 4 published bindings;
+it returns only the freshly reauthenticated published-binding projection.
+Reference-batch
+construction reads the Task 4 bindings only after authenticated inventory
+loading. This task owns
 the closed schedule-anchor and game-evidence inventory schema branches; Task 8
 adds their boundary-bearing subbranches once the availability model exists.
 
@@ -595,7 +664,9 @@ class RecoveryAvailabilityTests(unittest.TestCase):
         self.assertNotIn(633224, visible_game_pks(recovery_history_for(633224), date(2021, 9, 24)))
 
     def test_boundary_rejects_changed_or_cross_bound_catalog_fields(self) -> None:
-        bindings = RecoveryDispositionBindings(recovery_catalog().bindings())
+        bindings = RecoveryDispositionBindings(
+            load_recovery_disposition_bindings(recovery_catalog())
+        )
         with self.assertRaisesRegex(ValueError, "availability boundary"):
             _availability_date({**recovery_game(630882), "result_available_on": "2020-08-13"}, bindings)
         with self.assertRaisesRegex(ValueError, "availability boundary"):
