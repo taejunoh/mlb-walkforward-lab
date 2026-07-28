@@ -11,6 +11,7 @@ import shutil
 import hashlib
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 from types import MappingProxyType
 
@@ -128,6 +129,109 @@ def populate_isolated_parent_evidence(destination: Path, source: Path = ROOT) ->
         directories.add(quarantine.parent)
     for relative in sorted(directories):
         shutil.copytree(source / relative, destination / relative)
+
+
+_MATERIALIZED_SOURCE_AUTHORITIES: list[tempfile.TemporaryDirectory[str]] = []
+
+
+def _has_original_2019_evidence(root: Path) -> bool:
+    return root.is_dir() and all(
+        (root / relative).is_file()
+        for relative in PARENT_RELATIVES["original_2019_565534"].values()
+    )
+
+
+def _git_head(root: Path) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _is_matching_source_authority(checkout_root: Path, candidate: Path) -> bool:
+    if not _has_original_2019_evidence(candidate):
+        return False
+    if _git_head(checkout_root) != _git_head(candidate):
+        return False
+    try:
+        from mlb_backtest.v52_query_plan import _load_static_contracts
+
+        _load_static_contracts(
+            candidate
+            / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            candidate
+            / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _copy_original_2019_evidence(destination: Path, source: Path) -> None:
+    directories = {
+        relative.parent
+        for relative in PARENT_RELATIVES["original_2019_565534"].values()
+    }
+    for relative in sorted(directories):
+        shutil.copytree(source / relative, destination / relative)
+
+
+def matching_source_authority_root(
+    checkout_root: Path = _TEST_REPOSITORY_ROOT,
+    evidence_root: Path | None = None,
+) -> Path:
+    """Return a current-HEAD source authority without changing old evidence.
+
+    An exact current authority is used directly.  A configured old authority is
+    evidence-only: this helper clones the current committed checkout and copies
+    only the authenticated 2019 parent files needed by the old 565534 tests.
+    """
+    checkout = Path(checkout_root).resolve()
+    configured = evidence_root
+    if configured is None:
+        raw = os.environ.get(SOURCE_AUTHORITY_ROOT_ENV)
+        configured = Path(raw) if raw else checkout
+    evidence = Path(configured).resolve()
+    if not _has_original_2019_evidence(evidence):
+        raise ParentEvidenceConfigurationError(
+            "immutable 2019 source evidence is absent; set "
+            f"{SOURCE_AUTHORITY_ROOT_ENV} to an exact evidence root"
+        )
+    if _is_matching_source_authority(checkout, evidence):
+        return evidence
+    temporary = tempfile.TemporaryDirectory(
+        prefix="v52-source-authority-", dir=checkout.parent
+    )
+    repository = Path(temporary.name) / "repo"
+    try:
+        subprocess.run(["git", "clone", "-q", checkout, repository], check=True)
+        if _git_head(repository) != _git_head(checkout):
+            raise ParentEvidenceConfigurationError(
+                "materialized source authority HEAD differs from the supplied checkout"
+            )
+        _copy_original_2019_evidence(repository, evidence)
+        from mlb_backtest.v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+
+        build_duplicate_disposition_authority(
+            repository,
+            source_run_spec_path=repository
+            / "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json",
+            acquisition_contract_path=repository
+            / "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json",
+        )
+    except Exception:
+        temporary.cleanup()
+        raise
+    _MATERIALIZED_SOURCE_AUTHORITIES.append(temporary)
+    return repository
 
 
 def recovery_authority_fixture(
@@ -253,6 +357,7 @@ def _binding(repository: Path, relative: Path, digest_key: str) -> dict[str, str
 __all__ = [
     "ORIGINAL_PARENT_TREE",
     "GOLDEN_PARENT_TREE_FINGERPRINTS",
+    "matching_source_authority_root",
     "PARENT_RELATIVES",
     "ParentEvidenceConfigurationError",
     "ROOT",

@@ -30,15 +30,24 @@ from mlb_backtest.v52_duplicate_gamepk_disposition import (
     publish_duplicate_gamepk_disposition,
     project_schedule_occurrences,
 )
-from tests.v52_recovery_schedule_conflict_fixture import recovery_authority_fixture
+from tests.v52_recovery_schedule_conflict_fixture import (
+    matching_source_authority_root,
+    recovery_authority_fixture,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_AUTHORITY_ROOT = Path(
+CONFIGURED_SOURCE_AUTHORITY_ROOT = Path(
     os.environ.get("MLB_V52_SOURCE_AUTHORITY_ROOT", str(ROOT))
 ).resolve()
+SOURCE_AUTHORITY_ROOT = matching_source_authority_root(
+    ROOT, CONFIGURED_SOURCE_AUTHORITY_ROOT
+)
 RECOVERY_PARENT_EVIDENCE_ROOT = Path(
-    os.environ.get("MLB_V52_RECOVERY_PARENT_EVIDENCE_ROOT", str(SOURCE_AUTHORITY_ROOT))
+    os.environ.get(
+        "MLB_V52_RECOVERY_PARENT_EVIDENCE_ROOT",
+        str(CONFIGURED_SOURCE_AUTHORITY_ROOT),
+    )
 ).resolve()
 FIXTURES = ROOT / "tests/fixtures/v5_2_qd/sources"
 SCHEMA = ROOT / "schemas/v5_2_season_source_snapshot.schema.json"
@@ -1320,6 +1329,46 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "changed|differs|identity"):
                     mutated.reauthenticate()
 
+    def test_reauthentication_rejects_nested_occurrence_parent_and_count_mutations(
+        self,
+    ) -> None:
+        authority = self.catalog.for_game_pk(630882)
+        cases: dict[str, tuple[tuple[str, ...], object]] = {
+            "occurrence_index": (
+                ("suppressed_occurrence", "date_index"),
+                18,
+            ),
+            "parent_registration_path": (
+                ("old_authority", "query_registration", "path"),
+                "data/forged/query.json",
+            ),
+            "parent_raw_hash": (
+                ("old_authority", "raw", "sha256"),
+                "0" * 64,
+            ),
+            "occurrence_status": (
+                ("fixed_game_facts", "terminal_status"),
+                "Scheduled",
+            ),
+            "occurrence_count": (
+                ("occurrence_counts", "projected_occurrences"),
+                971,
+            ),
+        }
+        for label, (path, replacement) in cases.items():
+            with self.subTest(label=label):
+                semantics = _plain_json(authority.semantics.expected_sidecar_semantics)
+                target = semantics
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = replacement
+                changed = dataclasses.replace(
+                    authority.semantics,
+                    expected_sidecar_semantics=semantics,
+                )
+                with self.assertRaisesRegex(ValueError, "changed|differs|identity"):
+                    dataclasses.replace(authority, semantics=changed).reauthenticate()
+
     def test_lookup_fails_closed_for_unknown_or_duplicate_identity(self) -> None:
         import dataclasses
 
@@ -1352,6 +1401,33 @@ class RecoveryDispositionCatalogTests(unittest.TestCase):
             sidecar["semantics"]["unexpected"] = True
             with self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(sidecar, schema)
+
+    def test_stale_source_authority_is_materialized_without_mutating_evidence(self) -> None:
+        from tests.v52_recovery_schedule_conflict_fixture import (
+            matching_source_authority_root,
+        )
+
+        original = CONFIGURED_SOURCE_AUTHORITY_ROOT
+        protected = tuple(
+            path
+            for path in original.glob(
+                "data/v5_2_qd/historical/**/mlb_schedule_game_feed/**/*"
+            )
+            if path.is_file()
+        )
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
+        materialized = matching_source_authority_root(ROOT, original)
+        self.assertNotEqual(materialized, original)
+        self.assertTrue(
+            (materialized / "data/v5_2_qd/historical/raw").is_dir()
+        )
+        self.assertFalse(
+            (materialized / "data/v5_2_qd/historical_superseding_565534/raw").exists()
+        )
+        self.assertEqual(
+            before,
+            {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected},
+        )
 
 
 if __name__ == "__main__":
