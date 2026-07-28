@@ -361,6 +361,84 @@ def _source_checkpoint_payload(
 
 
 class ExecutionRegistryTest(unittest.TestCase):
+    def test_recovery_checkpoint_catalog_artifacts_are_snapshot_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_spec = self.make_repo(Path(directory))
+            raw = root / "data/v5_2_qd/historical_recovery_schedule_conflicts/raw"
+
+            def artifact(relative: Path, contents: bytes) -> dict[str, str]:
+                path = raw / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+                return {
+                    "path": relative.as_posix(),
+                    "sha256": hashlib.sha256(contents).hexdigest(),
+                }
+
+            def registry_artifact(relative: Path, contents: bytes) -> dict[str, str]:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+                return {
+                    "path": relative.as_posix(),
+                    "sha256": hashlib.sha256(contents).hexdigest(),
+                }
+
+            catalog = []
+            for game_pk in (565534, 630882, 633224):
+                query_id = f"{game_pk:x}".ljust(64, "0")
+                catalog.append(
+                    {
+                        "query_sidecar": artifact(
+                            Path("queries/mlb_schedule_game_feed")
+                            / query_id
+                            / "sidecars/catalog.json",
+                            f"sidecar-{game_pk}".encode(),
+                        ),
+                        "success_receipt": artifact(
+                            Path("queries/mlb_schedule_game_feed")
+                            / query_id
+                            / "success.json",
+                            f"success-{game_pk}".encode(),
+                        ),
+                    }
+                )
+            semantic = {
+                "run_id": "historical_walkforward_500_recovery_schedule_conflicts",
+                "run_spec": registry_artifact(Path("registry/run.json"), b"run"),
+                "acquisition_contract": registry_artifact(
+                    Path("registry/contract.json"), b"contract"
+                ),
+                "execution_phase_receipt": registry_artifact(
+                    Path("registry/phase.json"), b"phase"
+                ),
+                "query_batches": [],
+                "query_evidence_receipts": [],
+                "stage_evidence_receipts": [],
+                "split_receipts": [],
+                "recovery_disposition_bindings": catalog,
+            }
+            paths = self.registry._paths(root, run_spec)
+            snapshots = self.registry._checkpoint_semantic_snapshots(paths, semantic)
+            self.assertEqual(len(snapshots), 9)
+
+            target = raw / Path(catalog[0]["query_sidecar"]["path"])
+            target.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "snapshot|artifact"):
+                self.registry._verify_artifact_snapshots(
+                    root, snapshots, "recovery checkpoint catalog"
+                )
+
+            target.write_bytes(b"sidecar-565534")
+            snapshots = self.registry._checkpoint_semantic_snapshots(paths, semantic)
+            replacement = target.with_suffix(".replacement")
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            with self.assertRaisesRegex(ValueError, "snapshot|artifact"):
+                self.registry._verify_artifact_snapshots(
+                    root, snapshots, "recovery checkpoint catalog"
+                )
+
     def test_recovery_static_checkpoint_requires_three_sorted_dispositions(
         self,
     ) -> None:

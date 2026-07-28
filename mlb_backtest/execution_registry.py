@@ -3891,6 +3891,33 @@ def _checkpoint_semantic_snapshots(
         for value in values:
             assert isinstance(value, Mapping)
             bindings.append(value)
+    if semantic.get("run_id") == _RECOVERY_RUN_ID:
+        recovery_bindings = semantic.get("recovery_disposition_bindings")
+        if not isinstance(recovery_bindings, list):
+            raise ValueError("recovery checkpoint disposition bindings differ")
+        for recovery_binding in recovery_bindings:
+            if not isinstance(recovery_binding, Mapping):
+                raise ValueError("recovery checkpoint disposition binding differs")
+            for key in ("query_sidecar", "success_receipt"):
+                artifact = recovery_binding.get(key)
+                if not isinstance(artifact, Mapping):
+                    raise ValueError("recovery checkpoint disposition binding differs")
+                relative = artifact.get("path")
+                digest = artifact.get("sha256")
+                if (
+                    not isinstance(relative, str)
+                    or not isinstance(digest, str)
+                    or not _SHA256.fullmatch(digest)
+                ):
+                    raise ValueError("recovery checkpoint disposition binding differs")
+                bindings.append(
+                    {
+                        "path": (
+                            Path(_RECOVERY_RAW_PREFIX) / relative
+                        ).as_posix(),
+                        "sha256": digest,
+                    }
+                )
     snapshots: list[_ArtifactSnapshot] = []
     seen: set[str] = set()
     for binding in bindings:
