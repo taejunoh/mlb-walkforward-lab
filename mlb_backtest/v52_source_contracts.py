@@ -87,6 +87,32 @@ def require_query(
         raise ValueError("query parser_version differs from v5.2.1")
 
 
+def require_schedule_query(
+    query: LogicalQuery,
+    *,
+    endpoint: str,
+    expected_media_type: str,
+) -> None:
+    """Validate the schedule grain while leaving generic v5.2.1 closed."""
+    if query.parser_version == "v5.2.1":
+        require_query(
+            query,
+            source="mlb_schedule_game_feed",
+            grain="season_schedule_and_game",
+            endpoint=endpoint,
+            expected_media_type=expected_media_type,
+        )
+        return
+    if (
+        query.parser_version != "v5.2.2"
+        or query.source != "mlb_schedule_game_feed"
+        or query.grain != "season_schedule_and_game"
+        or query.endpoint != endpoint
+        or query.expected_media_type != expected_media_type
+    ):
+        raise ValueError("schedule query authority differs")
+
+
 def recompute_query_sidecar(
     query: LogicalQuery, raw: bytes, *, authority: object | None = None
 ) -> Mapping[str, object]:
@@ -253,4 +279,5 @@ __all__ = [
     "query_sidecar",
     "recompute_query_sidecar",
     "require_query",
+    "require_schedule_query",
 ]

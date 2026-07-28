@@ -67,6 +67,12 @@ _ACQUISITION_CONTRACT_RELATIVE = Path(
 _SOURCE_ACQUISITION_CONTRACT_RELATIVE = Path(
     "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
 )
+_RECOVERY_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts.json"
+)
+_RECOVERY_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts.json"
+)
 _SOURCE_DISPOSITION_QUERY_ID = (
     "8b6f8fc8b99613d6af0b05aeff85b9547f62b78024809a1a8b6d13193409b095"
 )
@@ -79,6 +85,10 @@ _SOURCE_SCHEDULE_INVENTORY_RELATIVE = Path(
     "audit/v5_2_qd/historical_superseding_565534/acquisition/"
     "schedule_anchor_inventory.json"
 )
+_RECOVERY_SCHEDULE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical_recovery_schedule_conflicts/acquisition/"
+    "schedule_anchor_inventory.json"
+)
 _SCHEDULE_INVENTORY_SCHEMA_RELATIVE = Path(
     "schemas/v5_2_schedule_anchor_inventory.schema.json"
 )
@@ -86,6 +96,7 @@ _AUDIT_RELATIVE = Path("audit/v5_2_qd/historical")
 _SOURCE_AUDIT_RELATIVE = Path(
     "audit/v5_2_qd/historical_superseding_565534"
 )
+_RECOVERY_AUDIT_RELATIVE = Path("audit/v5_2_qd/historical_recovery_schedule_conflicts")
 _TIMEZONE_STAGE_EVIDENCE_LIMITS = (
     64 * 1024 * 1024,
     1024 * 1024,
@@ -101,6 +112,11 @@ def _request_authority_paths(
 ) -> tuple[Path, Path]:
     """Return the exact RunSpec/contract pair selected by this invocation."""
     if isinstance(request.run_spec, SourceRunSpec):
+        if request.run_spec == parse_source_run_spec(expected_recovery_source_run()):
+            return (
+                root / _RECOVERY_RUN_SPEC_RELATIVE,
+                root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            )
         return (
             root / _SOURCE_RUN_SPEC_RELATIVE,
             root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
@@ -112,6 +128,8 @@ def _request_authority_paths(
 
 def _authority_audit_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
     if isinstance(run_spec, SourceRunSpec):
+        if run_spec == parse_source_run_spec(expected_recovery_source_run()):
+            return _RECOVERY_AUDIT_RELATIVE
         return _SOURCE_AUDIT_RELATIVE
     if isinstance(run_spec, RunSpec):
         return _AUDIT_RELATIVE
@@ -120,6 +138,8 @@ def _authority_audit_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
 
 def _schedule_inventory_relative(run_spec: RunSpec | SourceRunSpec) -> Path:
     if isinstance(run_spec, SourceRunSpec):
+        if run_spec == parse_source_run_spec(expected_recovery_source_run()):
+            return _RECOVERY_SCHEDULE_INVENTORY_RELATIVE
         return _SOURCE_SCHEDULE_INVENTORY_RELATIVE
     if isinstance(run_spec, RunSpec):
         return _SCHEDULE_INVENTORY_RELATIVE
@@ -1009,13 +1029,9 @@ def _validate_request_contract(
     ):
         raise TrustIntegrityError("free-space reserve is below 20 GiB")
 
+    expected_run_path, expected_contract_path = _request_authority_paths(request, root)
     supplied_contract = (
-        root
-        / (
-            _SOURCE_ACQUISITION_CONTRACT_RELATIVE
-            if isinstance(request.run_spec, SourceRunSpec)
-            else _ACQUISITION_CONTRACT_RELATIVE
-        )
+        expected_contract_path
         if request.acquisition_contract_path is None
         else request.acquisition_contract_path
     )
@@ -1024,9 +1040,7 @@ def _validate_request_contract(
 
         try:
             context = _load_static_contracts(
-                root
-                / "protocols/v5_2_qd/"
-                "historical_walkforward_500_superseding_565534.json",
+                expected_run_path,
                 supplied_contract,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -4026,9 +4040,8 @@ def _cli_exact_run_spec(root: Path, supplied: Path) -> Path:
     candidate = _absolute_supplied(supplied, canonical_root)
     permitted = {
         canonical_root / _RUN_SPEC_RELATIVE,
-        canonical_root
-        / "protocols/v5_2_qd/"
-        "historical_walkforward_500_superseding_565534.json",
+        canonical_root / _SOURCE_RUN_SPEC_RELATIVE,
+        canonical_root / _RECOVERY_RUN_SPEC_RELATIVE,
     }
     if candidate not in permitted:
         raise TrustIntegrityError("run spec path differs from the frozen contract")
@@ -4051,7 +4064,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             run_spec = (
                 load_source_run_spec(run_spec_path)
-                if run_spec_path.name.endswith("_superseding_565534.json")
+                if run_spec_path
+                in {
+                    canonical_root / _SOURCE_RUN_SPEC_RELATIVE,
+                    canonical_root / _RECOVERY_RUN_SPEC_RELATIVE,
+                }
                 else load_run_spec(run_spec_path)
             )
         except (OSError, ValueError) as exc:

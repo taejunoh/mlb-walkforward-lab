@@ -8,7 +8,11 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 
-from ..source_parsers.schedule import parse_schedule, validate_schedule_query_coverage
+from ..source_parsers.schedule import (
+    parse_schedule,
+    parse_schedule_occurrences,
+    validate_schedule_query_coverage,
+)
 from ..v52_evidence import LogicalQuery, logical_query_id
 from ..v52_source_contracts import (
     QUERY_SIDECAR_KEYS,
@@ -16,6 +20,7 @@ from ..v52_source_contracts import (
     canonical_sha256,
     query_sidecar,
     require_query,
+    require_schedule_query,
 )
 
 
@@ -90,7 +95,7 @@ def _official_optional_bool(
     return value
 
 
-def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]:
+def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int, int]:
     payload = _json_object(raw, "schedule")
     total_games = payload.get("totalGames")
     if type(total_games) is not int or total_games < 0:
@@ -98,7 +103,6 @@ def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]
     dates = payload.get("dates")
     if not isinstance(dates, list):
         raise ValueError("schedule dates must be a list")
-    seen: set[int] = set()
     site_flags: dict[int, dict[str, bool]] = {}
     date_total_sum = 0
     for day in dates:
@@ -112,22 +116,23 @@ def _raw_schedule_metadata(raw: bytes) -> tuple[dict[int, dict[str, bool]], int]
             if not isinstance(game, dict) or game.get("gameType") != "R":
                 continue
             game_pk = _positive(game.get("gamePk"), "schedule gamePk")
-            if game_pk in seen:
-                raise ValueError("schedule contains duplicate gamePk")
-            seen.add(game_pk)
             neutral = _official_optional_bool(game, "neutralSite", "neutralSite")
             alternate = _official_optional_bool(
                 game, "isAlternateSite", "isAlternateSite"
             )
-            site_flags[game_pk] = {
+            flags = {
                 "alternate_site": alternate,
                 "neutral_site": neutral,
             }
+            prior = site_flags.setdefault(game_pk, flags)
+            if prior != flags:
+                raise ValueError("schedule duplicate gamePk site flags differ")
         if date_total != len(day["games"]):
             raise ValueError("schedule date totalGames differs from response population")
-    if total_games != date_total_sum or total_games != len(seen):
+    raw_occurrences = parse_schedule_occurrences(raw)
+    if total_games != date_total_sum or total_games != len(raw_occurrences):
         raise ValueError("schedule totalGames differs from exact parsed population")
-    return site_flags, total_games
+    return site_flags, total_games, len(raw_occurrences)
 
 
 def _schedule_range(query: LogicalQuery) -> tuple[int, date, date]:
@@ -154,21 +159,19 @@ def recompute_schedule_anchor_sidecar(
     raw: bytes, query: LogicalQuery
 ) -> Mapping[str, object]:
     """Seal a complete schedule response without depending on boxscores."""
-    require_query(
+    require_schedule_query(
         query,
-        source="mlb_schedule_game_feed",
-        grain="season_schedule_and_game",
         endpoint=_SCHEDULE_ENDPOINT,
         expected_media_type="application/json",
     )
     year, first, last = _schedule_range(query)
-    site_flags, declared_total = _raw_schedule_metadata(raw)
+    site_flags, declared_total, raw_occurrence_count = _raw_schedule_metadata(raw)
     validate_schedule_query_coverage(raw, first.isoformat(), last.isoformat())
     games = parse_schedule(raw)
     if not games:
         raise ValueError("schedule response contains no regular-season games")
-    if len(games) != declared_total:
-        raise ValueError("schedule parsed population differs from totalGames")
+    if raw_occurrence_count != declared_total:
+        raise ValueError("schedule raw occurrence population differs from totalGames")
     if any(
         not first <= _day(game["official_date"], "game official_date") <= last
         for game in games

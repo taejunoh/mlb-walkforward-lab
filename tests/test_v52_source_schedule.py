@@ -277,6 +277,66 @@ def _mutate_565534_predicate(
 
 
 class V52ScheduleSourceTest(unittest.TestCase):
+    def test_v522_preserves_raw_occurrences_before_normalized_selection(self) -> None:
+        """Changing raw duplicate accounting must not change normalized selection."""
+        from collections import Counter
+
+        from mlb_backtest.source_parsers.schedule import parse_schedule_occurrences
+
+        expected = {
+            2018: (2485, 2430, 53, 108, 55),
+            2022: (2479, 2430, 49, 98, 49),
+            2023: (2475, 2430, 45, 90, 45),
+            2024: (2469, 2430, 37, 76, 39),
+        }
+        for year, (raw_total, normalized, duplicate_ids, duplicate_members, extras) in expected.items():
+            with self.subTest(year=year):
+                duplicate_population = list(range(1, duplicate_ids + 1))
+                duplicate_population.extend(range(1, extras - duplicate_ids + 1))
+                game_pks = list(range(1, normalized + 1)) + duplicate_population
+                payload = {
+                    "totalGames": raw_total,
+                    "dates": [
+                        {
+                            "date": f"{year}-04-01",
+                            "totalGames": raw_total,
+                            "games": [
+                                {"gamePk": game_pk, "gameType": "R"}
+                                for game_pk in game_pks
+                            ],
+                        }
+                    ],
+                }
+                occurrences = parse_schedule_occurrences(
+                    json.dumps(payload, separators=(",", ":")).encode()
+                )
+                multiplicities = Counter(game["gamePk"] for game in occurrences)
+                self.assertEqual(
+                    (
+                        len(occurrences),
+                        len(multiplicities),
+                        sum(count > 1 for count in multiplicities.values()),
+                        sum(count for count in multiplicities.values() if count > 1),
+                        len(occurrences) - len(multiplicities),
+                    ),
+                    (raw_total, normalized, duplicate_ids, duplicate_members, extras),
+                )
+
+    def test_v522_accepts_ordinary_raw_duplicates_after_raw_count_validation(self) -> None:
+        from mlb_backtest.v52_sources.schedule import recompute_schedule_anchor_sidecar
+
+        payload = _schedule_payload()
+        payload["dates"][0]["games"].append(
+            copy.deepcopy(payload["dates"][0]["games"][0])
+        )
+        payload["dates"][0]["totalGames"] = 3
+        payload["totalGames"] = 3
+        query = dataclasses.replace(_query(), parser_version="v5.2.2")
+        sidecar = recompute_schedule_anchor_sidecar(
+            json.dumps(payload, separators=(",", ":")).encode(), query
+        )
+        self.assertEqual(sidecar["semantics"]["unique_game_count"], 2)
+
     def test_schedule_disposition_dispatch_requires_matching_authority_and_empty_raw(self) -> None:
         authority = build_duplicate_disposition_authority(
             SOURCE_AUTHORITY_ROOT,

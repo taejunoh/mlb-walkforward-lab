@@ -292,6 +292,27 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     }
 
 
+def parse_schedule_occurrences(path: str | Path | bytes) -> list[dict]:
+    """Return raw regular-season occurrences without reconciling duplicate IDs."""
+    try:
+        raw = path if isinstance(path, bytes) else Path(path).read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed schedule: expected UTF-8 JSON") from exc
+
+    root = _mapping(payload, "root")
+    dates = _list(root.get("dates"), "dates")
+    occurrences: list[dict] = []
+    for date_index, raw_date_entry in enumerate(dates):
+        date_entry = _mapping(raw_date_entry, f"dates[{date_index}]")
+        raw_games = _list(date_entry.get("games"), f"dates[{date_index}].games")
+        for game_index, raw_game in enumerate(raw_games):
+            game = _mapping(raw_game, f"dates[{date_index}].games[{game_index}]")
+            if game.get("gameType") == "R":
+                occurrences.append(game)
+    return occurrences
+
+
 def parse_schedule(path: str | Path | bytes) -> list[dict]:
     """Read a UTF-8 MLB schedule JSON file and normalize regular-season games."""
     try:

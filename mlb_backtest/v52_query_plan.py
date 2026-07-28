@@ -457,25 +457,64 @@ def _validate_static_schedule_stage(
             )
 
 
+RECOVERY_STATIC_QUERY_TABLE = (
+    (2018, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2019, "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534", "v5.2.2"),
+    (2020, "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882", "v5.2.2"),
+    (2021, "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224", "v5.2.2"),
+    (2022, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2023, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2024, _SCHEDULE_ENDPOINT, "v5.2.2"),
+)
 _RECOVERY_DISPOSITION_ENDPOINTS = {
-    2019: "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
-    2020: "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
-    2021: "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+    year: endpoint
+    for year, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE
+    if endpoint != _SCHEDULE_ENDPOINT
 }
+
+
+def _require_recovery_schedule_query(
+    query: LogicalQuery, context: SourceAuthorityContext
+) -> None:
+    """Permit v5.2.2 only under the exact authenticated recovery authority."""
+    from .v52_schedule_conflict_recovery_disposition import (
+        RECOVERY_DISPOSITION_ENDPOINTS,
+    )
+
+    table_dispositions = tuple(
+        endpoint
+        for _, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE
+        if endpoint != _SCHEDULE_ENDPOINT
+    )
+    if (
+        not isinstance(context.authority, SourceRunSpec)
+        or context.run_id != _RECOVERY_RUN_ID
+        or context.authority_path
+        != context.repository_root / _RECOVERY_RUN_SPEC_RELATIVE
+        or context.acquisition_contract_path
+        != context.repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        or query.run_spec_sha256 != context.authority_sha256
+        or query.acquisition_contract_sha256 != context.acquisition_contract_sha256
+        or query.parser_version != "v5.2.2"
+        or query.endpoint
+        not in {endpoint for _, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE}
+        or table_dispositions != RECOVERY_DISPOSITION_ENDPOINTS
+    ):
+        raise ValueError("recovery schedule query authority differs")
 
 
 def _validate_recovery_static_schedule_queries(
     queries: Sequence[LogicalQuery],
     *,
-    run_spec_sha256: str | None = None,
-    acquisition_contract_sha256: str | None = None,
+    context: SourceAuthorityContext | None = None,
 ) -> None:
     """Validate only the design-fixed recovery schedule query table."""
     if len(queries) != 7:
         raise ValueError("recovery STATIC_SCHEDULES requires exactly seven queries")
-    for query, year in zip(queries, range(2018, 2025), strict=True):
+    for query, (year, endpoint, parser_version) in zip(
+        queries, RECOVERY_STATIC_QUERY_TABLE, strict=True
+    ):
         first, last = SEASON_BOUNDARIES[year]
-        endpoint = _RECOVERY_DISPOSITION_ENDPOINTS.get(year, _SCHEDULE_ENDPOINT)
         expected_parameters: Mapping[str, object]
         if year in _RECOVERY_DISPOSITION_ENDPOINTS:
             expected_parameters = {}
@@ -499,19 +538,12 @@ def _validate_recovery_static_schedule_queries(
                 "end_date": last.isoformat(),
             }
             or query.expected_media_type != "application/json"
-            or query.parser_version != "v5.2.2"
+            or query.parser_version != parser_version
             or query.parent_query_id is not None
-            or (
-                run_spec_sha256 is not None
-                and query.run_spec_sha256 != run_spec_sha256
-            )
-            or (
-                acquisition_contract_sha256 is not None
-                and query.acquisition_contract_sha256
-                != acquisition_contract_sha256
-            )
         ):
             raise ValueError("recovery STATIC_SCHEDULES query table differs")
+        if context is not None:
+            _require_recovery_schedule_query(query, context)
 
 
 def _validate_remaining_stage(
@@ -1882,10 +1914,11 @@ def _build_recovery_static_schedule_queries(
     inputs: _StaticQueryInputs,
 ) -> tuple[LogicalQuery, ...]:
     queries: list[LogicalQuery] = []
-    for season in inputs.seasons:
-        endpoint = _RECOVERY_DISPOSITION_ENDPOINTS.get(
-            season.year, _SCHEDULE_ENDPOINT
-        )
+    for season, (year, endpoint, parser_version) in zip(
+        inputs.seasons, RECOVERY_STATIC_QUERY_TABLE, strict=True
+    ):
+        if season.year != year:
+            raise AssertionError("recovery static query table year differs")
         parameters: Mapping[str, object]
         if season.year in _RECOVERY_DISPOSITION_ENDPOINTS:
             parameters = {}
@@ -1909,7 +1942,7 @@ def _build_recovery_static_schedule_queries(
                     "end_date": season.last.isoformat(),
                 },
                 expected_media_type="application/json",
-                parser_version=inputs.schedule_parser_version,
+                parser_version=parser_version,
                 run_spec_sha256=inputs.run_spec_sha256,
                 acquisition_contract_sha256=inputs.acquisition_contract_sha256,
             )
@@ -3274,8 +3307,7 @@ def _validate_recovery_parser_batch(repository_root: Path, batch: QueryBatch) ->
     if any(query.parser_version == "v5.2.2" for query in batch.queries):
         _validate_recovery_static_schedule_queries(
             batch.queries,
-            run_spec_sha256=recovery_context.authority_sha256,
-            acquisition_contract_sha256=recovery_context.acquisition_contract_sha256,
+            context=recovery_context,
         )
 
 
