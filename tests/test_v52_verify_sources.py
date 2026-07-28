@@ -1028,6 +1028,99 @@ class RecoveryReplayCapabilityTests(unittest.TestCase):
                         attack, recovery_dispositions=capability
                     )
 
+    def test_recovery_decoder_requires_a_published_capability(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+
+        authority = _normalized_game_authority()
+        snapshot = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )[0].as_mapping()
+        entries, mapping, catalog, binding_type = self._recovery_bindings()
+        snapshot["run_id"] = "historical_walkforward_500_recovery_schedule_conflicts"
+        snapshot["schedule_conflict_dispositions"] = mapping
+        forged = json.loads(canonical_json_bytes(snapshot))
+        forged["schedule_conflict_dispositions"]["entries"][1]["query_sidecar"][
+            "sha256"
+        ] = "f" * 64
+
+        for candidate in (snapshot, forged):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                ValueError, "availability capability is required"
+            ):
+                verifier._validate_normalized_snapshot_mapping(candidate)
+
+        loader, factory = self._published_capability(
+            mapping, catalog, entries, binding_type
+        )
+        with loader:
+            capability = factory()
+            self.assertEqual(
+                verifier._validate_normalized_snapshot_mapping(
+                    snapshot, recovery_dispositions=capability
+                ),
+                snapshot,
+            )
+            with self.assertRaisesRegex(ValueError, "binding differs"):
+                verifier._validate_normalized_snapshot_mapping(
+                    forged, recovery_dispositions=capability
+                )
+
+    def test_recovery_history_lineage_reauthenticates_reused_snapshots(self) -> None:
+        from mlb_backtest import v52_verify_sources as verifier
+        from mlb_backtest.v52_sources.history import recompute_prior_history_sidecar
+
+        authority = _normalized_game_authority()
+        base = verifier._build_game_normalized_snapshots(
+            "historical_walkforward_500",
+            authority.records,
+            authority.game_inventory,
+            authority.timezone_gate,
+            authority.schedule_inventory,
+        )[0]
+        entries, mapping, catalog, binding_type = self._recovery_bindings()
+        loader, factory = self._published_capability(
+            mapping, catalog, entries, binding_type
+        )
+        with loader:
+            capability = factory()
+            game_mapping = base.as_mapping()
+            game_mapping["run_id"] = (
+                "historical_walkforward_500_recovery_schedule_conflicts"
+            )
+            game_mapping["schedule_conflict_dispositions"] = mapping
+            game_bytes = canonical_json_bytes(game_mapping) + b"\n"
+            game = dataclasses.replace(
+                base,
+                run_id="historical_walkforward_500_recovery_schedule_conflicts",
+                canonical_bytes=game_bytes,
+                sha256=hashlib.sha256(game_bytes).hexdigest(),
+                recovery_dispositions=capability,
+            )
+            history_payload = recompute_prior_history_sidecar(
+                game.payload,
+                source_snapshot_sha256=game.sha256,
+                run_id=game.run_id,
+                recovery_dispositions=capability,
+            )
+            history = verifier._history_normalized_snapshot(
+                game.run_id,
+                game,
+                history_payload,
+                recovery_dispositions=capability,
+            )
+            with self.assertRaisesRegex(ValueError, "lineage differs"):
+                verifier._validate_history_snapshot_lineage(history, game)
+            self.assertEqual(
+                verifier._validate_history_snapshot_lineage(
+                    history, game, recovery_dispositions=capability
+                ),
+                history.as_mapping(),
+            )
+
     def test_replay_rejects_missing_tampered_reordered_and_cross_bound_catalogs(self) -> None:
         from mlb_backtest import v52_verify_sources as verifier
 
@@ -1118,10 +1211,13 @@ class RecoveryReplayCapabilityTests(unittest.TestCase):
             for name in (
                 "_build_game_normalized_snapshots",
                 "_build_statcast_normalized_snapshots",
+                "_build_pitching_normalized_snapshots",
+                "_build_reference_normalized_snapshots",
                 "_build_history_normalized_snapshots",
+                "_build_career_bf_normalized_snapshots",
             )
         ]
-        self.assertEqual(len({id(value) for value in passed}), 3)
+        self.assertEqual(len({id(value) for value in passed}), 6)
         self.assertTrue(all(value is not inputs.recovery_dispositions for value in passed))
 
     def test_public_verifier_boundaries_reject_duck_typed_capabilities(self) -> None:

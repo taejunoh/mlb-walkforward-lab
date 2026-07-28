@@ -435,6 +435,21 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         if recovery_dispositions is not None
         else None
     )
+    pitching_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
+    reference_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
+    career_dispositions = (
+        recovery_dispositions.reauthenticate()
+        if recovery_dispositions is not None
+        else None
+    )
     schedule = _build_game_normalized_snapshots(
         inputs.run_id,
         inputs.records,
@@ -455,7 +470,11 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         recovery_dispositions=statcast_dispositions,
     )
     pitching = _build_pitching_normalized_snapshots(
-        inputs.run_id, inputs.records, inputs.graph, schedule
+        inputs.run_id,
+        inputs.records,
+        inputs.graph,
+        schedule,
+        recovery_dispositions=pitching_dispositions,
     )
     reference = _build_reference_normalized_snapshots(
         inputs.run_id,
@@ -463,6 +482,7 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         inputs.graph,
         schedule,
         inputs.timezone_gate,
+        recovery_dispositions=reference_dispositions,
     )
     history = _build_history_normalized_snapshots(
         inputs.run_id,
@@ -472,7 +492,11 @@ def replay_verified_snapshots(inputs: SnapshotReplayInputs) -> tuple[NormalizedS
         recovery_dispositions=history_dispositions,
     )
     career = _build_career_bf_normalized_snapshots(
-        inputs.run_id, inputs.records, inputs.graph, schedule
+        inputs.run_id,
+        inputs.records,
+        inputs.graph,
+        schedule,
+        recovery_dispositions=career_dispositions,
     )
     snapshots = tuple(
         sorted(
@@ -579,11 +603,12 @@ def _validate_normalized_snapshot_mapping(
     if envelope["run_id"] == _RECOVERY_RUN_ID:
         if not has_recovery_catalog or not isinstance(recovery_catalog, Mapping):
             raise ValueError("normalized recovery disposition binding differs")
-        if recovery_dispositions is not None:
-            if canonical_json_bytes(recovery_catalog) != canonical_json_bytes(
-                recovery_dispositions.as_mapping()
-            ):
-                raise ValueError("normalized recovery disposition binding differs")
+        if recovery_dispositions is None:
+            raise ValueError("normalized recovery availability capability is required")
+        if canonical_json_bytes(recovery_catalog) != canonical_json_bytes(
+            recovery_dispositions.as_mapping()
+        ):
+            raise ValueError("normalized recovery disposition binding differs")
     elif has_recovery_catalog:
         raise ValueError("normalized snapshot rejects recovery disposition binding")
     if has_recovery_catalog and has_disposition:
@@ -2444,6 +2469,8 @@ def _build_game_normalized_snapshots(
 def _validate_history_snapshot_lineage(
     history_snapshot: NormalizedSnapshot,
     game_snapshot: NormalizedSnapshot,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> dict[str, object]:
     history_mapping = (
         history_snapshot.as_mapping()
@@ -2458,8 +2485,12 @@ def _validate_history_snapshot_lineage(
     if history_mapping is None or game_mapping is None:
         raise ValueError("history normalized snapshot lineage differs")
     try:
-        history_validated = _validate_normalized_snapshot_mapping(history_mapping)
-        game_validated = _validate_normalized_snapshot_mapping(game_mapping)
+        history_validated = _validate_normalized_snapshot_mapping(
+            history_mapping, recovery_dispositions=recovery_dispositions
+        )
+        game_validated = _validate_normalized_snapshot_mapping(
+            game_mapping, recovery_dispositions=recovery_dispositions
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("history normalized snapshot lineage differs") from exc
     if (
@@ -2493,9 +2524,13 @@ def _validate_history_snapshot_lineage(
         duplicate_gamepk_disposition=(
             disposition.as_mapping() if source_2019 else None
         ),
+        recovery_dispositions=recovery_dispositions,
     )
     expected = _history_normalized_snapshot(
-        game_snapshot.run_id, game_snapshot, payload
+        game_snapshot.run_id,
+        game_snapshot,
+        payload,
+        recovery_dispositions=recovery_dispositions,
     )
     if (
         history_snapshot.logical_query_ids != game_snapshot.logical_query_ids
@@ -2513,12 +2548,18 @@ def _history_normalized_snapshot(
     run_id: str,
     game_snapshot: NormalizedSnapshot,
     payload: Mapping[str, object],
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> NormalizedSnapshot:
     if payload.get("source_snapshot_sha256") != game_snapshot.sha256:
         raise ValueError("history upstream source snapshot SHA-256 differs")
     source_2019 = run_id == _SOURCE_RUN_ID and game_snapshot.season == 2019
     disposition = game_snapshot.duplicate_gamepk_disposition
-    recovery_dispositions = game_snapshot.recovery_dispositions
+    recovery_dispositions = (
+        game_snapshot.recovery_dispositions
+        if recovery_dispositions is None
+        else recovery_dispositions
+    )
     if source_2019 != (disposition is not None):
         raise ValueError("history source disposition authority differs")
     if source_2019 != bool(game_snapshot.dispositioned_query_ids):
@@ -2671,7 +2712,14 @@ def _build_history_normalized_snapshots(
             ),
             recovery_dispositions=recovery_dispositions,
         )
-        snapshots.append(_history_normalized_snapshot(run_id, game_snapshot, payload))
+        snapshots.append(
+            _history_normalized_snapshot(
+                run_id,
+                game_snapshot,
+                payload,
+                recovery_dispositions=recovery_dispositions,
+            )
+        )
     return tuple(snapshots)
 
 
@@ -3110,6 +3158,8 @@ def _build_pitching_normalized_snapshots(
     records: Sequence[VerifiedQueryRecord],
     graph: _TerminalQueryGraph,
     game_snapshots: Sequence[NormalizedSnapshot],
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Build seven immutable D-1 pitching snapshots without I/O."""
     if not isinstance(run_id, str) or not run_id:
@@ -3186,7 +3236,10 @@ def _build_pitching_normalized_snapshots(
             or snapshot.grain != "season_game_evidence_snapshot"
             or snapshot.season in game_by_season
             or mapping is None
-            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or _validate_normalized_snapshot_mapping(
+                mapping, recovery_dispositions=recovery_dispositions
+            )
+            != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
             or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
@@ -3424,6 +3477,8 @@ def _build_career_bf_normalized_snapshots(
     records: Sequence[VerifiedQueryRecord],
     graph: _TerminalQueryGraph,
     game_snapshots: Sequence[NormalizedSnapshot],
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Build seven snapshots from externally sealed records with internal rebinding.
 
@@ -3572,7 +3627,10 @@ def _build_career_bf_normalized_snapshots(
             or snapshot.grain != "season_game_evidence_snapshot"
             or snapshot.season in game_by_season
             or mapping is None
-            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or _validate_normalized_snapshot_mapping(
+                mapping, recovery_dispositions=recovery_dispositions
+            )
+            != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
             or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
@@ -3861,6 +3919,8 @@ def _build_reference_normalized_snapshots(
     graph: _TerminalQueryGraph,
     game_snapshots: Sequence[NormalizedSnapshot],
     timezone_gate: VerifiedTimezoneGate,
+    *,
+    recovery_dispositions: RecoveryDispositionBindings | None = None,
 ) -> tuple[NormalizedSnapshot, ...]:
     """Build immutable effective-dated reference snapshots without I/O."""
     if not isinstance(run_id, str) or not run_id:
@@ -4065,7 +4125,10 @@ def _build_reference_normalized_snapshots(
             or snapshot.grain != "season_game_evidence_snapshot"
             or snapshot.season in game_by_season
             or mapping is None
-            or _validate_normalized_snapshot_mapping(mapping) != mapping
+            or _validate_normalized_snapshot_mapping(
+                mapping, recovery_dispositions=recovery_dispositions
+            )
+            != mapping
             or snapshot.canonical_bytes != canonical_json_bytes(mapping) + b"\n"
             or snapshot.sha256 != hashlib.sha256(snapshot.canonical_bytes).hexdigest()
         ):
