@@ -1,0 +1,1 @@
+{"artifact_kind":"VENUE_TIMEZONE_MAPPING","schema_version":1,"timezone_rows":[{"effective_end":"2024-12-31","effective_start":"2018-01-01","time_zone":"America/New_York","venue_id":31},{"effective_end":"2024-12-31","effective_start":"2024-01-01","time_zone":"America/Los_Angeles","venue_id":99}]}

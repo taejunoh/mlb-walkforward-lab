@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-07-12",
+  "model_version": "v5.1-BT",
+  "production_data_root": "data/v5_1_bt",
+  "bulk_raw_data_tracked": false,
+  "raw_inventory_at_audit": {
+    "manifest_records": 1675,
+    "raw_files": 1361,
+    "disk_usage_approx": "3.0G",
+    "candidate_selected_source_manifest_count": 692,
+    "frozen_training_source_manifest_count": 1311
+  },
+  "acquisition": {
+    "mlb_schedule": {
+      "manifest_records": 5,
+      "unique_raw_sha256": 5,
+      "row_count_sum": 5,
+      "retrieved_first_utc": "2026-07-12T06:24:17.124934+00:00",
+      "retrieved_last_utc": "2026-07-12T06:24:27.005908+00:00",
+      "observed_retrieval_span_seconds": 9.880974
+    },
+    "baseball_savant_statcast": {
+      "manifest_records": 213,
+      "unique_raw_sha256": 213,
+      "row_count_sum": 3455533,
+      "retrieved_first_utc": "2026-07-12T06:25:28.570881+00:00",
+      "retrieved_last_utc": "2026-07-12T08:18:08.844095+00:00",
+      "observed_retrieval_span_seconds": 6760.273214
+    },
+    "mlb_stats_pitching": {
+      "manifest_records": 726,
+      "unique_raw_sha256": 726,
+      "row_count_sum": 726,
+      "retrieved_first_utc": "2026-07-12T06:57:09.271008+00:00",
+      "retrieved_last_utc": "2026-07-12T07:06:09.814608+00:00",
+      "observed_retrieval_span_seconds": 540.5436
+    },
+    "mlb_stats_pitcher_bf": {
+      "manifest_records": 731,
+      "unique_raw_sha256": 417,
+      "row_count_sum": 731,
+      "retrieved_first_utc": "2026-07-12T07:06:43.220157+00:00",
+      "retrieved_last_utc": "2026-07-12T08:21:18.159799+00:00",
+      "observed_retrieval_span_seconds": 4474.939642,
+      "note": "Manifest records exceed unique raw hashes because resumable/repeated publication preserved immutable audit records."
+    }
+  },
+  "production_bug_fix_commit_chain": [
+    {"commit": "f79e533382f97c59d4a764795795b0e1ce298de4", "subject": "fix: validate schedule query date buckets"},
+    {"commit": "8cf7003ceaa6f37c69ebeb674e21fcf2e8ae17f0", "subject": "fix: constrain rescheduled schedule exceptions"},
+    {"commit": "cefaf48e0b70b824f6879f8a390ef32dba090343", "subject": "fix: validate raw reschedule completion fields"},
+    {"commit": "f5e39895d268763bd29032d30ee4817da13b670f", "subject": "fix: split silent Statcast row-capped ranges"},
+    {"commit": "645a8f4102a007695bcde7374428b3e1b4d1d74d", "subject": "fix: derive lineup weights from terminal plate appearances"},
+    {"commit": "cd97349df4316745cfadbaed456f5c273ab1cbc5", "subject": "fix: canonicalize inferred hit by pitch events"},
+    {"commit": "32677777b592fdf89c3057e54c3f087617b5bad3", "subject": "fix: close advanced final half-inning outs"},
+    {"commit": "e4c9680bd49446c4b078dfacb9c22b887663a84f", "subject": "fix: recover neutral-site venue name from schedule description"},
+    {"commit": "0df0518dafa551679f9b9035f43c495e0334b9c3", "subject": "fix: bind schedule history to Statcast game dates"},
+    {"commit": "e104bccaf7fce211303cf2bd6a32d0daa9c8c826", "subject": "fix: preserve schedule history audit provenance"},
+    {"commit": "dd9cd490186162f44dbae19c8119e8eba056f953", "subject": "fix: bind schedule provenance to raw manifests"},
+    {"commit": "63c5e5d80dc07e9ea262af02082b00729127a10c", "subject": "fix: share schedule query coverage validation"},
+    {"commit": "4fe37aa8a52fde64f5707d4097325d9aac51c616", "subject": "fix: reconcile duplicate schedule outcomes"},
+    {"commit": "b5f06bea49df8639986ae7aa8c41ebe934aeb1d7", "subject": "fix: bind outcomes to locked game identity"}
+  ],
+  "artifact_counts": {
+    "training_raw_rows": 7290,
+    "training_edges": 7265,
+    "candidate_rows": 1972,
+    "locked_rows": 1340,
+    "locked_dates": 100,
+    "top1_rows": 100,
+    "top3_rows": 300,
+    "evaluated_rows": 1340,
+    "void_top1": 0
+  }
+}

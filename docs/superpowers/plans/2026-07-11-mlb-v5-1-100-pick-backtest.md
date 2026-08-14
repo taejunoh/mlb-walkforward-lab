@@ -149,6 +149,15 @@ git commit -m "feat: freeze v5.1 backtest model card"
 - Create: `mlb_backtest/manifest.py`
 - Create: `tests/test_manifest.py`
 
+Store payload bytes once at `<root>/<source>/<payload_sha>.raw`. Store each
+provenance record at
+`<root>/<source>/<payload_sha>.<canonical_query_sha>.manifest.json`, where
+`canonical_query_sha` is the SHA-256 of compact UTF-8 JSON with sorted keys.
+Manifest identity is deterministic and insertion-order-independent: equivalent
+query dictionaries always resolve to the same path, while distinct canonical
+queries for the same payload resolve to distinct manifests. This storage rule
+does not change any frozen model behavior.
+
 - [ ] **Step 1: Write failing tests for deterministic hashes and write-once behavior**
 
 ```python
@@ -212,7 +221,11 @@ class RawStore:
         folder = self.root / source
         folder.mkdir(parents=True, exist_ok=True)
         data_path = folder / f"{digest}.raw"
-        manifest_path = folder / f"{digest}.manifest.json"
+        canonical_query = json.dumps(
+            query, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        query_digest = hashlib.sha256(canonical_query).hexdigest()
+        manifest_path = folder / f"{digest}.{query_digest}.manifest.json"
         if not data_path.exists():
             fd, tmp = tempfile.mkstemp(dir=folder)
             with os.fdopen(fd, "wb") as handle:
@@ -760,6 +773,10 @@ git commit -m "feat: add backtest metrics and completion rules"
 ```
 
 ## Task 10: Orchestrate acquisition, calibration, replay, lock, and evaluation
+
+The frozen acquisition window begins on `2025-05-01`; the initial lock ends on
+`2025-08-12`, while schedule-backed extensions may continue only through the
+frozen `extension_end` of `2025-09-28`.
 
 **Files:**
 - Create: `mlb_backtest/pipeline.py`

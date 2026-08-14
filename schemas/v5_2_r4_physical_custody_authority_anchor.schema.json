@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "key_id", "source_approval", "artifacts", "amendment", "custody_identity_manifest_sha256", "receipt_comparison"],
+  "properties": {
+    "schema_version": {"const": "v5.2-r4-physical-custody-authority-anchor-v1"},
+    "kind": {"const": "MLB_R4_PHYSICAL_CUSTODY_AUTHORITY"},
+    "key_id": {"type": "string", "pattern": "^ed25519-sha256:[0-9a-f]{64}$"},
+    "source_approval": {"$ref": "#/$defs/sourceApproval"},
+    "artifacts": {"$ref": "#/$defs/artifacts"},
+    "amendment": {"$ref": "#/$defs/amendment"},
+    "custody_identity_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "receipt_comparison": {"$ref": "#/$defs/receiptComparison"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "blob": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sourceApproval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["logical_raw_root", "protected_inventory_path", "protected_inventory_sha256"],
+      "properties": {
+        "logical_raw_root": {"const": "data/v5_1_bt/raw"},
+        "protected_inventory_path": {"const": "audit/v5_1_bt/protected_raw_inventory.json"},
+        "protected_inventory_sha256": {"const": "2ec8bf0237cc5bdb00ddb6d2236ac631bb793aed9ba79f308672a9ecb90809c6"}
+      }
+    },
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["inventory", "receipt", "contract", "run_spec"],
+      "properties": {
+        "inventory": {"$ref": "#/$defs/binding"}, "receipt": {"$ref": "#/$defs/binding"},
+        "contract": {"$ref": "#/$defs/binding"}, "run_spec": {"$ref": "#/$defs/binding"}
+      }
+    },
+    "gitBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "git_blob_id"],
+      "properties": {
+        "path": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha256"}, "git_blob_id": {"$ref": "#/$defs/blob"}
+      }
+    },
+    "amendment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["design", "implementation_plan"],
+      "properties": {"design": {"$ref": "#/$defs/gitBinding"}, "implementation_plan": {"$ref": "#/$defs/gitBinding"}}
+    },
+    "receiptComparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_content_manifest_sha256", "snapshot_content_manifest_sha256", "source_logical_binding_manifest_sha256", "snapshot_logical_binding_manifest_sha256"],
+      "properties": {
+        "source_content_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "snapshot_content_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "source_logical_binding_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "snapshot_logical_binding_manifest_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

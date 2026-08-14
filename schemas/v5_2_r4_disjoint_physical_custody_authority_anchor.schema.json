@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.invalid/schemas/v5_2_r4_disjoint_physical_custody_authority_anchor.schema.json",
+  "title": "R4 disjoint physical custody authority anchor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "custody_generation", "key_id", "artifacts", "execution_binding", "supersedes_incomplete_attempt", "source_approval", "amendment"],
+  "properties": {
+    "schema_version": {"const": "v5.2-r4-disjoint-custody-authority-anchor-v1"},
+    "kind": {"const": "MLB_R4_DISJOINT_PHYSICAL_CUSTODY_AUTHORITY"},
+    "custody_generation": {"const": "v5.2-r4-disjoint-custody-v2"},
+    "key_id": {"type": "string", "pattern": "^ed25519-sha256:[0-9a-f]{64}$"},
+    "artifacts": {"$ref": "#/$defs/artifacts"},
+    "execution_binding": {"$ref": "#/$defs/executionBinding"},
+    "supersedes_incomplete_attempt": {"$ref": "#/$defs/supersession"},
+    "amendment": {"$ref": "#/$defs/amendment"},
+    "source_approval": {"$ref": "#/$defs/sourceApproval"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "sourceApproval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["logical_raw_root", "protected_inventory_path", "protected_inventory_sha256"],
+      "properties": {
+        "logical_raw_root": {"const": "data/v5_1_bt/raw"},
+        "protected_inventory_path": {"const": "audit/v5_1_bt/protected_raw_inventory.json"},
+        "protected_inventory_sha256": {"const": "2ec8bf0237cc5bdb00ddb6d2236ac631bb793aed9ba79f308672a9ecb90809c6"}
+      }
+    },
+    "artifactBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["inventory", "receipt", "contract", "run_spec", "journal"],
+      "properties": {
+        "inventory": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"const": "audit/v5_2_qd/historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/protected_raw_inventory_r4_disjoint_v2.json"}, "sha256": {"$ref": "#/$defs/sha256"}}},
+        "receipt": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"const": "audit/v5_2_qd/historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/physical_custody_transition_r4_disjoint_v2.json"}, "sha256": {"$ref": "#/$defs/sha256"}}},
+        "contract": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"const": "protocols/v5_2_qd/historical_source_acquisition_recovery_schedule_conflicts_missing_venue_r4_disjoint_v2.json"}, "sha256": {"$ref": "#/$defs/sha256"}}},
+        "run_spec": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"const": "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts_missing_venue_r4.json"}, "sha256": {"$ref": "#/$defs/sha256"}}},
+        "journal": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"const": "audit/v5_2_qd/historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/custody_issuance_journal_r4_disjoint_v2.ndjson"}, "sha256": {"$ref": "#/$defs/sha256"}}}
+      }
+    },
+    "directoryIdentity": {"type": "object", "additionalProperties": false, "required": ["file_type", "volume_uuid", "device", "inode", "ctime_ns", "mode", "flags"], "properties": {"file_type": {"const": "directory"}, "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1}, "ctime_ns": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 0}, "flags": {"type": "integer", "minimum": 0}}},
+    "regularIdentity": {"type": "object", "additionalProperties": false, "required": ["file_type", "volume_uuid", "device", "inode", "ctime_ns", "mode", "flags", "size"], "properties": {"file_type": {"const": "regular"}, "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1}, "ctime_ns": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 0}, "flags": {"type": "integer", "minimum": 0}, "size": {"type": "integer", "minimum": 0}}},
+    "executableIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["volume_uuid", "device", "inode", "ctime_ns", "file_type", "mode", "uid", "nlink", "byte_size"],
+      "properties": {
+        "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1}, "ctime_ns": {"type": "integer", "minimum": 0}, "file_type": {"const": "regular"}, "mode": {"type": "integer", "minimum": 0}, "uid": {"type": "integer", "minimum": 0}, "nlink": {"const": 1}, "byte_size": {"type": "integer", "minimum": 1}
+      }
+    },
+    "executionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["executable_sha256", "executable_identity", "repository_head", "repository_tree", "repository_clean", "implementation_blob", "design_blob", "plan_blob", "source_approval_sha256", "target_volume_uuid", "supersedes_incomplete_attempt_sha256"],
+      "properties": {
+        "executable_sha256": {"$ref": "#/$defs/sha256"}, "executable_identity": {"$ref": "#/$defs/executableIdentity"}, "repository_head": {"$ref": "#/$defs/sha1"}, "repository_tree": {"$ref": "#/$defs/sha1"}, "repository_clean": {"const": true}, "implementation_blob": {"$ref": "#/$defs/sha1"}, "design_blob": {"$ref": "#/$defs/sha1"}, "plan_blob": {"$ref": "#/$defs/sha1"}, "source_approval_sha256": {"const": "2ec8bf0237cc5bdb00ddb6d2236ac631bb793aed9ba79f308672a9ecb90809c6"}, "target_volume_uuid": {"$ref": "#/$defs/uuid"}, "supersedes_incomplete_attempt_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "amendmentBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "git_blob_id"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}, "git_blob_id": {"$ref": "#/$defs/sha1"}}
+    },
+    "amendment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["design", "implementation_plan", "implementation"],
+      "properties": {"design": {"$ref": "#/$defs/amendmentBinding"}, "implementation_plan": {"$ref": "#/$defs/amendmentBinding"}, "implementation": {"$ref": "#/$defs/amendmentBinding"}}
+    },
+    "supersession": {
+      "type": "object", "additionalProperties": false,
+      "required": ["old_custody_parent", "old_final_root", "old_owner_lock", "observer_state", "metadata_inconsistent", "final_root_identity", "owner_lock_identity", "observed_leaf_count", "observed_directory_count", "observed_content_closure_sha256"],
+      "properties": {
+        "old_custody_parent": {"const": "/Users/taejunoh/Documents/MLB Custody"}, "old_final_root": {"const": "/Users/taejunoh/Documents/MLB Custody/v5_1_bt_r4"}, "old_owner_lock": {"const": "/Users/taejunoh/Documents/MLB Custody/.v5_1_bt_r4.issuance.lock"}, "observer_state": {"const": "OBSERVER_INCOMPLETE_LOCKED"}, "metadata_inconsistent": {"const": true}, "final_root_identity": {"$ref": "#/$defs/directoryIdentity"}, "owner_lock_identity": {"$ref": "#/$defs/regularIdentity"}, "observed_leaf_count": {"type": "integer", "minimum": 0}, "observed_directory_count": {"type": "integer", "minimum": 0}, "observed_content_closure_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

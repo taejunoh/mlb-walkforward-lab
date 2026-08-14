@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.invalid/schemas/v5_2_r4_disjoint_custody_journal_record.schema.json",
+  "title": "R4 disjoint custody journal record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "journal_version",
+    "custody_generation",
+    "sequence",
+    "event",
+    "outcome",
+    "previous_event_sha256",
+    "execution_binding_sha256",
+    "target_volume_uuid",
+    "detail",
+    "event_sha256"
+  ],
+  "properties": {
+    "journal_version": {"const": "MLB_R4_DISJOINT_CUSTODY_JOURNAL_V1"},
+    "custody_generation": {"const": "v5.2-r4-disjoint-custody-v2"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "event": {
+      "enum": [
+        "PREFLIGHT_PARENT_ACCEPTED",
+        "LOCK_ACQUIRE",
+        "SOURCE_CLOSURE_VALIDATE",
+        "TEMP_ROOT_CREATE",
+        "COPY_AND_CONTENT_VALIDATE",
+        "MODE_FLAG_VALIDATE",
+        "SNAPSHOT_PUBLISH",
+        "INVENTORY_PUBLISH",
+        "RECEIPT_PUBLISH",
+        "CONTRACT_PUBLISH_AND_AUTHENTICATE",
+        "PRE_ANCHOR_AUTHORITY_READY",
+        "FAILURE"
+      ]
+    },
+    "outcome": {"enum": ["INTENT", "SUCCESS", "FAILURE"]},
+    "previous_event_sha256": {"$ref": "#/$defs/sha256"},
+    "execution_binding_sha256": {"$ref": "#/$defs/sha256"},
+    "target_volume_uuid": {"$ref": "#/$defs/volumeUuid"},
+    "detail": {"$ref": "#/$defs/detail"},
+    "event_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "volumeUuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "intentDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class"],
+      "properties": {
+        "class": {
+          "enum": ["PREFLIGHT", "LOCK", "SOURCE", "TEMP_ROOT", "COPY", "MODE", "PUBLISH", "INVENTORY", "RECEIPT", "CONTRACT", "AUTHORITY"]
+        }
+      }
+    },
+    "failureDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "code"],
+      "properties": {
+        "class": {"type": "string", "minLength": 1},
+        "code": {"type": "string", "minLength": 1}
+      }
+    },
+    "readyDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "snapshot_manifest_sha256", "inventory_sha256", "receipt_sha256", "contract_sha256"],
+      "properties": {
+        "class": {"const": "AUTHORITY"},
+        "snapshot_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "detail": {
+      "oneOf": [
+        {"$ref": "#/$defs/intentDetail"},
+        {"$ref": "#/$defs/failureDetail"},
+        {"$ref": "#/$defs/readyDetail"}
+      ]
+    }
+  }
+}

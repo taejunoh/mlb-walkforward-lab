@@ -1,0 +1,124 @@
+{
+  "$defs": {
+    "attempt_uuid": {"pattern": "^[0-9a-f]{32}$", "type": "string"},
+    "sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "timestamp": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_privileged_materialization_journal_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "STAGE_CREATED"},
+        "sequence": {"const": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "stage_name": {"$ref": "#/$defs/attempt_uuid"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "stage_name", "journal_sha256", "sha256"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "PRESEALED"},
+        "published_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_file_sha256": {"$ref": "#/$defs/sha256"},
+        "sequence": {"const": 2},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "published_closure_sha256", "receipt_file_sha256", "journal_sha256", "sha256"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "RENAME_INTENT"},
+        "published_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_file_sha256": {"$ref": "#/$defs/sha256"},
+        "sequence": {"const": 3},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "published_closure_sha256", "receipt_file_sha256", "journal_sha256", "sha256"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "PUBLISHED"},
+        "published_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_file_sha256": {"$ref": "#/$defs/sha256"},
+        "published_device": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "published_inode": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "sequence": {"const": 4},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "published_closure_sha256", "receipt_file_sha256", "published_device", "published_inode", "journal_sha256", "sha256"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "failure_class": {"enum": ["PRE_RENAME_IO", "PRE_RENAME_REBIND", "PRE_RENAME_SEAL", "PRE_RENAME_DURABILITY"]},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "QUARANTINED"},
+        "quarantine_name": {"$ref": "#/$defs/attempt_uuid"},
+        "sequence": {"const": 4},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "failure_class", "quarantine_name", "journal_sha256", "sha256"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "admission_record_sha256": {"$ref": "#/$defs/sha256"},
+        "attempt_uuid": {"$ref": "#/$defs/attempt_uuid"},
+        "authority_id": {"const": "r4-disjoint-custody-v2-execution-v1"},
+        "failure_class": {"enum": ["POST_RENAME_REBIND", "POST_RENAME_SEAL", "POST_RENAME_DURABILITY", "POST_RENAME_JOURNAL"]},
+        "journal_sha256": {"$ref": "#/$defs/sha256"},
+        "kind": {"const": "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2"},
+        "namespace": {"const": "org.mlb-walkforward.r4.protected-execution-authority/v1"},
+        "phase": {"const": "PUBLISH_INDETERMINATE"},
+        "published_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_file_sha256": {"$ref": "#/$defs/sha256"},
+        "sequence": {"const": 4},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["admission_record_sha256", "attempt_uuid", "authority_id", "kind", "namespace", "phase", "sequence", "failure_class", "published_closure_sha256", "receipt_file_sha256", "journal_sha256", "sha256"],
+      "type": "object"
+    }
+  ]
+}

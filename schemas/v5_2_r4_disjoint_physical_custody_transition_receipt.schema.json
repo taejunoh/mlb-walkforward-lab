@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.invalid/schemas/v5_2_r4_disjoint_physical_custody_transition_receipt.schema.json",
+  "title": "R4 disjoint physical custody transition receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "custody_generation", "final_name", "inventory", "target_volume_uuid",
+    "comparison", "operational_journal", "execution_binding_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "v5.2-r4-disjoint-physical-custody-transition-receipt-v1"},
+    "kind": {"const": "MLB_R4_DISJOINT_PHYSICAL_CUSTODY_TRANSITION"},
+    "custody_generation": {"const": "v5.2-r4-disjoint-custody-v2"},
+    "final_name": {"const": "v5_1_bt_r4"},
+    "inventory": {"$ref": "#/$defs/binding"},
+    "target_volume_uuid": {"$ref": "#/$defs/uuid"},
+    "comparison": {"$ref": "#/$defs/comparison"},
+    "operational_journal": {"$ref": "#/$defs/journalBinding"},
+    "execution_binding_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"const": "audit/v5_2_qd/historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/protected_raw_inventory_r4_disjoint_v2.json"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "journalBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "path", "sha256", "terminal_event_sha256"],
+      "properties": {
+        "format": {"const": "MLB_R4_DISJOINT_CUSTODY_JOURNAL_V1"},
+        "path": {"const": "audit/v5_2_qd/historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/custody_issuance_journal_r4_disjoint_v2.ndjson"},
+        "sha256": {"$ref": "#/$defs/sha256"}, "terminal_event_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "comparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["leaf_count", "record_count", "physical_member_count", "logical_binding_count", "source_content_manifest_sha256", "snapshot_content_manifest_sha256", "directory_manifest_sha256", "objects"],
+      "properties": {
+        "leaf_count": {"const": 4715}, "record_count": {"const": 1675}, "physical_member_count": {"const": 4711}, "logical_binding_count": {"const": 5025},
+        "source_content_manifest_sha256": {"$ref": "#/$defs/sha256"}, "snapshot_content_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "directory_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "objects": {"type": "array", "minItems": 4715, "maxItems": 4715, "items": {"$ref": "#/$defs/objectComparison"}}
+      }
+    },
+    "objectComparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "source_sha256", "snapshot_sha256", "byte_size"],
+      "properties": {
+        "path": {"anyOf": [{"type": "string", "pattern": "^(?!.*\\\\)data/v5_1_bt/raw/(?!\\.{1,2}/)[^/]+/(?!\\.{1,2}$)[^/]+$"}, {"enum": [".baseball_savant_statcast.lock", ".mlb_schedule.lock", ".mlb_stats_pitcher_bf.lock", ".mlb_stats_pitching.lock"]}]}, "source_sha256": {"$ref": "#/$defs/sha256"}, "snapshot_sha256": {"$ref": "#/$defs/sha256"}, "byte_size": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

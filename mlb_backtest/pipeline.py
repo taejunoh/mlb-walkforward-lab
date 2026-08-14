@@ -1,0 +1,1494 @@
+"""Deterministic, stage-isolated orchestration for the v5.1 backtest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import stat
+import tempfile
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from .config import load_config
+from .locking import lock_predictions
+from .manifest import RawStore
+from .normalize import fit_frozen_calibration
+from .ranking import rank_daily
+from .scoring import (
+    WEIGHTS,
+    component_agreement,
+    component_edge,
+    confidence_score,
+    full_agreement,
+    home_probability,
+    overall_completeness,
+    predicted_pick,
+    tier,
+    uncertainty,
+)
+from .sources import (
+    fetch_bytes,
+    parse_schedule,
+    schedule_url,
+    validate_schedule_query_coverage,
+)
+from .statcast import regular_season_ranges
+
+
+STAGES = (
+    "raw",
+    "calibration",
+    "features",
+    "initial_locked",
+    "initial_outcomes",
+    "extension_rounds",
+    "locked",
+    "outcomes",
+    "reports",
+)
+_CALIBRATION_REQUIRED = frozenset(("official_date", "edge", "home_win"))
+_CALIBRATION_ALLOWED = _CALIBRATION_REQUIRED | {"game_pk"}
+_COMPONENTS = frozenset(WEIGHTS)
+_CANDIDATE_REQUIRED = frozenset(
+    (
+        "game_pk",
+        "official_date",
+        "scheduled_start_utc",
+        "away_team",
+        "home_team",
+        "away_scores",
+        "home_scores",
+        "qualities",
+        "starter_career_bf",
+        "critical_failure",
+        "unresolved_context",
+        "lineup_provenance",
+        "data_status",
+    )
+)
+_CANDIDATE_OPTIONAL = frozenset(("doubleheader_marker",))
+_CANDIDATE_ALLOWED = _CANDIDATE_REQUIRED | _CANDIDATE_OPTIONAL
+_FORBIDDEN_TOKENS = (
+    "actual_winner",
+    "market",
+    "outcome",
+    "result",
+    "moneyline",
+    "odds",
+)
+_DATA_STATUS = frozenset(("COMPLETE", "INCOMPLETE"))
+_LINEUP_PROVENANCE = frozenset(
+    ("RECONSTRUCTED_FINAL_LINEUP", "TIMESTAMP_VERIFIED_LINEUP")
+)
+
+
+def _backtest_schedule_window(config: Mapping[str, object]) -> dict[str, str]:
+    initial = config["initial_window"]
+    return {"start": initial["start"], "end": config["extension_end"]}
+
+
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _canonical_jsonl(rows: Sequence[Mapping[str, object]]) -> bytes:
+    return b"".join(
+        (
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        for row in rows
+    )
+
+
+def _safe_data_dir(value: str | Path) -> Path:
+    root = Path(value)
+    if root.is_symlink():
+        raise ValueError("data directory cannot be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("data directory must be a real directory")
+    resolved_root = root.resolve(strict=True)
+    resolved_stages: set[Path] = set()
+    for name in STAGES:
+        stage = root / name
+        if stage.is_symlink():
+            raise ValueError(f"stage directory cannot be a symlink: {name}")
+        if stage.exists():
+            if not stage.is_dir():
+                raise ValueError(f"stage path must be a directory: {name}")
+            resolved = stage.resolve(strict=True)
+            if resolved.parent != resolved_root or resolved in resolved_stages:
+                raise ValueError(f"stage path alias is forbidden: {name}")
+            resolved_stages.add(resolved)
+    return root
+
+
+def _stage(root: Path, name: str, *, create: bool = True) -> Path:
+    path = root / name
+    if path.is_symlink():
+        raise ValueError(f"stage directory cannot be a symlink: {name}")
+    if create:
+        path.mkdir(exist_ok=True)
+    if not path.is_dir():
+        raise ValueError(f"stage path must be a real directory: {name}")
+    if path.resolve(strict=True).parent != root.resolve(strict=True):
+        raise ValueError(f"stage path alias is forbidden: {name}")
+    return path
+
+
+def _safe_descendant_dir(
+    root: Path, relative: str | Path, *, create: bool = True
+) -> Path:
+    """Walk and validate every directory component below a resolved data root."""
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or any(part in ("", "..") for part in relative_path.parts):
+        raise ValueError("stage descendant must be a relative path without aliases")
+    resolved_root = root.resolve(strict=True)
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"stage descendant cannot be a symlink: {relative_path}")
+        if not current.exists():
+            if not create:
+                raise RuntimeError(f"missing stage descendant: {relative_path}")
+            current.mkdir()
+        if current.is_symlink() or not current.is_dir():
+            raise ValueError(f"stage descendant must be a real directory: {relative_path}")
+        resolved = current.resolve(strict=True)
+        if resolved_root not in resolved.parents:
+            raise ValueError(f"stage descendant alias is forbidden: {relative_path}")
+    return current
+
+
+def _regular_bytes(path: Path, label: str) -> bytes:
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"missing prerequisite: {label}") from exc
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise RuntimeError(f"{label} changed while opening")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _jsonl(path: Path, label: str) -> list[dict[str, object]]:
+    content = _regular_bytes(path, label)
+    rows: list[dict[str, object]] = []
+    for number, raw in enumerate(content.splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} line {number} must be UTF-8 JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{label} line {number} must be a JSON object")
+        rows.append(row)
+    return rows
+
+
+def _json_object(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(_regular_bytes(path, label).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must be UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _require_raw_schedule(
+    root: Path, config: Mapping[str, object], role: str
+) -> tuple[str, dict[int, dict[str, object]]]:
+    """Verify the immutable schedule manifest required by a prepared input stage."""
+    if role == "training":
+        windows = [
+            {"start": start, "end": end}
+            for start, end in regular_season_ranges(config["extension_end"])[:3]
+        ]
+    elif role == "history":
+        windows = [{"start": "2025-03-18", "end": "2025-04-30"}]
+    else:
+        windows = [_backtest_schedule_window(config)]
+    expected_queries = [
+        {
+            "role": role,
+            "start": window["start"],
+            "end": window["end"],
+            "gameType": "R",
+            "url": schedule_url(window["start"], window["end"]),
+        }
+        for window in windows
+    ]
+    folder = root / "raw" / "mlb_schedule"
+    if folder.is_symlink() or not folder.is_dir():
+        raise RuntimeError(f"missing prerequisite: raw/schedule manifest for {role}")
+    matches: dict[str, tuple[str, dict[int, dict[str, object]]]] = {}
+    for manifest_path in sorted(folder.glob("*.manifest.json")):
+        content = _regular_bytes(manifest_path, "raw schedule manifest")
+        try:
+            manifest = RawStore._read_manifest(content)
+        except RuntimeError as exc:
+            raise RuntimeError("raw schedule manifest is invalid") from exc
+        query = manifest.get("query")
+        if query not in expected_queries:
+            continue
+        digest = manifest.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError("raw schedule manifest digest is invalid")
+        seal_path = manifest_path.with_name(manifest_path.name[:-5] + ".sha256")
+        expected_seal = f"{hashlib.sha256(content).hexdigest()}\n".encode("utf-8")
+        if _regular_bytes(seal_path, "raw schedule manifest seal") != expected_seal:
+            raise RuntimeError("raw schedule manifest seal mismatch")
+        payload = _regular_bytes(folder / f"{digest}.raw", "raw schedule payload")
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeError("raw schedule payload digest mismatch")
+        if manifest["row_count"] != sum(
+            bool(line.strip()) for line in payload.splitlines()
+        ):
+            raise RuntimeError("raw schedule manifest row_count mismatch")
+        query_bytes = json.dumps(
+            query,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        query_digest = hashlib.sha256(query_bytes).hexdigest()
+        if manifest_path.name != f"{digest}.{query_digest}.manifest.json":
+            raise RuntimeError("raw schedule manifest address mismatch")
+        games = parse_schedule(payload)
+        try:
+            validate_schedule_query_coverage(payload, query["start"], query["end"])
+        except ValueError as exc:
+            raise RuntimeError(
+                "raw schedule game is outside manifest query window"
+            ) from exc
+        index = {game["game_pk"]: game for game in games}
+        if len(index) != len(games):
+            raise RuntimeError("raw schedule contains duplicate game_pk values")
+        query_key = json.dumps(query, separators=(",", ":"), sort_keys=True)
+        if query_key in matches:
+            raise RuntimeError(f"ambiguous raw/schedule manifests for {role}")
+        matches[query_key] = (digest, index)
+    ordered_keys = [
+        json.dumps(query, separators=(",", ":"), sort_keys=True)
+        for query in expected_queries
+    ]
+    if any(key not in matches for key in ordered_keys):
+        raise RuntimeError(
+            f"missing prerequisite: raw/schedule manifest for {role}"
+        )
+    merged = {}
+    digests = []
+    for key in ordered_keys:
+        digest, index = matches[key]
+        digests.append(digest)
+        for game_pk, game in index.items():
+            if game_pk in merged:
+                raise RuntimeError("raw schedule manifests duplicate game_pk")
+            merged[game_pk] = game
+    aggregate_digest = hashlib.sha256("".join(digests).encode("ascii")).hexdigest()
+    return aggregate_digest, merged
+
+
+def _write_once(path: Path, content: bytes, label: str, root: Path) -> Path:
+    try:
+        relative_parent = path.parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under the data directory") from exc
+    safe_parent = _safe_descendant_dir(root, relative_parent)
+    if safe_parent != path.parent:
+        raise ValueError(f"{label} parent path alias is forbidden")
+    if path.is_symlink() or path.exists() and not path.is_file():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    if path.exists():
+        if _regular_bytes(path, label) != content:
+            raise RuntimeError(f"immutable {label} differs")
+        return path
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if _regular_bytes(path, label) != content:
+                raise RuntimeError(f"immutable {label} differs")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _write_jsonl_once(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    label: str,
+    root: Path,
+) -> tuple[Path, str]:
+    """Atomically stream canonical JSONL and return its incremental SHA-256."""
+    try:
+        relative_parent = path.parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under the data directory") from exc
+    safe_parent = _safe_descendant_dir(root, relative_parent)
+    if safe_parent != path.parent:
+        raise ValueError(f"{label} parent path alias is forbidden")
+    if path.is_symlink() or path.exists() and not path.is_file():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent)
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            for row in rows:
+                chunk = (
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                handle.write(chunk)
+                digest.update(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        expected = digest.hexdigest()
+        if path.exists():
+            if hashlib.sha256(_regular_bytes(path, label)).hexdigest() != expected:
+                raise RuntimeError(f"immutable {label} differs")
+            return path, expected
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if hashlib.sha256(_regular_bytes(path, label)).hexdigest() != expected:
+                raise RuntimeError(f"immutable {label} differs")
+        return path, expected
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _load_model_card(
+    root: Path, config_path: str | Path, *, verified_catalog=None
+) -> tuple[dict[str, object], str]:
+    path = root / "calibration" / "model_card.json"
+    content = _regular_bytes(path, "model card")
+    try:
+        card = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("model card must be UTF-8 JSON") from exc
+    required = {
+        "alpha",
+        "beta",
+        "calibration_input_sha256",
+        "config_sha256",
+        "model_version",
+        "protocol_phase",
+        "schema_version",
+        "training",
+        "training_window",
+    }
+    v2_fields = {
+        "frozen_inputs_sha256",
+        "max_training_date",
+        "normalization",
+        "normalization_input_sha256",
+        "slot_weights",
+        "source_manifest_sha256s",
+        "training_raw_count",
+    }
+    if not isinstance(card, dict) or (
+        card.get("schema_version") == 1
+        and set(card) != required
+        or card.get("schema_version") == 2
+        and set(card) != required | v2_fields
+        or card.get("schema_version") not in {1, 2}
+    ):
+        raise ValueError("model card fields are invalid")
+    if card["model_version"] != "v5.1-BT" or card["protocol_phase"] != "Backtest":
+        raise ValueError("model card identity is invalid")
+    config = load_config(config_path)
+    if card["schema_version"] == 2:
+        from .scoring_prep import validate_normalization
+
+        frozen = {
+            key: card[key]
+            for key in (
+                "max_training_date",
+                "normalization",
+                "normalization_input_sha256",
+                "slot_weights",
+                "source_manifest_sha256s",
+                "training_raw_count",
+            )
+        }
+        if (
+            not isinstance(frozen["normalization"], dict)
+            or set(frozen["slot_weights"]) != {str(i) for i in range(1, 10)}
+            or not math.isclose(
+                math.fsum(float(value) for value in frozen["slot_weights"].values()),
+                1.0,
+                abs_tol=1e-12,
+            )
+            or not isinstance(frozen["source_manifest_sha256s"], list)
+            or not frozen["source_manifest_sha256s"]
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in [
+                    card["frozen_inputs_sha256"],
+                    frozen["normalization_input_sha256"],
+                    *frozen["source_manifest_sha256s"],
+                ]
+            )
+            or not isinstance(frozen["training_raw_count"], int)
+            or frozen["training_raw_count"] <= 0
+            or not isinstance(frozen["max_training_date"], str)
+            or frozen["max_training_date"] > config["training_window"]["end"]
+        ):
+            raise ValueError("model card frozen inputs are invalid")
+        validate_normalization(frozen["normalization"])
+        frozen_path = root / "calibration" / "frozen_inputs.json"
+        frozen_bytes = _regular_bytes(frozen_path, "calibration/frozen_inputs.json")
+        if hashlib.sha256(frozen_bytes).hexdigest() != card["frozen_inputs_sha256"]:
+            raise ValueError("model card frozen inputs hash mismatch")
+        frozen_file = _json_object(frozen_path, "calibration/frozen_inputs.json")
+        if any(frozen_file.get(key) != value for key, value in frozen.items()):
+            raise ValueError("model card frozen inputs content mismatch")
+        training_raw = _regular_bytes(
+            root / "calibration" / "training_raw_features.jsonl",
+            "calibration/training_raw_features.jsonl",
+        )
+        if hashlib.sha256(training_raw).hexdigest() != frozen["normalization_input_sha256"]:
+            raise ValueError("model card normalization input hash mismatch")
+        catalog = (
+            RawStore(root / "raw").verify_manifests()
+            if verified_catalog is None
+            else verified_catalog
+        )
+        raw_hashes = {
+            item["manifest_sha256"]
+            for item in catalog
+        }
+        if not set(frozen["source_manifest_sha256s"]) <= raw_hashes:
+            raise ValueError("model card source manifest hash mismatch")
+    if any(
+        isinstance(card[field], bool)
+        or not isinstance(card[field], (int, float))
+        or not math.isfinite(float(card[field]))
+        for field in ("alpha", "beta")
+    ):
+        raise ValueError("model card coefficients must be finite numbers")
+    config_digest = hashlib.sha256(
+        _regular_bytes(Path(config_path), "config")
+    ).hexdigest()
+    if card["config_sha256"] != config_digest:
+        raise ValueError("model card config hash does not match current config")
+    if card["training_window"] != config["training_window"]:
+        raise ValueError("model card training window is not frozen")
+    training = card["training"]
+    if not isinstance(training, dict) or set(training) != {
+        "training_min_date",
+        "training_max_date",
+        "training_count",
+        "l2",
+    }:
+        raise ValueError("model card training metadata is invalid")
+    if not (
+        config["training_window"]["start"]
+        <= training["training_min_date"]
+        <= training["training_max_date"]
+        <= config["training_window"]["end"]
+    ):
+        raise ValueError("model card training metadata crosses frozen boundaries")
+    calibration_input = root / "calibration" / "training_edges.jsonl"
+    if calibration_input.exists() and card["calibration_input_sha256"] != hashlib.sha256(
+        _regular_bytes(calibration_input, "calibration input")
+    ).hexdigest():
+        raise ValueError("model card calibration input hash mismatch")
+    return card, hashlib.sha256(content).hexdigest()
+
+
+def _verify_candidate_provenance(root: Path) -> str:
+    path = root / "features" / "candidate_provenance.json"
+    content = _regular_bytes(path, "candidate provenance")
+    provenance = _json_object(path, "candidate provenance")
+    if set(provenance) != {
+        "schema_version",
+        "candidate_raw_sha256",
+        "candidate_components_sha256",
+        "schedule_history",
+        "source_manifest_sha256s",
+    } or provenance["schema_version"] != 2:
+        raise ValueError("candidate provenance fields are invalid")
+    schedule = provenance["schedule_history"]
+    schedule_fields = {
+        "coverage_start",
+        "coverage_end",
+        "coverage_complete",
+        "source_manifest_sha256s",
+        "children",
+    }
+    child_fields = {
+        "role",
+        "coverage_start",
+        "coverage_end",
+        "coverage_complete",
+        "source_manifest_sha256",
+        "played_game_count",
+        "excluded_schedule_date_count",
+        "excluded_schedule_date_game_pks",
+        "excluded_statcast_date_count",
+        "excluded_statcast_date_game_pks",
+    }
+    if not isinstance(schedule, dict) or set(schedule) != schedule_fields:
+        raise ValueError("candidate schedule history fields are invalid")
+    try:
+        coverage_start = date.fromisoformat(schedule["coverage_start"]).isoformat()
+        coverage_end = date.fromisoformat(schedule["coverage_end"]).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate schedule history coverage is invalid") from exc
+    children = schedule["children"]
+    if (
+        coverage_start != schedule["coverage_start"]
+        or coverage_end != schedule["coverage_end"]
+        or coverage_start > coverage_end
+        or type(schedule["coverage_complete"]) is not bool
+        or not isinstance(children, list)
+        or [child.get("role") for child in children if isinstance(child, dict)]
+        != ["history", "backtest"]
+    ):
+        raise ValueError("candidate schedule history coverage is invalid")
+    child_hashes = []
+    child_completeness = []
+    child_ranges = []
+    for child in children:
+        if set(child) != child_fields:
+            raise ValueError("candidate schedule history child fields are invalid")
+        try:
+            child_start = date.fromisoformat(child["coverage_start"]).isoformat()
+            child_end = date.fromisoformat(child["coverage_end"]).isoformat()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate schedule history child coverage is invalid") from exc
+        if (
+            child_start != child["coverage_start"]
+            or child_end != child["coverage_end"]
+            or not coverage_start <= child_start <= child_end <= coverage_end
+            or type(child["coverage_complete"]) is not bool
+            or type(child["played_game_count"]) is not int
+            or child["played_game_count"] <= 0
+        ):
+            raise ValueError("candidate schedule history child coverage is invalid")
+        for prefix in ("excluded_schedule_date", "excluded_statcast_date"):
+            count = child[f"{prefix}_count"]
+            game_pks = child[f"{prefix}_game_pks"]
+            if (
+                type(count) is not int
+                or count < 0
+                or not isinstance(game_pks, list)
+                or any(type(game_pk) is not int or game_pk <= 0 for game_pk in game_pks)
+                or game_pks != sorted(set(game_pks))
+                or count != len(game_pks)
+            ):
+                raise ValueError("candidate schedule history exclusions are invalid")
+        if child["coverage_complete"] != (
+            child["excluded_statcast_date_count"] == 0
+        ):
+            raise ValueError("candidate schedule history completeness is invalid")
+        child_hashes.append(child["source_manifest_sha256"])
+        child_completeness.append(child["coverage_complete"])
+        child_ranges.append(
+            (date.fromisoformat(child_start), date.fromisoformat(child_end))
+        )
+    if any(
+        right_start != left_end + timedelta(days=1)
+        for (_, left_end), (right_start, _) in zip(
+            child_ranges, child_ranges[1:]
+        )
+    ):
+        raise ValueError("candidate schedule history ranges are invalid")
+    if (
+        coverage_start != child_ranges[0][0].isoformat()
+        or coverage_end != child_ranges[-1][1].isoformat()
+        or schedule["source_manifest_sha256s"] != child_hashes
+        or schedule["coverage_complete"] != all(child_completeness)
+    ):
+        raise ValueError("candidate schedule history aggregation is invalid")
+    hashes = [
+        provenance["candidate_raw_sha256"],
+        provenance["candidate_components_sha256"],
+        *provenance["source_manifest_sha256s"],
+        *schedule["source_manifest_sha256s"],
+    ] if isinstance(provenance["source_manifest_sha256s"], list) else []
+    if not hashes or any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in hashes
+    ):
+        raise ValueError("candidate provenance hashes are invalid")
+    raw = _regular_bytes(
+        root / "features" / "candidate_raw_features.jsonl",
+        "candidate raw features",
+    )
+    if hashlib.sha256(raw).hexdigest() != provenance["candidate_raw_sha256"]:
+        raise ValueError("candidate raw hash mismatch")
+    components = _regular_bytes(
+        root / "features" / "candidate_components.jsonl",
+        "candidate components",
+    )
+    if hashlib.sha256(components).hexdigest() != provenance["candidate_components_sha256"]:
+        raise ValueError("candidate components hash mismatch")
+    verified_manifests = RawStore(root / "raw").verify_manifests()
+    manifests_by_sha: defaultdict[str, list] = defaultdict(list)
+    for item in verified_manifests:
+        manifests_by_sha[item["manifest_sha256"]].append(item["manifest"])
+    top_level_hashes = set(provenance["source_manifest_sha256s"])
+    for child in children:
+        child_hash = child["source_manifest_sha256"]
+        bound = manifests_by_sha.get(child_hash, [])
+        expected_query = {
+            "role": child["role"],
+            "start": child["coverage_start"],
+            "end": child["coverage_end"],
+            "gameType": "R",
+            "url": schedule_url(child["coverage_start"], child["coverage_end"]),
+        }
+        if (
+            child_hash not in top_level_hashes
+            or len(bound) != 1
+            or bound[0].get("source") != "mlb_schedule"
+            or bound[0].get("query") != expected_query
+        ):
+            raise ValueError("candidate schedule history manifest is invalid")
+    if not top_level_hashes <= set(manifests_by_sha):
+        raise ValueError("candidate source manifest hash mismatch")
+    return hashlib.sha256(content).hexdigest()
+
+
+def fetch_stage(config_path: str | Path, data_dir: str | Path) -> list[object]:
+    config = load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    raw = _stage(root, "raw")
+    store = RawStore(raw)
+    artifacts = []
+    windows = [
+        ("training", {"start": start, "end": end})
+        for start, end in regular_season_ranges(config["extension_end"])[:3]
+    ] + [
+        ("history", {"start": "2025-03-18", "end": "2025-04-30"}),
+        ("backtest", _backtest_schedule_window(config)),
+    ]
+    for role, window in windows:
+        url = schedule_url(window["start"], window["end"])
+        artifacts.append(
+            store.put_unique_query(
+                "mlb_schedule",
+                {
+                    "role": role,
+                    "start": window["start"],
+                    "end": window["end"],
+                    "gameType": "R",
+                    "url": url,
+                },
+                fetch_bytes(url),
+            )
+        )
+    return artifacts
+
+
+def calibrate_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+    """Fit calibration from the verified prepare-training JSONL input."""
+    config_bytes = _regular_bytes(Path(config_path), "config")
+    config = load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    _require_raw_schedule(root, config, "training")
+    calibration = _stage(root, "calibration")
+    source = calibration / "training_edges.jsonl"
+    source_bytes = _regular_bytes(source, "calibration/training_edges.jsonl")
+    rows = _jsonl(source, "calibration/training_edges.jsonl")
+    for row in rows:
+        unknown = set(row) - _CALIBRATION_ALLOWED
+        missing = _CALIBRATION_REQUIRED - set(row)
+        if unknown or missing:
+            raise ValueError(
+                f"calibration row contract violation; unknown={sorted(unknown)}, missing={sorted(missing)}"
+            )
+    alpha, beta, metadata = fit_frozen_calibration(
+        rows,
+        training_start=config["training_window"]["start"],
+        training_end=config["training_window"]["end"],
+    )
+    card = {
+        "alpha": alpha,
+        "beta": beta,
+        "calibration_input_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "model_version": config["model_version"],
+        "protocol_phase": config["protocol"],
+        "schema_version": 1,
+        "training": metadata,
+        "training_window": config["training_window"],
+    }
+    frozen_path = calibration / "frozen_inputs.json"
+    if frozen_path.exists():
+        frozen_bytes = _regular_bytes(frozen_path, "calibration/frozen_inputs.json")
+        frozen = _json_object(frozen_path, "calibration/frozen_inputs.json")
+        required = {
+            "schema_version",
+            "normalization",
+            "slot_weights",
+            "source_manifest_sha256s",
+            "normalization_input_sha256",
+            "training_raw_count",
+            "max_training_date",
+        }
+        if set(frozen) != required or frozen["schema_version"] != 1:
+            raise ValueError("frozen inputs fields are invalid")
+        card.update(
+            {
+                key: frozen[key]
+                for key in required - {"schema_version"}
+            }
+        )
+        card["frozen_inputs_sha256"] = hashlib.sha256(frozen_bytes).hexdigest()
+        card["schema_version"] = 2
+    return _write_once(calibration / "model_card.json", _canonical_json(card), "model card", root)
+
+
+def _canonical_utc(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("scheduled_start_utc must be canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("scheduled_start_utc must be canonical UTC") from exc
+    canonical = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if parsed.utcoffset() != timedelta(0) or canonical != value:
+        raise ValueError("scheduled_start_utc must be canonical UTC ending in Z")
+    return parsed
+
+
+def _reject_forbidden_nested(value: object, path: str = "candidate") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            lowered = key.lower()
+            token = next((item for item in _FORBIDDEN_TOKENS if item in lowered), None)
+            if token is not None:
+                raise ValueError(
+                    f"unknown forbidden {token} token in candidate input"
+                )
+            _reject_forbidden_nested(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _reject_forbidden_nested(nested, f"{path}[{index}]")
+
+
+def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
+    _reject_forbidden_nested(row)
+    if "source_game_dates" in row:
+        raise ValueError("same-day event provenance lists are forbidden")
+    if "source_game_pks" in row:
+        raise ValueError("target game_pk provenance lists are forbidden")
+    unknown = set(row) - _CANDIDATE_ALLOWED
+    missing = _CANDIDATE_REQUIRED - set(row)
+    if unknown or missing:
+        raise ValueError(
+            f"candidate contract violation; unknown={sorted(unknown)}, missing={sorted(missing)}"
+        )
+    result = dict(row)
+    game_pk = result["game_pk"]
+    if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+        raise ValueError("candidate game_pk must be a positive integer")
+    try:
+        date.fromisoformat(result["official_date"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate official_date must be an ISO date") from exc
+    _canonical_utc(result["scheduled_start_utc"])
+    for field in ("away_team", "home_team"):
+        if not isinstance(result[field], str) or not result[field].strip():
+            raise ValueError(f"candidate {field} must be non-empty")
+    if result["away_team"] == result["home_team"]:
+        raise ValueError("candidate teams must differ")
+    for field in ("away_scores", "home_scores", "qualities"):
+        value = result[field]
+        if not isinstance(value, Mapping) or set(value) != _COMPONENTS:
+            raise ValueError(f"candidate {field} must contain exactly six components")
+    if not isinstance(result["critical_failure"], bool) or not isinstance(
+        result["unresolved_context"], bool
+    ):
+        raise ValueError("candidate failure/context flags must be bool")
+    bf = result["starter_career_bf"]
+    if isinstance(bf, bool) or not isinstance(bf, int) or bf < 0:
+        raise ValueError("starter_career_bf must be a non-negative integer")
+    if not isinstance(result["data_status"], str) or result["data_status"] not in _DATA_STATUS:
+        raise ValueError("data_status must be COMPLETE or INCOMPLETE")
+    if (
+        not isinstance(result["lineup_provenance"], str)
+        or result["lineup_provenance"] not in _LINEUP_PROVENANCE
+    ):
+        raise ValueError(
+            "lineup_provenance must be RECONSTRUCTED_FINAL_LINEUP or "
+            "TIMESTAMP_VERIFIED_LINEUP"
+        )
+    if "doubleheader_marker" in result and (
+        not isinstance(result["doubleheader_marker"], str)
+        or result["doubleheader_marker"] not in ("GAME1", "GAME2")
+    ):
+        raise ValueError("doubleheader_marker must be GAME1 or GAME2")
+    return result
+
+
+def _bind_candidate_to_schedule(
+    candidate: Mapping[str, object],
+    schedule_index: Mapping[int, Mapping[str, object]],
+    window: Mapping[str, str],
+) -> None:
+    official_date = candidate["official_date"]
+    if not window["start"] <= official_date <= window["end"]:
+        raise ValueError("candidate is outside the configured backtest window")
+    scheduled = schedule_index.get(candidate["game_pk"])
+    if scheduled is None:
+        raise ValueError("candidate game_pk is absent from the official schedule")
+    for field in (
+        "official_date",
+        "scheduled_start_utc",
+        "away_team",
+        "home_team",
+    ):
+        if candidate[field] != scheduled[field]:
+            raise ValueError(f"candidate {field} does not match the official schedule")
+
+
+def features_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+    """Score a prepare-features pregame-only candidate-components input."""
+    config = load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    _, schedule_index = _require_raw_schedule(root, config, "backtest")
+    card, _ = _load_model_card(root, config_path)
+    candidate_provenance_sha = (
+        _verify_candidate_provenance(root) if card["schema_version"] == 2 else None
+    )
+    features = _stage(root, "features")
+    source = features / "candidate_components.jsonl"
+    candidates = [_validate_candidate(row) for row in _jsonl(source, "features/candidate_components.jsonl")]
+    for candidate in candidates:
+        _bind_candidate_to_schedule(
+            candidate, schedule_index, _backtest_schedule_window(config)
+        )
+    seen: set[int] = set()
+    predictions: list[dict[str, object]] = []
+    for candidate in candidates:
+        game_pk = candidate["game_pk"]
+        if game_pk in seen:
+            raise ValueError("duplicate candidate game_pk")
+        seen.add(game_pk)
+        edge = component_edge(candidate["home_scores"], candidate["away_scores"])
+        p_home = home_probability(edge, card["alpha"], card["beta"])
+        pick = predicted_pick(candidate["home_team"], candidate["away_team"], p_home)
+        if pick["predicted_side"] == "none":
+            raise ValueError("exactly neutral candidates cannot be locked")
+        qualities = candidate["qualities"]
+        completeness = overall_completeness(qualities)
+        edges = {
+            name: float(candidate["home_scores"][name]) - float(candidate["away_scores"][name])
+            for name in _COMPONENTS
+        }
+        agreement = component_agreement(
+            {name: edges[name] for name in ("starter", "offense", "bullpen")},
+            pick["predicted_side"],
+        )
+        confidence = confidence_score(
+            completeness,
+            qualities["starter"],
+            qualities["offense"],
+            qualities["bullpen"],
+            agreement,
+            qualities["environment"],
+            qualities["schedule"],
+        )
+        label = uncertainty(
+            completeness,
+            candidate["critical_failure"],
+            candidate["starter_career_bf"],
+            candidate["unresolved_context"],
+        )
+        start = _canonical_utc(candidate["scheduled_start_utc"])
+        row = {
+            "game_pk": game_pk,
+            "official_date": candidate["official_date"],
+            "scheduled_start_utc": candidate["scheduled_start_utc"],
+            "lock_at_utc": (start - timedelta(minutes=45)).isoformat().replace("+00:00", "Z"),
+            "away_team": candidate["away_team"],
+            "home_team": candidate["home_team"],
+            "predicted_side": pick["predicted_side"],
+            "predicted_winner": pick["predicted_winner"],
+            "p_home": p_home,
+            "pick_probability": pick["pick_probability"],
+            "confidence": confidence,
+            "uncertainty": label,
+            "tier": tier(pick["pick_probability"], confidence, label),
+            "full_agreement": full_agreement(
+                {name: edges[name] for name in ("starter", "offense", "bullpen")},
+                pick["predicted_side"],
+                label,
+            ),
+            "model_version": "v5.1-BT",
+            "protocol_phase": "Backtest",
+            "starter_edge_abs": abs(edges["starter"]),
+            "overall_completeness": completeness,
+            "lineup_provenance": candidate["lineup_provenance"],
+            "data_status": candidate["data_status"],
+        }
+        if "doubleheader_marker" in candidate:
+            row["doubleheader_marker"] = candidate["doubleheader_marker"]
+        for component in sorted(_COMPONENTS):
+            row[f"away_{component}_score"] = candidate["away_scores"][component]
+            row[f"home_{component}_score"] = candidate["home_scores"][component]
+            row[f"{component}_edge"] = edges[component]
+            row[f"{component}_quality"] = qualities[component]
+        predictions.append(row)
+    predictions.sort(key=lambda row: (row["official_date"], row["scheduled_start_utc"], row["game_pk"]))
+    scored_bytes = _canonical_jsonl(predictions)
+    path = _write_once(
+        features / "scored_candidates.jsonl",
+        scored_bytes,
+        "scored candidates",
+        root,
+    )
+    if candidate_provenance_sha is not None:
+        _write_once(
+            features / "scored_candidate_provenance.json",
+            _canonical_json(
+                {
+                    "schema_version": 1,
+                    "candidate_provenance_sha256": candidate_provenance_sha,
+                    "scored_candidates_sha256": hashlib.sha256(scored_bytes).hexdigest(),
+                }
+            ),
+            "scored candidate provenance",
+            root,
+        )
+    return path
+
+
+def _verify_scored_candidate_provenance(root: Path) -> str:
+    candidate_sha = _verify_candidate_provenance(root)
+    path = root / "features" / "scored_candidate_provenance.json"
+    content = _regular_bytes(path, "scored candidate provenance")
+    value = _json_object(path, "scored candidate provenance")
+    if set(value) != {
+        "schema_version",
+        "candidate_provenance_sha256",
+        "scored_candidates_sha256",
+    } or value["schema_version"] != 1:
+        raise ValueError("scored candidate provenance fields are invalid")
+    scored = _regular_bytes(
+        root / "features" / "scored_candidates.jsonl", "scored candidates"
+    )
+    if value["candidate_provenance_sha256"] != candidate_sha:
+        raise ValueError("scored candidate provenance input hash mismatch")
+    if value["scored_candidates_sha256"] != hashlib.sha256(scored).hexdigest():
+        raise ValueError("scored candidate provenance output hash mismatch")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _verify_locked_source_provenance(root: Path, locked_sha256: str) -> None:
+    scored_sha = _verify_scored_candidate_provenance(root)
+    value = _json_object(
+        root / "locked" / "source_provenance.json", "locked source provenance"
+    )
+    if set(value) != {
+        "schema_version",
+        "scored_candidate_provenance_sha256",
+        "locked_predictions_sha256",
+    } or value["schema_version"] != 1:
+        raise ValueError("locked source provenance fields are invalid")
+    if value["scored_candidate_provenance_sha256"] != scored_sha:
+        raise ValueError("locked source provenance input hash mismatch")
+    if value["locked_predictions_sha256"] != locked_sha256:
+        raise ValueError("locked source provenance output hash mismatch")
+
+
+def _rank_and_lock(
+    candidates: Sequence[Mapping[str, object]],
+    output_dir: Path,
+    model_hash: str,
+) -> dict[str, object]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    by_game: dict[int, dict[str, object]] = {}
+    for row in candidates:
+        _reject_forbidden_nested(row, "scored candidate")
+        game_pk = row.get("game_pk")
+        if game_pk in by_game:
+            raise ValueError("duplicate scored candidate game_pk")
+        by_game[game_pk] = row
+        grouped[row["official_date"]].append(
+            {
+                "game_pk": row["game_pk"],
+                "official_date": row["official_date"],
+                "pick_probability": row["pick_probability"],
+                "confidence": row["confidence"],
+                "starter_edge_abs": row["starter_edge_abs"],
+                "scheduled_start_utc": row["scheduled_start_utc"],
+            }
+        )
+    locked_rows = []
+    for official_date in sorted(grouped):
+        for ranked in rank_daily(grouped[official_date]):
+            full = dict(by_game[ranked["game_pk"]])
+            full.update({key: ranked[key] for key in ("daily_rank", "top1", "top3")})
+            locked_rows.append(full)
+    return lock_predictions(locked_rows, output_dir, model_hash)
+
+
+def lock_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
+    config = load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    card, model_hash = _load_model_card(root, config_path)
+    scored_provenance_sha = (
+        _verify_scored_candidate_provenance(root)
+        if card["schema_version"] == 2
+        else None
+    )
+    candidates = _jsonl(
+        root / "features" / "scored_candidates.jsonl",
+        "features/scored_candidates.jsonl",
+    )
+    initial = config["initial_window"]
+    initial_candidates = [
+        row
+        for row in candidates
+        if initial["start"] <= row["official_date"] <= initial["end"]
+    ]
+    result = _rank_and_lock(
+        initial_candidates, _stage(root, "locked"), model_hash
+    )
+    if scored_provenance_sha is not None:
+        _write_once(
+            root / "locked" / "source_provenance.json",
+            _canonical_json(
+                {
+                    "schema_version": 1,
+                    "scored_candidate_provenance_sha256": scored_provenance_sha,
+                    "locked_predictions_sha256": result["sha256"],
+                }
+            ),
+            "locked source provenance",
+            root,
+        )
+    return result
+
+
+def _require_complete_outcomes(
+    lock_manifest: Path,
+    outcome_rows: Sequence[Mapping[str, object]],
+    model_hash: str,
+) -> list[dict[str, object]]:
+    from .outcomes import _load_lock
+
+    _, predictions = _load_lock(lock_manifest, model_hash)
+    counts: dict[object, int] = defaultdict(int)
+    for row in outcome_rows:
+        if isinstance(row, Mapping):
+            game_pk = row.get("game_pk")
+            if isinstance(game_pk, int) and not isinstance(game_pk, bool):
+                counts[game_pk] += 1
+    missing = sorted(
+        row["game_pk"] for row in predictions if counts[row["game_pk"]] == 0
+    )
+    duplicate = sorted(
+        row["game_pk"] for row in predictions if counts[row["game_pk"]] > 1
+    )
+    if missing:
+        raise ValueError(f"missing locked outcomes: {missing}")
+    if duplicate:
+        raise ValueError(f"each locked candidate requires exactly one outcome: {duplicate}")
+    return predictions
+
+
+def _join_complete_outcomes(
+    lock_manifest: Path,
+    rows: Sequence[Mapping[str, object]],
+    model_hash: str,
+    output_root: Path,
+    label: str,
+    root: Path,
+) -> Path:
+    _require_complete_outcomes(lock_manifest, rows, model_hash)
+    from .outcomes import join_outcomes
+
+    with tempfile.TemporaryDirectory(dir=output_root) as temporary_dir:
+        generated = join_outcomes(
+            lock_manifest, rows, model_hash, Path(temporary_dir) / "evaluated"
+        )
+        generated_bytes = _regular_bytes(generated, f"generated {label}")
+    return _write_once(
+        output_root / "evaluated" / "evaluated_predictions.jsonl",
+        generated_bytes,
+        label,
+        root,
+    )
+
+
+def outcomes_stage(config_path: str | Path, data_dir: str | Path) -> Path:
+    load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    card, model_hash = _load_model_card(root, config_path)
+    locked_manifest = root / "locked" / "lock_manifest.json"
+    _regular_bytes(locked_manifest, "locked/lock_manifest.json")
+    if card["schema_version"] == 2:
+        from .outcomes import _load_lock
+
+        lock_metadata, _locked = _load_lock(locked_manifest, model_hash)
+        _verify_locked_source_provenance(root, lock_metadata["sha256"])
+    outcome_root = _stage(root, "outcomes")
+    rows = _jsonl(outcome_root / "outcomes_input.jsonl", "outcomes/outcomes_input.jsonl")
+    return _join_complete_outcomes(
+        locked_manifest,
+        rows,
+        model_hash,
+        outcome_root,
+        "evaluated predictions",
+        root,
+    )
+
+
+def report_stage(config_path: str | Path, data_dir: str | Path) -> dict[str, object]:
+    load_config(config_path)
+    root = _safe_data_dir(data_dir)
+    card, model_hash = _load_model_card(root, config_path)
+    if card["schema_version"] == 2:
+        from .outcomes import _load_lock
+
+        lock_metadata, _locked = _load_lock(
+            root / "locked" / "lock_manifest.json", model_hash
+        )
+        _verify_locked_source_provenance(root, lock_metadata["sha256"])
+    evaluated_path = root / "outcomes" / "evaluated" / "evaluated_predictions.jsonl"
+    evaluated = _jsonl(evaluated_path, "evaluated predictions")
+    _require_complete_outcomes(
+        root / "locked" / "lock_manifest.json",
+        [row.get("outcome", {}) for row in evaluated],
+        model_hash,
+    )
+    baseline_path = root / "outcomes" / "baseline.json"
+    baseline_raw = _json_object(baseline_path, "baseline mapping") if baseline_path.exists() else {}
+    baseline: dict[int, str] = {}
+    for key, team in baseline_raw.items():
+        try:
+            game_pk = int(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("baseline keys must be game_pk integers") from exc
+        baseline[game_pk] = team
+    from .metrics import evaluate
+
+    summary = evaluate(evaluated, baseline_by_game=baseline)
+    _write_once(_stage(root, "reports") / "summary.json", _canonical_json(summary), "summary report", root)
+    return summary
+
+
+def _array_fixture(path: Path, label: str) -> list[dict[str, object]]:
+    try:
+        value = json.loads(_regular_bytes(path, label).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must be UTF-8 JSON") from exc
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError(f"{label} must be an array of objects")
+    return value
+
+
+def run_fixture_replay(fixture_dir: str | Path, out_dir: str | Path) -> dict[str, object]:
+    fixture = Path(fixture_dir)
+    root = _safe_data_dir(out_dir)
+    config_path = Path(__file__).resolve().parent.parent / "config" / "v5_1_bt.json"
+    config = load_config(config_path)
+    schedule_payload = _regular_bytes(fixture / "schedule.json", "fixture schedule")
+    raw_store = RawStore(_stage(root, "raw"))
+    windows = [
+        ("training", {"start": start, "end": end})
+        for start, end in regular_season_ranges(config["extension_end"])[:3]
+    ] + [("backtest", _backtest_schedule_window(config))]
+    for role, window in windows:
+        payload = schedule_payload if role == "backtest" else b'{"dates":[]}'
+        raw_store.put(
+            "mlb_schedule",
+            {
+                "role": role,
+                "start": window["start"],
+                "end": window["end"],
+                "gameType": "R",
+                "url": schedule_url(window["start"], window["end"]),
+            },
+            payload,
+        )
+    calibration_rows = _array_fixture(fixture / "calibration.json", "fixture calibration")
+    game_rows = _array_fixture(fixture / "games.json", "fixture games")
+    calibration = _stage(root, "calibration")
+    features = _stage(root, "features")
+    _write_once(calibration / "training_edges.jsonl", _canonical_jsonl(calibration_rows), "fixture calibration input", root)
+    _write_once(features / "candidate_components.jsonl", _canonical_jsonl(game_rows), "fixture feature input", root)
+    calibrate_stage(config_path, root)
+    features_stage(config_path, root)
+    _, model_hash = _load_model_card(root, config_path)
+    scored_rows = _jsonl(
+        root / "features" / "scored_candidates.jsonl",
+        "fixture scored candidates",
+    )
+    all_dates = sorted({row["official_date"] for row in scored_rows})
+    if len(all_dates) < 4:
+        raise ValueError("fixture replay requires three initial dates and an extension date")
+    initial_dates = all_dates[:3]
+    initial_candidates = [
+        row for row in scored_rows if row["official_date"] in initial_dates
+    ]
+    initial_manifest = _rank_and_lock(
+        initial_candidates, _stage(root, "initial_locked"), model_hash
+    )
+    initial_lock_path = root / "initial_locked" / "lock_manifest.json"
+    initial_lock_mtime = initial_lock_path.stat().st_mtime_ns
+
+    # Initial outcomes remain unopened until the immutable three-date lock exists.
+    initial_fixture_outcomes = _array_fixture(
+        fixture / "initial_outcomes.json", "fixture initial outcomes"
+    )
+    initial_game_pks = {row["game_pk"] for row in initial_candidates}
+    initial_outcome_rows = [
+        row for row in initial_fixture_outcomes if row["game_pk"] in initial_game_pks
+    ]
+    initial_outcome_root = _stage(root, "initial_outcomes")
+    _write_once(
+        initial_outcome_root / "outcomes_input.jsonl",
+        _canonical_jsonl(initial_outcome_rows),
+        "fixture initial outcome input",
+        root,
+    )
+    initial_evaluated_path = _join_complete_outcomes(
+        initial_lock_path,
+        initial_outcome_rows,
+        model_hash,
+        initial_outcome_root,
+        "initial evaluated predictions",
+        root,
+    )
+    initial_evaluated = _jsonl(initial_evaluated_path, "initial evaluated predictions")
+    from .metrics import completion_status, extension_dates
+
+    initial_completion = completion_status(initial_evaluated, target=3)
+    evaluated = initial_evaluated
+    accumulated_outcomes = list(initial_outcome_rows)
+    selected_dates = list(initial_dates)
+    selected_extension_dates: list[str] = []
+    round_lock_shas: list[str] = []
+    round_number = 0
+    while not completion_status(evaluated, target=3)["complete"]:
+        status = completion_status(evaluated, target=3)
+        future_dates = [day for day in all_dates if day > max(selected_dates)]
+        try:
+            batch_dates = extension_dates(evaluated, future_dates, target=3)
+        except ValueError as exc:
+            raise RuntimeError(
+                "schedule dates exhausted before graded target: "
+                f"graded={status['graded_top1']} void={status['void_top1']} "
+                f"target={status['target']}"
+            ) from exc
+        round_number += 1
+        selected_dates.extend(batch_dates)
+        selected_extension_dates.extend(batch_dates)
+        cumulative_candidates = [
+            row for row in scored_rows if row["official_date"] in selected_dates
+        ]
+        round_root = Path("extension_rounds") / f"round_{round_number:03d}"
+        round_lock_dir = _safe_descendant_dir(root, round_root / "locked")
+        round_manifest = _rank_and_lock(
+            cumulative_candidates, round_lock_dir, model_hash
+        )
+        round_lock_shas.append(round_manifest["sha256"])
+
+        # Each date's result is opened only after its cumulative round lock exists.
+        for extension_date in batch_dates:
+            accumulated_outcomes.extend(
+                _array_fixture(
+                    fixture
+                    / "extension_outcomes_by_date"
+                    / f"{extension_date}.json",
+                    f"fixture extension outcomes for {extension_date}",
+                )
+            )
+        round_outcome_dir = _safe_descendant_dir(root, round_root / "outcomes")
+        round_evaluated_path = _join_complete_outcomes(
+            round_lock_dir / "lock_manifest.json",
+            accumulated_outcomes,
+            model_hash,
+            round_outcome_dir,
+            f"extension round {round_number} evaluated predictions",
+            root,
+        )
+        evaluated = _jsonl(
+            round_evaluated_path,
+            f"extension round {round_number} evaluated predictions",
+        )
+
+    final_dates = set(selected_dates)
+    final_candidates = [
+        row for row in scored_rows if row["official_date"] in final_dates
+    ]
+    lock_manifest = _rank_and_lock(
+        final_candidates, _stage(root, "locked"), model_hash
+    )
+    lock_path = root / "locked" / "lock_manifest.json"
+    lock_mtime = lock_path.stat().st_mtime_ns
+
+    final_game_pks = {row["game_pk"] for row in final_candidates}
+    final_outcome_rows = [
+        row for row in accumulated_outcomes if row["game_pk"] in final_game_pks
+    ]
+    outcome_root = _stage(root, "outcomes")
+    _write_once(outcome_root / "outcomes_input.jsonl", _canonical_jsonl(final_outcome_rows), "fixture outcome input", root)
+    evaluated_path = outcomes_stage(config_path, root)
+    summary = report_stage(config_path, root)
+    prediction_rows = _jsonl(root / "locked" / "predictions.jsonl", "locked predictions")
+    initial_prediction_rows = _jsonl(
+        root / "initial_locked" / "predictions.jsonl", "initial locked predictions"
+    )
+    overlapping = [
+        row for row in prediction_rows if row["official_date"] in initial_dates
+    ]
+    if initial_prediction_rows != overlapping:
+        raise RuntimeError("initial locked predictions changed in the final lock")
+    selected = [row for row in prediction_rows if row["top1"] == "Yes"]
+    result = {
+        "selection_dates": len({row["official_date"] for row in selected}),
+        "top1_count": len(selected),
+        "graded_count": summary["primary"]["N"],
+        "graded_top1": summary["primary"]["N"],
+        "void_count": summary["void_top1"],
+        "void_top1": summary["void_top1"],
+        "lock_mtime_ns": lock_mtime,
+        "outcome_mtime_ns": evaluated_path.stat().st_mtime_ns,
+        "initial_lock_mtime_ns": initial_lock_mtime,
+        "initial_outcome_mtime_ns": initial_evaluated_path.stat().st_mtime_ns,
+        "initial_lock_sha": initial_manifest["sha256"],
+        "initial_locked_sha256": initial_manifest["sha256"],
+        "extension_dates": selected_extension_dates,
+        "round_lock_shas": round_lock_shas,
+        "round_hashes": round_lock_shas,
+        "initial_completion": initial_completion,
+        "final_lock_sha": lock_manifest["sha256"],
+        "lock_sha256": lock_manifest["sha256"],
+        "locked_sha256": lock_manifest["sha256"],
+        "summary": summary,
+    }
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mlb_backtest.pipeline",
+        description="Run deterministic backtest stages over prepared JSONL inputs.",
+        epilog=(
+            "calibrate and features require immutable raw schedule manifests. "
+            "Run fetch, fetch-statcast, fetch-era, fetch-career-bf, "
+            "prepare-training, calibrate, "
+            "prepare-features, features, lock, prepare-outcomes, outcomes, report."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in (
+        "fetch",
+        "fetch-statcast",
+        "fetch-era",
+        "fetch-career-bf",
+        "prepare-training",
+        "calibrate",
+        "prepare-candidates",
+        "prepare-features",
+        "features",
+        "lock",
+        "prepare-outcomes",
+        "outcomes",
+        "report",
+    ):
+        subparser = subparsers.add_parser(command)
+        subparser.add_argument("--config", required=True)
+        subparser.add_argument("--data-dir", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    from .statcast import fetch_statcast_stage
+    from .model_prep import (
+        fetch_league_era_stage,
+        fetch_prior_career_bf_stage,
+        prepare_candidates_stage,
+        prepare_outcomes_stage,
+        prepare_training_stage,
+    )
+
+    commands = {
+        "fetch": fetch_stage,
+        "fetch-statcast": fetch_statcast_stage,
+        "fetch-era": fetch_league_era_stage,
+        "fetch-career-bf": fetch_prior_career_bf_stage,
+        "prepare-training": prepare_training_stage,
+        "calibrate": calibrate_stage,
+        "prepare-candidates": prepare_candidates_stage,
+        "prepare-features": prepare_candidates_stage,
+        "features": features_stage,
+        "lock": lock_stage,
+        "prepare-outcomes": prepare_outcomes_stage,
+        "outcomes": outcomes_stage,
+        "report": report_stage,
+    }
+    commands[args.command](args.config, args.data_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "calibrate_stage",
+    "features_stage",
+    "fetch_stage",
+    "lock_stage",
+    "main",
+    "outcomes_stage",
+    "report_stage",
+    "run_fixture_replay",
+]

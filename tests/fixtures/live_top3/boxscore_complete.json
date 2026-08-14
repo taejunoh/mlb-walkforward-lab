@@ -1,0 +1,34 @@
+{
+  "teams": {
+    "away": {
+      "team": {"id": 110},
+      "pitchers": [501],
+      "players": {
+        "ID1001": {"person": {"id": 1001}, "battingOrder": "100"},
+        "ID1002": {"person": {"id": 1002}, "battingOrder": "200"},
+        "ID1003": {"person": {"id": 1003}, "battingOrder": "300"},
+        "ID1004": {"person": {"id": 1004}, "battingOrder": "400"},
+        "ID1005": {"person": {"id": 1005}, "battingOrder": "500"},
+        "ID1006": {"person": {"id": 1006}, "battingOrder": "600"},
+        "ID1007": {"person": {"id": 1007}, "battingOrder": "700"},
+        "ID1008": {"person": {"id": 1008}, "battingOrder": "800"},
+        "ID1009": {"person": {"id": 1009}, "battingOrder": "900"}
+      }
+    },
+    "home": {
+      "team": {"id": 120},
+      "pitchers": [601],
+      "players": {
+        "ID2001": {"person": {"id": 2001}, "battingOrder": "100"},
+        "ID2002": {"person": {"id": 2002}, "battingOrder": "200"},
+        "ID2003": {"person": {"id": 2003}, "battingOrder": "300"},
+        "ID2004": {"person": {"id": 2004}, "battingOrder": "400"},
+        "ID2005": {"person": {"id": 2005}, "battingOrder": "500"},
+        "ID2006": {"person": {"id": 2006}, "battingOrder": "600"},
+        "ID2007": {"person": {"id": 2007}, "battingOrder": "700"},
+        "ID2008": {"person": {"id": 2008}, "battingOrder": "800"},
+        "ID2009": {"person": {"id": 2009}, "battingOrder": "900"}
+      }
+    }
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "records": [
+    {
+      "anchor": {
+        "alternate_site": false,
+        "away_score": 6,
+        "away_team_id": 133,
+        "completed_innings": 9,
+        "doubleheader_order": 1,
+        "game_pk": 565338,
+        "home_score": 4,
+        "home_team_id": 114,
+        "neutral_site": false,
+        "official_date": "2019-05-20",
+        "played": true,
+        "raw_game_object_sha256": "92900ec47f924a1a68d533d63ae068faabd42262b808461a543974b61f75d5ef",
+        "scheduled_innings": 9,
+        "scheduled_start_utc": "2019-05-20T22:10:00Z",
+        "season": 2019,
+        "season_start_date": "2019-03-20",
+        "terminal_status": "Final",
+        "venue_id": 5,
+        "winner_team_id": 133
+      },
+      "normalized_anchor_sha256": "5224b908bc7a340ac057bb9f56efa1e9ebdf3ac64972191611e0e0b802410c96"
+    },
+    {
+      "anchor": {
+        "alternate_site": false,
+        "away_score": 5,
+        "away_team_id": 146,
+        "completed_innings": 11,
+        "doubleheader_order": 1,
+        "game_pk": 565535,
+        "home_score": 4,
+        "home_team_id": 116,
+        "neutral_site": false,
+        "official_date": "2019-05-21",
+        "played": true,
+        "raw_game_object_sha256": "11afba7dcd8ec0de2b78f8773e2c49c8f23a7d104e9b1a2b58d9a9f5893ff019",
+        "scheduled_innings": 9,
+        "scheduled_start_utc": "2019-05-21T23:10:00Z",
+        "season": 2019,
+        "season_start_date": "2019-03-20",
+        "terminal_status": "Final",
+        "venue_id": 2394,
+        "winner_team_id": 146
+      },
+      "normalized_anchor_sha256": "131e5e173effb6b610c00624a3544bb36c0b42968e69c3d1c2e740a8e35248b2"
+    },
+    {
+      "anchor": {
+        "alternate_site": false,
+        "away_score": 5,
+        "away_team_id": 116,
+        "completed_innings": 11,
+        "doubleheader_order": 1,
+        "game_pk": 566156,
+        "home_score": 4,
+        "home_team_id": 133,
+        "neutral_site": false,
+        "official_date": "2019-09-06",
+        "played": true,
+        "raw_game_object_sha256": "35b92c2f65d844a4e66574c23cf1ba4b8c2c30c8823024cf94378c67fda8c2ab",
+        "scheduled_innings": 9,
+        "scheduled_start_utc": "2019-09-07T02:07:00Z",
+        "season": 2019,
+        "season_start_date": "2019-03-20",
+        "terminal_status": "Final",
+        "venue_id": 10,
+        "winner_team_id": 116
+      },
+      "normalized_anchor_sha256": "3e80a9bb13f2751a7378e3a4157777b2aad6b99d70b51f700c4393a9b73ddf29"
+    },
+    {
+      "anchor": {
+        "alternate_site": false,
+        "away_score": 2,
+        "away_team_id": 116,
+        "completed_innings": 9,
+        "doubleheader_order": 1,
+        "game_pk": 566157,
+        "home_score": 10,
+        "home_team_id": 133,
+        "neutral_site": false,
+        "official_date": "2019-09-07",
+        "played": true,
+        "raw_game_object_sha256": "db8427682b066341a9f204dd2832ff418d93946b1ff12e07b147e7e60398ca6d",
+        "scheduled_innings": 9,
+        "scheduled_start_utc": "2019-09-08T01:07:00Z",
+        "season": 2019,
+        "season_start_date": "2019-03-20",
+        "terminal_status": "Final",
+        "venue_id": 10,
+        "winner_team_id": 133
+      },
+      "normalized_anchor_sha256": "c5b3a273d946f93b500430363f679e351a1b03e739576a1f3830bafbc829769f"
+    }
+  ]
+}

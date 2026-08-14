@@ -1,0 +1,22 @@
+{
+  "first": {
+    "calendar_event_id": "14-565534-2019-05-19",
+    "date_index": 54,
+    "game_date": "2019-05-19T17:10:00Z",
+    "game_index": 5,
+    "resume_date": "2019-09-07T00:15:00Z",
+    "resume_game_date": "2019-09-06",
+    "sha256": "5d2fc4945a5e562bb6676d8af0d1272dec29c946c293925a938655d15a000941",
+    "venue_id": 2394
+  },
+  "retained": {
+    "calendar_event_id": "14-565534-2019-09-06",
+    "date_index": 161,
+    "game_date": "2019-09-07T00:15:00Z",
+    "game_index": 12,
+    "resumed_from": "2019-05-19T17:10:00Z",
+    "resumed_from_date": "2019-05-19",
+    "sha256": "6b07d5e4781c472ca1e0a22b7190acdef61c8fe3d8885524835d6f6c876a9dd6",
+    "venue_id": 10
+  }
+}

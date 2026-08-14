@@ -1,0 +1,6 @@
+{
+  "teams": {
+    "away": {"team": {"id": 110}, "pitchers": [], "players": {}},
+    "home": {"team": {"id": 120}, "pitchers": [], "players": {}}
+  }
+}

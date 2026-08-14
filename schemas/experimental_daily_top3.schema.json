@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "model_label", "target_date", "command_inputs",
+    "executed_at_eastern", "executed_at_utc", "history_cutoff_date",
+    "cache_authority", "model_card_sha256", "source_bindings",
+    "verified_top3", "preliminary_top3", "unscored_games",
+    "excluded_games", "warnings", "content_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "model_label": {"const": "v5.1-EXPERIMENTAL-LIVE"},
+    "target_date": {"$ref": "#/$defs/date"},
+    "command_inputs": {"$ref": "#/$defs/commandInputs"},
+    "executed_at_eastern": {"$ref": "#/$defs/eastern"},
+    "executed_at_utc": {"$ref": "#/$defs/utc"},
+    "history_cutoff_date": {"$ref": "#/$defs/date"},
+    "cache_authority": {"$ref": "#/$defs/cacheAuthority"},
+    "model_card_sha256": {"$ref": "#/$defs/sha256"},
+    "source_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/sourceBinding"}
+    },
+    "verified_top3": {"type": "array", "maxItems": 0, "items": {"$ref": "#/$defs/rankedRow"}},
+    "preliminary_top3": {
+      "type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/rankedRow"}
+    },
+    "unscored_games": {"type": "array", "items": {"$ref": "#/$defs/unscoredRow"}},
+    "excluded_games": {"type": "array", "items": {"$ref": "#/$defs/excludedRow"}},
+    "warnings": {"$ref": "#/$defs/warnings"},
+    "content_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?Z$"
+    },
+    "eastern": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?-0[45]:00$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "posixPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)(?!.*\/$).+"
+    },
+    "commandInputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "model_card"],
+      "properties": {
+        "date": {"$ref": "#/$defs/date"},
+        "model_card": {"$ref": "#/$defs/posixPath"}
+      }
+    },
+    "cacheAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "cutoff_date", "catalog_sha256"],
+      "properties": {
+        "namespace": {"const": "experimental_daily/history_cache"},
+        "cutoff_date": {"$ref": "#/$defs/date"},
+        "catalog_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source", "observation_id", "query_identity_json", "requested_url", "final_url",
+        "binding_role", "game_pks",
+        "response_completed_at_utc", "durable_at_utc", "http_status",
+        "content_type", "etag", "last_modified", "payload_sha256",
+        "byte_length", "payload_relative", "manifest_sha256",
+        "receipt_relative", "receipt_sha256", "binding_sha256"
+      ],
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "stats_api"}}},
+          "then": {"properties": {"final_url": {"pattern": "^https://statsapi\\.mlb\\.com(?:[/?#]|$)"}}}
+        },
+        {
+          "if": {"properties": {"source": {"const": "savant"}}},
+          "then": {"properties": {"final_url": {"pattern": "^https://baseballsavant\\.mlb\\.com(?:[/?#]|$)"}}}
+        }
+      ],
+      "properties": {
+        "source": {"enum": ["stats_api", "savant"]},
+        "binding_role": {
+          "enum": ["LIVE_SCHEDULE", "LIVE_PARTICIPANTS", "FINAL_SCHEDULE",
+            "HISTORY_SCHEDULE", "HISTORY_STATCAST", "HISTORY_ERA",
+            "HISTORY_VENUE", "CAREER_BF"]
+        },
+        "game_pks": {
+          "type": "array", "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        },
+        "observation_id": {"type": "string", "minLength": 1},
+        "query_identity_json": {"type": "string", "minLength": 2, "pattern": "^\\{.*\\}$"},
+        "requested_url": {"type": "string", "format": "uri", "pattern": "^https?://"},
+        "final_url": {"type": "string", "format": "uri", "pattern": "^https?://"},
+        "response_completed_at_utc": {"$ref": "#/$defs/utc"},
+        "durable_at_utc": {"$ref": "#/$defs/utc"},
+        "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "content_type": {"type": ["string", "null"]},
+        "etag": {"type": ["string", "null"]},
+        "last_modified": {"type": ["string", "null"]},
+        "payload_sha256": {"$ref": "#/$defs/sha256"},
+        "byte_length": {"type": "integer", "minimum": 0},
+        "payload_relative": {"$ref": "#/$defs/posixPath"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_relative": {"$ref": "#/$defs/posixPath"},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "binding_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "rankedRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "game_pk", "target_date", "away_team", "home_team", "predicted_winner",
+        "pick_probability", "pick_probability_display", "state", "rank",
+        "data_completeness", "starter_edge_abs", "starter_provenance",
+        "lineup_provenance", "scheduled_start_utc", "observation_boundary_utc",
+        "reason_codes", "model_card_sha256", "feature_sha256", "source_binding_sha256s"
+      ],
+      "properties": {
+        "game_pk": {"type": "integer", "minimum": 1},
+        "target_date": {"$ref": "#/$defs/date"},
+        "away_team": {"type": "string", "minLength": 1},
+        "home_team": {"type": "string", "minLength": 1},
+        "predicted_winner": {"type": "string", "minLength": 1},
+        "pick_probability": {"type": "number", "minimum": 0, "maximum": 1},
+        "pick_probability_display": {"type": "string", "minLength": 1},
+        "state": {"const": "PRELIMINARY"},
+        "rank": {"type": "integer", "minimum": 1},
+        "data_completeness": {"type": "number", "minimum": 0, "maximum": 1},
+        "starter_edge_abs": {"type": "number", "minimum": 0},
+        "starter_provenance": {"type": "string", "minLength": 1},
+        "lineup_provenance": {"type": "string", "minLength": 1},
+        "scheduled_start_utc": {"$ref": "#/$defs/utc"},
+        "observation_boundary_utc": {"$ref": "#/$defs/utc"},
+        "reason_codes": {"$ref": "#/$defs/stringArray"},
+        "model_card_sha256": {"$ref": "#/$defs/sha256"},
+        "feature_sha256": {"$ref": "#/$defs/sha256"},
+        "source_binding_sha256s": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true
+        }
+      }
+    },
+    "unscoredRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "game_pk", "target_date", "away_team", "home_team", "state",
+        "scheduled_start_utc", "reason_codes", "source_binding_sha256s"
+      ],
+      "properties": {
+        "game_pk": {"type": "integer", "minimum": 1},
+        "target_date": {"$ref": "#/$defs/date"},
+        "away_team": {"type": "string", "minLength": 1},
+        "home_team": {"type": "string", "minLength": 1},
+        "state": {"const": "UNSCORED"},
+        "scheduled_start_utc": {"$ref": "#/$defs/utc"},
+        "reason_codes": {"$ref": "#/$defs/stringArray"},
+        "source_binding_sha256s": {
+          "type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true
+        }
+      }
+    },
+    "excludedRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "game_pk", "target_date", "away_team", "home_team", "state",
+        "scheduled_start_utc", "reason_codes", "source_binding_sha256s"
+      ],
+      "properties": {
+        "game_pk": {"type": "integer", "minimum": 1},
+        "target_date": {"$ref": "#/$defs/date"},
+        "away_team": {"type": "string", "minLength": 1},
+        "home_team": {"type": "string", "minLength": 1},
+        "state": {"const": "EXCLUDED"},
+        "scheduled_start_utc": {"$ref": "#/$defs/utc"},
+        "reason_codes": {"$ref": "#/$defs/stringArray"},
+        "source_binding_sha256s": {
+          "type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true
+        }
+      }
+    }
+  }
+}
