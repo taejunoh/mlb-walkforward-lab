@@ -1,0 +1,175 @@
+{
+  "$defs": {
+    "baseball_savant_statcast_query": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {"type": "string"},
+        "game_type": {"type": "string"},
+        "start": {"type": "string"},
+        "url": {"type": "string"}
+      },
+      "required": ["end", "game_type", "start", "url"],
+      "type": "object"
+    },
+    "inode_fingerprint": {
+      "additionalProperties": false,
+      "properties": {
+        "device": {"minimum": 0, "type": "integer"},
+        "inode": {"minimum": 1, "type": "integer"}
+      },
+      "required": ["device", "inode"],
+      "type": "object"
+    },
+    "mlb_schedule_query": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {"type": "string"},
+        "gameType": {"type": "string"},
+        "role": {"type": "string"},
+        "start": {"type": "string"},
+        "url": {"type": "string"}
+      },
+      "required": ["end", "gameType", "role", "start", "url"],
+      "type": "object"
+    },
+    "mlb_stats_pitcher_bf_query": {
+      "additionalProperties": false,
+      "properties": {
+        "endDate": {"type": "string"},
+        "gameType": {"type": "string"},
+        "group": {"type": "string"},
+        "pitcher_id": {"type": "integer"},
+        "sportIds": {"type": "integer"},
+        "startDate": {"type": "string"},
+        "stats": {"type": "string"},
+        "url": {"type": "string"}
+      },
+      "required": [
+        "endDate",
+        "gameType",
+        "group",
+        "pitcher_id",
+        "sportIds",
+        "startDate",
+        "stats",
+        "url"
+      ],
+      "type": "object"
+    },
+    "mlb_stats_pitching_query": {
+      "additionalProperties": false,
+      "properties": {
+        "endDate": {"type": "string"},
+        "gameType": {"type": "string"},
+        "group": {"type": "string"},
+        "limit": {"type": "integer"},
+        "playerPool": {"type": "string"},
+        "sportIds": {"type": "integer"},
+        "startDate": {"type": "string"},
+        "stats": {"type": "string"},
+        "url": {"type": "string"}
+      },
+      "required": [
+        "endDate",
+        "gameType",
+        "group",
+        "limit",
+        "playerPool",
+        "sportIds",
+        "startDate",
+        "stats",
+        "url"
+      ],
+      "type": "object"
+    },
+    "object": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_size": {"minimum": 0, "type": "integer"},
+        "inode_fingerprint": {"$ref": "#/$defs/inode_fingerprint"},
+        "path": {
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "type": "string"
+        },
+        "sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"}
+      },
+      "required": ["byte_size", "inode_fingerprint", "path", "sha256"],
+      "type": "object"
+    },
+    "record": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "baseball_savant_statcast"}}},
+          "then": {"properties": {"canonical_query": {"$ref": "#/$defs/baseball_savant_statcast_query"}}}
+        },
+        {
+          "if": {"properties": {"source": {"const": "mlb_schedule"}}},
+          "then": {"properties": {"canonical_query": {"$ref": "#/$defs/mlb_schedule_query"}}}
+        },
+        {
+          "if": {"properties": {"source": {"const": "mlb_stats_pitcher_bf"}}},
+          "then": {"properties": {"canonical_query": {"$ref": "#/$defs/mlb_stats_pitcher_bf_query"}}}
+        },
+        {
+          "if": {"properties": {"source": {"const": "mlb_stats_pitching"}}},
+          "then": {"properties": {"canonical_query": {"$ref": "#/$defs/mlb_stats_pitching_query"}}}
+        }
+      ],
+      "properties": {
+        "canonical_query": {
+          "oneOf": [
+            {"$ref": "#/$defs/baseball_savant_statcast_query"},
+            {"$ref": "#/$defs/mlb_schedule_query"},
+            {"$ref": "#/$defs/mlb_stats_pitcher_bf_query"},
+            {"$ref": "#/$defs/mlb_stats_pitching_query"}
+          ]
+        },
+        "manifest": {"$ref": "#/$defs/object"},
+        "raw": {"$ref": "#/$defs/object"},
+        "rawstore_verified": {"const": true},
+        "seal": {"$ref": "#/$defs/object"},
+        "source": {
+          "enum": [
+            "baseball_savant_statcast",
+            "mlb_schedule",
+            "mlb_stats_pitcher_bf",
+            "mlb_stats_pitching"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "canonical_query",
+        "manifest",
+        "raw",
+        "rawstore_verified",
+        "seal",
+        "source"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "legacy_root": {"const": "data/v5_1_bt/raw"},
+    "manifest_count": {"minimum": 1, "type": "integer"},
+    "rawstore_verification": {"const": "PASS"},
+    "records": {
+      "items": {"$ref": "#/$defs/record"},
+      "minItems": 1,
+      "type": "array"
+    },
+    "schema_version": {"const": 1}
+  },
+  "required": [
+    "legacy_root",
+    "manifest_count",
+    "rawstore_verification",
+    "records",
+    "schema_version"
+  ],
+  "type": "object"
+}

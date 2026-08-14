@@ -1,0 +1,7 @@
+pitch_type,game_date,game_pk,pitcher,batter,events,description,p_throws,home_team,away_team,inning,inning_topbot,release_speed,woba_value,woba_denom,estimated_woba_using_speedangle,launch_speed_angle,at_bat_number,pitch_number,home_score,away_score,post_home_score,post_away_score,outs_when_up,game_type
+FF,2024-04-02,1002,13,103,field_out,hit_into_play,R,AAA,BBB,1,Top,96.0,0,1,0.08,2,1,1,0,0,0,0,0,R
+FF,2024-04-02,1002,13,104,strikeout,swinging_strike,R,AAA,BBB,1,Top,95.0,0,1,0.05,,2,1,0,0,0,0,1,R
+FF,2024-04-02,1002,13,105,field_out,hit_into_play,R,AAA,BBB,1,Top,94.0,0,1,0.07,3,3,1,0,0,0,0,2,R
+FF,2024-04-02,1002,23,203,field_out,hit_into_play,L,AAA,BBB,1,Bot,92.0,0,1,0.09,2,4,1,0,0,0,0,0,R
+FF,2024-04-02,1002,23,204,strikeout,swinging_strike,L,AAA,BBB,1,Bot,91.0,0,1,0.04,,5,1,0,0,0,0,1,R
+FF,2024-04-02,1002,23,205,field_out,hit_into_play,L,AAA,BBB,1,Bot,90.0,0,1,0.06,3,6,1,0,0,0,0,2,R

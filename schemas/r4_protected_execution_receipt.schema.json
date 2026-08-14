@@ -1,0 +1,166 @@
+{
+  "$defs": {
+    "git": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_protected_execution_receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "admission_record_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "dependency_closure_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "staged_mach_o_observations_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "pre_install_staged_mach_o_observations_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "environment_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "git_head": {
+      "$ref": "#/$defs/git"
+    },
+    "git_tree": {
+      "$ref": "#/$defs/git"
+    },
+    "helper_codesign_requirement_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "helper_signing_identity_sha1": {
+      "const": "4C6503D0A78A9F51C86CC7C9683115E74A4902A7"
+    },
+    "helper_team_id": {
+      "const": "3BMF4LM6TM"
+    },
+    "input_bundle_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "key_generation": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "kind": {
+      "const": "R4_PROTECTED_EXECUTION_RECEIPT_V2"
+    },
+    "lock_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "materialization_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "provisioner_binary_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "public_key_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "published_closure_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "required_blob_set_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "runtime_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "runtime_output_closure_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sandbox_profile_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sandbox_launcher_path": {"const": "/usr/bin/sandbox-exec"},
+    "sandbox_launcher_descriptor_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_launcher_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_launcher_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_profile_template_sha256": {"$ref": "#/$defs/sha256"},
+    "child_command_template_sha256": {"$ref": "#/$defs/sha256"},
+    "installer_command_sha256": {"$ref": "#/$defs/sha256"},
+    "import_command_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_mach_o_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_mach_o_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "state": {
+      "const": "SEALED"
+    },
+    "task14_approval_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "wheel_set_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "state",
+    "key_generation",
+    "manifest_sha256",
+    "runtime_manifest_sha256",
+    "task14_approval_sha256",
+    "input_bundle_manifest_sha256",
+    "lock_sha256",
+    "materialization_policy_sha256",
+    "wheel_set_sha256",
+    "runtime_output_closure_sha256",
+    "dependency_closure_sha256",
+    "staged_mach_o_observations_sha256",
+    "pre_install_staged_mach_o_observations_sha256",
+    "admission_record_sha256",
+    "git_head",
+    "git_tree",
+    "required_blob_set_sha256",
+    "provisioner_binary_sha256",
+    "helper_codesign_requirement_sha256",
+    "helper_team_id",
+    "helper_signing_identity_sha1",
+    "public_key_sha256",
+    "published_closure_sha256",
+    "sandbox_launcher_path",
+    "sandbox_launcher_descriptor_identity_sha256",
+    "sandbox_launcher_sha256",
+    "sandbox_launcher_codesign_identity_sha256",
+    "sandbox_profile_template_sha256",
+    "sandbox_profile_sha256",
+    "child_command_template_sha256",
+    "installer_command_sha256",
+    "import_command_sha256",
+    "interpreter_pre_install_sha256",
+    "interpreter_pre_install_mach_o_sha256",
+    "interpreter_pre_install_codesign_identity_sha256",
+    "interpreter_post_install_sha256",
+    "interpreter_post_install_mach_o_sha256",
+    "interpreter_post_install_codesign_identity_sha256",
+    "environment_sha256",
+    "sha256"
+  ],
+  "type": "object"
+}

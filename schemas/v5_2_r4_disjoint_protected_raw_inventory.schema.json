@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.invalid/schemas/v5_2_r4_disjoint_protected_raw_inventory.schema.json",
+  "title": "R4 disjoint protected raw inventory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "custody_generation", "custody_parent_class", "final_name",
+    "source_approval", "operational_journal", "execution_binding", "snapshot",
+    "manifest_count", "physical_member_count", "logical_binding_count", "rawstore_verification",
+    "records", "members", "bindings", "root_locks", "directories", "directory_manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "v5.2-r4-disjoint-protected-raw-inventory-v1"},
+    "kind": {"const": "MLB_R4_DISJOINT_PROTECTED_RAW_INVENTORY"},
+    "custody_generation": {"const": "v5.2-r4-disjoint-custody-v2"},
+    "custody_parent_class": {"const": "LOCAL_APFS_NON_FILE_PROVIDER"},
+    "final_name": {"const": "v5_1_bt_r4"},
+    "source_approval": {"$ref": "#/$defs/sourceApproval"},
+    "operational_journal": {"$ref": "#/$defs/operationalJournal"},
+    "execution_binding": {"$ref": "#/$defs/executionBinding"},
+    "snapshot": {"$ref": "#/$defs/snapshot"},
+    "manifest_count": {"const": 1675},
+    "physical_member_count": {"const": 4711},
+    "logical_binding_count": {"const": 5025},
+    "rawstore_verification": {"const": "PASS"},
+    "records": {"type": "array", "minItems": 1675, "maxItems": 1675, "items": {"$ref": "#/$defs/record"}},
+    "members": {"type": "array", "minItems": 4711, "maxItems": 4711, "items": {"$ref": "#/$defs/member"}},
+    "bindings": {"type": "array", "minItems": 5025, "maxItems": 5025, "items": {"$ref": "#/$defs/binding"}},
+    "root_locks": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/rootLock"}, "allOf": [{"contains": {"type": "object", "required": ["path"], "properties": {"path": {"const": ".baseball_savant_statcast.lock"}}}}, {"contains": {"type": "object", "required": ["path"], "properties": {"path": {"const": ".mlb_schedule.lock"}}}}, {"contains": {"type": "object", "required": ["path"], "properties": {"path": {"const": ".mlb_stats_pitcher_bf.lock"}}}}, {"contains": {"type": "object", "required": ["path"], "properties": {"path": {"const": ".mlb_stats_pitching.lock"}}}}]},
+    "directories": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/directory"}},
+    "directory_manifest_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitSha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "relativePath": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$)).+$"},
+    "rawPath": {"type": "string", "pattern": "^data/v5_1_bt/raw/[^/]+/[^/]+$"},
+    "sourceApproval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["logical_raw_root", "protected_inventory_path", "protected_inventory_sha256"],
+      "properties": {
+        "logical_raw_root": {"const": "data/v5_1_bt/raw"},
+        "protected_inventory_path": {"const": "audit/v5_1_bt/protected_raw_inventory.json"},
+        "protected_inventory_sha256": {"const": "2ec8bf0237cc5bdb00ddb6d2236ac631bb793aed9ba79f308672a9ecb90809c6"}
+      }
+    },
+    "operationalJournal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "sha256", "terminal_event_sha256"],
+      "properties": {
+        "format": {"const": "MLB_R4_DISJOINT_CUSTODY_JOURNAL_V1"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "terminal_event_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["volume_uuid", "device", "inode", "ctime_ns", "file_type", "mode", "flags", "nlink", "byte_size", "sha256"],
+      "properties": {
+        "volume_uuid": {"$ref": "#/$defs/uuid"},
+        "device": {"type": "integer", "minimum": 1},
+        "inode": {"type": "integer", "minimum": 1},
+        "ctime_ns": {"type": "integer", "minimum": 0},
+        "file_type": {"enum": ["regular", "directory"]},
+        "mode": {"type": "integer", "minimum": 0},
+        "flags": {"type": "integer", "minimum": 0},
+        "nlink": {"type": "integer", "minimum": 1},
+        "byte_size": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "directoryIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["volume_uuid", "device", "inode", "ctime_ns", "file_type", "nlink", "mode", "flags"],
+      "properties": {
+        "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1},
+        "ctime_ns": {"type": "integer", "minimum": 0}, "file_type": {"const": "directory"}, "nlink": {"type": "integer", "minimum": 1}, "mode": {"type": "integer", "minimum": 0}, "flags": {"type": "integer", "minimum": 0}
+      }
+    },
+    "executableIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["volume_uuid", "device", "inode", "ctime_ns", "file_type", "mode", "uid", "nlink", "byte_size"],
+      "properties": {
+        "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1},
+        "inode": {"type": "integer", "minimum": 1}, "ctime_ns": {"type": "integer", "minimum": 0},
+        "file_type": {"const": "regular"}, "mode": {"type": "integer", "minimum": 0},
+        "uid": {"type": "integer", "minimum": 0}, "nlink": {"const": 1}, "byte_size": {"type": "integer", "minimum": 1}
+      }
+    },
+    "executionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["executable_sha256", "executable_identity", "repository_head", "repository_tree", "repository_clean", "implementation_blob", "design_blob", "plan_blob", "source_approval_sha256", "target_volume_uuid", "supersedes_incomplete_attempt_sha256"],
+      "properties": {
+        "executable_sha256": {"$ref": "#/$defs/sha256"}, "executable_identity": {"$ref": "#/$defs/executableIdentity"},
+        "repository_head": {"$ref": "#/$defs/gitSha1"}, "repository_tree": {"$ref": "#/$defs/gitSha1"},
+        "repository_clean": {"const": true}, "implementation_blob": {"$ref": "#/$defs/gitSha1"}, "design_blob": {"$ref": "#/$defs/gitSha1"}, "plan_blob": {"$ref": "#/$defs/gitSha1"},
+        "source_approval_sha256": {"const": "2ec8bf0237cc5bdb00ddb6d2236ac631bb793aed9ba79f308672a9ecb90809c6"},
+        "target_volume_uuid": {"$ref": "#/$defs/uuid"}, "supersedes_incomplete_attempt_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["volume_uuid", "root_identity", "manifest_count", "physical_member_count", "logical_binding_count", "root_locks_sha256"],
+      "properties": {
+        "volume_uuid": {"$ref": "#/$defs/uuid"}, "root_identity": {"$ref": "#/$defs/directoryIdentity"},
+        "manifest_count": {"const": 1675}, "physical_member_count": {"const": 4711},
+        "logical_binding_count": {"const": 5025}, "root_locks_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "record": {"oneOf": [{"$ref": "#/$defs/statcastRecord"}, {"$ref": "#/$defs/scheduleRecord"}, {"$ref": "#/$defs/pitcherBfRecord"}, {"$ref": "#/$defs/pitchingRecord"}]},
+    "statcastRecord": {"type": "object", "additionalProperties": false, "required": ["source", "canonical_query", "rawstore_verified"], "properties": {"source": {"const": "baseball_savant_statcast"}, "canonical_query": {"type": "object", "additionalProperties": false, "required": ["start", "end", "game_type", "url"], "properties": {"start": {"type": "string"}, "end": {"type": "string"}, "game_type": {"type": "string"}, "url": {"type": "string"}}}, "rawstore_verified": {"const": true}}},
+    "scheduleRecord": {"type": "object", "additionalProperties": false, "required": ["source", "canonical_query", "rawstore_verified"], "properties": {"source": {"const": "mlb_schedule"}, "canonical_query": {"type": "object", "additionalProperties": false, "required": ["start", "end", "gameType", "role", "url"], "properties": {"start": {"type": "string"}, "end": {"type": "string"}, "gameType": {"type": "string"}, "role": {"type": "string"}, "url": {"type": "string"}}}, "rawstore_verified": {"const": true}}},
+    "pitcherBfRecord": {"type": "object", "additionalProperties": false, "required": ["source", "canonical_query", "rawstore_verified"], "properties": {"source": {"const": "mlb_stats_pitcher_bf"}, "canonical_query": {"type": "object", "additionalProperties": false, "required": ["startDate", "endDate", "gameType", "group", "stats", "url", "pitcher_id", "sportIds"], "properties": {"startDate": {"type": "string"}, "endDate": {"type": "string"}, "gameType": {"type": "string"}, "group": {"type": "string"}, "stats": {"type": "string"}, "url": {"type": "string"}, "pitcher_id": {"type": "integer"}, "sportIds": {"type": "integer"}}}, "rawstore_verified": {"const": true}}},
+    "pitchingRecord": {"type": "object", "additionalProperties": false, "required": ["source", "canonical_query", "rawstore_verified"], "properties": {"source": {"const": "mlb_stats_pitching"}, "canonical_query": {"type": "object", "additionalProperties": false, "required": ["startDate", "endDate", "gameType", "group", "playerPool", "stats", "url", "limit", "sportIds"], "properties": {"startDate": {"type": "string"}, "endDate": {"type": "string"}, "gameType": {"type": "string"}, "group": {"type": "string"}, "playerPool": {"type": "string"}, "stats": {"type": "string"}, "url": {"type": "string"}, "limit": {"type": "integer"}, "sportIds": {"type": "integer"}}}, "rawstore_verified": {"const": true}}},
+    "rootLock": {"type": "object", "additionalProperties": false, "required": ["path", "volume_uuid", "device", "inode", "ctime_ns", "file_type", "nlink", "byte_size", "sha256", "mode", "flags"], "properties": {"path": {"enum": [".baseball_savant_statcast.lock", ".mlb_schedule.lock", ".mlb_stats_pitcher_bf.lock", ".mlb_stats_pitching.lock"]}, "volume_uuid": {"$ref": "#/$defs/uuid"}, "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1}, "ctime_ns": {"type": "integer", "minimum": 0}, "file_type": {"const": "regular"}, "nlink": {"const": 1}, "byte_size": {"const": 0}, "sha256": {"const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}, "mode": {"const": 292}, "flags": {"type": "integer", "minimum": 0}}},
+    "member": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "volume_uuid", "device", "inode", "ctime_ns", "file_type", "nlink", "byte_size", "sha256", "mode", "flags"],
+      "properties": {
+        "path": {"$ref": "#/$defs/rawPath"}, "volume_uuid": {"$ref": "#/$defs/uuid"},
+        "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1},
+        "ctime_ns": {"type": "integer", "minimum": 0}, "file_type": {"const": "regular"}, "nlink": {"const": 1},
+        "byte_size": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/sha256"},
+        "mode": {"const": 292}, "flags": {"type": "integer", "minimum": 0}
+      }
+    },
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["record_index", "role", "path"],
+      "properties": {"record_index": {"type": "integer", "minimum": 0, "maximum": 1674}, "role": {"enum": ["manifest", "raw", "seal"]}, "path": {"$ref": "#/$defs/rawPath"}}
+    },
+    "directory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "volume_uuid", "device", "inode", "ctime_ns", "file_type", "nlink", "mode", "flags"],
+      "properties": {
+        "path": {"anyOf": [{"const": "."}, {"$ref": "#/$defs/relativePath"}]}, "volume_uuid": {"$ref": "#/$defs/uuid"},
+        "device": {"type": "integer", "minimum": 1}, "inode": {"type": "integer", "minimum": 1},
+        "ctime_ns": {"type": "integer", "minimum": 0}, "file_type": {"const": "directory"}, "nlink": {"type": "integer", "minimum": 1},
+        "mode": {"const": 365}, "flags": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

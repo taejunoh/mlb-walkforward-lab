@@ -1,0 +1,222 @@
+{
+  "$defs": {
+    "blob": {
+      "additionalProperties": false,
+      "properties": {
+        "blob": {
+          "$ref": "#/$defs/git"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "path",
+        "blob",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "entry": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "0444",
+                  "0555"
+                ]
+              },
+              "size": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "regular"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "type": {
+                "const": "directory"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "size": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "0444",
+            "0555"
+          ]
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "pattern": "^checkout(?:/.*)?$"
+            }
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "directory",
+            "regular"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "type",
+        "mode",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "git": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_protected_execution_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "entries": {
+      "contains": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/entry"
+          },
+          {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "path": {
+                "const": "checkout"
+              },
+              "size": {
+                "const": 0
+              },
+              "type": {
+                "const": "directory"
+              }
+            }
+          }
+        ]
+      },
+      "items": {
+        "$ref": "#/$defs/entry"
+      },
+      "maxContains": 1,
+      "minContains": 1,
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "strict-path-order",
+        "casefold-unique",
+        "complete-parent-directories",
+        "equal-input-bundle-checkout-entries",
+        "R4DIR"
+      ]
+    },
+    "git": {
+      "additionalProperties": false,
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/git"
+        },
+        "required_blobs": {
+          "items": {
+            "$ref": "#/$defs/blob"
+          },
+          "type": "array",
+          "uniqueItems": true,
+          "x-r4-semanticConstraints": [
+            "strict-path-order",
+            "casefold-unique",
+            "R4V2_REQUIRED_BLOBS"
+          ]
+        },
+        "tree": {
+          "$ref": "#/$defs/git"
+        }
+      },
+      "required": [
+        "head",
+        "tree",
+        "required_blobs"
+      ],
+      "type": "object"
+    },
+    "input_bundle_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "kind": {
+      "const": "R4_PROTECTED_EXECUTION_MANIFEST_V2"
+    },
+    "materialization_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "runtime_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "git",
+    "entries",
+    "runtime_manifest_sha256",
+    "input_bundle_manifest_sha256",
+    "materialization_policy_sha256",
+    "sha256"
+  ],
+  "type": "object"
+}

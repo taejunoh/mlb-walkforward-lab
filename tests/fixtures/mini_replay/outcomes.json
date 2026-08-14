@@ -1,0 +1,8 @@
+[
+  {"game_pk": 1001, "actual_winner": "Pittsburgh Pirates", "status": "Final"},
+  {"game_pk": 2001, "actual_winner": "Boston Red Sox", "status": "Final"},
+  {"game_pk": 2002, "actual_winner": "Minnesota Twins", "status": "Final"},
+  {"game_pk": 3001, "actual_winner": "", "status": "VOID"},
+  {"game_pk": 4001, "actual_winner": "", "status": "VOID"},
+  {"game_pk": 5001, "actual_winner": "New York Yankees", "status": "Final"}
+]

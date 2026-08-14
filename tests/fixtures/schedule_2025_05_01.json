@@ -1,0 +1,67 @@
+{
+  "dates": [
+    {
+      "date": "2025-05-01",
+      "games": [
+        {
+          "gamePk": 778100,
+          "gameType": "R",
+          "officialDate": "2025-05-01",
+          "gameDate": "2025-05-01T16:35:00Z",
+          "status": {"detailedState": "Final"},
+          "teams": {
+            "away": {
+              "team": {"id": 112, "name": "Chicago Cubs"},
+              "score": 2,
+              "isWinner": false,
+              "probablePitcher": {"id": 607067, "fullName": "Colin Rea"}
+            },
+            "home": {
+              "team": {"id": 134, "name": "Pittsburgh Pirates"},
+              "score": 4,
+              "isWinner": true,
+              "probablePitcher": {"id": 694973, "fullName": "Paul Skenes"}
+            }
+          },
+          "lineups": {
+            "awayPlayers": [
+              {"id": 664023, "fullName": "Ian Happ"},
+              {"id": 663656, "fullName": "Kyle Tucker"},
+              {"id": 673548, "fullName": "Seiya Suzuki"},
+              {"id": 683737, "fullName": "Michael Busch"},
+              {"id": 663538, "fullName": "Nico Hoerner"},
+              {"id": 691718, "fullName": "Pete Crow-Armstrong"},
+              {"id": 665804, "fullName": "Miguel Amaya"},
+              {"id": 621020, "fullName": "Dansby Swanson"},
+              {"id": 670032, "fullName": "Nicky Lopez"}
+            ],
+            "homePlayers": [
+                {"id": 665833, "fullName": "Oneil Cruz"},
+                {"id": 668804, "fullName": "Bryan Reynolds"},
+                {"id": 457705, "fullName": "Andrew McCutchen"},
+                {"id": 665839, "fullName": "Enmanuel Valdez"},
+                {"id": 663647, "fullName": "Ke'Bryan Hayes"},
+                {"id": 672744, "fullName": "Alexander Canario"},
+                {"id": 624428, "fullName": "Adam Frazier"},
+                {"id": 669707, "fullName": "Jared Triolo"},
+                {"id": 680779, "fullName": "Henry Davis"}
+            ]
+          },
+          "venue": {"id": 31, "name": "PNC Park"}
+        },
+        {
+          "gamePk": 999001,
+          "gameType": "S",
+          "officialDate": "2025-05-01",
+          "gameDate": "2025-05-01T17:00:00Z",
+          "status": {"detailedState": "Final"},
+          "teams": {
+            "away": {"team": {"id": 1, "name": "Spring Away"}},
+            "home": {"team": {"id": 2, "name": "Spring Home"}}
+          },
+          "venue": {"id": 1, "name": "Spring Park"}
+        }
+      ]
+    }
+  ]
+}

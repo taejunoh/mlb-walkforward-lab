@@ -1,0 +1,327 @@
+{
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "python_archive"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "version": {
+                "pattern": "^[\\x20-\\x7e]+$"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "filename": {
+          "pattern": "^(?!\\.\\.?$)[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "python_archive",
+            "wheel"
+          ]
+        },
+        "path": {
+          "pattern": "^artifacts/(?!\\.\\.?$)[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "url": {
+          "pattern": "^[\\x20-\\x7e]+$",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^[\\x20-\\x7e]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "kind",
+        "filename",
+        "version",
+        "url",
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "blob": {
+      "additionalProperties": false,
+      "properties": {
+        "blob": {
+          "$ref": "#/$defs/git"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "path",
+        "blob",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "entry": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "0444",
+                  "0555"
+                ]
+              },
+              "size": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "regular"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "type": {
+                "const": "directory"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "size": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "0444",
+            "0555"
+          ]
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "pattern": "^checkout(?:/.*)?$"
+            }
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "directory",
+            "regular"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "type",
+        "mode",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "git": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_runtime_input_bundle_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "items": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/artifact"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "wheel"
+              }
+            }
+          }
+        ]
+      },
+      "minItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "python_archive"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "paths-equal-artifacts-filename",
+        "unique-casefold-filenames",
+        "lock-order-wheels"
+      ]
+    },
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "checkout_entries": {
+      "contains": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/entry"
+          },
+          {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "path": {
+                "const": "checkout"
+              },
+              "size": {
+                "const": 0
+              },
+              "type": {
+                "const": "directory"
+              }
+            }
+          }
+        ]
+      },
+      "items": {
+        "$ref": "#/$defs/entry"
+      },
+      "maxContains": 1,
+      "minContains": 1,
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "strict-path-order",
+        "casefold-unique",
+        "complete-parent-directories",
+        "directory-r4dir-digests"
+      ]
+    },
+    "git": {
+      "additionalProperties": false,
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/git"
+        },
+        "required_blobs": {
+          "items": {
+            "$ref": "#/$defs/blob"
+          },
+          "type": "array",
+          "uniqueItems": true,
+          "x-r4-semanticConstraints": [
+            "strict-path-order",
+            "casefold-unique"
+          ]
+        },
+        "tree": {
+          "$ref": "#/$defs/git"
+        }
+      },
+      "required": [
+        "head",
+        "tree",
+        "required_blobs"
+      ],
+      "type": "object"
+    },
+    "kind": {
+      "const": "R4_RUNTIME_INPUT_BUNDLE_V2"
+    },
+    "lock_path": {
+      "const": "r4_protected_python311.lock.json"
+    },
+    "lock_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "materialization_policy_path": {
+      "const": "materialization-policy.json"
+    },
+    "materialization_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "lock_path",
+    "lock_sha256",
+    "materialization_policy_path",
+    "git",
+    "artifacts",
+    "checkout_entries",
+    "materialization_policy_sha256",
+    "sha256"
+  ],
+  "type": "object"
+}

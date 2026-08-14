@@ -1,0 +1,54 @@
+{
+  "$defs": {
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_privileged_materialization_admission_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attempt_uuid": {
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "input_bundle_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "kind": {
+      "const": "R4_PRIVILEGED_MATERIALIZATION_ADMISSION_V2"
+    },
+    "materialization_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "storage_volume_uuid": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "task14_approval_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "attempt_uuid",
+    "task14_approval_sha256",
+    "input_bundle_manifest_sha256",
+    "materialization_policy_sha256",
+    "storage_volume_uuid",
+    "sha256"
+  ],
+  "type": "object"
+}

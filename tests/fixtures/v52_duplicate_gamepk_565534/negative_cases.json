@@ -1,0 +1,41 @@
+{
+  "changed_suppressed_predicates": [
+    "gamePk",
+    "gameType",
+    "season",
+    "officialDate",
+    "away_team_id",
+    "home_team_id",
+    "terminal_status",
+    "away_score",
+    "home_score",
+    "winner_team_id",
+    "gameDate",
+    "resumeDate",
+    "resumeGameDate",
+    "venue_id",
+    "calendar_event_id",
+    "sha256"
+  ],
+  "changed_retained_predicates": [
+    "gamePk",
+    "gameType",
+    "season",
+    "officialDate",
+    "away_team_id",
+    "home_team_id",
+    "terminal_status",
+    "away_score",
+    "home_score",
+    "winner_team_id",
+    "gameDate",
+    "resumedFrom",
+    "resumedFromDate",
+    "venue_id",
+    "calendar_event_id",
+    "sha256"
+  ],
+  "rejected_special_copy_counts": [1, 3],
+  "rejected_projection_totals": [2471, 2473],
+  "rejected_ordinary_pair": "identity_or_non-start-field_difference"
+}

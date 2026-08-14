@@ -1,0 +1,20 @@
+{
+  "teams": {
+    "away": {
+      "team": {"id": 110},
+      "pitchers": [501, 502],
+      "players": {
+        "ID1001": {"person": {"id": 1001}, "battingOrder": "101"},
+        "ID1002": {"person": {"id": 1002}, "battingOrder": "201"},
+        "ID1003": {"person": {"id": 1003}, "battingOrder": "301"},
+        "ID1004": {"person": {"id": 1004}, "battingOrder": "401"},
+        "ID1005": {"person": {"id": 1005}, "battingOrder": "501"},
+        "ID1006": {"person": {"id": 1006}, "battingOrder": "601"},
+        "ID1007": {"person": {"id": 1007}, "battingOrder": "701"},
+        "ID1008": {"person": {"id": 1008}, "battingOrder": "801"},
+        "ID1009": {"person": {"id": 1009}, "battingOrder": "901"}
+      }
+    },
+    "home": {"team": {"id": 120}, "pitchers": [601], "players": {}}
+  }
+}

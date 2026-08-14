@@ -1,0 +1,327 @@
+{
+  "$defs": {
+    "dependency": {
+      "additionalProperties": false,
+      "properties": {
+        "dependency": {
+          "pattern": "^(?!.*(?:^|/)\\.\\.?(?:/|$))(?:/(?:usr/lib|System)/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*|@(?:loader_path|executable_path|rpath)(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*)$",
+          "type": "string"
+        },
+                "loader": {
+                    "pattern": "^(?!.*(?:^|/)\\.\\.?(?:/|$))runtime/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*$",
+          "type": "string"
+        },
+        "resolved": {
+          "pattern": "^(?!.*(?:^|/)\\.\\.?(?:/|$))(?:runtime/closure/python311/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*|/(?:usr/lib|System)/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "loader",
+        "dependency",
+        "resolved"
+      ],
+      "type": "object"
+    },
+    "mach_o_slice": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_type": {"type": "integer"},
+        "cpu_subtype": {"type": "integer"},
+        "file_type": {"minimum": 0, "type": "integer"},
+        "uuid": {"pattern": "^[0-9a-f]{32}$", "type": "string"},
+        "code_signature_offset": {"minimum": 0, "type": "integer"},
+        "code_signature_size": {"minimum": 0, "type": "integer"}
+      },
+      "required": ["cpu_type", "cpu_subtype", "file_type", "uuid", "code_signature_offset", "code_signature_size"],
+      "type": "object"
+    },
+    "mach_o_observation": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {"allOf": [{"$ref": "#/$defs/path"}, {"pattern": "^runtime/closure/python311/"}]},
+        "slices": {"items": {"$ref": "#/$defs/mach_o_slice"}, "minItems": 1, "type": "array", "x-r4-semanticConstraints": ["strict-cpu-type-subtype-order"]},
+        "dependencies": {"items": {"$ref": "#/$defs/dependency"}, "type": "array", "uniqueItems": true, "x-r4-semanticConstraints": ["strict-loader-dependency-resolved-order"]}
+      },
+      "required": ["path", "slices", "dependencies"],
+      "type": "object"
+    },
+    "staged_mach_o_observation": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {"allOf": [{"$ref": "#/$defs/path"}, {"pattern": "^runtime/closure/python311/"}]},
+        "descriptor_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "mach_o_observation": {"$ref": "#/$defs/mach_o_observation"},
+        "dependency_closure_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["path", "descriptor_identity_sha256", "sha256", "codesign_identity_sha256", "mach_o_observation", "dependency_closure_sha256"],
+      "type": "object"
+    },
+    "entry": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "0444",
+                  "0555"
+                ]
+              },
+              "size": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "regular"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "type": {
+                "const": "directory"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "size": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "0444",
+            "0555"
+          ]
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "pattern": "^runtime(?:/.*)?$"
+            }
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "directory",
+            "regular"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "type",
+        "mode",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$id": "r4_hermetic_python311_runtime.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "dependency_closure_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "staged_mach_o_observations": {
+      "items": {"$ref": "#/$defs/staged_mach_o_observation"},
+      "minItems": 1,
+      "type": "array",
+      "x-r4-semanticConstraints": ["strict-path-order", "R4V2_STAGED_MACHO_OBSERVATIONS"]
+    },
+    "pre_install_staged_mach_o_observations": {
+      "items": {"$ref": "#/$defs/staged_mach_o_observation"},
+      "minItems": 1,
+      "type": "array",
+      "x-r4-semanticConstraints": ["strict-path-order", "R4V2_STAGED_MACHO_OBSERVATIONS"]
+    },
+    "pre_install_staged_mach_o_observations_sha256": {"$ref": "#/$defs/sha256"},
+    "staged_mach_o_observations_sha256": {"$ref": "#/$defs/sha256"},
+    "entries": {
+      "contains": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/entry"
+          },
+          {
+            "properties": {
+              "mode": {
+                "const": "0555"
+              },
+              "path": {
+                "const": "runtime"
+              },
+              "size": {
+                "const": 0
+              },
+              "type": {
+                "const": "directory"
+              }
+            }
+          }
+        ]
+      },
+      "items": {
+        "$ref": "#/$defs/entry"
+      },
+      "maxContains": 1,
+      "minContains": 1,
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "strict-path-order",
+        "casefold-unique",
+        "complete-parent-directories",
+        "R4V2_RUNTIME_ENTRIES"
+      ]
+    },
+    "entries_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "entrypoint": {
+      "const": "runtime/closure/python311/bin/python3.11"
+    },
+    "environment_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "import_probe_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "installer_command_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "kind": {
+      "const": "R4_HERMETIC_PYTHON311_RUNTIME_V2"
+    },
+    "lock_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "mach_o_dependencies": {
+      "items": {
+        "$ref": "#/$defs/dependency"
+      },
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "strict-loader-dependency-resolved-order",
+        "R4V2_RUNTIME_DEPENDENCIES"
+      ]
+    },
+    "materialization_input_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "materialization_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "python_version": {
+      "pattern": "^3\\.11\\.[0-9]+$",
+      "type": "string"
+    },
+    "runtime_output_closure_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sandbox_profile_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "wheel_set_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sandbox_launcher_path": {"const": "/usr/bin/sandbox-exec"},
+    "sandbox_launcher_descriptor_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_launcher_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_launcher_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "sandbox_profile_template_sha256": {"$ref": "#/$defs/sha256"},
+    "child_command_template_sha256": {"$ref": "#/$defs/sha256"},
+    "import_command_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_mach_o_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_pre_install_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_mach_o_sha256": {"$ref": "#/$defs/sha256"},
+    "interpreter_post_install_codesign_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "working_directory": {
+      "const": "runtime"
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "python_version",
+    "entrypoint",
+    "lock_sha256",
+    "materialization_input_sha256",
+    "materialization_policy_sha256",
+    "wheel_set_sha256",
+    "sandbox_launcher_path",
+    "sandbox_launcher_descriptor_identity_sha256",
+    "sandbox_launcher_sha256",
+    "sandbox_launcher_codesign_identity_sha256",
+    "sandbox_profile_template_sha256",
+    "child_command_template_sha256",
+    "installer_command_sha256",
+    "import_command_sha256",
+    "interpreter_pre_install_sha256",
+    "interpreter_pre_install_mach_o_sha256",
+    "interpreter_pre_install_codesign_identity_sha256",
+    "interpreter_post_install_sha256",
+    "interpreter_post_install_mach_o_sha256",
+    "interpreter_post_install_codesign_identity_sha256",
+    "import_probe_sha256",
+    "sandbox_profile_sha256",
+    "environment_sha256",
+    "working_directory",
+    "entries",
+    "entries_sha256",
+    "runtime_output_closure_sha256",
+    "mach_o_dependencies",
+    "dependency_closure_sha256",
+    "staged_mach_o_observations",
+    "staged_mach_o_observations_sha256",
+    "pre_install_staged_mach_o_observations",
+    "pre_install_staged_mach_o_observations_sha256",
+    "sha256"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,265 @@
+{
+  "$defs": {
+    "codesign_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {"$ref": "#/$defs/ascii"},
+        "designated_requirement": {"$ref": "#/$defs/ascii"},
+        "team_identifier": {
+          "anyOf": [
+            {"$ref": "#/$defs/ascii"},
+            {"type": "null"}
+          ]
+        },
+        "certificate_chain_sha256": {"$ref": "#/$defs/sha256"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["identifier", "designated_requirement", "team_identifier", "certificate_chain_sha256", "sha256"],
+      "type": "object"
+    },
+    "ascii": {
+      "pattern": "^[\\x20-\\x7e]+$",
+      "type": "string"
+    },
+    "relative": {
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+(?:/[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+)*$",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "sandbox_launcher_codesign_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {"const": "com.apple.sandbox-exec"},
+        "designated_requirement": {"const": "identifier \"com.apple.sandbox-exec\" and anchor apple"},
+        "team_identifier": {"const": null},
+        "certificate_chain_sha256": {"$ref": "#/$defs/sha256"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "required": ["identifier", "designated_requirement", "team_identifier", "certificate_chain_sha256", "sha256"],
+      "type": "object"
+    }
+  },
+  "$id": "r4_privileged_materialization_policy_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_loader_roots": {
+      "const": [
+        "runtime/closure/python311",
+        "/System/",
+        "/usr/lib/"
+      ]
+    },
+    "archive": {
+      "additionalProperties": false,
+      "properties": {
+        "archive_root": {
+          "const": "python"
+        },
+        "entrypoint": {
+          "const": "runtime/closure/python311/bin/python3.11"
+        },
+        "final_runtime_path": {
+          "const": "runtime/closure/python311"
+        },
+        "max_members": {
+          "const": 100000
+        },
+        "max_unpacked_bytes": {
+          "const": 8589934592
+        }
+      },
+      "required": [
+        "archive_root",
+        "final_runtime_path",
+        "entrypoint",
+        "max_members",
+        "max_unpacked_bytes"
+      ],
+      "type": "object"
+    },
+    "authority_id": {
+      "const": "r4-disjoint-custody-v2-execution-v1"
+    },
+    "child_execution": {
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "const": "runtime"
+        },
+        "environment": {
+          "const": [
+            "HOME=__R4_STAGE__/home",
+            "LANG=C",
+            "LC_ALL=C",
+            "PATH=/usr/bin:/bin",
+            "PIP_CONFIG_FILE=/dev/null",
+            "PIP_DISABLE_PIP_VERSION_CHECK=1",
+            "PIP_NO_INPUT=1",
+            "PYTHONNOUSERSITE=1",
+            "TMPDIR=__R4_STAGE__/tmp"
+          ]
+        },
+        "import_argv": {
+          "const": [
+            "-I",
+            "-s",
+            "-E",
+            "-c",
+            "import importlib,json,sys\nmods=(\"cryptography\",\"jsonschema\",\"numpy\",\"scipy\")\nprint(json.dumps({\"version\":sys.version.split()[0],\"paths\":sys.path,\"files\":[importlib.import_module(name).__file__ for name in mods]},sort_keys=True,separators=(\",\",\":\")))"
+          ]
+        },
+        "max_output_bytes": {
+          "const": 1000000
+        },
+        "network_denied": {
+          "const": true
+        },
+        "pip_argv": {
+          "items": {
+            "$ref": "#/$defs/ascii"
+          },
+          "type": "array",
+          "x-r4-semanticConstraints": [
+            "fixed-pip-prefix",
+            "lock-order-wheel-suffix"
+          ]
+        },
+        "read_allow": {
+          "const": [
+            "runtime/closure/python311",
+            "wheelhouse",
+            "home",
+            "tmp",
+            "/dev/null",
+            "/System",
+            "/usr/lib"
+          ]
+        },
+        "sandbox_profile_template_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "child_command_template_sha256": {"$ref": "#/$defs/sha256"},
+        "sandbox_profile_utf8": {
+          "const": "(version 1)\n(deny default)\n(deny network*)\n(allow file-read* (subpath \"__R4_STAGE__/runtime/closure/python311\") (subpath \"__R4_STAGE__/wheelhouse\") (subpath \"__R4_STAGE__/home\") (subpath \"__R4_STAGE__/tmp\") (literal \"/dev/null\") (subpath \"/System\") (subpath \"/usr/lib\"))\n(allow file-write* (subpath \"__R4_STAGE__/runtime\") (subpath \"__R4_STAGE__/home\") (subpath \"__R4_STAGE__/tmp\"))"
+        },
+        "timeout_seconds": {
+          "const": 300
+        },
+        "write_allow": {
+          "const": [
+            "runtime",
+            "home",
+            "tmp"
+          ]
+        }
+      },
+      "required": [
+        "cwd",
+        "environment",
+        "pip_argv",
+        "import_argv",
+        "timeout_seconds",
+        "max_output_bytes",
+        "sandbox_profile_utf8",
+        "sandbox_profile_template_sha256",
+        "child_command_template_sha256",
+        "read_allow",
+        "write_allow",
+        "network_denied"
+      ],
+      "type": "object"
+    },
+    "import_modules": {
+      "const": [
+        "cryptography",
+        "jsonschema",
+        "numpy",
+        "scipy"
+      ]
+    },
+    "sandbox_launcher": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {"const": "/usr/bin/sandbox-exec"},
+        "descriptor_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "codesign_identity": {"$ref": "#/$defs/sandbox_launcher_codesign_identity"}
+      },
+      "required": ["path", "descriptor_identity_sha256", "sha256", "codesign_identity"],
+      "type": "object"
+    },
+    "base_interpreter": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {"const": "runtime/closure/python311/bin/python3.11"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "mach_o_sha256": {"$ref": "#/$defs/sha256"},
+        "codesign_identity": {"$ref": "#/$defs/codesign_identity"}
+      },
+      "required": ["path", "sha256", "mach_o_sha256", "codesign_identity"],
+      "type": "object"
+    },
+    "import_probe_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "kind": {
+      "const": "R4_PRIVILEGED_MATERIALIZATION_POLICY_V2"
+    },
+    "namespace": {
+      "const": "org.mlb-walkforward.r4.protected-execution-authority/v1"
+    },
+    "python_version": {
+      "pattern": "^3\\.11\\.[0-9]+$",
+      "type": "string"
+    },
+    "schema_versions": {
+      "const": [
+        "R4_RUNTIME_INPUT_BUNDLE_V2",
+        "R4_PRIVILEGED_MATERIALIZATION_POLICY_V2",
+        "R4_PRIVILEGED_MATERIALIZATION_ADMISSION_V2",
+        "R4_PRIVILEGED_MATERIALIZATION_ADMISSION_LOCATOR_V2",
+        "R4_PRIVILEGED_MATERIALIZATION_JOURNAL_V2",
+        "R4_HERMETIC_PYTHON311_RUNTIME_V2",
+        "R4_PROTECTED_EXECUTION_MANIFEST_V2",
+        "R4_PROTECTED_EXECUTION_RECEIPT_V2"
+      ]
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "wheel_filenames": {
+      "items": {
+        "pattern": "^[\\x21-\\x2e\\x30-\\x5b\\x5d-\\x7e]+$",
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true,
+      "x-r4-semanticConstraints": [
+        "lock-order",
+        "casefold-unique"
+      ]
+    }
+  },
+  "required": [
+    "kind",
+    "namespace",
+    "authority_id",
+    "python_version",
+    "archive",
+    "wheel_filenames",
+    "sandbox_launcher",
+    "base_interpreter",
+    "child_execution",
+    "allowed_loader_roots",
+    "import_modules",
+    "import_probe_sha256",
+    "schema_versions",
+    "sha256"
+  ],
+  "type": "object"
+}

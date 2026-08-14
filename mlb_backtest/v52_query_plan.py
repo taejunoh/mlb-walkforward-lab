@@ -1,0 +1,6546 @@
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Mapping, Sequence
+from urllib.parse import urlencode
+
+from .diagnostics import deep_freeze
+from .protocols import (
+    RunSpec,
+    SourceRunSpec,
+    parse_run_spec,
+    parse_source_run_spec,
+)
+from .v52_evidence import (
+    LogicalQuery,
+    V52EvidenceStore,
+    canonical_query_bytes,
+    logical_query_id,
+)
+from .v52_recovery_parent_evidence import PARENT_RELATIVES, _PARENT_SPECS
+from .v52_seasons import SEASON_BOUNDARIES, monthly_ranges
+
+if TYPE_CHECKING:
+    from .v52_legacy import LegacyEvidenceCapability
+
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_BLOB = re.compile(r"^[0-9a-f]{40}$")
+_SCHEDULE_ENDPOINT = "https://statsapi.mlb.com/api/v1/schedule"
+_STATCAST_ENDPOINT = "https://baseballsavant.mlb.com/statcast_search/csv"
+_STATS_ENDPOINT = "https://statsapi.mlb.com/api/v1/stats"
+_TEAMS_ENDPOINT = "https://statsapi.mlb.com/api/v1/teams"
+_MLB_BASE = "https://statsapi.mlb.com/api/v1"
+_RUN_SPEC_RELATIVE = Path("protocols/v5_2_qd/historical_walkforward_500.json")
+_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition.json"
+)
+_SOURCE_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_superseding_565534.json"
+)
+_SOURCE_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_source_acquisition_superseding_565534.json"
+)
+_RECOVERY_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/historical_walkforward_500_recovery_schedule_conflicts_r2.json"
+)
+_RECOVERY_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts_r2.json"
+)
+_R3_RECOVERY_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_walkforward_500_recovery_schedule_conflicts_missing_venue_r3.json"
+)
+_R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts_missing_venue_r3.json"
+)
+_R4_RECOVERY_RUN_SPEC_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_walkforward_500_recovery_schedule_conflicts_missing_venue_r4.json"
+)
+_R4_RECOVERY_ACQUISITION_CONTRACT_RELATIVE = Path(
+    "protocols/v5_2_qd/"
+    "historical_source_acquisition_recovery_schedule_conflicts_missing_venue_r4.json"
+)
+_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/2026-07-13-mlb-v5-2-acquire-fit-500-design.md"
+)
+_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/2026-07-13-mlb-v5-2-hybrid-acquisition.md"
+)
+_PLAN_A_AMENDMENT_RELATIVE = Path(
+    "docs/superpowers/specs/2026-07-14-mlb-v5-2-plan-a-contract-amendment.md"
+)
+_SOURCE_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run-amendment.md"
+)
+_SOURCE_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/"
+    "2026-07-21-v5-2-duplicate-gamepk-565534-option-1-superseding-run.md"
+)
+_SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-22-v5-2-duplicate-gamepk-565534-ephemeral-parse-schedule-equivalence-addendum.md"
+)
+_RECOVERY_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-28-v5-2-schedule-conflict-recovery-r2-design.md"
+)
+_RECOVERY_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/2026-07-28-v5-2-schedule-conflict-recovery-r2.md"
+)
+_R3_RECOVERY_APPROVED_DESIGN_RELATIVE = Path(
+    "docs/superpowers/specs/"
+    "2026-07-29-v5-2-r3-authority-catalog-bootstrap-design.md"
+)
+_R3_RECOVERY_IMPLEMENTATION_PLAN_RELATIVE = Path(
+    "docs/superpowers/plans/"
+    "2026-07-29-v5-2-r3-authority-catalog-bootstrap.md"
+)
+_ACQUISITION_SCHEMA_RELATIVE = Path("schemas/v5_2_acquisition_contract.schema.json")
+_ACQUISITION_BATCH_ROOT = Path("audit/v5_2_qd/historical/acquisition/query_batches")
+_SOURCE_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches"
+)
+_RECOVERY_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/historical_recovery_schedule_conflicts_r2/acquisition/query_batches"
+)
+_R3_RECOVERY_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/"
+    "historical_recovery_schedule_conflicts_missing_venue_r3/acquisition/"
+    "query_batches"
+)
+_R4_RECOVERY_ACQUISITION_BATCH_ROOT = Path(
+    "audit/v5_2_qd/"
+    "historical_recovery_schedule_conflicts_missing_venue_r4/acquisition/"
+    "query_batches"
+)
+_SOURCE_SCHEDULE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical_superseding_565534/acquisition/"
+    "schedule_anchor_inventory.json"
+)
+_GAME_EVIDENCE_INVENTORY_RELATIVE = Path(
+    "audit/v5_2_qd/historical/acquisition/game_evidence_inventory.json"
+)
+_SPLIT_RECEIPT_ROOT = Path(
+    "audit/v5_2_qd/historical/acquisition/split_receipts"
+)
+_PRESEASON_DISPOSITION_REASON = "AS_OF_DATE_PRECEDES_REGULAR_SEASON_START"
+_SPLIT_REASONS = frozenset({"ROW_CAP", "SIZE_LIMIT", "TIMEOUT"})
+_SPLIT_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$"
+)
+_ALLOWED_STAGES = frozenset(
+    {
+        "STATIC_SCHEDULES",
+        "REFERENCE_INPUTS",
+        "TIMEZONE_REVIEW",
+        "PARTICIPANT_DERIVED",
+        "REMAINING",
+    }
+)
+
+
+@dataclass(frozen=True)
+class QueryBatch:
+    batch_id: str
+    stage: str
+    derived_from_sha256: str | None
+    queries: tuple[LogicalQuery, ...]
+
+
+@dataclass(frozen=True)
+class SplitReceipt:
+    split_receipt_id: str
+    receipt_sha256: str
+    stage: str
+    parent_batch_id: str
+    parent_query_id: str
+    reason: str
+    exhausted_attempt_number: int
+    depth: int
+    child_batch_id: str
+    child_query_ids: tuple[str, ...]
+    recorded_at_utc: str
+
+
+@dataclass(frozen=True)
+class _StaticSeason:
+    year: int
+    first: date
+    last: date
+
+
+@dataclass(frozen=True)
+class _StaticQueryInputs:
+    seasons: tuple[_StaticSeason, ...]
+    schedule_grain: str
+    schedule_parser_version: str
+    statcast_grain: str
+    statcast_parser_version: str
+    run_spec_sha256: str
+    acquisition_contract_sha256: str
+
+
+@dataclass(frozen=True)
+class SourceAuthorityContext:
+    repository_root: Path
+    authority: RunSpec | SourceRunSpec
+    authority_path: Path
+    authority_sha256: str
+    acquisition_contract_path: Path
+    acquisition_contract_sha256: str
+    contract: Mapping[str, object]
+    run_id: str
+    raw_root: Path
+    sources_root: Path
+    acquisition_audit_root: Path
+    execution_audit_root: Path
+    report_root: Path
+
+
+@dataclass(frozen=True)
+class _AuthorityBranch:
+    authority_relative: Path
+    contract_relative: Path
+    design_relative: Path
+    plan_relative: Path
+    amendment_relative: Path | None
+    addendum_relative: Path | None
+    schema_index: int
+    recovery_variant: str | None = None
+
+    @property
+    def recovery(self) -> bool:
+        return self.recovery_variant is not None
+
+
+_AUTHORITY_BRANCHES = (
+    _AuthorityBranch(
+        _RUN_SPEC_RELATIVE,
+        _ACQUISITION_CONTRACT_RELATIVE,
+        _APPROVED_DESIGN_RELATIVE,
+        _IMPLEMENTATION_PLAN_RELATIVE,
+        _PLAN_A_AMENDMENT_RELATIVE,
+        None,
+        0,
+    ),
+    _AuthorityBranch(
+        _SOURCE_RUN_SPEC_RELATIVE,
+        _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        _SOURCE_APPROVED_DESIGN_RELATIVE,
+        _SOURCE_IMPLEMENTATION_PLAN_RELATIVE,
+        None,
+        _SOURCE_EPHEMERAL_PARSE_SCHEDULE_EQUIVALENCE_ADDENDUM_RELATIVE,
+        1,
+    ),
+    _AuthorityBranch(
+        _RECOVERY_RUN_SPEC_RELATIVE,
+        _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        _RECOVERY_APPROVED_DESIGN_RELATIVE,
+        _RECOVERY_IMPLEMENTATION_PLAN_RELATIVE,
+        None,
+        None,
+        2,
+        "r2",
+    ),
+    _AuthorityBranch(
+        _R3_RECOVERY_RUN_SPEC_RELATIVE,
+        _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        _R3_RECOVERY_APPROVED_DESIGN_RELATIVE,
+        _R3_RECOVERY_IMPLEMENTATION_PLAN_RELATIVE,
+        None,
+        None,
+        3,
+        "r3",
+    ),
+    _AuthorityBranch(
+        _R4_RECOVERY_RUN_SPEC_RELATIVE,
+        _R4_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        Path(
+            "docs/superpowers/specs/"
+            "2026-08-04-v5-2-r4-physical-custody-authority-design.md"
+        ),
+        Path("docs/superpowers/plans/2026-08-04-v5-2-r4-physical-custody-authority.md"),
+        None,
+        None,
+        4,
+        "r4",
+    ),
+)
+
+
+_SOURCE_SUPERSEDES = {
+    "run_id": "historical_walkforward_500",
+    "run_spec_sha256": "d622bff184f0bdade22848d4b76fc43bdf9ac88c7a51513dee4a7d5f51bd1492",
+    "acquisition_contract_sha256": "cef89a1d4191ef83eb0fc2b0f4bdd191aeb8ba53cbb1bc6df73199604f23a9d9",
+    "static_batch_id": "069fd746f9c7ecb1267b7ae44f8d44a1aeb3575a92c64482dacbc5b61d8f0571",
+    "static_batch_sha256": "a6a2ac816620797b21e5bcf297fb92453f1143ed0d3d4c01effbf15c531ca39a",
+    "checkpoint_sha256": "00b8b6eae2c0ba8de17f6ed1c05f0c9ddfb98e967e9b7ef0284581cc98b5ad06",
+    "query_id": "11beeec110e975d6299c4a9a4b422c034e00962db8843dc65d28453e2967feb8",
+    "quarantine_receipt_sha256": "a2f26dd297fc2f0de084c857e6deb575973f147e8c9712a724d82308a9a693f8",
+    "raw_sha256": "6eeedd3877eeef18dae400dba8920dcde0cc79b3ab76b08316385868e89df1e0",
+}
+_SOURCE_RUN_SPEC_SHA256 = (
+    "88a4253d76b0f73694fbdc5ddbe64217c37ae379d7ee80931a64ab7742014850"
+)
+_SOURCE_ACQUISITION_CONTRACT_SHA256 = (
+    "3ddf83fdec9a328f5005fe8f62f4f680f4ef81516acd1aef2f90845b11c11d58"
+)
+_SOURCE_STATIC_BATCH_ID = (
+    "d4d07954d69d91d7f721aee9554e83b925c8d3c3cd60f7dc7efeba9f5ed5c661"
+)
+_HISTORICAL_RUN_SPEC_SHA256 = _SOURCE_SUPERSEDES["run_spec_sha256"]
+_HISTORICAL_ACQUISITION_CONTRACT_SHA256 = _SOURCE_SUPERSEDES[
+    "acquisition_contract_sha256"
+]
+
+
+def _recovery_provenance() -> dict[str, object]:
+    """Materialize the Task 1 catalog without accepting caller-selected facts."""
+    provenance: dict[str, object] = {}
+    for name, relatives in PARENT_RELATIVES.items():
+        spec = _PARENT_SPECS[name]
+        entry: dict[str, object] = {
+            "query_id": spec.query_id,
+            "parent_query_id": None,
+            "registration": {
+                "path": relatives["registration"].as_posix(),
+                "sha256": spec.registration_sha256,
+                "byte_count": spec.registration_byte_count,
+            },
+            "quarantine": {
+                "path": relatives["quarantine"].as_posix(),
+                "sha256": spec.quarantine_sha256,
+                "byte_count": spec.quarantine_byte_count,
+            },
+            "raw": {
+                "path": relatives["raw"].as_posix(),
+                "sha256": spec.raw_sha256,
+                "byte_count": spec.raw_byte_count,
+            },
+        }
+        if spec.attempt_sha256 is not None:
+            entry["attempt"] = {
+                "path": relatives["attempt"].as_posix(),
+                "sha256": spec.attempt_sha256,
+                "byte_count": spec.attempt_byte_count,
+            }
+        provenance[name] = entry
+    return provenance
+
+
+_RECOVERY_PROVENANCE = _recovery_provenance()
+_R3_RECOVERY_PROVENANCE = {
+    **_RECOVERY_PROVENANCE,
+    "missing_venue_2021_632924": _RECOVERY_PROVENANCE["superseding_2021_633224"],
+}
+_RECOVERY_RUN_ID = "historical_walkforward_500_recovery_schedule_conflicts_r2"
+_R3_RECOVERY_RUN_ID = (
+    "historical_walkforward_500_recovery_schedule_conflicts_missing_venue_r3"
+)
+_R4_RECOVERY_RUN_ID = (
+    "historical_walkforward_500_recovery_schedule_conflicts_missing_venue_r4"
+)
+_RECOVERY_CANONICAL_ROOTS = {
+    "raw": "data/v5_2_qd/historical_recovery_schedule_conflicts_r2/raw",
+    "sources": "data/v5_2_qd/historical_recovery_schedule_conflicts_r2/sources",
+    "acquisition_audit": (
+        "audit/v5_2_qd/historical_recovery_schedule_conflicts_r2/acquisition"
+    ),
+    "execution_audit": (
+        "audit/v5_2_qd/historical_recovery_schedule_conflicts_r2/execution"
+    ),
+}
+_R3_RECOVERY_CANONICAL_ROOTS = {
+    key: value.replace(
+        "historical_recovery_schedule_conflicts_r2",
+        "historical_recovery_schedule_conflicts_missing_venue_r3",
+    )
+    for key, value in _RECOVERY_CANONICAL_ROOTS.items()
+}
+_R4_RECOVERY_CANONICAL_ROOTS = {
+    key: value.replace(
+        "historical_recovery_schedule_conflicts_missing_venue_r3",
+        "historical_recovery_schedule_conflicts_missing_venue_r4",
+    )
+    for key, value in _R3_RECOVERY_CANONICAL_ROOTS.items()
+}
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    def normalized(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {key: normalized(child) for key, child in item.items()}
+        if isinstance(item, tuple):
+            return [normalized(child) for child in item]
+        if isinstance(item, list):
+            return [normalized(child) for child in item]
+        return item
+
+    try:
+        return json.dumps(
+            normalized(value),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("value must be canonical JSON compatible") from exc
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _validate_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _query_record(query: LogicalQuery) -> dict[str, object]:
+    record = json.loads(canonical_query_bytes(query))
+    if not isinstance(record, dict):
+        raise ValueError("logical query must encode as an object")
+    return record
+
+
+def _validate_shared_query_bindings(
+    queries: Sequence[LogicalQuery], label: str
+) -> None:
+    bindings = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in queries
+    }
+    if len(bindings) != 1:
+        raise ValueError(f"{label} queries must share run/contract bindings")
+    run_spec_sha256, acquisition_contract_sha256 = next(iter(bindings))
+    _validate_sha256(run_spec_sha256, f"{label} run_spec_sha256")
+    _validate_sha256(
+        acquisition_contract_sha256,
+        f"{label} acquisition_contract_sha256",
+    )
+
+
+def _validate_static_schedule_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if derived_from_sha256 is not None:
+        raise ValueError("STATIC_SCHEDULES root cannot be derived")
+    years = list(range(2018, 2025))
+    if len(queries) != len(years):
+        raise ValueError(
+            "STATIC_SCHEDULES stage must contain the seven canonical season roots"
+        )
+    _validate_shared_query_bindings(queries, "STATIC_SCHEDULES")
+    if any(query.parser_version == "v5.2.3" for query in queries):
+        _validate_r3_static_schedule_queries(queries)
+        return
+    if any(query.parser_version == "v5.2.2" for query in queries):
+        _validate_recovery_static_schedule_queries(queries)
+        return
+    for query, year in zip(queries, years):
+        first, last = SEASON_BOUNDARIES[year]
+        if year == 2019 and query.endpoint == "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534":
+            from .v52_duplicate_gamepk_disposition import (
+                OLD_QUERY_ID,
+                OLD_RAW_SHA256,
+                OLD_REGISTRATION_RELATIVE,
+                OLD_REGISTRATION_SHA256,
+                OLD_QUARANTINE_RELATIVE,
+                OLD_QUARANTINE_SHA256,
+                OLD_RAW_RELATIVE,
+                OLD_RAW_BYTE_COUNT,
+                RETAINED_OBJECT_SHA256,
+                SUPPRESSED_OBJECT_SHA256,
+            )
+
+            expected_derived_range = {
+                "year": 2019,
+                "start_date": first.isoformat(),
+                "end_date": last.isoformat(),
+                "disposition": "SCHEDULE_DUPLICATE_GAMEPK_565534",
+                "game_pk": 565534,
+                "old_authority": {
+                    "query_id": OLD_QUERY_ID,
+                    "query_registration": {
+                        "path": str(OLD_REGISTRATION_RELATIVE),
+                        "sha256": OLD_REGISTRATION_SHA256,
+                    },
+                    "quarantine_receipt": {
+                        "path": str(OLD_QUARANTINE_RELATIVE),
+                        "sha256": OLD_QUARANTINE_SHA256,
+                    },
+                    "raw": {
+                        "path": str(OLD_RAW_RELATIVE),
+                        "sha256": OLD_RAW_SHA256,
+                        "byte_count": OLD_RAW_BYTE_COUNT,
+                    },
+                },
+                "suppressed_occurrence": {
+                    "date_index": 54,
+                    "game_index": 5,
+                    "sha256": SUPPRESSED_OBJECT_SHA256,
+                },
+                "retained_occurrence": {
+                    "date_index": 161,
+                    "game_index": 12,
+                    "sha256": RETAINED_OBJECT_SHA256,
+                },
+            }
+            if (
+                query.source != "mlb_schedule_game_feed"
+                or query.grain != "season_schedule_and_game"
+                or query.expected_media_type != "application/json"
+                or query.parser_version != "v5.2.1"
+                or query.parent_query_id is not None
+                or dict(query.parameters) != {}
+                or dict(query.requested_range) != expected_derived_range
+                or query.run_spec_sha256 != _SOURCE_RUN_SPEC_SHA256
+                or query.acquisition_contract_sha256
+                != _SOURCE_ACQUISITION_CONTRACT_SHA256
+            ):
+                raise ValueError("STATIC_SCHEDULES derived 2019 query differs")
+            continue
+        expected_parameters = {
+            "sportId": 1,
+            "gameType": "R",
+            "startDate": first.isoformat(),
+            "endDate": last.isoformat(),
+            "hydrate": "probablePitcher,lineups,venue,linescore",
+        }
+        expected_range = {
+            "year": year,
+            "start_date": first.isoformat(),
+            "end_date": last.isoformat(),
+        }
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or query.endpoint != _SCHEDULE_ENDPOINT
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or query.parent_query_id is not None
+            or dict(query.parameters) != expected_parameters
+            or dict(query.requested_range) != expected_range
+        ):
+            raise ValueError(
+                "STATIC_SCHEDULES queries must be the ordered canonical "
+                "2018-2024 season roots"
+            )
+
+
+RECOVERY_STATIC_QUERY_TABLE = (
+    (2018, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2019, "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534", "v5.2.2"),
+    (2020, "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882", "v5.2.2"),
+    (2021, "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224", "v5.2.2"),
+    (2022, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2023, _SCHEDULE_ENDPOINT, "v5.2.2"),
+    (2024, _SCHEDULE_ENDPOINT, "v5.2.2"),
+)
+R3_STATIC_QUERY_TABLE = (
+    (2018, _SCHEDULE_ENDPOINT, "v5.2.3"),
+    (2019, "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534", "v5.2.3"),
+    (2020, "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882", "v5.2.3"),
+    (
+        2021,
+        "disposition://SCHEDULE_RECOVERY_2021_633224_AND_MISSING_VENUE_632924",
+        "v5.2.3",
+    ),
+    (2022, _SCHEDULE_ENDPOINT, "v5.2.3"),
+    (2023, _SCHEDULE_ENDPOINT, "v5.2.3"),
+    (2024, _SCHEDULE_ENDPOINT, "v5.2.3"),
+)
+R3_STATIC_QUERY_TABLE_BY_YEAR = {
+    year: endpoint for year, endpoint, _ in R3_STATIC_QUERY_TABLE
+}
+_RECOVERY_DISPOSITION_ENDPOINTS = {
+    year: endpoint
+    for year, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE
+    if endpoint != _SCHEDULE_ENDPOINT
+}
+
+
+def _require_recovery_schedule_query(
+    query: LogicalQuery, context: SourceAuthorityContext
+) -> None:
+    """Permit v5.2.2 only under the exact authenticated recovery authority."""
+    from .v52_schedule_conflict_recovery_disposition import (
+        RECOVERY_DISPOSITION_ENDPOINTS,
+    )
+
+    table_dispositions = tuple(
+        endpoint
+        for _, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE
+        if endpoint != _SCHEDULE_ENDPOINT
+    )
+    query_year = query.requested_range.get("year")
+    expected_row = next(
+        (
+            (year, endpoint, parser_version)
+            for year, endpoint, parser_version in RECOVERY_STATIC_QUERY_TABLE
+            if year == query_year
+        ),
+        None,
+    )
+    if expected_row is None:
+        exact_static_row = False
+    else:
+        year, endpoint, parser_version = expected_row
+        first, last = SEASON_BOUNDARIES[year]
+        expected_parameters: Mapping[str, object]
+        if endpoint in _RECOVERY_DISPOSITION_ENDPOINTS.values():
+            expected_parameters = {}
+        else:
+            expected_parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": first.isoformat(),
+                "endDate": last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        exact_static_row = (
+            query.source == "mlb_schedule_game_feed"
+            and query.grain == "season_schedule_and_game"
+            and query.endpoint == endpoint
+            and dict(query.parameters) == expected_parameters
+            and dict(query.requested_range)
+            == {
+                "year": year,
+                "start_date": first.isoformat(),
+                "end_date": last.isoformat(),
+            }
+            and query.expected_media_type == "application/json"
+            and query.parser_version == parser_version
+            and query.parent_query_id is None
+        )
+    if (
+        not isinstance(context.authority, SourceRunSpec)
+        or context.run_id != _RECOVERY_RUN_ID
+        or context.authority_path
+        != context.repository_root / _RECOVERY_RUN_SPEC_RELATIVE
+        or context.acquisition_contract_path
+        != context.repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        or query.run_spec_sha256 != context.authority_sha256
+        or query.acquisition_contract_sha256 != context.acquisition_contract_sha256
+        or query.parser_version != "v5.2.2"
+        or query.endpoint
+        not in {endpoint for _, endpoint, _ in RECOVERY_STATIC_QUERY_TABLE}
+        or table_dispositions != RECOVERY_DISPOSITION_ENDPOINTS
+        or (query.endpoint in table_dispositions and not exact_static_row)
+    ):
+        raise ValueError("recovery schedule query authority differs")
+
+
+def _validate_recovery_static_schedule_queries(
+    queries: Sequence[LogicalQuery],
+    *,
+    context: SourceAuthorityContext | None = None,
+) -> None:
+    """Validate only the design-fixed recovery schedule query table."""
+    if len(queries) != 7:
+        raise ValueError("recovery STATIC_SCHEDULES requires exactly seven queries")
+    for query, (year, endpoint, parser_version) in zip(
+        queries, RECOVERY_STATIC_QUERY_TABLE, strict=True
+    ):
+        first, last = SEASON_BOUNDARIES[year]
+        expected_parameters: Mapping[str, object]
+        if year in _RECOVERY_DISPOSITION_ENDPOINTS:
+            expected_parameters = {}
+        else:
+            expected_parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": first.isoformat(),
+                "endDate": last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or query.endpoint != endpoint
+            or dict(query.parameters) != expected_parameters
+            or dict(query.requested_range)
+            != {
+                "year": year,
+                "start_date": first.isoformat(),
+                "end_date": last.isoformat(),
+            }
+            or query.expected_media_type != "application/json"
+            or query.parser_version != parser_version
+            or query.parent_query_id is not None
+        ):
+            raise ValueError("recovery STATIC_SCHEDULES query table differs")
+        if context is not None:
+            _require_recovery_schedule_query(query, context)
+
+
+def _validate_r3_static_schedule_queries(
+    queries: Sequence[LogicalQuery],
+    *,
+    context: SourceAuthorityContext | None = None,
+) -> None:
+    if len(queries) != 7:
+        raise ValueError("r3 STATIC_SCHEDULES requires exactly seven queries")
+    for query, (year, endpoint, parser_version) in zip(
+        queries, R3_STATIC_QUERY_TABLE, strict=True
+    ):
+        first, last = SEASON_BOUNDARIES[year]
+        parameters: Mapping[str, object] = (
+            {}
+            if endpoint.startswith("disposition://")
+            else {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": first.isoformat(),
+                "endDate": last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        )
+        if (
+            query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or query.endpoint != endpoint
+            or dict(query.parameters) != parameters
+            or dict(query.requested_range)
+            != {"year": year, "start_date": first.isoformat(), "end_date": last.isoformat()}
+            or query.expected_media_type != "application/json"
+            or query.parser_version != parser_version
+            or query.parent_query_id is not None
+        ):
+            raise ValueError("r3 STATIC_SCHEDULES query table differs")
+        if context is not None and (
+            context.run_id != _R3_RECOVERY_RUN_ID
+            or query.run_spec_sha256 != context.authority_sha256
+            or query.acquisition_contract_sha256 != context.acquisition_contract_sha256
+        ):
+            raise ValueError("r3 schedule query authority differs")
+
+
+def _validate_r4_static_schedule_queries(
+    queries: Sequence[LogicalQuery],
+    *,
+    context: SourceAuthorityContext | None = None,
+) -> None:
+    _validate_r3_static_schedule_queries(queries)
+    if context is not None and (
+        context.run_id != _R4_RECOVERY_RUN_ID
+        or any(
+            query.run_spec_sha256 != context.authority_sha256
+            or query.acquisition_contract_sha256
+            != context.acquisition_contract_sha256
+            for query in queries
+        )
+    ):
+        raise ValueError("r4 schedule query authority differs")
+
+
+def _validate_remaining_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if not queries:
+        raise ValueError("REMAINING stage must contain nonempty Statcast queries")
+    _validate_shared_query_bindings(queries, "REMAINING")
+    ranges = [_canonical_statcast_parent_range(query) for query in queries]
+    if derived_from_sha256 is not None:
+        for query in queries:
+            _validate_sha256(query.parent_query_id, "REMAINING parent_query_id")
+        return
+
+    expected = [
+        (year, first, last)
+        for year in range(2018, 2025)
+        for first, last in monthly_ranges(*SEASON_BOUNDARIES[year])
+    ]
+    if len(queries) != len(expected):
+        raise ValueError(
+            "REMAINING Statcast root must contain all 46 canonical monthly queries"
+        )
+    for query, (first, last), (year, expected_first, expected_last) in zip(
+        queries, ranges, expected
+    ):
+        if (
+            query.parent_query_id is not None
+            or (first, last) != (expected_first, expected_last)
+            or dict(query.requested_range)
+            != {
+                "year": year,
+                "start_date": expected_first.isoformat(),
+                "end_date": expected_last.isoformat(),
+            }
+        ):
+            raise ValueError(
+                "REMAINING Statcast root must be the ordered canonical monthly coverage"
+            )
+
+
+def _reference_common(query: LogicalQuery, label: str) -> None:
+    if (
+        query.parent_query_id is not None
+        or query.expected_media_type != "application/json"
+        or query.parser_version != "v5.2.1"
+    ):
+        raise ValueError(f"REFERENCE_INPUTS {label} query contract differs")
+
+
+def _validate_reference_inputs_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    derived = _validate_sha256(
+        derived_from_sha256, "REFERENCE_INPUTS derived_from_sha256"
+    )
+    if not derived or not queries:
+        raise ValueError("REFERENCE_INPUTS requires a nonempty derived batch")
+    _validate_shared_query_bindings(queries, "REFERENCE_INPUTS")
+
+    categories: list[int] = []
+    boxscores: list[tuple[int, int, date]] = []
+    pitching: list[tuple[int, date, tuple[int, ...]]] = []
+    teams: list[int] = []
+    venues: list[int] = []
+    boxscore_endpoint = re.compile(rf"^{re.escape(_MLB_BASE)}/game/([1-9][0-9]*)/boxscore$")
+    venue_endpoint = re.compile(rf"^{re.escape(_MLB_BASE)}/venues/([1-9][0-9]*)$")
+
+    for query in queries:
+        _reference_common(query, "source")
+        boxscore_match = boxscore_endpoint.fullmatch(query.endpoint)
+        venue_match = venue_endpoint.fullmatch(query.endpoint)
+        if query.source == "mlb_schedule_game_feed" and boxscore_match is not None:
+            categories.append(0)
+            game_pk = int(boxscore_match.group(1))
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            requested_game_pk = requested.get("game_pk")
+            if (
+                query.grain != "season_schedule_and_game"
+                or dict(query.parameters)
+                or set(requested) != {"season", "game_pk", "official_date"}
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or season not in SEASON_BOUNDARIES
+                or requested_game_pk != game_pk
+            ):
+                raise ValueError("REFERENCE_INPUTS boxscore query differs")
+            official = _iso_date(
+                requested.get("official_date"), "REFERENCE_INPUTS boxscore date"
+            )
+            first, last = SEASON_BOUNDARIES[season]
+            if not first <= official <= last:
+                raise ValueError("REFERENCE_INPUTS boxscore date differs from season")
+            boxscores.append((game_pk, season, official))
+            continue
+
+        if query.source == "mlb_stats_pitching":
+            categories.append(1)
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            if (
+                query.grain != "season_d1_league_pitching_reference"
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or season not in SEASON_BOUNDARIES
+            ):
+                raise ValueError("REFERENCE_INPUTS pitching query differs")
+            as_of = _iso_date(
+                requested.get("as_of_date"), "REFERENCE_INPUTS pitching as_of_date"
+            )
+            consumers = requested.get("consuming_game_pks")
+            cutoffs = requested.get("consumer_cutoff_dates")
+            if (
+                not isinstance(consumers, list)
+                or not consumers
+                or any(
+                    isinstance(game_pk, bool)
+                    or not isinstance(game_pk, int)
+                    or game_pk <= 0
+                    for game_pk in consumers
+                )
+                or consumers != sorted(set(consumers))
+                or not isinstance(cutoffs, dict)
+                or set(cutoffs) != {str(game_pk) for game_pk in consumers}
+                or any(value != as_of.isoformat() for value in cutoffs.values())
+            ):
+                raise ValueError("REFERENCE_INPUTS pitching consumers differ")
+            first, _ = SEASON_BOUNDARIES[season]
+            if as_of < first:
+                expected_requested = {
+                    "season": season,
+                    "as_of_date": as_of.isoformat(),
+                    "consumer_cutoff_dates": cutoffs,
+                    "consuming_game_pks": consumers,
+                    "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                    "reason": _PRESEASON_DISPOSITION_REASON,
+                }
+                if (
+                    as_of != first - timedelta(days=1)
+                    or query.endpoint
+                    != "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+                    or dict(query.parameters)
+                    or requested != expected_requested
+                ):
+                    raise ValueError(
+                        "REFERENCE_INPUTS preseason disposition differs"
+                    )
+            else:
+                expected_parameters = {
+                    "stats": "byDateRange",
+                    "group": "pitching",
+                    "sportIds": 1,
+                    "gameType": "R",
+                    "playerPool": "ALL",
+                    "limit": 5000,
+                    "startDate": first.isoformat(),
+                    "endDate": as_of.isoformat(),
+                }
+                expected_requested = {
+                    "season": season,
+                    "start_date": first.isoformat(),
+                    "as_of_date": as_of.isoformat(),
+                    "consumer_cutoff_dates": cutoffs,
+                    "consuming_game_pks": consumers,
+                    "response_completeness": {
+                        "limit": 5000,
+                        "reject_total_splits_at_or_above_limit": True,
+                    },
+                }
+                if (
+                    query.endpoint != _STATS_ENDPOINT
+                    or dict(query.parameters) != expected_parameters
+                    or requested != expected_requested
+                ):
+                    raise ValueError("REFERENCE_INPUTS pitching query differs")
+            pitching.append((season, as_of, tuple(consumers)))
+            continue
+
+        if query.source == "venue_team_timezone_table" and query.endpoint == _TEAMS_ENDPOINT:
+            categories.append(2)
+            requested = dict(query.requested_range)
+            season = requested.get("season")
+            if (
+                query.grain != "effective_dated_venue_team_reference"
+                or isinstance(season, bool)
+                or not isinstance(season, int)
+                or dict(query.parameters)
+                != {
+                    "sportId": 1,
+                    "season": season,
+                    "hydrate": "venue(location)",
+                }
+                or requested != {"season": season, "entity": "teams"}
+            ):
+                raise ValueError("REFERENCE_INPUTS team query differs")
+            teams.append(season)
+            continue
+
+        if (
+            query.source == "venue_team_timezone_table"
+            and venue_match is not None
+        ):
+            categories.append(3)
+            venue_id = int(venue_match.group(1))
+            if (
+                query.grain != "effective_dated_venue_team_reference"
+                or dict(query.parameters) != {"hydrate": "location"}
+                or dict(query.requested_range) != {"venue_id": venue_id}
+            ):
+                raise ValueError("REFERENCE_INPUTS venue query differs")
+            venues.append(venue_id)
+            continue
+        raise ValueError("REFERENCE_INPUTS contains an unapproved source query")
+
+    if categories != sorted(categories):
+        raise ValueError("REFERENCE_INPUTS query partitions are out of order")
+    game_pks = [row[0] for row in boxscores]
+    if game_pks != sorted(set(game_pks)):
+        raise ValueError("REFERENCE_INPUTS boxscores are not uniquely ordered")
+    pitching_keys = [(season, as_of) for season, as_of, _ in pitching]
+    if pitching_keys != sorted(set(pitching_keys)):
+        raise ValueError(
+            "REFERENCE_INPUTS pitching groups are not uniquely ordered"
+        )
+    if teams != list(range(2018, 2025)):
+        raise ValueError("REFERENCE_INPUTS requires the seven canonical team queries")
+    if not venues or venues != sorted(set(venues)):
+        raise ValueError("REFERENCE_INPUTS venues are not uniquely ordered")
+
+    boxscore_by_pk = {
+        game_pk: (season, official) for game_pk, season, official in boxscores
+    }
+    pitching_consumers: set[int] = set()
+    for season, as_of, consumers in pitching:
+        for game_pk in consumers:
+            if game_pk in pitching_consumers:
+                raise ValueError("REFERENCE_INPUTS pitching consumer is duplicated")
+            expected = boxscore_by_pk.get(game_pk)
+            if expected != (season, as_of + timedelta(days=1)):
+                raise ValueError(
+                    "REFERENCE_INPUTS pitching consumer differs from boxscore"
+                )
+            pitching_consumers.add(game_pk)
+    if pitching_consumers != set(boxscore_by_pk):
+        raise ValueError("REFERENCE_INPUTS pitching coverage differs from boxscores")
+
+
+def _validate_participant_derived_stage(
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    _validate_sha256(derived_from_sha256, "PARTICIPANT_DERIVED derived_from_sha256")
+    if not queries:
+        raise ValueError("PARTICIPANT_DERIVED requires a nonempty derived batch")
+    _validate_shared_query_bindings(queries, "PARTICIPANT_DERIVED")
+
+    baselines = ("2017-12-31", "2021-12-31")
+    keys: list[tuple[int, int]] = []
+    consumers_by_pitcher: dict[int, set[int]] = {}
+    for query in queries:
+        requested = dict(query.requested_range)
+        parameters = dict(query.parameters)
+        pitcher_id = requested.get("pitcher_id")
+        inclusive_end = requested.get("inclusive_end")
+        consumers = requested.get("consuming_game_pks")
+        cutoffs = requested.get("consumer_cutoff_dates")
+        if (
+            isinstance(pitcher_id, bool)
+            or not isinstance(pitcher_id, int)
+            or pitcher_id <= 0
+            or inclusive_end not in baselines
+            or query.source != "mlb_stats_pitcher_bf"
+            or query.grain != "player_career_batters_faced_reference"
+            or query.endpoint != f"{_MLB_BASE}/people/{pitcher_id}/stats"
+            or query.expected_media_type != "application/json"
+            or query.parser_version != "v5.2.1"
+            or query.parent_query_id is not None
+            or set(requested)
+            != {
+                "consumer_cutoff_dates",
+                "consuming_game_pks",
+                "pitcher_id",
+                "inclusive_end",
+            }
+            or parameters
+            != {
+                "stats": "byDateRange",
+                "group": "pitching",
+                "gameType": "R",
+                "sportIds": 1,
+                "startDate": "1876-01-01",
+                "endDate": inclusive_end,
+            }
+            or not isinstance(consumers, list)
+            or not consumers
+            or any(
+                isinstance(game_pk, bool)
+                or not isinstance(game_pk, int)
+                or game_pk <= 0
+                for game_pk in consumers
+            )
+            or consumers != sorted(set(consumers))
+            or not isinstance(cutoffs, dict)
+            or set(cutoffs) != {str(game_pk) for game_pk in consumers}
+        ):
+            raise ValueError("PARTICIPANT_DERIVED query contract differs")
+
+        expected_baseline = None
+        for game_pk in consumers:
+            cutoff = _iso_date(
+                cutoffs[str(game_pk)], "PARTICIPANT_DERIVED consumer cutoff"
+            )
+            if not date(2017, 12, 31) <= cutoff <= date(2024, 12, 30):
+                raise ValueError(
+                    "PARTICIPANT_DERIVED consumer cutoff is outside the historical run"
+                )
+            baseline = "2017-12-31" if cutoff <= date(2021, 12, 31) else "2021-12-31"
+            if expected_baseline is None:
+                expected_baseline = baseline
+            elif expected_baseline != baseline:
+                raise ValueError("PARTICIPANT_DERIVED query mixes baseline partitions")
+        if inclusive_end != expected_baseline:
+            raise ValueError("PARTICIPANT_DERIVED baseline differs from cutoffs")
+
+        key = (pitcher_id, baselines.index(inclusive_end))
+        keys.append(key)
+        seen = consumers_by_pitcher.setdefault(pitcher_id, set())
+        if seen.intersection(consumers):
+            raise ValueError("PARTICIPANT_DERIVED consumer is duplicated")
+        seen.update(consumers)
+
+    if keys != sorted(set(keys)):
+        raise ValueError("PARTICIPANT_DERIVED queries are not uniquely ordered")
+
+
+def _validate_stage_batch(
+    stage: str,
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> None:
+    if stage == "STATIC_SCHEDULES":
+        _validate_static_schedule_stage(derived_from_sha256, queries)
+    elif stage == "REFERENCE_INPUTS":
+        _validate_reference_inputs_stage(derived_from_sha256, queries)
+    elif stage == "PARTICIPANT_DERIVED":
+        _validate_participant_derived_stage(derived_from_sha256, queries)
+    elif stage == "REMAINING":
+        _validate_remaining_stage(derived_from_sha256, queries)
+
+
+def _batch_payload(
+    stage: str,
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> dict[str, object]:
+    if not isinstance(stage, str) or not stage:
+        raise ValueError("batch stage must be nonempty text")
+    if stage not in _ALLOWED_STAGES:
+        raise ValueError("batch stage is not an approved acquisition stage")
+    if derived_from_sha256 is not None:
+        _validate_sha256(derived_from_sha256, "derived_from_sha256")
+    if not isinstance(queries, Sequence) or any(
+        not isinstance(query, LogicalQuery) for query in queries
+    ):
+        raise ValueError("batch queries must be LogicalQuery values")
+    query_records = [_query_record(query) for query in queries]
+    query_ids = [logical_query_id(query) for query in queries]
+    if len(query_ids) != len(set(query_ids)):
+        raise ValueError(f"{stage} query batch contains duplicate logical queries")
+    _validate_stage_batch(stage, derived_from_sha256, queries)
+    return {
+        "stage": stage,
+        "derived_from_sha256": derived_from_sha256,
+        "queries": query_records,
+    }
+
+
+def _make_batch(
+    stage: str,
+    derived_from_sha256: str | None,
+    queries: Sequence[LogicalQuery],
+) -> QueryBatch:
+    ordered = tuple(queries)
+    payload = _batch_payload(stage, derived_from_sha256, ordered)
+    return QueryBatch(
+        batch_id=_sha256_bytes(_canonical_json_bytes(payload)),
+        stage=stage,
+        derived_from_sha256=derived_from_sha256,
+        queries=ordered,
+    )
+
+
+def _parse_json_object(
+    contents: bytes, label: str, *, canonical: bool = False
+) -> dict[str, object]:
+    try:
+        value = json.loads(contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must be UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    if canonical and contents != _canonical_json_bytes(value) + b"\n":
+        raise ValueError(f"{label} must be canonical JSON with one newline")
+    return value
+
+
+def _load_json_object(
+    path: Path, label: str, *, canonical: bool = False
+) -> tuple[dict[str, object], str]:
+    if not isinstance(path, Path):
+        path = Path(path)
+    contents = path.read_bytes()
+    return (
+        _parse_json_object(contents, label, canonical=canonical),
+        _sha256_bytes(contents),
+    )
+
+
+def _authority_branch(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> tuple[Path, _AuthorityBranch]:
+    supplied_run = Path(run_spec_path)
+    supplied_contract = Path(acquisition_contract_path)
+    for supplied, label in (
+        (supplied_run, "RunSpec"),
+        (supplied_contract, "acquisition contract"),
+    ):
+        text = os.fspath(supplied)
+        if (
+            not supplied.is_absolute()
+            or "\\" in text
+            or any(part in {"", ".", ".."} for part in supplied.parts)
+            or Path(os.path.abspath(text)) != supplied
+        ):
+            raise ValueError(f"{label} path differs from the repository contract")
+    for branch in _AUTHORITY_BRANCHES:
+        if (
+            supplied_run.parts[-len(branch.authority_relative.parts) :]
+            != branch.authority_relative.parts
+        ):
+            continue
+        root = supplied_run
+        for _ in branch.authority_relative.parts:
+            root = root.parent
+        if supplied_contract != root / branch.contract_relative:
+            raise ValueError("RunSpec/acquisition contract pair differs")
+        return root, branch
+    raise ValueError("RunSpec path differs from the repository contract")
+
+
+def _read_repository_file(root: Path, relative: Path, label: str) -> bytes:
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(component in {"", ".", ".."} for component in relative.parts)
+    ):
+        raise ValueError(f"{label} path must stay under the repository root")
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in relative.parent.parts:
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except OSError as exc:
+                raise ValueError(
+                    f"{label} ancestors must be no-follow directories"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError(f"{label} ancestor identity differs")
+            except BaseException:
+                os.close(child)
+                raise
+            descriptors.append(child)
+            current = child
+        result = _read_linked_regular(current, relative.name, label)
+        if result is None:
+            raise ValueError(f"{label} is missing")
+        contents, metadata = result
+        if metadata.st_nlink != 1:
+            raise ValueError(f"{label} must be an unaliased regular file")
+        return contents
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _verify_repository_binding(
+    root: Path,
+    raw: object,
+    *,
+    expected_path: Path,
+    label: str,
+    digest_key: str = "sha256",
+    extra_keys: frozenset[str] = frozenset(),
+) -> bytes:
+    expected_keys = {"path", digest_key, *extra_keys}
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError(f"{label} binding differs")
+    if raw.get("path") != expected_path.as_posix():
+        raise ValueError(f"{label} path binding differs")
+    digest = raw.get(digest_key)
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise ValueError(f"{label} hash binding differs")
+    contents = _read_repository_file(root, expected_path, label)
+    if _sha256_bytes(contents) != digest:
+        raise ValueError(f"{label} hash binding differs")
+    return contents
+
+
+def _clean_git_environment() -> dict[str, str]:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return environment
+
+
+def _verify_head_blob(
+    root: Path,
+    relative: Path,
+    contents: bytes,
+    label: str,
+    *,
+    expected_blob: object | None = None,
+) -> str:
+    if expected_blob is not None and (
+        not isinstance(expected_blob, str) or not _GIT_BLOB.fullmatch(expected_blob)
+    ):
+        raise ValueError(f"{label} Git blob binding differs")
+    environment = _clean_git_environment()
+    top_level = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    resolved = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{relative.as_posix()}"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    resolved_blob = resolved.stdout.decode("ascii", errors="replace").strip()
+    blob_identity = expected_blob if expected_blob is not None else resolved_blob
+    blob = subprocess.run(
+        ["git", "cat-file", "blob", str(blob_identity)],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    if (
+        top_level.returncode
+        or Path(
+            os.path.abspath(top_level.stdout.decode("utf-8", errors="replace").strip())
+        )
+        != Path(os.path.abspath(root))
+        or resolved.returncode
+        or not _GIT_BLOB.fullmatch(resolved_blob)
+        or resolved_blob != blob_identity
+        or blob.returncode
+        or blob.stdout != contents
+    ):
+        raise ValueError(f"{label} Git blob binding differs")
+    return resolved_blob
+
+
+def _verify_implementation_plan_git_blob(
+    root: Path,
+    relative: Path,
+    raw: dict[str, object],
+    contents: bytes,
+) -> None:
+    _verify_head_blob(
+        root,
+        relative,
+        contents,
+        "implementation plan",
+        expected_blob=raw.get("git_blob_id"),
+    )
+
+
+def _verify_frozen_acquisition_schema(
+    root: Path,
+    contract: dict[str, object],
+    *,
+    schema_index: int,
+) -> None:
+    contents = _read_repository_file(
+        root,
+        _ACQUISITION_SCHEMA_RELATIVE,
+        "acquisition contract schema",
+    )
+    schema = _parse_json_object(
+        contents,
+        "acquisition contract schema",
+        canonical=True,
+    )
+    variants = schema.get("oneOf")
+    trusted_path = Path(__file__).resolve().parents[1] / _ACQUISITION_SCHEMA_RELATIVE
+    trusted_schema = _parse_json_object(
+        trusted_path.read_bytes(), "trusted acquisition contract schema", canonical=True
+    )
+    trusted_variants = trusted_schema.get("oneOf")
+    approved_prefix_lengths = frozenset({3, 4, 5})
+    if (
+        set(schema) != {"$schema", "oneOf"}
+        or schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
+        or not isinstance(variants, list)
+        or len(variants) not in approved_prefix_lengths
+        or not isinstance(trusted_variants, list)
+        or len(trusted_variants) != len(_AUTHORITY_BRANCHES)
+        or not 0 <= schema_index < len(variants)
+        or not _strict_json_equal(
+            variants[: schema_index + 1], trusted_variants[: schema_index + 1]
+        )
+        or not all(isinstance(item, dict) for item in variants)
+    ):
+        raise ValueError("acquisition contract differs from its frozen schema")
+    selected = variants[schema_index]
+    required = selected.get("required")
+    properties = selected.get("properties")
+    exact_const = selected.get("const")
+    if (
+        selected.get("additionalProperties") is not False
+        or selected.get("type") != "object"
+        or (schema_index not in {2, 3, 4} and _canonical_json_bytes(exact_const)
+            != _canonical_json_bytes(contract))
+        or not isinstance(required, list)
+        or set(required) != set(contract)
+        or len(required) != len(contract)
+        or not isinstance(properties, dict)
+        or set(properties) != set(contract)
+    ):
+        raise ValueError("acquisition contract differs from its frozen schema")
+    _verify_head_blob(
+        root,
+        _ACQUISITION_SCHEMA_RELATIVE,
+        contents,
+        "acquisition contract schema",
+    )
+    if schema_index in {2, 3, 4}:
+        _validate_closed_recovery_schema(contract, selected, "acquisition contract")
+
+
+def _validate_closed_recovery_schema(
+    value: object, schema: Mapping[str, object], label: str
+) -> None:
+    """Validate the recovery base without accepting an open schema fragment."""
+    if "const" in schema:
+        if not _strict_json_equal(value, schema["const"]):
+            if label.endswith(".recovery_provenance"):
+                raise ValueError("recovery provenance differs")
+            raise ValueError(f"{label} differs from its closed recovery schema")
+        return
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list) or not any(
+            _strict_json_equal(value, candidate) for candidate in enum
+        ):
+            raise ValueError(f"{label} differs from its closed recovery schema")
+        if set(schema) == {"enum"}:
+            return
+    schema_type = schema.get("type")
+    if schema_type != "object" or schema.get("additionalProperties") is not False:
+        raise ValueError(f"{label} recovery schema is not closed")
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} differs from its closed recovery schema")
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if (
+        not isinstance(properties, Mapping)
+        or not isinstance(required, list)
+        or set(properties) != set(required)
+        or set(value) != set(required)
+    ):
+        raise ValueError(f"{label} differs from its closed recovery schema")
+    for key in required:
+        child = properties[key]
+        if not isinstance(key, str) or not isinstance(child, Mapping):
+            raise ValueError(f"{label} recovery schema is not closed")
+        if child.get("type") == "string" and "pattern" in child:
+            pattern = child["pattern"]
+            if not isinstance(value[key], str) or not isinstance(pattern, str) or not re.fullmatch(
+                pattern, value[key]
+            ):
+                raise ValueError(f"{label}.{key} differs from its closed recovery schema")
+            if set(child) != {"type", "pattern"}:
+                raise ValueError(f"{label}.{key} recovery schema is not closed")
+            continue
+        _validate_closed_recovery_schema(value[key], child, f"{label}.{key}")
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    """Compare JSON values without Python's bool/int or int/float coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        if not isinstance(right, Mapping) or set(left) != set(right):
+            return False
+        return all(_strict_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return isinstance(right, list) and len(left) == len(right) and all(
+            _strict_json_equal(item, candidate)
+            for item, candidate in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _namespace_relative(value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"{label} namespace path differs")
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.as_posix() != value
+    ):
+        raise ValueError(f"{label} namespace path differs")
+    return relative
+
+
+def _validate_namespace_ancestors(
+    root: Path, relative: Path, label: str
+) -> tuple[int, int] | None:
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for index, component in enumerate(relative.parts):
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ValueError(
+                    f"{label} namespace ancestors must be no-follow directories"
+                ) from exc
+            descriptors.append(child)
+            opened = os.fstat(child)
+            linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (linked.st_dev, linked.st_ino)
+            ):
+                raise ValueError(f"{label} namespace directory identity differs")
+            current = child
+            if index == len(relative.parts) - 1:
+                return opened.st_dev, opened.st_ino
+        raise AssertionError("nonempty namespace path was not traversed")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return (
+        left == right
+        or left.parts[: len(right.parts)] == right.parts
+        or right.parts[: len(left.parts)] == left.parts
+    )
+
+
+def _context_roots(
+    root: Path,
+    authority: RunSpec | SourceRunSpec,
+    contract: Mapping[str, object],
+) -> tuple[Path, Path, Path, Path, Path]:
+    namespaces = authority.raw.get("namespaces")
+    canonical_roots = contract.get("canonical_roots")
+    if not isinstance(namespaces, Mapping) or not isinstance(
+        canonical_roots, Mapping
+    ):
+        raise ValueError("authority namespace bindings differ")
+    raw_relative = _namespace_relative(namespaces.get("raw"), "raw")
+    audit_relative = _namespace_relative(namespaces.get("audit"), "audit")
+    report_relative = _namespace_relative(namespaces.get("reports"), "reports")
+    sources_relative = _namespace_relative(
+        namespaces.get("sources", (raw_relative.parent / "sources").as_posix()),
+        "sources",
+    )
+    acquisition_relative = audit_relative / "acquisition"
+    execution_relative = audit_relative / "execution"
+    expected_contract_roots = {
+        "raw": raw_relative.as_posix(),
+        "sources": sources_relative.as_posix(),
+        "acquisition_audit": acquisition_relative.as_posix(),
+        "execution_audit": execution_relative.as_posix(),
+    }
+    if dict(canonical_roots) != expected_contract_roots:
+        raise ValueError("acquisition contract canonical roots differ")
+    relatives = (
+        raw_relative,
+        sources_relative,
+        acquisition_relative,
+        execution_relative,
+        report_relative,
+    )
+    for index, left in enumerate(relatives):
+        for right in relatives[index + 1 :]:
+            if _paths_overlap(left, right):
+                raise ValueError("authority namespace roots overlap")
+    identities = [
+        _validate_namespace_ancestors(root, relative, relative.as_posix())
+        for relative in relatives
+    ]
+    present = [identity for identity in identities if identity is not None]
+    if len(present) != len(set(present)):
+        raise ValueError("authority namespace roots alias")
+    return tuple(root / relative for relative in relatives)  # type: ignore[return-value]
+
+
+def _validate_recovery_acquisition_contract(
+    contract: Mapping[str, object], bindings: Mapping[str, object]
+) -> None:
+    """Authenticate the only non-serialized recovery authority surface.
+
+    The recovery contract itself is intentionally not committed until execution
+    closure.  Its schema consequently closes its shape, while these fixed
+    authority facts close the values that cannot participate in the hash cycle.
+    """
+    if contract.get("run_id") == _R4_RECOVERY_RUN_ID:
+        from .v52_source_contracts import validate_r4_recovery_acquisition_contract
+
+        validate_r4_recovery_acquisition_contract(contract, bindings)
+        return
+    if contract.get("run_id") == _R3_RECOVERY_RUN_ID:
+        _validate_r3_recovery_acquisition_contract(contract, bindings)
+        return
+    expected_keys = {
+        "bindings",
+        "canonical_roots",
+        "forbidden_years",
+        "host_concurrency",
+        "legacy_protection",
+        "minimum_free_space_reserve_bytes",
+        "request_timeout_seconds",
+        "required_years",
+        "response_byte_limits",
+        "response_completeness_limits",
+        "run_id",
+        "schema_version",
+        "season_boundaries",
+        "sources",
+        "timezone_mapping_path",
+        "recovery_provenance",
+    }
+    if (
+        set(contract) != expected_keys
+        or contract.get("run_id") != _RECOVERY_RUN_ID
+        or contract.get("schema_version") != 2
+        or contract.get("canonical_roots") != _RECOVERY_CANONICAL_ROOTS
+        or set(bindings) != {"approved_design", "implementation_plan", "run_spec"}
+    ):
+        raise ValueError("recovery acquisition authority differs")
+    if contract.get("recovery_provenance") != _RECOVERY_PROVENANCE:
+        raise ValueError("recovery provenance differs")
+    sources = contract.get("sources")
+    if not isinstance(sources, list) or len(sources) != 6:
+        raise ValueError("recovery sources differ")
+    schedule = next(
+        (
+            source
+            for source in sources
+            if isinstance(source, Mapping)
+            and source.get("name") == "mlb_schedule_game_feed"
+        ),
+        None,
+    )
+    if not isinstance(schedule, Mapping) or schedule != {
+        "name": "mlb_schedule_game_feed",
+        "grain": "season_schedule_and_game",
+        "parser_version": "v5.2.2",
+        "endpoints": [
+            _SCHEDULE_ENDPOINT,
+            "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_633224",
+        ],
+    }:
+        raise ValueError("recovery schedule source differs")
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise ValueError("recovery sources differ")
+        if source.get("name") != "mlb_schedule_game_feed" and source.get(
+            "parser_version"
+        ) != "v5.2.1":
+            raise ValueError("recovery non-schedule parser differs")
+
+
+def _validate_r3_recovery_acquisition_contract(
+    contract: Mapping[str, object], bindings: Mapping[str, object]
+) -> None:
+    expected_keys = {
+        "bindings", "canonical_roots", "forbidden_years", "host_concurrency",
+        "legacy_protection", "minimum_free_space_reserve_bytes",
+        "recovery_disposition", "recovery_provenance", "request_timeout_seconds",
+        "required_years", "response_byte_limits", "response_completeness_limits",
+        "run_id", "schema_version", "season_boundaries", "sources",
+        "timezone_mapping_path",
+    }
+    expected_disposition = {
+        "parser_version": "v5.2.3",
+        "policy_version": "v5.2.3",
+        "record_game_pks": [565534, 630882, 633224, 632924],
+        "projection_endpoints": [
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_565534",
+            "disposition://SCHEDULE_DUPLICATE_GAMEPK_630882",
+            "disposition://SCHEDULE_RECOVERY_2021_633224_AND_MISSING_VENUE_632924",
+        ],
+        "record_to_projection_indexes": [0, 1, 2, 2],
+        "excluded_game_pks": [632924],
+    }
+    if (
+        set(contract) != expected_keys
+        or contract.get("run_id") != _R3_RECOVERY_RUN_ID
+        or contract.get("schema_version") != 2
+        or contract.get("canonical_roots") != _R3_RECOVERY_CANONICAL_ROOTS
+        or set(bindings) != {"approved_design", "implementation_plan", "run_spec"}
+        or contract.get("recovery_disposition") != expected_disposition
+        or contract.get("recovery_provenance") != _R3_RECOVERY_PROVENANCE
+    ):
+        raise ValueError("r3 recovery acquisition authority differs")
+    sources = contract.get("sources")
+    schedule = next(
+        (source for source in sources if isinstance(source, Mapping)
+         and source.get("name") == "mlb_schedule_game_feed"),
+        None,
+    ) if isinstance(sources, list) else None
+    if not isinstance(schedule, Mapping) or schedule != {
+        "name": "mlb_schedule_game_feed", "grain": "season_schedule_and_game",
+        "parser_version": "v5.2.3", "endpoints": [
+            _SCHEDULE_ENDPOINT, "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore",
+            *expected_disposition["projection_endpoints"],
+        ],
+    }:
+        raise ValueError("r3 recovery schedule source differs")
+
+
+def _load_static_contracts(
+    run_spec_path: Path, acquisition_contract_path: Path
+) -> SourceAuthorityContext:
+    run_spec_path = Path(run_spec_path)
+    acquisition_contract_path = Path(acquisition_contract_path)
+    root, branch = _authority_branch(run_spec_path, acquisition_contract_path)
+    run_spec_contents = _read_repository_file(root, branch.authority_relative, "RunSpec")
+    run_raw = _parse_json_object(run_spec_contents, "RunSpec", canonical=True)
+    authority = (
+        parse_run_spec(run_raw)
+        if branch.schema_index == 0
+        else parse_source_run_spec(run_raw)
+    )
+    run_sha = _sha256_bytes(run_spec_contents)
+    contract_contents = _read_repository_file(
+        root,
+        branch.contract_relative,
+        "acquisition contract",
+    )
+    contract = _parse_json_object(
+        contract_contents,
+        "acquisition contract",
+        canonical=True,
+    )
+    contract_sha = _sha256_bytes(contract_contents)
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, dict):
+        raise AssertionError("validated acquisition contract bindings must be an object")
+    verified_run_spec = _verify_repository_binding(
+        root,
+        bindings.get("run_spec"),
+        expected_path=branch.authority_relative,
+        label="RunSpec",
+        extra_keys=frozenset({"git_blob_id"}) if branch.recovery else frozenset(),
+    )
+    if verified_run_spec != run_spec_contents:
+        raise ValueError("acquisition contract RunSpec binding differs")
+    design_contents = _verify_repository_binding(
+        root,
+        bindings.get("approved_design"),
+        expected_path=branch.design_relative,
+        label="approved design",
+        extra_keys=frozenset({"git_blob_id"}) if branch.recovery else frozenset(),
+    )
+    if branch.recovery:
+        run_binding = bindings.get("run_spec")
+        design_binding = bindings.get("approved_design")
+        if not isinstance(run_binding, dict) or not isinstance(design_binding, dict):
+            raise AssertionError("validated recovery bindings must be objects")
+        _verify_head_blob(
+            root,
+            branch.authority_relative,
+            verified_run_spec,
+            "RunSpec",
+            expected_blob=run_binding.get("git_blob_id"),
+        )
+        _verify_head_blob(
+            root,
+            branch.design_relative,
+            design_contents,
+            "approved design",
+            expected_blob=design_binding.get("git_blob_id"),
+        )
+    plan_binding = bindings.get("implementation_plan")
+    plan_contents = _verify_repository_binding(
+        root,
+        plan_binding,
+        expected_path=branch.plan_relative,
+        label="implementation plan",
+        digest_key="working_tree_sha256",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    if not isinstance(plan_binding, dict):
+        raise AssertionError("validated implementation plan binding must be an object")
+    _verify_implementation_plan_git_blob(
+        root, branch.plan_relative, plan_binding, plan_contents
+    )
+    if branch.recovery:
+        _validate_recovery_acquisition_contract(contract, bindings)
+    elif branch.addendum_relative is None:
+        if branch.amendment_relative is None:
+            raise AssertionError("default authority amendment path is missing")
+        _verify_repository_binding(
+            root,
+            bindings.get("plan_a_amendment"),
+            expected_path=branch.amendment_relative,
+            label="Plan A amendment",
+        )
+    else:
+        if set(bindings) != {
+            "approved_design",
+            "ephemeral_parse_schedule_equivalence_addendum",
+            "implementation_plan",
+            "run_spec",
+        } or contract.get("supersedes") != _SOURCE_SUPERSEDES:
+            raise ValueError("superseding acquisition authority differs")
+        addendum_binding = bindings.get(
+            "ephemeral_parse_schedule_equivalence_addendum"
+        )
+        addendum_contents = _verify_repository_binding(
+            root,
+            addendum_binding,
+            expected_path=branch.addendum_relative,
+            label="ephemeral parse schedule equivalence addendum",
+            extra_keys=frozenset({"git_blob_id"}),
+        )
+        if not isinstance(addendum_binding, dict):
+            raise AssertionError("validated addendum binding must be an object")
+        _verify_head_blob(
+            root,
+            branch.addendum_relative,
+            addendum_contents,
+            "ephemeral parse schedule equivalence addendum",
+            expected_blob=addendum_binding.get("git_blob_id"),
+        )
+        _verify_repository_binding(
+            root,
+            addendum_binding,
+            expected_path=branch.addendum_relative,
+            label="ephemeral parse schedule equivalence addendum",
+            extra_keys=frozenset({"git_blob_id"}),
+        )
+    _verify_frozen_acquisition_schema(
+        root,
+        contract,
+        schema_index=branch.schema_index,
+    )
+    raw_root, sources_root, acquisition_root, execution_root, report_root = (
+        _context_roots(root, authority, contract)
+    )
+    if branch.recovery:
+        _rebind_recovery_authority(
+            root,
+            branch,
+            run_spec_contents,
+            contract_contents,
+            design_contents,
+            plan_contents,
+            contract,
+        )
+        raw_root, sources_root, acquisition_root, execution_root, report_root = (
+            _context_roots(root, authority, contract)
+        )
+    return SourceAuthorityContext(
+        repository_root=root,
+        authority=authority,
+        authority_path=root / branch.authority_relative,
+        authority_sha256=run_sha,
+        acquisition_contract_path=root / branch.contract_relative,
+        acquisition_contract_sha256=contract_sha,
+        contract=deep_freeze(contract),
+        run_id=authority.run_id,
+        raw_root=raw_root,
+        sources_root=sources_root,
+        acquisition_audit_root=acquisition_root,
+        execution_audit_root=execution_root,
+        report_root=report_root,
+    )
+
+
+def _rebind_recovery_authority(
+    root: Path,
+    branch: _AuthorityBranch,
+    run_spec_contents: bytes,
+    contract_contents: bytes,
+    design_contents: bytes,
+    plan_contents: bytes,
+    contract: Mapping[str, object],
+) -> None:
+    """Re-open every recovery binding after its Git identity has been checked."""
+    if not branch.recovery:
+        raise AssertionError("recovery rebind requires the recovery authority")
+    rebound_contract = _read_repository_file(
+        root, branch.contract_relative, "acquisition contract"
+    )
+    if rebound_contract != contract_contents:
+        raise ValueError("recovery acquisition contract binding differs")
+    rebound_run = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("run_spec")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.authority_relative,
+        label="RunSpec",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    rebound_design = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("approved_design")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.design_relative,
+        label="approved design",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    rebound_plan = _verify_repository_binding(
+        root,
+        contract.get("bindings", {}).get("implementation_plan")
+        if isinstance(contract.get("bindings"), Mapping)
+        else None,
+        expected_path=branch.plan_relative,
+        label="implementation plan",
+        digest_key="working_tree_sha256",
+        extra_keys=frozenset({"git_blob_id"}),
+    )
+    if (
+        rebound_run != run_spec_contents
+        or rebound_design != design_contents
+        or rebound_plan != plan_contents
+    ):
+        raise ValueError("recovery authority bytes changed during rebind")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise AssertionError("validated recovery bindings must be an object")
+    for relative, contents, label, binding in (
+        (branch.authority_relative, rebound_run, "RunSpec", bindings.get("run_spec")),
+        (
+            branch.design_relative,
+            rebound_design,
+            "approved design",
+            bindings.get("approved_design"),
+        ),
+        (
+            branch.plan_relative,
+            rebound_plan,
+            "implementation plan",
+            bindings.get("implementation_plan"),
+        ),
+    ):
+        if not isinstance(binding, Mapping):
+            raise AssertionError("validated recovery binding must be an object")
+        _verify_head_blob(
+            root,
+            relative,
+            contents,
+            label,
+            expected_blob=binding.get("git_blob_id"),
+        )
+    for relative, contents, label in (
+        (branch.contract_relative, contract_contents, "acquisition contract"),
+        (branch.authority_relative, rebound_run, "RunSpec"),
+        (branch.design_relative, rebound_design, "approved design"),
+        (branch.plan_relative, rebound_plan, "implementation plan"),
+    ):
+        if _read_repository_file(root, relative, label) != contents:
+            raise ValueError(f"{label} bytes changed after recovery rebind")
+
+
+def _validate_run_bound_acquisition_contract(
+    root: Path,
+    run_spec_contents: bytes,
+    contract_contents: bytes,
+) -> tuple[dict[str, object], str, dict[str, object], str]:
+    """Existing old-authority content binding used by downstream validators."""
+    run_spec = _parse_json_object(run_spec_contents, "RunSpec")
+    run_sha = _sha256_bytes(run_spec_contents)
+    contract = _parse_json_object(
+        contract_contents,
+        "acquisition contract",
+        canonical=True,
+    )
+    contract_sha = _sha256_bytes(contract_contents)
+    if contract.get("schema_version") != 2:
+        raise ValueError("acquisition contract must use schema version 2")
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, dict):
+        raise ValueError("acquisition contract bindings must be an object")
+    verified = _verify_repository_binding(
+        root,
+        bindings.get("run_spec"),
+        expected_path=_RUN_SPEC_RELATIVE,
+        label="RunSpec",
+    )
+    if verified != run_spec_contents:
+        raise ValueError("acquisition contract RunSpec binding differs")
+    return run_spec, run_sha, contract, contract_sha
+
+
+def _iso_date(value: object, label: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO date") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"{label} must be a canonical ISO date")
+    return parsed
+
+
+def _logical_query(
+    *,
+    source: str,
+    grain: str,
+    endpoint: str,
+    parameters: Mapping[str, object],
+    requested_range: Mapping[str, object],
+    expected_media_type: str,
+    parser_version: str,
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+    parent_query_id: str | None = None,
+) -> LogicalQuery:
+    return LogicalQuery(
+        source=source,
+        grain=grain,
+        endpoint=endpoint,
+        parameters=dict(parameters),
+        requested_range=dict(requested_range),
+        expected_media_type=expected_media_type,
+        parser_version=parser_version,
+        parent_query_id=parent_query_id,
+        run_spec_sha256=run_spec_sha256,
+        acquisition_contract_sha256=acquisition_contract_sha256,
+    )
+
+
+def _source_contract(
+    contract: Mapping[str, object], name: str
+) -> Mapping[str, object]:
+    sources = contract.get("sources")
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
+        raise ValueError("acquisition contract sources must be a list")
+    matches = [
+        item
+        for item in sources
+        if isinstance(item, Mapping) and item.get("name") == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"acquisition contract must define {name} exactly once")
+    return matches[0]
+
+
+def _source_identity_text(
+    source_contract: Mapping[str, object], key: str, label: str
+) -> str:
+    value = source_contract.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"acquisition {label} differs")
+    return value
+
+
+def _statcast_parameters(first: str, last: str) -> dict[str, object]:
+    return {
+        "all": "true",
+        "type": "details",
+        "player_type": "batter",
+        "game_date_gt": first,
+        "game_date_lt": last,
+        "hfGT": "R|",
+        "group_by": "name-year",
+        "sort_col": "pitches",
+        "player_event_sort": "api_p_release_speed",
+        "sort_order": "desc",
+        "min_pitches": "0",
+    }
+
+
+def _validated_static_query_inputs(
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> _StaticQueryInputs:
+    context = _load_static_contracts(
+        run_spec_path, acquisition_contract_path
+    )
+    run_spec = context.authority.raw
+    run_sha = context.authority_sha256
+    contract = context.contract
+    contract_sha = context.acquisition_contract_sha256
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("acquisition contract bindings must be an object")
+    run_binding = bindings.get("run_spec")
+    if not isinstance(run_binding, Mapping) or run_binding.get("sha256") != run_sha:
+        raise ValueError("acquisition contract RunSpec binding differs")
+    forbidden = contract.get("forbidden_years")
+    years = contract.get("required_years")
+    if (
+        not isinstance(years, Sequence)
+        or isinstance(years, (str, bytes))
+        or tuple(years) != tuple(range(2018, 2025))
+        or not isinstance(forbidden, Sequence)
+        or isinstance(forbidden, (str, bytes))
+        or 2025 not in forbidden
+    ):
+        raise ValueError("acquisition contract year scope differs")
+    forbidden_authority_years = (
+        run_spec.get("forbidden_target_years", [])
+        if isinstance(context.authority, RunSpec)
+        else run_spec.get("forbidden_source_years", [])
+    )
+    if 2025 not in forbidden_authority_years:
+        raise ValueError("RunSpec must forbid 2025")
+
+    schedule_contract = _source_contract(contract, "mlb_schedule_game_feed")
+    statcast_contract = _source_contract(contract, "baseball_savant_statcast")
+    if _SCHEDULE_ENDPOINT not in schedule_contract.get("endpoints", []):
+        raise ValueError("official schedule endpoint differs")
+    if _STATCAST_ENDPOINT not in statcast_contract.get("endpoints", []):
+        raise ValueError("official Statcast endpoint differs")
+    boundaries = contract.get("season_boundaries")
+    if not isinstance(boundaries, Sequence) or isinstance(boundaries, (str, bytes)):
+        raise ValueError("season boundaries must be a list")
+    by_year = {
+        item.get("year"): item
+        for item in boundaries
+        if isinstance(item, Mapping)
+    }
+    if set(by_year) != set(years):
+        raise ValueError("season boundary years differ")
+
+    seasons: list[_StaticSeason] = []
+    for year in years:
+        if isinstance(year, bool) or not isinstance(year, int):
+            raise ValueError("season boundary year differs")
+        boundary = by_year[year]
+        first = _iso_date(boundary.get("start_date"), "season start")
+        last = _iso_date(boundary.get("end_date"), "season end")
+        if (
+            first.year != year
+            or last.year != year
+            or first > last
+            or (first, last) != SEASON_BOUNDARIES[year]
+        ):
+            raise ValueError("season boundary range differs")
+        seasons.append(_StaticSeason(year=year, first=first, last=last))
+    return _StaticQueryInputs(
+        seasons=tuple(seasons),
+        schedule_grain=_source_identity_text(
+            schedule_contract, "grain", "schedule grain"
+        ),
+        schedule_parser_version=_source_identity_text(
+            schedule_contract, "parser_version", "schedule parser version"
+        ),
+        statcast_grain=_source_identity_text(
+            statcast_contract, "grain", "Statcast grain"
+        ),
+        statcast_parser_version=_source_identity_text(
+            statcast_contract, "parser_version", "Statcast parser version"
+        ),
+        run_spec_sha256=run_sha,
+        acquisition_contract_sha256=contract_sha,
+    )
+
+
+def build_static_batch(
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+    context = _load_static_contracts(run_spec_path, acquisition_contract_path)
+    if (
+        isinstance(context.authority, SourceRunSpec)
+        and context.authority.run_id == _RECOVERY_RUN_ID
+    ):
+        return _make_batch(
+            "STATIC_SCHEDULES",
+            None,
+            _build_recovery_static_schedule_queries(inputs),
+        )
+    if (
+        isinstance(context.authority, SourceRunSpec)
+        and context.authority.run_id == _R3_RECOVERY_RUN_ID
+    ):
+        return _make_batch(
+            "STATIC_SCHEDULES", None, _build_r3_static_schedule_queries(inputs)
+        )
+    if (
+        isinstance(context.authority, SourceRunSpec)
+        and context.authority.run_id == _R4_RECOVERY_RUN_ID
+    ):
+        return _make_batch(
+            "STATIC_SCHEDULES", None, _build_r4_static_schedule_queries(inputs)
+        )
+    disposition_query: LogicalQuery | None = None
+    if isinstance(context.authority, SourceRunSpec):
+        from .v52_duplicate_gamepk_disposition import (
+            build_duplicate_disposition_authority,
+        )
+
+        disposition_query = build_duplicate_disposition_authority(
+            context.repository_root,
+            source_run_spec_path=context.authority_path,
+            acquisition_contract_path=context.acquisition_contract_path,
+        ).query
+
+    queries: list[LogicalQuery] = []
+    for season in inputs.seasons:
+        if season.year == 2019 and disposition_query is not None:
+            queries.append(disposition_query)
+            continue
+        queries.append(
+            _logical_query(
+                source="mlb_schedule_game_feed",
+                grain=inputs.schedule_grain,
+                endpoint=_SCHEDULE_ENDPOINT,
+                parameters={
+                    "sportId": 1,
+                    "gameType": "R",
+                    "startDate": season.first.isoformat(),
+                    "endDate": season.last.isoformat(),
+                    "hydrate": "probablePitcher,lineups,venue,linescore",
+                },
+                requested_range={
+                    "year": season.year,
+                    "start_date": season.first.isoformat(),
+                    "end_date": season.last.isoformat(),
+                },
+                expected_media_type="application/json",
+                parser_version=inputs.schedule_parser_version,
+                run_spec_sha256=inputs.run_spec_sha256,
+                acquisition_contract_sha256=inputs.acquisition_contract_sha256,
+            )
+        )
+    return _make_batch("STATIC_SCHEDULES", None, queries)
+
+
+def _build_recovery_static_schedule_queries(
+    inputs: _StaticQueryInputs,
+) -> tuple[LogicalQuery, ...]:
+    queries: list[LogicalQuery] = []
+    for season, (year, endpoint, parser_version) in zip(
+        inputs.seasons, RECOVERY_STATIC_QUERY_TABLE, strict=True
+    ):
+        if season.year != year:
+            raise AssertionError("recovery static query table year differs")
+        parameters: Mapping[str, object]
+        if season.year in _RECOVERY_DISPOSITION_ENDPOINTS:
+            parameters = {}
+        else:
+            parameters = {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": season.first.isoformat(),
+                "endDate": season.last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        queries.append(
+            _logical_query(
+                source="mlb_schedule_game_feed",
+                grain=inputs.schedule_grain,
+                endpoint=endpoint,
+                parameters=parameters,
+                requested_range={
+                    "year": season.year,
+                    "start_date": season.first.isoformat(),
+                    "end_date": season.last.isoformat(),
+                },
+                expected_media_type="application/json",
+                parser_version=parser_version,
+                run_spec_sha256=inputs.run_spec_sha256,
+                acquisition_contract_sha256=inputs.acquisition_contract_sha256,
+            )
+        )
+    return tuple(queries)
+
+
+def _build_r3_static_schedule_queries(
+    inputs: _StaticQueryInputs,
+) -> tuple[LogicalQuery, ...]:
+    queries: list[LogicalQuery] = []
+    for season, (year, endpoint, parser_version) in zip(
+        inputs.seasons, R3_STATIC_QUERY_TABLE, strict=True
+    ):
+        if season.year != year:
+            raise AssertionError("r3 static query table year differs")
+        parameters: Mapping[str, object] = (
+            {}
+            if endpoint.startswith("disposition://")
+            else {
+                "sportId": 1,
+                "gameType": "R",
+                "startDate": season.first.isoformat(),
+                "endDate": season.last.isoformat(),
+                "hydrate": "probablePitcher,lineups,venue,linescore",
+            }
+        )
+        queries.append(_logical_query(
+            source="mlb_schedule_game_feed", grain=inputs.schedule_grain,
+            endpoint=endpoint, parameters=parameters,
+            requested_range={"year": season.year, "start_date": season.first.isoformat(), "end_date": season.last.isoformat()},
+            expected_media_type="application/json", parser_version=parser_version,
+            run_spec_sha256=inputs.run_spec_sha256,
+            acquisition_contract_sha256=inputs.acquisition_contract_sha256,
+        ))
+    return tuple(queries)
+
+
+def _build_r4_static_schedule_queries(
+    inputs: _StaticQueryInputs,
+) -> tuple[LogicalQuery, ...]:
+    """R4 preserves the R3 table, but its authority hashes make IDs distinct."""
+    return _build_r3_static_schedule_queries(inputs)
+
+
+def _build_statcast_root_batch(
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    inputs = _validated_static_query_inputs(run_spec_path, acquisition_contract_path)
+
+    queries: list[LogicalQuery] = []
+    for season in inputs.seasons:
+        for chunk_start, chunk_end in monthly_ranges(season.first, season.last):
+            start_text = chunk_start.isoformat()
+            end_text = chunk_end.isoformat()
+            queries.append(
+                _logical_query(
+                    source="baseball_savant_statcast",
+                    grain=inputs.statcast_grain,
+                    endpoint=_STATCAST_ENDPOINT,
+                    parameters=_statcast_parameters(start_text, end_text),
+                    requested_range={
+                        "year": season.year,
+                        "start_date": start_text,
+                        "end_date": end_text,
+                    },
+                    expected_media_type="text/csv",
+                    parser_version=inputs.statcast_parser_version,
+                    run_spec_sha256=inputs.run_spec_sha256,
+                    acquisition_contract_sha256=inputs.acquisition_contract_sha256,
+                )
+            )
+    return _make_batch("REMAINING", None, queries)
+
+
+def _explicit_authority_paths(
+    repository_root: Path,
+    *,
+    run_spec_path: Path | None,
+    acquisition_contract_path: Path | None,
+) -> tuple[Path, Path]:
+    """Return one authenticated authority pair without a namespace fallback.
+
+    The legacy public builders intentionally keep their zero-argument authority
+    seam.  A caller selecting the superseding authority, however, must name
+    both files.  Accepting one side, or silently falling back to the legacy
+    pair, would let a source-stage replay bind its batch under the wrong root.
+    """
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    if (run_spec_path is None) != (acquisition_contract_path is None):
+        raise ValueError("RunSpec and acquisition contract must be supplied together")
+    if run_spec_path is None:
+        return root / _RUN_SPEC_RELATIVE, root / _ACQUISITION_CONTRACT_RELATIVE
+    run_path = Path(run_spec_path)
+    contract_path = Path(acquisition_contract_path)
+    authority_root, _branch = _authority_branch(run_path, contract_path)
+    if authority_root != root:
+        raise ValueError("RunSpec path differs from repository root")
+    return run_path, contract_path
+
+
+def build_statcast_root_batch_for_authority(
+    repository_root: Path,
+    *,
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> QueryBatch:
+    """Build the canonical Statcast root for one explicitly selected authority."""
+    run_path, contract_path = _explicit_authority_paths(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    return _build_statcast_root_batch(run_path, contract_path)
+
+
+def build_statcast_root_batch(repository_root: Path) -> QueryBatch:
+    """Build the legacy canonical Statcast root with its frozen public seam."""
+    root = Path(repository_root)
+    return _build_statcast_root_batch(
+        root / _RUN_SPEC_RELATIVE,
+        root / _ACQUISITION_CONTRACT_RELATIVE,
+    )
+
+
+def _canonical_mapping_sha256(value: Mapping[str, object], label: str) -> str:
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{label} must be a string-keyed mapping")
+    return _sha256_bytes(_canonical_json_bytes(dict(value)))
+
+
+def _validate_binding_hashes(
+    run_spec_sha256: str, acquisition_contract_sha256: str
+) -> None:
+    _validate_sha256(run_spec_sha256, "run_spec_sha256")
+    _validate_sha256(acquisition_contract_sha256, "acquisition_contract_sha256")
+
+
+def _batch_root_for_batch(root: Path, batch: QueryBatch) -> Path:
+    """Select only the authenticated authority namespace of this batch."""
+    if not batch.queries:
+        raise ValueError("query batch must contain authority-bound queries")
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if len(pairs) != 1:
+        raise ValueError("query batch authority hash pairs differ")
+    pair = pairs.pop()
+    if pair == (
+        _HISTORICAL_RUN_SPEC_SHA256,
+        _HISTORICAL_ACQUISITION_CONTRACT_SHA256,
+    ):
+        return _ACQUISITION_BATCH_ROOT
+    if pair == (_SOURCE_RUN_SPEC_SHA256, _SOURCE_ACQUISITION_CONTRACT_SHA256):
+        source_context = _load_static_contracts(
+            root / _SOURCE_RUN_SPEC_RELATIVE,
+            root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if (
+            source_context.authority_sha256 != _SOURCE_RUN_SPEC_SHA256
+            or source_context.acquisition_contract_sha256
+            != _SOURCE_ACQUISITION_CONTRACT_SHA256
+        ):
+            raise ValueError("query batch source authority differs")
+        return _SOURCE_ACQUISITION_BATCH_ROOT
+    for recovery_context in _recovery_contexts_if_present(root):
+        if pair != (
+            recovery_context.authority_sha256,
+            recovery_context.acquisition_contract_sha256,
+        ):
+            continue
+        batch_roots = {
+            _RECOVERY_RUN_ID: _RECOVERY_ACQUISITION_BATCH_ROOT,
+            _R3_RECOVERY_RUN_ID: _R3_RECOVERY_ACQUISITION_BATCH_ROOT,
+            _R4_RECOVERY_RUN_ID: _R4_RECOVERY_ACQUISITION_BATCH_ROOT,
+        }
+        if recovery_context.run_id not in batch_roots:
+            raise AssertionError("authenticated recovery context variant differs")
+        return batch_roots[recovery_context.run_id]
+    raise ValueError("query batch authority hash pair differs")
+
+
+def _recovery_context_if_present(root: Path) -> SourceAuthorityContext | None:
+    contexts = _recovery_contexts_if_present(root)
+    return contexts[0] if contexts else None
+
+
+def _recovery_contexts_if_present(root: Path) -> tuple[SourceAuthorityContext, ...]:
+    contexts: list[SourceAuthorityContext] = []
+    for run_relative, contract_relative in (
+        (_RECOVERY_RUN_SPEC_RELATIVE, _RECOVERY_ACQUISITION_CONTRACT_RELATIVE),
+        (_R3_RECOVERY_RUN_SPEC_RELATIVE, _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE),
+        (_R4_RECOVERY_RUN_SPEC_RELATIVE, _R4_RECOVERY_ACQUISITION_CONTRACT_RELATIVE),
+    ):
+        contexts.extend(
+            _recovery_context_for_pair_if_present(root, run_relative, contract_relative)
+        )
+    return tuple(contexts)
+
+
+def _recovery_context_for_pair_if_present(
+    root: Path, run_relative: Path, contract_relative: Path
+) -> tuple[SourceAuthorityContext, ...]:
+    run_path = root / run_relative
+    contract_path = root / contract_relative
+    present: list[bool] = []
+    for path in (run_path, contract_path):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            present.append(False)
+        except OSError as exc:
+            raise ValueError("recovery authority path identity is unavailable") from exc
+        else:
+            present.append(True)
+    if not any(present):
+        return ()
+    if not all(present):
+        raise ValueError("recovery authority path pair differs")
+    return (_load_static_contracts(run_path, contract_path),)
+
+
+def _source_reference_batch_id(root: Path) -> str | None:
+    """Derive the source reference ID from authority artifacts, never batch paths."""
+    try:
+        os.lstat(root / _SOURCE_RUN_SPEC_RELATIVE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("source RunSpec identity is unavailable") from exc
+    try:
+        os.lstat(root / _SOURCE_SCHEDULE_INVENTORY_RELATIVE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("source schedule inventory identity is unavailable") from exc
+    context = _load_static_contracts(
+        root / _SOURCE_RUN_SPEC_RELATIVE,
+        root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    contents = _read_repository_file(
+        root,
+        _SOURCE_SCHEDULE_INVENTORY_RELATIVE,
+        "source schedule anchor inventory",
+    )
+    inventory = _parse_json_object(
+        contents, "source schedule anchor inventory", canonical=True
+    )
+    return _build_schedule_reference_batch_from_inventory(
+        inventory,
+        inventory_sha256=_sha256_bytes(contents),
+        run_spec_sha256=context.authority_sha256,
+        acquisition_contract_sha256=context.acquisition_contract_sha256,
+    ).batch_id
+
+
+def _r3_reference_batch_id(root: Path) -> str | None:
+    """Replay the sealed r3 reference authority before selecting its namespace."""
+    contexts = _recovery_context_for_pair_if_present(
+        root,
+        _R3_RECOVERY_RUN_SPEC_RELATIVE,
+        _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if not contexts:
+        return None
+    if len(contexts) != 1:
+        raise ValueError("r3 recovery authority path pair differs")
+    context = contexts[0]
+    if (
+        context.run_id != _R3_RECOVERY_RUN_ID
+        or context.repository_root != root
+        or context.authority_path != root / _R3_RECOVERY_RUN_SPEC_RELATIVE
+        or context.acquisition_contract_path
+        != root / _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+    ):
+        raise ValueError("r3 reference authority differs")
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(root)
+        / "schedule_anchor_inventory.json"
+    )
+    try:
+        os.lstat(root / inventory_relative)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("r3 schedule inventory identity is unavailable") from exc
+    _parse_json_object(
+        _read_repository_file(root, inventory_relative, "r3 schedule inventory"),
+        "r3 schedule inventory",
+        canonical=True,
+    )
+    return _load_r3_reference_batch_authority(
+        root, read_only_progress=True
+    ).batch_id
+
+
+def _batch_root_for_authority(
+    root: Path,
+    authority: RunSpec | SourceRunSpec | None,
+    *,
+    batch_id: str,
+) -> Path:
+    if authority is None:
+        r3_contexts = _recovery_context_for_pair_if_present(
+            root,
+            _R3_RECOVERY_RUN_SPEC_RELATIVE,
+            _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if len(r3_contexts) == 1:
+            r3_context = r3_contexts[0]
+            if build_static_batch(
+                r3_context.authority_path, r3_context.acquisition_contract_path
+            ).batch_id == batch_id:
+                return _R3_RECOVERY_ACQUISITION_BATCH_ROOT
+            if _r3_reference_batch_id(root) == batch_id:
+                return _R3_RECOVERY_ACQUISITION_BATCH_ROOT
+        r2_contexts = _recovery_context_for_pair_if_present(
+            root,
+            _RECOVERY_RUN_SPEC_RELATIVE,
+            _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if len(r2_contexts) == 1:
+            r2_context = r2_contexts[0]
+            if build_static_batch(
+                r2_context.authority_path, r2_context.acquisition_contract_path
+            ).batch_id == batch_id:
+                return _RECOVERY_ACQUISITION_BATCH_ROOT
+        if batch_id == _SOURCE_STATIC_BATCH_ID:
+            context = _load_static_contracts(
+                root / _SOURCE_RUN_SPEC_RELATIVE,
+                root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            if build_static_batch(
+                context.authority_path, context.acquisition_contract_path
+            ).batch_id != batch_id:
+                raise ValueError("source static batch authority differs")
+            return _SOURCE_ACQUISITION_BATCH_ROOT
+        if _source_reference_batch_id(root) == batch_id:
+            return _SOURCE_ACQUISITION_BATCH_ROOT
+        return _ACQUISITION_BATCH_ROOT
+    if isinstance(authority, RunSpec):
+        return _ACQUISITION_BATCH_ROOT
+    if isinstance(authority, SourceRunSpec):
+        if authority.run_id == _SOURCE_RUN_ID:
+            context = _load_static_contracts(
+                root / _SOURCE_RUN_SPEC_RELATIVE,
+                root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            expected = _SOURCE_ACQUISITION_BATCH_ROOT
+        elif authority.run_id == _RECOVERY_RUN_ID:
+            context = _recovery_context_if_present(root)
+            if context is None:
+                raise ValueError("recovery authority path pair differs")
+            expected = _RECOVERY_ACQUISITION_BATCH_ROOT
+        elif authority.run_id == _R3_RECOVERY_RUN_ID:
+            contexts = _recovery_context_for_pair_if_present(
+                root,
+                _R3_RECOVERY_RUN_SPEC_RELATIVE,
+                _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            if len(contexts) != 1:
+                raise ValueError("r3 recovery authority path pair differs")
+            context = contexts[0]
+            expected = _R3_RECOVERY_ACQUISITION_BATCH_ROOT
+        elif authority.run_id == _R4_RECOVERY_RUN_ID:
+            contexts = _recovery_context_for_pair_if_present(
+                root,
+                _R4_RECOVERY_RUN_SPEC_RELATIVE,
+                _R4_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            )
+            if len(contexts) != 1:
+                raise ValueError("r4 recovery authority path pair differs")
+            context = contexts[0]
+            expected = _R4_RECOVERY_ACQUISITION_BATCH_ROOT
+        else:
+            raise ValueError("query batch source authority differs")
+    else:
+        raise TypeError("query batch authority must be a RunSpec or SourceRunSpec")
+    if context.authority != authority:
+        raise ValueError("query batch authority object differs from repository bytes")
+    return expected
+
+
+def _authority_paths_for_batch(
+    repository_root: Path, batch: QueryBatch
+) -> tuple[Path, Path] | None:
+    """Resolve a non-historical batch namespace back to its exact authority pair."""
+    batch_root = _batch_root_for_batch(repository_root, batch)
+    if batch_root == _ACQUISITION_BATCH_ROOT:
+        return None
+    if batch_root == _SOURCE_ACQUISITION_BATCH_ROOT:
+        return (
+            repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+            repository_root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+        )
+    if batch_root == _RECOVERY_ACQUISITION_BATCH_ROOT:
+        context = _recovery_context_if_present(repository_root)
+        if context is None:
+            raise ValueError("recovery authority path pair differs")
+        return context.authority_path, context.acquisition_contract_path
+    if batch_root == _R3_RECOVERY_ACQUISITION_BATCH_ROOT:
+        contexts = _recovery_context_for_pair_if_present(
+            repository_root,
+            _R3_RECOVERY_RUN_SPEC_RELATIVE,
+            _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if len(contexts) != 1:
+            raise ValueError("r3 recovery authority path pair differs")
+        return contexts[0].authority_path, contexts[0].acquisition_contract_path
+    if batch_root == _R4_RECOVERY_ACQUISITION_BATCH_ROOT:
+        contexts = _recovery_context_for_pair_if_present(
+            repository_root,
+            _R4_RECOVERY_RUN_SPEC_RELATIVE,
+            _R4_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+        )
+        if len(contexts) != 1:
+            raise ValueError("r4 recovery authority path pair differs")
+        return contexts[0].authority_path, contexts[0].acquisition_contract_path
+    raise ValueError("query batch authority namespace differs")
+
+
+def _reject_batch_shadow(root: Path, selected_root: Path, batch_id: str) -> None:
+    roots = (
+        _ACQUISITION_BATCH_ROOT,
+        _SOURCE_ACQUISITION_BATCH_ROOT,
+        _RECOVERY_ACQUISITION_BATCH_ROOT,
+        _R3_RECOVERY_ACQUISITION_BATCH_ROOT,
+        _R4_RECOVERY_ACQUISITION_BATCH_ROOT,
+    )
+    if selected_root not in roots:
+        raise ValueError("query batch authority namespace differs")
+    for alternate in roots:
+        if alternate == selected_root:
+            continue
+        try:
+            os.lstat(root / alternate / f"{batch_id}.json")
+        except FileNotFoundError:
+            continue
+        raise ValueError("query batch is shadowed across authority namespaces")
+
+
+def _rebind_batch_namespace(
+    root: Path, selected_root: Path, batch: QueryBatch
+) -> None:
+    if _batch_root_for_batch(root, batch) != selected_root:
+        raise ValueError("query batch authority namespace changed")
+    _reject_batch_shadow(root, selected_root, batch.batch_id)
+
+
+_SCHEDULE_INVENTORY_KEYS = frozenset(
+    {
+        "acquisition_contract",
+        "anchors",
+        "artifact_kind",
+        "counts",
+        "run_id",
+        "run_spec",
+        "schema_version",
+        "season_sources",
+        "static_batch",
+        "team_ids",
+        "venue_ids",
+    }
+)
+_RECOVERY_SCHEDULE_INVENTORY_KEYS = _SCHEDULE_INVENTORY_KEYS | {
+    "schedule_conflict_dispositions"
+}
+_SOURCE_SCHEDULE_ANCHOR_KEYS = frozenset(
+    {
+        "alternate_site",
+        "away_score",
+        "away_team_id",
+        "completed_innings",
+        "doubleheader_order",
+        "game_pk",
+        "home_score",
+        "home_team_id",
+        "neutral_site",
+        "official_date",
+        "played",
+        "raw_game_object_sha256",
+        "scheduled_innings",
+        "scheduled_start_utc",
+        "season",
+        "season_start_date",
+        "terminal_status",
+        "venue_id",
+        "winner_team_id",
+    }
+)
+_OLD_SCHEDULE_ANCHOR_KEYS = _SOURCE_SCHEDULE_ANCHOR_KEYS - {
+    "raw_game_object_sha256"
+}
+_SCHEDULE_SOURCE_KEYS = frozenset(
+    {
+        "game_count",
+        "inclusive_end",
+        "inclusive_start",
+        "played_game_count",
+        "query_id",
+        "query_sidecar",
+        "raw_sha256",
+        "season",
+        "storage_mode",
+        "success_receipt",
+        "unplayed_game_count",
+    }
+)
+_DERIVED_SCHEDULE_SOURCE_KEYS = _SCHEDULE_SOURCE_KEYS | {"occurrence_counts"}
+_SOURCE_RUN_ID = "historical_walkforward_500_superseding_565534"
+
+
+def _inventory_binding(
+    raw: object,
+    label: str,
+    *,
+    expected_path: str | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[str, str]:
+    if not isinstance(raw, Mapping) or set(raw) != {"path", "sha256"}:
+        raise ValueError(f"schedule inventory {label} binding differs")
+    path = raw.get("path")
+    digest = raw.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or any(part in {"", ".", ".."} for part in Path(path).parts)
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or (expected_path is not None and path != expected_path)
+        or (expected_sha256 is not None and digest != expected_sha256)
+    ):
+        raise ValueError(f"schedule inventory {label} binding differs")
+    return path, digest
+
+
+def _validated_schedule_inventory_anchors(
+    anchor_inventory: Mapping[str, object],
+    *,
+    inventory_sha256: str,
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+    r3_projection: object | None = None,
+    r3_static_batch: QueryBatch | None = None,
+) -> list[Mapping[str, object]]:
+    _validate_sha256(inventory_sha256, "schedule inventory SHA-256")
+    if (
+        _sha256_bytes(_canonical_json_bytes(anchor_inventory) + b"\n")
+        != inventory_sha256
+    ):
+        raise ValueError("schedule inventory SHA-256 differs from canonical bytes")
+    run_id = anchor_inventory.get("run_id")
+    source_branch = run_id == _SOURCE_RUN_ID
+    recovery_branch = run_id == _RECOVERY_RUN_ID
+    r3_branch = run_id == _R3_RECOVERY_RUN_ID
+    if set(anchor_inventory) != (
+        _RECOVERY_SCHEDULE_INVENTORY_KEYS
+        if recovery_branch or r3_branch
+        else _SCHEDULE_INVENTORY_KEYS
+    ):
+        raise ValueError("schedule inventory top-level keys differ")
+    if (
+        anchor_inventory.get("artifact_kind") != "SCHEDULE_ANCHOR_INVENTORY"
+        or anchor_inventory.get("schema_version") != 1
+        or run_id
+        not in {
+            "historical_walkforward_500",
+            _SOURCE_RUN_ID,
+            _RECOVERY_RUN_ID,
+            _R3_RECOVERY_RUN_ID,
+        }
+    ):
+        raise ValueError("schedule inventory identity differs")
+    expected_run_path = (
+        _R3_RECOVERY_RUN_SPEC_RELATIVE
+        if r3_branch
+        else _RECOVERY_RUN_SPEC_RELATIVE
+        if recovery_branch
+        else _SOURCE_RUN_SPEC_RELATIVE
+        if source_branch
+        else _RUN_SPEC_RELATIVE
+    ).as_posix()
+    expected_contract_path = (
+        _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        if r3_branch
+        else _RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        if recovery_branch
+        else _SOURCE_ACQUISITION_CONTRACT_RELATIVE
+        if source_branch
+        else _ACQUISITION_CONTRACT_RELATIVE
+    ).as_posix()
+    batch_root = (
+        _R3_RECOVERY_ACQUISITION_BATCH_ROOT
+        if r3_branch
+        else _RECOVERY_ACQUISITION_BATCH_ROOT
+        if recovery_branch
+        else Path("audit/v5_2_qd/historical_superseding_565534/acquisition/query_batches")
+        if source_branch
+        else _ACQUISITION_BATCH_ROOT
+    )
+    _inventory_binding(
+        anchor_inventory.get("run_spec"),
+        "RunSpec",
+        expected_path=expected_run_path,
+        expected_sha256=run_spec_sha256,
+    )
+    _inventory_binding(
+        anchor_inventory.get("acquisition_contract"),
+        "acquisition contract",
+        expected_path=expected_contract_path,
+        expected_sha256=acquisition_contract_sha256,
+    )
+    static_batch = anchor_inventory.get("static_batch")
+    if not isinstance(static_batch, Mapping) or set(static_batch) != {
+        "batch_id",
+        "path",
+        "sha256",
+    }:
+        raise ValueError("schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_batch.get("batch_id"), "schedule inventory static batch ID"
+    )
+    _inventory_binding(
+        {"path": static_batch.get("path"), "sha256": static_batch.get("sha256")},
+        "static batch",
+        expected_path=(
+            batch_root / f"{static_batch_id}.json"
+        ).as_posix(),
+    )
+    r3_query_ids_by_year: dict[int, str] | None = None
+    if r3_branch:
+        from .v52_schedule_conflict_recovery_disposition import (
+            RecoveryDispositionProjection,
+        )
+
+        if (
+            not isinstance(r3_projection, RecoveryDispositionProjection)
+            or not isinstance(r3_static_batch, QueryBatch)
+            or r3_static_batch.stage != "STATIC_SCHEDULES"
+            or r3_static_batch.derived_from_sha256 is not None
+            or r3_static_batch.batch_id != static_batch_id
+        ):
+            raise ValueError("r3 schedule inventory authority differs")
+        _validate_r3_static_schedule_queries(r3_static_batch.queries)
+        if any(
+            query.run_spec_sha256 != run_spec_sha256
+            or query.acquisition_contract_sha256 != acquisition_contract_sha256
+            for query in r3_static_batch.queries
+        ):
+            raise ValueError("r3 schedule inventory static authority differs")
+        if (
+            r3_projection.record_game_pks != (565534, 630882, 633224, 632924)
+            or len(r3_projection.projection_query_ids) != 3
+            or r3_projection.record_to_projection_indexes != (0, 1, 2, 2)
+            or r3_projection.excluded_game_pks != frozenset({632924})
+        ):
+            raise ValueError("r3 schedule inventory topology differs")
+        disposition_mapping = anchor_inventory.get("schedule_conflict_dispositions")
+        expected_mapping = {
+            "excluded_game_pks": [632924],
+            "projection_query_ids": list(r3_projection.projection_query_ids),
+            "record_game_pks": [565534, 630882, 633224, 632924],
+            "record_to_projection_indexes": [0, 1, 2, 2],
+        }
+        if (
+            not isinstance(disposition_mapping, Mapping)
+            or dict(disposition_mapping) != expected_mapping
+        ):
+            raise ValueError("r3 schedule inventory disposition mapping differs")
+        r3_query_ids_by_year = {
+            int(query.requested_range["year"]): logical_query_id(query)
+            for query in r3_static_batch.queries
+        }
+        if (
+            len(r3_query_ids_by_year) != 7
+            or tuple(r3_query_ids_by_year) != tuple(range(2018, 2025))
+            or tuple(
+                logical_query_id(query)
+                for query in r3_static_batch.queries
+                if query.endpoint.startswith("disposition://")
+            ) != r3_projection.projection_query_ids
+        ):
+            raise ValueError("r3 schedule inventory static topology differs")
+
+    raw_anchors = anchor_inventory.get("anchors")
+    if (
+        not isinstance(raw_anchors, Sequence)
+        or isinstance(raw_anchors, (str, bytes))
+        or not raw_anchors
+    ):
+        raise ValueError("schedule inventory anchors must be nonempty")
+    anchors: list[Mapping[str, object]] = []
+    prior: tuple[int, int] | None = None
+    game_pks: set[int] = set()
+    teams: set[int] = set()
+    venues: set[int] = set()
+    by_season: dict[int, list[Mapping[str, object]]] = {
+        season: [] for season in range(2018, 2025)
+    }
+    for raw in raw_anchors:
+        expected_anchor_keys = (
+            _SOURCE_SCHEDULE_ANCHOR_KEYS
+            if source_branch or recovery_branch or r3_branch
+            else _OLD_SCHEDULE_ANCHOR_KEYS
+        )
+        if not isinstance(raw, Mapping) or set(raw) != expected_anchor_keys:
+            raise ValueError("schedule inventory anchor keys differ")
+        season = raw.get("season")
+        game_pk = raw.get("game_pk")
+        venue_id = raw.get("venue_id")
+        away_team_id = raw.get("away_team_id")
+        home_team_id = raw.get("home_team_id")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                season,
+                game_pk,
+                venue_id,
+                away_team_id,
+                home_team_id,
+            )
+        ):
+            raise ValueError("schedule inventory anchor IDs differ")
+        if season not in SEASON_BOUNDARIES:
+            raise ValueError("schedule inventory anchor season differs")
+        if type(raw.get("played")) is not bool:
+            raise ValueError("schedule inventory anchor played differs")
+        if source_branch or recovery_branch or r3_branch:
+            _validate_sha256(
+                raw.get("raw_game_object_sha256"),
+                "schedule inventory raw-object provenance",
+            )
+        official = _iso_date(
+            raw.get("official_date"), "schedule inventory official_date"
+        )
+        season_start = _iso_date(
+            raw.get("season_start_date"), "schedule inventory season_start_date"
+        )
+        first, last = SEASON_BOUNDARIES[season]
+        if season_start != first or not first <= official <= last:
+            raise ValueError("schedule inventory anchor dates differ from season")
+        identity = (season, game_pk)
+        if prior is not None and identity <= prior:
+            raise ValueError("schedule inventory anchors are not strictly ordered")
+        if game_pk in game_pks:
+            raise ValueError("schedule inventory contains duplicate game_pk")
+        prior = identity
+        game_pks.add(game_pk)
+        teams.update((away_team_id, home_team_id))
+        venues.add(venue_id)
+        anchors.append(raw)
+        by_season[season].append(raw)
+
+    if r3_branch and (
+        632924 in game_pks
+        or any(
+            anchor.get("venue_id") is None
+            or not isinstance(anchor.get("venue_id"), int)
+            or anchor.get("venue_id") <= 0
+            for anchor in anchors
+        )
+    ):
+        raise ValueError("r3 schedule inventory exclusion or venue anchor differs")
+
+    if source_branch:
+        from .v52_duplicate_gamepk_disposition import (
+            RETAINED_OBJECT_SHA256,
+            SUPPRESSED_OBJECT_SHA256,
+        )
+
+        if any(
+            anchor.get("raw_game_object_sha256") == SUPPRESSED_OBJECT_SHA256
+            for anchor in anchors
+        ):
+            raise ValueError("schedule inventory contains suppressed raw occurrence")
+
+        retained = [anchor for anchor in anchors if anchor.get("game_pk") == 565534]
+        if len(retained) != 1 or (
+            retained[0].get("venue_id") != 10
+            or retained[0].get("scheduled_start_utc") != "2019-09-07T00:15:00Z"
+            or retained[0].get("raw_game_object_sha256") != RETAINED_OBJECT_SHA256
+        ):
+            raise ValueError("schedule inventory retained 565534 anchor differs")
+
+    inventory_team_ids = anchor_inventory.get("team_ids")
+    inventory_venue_ids = anchor_inventory.get("venue_ids")
+    if (
+        not isinstance(inventory_team_ids, Sequence)
+        or isinstance(inventory_team_ids, (str, bytes))
+        or list(inventory_team_ids) != sorted(teams)
+    ):
+        raise ValueError("schedule inventory team IDs differ from anchors")
+    if (
+        not isinstance(inventory_venue_ids, Sequence)
+        or isinstance(inventory_venue_ids, (str, bytes))
+        or list(inventory_venue_ids) != sorted(venues)
+    ):
+        raise ValueError("schedule inventory venue IDs differ from anchors")
+    played_count = sum(anchor.get("played") is True for anchor in anchors)
+    if anchor_inventory.get("counts") != {
+        "game_count": len(anchors),
+        "played_game_count": played_count,
+        "season_count": 7,
+        "unplayed_game_count": len(anchors) - played_count,
+    }:
+        raise ValueError("schedule inventory counts differ from anchors")
+    sources = anchor_inventory.get("season_sources")
+    if (
+        not isinstance(sources, Sequence)
+        or isinstance(sources, (str, bytes))
+        or len(sources) != 7
+    ):
+        raise ValueError("schedule inventory season sources differ")
+    for season, source in zip(range(2018, 2025), sources, strict=True):
+        derived_2019 = source_branch and season == 2019
+        recovery_derived = (recovery_branch or r3_branch) and season in {
+            2019,
+            2020,
+            2021,
+        }
+        expected_keys = (
+            _DERIVED_SCHEDULE_SOURCE_KEYS
+            if derived_2019 or recovery_derived
+            else _SCHEDULE_SOURCE_KEYS
+        )
+        if not isinstance(source, Mapping) or set(source) != expected_keys:
+            raise ValueError("schedule inventory season source keys differ")
+        rows = by_season[season]
+        played = sum(row.get("played") is True for row in rows)
+        first, last = SEASON_BOUNDARIES[season]
+        if (
+            not rows
+            or source.get("season") != season
+            or source.get("inclusive_start") != first.isoformat()
+            or source.get("inclusive_end") != last.isoformat()
+            or source.get("game_count") != len(rows)
+            or source.get("played_game_count") != played
+            or source.get("unplayed_game_count") != len(rows) - played
+        ):
+            raise ValueError("schedule inventory season source differs")
+        _validate_sha256(source.get("query_id"), "schedule source query ID")
+        if r3_branch and (
+            r3_query_ids_by_year is None
+            or source.get("query_id") != r3_query_ids_by_year[season]
+        ):
+            raise ValueError("r3 schedule inventory season source query differs")
+        if derived_2019:
+            from .v52_duplicate_gamepk_disposition import EXPECTED_OCCURRENCE_COUNTS
+
+            if (
+                source.get("storage_mode") != "DERIVED_DISPOSITION"
+                or source.get("raw_sha256") is not None
+                or source.get("occurrence_counts")
+                != dict(EXPECTED_OCCURRENCE_COUNTS)
+            ):
+                raise ValueError("schedule inventory derived 2019 source differs")
+        elif recovery_derived:
+            if (
+                source.get("storage_mode") != "DERIVED_DISPOSITION"
+                or source.get("raw_sha256") is not None
+            ):
+                raise ValueError("recovery schedule inventory derived source differs")
+        else:
+            if source.get("storage_mode") not in {
+                "FETCHED_RAW",
+                "PROTECTED_LEGACY_REFERENCE",
+            }:
+                raise ValueError("schedule inventory season source differs")
+            _validate_sha256(source.get("raw_sha256"), "schedule source raw SHA-256")
+        _inventory_binding(source.get("query_sidecar"), "query sidecar")
+        _inventory_binding(source.get("success_receipt"), "success receipt")
+    return anchors
+
+
+def _build_schedule_reference_batch_from_inventory(
+    anchor_inventory: Mapping[str, object],
+    *,
+    inventory_sha256: str,
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+    r3_projection: object | None = None,
+    r3_static_batch: QueryBatch | None = None,
+) -> QueryBatch:
+    _validate_binding_hashes(run_spec_sha256, acquisition_contract_sha256)
+    anchors = _validated_schedule_inventory_anchors(
+        anchor_inventory,
+        inventory_sha256=inventory_sha256,
+        run_spec_sha256=run_spec_sha256,
+        acquisition_contract_sha256=acquisition_contract_sha256,
+        r3_projection=r3_projection,
+        r3_static_batch=r3_static_batch,
+    )
+
+    unique_games: dict[int, tuple[int, date, date, int, bool]] = {}
+    seasons: set[int] = set()
+    venues: set[int] = set()
+    pitching_consumers: dict[tuple[int, date, date], set[int]] = {}
+    for raw in anchors:
+        if not isinstance(raw, Mapping):
+            raise ValueError("schedule anchor must be an object")
+        season = raw.get("season")
+        game_pk = raw.get("game_pk")
+        venue_id = raw.get("venue_id")
+        played = raw.get("played")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (season, game_pk, venue_id)
+        ):
+            raise ValueError("schedule anchor IDs must be positive integers")
+        if season not in range(2018, 2025):
+            raise ValueError("schedule anchor season is outside 2018-2024")
+        if type(played) is not bool:
+            raise ValueError("schedule anchor played must be explicitly boolean")
+        official = _iso_date(raw.get("official_date"), "anchor official_date")
+        season_start = _iso_date(
+            raw.get("season_start_date"), "anchor season_start_date"
+        )
+        frozen_start, frozen_end = SEASON_BOUNDARIES[season]
+        if season_start != frozen_start or not frozen_start <= official <= frozen_end:
+            raise ValueError("schedule anchor dates differ from season")
+        identity = (season, season_start, official, venue_id, played)
+        if game_pk in unique_games:
+            raise ValueError("schedule inventory contains duplicate game_pk")
+        unique_games[game_pk] = identity
+        seasons.add(season)
+        venues.add(venue_id)
+        if played:
+            pitching_consumers.setdefault(
+                (season, season_start, official - timedelta(days=1)), set()
+            ).add(game_pk)
+
+    queries: list[LogicalQuery] = []
+    for game_pk, (season, _season_start, official, _venue_id, played) in sorted(
+        unique_games.items()
+    ):
+        if not played:
+            continue
+        queries.append(
+            _logical_query(
+                source="mlb_schedule_game_feed",
+                grain="season_schedule_and_game",
+                endpoint=f"{_MLB_BASE}/game/{game_pk}/boxscore",
+                parameters={},
+                requested_range={
+                    "season": season,
+                    "game_pk": game_pk,
+                    "official_date": official.isoformat(),
+                },
+                expected_media_type="application/json",
+                parser_version="v5.2.1",
+                run_spec_sha256=run_spec_sha256,
+                acquisition_contract_sha256=acquisition_contract_sha256,
+            )
+        )
+    for season, season_start, as_of in sorted(pitching_consumers):
+        consumers = sorted(pitching_consumers[(season, season_start, as_of)])
+        consumer_cutoffs = {str(game_pk): as_of.isoformat() for game_pk in consumers}
+        if as_of < season_start:
+            endpoint = "disposition://PRESEASON_NO_CURRENT_SEASON_PITCHING"
+            parameters: dict[str, object] = {}
+            requested = {
+                "season": season,
+                "as_of_date": as_of.isoformat(),
+                "consumer_cutoff_dates": consumer_cutoffs,
+                "consuming_game_pks": consumers,
+                "disposition": "PRESEASON_NO_CURRENT_SEASON_PITCHING",
+                "reason": _PRESEASON_DISPOSITION_REASON,
+            }
+        else:
+            endpoint = _STATS_ENDPOINT
+            parameters = {
+                "stats": "byDateRange",
+                "group": "pitching",
+                "sportIds": 1,
+                "gameType": "R",
+                "playerPool": "ALL",
+                "limit": 5000,
+                "startDate": season_start.isoformat(),
+                "endDate": as_of.isoformat(),
+            }
+            requested = {
+                "season": season,
+                "start_date": season_start.isoformat(),
+                "as_of_date": as_of.isoformat(),
+                "consumer_cutoff_dates": consumer_cutoffs,
+                "consuming_game_pks": consumers,
+                "response_completeness": {
+                    "limit": 5000,
+                    "reject_total_splits_at_or_above_limit": True,
+                },
+            }
+        queries.append(
+            _logical_query(
+                source="mlb_stats_pitching",
+                grain="season_d1_league_pitching_reference",
+                endpoint=endpoint,
+                parameters=parameters,
+                requested_range=requested,
+                expected_media_type="application/json",
+                parser_version="v5.2.1",
+                run_spec_sha256=run_spec_sha256,
+                acquisition_contract_sha256=acquisition_contract_sha256,
+            )
+        )
+    for season in sorted(seasons):
+        queries.append(
+            _logical_query(
+                source="venue_team_timezone_table",
+                grain="effective_dated_venue_team_reference",
+                endpoint=_TEAMS_ENDPOINT,
+                parameters={
+                    "sportId": 1,
+                    "season": season,
+                    "hydrate": "venue(location)",
+                },
+                requested_range={"season": season, "entity": "teams"},
+                expected_media_type="application/json",
+                parser_version="v5.2.1",
+                run_spec_sha256=run_spec_sha256,
+                acquisition_contract_sha256=acquisition_contract_sha256,
+            )
+        )
+    for venue_id in sorted(venues):
+        queries.append(
+            _logical_query(
+                source="venue_team_timezone_table",
+                grain="effective_dated_venue_team_reference",
+                endpoint=f"{_MLB_BASE}/venues/{venue_id}",
+                parameters={"hydrate": "location"},
+                requested_range={"venue_id": venue_id},
+                expected_media_type="application/json",
+                parser_version="v5.2.1",
+                run_spec_sha256=run_spec_sha256,
+                acquisition_contract_sha256=acquisition_contract_sha256,
+            )
+        )
+    return _make_batch("REFERENCE_INPUTS", inventory_sha256, queries)
+
+
+def build_schedule_reference_batch(
+    repository_root: Path,
+    run_spec_path: Path,
+    *,
+    acquisition_contract_path: Path,
+    static_batch_id: str,
+    evidence_root: Path,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    run_spec_path = Path(os.path.abspath(os.fspath(run_spec_path)))
+    authority_root, authority_branch = _authority_branch(
+        run_spec_path, acquisition_contract_path
+    )
+    if authority_root != repository_root:
+        raise ValueError("reference RunSpec path differs from repository root")
+    r3_projection: object | None = None
+    r3_static_batch: QueryBatch | None = None
+    context: SourceAuthorityContext | None = None
+    if authority_branch.recovery_variant == "r3":
+        context = _load_static_contracts(run_spec_path, acquisition_contract_path)
+        if (
+            context.run_id != _R3_RECOVERY_RUN_ID
+            or context.authority_path != repository_root / _R3_RECOVERY_RUN_SPEC_RELATIVE
+            or context.acquisition_contract_path
+            != repository_root / _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE
+        ):
+            raise ValueError("r3 schedule inventory authority differs")
+        r3_static_batch = build_static_batch(
+            context.authority_path, context.acquisition_contract_path
+        )
+        _validate_r3_static_schedule_queries(
+            r3_static_batch.queries, context=context
+        )
+        if (
+            r3_static_batch.stage != "STATIC_SCHEDULES"
+            or r3_static_batch.derived_from_sha256 is not None
+        ):
+            raise ValueError("r3 schedule inventory static authority differs")
+        from .v52_missing_venue_recovery_disposition import (
+            MissingVenueRecoveryDispositionCatalog,
+            build_missing_venue_recovery_disposition_catalog,
+        )
+
+        catalog = build_missing_venue_recovery_disposition_catalog(
+            repository_root,
+            context.authority_path,
+            context.acquisition_contract_path,
+        )
+        r3_projection = catalog.as_projection()
+        if (
+            not isinstance(catalog, MissingVenueRecoveryDispositionCatalog)
+            or catalog.authority_run_spec_sha256 != context.authority_sha256
+            or catalog.authority_acquisition_contract_sha256
+            != context.acquisition_contract_sha256
+            or r3_projection.record_game_pks != (565534, 630882, 633224, 632924)
+            or len(r3_projection.projection_query_ids) != 3
+            or r3_projection.record_to_projection_indexes != (0, 1, 2, 2)
+            or r3_projection.excluded_game_pks != frozenset({632924})
+            or tuple(
+                logical_query_id(query)
+                for query in r3_static_batch.queries
+                if query.endpoint.startswith("disposition://")
+            ) != r3_projection.projection_query_ids
+        ):
+            raise ValueError("r3 schedule inventory topology differs")
+    from .protocols import load_run_spec
+    from .v52_schedule_inventory import load_verified_schedule_anchor_inventory
+
+    if authority_branch.schema_index != 0:
+        authority = (
+            context
+            if context is not None
+            else _load_static_contracts(run_spec_path, acquisition_contract_path)
+        ).authority
+        if not isinstance(authority, SourceRunSpec):
+            raise ValueError("source reference authority differs")
+    else:
+        authority = load_run_spec(run_spec_path)
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        authority,
+        acquisition_contract_path=acquisition_contract_path,
+        static_batch_id=static_batch_id,
+        evidence_root=evidence_root,
+        read_only_progress=read_only_progress,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified schedule inventory authority bindings differ")
+    if (
+        authority_branch.recovery_variant == "r3"
+        and verified.payload.get("run_id") != _R3_RECOVERY_RUN_ID
+    ):
+        raise ValueError("r3 schedule inventory namespace differs")
+    if authority_branch.recovery_variant == "r2":
+        from .v52_schedule_conflict_recovery_disposition import (
+            build_recovery_schedule_conflict_catalog,
+        )
+        from .v52_schedule_inventory import RecoveryDispositionBindings
+
+        catalog = build_recovery_schedule_conflict_catalog(
+            repository_root, run_spec_path, acquisition_contract_path
+        )
+        RecoveryDispositionBindings.from_catalog_mapping(
+            verified.payload.get("schedule_conflict_dispositions"), catalog
+        )
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified schedule acquisition contract SHA-256",
+        ),
+        r3_projection=r3_projection,
+        r3_static_batch=r3_static_batch,
+    )
+
+
+def _load_fixed_reference_batch_authority(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    from .protocols import parse_run_spec
+    from .v52_schedule_inventory import (
+        _read_inventory_contents,
+        load_verified_schedule_anchor_inventory,
+    )
+
+    run_contents = _read_repository_file(
+        repository_root, _RUN_SPEC_RELATIVE, "reference RunSpec"
+    )
+    run_spec = parse_run_spec(_parse_json_object(run_contents, "reference RunSpec"))
+    namespaces = run_spec.raw.get("namespaces")
+    raw_namespace = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(raw_namespace, str):
+        raise ValueError("reference RunSpec raw namespace differs")
+    raw_relative = Path(raw_namespace)
+    if (
+        raw_relative.is_absolute()
+        or not raw_relative.parts
+        or any(part in {"", ".", ".."} for part in raw_relative.parts)
+    ):
+        raise ValueError("reference RunSpec raw namespace differs")
+    inventory_record = _parse_json_object(
+        _read_inventory_contents(repository_root),
+        "schedule anchor inventory",
+        canonical=True,
+    )
+    static_binding = inventory_record.get("static_batch")
+    if not isinstance(static_binding, dict):
+        raise ValueError("schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_binding.get("batch_id"), "schedule inventory static batch ID"
+    )
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        run_spec,
+        acquisition_contract_path=repository_root
+        / _ACQUISITION_CONTRACT_RELATIVE,
+        static_batch_id=static_batch_id,
+        evidence_root=repository_root / raw_relative,
+        read_only_progress=read_only_progress,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified schedule inventory authority bindings differ")
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified schedule acquisition contract SHA-256",
+        ),
+    )
+
+
+def _load_source_reference_batch_authority(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    from .v52_schedule_inventory import (
+        _read_inventory_contents,
+        load_verified_schedule_anchor_inventory,
+    )
+
+    context = _load_static_contracts(
+        repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+        repository_root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if not isinstance(context.authority, SourceRunSpec):
+        raise ValueError("source reference authority differs")
+    inventory_relative = (
+        context.acquisition_audit_root.relative_to(repository_root)
+        / "schedule_anchor_inventory.json"
+    )
+    inventory_record = _parse_json_object(
+        _read_inventory_contents(repository_root, inventory_relative),
+        "source schedule anchor inventory",
+        canonical=True,
+    )
+    static_binding = inventory_record.get("static_batch")
+    if not isinstance(static_binding, dict):
+        raise ValueError("source schedule inventory static batch binding differs")
+    static_batch_id = _validate_sha256(
+        static_binding.get("batch_id"), "source schedule inventory static batch ID"
+    )
+    verified = load_verified_schedule_anchor_inventory(
+        repository_root,
+        context.authority,
+        acquisition_contract_path=context.acquisition_contract_path,
+        static_batch_id=static_batch_id,
+        evidence_root=context.raw_root,
+        read_only_progress=read_only_progress,
+    )
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("source schedule inventory authority bindings differ")
+    return _build_schedule_reference_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=verified.sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "source schedule RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "source schedule acquisition contract SHA-256",
+        ),
+    )
+
+
+def _load_r3_reference_batch_authority(
+    repository_root: Path,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    """Replay REFERENCE_INPUTS only through the exact r3 inventory namespace."""
+    repository_root = Path(os.path.abspath(os.fspath(repository_root)))
+    context = _load_static_contracts(
+        repository_root / _R3_RECOVERY_RUN_SPEC_RELATIVE,
+        repository_root / _R3_RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if (
+        context.run_id != _R3_RECOVERY_RUN_ID
+        or context.repository_root != repository_root
+    ):
+        raise ValueError("r3 reference authority differs")
+    static = build_static_batch(
+        context.authority_path, context.acquisition_contract_path
+    )
+    return build_schedule_reference_batch(
+        repository_root,
+        context.authority_path,
+        acquisition_contract_path=context.acquisition_contract_path,
+        static_batch_id=static.batch_id,
+        evidence_root=context.raw_root,
+        read_only_progress=read_only_progress,
+    )
+
+
+def _validate_reference_batch_authority(
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+) -> None:
+    if batch.stage != "REFERENCE_INPUTS":
+        return
+    batch_root = _batch_root_for_batch(repository_root, batch)
+    expected = (
+        build_schedule_reference_batch(
+            repository_root,
+            repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+            acquisition_contract_path=repository_root
+            / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            static_batch_id=build_static_batch(
+                repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+                repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            ).batch_id,
+            evidence_root=_load_static_contracts(
+                repository_root / _RECOVERY_RUN_SPEC_RELATIVE,
+                repository_root / _RECOVERY_ACQUISITION_CONTRACT_RELATIVE,
+            ).raw_root,
+            read_only_progress=read_only_progress,
+        )
+        if batch_root == _RECOVERY_ACQUISITION_BATCH_ROOT
+        else _load_r3_reference_batch_authority(
+            repository_root, read_only_progress=read_only_progress
+        )
+        if batch_root == _R3_RECOVERY_ACQUISITION_BATCH_ROOT
+        else _load_source_reference_batch_authority(
+            repository_root, read_only_progress=read_only_progress
+        )
+        if batch_root == _SOURCE_ACQUISITION_BATCH_ROOT
+        else _load_fixed_reference_batch_authority(
+            repository_root, read_only_progress=read_only_progress
+        )
+    )
+    if batch != expected:
+        raise ValueError(
+            "REFERENCE_INPUTS differs from fixed schedule inventory replay"
+        )
+
+
+def _build_participant_derived_batch_from_inventory(
+    game_evidence_inventory: Mapping[str, object],
+    *,
+    inventory_sha256: str,
+    run_spec_sha256: str,
+    acquisition_contract_sha256: str,
+) -> QueryBatch:
+    _validate_binding_hashes(run_spec_sha256, acquisition_contract_sha256)
+    derived = _validate_sha256(inventory_sha256, "game evidence inventory SHA-256")
+    games = game_evidence_inventory.get("games")
+    if not isinstance(games, Sequence) or isinstance(games, (str, bytes)):
+        raise ValueError("game_evidence_inventory.games must be an array")
+    pitcher_consumers: dict[int, dict[int, date]] = {}
+    seen_game_pks: set[int] = set()
+    for game in games:
+        if not isinstance(game, Mapping):
+            raise ValueError("game evidence must be an object")
+        game_pk = game.get("game_pk")
+        season = game.get("season")
+        if isinstance(game_pk, bool) or not isinstance(game_pk, int) or game_pk <= 0:
+            raise ValueError("game evidence game_pk must be a positive integer")
+        if game_pk in seen_game_pks:
+            raise ValueError("game evidence contains duplicate game_pk")
+        seen_game_pks.add(game_pk)
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or season not in SEASON_BOUNDARIES
+        ):
+            raise ValueError("game evidence season must be within 2018-2024")
+        official_date = _iso_date(
+            game.get("official_date"), "game evidence official_date"
+        )
+        season_start, season_end = SEASON_BOUNDARIES[season]
+        if not season_start <= official_date <= season_end:
+            raise ValueError("game evidence official_date differs from season")
+        played = game.get("played")
+        if type(played) is not bool:
+            raise ValueError("game evidence played must be explicitly boolean")
+        if not played:
+            continue
+        if (
+            game.get("verification_status") != "VERIFIED"
+            or game.get("participant_provenance") != "RECONSTRUCTED_FINAL_PARTICIPANTS"
+        ):
+            continue
+        starters = game.get("actual_starter_ids")
+        if (
+            not isinstance(starters, Sequence)
+            or isinstance(starters, (str, bytes))
+            or len(starters) != 2
+        ):
+            raise ValueError("verified game must contain two actual starter IDs")
+        for pitcher_id in starters:
+            if (
+                isinstance(pitcher_id, bool)
+                or not isinstance(pitcher_id, int)
+                or pitcher_id <= 0
+            ):
+                raise ValueError("actual starter IDs must be positive integers")
+            pitcher_consumers.setdefault(pitcher_id, {})[game_pk] = (
+                official_date - timedelta(days=1)
+            )
+        if starters[0] == starters[1]:
+            raise ValueError("verified game actual starter IDs must be distinct")
+
+    queries = []
+    for pitcher_id in sorted(pitcher_consumers):
+        grouped: dict[str, dict[int, date]] = {
+            "2017-12-31": {},
+            "2021-12-31": {},
+        }
+        for game_pk, cutoff in pitcher_consumers[pitcher_id].items():
+            baseline = "2017-12-31" if cutoff <= date(2021, 12, 31) else "2021-12-31"
+            grouped[baseline][game_pk] = cutoff
+        for inclusive_end, consumers in grouped.items():
+            if not consumers:
+                continue
+            queries.append(
+                _logical_query(
+                    source="mlb_stats_pitcher_bf",
+                    grain="player_career_batters_faced_reference",
+                    endpoint=f"{_MLB_BASE}/people/{pitcher_id}/stats",
+                    parameters={
+                        "stats": "byDateRange",
+                        "group": "pitching",
+                        "gameType": "R",
+                        "sportIds": 1,
+                        "startDate": "1876-01-01",
+                        "endDate": inclusive_end,
+                    },
+                    requested_range={
+                        "consumer_cutoff_dates": {
+                            str(game_pk): consumers[game_pk].isoformat()
+                            for game_pk in sorted(consumers)
+                        },
+                        "consuming_game_pks": sorted(consumers),
+                        "pitcher_id": pitcher_id,
+                        "inclusive_end": inclusive_end,
+                    },
+                    expected_media_type="application/json",
+                    parser_version="v5.2.1",
+                    run_spec_sha256=run_spec_sha256,
+                    acquisition_contract_sha256=acquisition_contract_sha256,
+                )
+            )
+    return _make_batch("PARTICIPANT_DERIVED", derived, queries)
+
+
+def build_participant_derived_batch(
+    repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> QueryBatch:
+    from .v52_game_evidence_inventory import (
+        load_verified_game_evidence_inventory,
+    )
+
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    explicit_authority = (
+        run_spec_path is not None or acquisition_contract_path is not None
+    )
+    if explicit_authority:
+        authority_path, contract_path = _explicit_authority_paths(
+            root,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
+        )
+        context = _load_static_contracts(authority_path, contract_path)
+        verified = load_verified_game_evidence_inventory(
+            root,
+            run_spec_path=authority_path,
+            acquisition_contract_path=contract_path,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+        expected_inventory_path = (
+            context.acquisition_audit_root / "game_evidence_inventory.json"
+        )
+        if verified.path != expected_inventory_path:
+            raise ValueError("game evidence inventory authority path differs")
+        try:
+            inventory_relative = verified.path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("game evidence inventory authority path differs") from exc
+    else:
+        verified = load_verified_game_evidence_inventory(
+            root,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+        inventory_relative = _GAME_EVIDENCE_INVENTORY_RELATIVE
+    inventory_contents = _read_repository_file(
+        root,
+        inventory_relative,
+        "game evidence inventory",
+    )
+    inventory_sha256 = _sha256_bytes(inventory_contents)
+    if inventory_sha256 != verified.sha256:
+        raise ValueError("game evidence inventory changed after verified load")
+    run_binding = verified.payload.get("run_spec")
+    contract_binding = verified.payload.get("acquisition_contract")
+    if not isinstance(run_binding, Mapping) or not isinstance(
+        contract_binding, Mapping
+    ):
+        raise ValueError("verified game inventory authority bindings differ")
+    return _build_participant_derived_batch_from_inventory(
+        verified.payload,
+        inventory_sha256=inventory_sha256,
+        run_spec_sha256=_validate_sha256(
+            run_binding.get("sha256"), "verified game inventory RunSpec SHA-256"
+        ),
+        acquisition_contract_sha256=_validate_sha256(
+            contract_binding.get("sha256"),
+            "verified game inventory acquisition contract SHA-256",
+        ),
+    )
+
+
+def _validate_participant_batch_authority(
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    if batch.stage != "PARTICIPANT_DERIVED":
+        return
+    authority_paths = _authority_paths_for_batch(repository_root, batch)
+    expected = build_participant_derived_batch(
+        repository_root,
+        **(
+            {
+                "run_spec_path": authority_paths[0],
+                "acquisition_contract_path": authority_paths[1],
+            }
+            if authority_paths is not None
+            else {}
+        ),
+        read_only_progress=read_only_progress,
+        legacy_evidence=legacy_evidence,
+    )
+    if batch != expected:
+        raise ValueError("PARTICIPANT_DERIVED differs from fixed game inventory replay")
+
+
+def _is_source_static_batch(batch: QueryBatch) -> bool:
+    return (
+        batch.stage == "STATIC_SCHEDULES"
+        and bool(batch.queries)
+        and all(
+            query.run_spec_sha256 == _SOURCE_RUN_SPEC_SHA256
+            and query.acquisition_contract_sha256
+            == _SOURCE_ACQUISITION_CONTRACT_SHA256
+            for query in batch.queries
+        )
+    )
+
+
+def _validate_source_static_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if not _is_source_static_batch(batch):
+        return
+    expected = build_static_batch(
+        repository_root / _SOURCE_RUN_SPEC_RELATIVE,
+        repository_root / _SOURCE_ACQUISITION_CONTRACT_RELATIVE,
+    )
+    if batch != expected:
+        raise ValueError("source STATIC_SCHEDULES differs from authority replay")
+
+
+def _is_statcast_root_batch(batch: QueryBatch) -> bool:
+    return (
+        batch.stage == "REMAINING"
+        and batch.derived_from_sha256 is None
+        and len(batch.queries) == 46
+        and all(query.parent_query_id is None for query in batch.queries)
+    )
+
+
+def _validate_statcast_root_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    if not _is_statcast_root_batch(batch):
+        return
+    authority_paths = _authority_paths_for_batch(repository_root, batch)
+    expected = (
+        build_statcast_root_batch_for_authority(
+            repository_root,
+            run_spec_path=authority_paths[0],
+            acquisition_contract_path=authority_paths[1],
+        )
+        if authority_paths is not None
+        else build_statcast_root_batch(repository_root)
+    )
+    if batch != expected:
+        raise ValueError("REMAINING root differs from fixed Statcast authority replay")
+
+
+def _is_legacy_partition_batch_candidate(
+    repository_root: Path, batch: QueryBatch
+) -> bool:
+    if batch.stage != "REMAINING" or not batch.queries:
+        return False
+    if any(
+        query.requested_range.get("acquisition")
+        not in {"FETCH_REQUIRED", "PROTECTED_LEGACY_REFERENCE"}
+        for query in batch.queries
+    ):
+        return False
+    authority_paths = _authority_paths_for_batch(repository_root, batch)
+    root_batch = (
+        build_statcast_root_batch_for_authority(
+            repository_root,
+            run_spec_path=authority_paths[0],
+            acquisition_contract_path=authority_paths[1],
+        )
+        if authority_paths is not None
+        else build_statcast_root_batch(repository_root)
+    )
+    root_ids = {logical_query_id(parent) for parent in root_batch.queries}
+    direct_root_ids = {
+        query.parent_query_id
+        for query in batch.queries
+        if query.parent_query_id in root_ids
+    }
+    return len(direct_root_ids) >= 1
+
+
+def _validate_legacy_partition_batch_authority(
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    if not _is_legacy_partition_batch_candidate(repository_root, batch):
+        return
+    authority_paths = _authority_paths_for_batch(repository_root, batch)
+    expected = build_legacy_partition_batch(
+        repository_root,
+        **(
+            {
+                "run_spec_path": authority_paths[0],
+                "acquisition_contract_path": authority_paths[1],
+            }
+            if authority_paths is not None
+            else {}
+        ),
+        read_only_progress=read_only_progress,
+        legacy_evidence=legacy_evidence,
+    )
+    if batch != expected:
+        raise ValueError("REMAINING legacy partition differs from decision replay")
+
+
+def _validate_query_batch_authority(
+    repository_root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    _validate_recovery_pair_static_authority(repository_root, batch)
+    _validate_recovery_marked_batch_authority(repository_root, batch)
+    _validate_recovery_parser_batch(repository_root, batch)
+    _validate_source_static_batch_authority(repository_root, batch)
+    _validate_reference_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+    )
+    _validate_participant_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+        legacy_evidence=legacy_evidence,
+    )
+    _validate_statcast_root_batch_authority(repository_root, batch)
+    _validate_legacy_partition_batch_authority(
+        repository_root,
+        batch,
+        read_only_progress=read_only_progress,
+        legacy_evidence=legacy_evidence,
+    )
+
+
+def _validate_recovery_pair_static_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    """Select recovery validation from an authenticated pair, never markers."""
+    if batch.stage != "STATIC_SCHEDULES" or not batch.queries:
+        return
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if len(pairs) != 1:
+        return
+    pair = pairs.pop()
+    for context in _recovery_contexts_if_present(repository_root):
+        if pair != (
+            context.authority_sha256,
+            context.acquisition_contract_sha256,
+        ):
+            continue
+        if context.run_id == _RECOVERY_RUN_ID:
+            _validate_recovery_static_schedule_queries(batch.queries, context=context)
+            return
+        if context.run_id == _R3_RECOVERY_RUN_ID:
+            _validate_r3_static_schedule_queries(batch.queries, context=context)
+            return
+        if context.run_id == _R4_RECOVERY_RUN_ID:
+            _validate_r4_static_schedule_queries(batch.queries, context=context)
+            return
+        raise AssertionError("authenticated recovery context variant differs")
+
+
+def _validate_recovery_marked_batch_authority(
+    repository_root: Path, batch: QueryBatch
+) -> None:
+    """Recovery parser/table markers have no historical or superseding fallback."""
+    recovery_only_endpoints = (
+        frozenset(_RECOVERY_DISPOSITION_ENDPOINTS.values())
+        | frozenset(
+            endpoint for _, endpoint, _ in R3_STATIC_QUERY_TABLE
+            if endpoint != _SCHEDULE_ENDPOINT
+        )
+    ) - {"disposition://SCHEDULE_DUPLICATE_GAMEPK_565534"}
+    marked = any(
+        query.parser_version == "v5.2.2"
+        or query.parser_version == "v5.2.3"
+        or query.endpoint in recovery_only_endpoints
+        for query in batch.queries
+    )
+    if not marked:
+        return
+    recovery_contexts = _recovery_contexts_if_present(repository_root)
+    if not recovery_contexts:
+        raise ValueError("recovery query authority is unavailable")
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if not any(
+        pairs == {(context.authority_sha256, context.acquisition_contract_sha256)}
+        for context in recovery_contexts
+    ):
+        raise ValueError("recovery query authority bindings differ")
+
+
+def _validate_recovery_parser_batch(repository_root: Path, batch: QueryBatch) -> None:
+    """Keep the v5.2.2 parser inside the recovery static-schedule boundary."""
+    recovery_contexts = _recovery_contexts_if_present(repository_root)
+    if not recovery_contexts or not batch.queries:
+        return
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    recovery_context = next(
+        (
+            context for context in recovery_contexts
+            if pairs == {(context.authority_sha256, context.acquisition_contract_sha256)}
+        ),
+        None,
+    )
+    if recovery_context is None:
+        return
+    sources = recovery_context.contract.get("sources")
+    if not isinstance(sources, tuple):
+        raise AssertionError("validated recovery sources must be frozen")
+    schedule = next(
+        (
+            source
+            for source in sources
+            if isinstance(source, Mapping)
+            and source.get("name") == "mlb_schedule_game_feed"
+        ),
+        None,
+    )
+    if not isinstance(schedule, Mapping):
+        raise AssertionError("validated recovery schedule source is missing")
+    declared_endpoints = schedule.get("endpoints")
+    if not isinstance(declared_endpoints, tuple):
+        raise AssertionError("validated recovery schedule endpoints must be frozen")
+    for query in batch.queries:
+        expected_parser = (
+            "v5.2.2" if recovery_context.run_id == _RECOVERY_RUN_ID else "v5.2.3"
+        )
+        if query.parser_version != expected_parser:
+            continue
+        disposition_endpoints = {
+            endpoint
+            for _, endpoint, _ in (
+                RECOVERY_STATIC_QUERY_TABLE
+                if recovery_context.run_id == _RECOVERY_RUN_ID
+                else R3_STATIC_QUERY_TABLE
+            )
+            if endpoint != _SCHEDULE_ENDPOINT
+        }
+        is_disposition = (
+            query.endpoint in disposition_endpoints
+            and query.endpoint in declared_endpoints
+        )
+        if (
+            batch.stage != "STATIC_SCHEDULES"
+            or query.source != "mlb_schedule_game_feed"
+            or query.grain != "season_schedule_and_game"
+            or (query.endpoint != _SCHEDULE_ENDPOINT and not is_disposition)
+        ):
+            raise ValueError(
+                f"recovery {expected_parser} queries are limited to STATIC_SCHEDULES "
+                "schedule authority"
+            )
+    if any(query.parser_version == "v5.2.2" for query in batch.queries):
+        _validate_recovery_static_schedule_queries(batch.queries, context=recovery_context)
+    if any(query.parser_version == "v5.2.3" for query in batch.queries):
+        if recovery_context.run_id == _R3_RECOVERY_RUN_ID:
+            _validate_r3_static_schedule_queries(batch.queries, context=recovery_context)
+        elif recovery_context.run_id == _R4_RECOVERY_RUN_ID:
+            _validate_r4_static_schedule_queries(batch.queries, context=recovery_context)
+
+
+def _canonical_statcast_parent_range(parent: LogicalQuery) -> tuple[date, date]:
+    if (
+        parent.source != "baseball_savant_statcast"
+        or parent.grain != "pitch"
+        or parent.endpoint != _STATCAST_ENDPOINT
+        or parent.expected_media_type != "text/csv"
+        or parent.parser_version != "v5.2.1"
+    ):
+        raise ValueError("parent must be an official Statcast query")
+    first = _iso_date(parent.requested_range.get("start_date"), "parent start")
+    last = _iso_date(parent.requested_range.get("end_date"), "parent end")
+    if first > last:
+        raise ValueError("parent query range is reversed")
+    year = parent.requested_range.get("year")
+    if (
+        isinstance(year, bool)
+        or not isinstance(year, int)
+        or year not in SEASON_BOUNDARIES
+        or first.year != year
+        or last.year != year
+    ):
+        raise ValueError("Statcast parent year must be within 2018-2024")
+    if first.month != last.month:
+        raise ValueError("Statcast parent must stay within one calendar month")
+    season_start, season_end = SEASON_BOUNDARIES[year]
+    if not season_start <= first <= last <= season_end:
+        raise ValueError("Statcast parent range is outside regular-season bounds")
+    allowed_requested = {
+        "year",
+        "start_date",
+        "end_date",
+        "acquisition",
+        "protected_inventory_sha256",
+    }
+    if not set(parent.requested_range) <= allowed_requested:
+        raise ValueError("Statcast parent requested range contains extra fields")
+    acquisition = parent.requested_range.get("acquisition")
+    if acquisition is not None and acquisition not in {
+        "FETCH_REQUIRED",
+        "PROTECTED_LEGACY_REFERENCE",
+    }:
+        raise ValueError("Statcast parent acquisition disposition differs")
+    protected_inventory_sha256 = parent.requested_range.get(
+        "protected_inventory_sha256"
+    )
+    if acquisition == "PROTECTED_LEGACY_REFERENCE":
+        _validate_sha256(
+            protected_inventory_sha256,
+            "Statcast protected_inventory_sha256",
+        )
+    elif protected_inventory_sha256 is not None:
+        raise ValueError(
+            "only protected legacy Statcast queries may bind inventory lineage"
+        )
+    expected_parameters = _statcast_parameters(first.isoformat(), last.isoformat())
+    if dict(parent.parameters) != expected_parameters:
+        raise ValueError("Statcast parent parameters differ from canonical filters")
+    return first, last
+
+
+def validate_statcast_query(query: LogicalQuery) -> tuple[date, date]:
+    """Validate one Task3 Statcast query, including acquisition metadata."""
+    return _canonical_statcast_parent_range(query)
+
+
+def _statcast_child(
+    parent: LogicalQuery,
+    first: date,
+    last: date,
+    *,
+    acquisition: str | None = None,
+) -> LogicalQuery:
+    requested = {
+        key: value
+        for key, value in parent.requested_range.items()
+        if key not in {"start_date", "end_date", "acquisition"}
+    }
+    requested.update({"start_date": first.isoformat(), "end_date": last.isoformat()})
+    if acquisition is not None:
+        requested["acquisition"] = acquisition
+    elif parent.requested_range.get("acquisition") is not None:
+        requested["acquisition"] = parent.requested_range["acquisition"]
+    parameters = dict(parent.parameters)
+    parameters["game_date_gt"] = first.isoformat()
+    parameters["game_date_lt"] = last.isoformat()
+    return replace(
+        parent,
+        parameters=parameters,
+        requested_range=requested,
+        parent_query_id=logical_query_id(parent),
+    )
+
+
+def bisect_statcast_query(
+    parent: LogicalQuery,
+) -> tuple[LogicalQuery, LogicalQuery]:
+    first, last = _canonical_statcast_parent_range(parent)
+    if first == last:
+        raise ValueError("single-day Statcast query cannot be bisected")
+    midpoint = first + timedelta(days=(last - first).days // 2)
+    left = _statcast_child(parent, first, midpoint)
+    right = _statcast_child(parent, midpoint + timedelta(days=1), last)
+    return left, right
+
+
+def _validate_statcast_split_parent_batch(
+    repository_root: Path,
+    parent_batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    if _is_statcast_root_batch(parent_batch) or _is_legacy_partition_batch_candidate(
+        repository_root, parent_batch
+    ):
+        return
+    ancestor_batch_id = _validate_sha256(
+        parent_batch.derived_from_sha256,
+        "Statcast split parent batch derived_from_sha256",
+    )
+    parent_query_ids = {query.parent_query_id for query in parent_batch.queries}
+    if len(parent_query_ids) != 1 or None in parent_query_ids:
+        raise ValueError("Statcast split parent batch has noncanonical parent lineage")
+    if authority_context is None:
+        ancestor = load_query_batch(
+            repository_root,
+            ancestor_batch_id,
+            read_only_progress=read_only_progress,
+        )
+    else:
+        ancestor = _load_query_batch_for_authority(
+            repository_root,
+            ancestor_batch_id,
+            authority_context.authority,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+    parent_query_id = next(iter(parent_query_ids))
+    matches = [
+        query
+        for query in ancestor.queries
+        if logical_query_id(query) == parent_query_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("Statcast split parent batch has noncanonical parent lineage")
+    if parent_batch != build_statcast_split_batch(
+        repository_root,
+        ancestor,
+        matches[0],
+        read_only_progress=read_only_progress,
+        _authority_context=authority_context,
+        legacy_evidence=legacy_evidence,
+    ):
+        raise ValueError("Statcast split parent batch differs from canonical bisection")
+
+
+def build_statcast_split_batch(
+    repository_root: Path,
+    parent_batch: QueryBatch,
+    parent_query: LogicalQuery,
+    *,
+    read_only_progress: bool = False,
+    _authority_context: SourceAuthorityContext | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> QueryBatch:
+    """Build the canonical sealed child batch for one Statcast parent query."""
+    if not isinstance(parent_batch, QueryBatch):
+        raise TypeError("parent_batch must be a QueryBatch")
+    if not isinstance(parent_query, LogicalQuery):
+        raise TypeError("parent_query must be a LogicalQuery")
+    if parent_batch.stage != "REMAINING":
+        raise ValueError("Statcast split parent batch must use REMAINING stage")
+
+    payload = _batch_payload(
+        parent_batch.stage,
+        parent_batch.derived_from_sha256,
+        parent_batch.queries,
+    )
+    if parent_batch.batch_id != _sha256_bytes(_canonical_json_bytes(payload)):
+        raise ValueError("parent batch_id differs from its canonical sealed payload")
+    root = Path(repository_root)
+    authority_context = _authority_context
+    if authority_context is None:
+        authority_paths = _authority_paths_for_batch(root, parent_batch)
+        if authority_paths is not None:
+            authority_context = _load_static_contracts(*authority_paths)
+    elif authority_context.repository_root != Path(
+        os.path.abspath(os.fspath(root))
+    ):
+        raise ValueError("Statcast split authority context root differs")
+    _validate_query_batch_authority(
+        root,
+        parent_batch,
+        read_only_progress=read_only_progress,
+        legacy_evidence=legacy_evidence,
+    )
+    _validate_statcast_split_parent_batch(
+        root,
+        parent_batch,
+        read_only_progress=read_only_progress,
+        authority_context=authority_context,
+        legacy_evidence=legacy_evidence,
+    )
+
+    requested_parent_id = logical_query_id(parent_query)
+    matches = [
+        query
+        for query in parent_batch.queries
+        if logical_query_id(query) == requested_parent_id
+    ]
+    if len(matches) != 1 or matches[0] != parent_query:
+        raise ValueError("Statcast split parent query must occur exactly once in its batch")
+
+    return _make_batch(
+        "REMAINING",
+        parent_batch.batch_id,
+        bisect_statcast_query(parent_query),
+    )
+
+
+def _legacy_ranges(
+    protected_catalog: Sequence[Mapping[str, object]],
+) -> list[tuple[date, date]]:
+    result = []
+    for record in protected_catalog:
+        if not isinstance(record, Mapping):
+            raise ValueError("protected catalog records must be mappings")
+        if record.get("source") != "baseball_savant_statcast":
+            continue
+        if record.get("rawstore_verified") is not True:
+            continue
+        query = record.get("canonical_query")
+        if not isinstance(query, Mapping) or set(query) != {
+            "start",
+            "end",
+            "game_type",
+            "url",
+        }:
+            raise ValueError("legacy Statcast canonical query fields differ")
+        if query.get("game_type") != "R":
+            raise ValueError("legacy Statcast game type differs")
+        first = _iso_date(query.get("start"), "legacy start")
+        last = _iso_date(query.get("end"), "legacy end")
+        if first > last:
+            raise ValueError("legacy Statcast range is reversed")
+        if first.year not in {2022, 2023, 2024} or last.year != first.year:
+            raise ValueError("legacy Statcast range must be within 2022-2024")
+        if first.month != last.month:
+            raise ValueError("legacy Statcast child must stay within one month")
+        expected_url = (
+            f"{_STATCAST_ENDPOINT}?"
+            f"{urlencode(_statcast_parameters(first.isoformat(), last.isoformat()))}"
+        )
+        if query.get("url") != expected_url:
+            raise ValueError("legacy Statcast canonical URL differs")
+        result.append((first, last))
+    return result
+
+
+def _build_legacy_partition_batch_from_catalog(
+    parents: Sequence[LogicalQuery],
+    protected_catalog: Sequence[Mapping[str, object]],
+    *,
+    protected_inventory_sha256: str,
+) -> QueryBatch:
+    _validate_sha256(protected_inventory_sha256, "protected_inventory_sha256")
+    if not isinstance(parents, Sequence) or not isinstance(protected_catalog, Sequence):
+        raise ValueError("parents and protected_catalog must be sequences")
+    parent_ranges = []
+    for parent in parents:
+        if not isinstance(parent, LogicalQuery):
+            raise ValueError("parents must contain LogicalQuery values")
+        first, last = _canonical_statcast_parent_range(parent)
+        parent_ranges.append((first, last, parent))
+    for previous, current in zip(parent_ranges, parent_ranges[1:]):
+        if current[0] <= previous[0]:
+            raise ValueError("Statcast parent ranges must be strictly ordered")
+        if current[0] <= previous[1]:
+            raise ValueError("Statcast parent ranges overlap")
+
+    legacy = _legacy_ranges(protected_catalog)
+    candidates_by_parent: list[list[tuple[date, date]]] = [[] for _ in parent_ranges]
+    prior_parent_index = -1
+    for child_first, child_last in legacy:
+        matches = [
+            index
+            for index, (first, last, _parent) in enumerate(parent_ranges)
+            if first <= child_first <= child_last <= last
+        ]
+        if len(matches) != 1:
+            raise ValueError("verified legacy Statcast child maps to no unique parent")
+        parent_index = matches[0]
+        if parent_index < prior_parent_index:
+            raise ValueError("legacy Statcast children must be ordered by parent")
+        prior_parent_index = parent_index
+        candidates_by_parent[parent_index].append((child_first, child_last))
+
+    queries: list[LogicalQuery] = []
+    for (first, last, parent), candidates in zip(parent_ranges, candidates_by_parent):
+        exact = [
+            (start, end) for start, end in candidates if start == first and end == last
+        ]
+        strict = [
+            (start, end) for start, end in candidates if (start, end) != (first, last)
+        ]
+        if exact and strict:
+            raise ValueError("mixed parent/child legacy ambiguity")
+        for previous, current in zip(candidates, candidates[1:]):
+            if current == previous:
+                raise ValueError("duplicate legacy Statcast child mapping")
+            if current[0] < previous[0]:
+                raise ValueError("legacy Statcast children must be strictly ordered")
+            if current[0] <= previous[1]:
+                raise ValueError("legacy Statcast child ranges overlap")
+
+        cursor = first
+        for child_first, child_last in candidates:
+            if cursor < child_first:
+                queries.append(
+                    _statcast_child(
+                        parent,
+                        cursor,
+                        child_first - timedelta(days=1),
+                        acquisition="FETCH_REQUIRED",
+                    )
+                )
+            promoted = _statcast_child(
+                parent,
+                child_first,
+                child_last,
+                acquisition="PROTECTED_LEGACY_REFERENCE",
+            )
+            promoted_range = dict(promoted.requested_range)
+            promoted_range["protected_inventory_sha256"] = protected_inventory_sha256
+            queries.append(replace(promoted, requested_range=promoted_range))
+            cursor = child_last + timedelta(days=1)
+        if cursor <= last:
+            queries.append(
+                _statcast_child(
+                    parent,
+                    cursor,
+                    last,
+                    acquisition="FETCH_REQUIRED",
+                )
+            )
+    return _make_batch("REMAINING", protected_inventory_sha256, queries)
+
+
+def build_legacy_partition_batch_from_catalog(
+    root_batch: QueryBatch,
+    protected_catalog: Sequence[Mapping[str, object]],
+    *,
+    protected_inventory_sha256: str,
+) -> QueryBatch:
+    """Build the pure first-level legacy partition without publishing files."""
+    if not isinstance(root_batch, QueryBatch) or not _is_statcast_root_batch(
+        root_batch
+    ):
+        raise ValueError("root_batch must be the canonical Statcast root batch")
+    return _build_legacy_partition_batch_from_catalog(
+        root_batch.queries,
+        protected_catalog,
+        protected_inventory_sha256=protected_inventory_sha256,
+    )
+
+
+def build_legacy_partition_batch(
+    repository_root: Path,
+    *,
+    run_spec_path: Path | None = None,
+    acquisition_contract_path: Path | None = None,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> QueryBatch:
+    """Replay the sealed legacy decisions into the fixed first-level partition."""
+    from .v52_legacy_decision_inventory import (
+        _load_legacy_partition_decision_replay,
+    )
+
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    explicit_authority = (
+        run_spec_path is not None or acquisition_contract_path is not None
+    )
+    if explicit_authority:
+        authority_path, contract_path = _explicit_authority_paths(
+            root,
+            run_spec_path=run_spec_path,
+            acquisition_contract_path=acquisition_contract_path,
+        )
+        context = _load_static_contracts(authority_path, contract_path)
+        decision_sha256, protected_sha256, decisions = (
+            _load_legacy_partition_decision_replay(
+                root,
+                run_spec_path=authority_path,
+                acquisition_contract_path=contract_path,
+                legacy_evidence=legacy_evidence,
+            )
+        )
+        expected_root = build_statcast_root_batch_for_authority(
+            root,
+            run_spec_path=authority_path,
+            acquisition_contract_path=contract_path,
+        )
+        authority: RunSpec | SourceRunSpec | None = context.authority
+    else:
+        decision_sha256, protected_sha256, decisions = (
+            _load_legacy_partition_decision_replay(
+                root, legacy_evidence=legacy_evidence
+            )
+        )
+        expected_root = build_statcast_root_batch(root)
+        authority = None
+    root_batch = _load_query_batch(
+        root,
+        expected_root.batch_id,
+        invoke_authority_hook=False,
+        read_only_progress=read_only_progress,
+        authority=authority,
+    )
+    if root_batch != expected_root or len(root_batch.queries) != 46:
+        raise ValueError("legacy partition Statcast root authority differs")
+    if len(decisions) != 48:
+        raise ValueError("legacy partition requires exactly 48 sealed decisions")
+
+    parents = {
+        logical_query_id(parent): (parent, *_canonical_statcast_parent_range(parent))
+        for parent in root_batch.queries
+    }
+    if len(parents) != 46:
+        raise ValueError("legacy partition root query IDs are not unique")
+    by_parent: dict[str, list[tuple[date, date]]] = {
+        parent_id: [] for parent_id in parents
+    }
+    queries: list[LogicalQuery] = []
+    disposition_counts = {"PROMOTED": 0, "FETCH_REQUIRED": 0}
+    for decision in decisions:
+        parent_id = decision.get("parent_query_id")
+        candidate_id = decision.get("candidate_query_id")
+        decision_range = decision.get("range")
+        disposition = decision.get("disposition")
+        if (
+            not isinstance(parent_id, str)
+            or parent_id not in parents
+            or not isinstance(candidate_id, str)
+            or not isinstance(decision_range, Mapping)
+            or disposition not in disposition_counts
+        ):
+            raise ValueError("legacy partition decision binding differs")
+        year = decision_range.get("year")
+        first = _iso_date(decision_range.get("start_date"), "decision start")
+        last = _iso_date(decision_range.get("end_date"), "decision end")
+        parent, parent_first, parent_last = parents[parent_id]
+        if (
+            isinstance(year, bool)
+            or not isinstance(year, int)
+            or year != first.year
+            or first > last
+            or not parent_first <= first <= last <= parent_last
+        ):
+            raise ValueError("legacy partition decision range differs")
+        acquisition = (
+            "PROTECTED_LEGACY_REFERENCE"
+            if disposition == "PROMOTED"
+            else "FETCH_REQUIRED"
+        )
+        query = _statcast_child(parent, first, last, acquisition=acquisition)
+        if disposition == "PROMOTED":
+            requested = dict(query.requested_range)
+            requested["protected_inventory_sha256"] = protected_sha256
+            query = replace(query, requested_range=requested)
+        if logical_query_id(query) != candidate_id:
+            raise ValueError("legacy partition candidate query ID differs")
+        queries.append(query)
+        by_parent[parent_id].append((first, last))
+        disposition_counts[disposition] += 1
+
+    if disposition_counts != {"PROMOTED": 1, "FETCH_REQUIRED": 47}:
+        raise ValueError("legacy partition dispositions differ")
+    for parent_id, (parent, parent_first, parent_last) in parents.items():
+        ranges = by_parent[parent_id]
+        if not ranges or ranges[0][0] != parent_first or ranges[-1][1] != parent_last:
+            raise ValueError("legacy partition does not cover every root parent")
+        if any(
+            current[0] != previous[1] + timedelta(days=1)
+            for previous, current in zip(ranges, ranges[1:])
+        ):
+            raise ValueError("legacy partition root coverage is not contiguous")
+        if logical_query_id(parent) != parent_id:
+            raise ValueError("legacy partition root parent identity differs")
+
+    batch = _make_batch("REMAINING", decision_sha256, queries)
+    if tuple(logical_query_id(query) for query in batch.queries) != tuple(
+        decision["candidate_query_id"] for decision in decisions
+    ):
+        raise ValueError("legacy partition decision replay order differs")
+    return batch
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_root(root: Path) -> int:
+    absolute = Path(os.path.abspath(os.fspath(root)))
+    parts = absolute.parts
+    if not parts or parts[0] != os.sep:
+        raise ValueError("query batch root must resolve to an absolute path")
+    current = os.open(os.sep, _directory_flags())
+    try:
+        for component in parts[1:]:
+            child = -1
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        "query batch root ancestors must be no-follow directories"
+                    ) from exc
+                raise
+            try:
+                opened = os.fstat(child)
+                linked = os.stat(component, dir_fd=current, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ValueError("query batch root directory identity differs")
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _open_or_create_directory(parent_fd: int, name: str) -> int:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(
+                "query batch ancestors must be no-follow directories"
+            ) from exc
+        raise
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError("query batch ancestor must be a directory")
+    return descriptor
+
+
+def _read_existing(parent_fd: int, name: str) -> bytes | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("query batch must be a no-follow regular file") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("query batch must be an unaliased regular file")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_owned_temp(parent_fd: int, name: str, descriptor: int) -> None:
+    try:
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise ValueError("query batch temp ownership changed")
+    os.unlink(name, dir_fd=parent_fd)
+
+
+def _batch_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_linked_regular(
+    parent_fd: int, name: str, label: str
+) -> tuple[bytes, os.stat_result] | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{label} must be a no-follow regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or _batch_file_identity(before) != _batch_file_identity(linked)
+        ):
+            raise ValueError(f"{label} identity differs")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _batch_file_identity(before) != _batch_file_identity(
+            after
+        ) or _batch_file_identity(after) != _batch_file_identity(rebound):
+            raise ValueError(f"{label} identity changed while reading")
+        return b"".join(chunks), after
+    finally:
+        os.close(descriptor)
+
+
+def _open_existing_directory(parent_fd: int, name: str) -> int:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(
+            "query batch ancestors must be existing no-follow directories"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("query batch ancestor identity differs")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_opened_batch_chain(
+    root: Path, descriptors: Sequence[int], batch_root: Path
+) -> None:
+    expected_components = batch_root.parts
+    if len(descriptors) != len(expected_components) + 1:
+        raise ValueError("query batch ancestor chain differs")
+    fresh_root = _open_root(root)
+    try:
+        opened_root = os.fstat(descriptors[0])
+        rebound_root = os.fstat(fresh_root)
+        if (opened_root.st_dev, opened_root.st_ino) != (
+            rebound_root.st_dev,
+            rebound_root.st_ino,
+        ):
+            raise ValueError("query batch root identity changed")
+    finally:
+        os.close(fresh_root)
+    for index, component in enumerate(expected_components):
+        try:
+            opened = os.fstat(descriptors[index + 1])
+            linked = os.stat(
+                component,
+                dir_fd=descriptors[index],
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("query batch ancestor identity changed") from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("query batch ancestor identity changed")
+
+
+def _load_query_batch(
+    root: Path,
+    batch_id: str,
+    *,
+    invoke_authority_hook: bool,
+    read_only_progress: bool = False,
+    authority: RunSpec | SourceRunSpec | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> QueryBatch:
+    if type(invoke_authority_hook) is not bool:
+        raise TypeError("invoke_authority_hook must be a bool")
+    root = Path(root)
+    requested_id = _validate_sha256(batch_id, "batch_id")
+    batch_root = _batch_root_for_authority(
+        root, authority, batch_id=requested_id
+    )
+    _reject_batch_shadow(root, batch_root, requested_id)
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in batch_root.parts:
+            current = _open_existing_directory(current, component)
+            descriptors.append(current)
+        loaded = _read_linked_regular(current, f"{requested_id}.json", "query batch")
+        if loaded is None:
+            raise ValueError("query batch is missing")
+        contents, metadata = loaded
+        if metadata.st_nlink != 1:
+            raise ValueError("query batch must be an unaliased regular file")
+        record = _parse_json_object(contents, "query batch", canonical=True)
+        if set(record) != {
+            "batch_id",
+            "derived_from_sha256",
+            "queries",
+            "schema_version",
+            "stage",
+        }:
+            raise ValueError("query batch keys differ")
+        if record.get("schema_version") != 1:
+            raise ValueError("query batch schema version differs")
+        embedded_id = _validate_sha256(record.get("batch_id"), "embedded batch_id")
+        if embedded_id != requested_id:
+            raise ValueError("query batch requested and embedded IDs differ")
+        raw_queries = record.get("queries")
+        if not isinstance(raw_queries, list):
+            raise ValueError("query batch queries must be an array")
+        queries = []
+        for raw in raw_queries:
+            if not isinstance(raw, dict):
+                raise ValueError("query batch query must be an object")
+            try:
+                query = LogicalQuery(**raw)
+            except TypeError as exc:
+                raise ValueError("query batch query keys differ") from exc
+            if _query_record(query) != raw:
+                raise ValueError("query batch query record differs")
+            queries.append(query)
+        batch = _make_batch(
+            record.get("stage"),  # type: ignore[arg-type]
+            record.get("derived_from_sha256"),  # type: ignore[arg-type]
+            queries,
+        )
+        expected = {
+            "batch_id": batch.batch_id,
+            "derived_from_sha256": batch.derived_from_sha256,
+            "queries": [_query_record(query) for query in batch.queries],
+            "schema_version": 1,
+            "stage": batch.stage,
+        }
+        if batch.batch_id != requested_id or record != expected:
+            raise ValueError("query batch canonical ID binding differs")
+        if _batch_root_for_batch(root, batch) != batch_root:
+            raise ValueError("query batch is stored under the wrong authority root")
+        validation_depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+        validation_token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(
+            validation_depth + 1
+        )
+        try:
+            _validate_query_batch_authority(
+                root,
+                batch,
+                read_only_progress=read_only_progress,
+                legacy_evidence=legacy_evidence,
+            )
+        finally:
+            _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(validation_token)
+        rebound = _read_linked_regular(current, f"{requested_id}.json", "query batch")
+        if rebound is None:
+            raise ValueError("query batch is missing after reconstruction")
+        rebound_contents, rebound_metadata = rebound
+        if rebound_contents != contents or _batch_file_identity(
+            rebound_metadata
+        ) != _batch_file_identity(metadata):
+            raise ValueError("query batch identity or bytes changed during load")
+        _verify_opened_batch_chain(root, descriptors, batch_root)
+        if invoke_authority_hook and (
+            batch.stage in {"PARTICIPANT_DERIVED", "REFERENCE_INPUTS"}
+            or _is_source_static_batch(batch)
+            or _is_statcast_root_batch(batch)
+            or _is_legacy_partition_batch_candidate(root, batch)
+        ):
+            _rebind_query_batch_authority(
+                root,
+                batch,
+                read_only_progress=read_only_progress,
+                legacy_evidence=legacy_evidence,
+            )
+        _rebind_batch_namespace(root, batch_root, batch)
+        return batch
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def load_query_batch(
+    repository_root: Path,
+    batch_id: str,
+    *,
+    read_only_progress: bool = False,
+) -> QueryBatch:
+    return _load_query_batch(
+        repository_root,
+        batch_id,
+        invoke_authority_hook=True,
+        read_only_progress=read_only_progress,
+    )
+
+
+def _load_query_batch_for_authority(
+    repository_root: Path,
+    batch_id: str,
+    authority: RunSpec | SourceRunSpec,
+    *,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> QueryBatch:
+    return _load_query_batch(
+        repository_root,
+        batch_id,
+        invoke_authority_hook=True,
+        read_only_progress=read_only_progress,
+        authority=authority,
+        legacy_evidence=legacy_evidence,
+    )
+
+
+load_query_batch_for_authority = _load_query_batch_for_authority
+
+
+def _reconcile_batch_final(
+    parent_fd: int,
+    batch_id: str,
+    expected_contents: bytes,
+) -> bytes | None:
+    final_name = f"{batch_id}.json"
+    final = _read_linked_regular(parent_fd, final_name, "query batch final")
+    if final is None:
+        return None
+    final_contents, final_metadata = final
+    if final_contents != expected_contents:
+        raise RuntimeError("immutable query batch differs")
+    if final_metadata.st_nlink == 1:
+        return final_contents
+
+    stale_name = re.compile(rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$")
+    removed = False
+    for candidate_name in os.listdir(parent_fd):
+        if stale_name.fullmatch(candidate_name) is None:
+            continue
+        candidate = _read_linked_regular(
+            parent_fd, candidate_name, "query batch stale temp"
+        )
+        if candidate is None:
+            continue
+        candidate_contents, candidate_metadata = candidate
+        if (candidate_metadata.st_dev, candidate_metadata.st_ino) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+        ):
+            continue
+        if candidate_contents != expected_contents:
+            raise ValueError("query batch stale temp bytes differ")
+        rebound = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            rebound.st_dev,
+            rebound.st_ino,
+        ) != (
+            candidate_metadata.st_dev,
+            candidate_metadata.st_ino,
+        ):
+            raise ValueError("query batch stale temp identity changed")
+        os.unlink(candidate_name, dir_fd=parent_fd)
+        removed = True
+    if removed:
+        os.fsync(parent_fd)
+    reconciled = _read_existing(parent_fd, final_name)
+    if reconciled != expected_contents:
+        raise ValueError("query batch final did not reconcile to one link")
+    return reconciled
+
+
+def _cleanup_prelink_batch_temps(parent_fd: int, batch_id: str) -> None:
+    private_name = re.compile(rf"^\.{re.escape(batch_id)}\.[0-9a-f]{{32}}\.tmp$")
+    removed = False
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    for candidate_name in os.listdir(parent_fd):
+        if private_name.fullmatch(candidate_name) is None:
+            continue
+        try:
+            descriptor = os.open(candidate_name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                "query batch private temp must be a no-follow regular file"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            linked = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(linked.st_mode)
+                or opened.st_nlink != 1
+                or linked.st_nlink != 1
+                or _batch_file_identity(opened) != _batch_file_identity(linked)
+            ):
+                raise ValueError(
+                    "query batch private temp must be an unaliased regular file"
+                )
+            rebound = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
+            if _batch_file_identity(opened) != _batch_file_identity(rebound):
+                raise ValueError("query batch private temp identity changed")
+            os.unlink(candidate_name, dir_fd=parent_fd)
+            removed = True
+        finally:
+            os.close(descriptor)
+    if removed:
+        os.fsync(parent_fd)
+
+
+def _before_query_batch_authority_rebind() -> None:
+    """Deterministic authority-mutation test hook; production does nothing."""
+
+
+_QUERY_BATCH_AUTHORITY_REBIND_DEPTH: ContextVar[int] = ContextVar(
+    "query_batch_authority_rebind_depth", default=0
+)
+
+
+def _rebind_query_batch_authority(
+    root: Path,
+    batch: QueryBatch,
+    *,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    if (
+        batch.stage
+        not in {
+            "REFERENCE_INPUTS",
+            "PARTICIPANT_DERIVED",
+        }
+        and not _is_source_static_batch(batch)
+        and not _is_statcast_root_batch(batch)
+        and not _is_legacy_partition_batch_candidate(root, batch)
+    ):
+        return
+    depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+    token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(depth + 1)
+    try:
+        if depth == 0:
+            _before_query_batch_authority_rebind()
+        _validate_query_batch_authority(
+            root,
+            batch,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+    finally:
+        _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(token)
+
+
+def _cleanup_owned_query_batch_final(
+    parent_fd: int,
+    name: str,
+    contents: bytes,
+    identity: tuple[int, ...],
+) -> None:
+    loaded = _read_linked_regular(parent_fd, name, "owned query batch final")
+    if loaded is None:
+        return
+    final_contents, metadata = loaded
+    if final_contents != contents or _batch_file_identity(metadata) != identity:
+        raise ValueError("query batch final ownership changed before cleanup")
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _batch_file_identity(rebound) != identity:
+        raise ValueError("query batch final ownership changed before cleanup")
+    os.unlink(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def publish_query_batch(root: Path, batch: QueryBatch) -> Path:
+    return _publish_query_batch_for_authority(root, batch)
+
+
+def _publish_query_batch_for_authority(
+    root: Path,
+    batch: QueryBatch,
+    *,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> Path:
+    if not isinstance(batch, QueryBatch):
+        raise TypeError("batch must be a QueryBatch")
+    root = Path(root)
+    validation_depth = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.get()
+    validation_token = _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.set(
+        validation_depth + 1
+    )
+    try:
+        _validate_query_batch_authority(
+            root, batch, legacy_evidence=legacy_evidence
+        )
+    finally:
+        _QUERY_BATCH_AUTHORITY_REBIND_DEPTH.reset(validation_token)
+    batch_root = _batch_root_for_batch(root, batch)
+    _reject_batch_shadow(root, batch_root, batch.batch_id)
+    payload = _batch_payload(batch.stage, batch.derived_from_sha256, batch.queries)
+    expected_id = _sha256_bytes(_canonical_json_bytes(payload))
+    if batch.batch_id != expected_id:
+        raise ValueError("batch_id differs from canonical batch payload")
+    record = {"schema_version": 1, "batch_id": batch.batch_id, **payload}
+    contents = _canonical_json_bytes(record) + b"\n"
+    root_fd = _open_root(root)
+    descriptors = [root_fd]
+    try:
+        current = root_fd
+        for component in batch_root.parts:
+            current = _open_or_create_directory(current, component)
+            descriptors.append(current)
+        fcntl.flock(current, fcntl.LOCK_EX)
+        try:
+            name = f"{batch.batch_id}.json"
+            existing = _reconcile_batch_final(current, batch.batch_id, contents)
+            _cleanup_prelink_batch_temps(current, batch.batch_id)
+            if existing is not None:
+                _rebind_query_batch_authority(
+                    root, batch, legacy_evidence=legacy_evidence
+                )
+                _rebind_batch_namespace(root, batch_root, batch)
+                return root / batch_root / name
+            temp_name = f".{batch.batch_id}.{secrets.token_hex(16)}.tmp"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(temp_name, flags, 0o600, dir_fd=current)
+            temp_exists = True
+            try:
+                view = memoryview(contents)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("query batch publication made no progress")
+                    view = view[written:]
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("query batch temp publication was aliased")
+                os.fsync(descriptor)
+                if _read_existing(current, temp_name) != contents:
+                    raise ValueError("query batch temp bytes differ")
+                try:
+                    os.link(
+                        temp_name,
+                        name,
+                        src_dir_fd=current,
+                        dst_dir_fd=current,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    _unlink_owned_temp(current, temp_name, descriptor)
+                    temp_exists = False
+                    os.fsync(current)
+                    concurrent = _reconcile_batch_final(
+                        current, batch.batch_id, contents
+                    )
+                    if concurrent is None:
+                        raise ValueError("concurrent query batch final disappeared")
+                    _rebind_query_batch_authority(
+                        root, batch, legacy_evidence=legacy_evidence
+                    )
+                    _rebind_batch_namespace(root, batch_root, batch)
+                    return root / batch_root / name
+                _unlink_owned_temp(current, temp_name, descriptor)
+                temp_exists = False
+                created_identity = _batch_file_identity(os.fstat(descriptor))
+                os.fsync(current)
+                try:
+                    if (
+                        _reconcile_batch_final(current, batch.batch_id, contents)
+                        != contents
+                    ):
+                        raise ValueError("query batch bytes changed after publication")
+                    _rebind_query_batch_authority(
+                        root, batch, legacy_evidence=legacy_evidence
+                    )
+                    _rebind_batch_namespace(root, batch_root, batch)
+                    return root / batch_root / name
+                except BaseException:
+                    _cleanup_owned_query_batch_final(
+                        current,
+                        name,
+                        contents,
+                        created_identity,
+                    )
+                    raise
+            finally:
+                try:
+                    if temp_exists:
+                        _unlink_owned_temp(current, temp_name, descriptor)
+                        os.fsync(current)
+                finally:
+                    os.close(descriptor)
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _split_range(query: LogicalQuery) -> dict[str, object]:
+    first, last = validate_statcast_query(query)
+    return {
+        "end_date": last.isoformat(),
+        "start_date": first.isoformat(),
+        "year": first.year,
+    }
+
+
+def _validate_split_timestamp(value: object) -> str:
+    if not isinstance(value, str) or _SPLIT_TIMESTAMP.fullmatch(value) is None:
+        raise ValueError("split receipt timestamp differs")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("split receipt timestamp differs") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError("split receipt timestamp differs")
+    return value
+
+
+def _verify_split_evidence_root(
+    repository_root: Path,
+    evidence_root: Path,
+    parent: LogicalQuery | None = None,
+) -> None:
+    contents = _read_repository_file(
+        repository_root,
+        _RUN_SPEC_RELATIVE,
+        "split RunSpec",
+    )
+    contract_contents = _read_repository_file(
+        repository_root,
+        _ACQUISITION_CONTRACT_RELATIVE,
+        "split acquisition contract",
+    )
+    run_spec, run_spec_sha256, _, contract_sha256 = (
+        _validate_run_bound_acquisition_contract(
+            repository_root,
+            contents,
+            contract_contents,
+        )
+    )
+    if parent is not None:
+        if run_spec_sha256 != parent.run_spec_sha256:
+            raise ValueError("split parent RunSpec hash binding differs")
+        if contract_sha256 != parent.acquisition_contract_sha256:
+            raise ValueError("split parent acquisition contract hash binding differs")
+    namespaces = run_spec.get("namespaces")
+    raw = namespaces.get("raw") if isinstance(namespaces, Mapping) else None
+    if not isinstance(raw, str):
+        raise ValueError("split RunSpec raw namespace binding differs")
+    raw_path = Path(raw)
+    if (
+        raw_path.is_absolute()
+        or not raw_path.parts
+        or any(component in {"", ".", ".."} for component in raw_path.parts)
+    ):
+        raise ValueError("split RunSpec raw namespace binding differs")
+    expected = Path(os.path.abspath(os.fspath(Path(repository_root) / raw_path)))
+    supplied = Path(os.path.abspath(os.fspath(evidence_root)))
+    if supplied != expected:
+        raise ValueError("split evidence root differs from the RunSpec raw namespace")
+
+
+def _load_split_authority_context(
+    repository_root: Path,
+    *,
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+) -> SourceAuthorityContext:
+    """Authenticate the explicit source/recovery pair before opening its receipts."""
+    root = Path(os.path.abspath(os.fspath(repository_root)))
+    authority_path, contract_path = _explicit_authority_paths(
+        root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    context = _load_static_contracts(authority_path, contract_path)
+    if (
+        context.repository_root != root
+        or context.authority_path != authority_path
+        or context.acquisition_contract_path != contract_path
+        or not isinstance(context.authority, SourceRunSpec)
+        or context.run_id not in {_SOURCE_RUN_ID, _RECOVERY_RUN_ID}
+    ):
+        raise ValueError("split authority context differs")
+    return context
+
+
+def _split_receipt_root_for_context(context: SourceAuthorityContext) -> Path:
+    root = Path(os.path.abspath(os.fspath(context.repository_root)))
+    audit_root = Path(os.path.abspath(os.fspath(context.acquisition_audit_root)))
+    try:
+        relative = audit_root.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("split authority audit root differs") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("split authority audit root differs")
+    return relative / "split_receipts"
+
+
+def _verify_split_evidence_context(
+    context: SourceAuthorityContext, evidence_root: Path
+) -> None:
+    expected = Path(os.path.abspath(os.fspath(context.raw_root)))
+    supplied = Path(os.path.abspath(os.fspath(evidence_root)))
+    if supplied != expected:
+        raise ValueError("split evidence root differs from authority raw namespace")
+
+
+def _verify_split_batch_context(
+    context: SourceAuthorityContext, batch: QueryBatch
+) -> None:
+    pairs = {
+        (query.run_spec_sha256, query.acquisition_contract_sha256)
+        for query in batch.queries
+    }
+    if pairs != {
+        (context.authority_sha256, context.acquisition_contract_sha256)
+    }:
+        raise ValueError("split batch authority hash pair differs")
+
+
+def _verified_split_attempt(
+    evidence_root: Path,
+    parent: LogicalQuery,
+    reason: str,
+    attempt_number: int,
+    *,
+    read_only_progress: bool = False,
+) -> tuple[dict[str, object], str, str]:
+    if reason not in _SPLIT_REASONS:
+        raise ValueError("split reason is not approved")
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or not 1 <= attempt_number <= 999999
+    ):
+        raise ValueError("exhausted_attempt_number must be a positive integer")
+    store = (
+        V52EvidenceStore.open_read_only(evidence_root)
+        if read_only_progress
+        else V52EvidenceStore(evidence_root)
+    )
+    progress = store.read_verified_query_progress(parent)
+    if not progress.attempt_receipts:
+        raise ValueError("split parent has no exhausted attempt receipt")
+    if progress.pending_attempt_numbers:
+        raise ValueError("split attempt membership changed")
+    latest = max(
+        progress.attempt_receipts,
+        key=lambda record: int(record["attempt_number"]),
+    )
+    if latest.get("attempt_number") != attempt_number:
+        raise ValueError("split receipt must bind the latest attempt receipt")
+    if latest.get("outcome") != "SPLIT_REQUIRED":
+        raise ValueError("latest attempt is not SPLIT_REQUIRED")
+    if latest.get("error_classification") != reason:
+        raise ValueError("split reason differs from the latest attempt receipt")
+    split_evidence = store.read_verified_split_attempt(parent, attempt_number)
+    if (
+        split_evidence.query_id != logical_query_id(parent)
+        or split_evidence.attempt_number != attempt_number
+        or split_evidence.outcome != "SPLIT_REQUIRED"
+        or split_evidence.error_classification != reason
+    ):
+        raise ValueError("dedicated split evidence binding differs")
+    if reason in {"SIZE_LIMIT", "ROW_CAP"} and (
+        split_evidence.body_path is None
+        or split_evidence.body_sha256 is None
+        or split_evidence.byte_count <= 0
+    ):
+        raise ValueError(f"{reason} requires authenticated partial-body split evidence")
+    if (split_evidence.body_path is None) != (
+        split_evidence.body_sha256 is None
+    ) or (split_evidence.body_path is None) != (split_evidence.byte_count == 0):
+        raise ValueError("dedicated split evidence body binding differs")
+    parent_query_id = logical_query_id(parent)
+    relative = Path(
+        "queries",
+        parent.source,
+        parent_query_id,
+        "attempts",
+        f"{attempt_number:06d}.json",
+    )
+    if split_evidence.attempt_receipt_path != evidence_root / relative:
+        raise ValueError("dedicated split attempt receipt path differs")
+    contents = _read_repository_file(
+        evidence_root, relative, "split attempt receipt"
+    )
+    if (
+        contents != _canonical_json_bytes(dict(latest)) + b"\n"
+        or split_evidence.attempt_receipt_sha256 != _sha256_bytes(contents)
+    ):
+        raise ValueError("split attempt receipt bytes differ")
+    return dict(latest), relative.as_posix(), _sha256_bytes(contents)
+
+
+def _verified_split_lineage(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int | None,
+    *,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    active_parent_ids: set[str],
+    read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> tuple[
+    QueryBatch,
+    LogicalQuery,
+    QueryBatch,
+    dict[str, object],
+    str,
+    str,
+    int,
+]:
+    requested_parent_batch_id = _validate_sha256(
+        parent_batch_id, "parent_batch_id"
+    )
+    requested_parent_query_id = _validate_sha256(
+        parent_query_id, "parent_query_id"
+    )
+    requested_child_batch_id = _validate_sha256(child_batch_id, "child_batch_id")
+    if authority_context is None:
+        parent_batch = load_query_batch(
+            repository_root,
+            requested_parent_batch_id,
+            read_only_progress=read_only_progress,
+        )
+        child_batch = load_query_batch(
+            repository_root,
+            requested_child_batch_id,
+            read_only_progress=read_only_progress,
+        )
+    else:
+        parent_batch = _load_query_batch_for_authority(
+            repository_root,
+            requested_parent_batch_id,
+            authority_context.authority,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+        child_batch = _load_query_batch_for_authority(
+            repository_root,
+            requested_child_batch_id,
+            authority_context.authority,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+        _verify_split_batch_context(authority_context, parent_batch)
+        _verify_split_batch_context(authority_context, child_batch)
+    matches = [
+        query
+        for query in parent_batch.queries
+        if logical_query_id(query) == requested_parent_query_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("split parent query must occur exactly once in its batch")
+    parent = matches[0]
+    if authority_context is None:
+        _verify_split_evidence_root(repository_root, evidence_root, parent)
+    else:
+        _verify_split_evidence_context(authority_context, evidence_root)
+    parent_first, parent_last = validate_statcast_query(parent)
+    if parent_batch.stage != "REMAINING" or child_batch.stage != parent_batch.stage:
+        raise ValueError("split parent and child batches must use REMAINING stage")
+    if child_batch.derived_from_sha256 != parent_batch.batch_id:
+        raise ValueError("split child batch must derive from the parent batch")
+    if child_batch != build_statcast_split_batch(
+        repository_root,
+        parent_batch,
+        parent,
+        read_only_progress=read_only_progress,
+        _authority_context=authority_context,
+        legacy_evidence=legacy_evidence,
+    ):
+        raise ValueError("split child batch differs from the canonical bisection")
+    if len(child_batch.queries) < 2:
+        raise ValueError("split child batch must contain at least two queries")
+    cursor = parent_first
+    for child in child_batch.queries:
+        child_first, child_last = validate_statcast_query(child)
+        if (
+            child.parent_query_id != requested_parent_query_id
+            or child.run_spec_sha256 != parent.run_spec_sha256
+            or child.acquisition_contract_sha256
+            != parent.acquisition_contract_sha256
+        ):
+            raise ValueError("split child query lineage bindings differ")
+        if child != _statcast_child(parent, child_first, child_last):
+            raise ValueError("split child query differs from its canonical parent slice")
+        if child_first != cursor or child_first > child_last or child_last > parent_last:
+            raise ValueError("split child ranges are unordered, overlapping, or gapped")
+        cursor = child_last + timedelta(days=1)
+    if cursor != parent_last + timedelta(days=1):
+        raise ValueError("split child ranges do not cover the parent exactly")
+
+    legacy_kwargs: dict[str, Path] = {}
+    if authority_context is not None:
+        legacy_kwargs = {
+            "run_spec_path": authority_context.authority_path,
+            "acquisition_contract_path": authority_context.acquisition_contract_path,
+        }
+    legacy_depth_one_anchor = (
+        _is_legacy_partition_batch_candidate(repository_root, parent_batch)
+        and parent_batch
+        == build_legacy_partition_batch(
+            repository_root,
+            **legacy_kwargs,
+            read_only_progress=read_only_progress,
+            legacy_evidence=legacy_evidence,
+        )
+    )
+    if parent.parent_query_id is None:
+        if parent_batch.derived_from_sha256 is not None:
+            raise ValueError("split root parent batch must not be derived")
+        depth = 1
+    elif legacy_depth_one_anchor:
+        depth = 1
+    else:
+        if split_fd is None:
+            raise ValueError("recursive split receipt namespace is missing")
+        ancestor = _load_split_receipt_locked(
+            repository_root,
+            evidence_root,
+            split_fd,
+            parent.parent_query_id,
+            active_parent_ids=active_parent_ids,
+            read_only_progress=read_only_progress,
+            authority_context=authority_context,
+            legacy_evidence=legacy_evidence,
+        )
+        if ancestor is None:
+            raise ValueError("recursive split ancestor receipt is missing")
+        else:
+            if (
+                ancestor.child_batch_id != parent_batch.batch_id
+                or requested_parent_query_id not in ancestor.child_query_ids
+            ):
+                raise ValueError("recursive split ancestor binding differs")
+            depth = ancestor.depth + 1
+
+    attempt, attempt_path, attempt_sha256 = _verified_split_attempt(
+        evidence_root,
+        parent,
+        reason,
+        exhausted_attempt_number,
+        read_only_progress=read_only_progress,
+    )
+    return (
+        parent_batch,
+        parent,
+        child_batch,
+        attempt,
+        attempt_path,
+        attempt_sha256,
+        depth,
+    )
+
+
+def _split_record(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int | None,
+    *,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    active_parent_ids: set[str],
+    read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> dict[str, object]:
+    (
+        parent_batch,
+        parent,
+        child_batch,
+        attempt,
+        attempt_path,
+        attempt_sha256,
+        depth,
+    ) = _verified_split_lineage(
+        repository_root,
+        evidence_root,
+        split_fd,
+        parent_batch_id=parent_batch_id,
+        parent_query_id=parent_query_id,
+        reason=reason,
+        exhausted_attempt_number=exhausted_attempt_number,
+        child_batch_id=child_batch_id,
+        active_parent_ids=active_parent_ids,
+        read_only_progress=read_only_progress,
+        authority_context=authority_context,
+        legacy_evidence=legacy_evidence,
+    )
+    record = {
+        "attempt_receipt": {
+            "attempt_number": exhausted_attempt_number,
+            "path": attempt_path,
+            "sha256": attempt_sha256,
+        },
+        "child_batch_id": child_batch.batch_id,
+        "children": [
+            {
+                "query_id": logical_query_id(query),
+                "range": _split_range(query),
+            }
+            for query in child_batch.queries
+        ],
+        "depth": depth,
+        "parent_batch_id": parent_batch.batch_id,
+        "parent_query_id": logical_query_id(parent),
+        "parent_range": _split_range(parent),
+        "reason": reason,
+        "receipt_kind": "QUERY_SPLIT",
+        "recorded_at_utc": _validate_split_timestamp(attempt["ended_at_utc"]),
+        "schema_version": 1,
+        "stage": parent_batch.stage,
+    }
+    return {
+        **record,
+        "split_receipt_id": _sha256_bytes(_canonical_json_bytes(record)),
+    }
+
+
+_SPLIT_RECORD_KEYS = frozenset(
+    {
+        "attempt_receipt",
+        "child_batch_id",
+        "children",
+        "depth",
+        "parent_batch_id",
+        "parent_query_id",
+        "parent_range",
+        "reason",
+        "receipt_kind",
+        "recorded_at_utc",
+        "schema_version",
+        "split_receipt_id",
+        "stage",
+    }
+)
+
+
+def _split_receipt_value(record: dict[str, object], contents: bytes) -> SplitReceipt:
+    children = record["children"]
+    attempt = record["attempt_receipt"]
+    if not isinstance(children, list) or not isinstance(attempt, dict):
+        raise ValueError("split receipt nested records differ")
+    child_query_ids = tuple(
+        _validate_sha256(child.get("query_id"), "split child query_id")
+        if isinstance(child, dict)
+        else _validate_sha256(None, "split child query_id")
+        for child in children
+    )
+    attempt_number = attempt.get("attempt_number")
+    depth = record["depth"]
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or isinstance(depth, bool)
+        or not isinstance(depth, int)
+    ):
+        raise ValueError("split receipt numeric fields differ")
+    return SplitReceipt(
+        split_receipt_id=_validate_sha256(
+            record["split_receipt_id"], "split_receipt_id"
+        ),
+        receipt_sha256=_sha256_bytes(contents),
+        stage=str(record["stage"]),
+        parent_batch_id=_validate_sha256(
+            record["parent_batch_id"], "parent_batch_id"
+        ),
+        parent_query_id=_validate_sha256(
+            record["parent_query_id"], "parent_query_id"
+        ),
+        reason=str(record["reason"]),
+        exhausted_attempt_number=attempt_number,
+        depth=depth,
+        child_batch_id=_validate_sha256(record["child_batch_id"], "child_batch_id"),
+        child_query_ids=child_query_ids,
+        recorded_at_utc=_validate_split_timestamp(record["recorded_at_utc"]),
+    )
+
+
+def _load_split_receipt_locked(
+    repository_root: Path,
+    evidence_root: Path,
+    split_fd: int,
+    parent_query_id: str,
+    *,
+    active_parent_ids: set[str],
+    read_only_progress: bool = False,
+    authority_context: SourceAuthorityContext | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> SplitReceipt | None:
+    requested_id = _validate_sha256(parent_query_id, "parent_query_id")
+    if requested_id in active_parent_ids:
+        raise ValueError("split receipt ancestry contains a cycle")
+    name = f"{requested_id}.json"
+    loaded = _read_linked_regular(split_fd, name, "split receipt")
+    if loaded is None:
+        return None
+    contents, metadata = loaded
+    if metadata.st_nlink != 1:
+        raise ValueError("split receipt must be an unaliased regular file")
+    record = _parse_json_object(contents, "split receipt", canonical=True)
+    if set(record) != _SPLIT_RECORD_KEYS:
+        raise ValueError("split receipt keys differ")
+    if (
+        record.get("schema_version") != 1
+        or record.get("receipt_kind") != "QUERY_SPLIT"
+        or record.get("stage") != "REMAINING"
+        or record.get("reason") not in _SPLIT_REASONS
+        or record.get("parent_query_id") != requested_id
+    ):
+        raise ValueError("split receipt closed fields differ")
+    embedded_id = record.get("split_receipt_id")
+    identity = dict(record)
+    identity.pop("split_receipt_id", None)
+    if embedded_id != _sha256_bytes(_canonical_json_bytes(identity)):
+        raise ValueError("split receipt canonical ID binding differs")
+    attempt = record.get("attempt_receipt")
+    if not isinstance(attempt, dict) or set(attempt) != {
+        "attempt_number",
+        "path",
+        "sha256",
+    }:
+        raise ValueError("split attempt receipt binding differs")
+    attempt_number = attempt.get("attempt_number")
+    if isinstance(attempt_number, bool) or not isinstance(attempt_number, int):
+        raise ValueError("split attempt receipt number differs")
+
+    active_parent_ids.add(requested_id)
+    try:
+        expected = _split_record(
+            repository_root,
+            evidence_root,
+            split_fd,
+            parent_batch_id=_validate_sha256(
+                record.get("parent_batch_id"), "parent_batch_id"
+            ),
+            parent_query_id=requested_id,
+            reason=str(record["reason"]),
+            exhausted_attempt_number=attempt_number,
+            child_batch_id=_validate_sha256(
+                record.get("child_batch_id"), "child_batch_id"
+            ),
+            active_parent_ids=active_parent_ids,
+            read_only_progress=read_only_progress,
+            authority_context=authority_context,
+            legacy_evidence=legacy_evidence,
+        )
+    finally:
+        active_parent_ids.remove(requested_id)
+    if record != expected:
+        raise ValueError("split receipt verified reconstruction differs")
+    rebound = _read_linked_regular(split_fd, name, "split receipt")
+    if rebound is None:
+        raise ValueError("split receipt disappeared during load")
+    rebound_contents, rebound_metadata = rebound
+    if rebound_contents != contents or _batch_file_identity(
+        rebound_metadata
+    ) != _batch_file_identity(metadata):
+        raise ValueError("split receipt identity or bytes changed during load")
+    return _split_receipt_value(record, contents)
+
+
+def _open_optional_directory(parent_fd: int, name: str) -> int | None:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(
+            "split receipt ancestors must be existing no-follow directories"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("split receipt ancestor identity differs")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_split_namespace(
+    root: Path,
+    *,
+    create: bool,
+    receipt_root: Path = _SPLIT_RECEIPT_ROOT,
+) -> list[int] | None:
+    descriptors = [_open_root(root)]
+    try:
+        current = descriptors[0]
+        for component in receipt_root.parts:
+            child = (
+                _open_or_create_directory(current, component)
+                if create
+                else _open_optional_directory(current, component)
+            )
+            if child is None:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+                return None
+            descriptors.append(child)
+            current = child
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _verify_split_namespace_chain(
+    root: Path,
+    descriptors: Sequence[int],
+    *,
+    receipt_root: Path = _SPLIT_RECEIPT_ROOT,
+) -> None:
+    if len(descriptors) != len(receipt_root.parts) + 1:
+        raise ValueError("split receipt ancestor chain differs")
+    fresh_root = _open_root(root)
+    try:
+        opened = os.fstat(descriptors[0])
+        fresh = os.fstat(fresh_root)
+        if (opened.st_dev, opened.st_ino) != (fresh.st_dev, fresh.st_ino):
+            raise ValueError("split receipt root identity changed")
+    finally:
+        os.close(fresh_root)
+    for index, component in enumerate(receipt_root.parts):
+        try:
+            opened = os.fstat(descriptors[index + 1])
+            linked = os.stat(
+                component,
+                dir_fd=descriptors[index],
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("split receipt ancestor identity changed") from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("split receipt ancestor identity changed")
+
+
+def load_split_receipt(
+    repository_root: Path,
+    parent_query_id: str,
+    *,
+    evidence_root: Path,
+    read_only_progress: bool = False,
+) -> SplitReceipt | None:
+    requested_id = _validate_sha256(parent_query_id, "parent_query_id")
+    repository_root = Path(repository_root)
+    evidence_root = Path(evidence_root)
+    _verify_split_evidence_root(repository_root, evidence_root)
+    descriptors = _open_split_namespace(repository_root, create=False)
+    if descriptors is None:
+        return None
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_SH)
+        try:
+            receipt = _load_split_receipt_locked(
+                repository_root,
+                evidence_root,
+                current,
+                requested_id,
+                active_parent_ids=set(),
+                read_only_progress=read_only_progress,
+            )
+            _verify_split_namespace_chain(repository_root, descriptors)
+            return receipt
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _publish_split_bytes_locked(
+    parent_fd: int,
+    parent_query_id: str,
+    contents: bytes,
+) -> tuple[int, ...] | None:
+    temp_name = f".{parent_query_id}.{secrets.token_hex(16)}.tmp"
+    final_name = f"{parent_query_id}.json"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+    temp_exists = True
+    try:
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("split receipt publication made no progress")
+            view = view[written:]
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("split receipt temp publication was aliased")
+        os.fsync(descriptor)
+        if _read_existing(parent_fd, temp_name) != contents:
+            raise ValueError("split receipt temp bytes differ")
+        try:
+            os.link(
+                temp_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _unlink_owned_temp(parent_fd, temp_name, descriptor)
+            temp_exists = False
+            os.fsync(parent_fd)
+            concurrent = _reconcile_batch_final(
+                parent_fd, parent_query_id, contents
+            )
+            if concurrent is None:
+                raise ValueError("concurrent split receipt disappeared")
+            return None
+        _unlink_owned_temp(parent_fd, temp_name, descriptor)
+        temp_exists = False
+        os.fsync(parent_fd)
+        if _reconcile_batch_final(parent_fd, parent_query_id, contents) != contents:
+            raise ValueError("split receipt bytes changed after publication")
+        return _batch_file_identity(os.fstat(descriptor))
+    finally:
+        try:
+            if temp_exists:
+                _unlink_owned_temp(parent_fd, temp_name, descriptor)
+                os.fsync(parent_fd)
+        finally:
+            os.close(descriptor)
+
+
+def _cleanup_owned_split_final(
+    parent_fd: int,
+    parent_query_id: str,
+    contents: bytes,
+    identity: tuple[int, ...],
+) -> None:
+    name = f"{parent_query_id}.json"
+    loaded = _read_linked_regular(parent_fd, name, "owned split receipt final")
+    if loaded is None:
+        return
+    final_contents, metadata = loaded
+    if final_contents != contents or _batch_file_identity(metadata) != identity:
+        raise ValueError("split receipt final ownership changed before cleanup")
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _batch_file_identity(rebound) != identity:
+        raise ValueError("split receipt final ownership changed before cleanup")
+    os.unlink(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def publish_split_receipt(
+    repository_root: Path,
+    *,
+    evidence_root: Path,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+) -> SplitReceipt:
+    requested_parent_query_id = _validate_sha256(
+        parent_query_id, "parent_query_id"
+    )
+    repository_root = Path(repository_root)
+    evidence_root = Path(evidence_root)
+    descriptors = _open_split_namespace(repository_root, create=True)
+    if descriptors is None:
+        raise AssertionError("created split receipt namespace must exist")
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_EX)
+        try:
+            _verify_split_namespace_chain(repository_root, descriptors)
+            record = _split_record(
+                repository_root,
+                evidence_root,
+                current,
+                parent_batch_id=parent_batch_id,
+                parent_query_id=requested_parent_query_id,
+                reason=reason,
+                exhausted_attempt_number=exhausted_attempt_number,
+                child_batch_id=child_batch_id,
+                active_parent_ids={requested_parent_query_id},
+            )
+            contents = _canonical_json_bytes(record) + b"\n"
+            existing = _reconcile_batch_final(
+                current, requested_parent_query_id, contents
+            )
+            _cleanup_prelink_batch_temps(current, requested_parent_query_id)
+            created_identity = None
+            if existing is None:
+                created_identity = _publish_split_bytes_locked(
+                    current,
+                    requested_parent_query_id,
+                    contents,
+                )
+            try:
+                receipt = _load_split_receipt_locked(
+                    repository_root,
+                    evidence_root,
+                    current,
+                    requested_parent_query_id,
+                    active_parent_ids=set(),
+                )
+                if receipt is None:
+                    raise ValueError("split receipt is missing after publication")
+                _verify_split_namespace_chain(repository_root, descriptors)
+                return receipt
+            except BaseException:
+                if created_identity is not None:
+                    _cleanup_owned_split_final(
+                        current,
+                        requested_parent_query_id,
+                        contents,
+                        created_identity,
+                    )
+                raise
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _prevalidate_authority_split_batches(
+    context: SourceAuthorityContext,
+    *,
+    parent_batch_id: str,
+    parent_query_id: str,
+    child_batch_id: str,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> None:
+    """Reject a bad source/recovery binding before creating its receipt directory."""
+    parent_id = _validate_sha256(parent_batch_id, "parent_batch_id")
+    child_id = _validate_sha256(child_batch_id, "child_batch_id")
+    query_id = _validate_sha256(parent_query_id, "parent_query_id")
+    parent_batch = _load_query_batch_for_authority(
+        context.repository_root,
+        parent_id,
+        context.authority,
+        read_only_progress=True,
+        legacy_evidence=legacy_evidence,
+    )
+    child_batch = _load_query_batch_for_authority(
+        context.repository_root,
+        child_id,
+        context.authority,
+        read_only_progress=True,
+        legacy_evidence=legacy_evidence,
+    )
+    _verify_split_batch_context(context, parent_batch)
+    _verify_split_batch_context(context, child_batch)
+    if sum(logical_query_id(query) == query_id for query in parent_batch.queries) != 1:
+        raise ValueError("split parent query must occur exactly once in its batch")
+
+
+def _preflight_authority_split_record(
+    context: SourceAuthorityContext,
+    *,
+    receipt_root: Path,
+    evidence_root: Path,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    split_fd: int | None = None,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> dict[str, object]:
+    """Fully reconstruct a split before creating a previously absent namespace."""
+    if split_fd is not None:
+        return _split_record(
+            context.repository_root,
+            evidence_root,
+            split_fd,
+            parent_batch_id=parent_batch_id,
+            parent_query_id=parent_query_id,
+            reason=reason,
+            exhausted_attempt_number=exhausted_attempt_number,
+            child_batch_id=child_batch_id,
+            active_parent_ids={parent_query_id},
+            read_only_progress=True,
+            authority_context=context,
+            legacy_evidence=legacy_evidence,
+        )
+    descriptors = _open_split_namespace(
+        context.repository_root,
+        create=False,
+        receipt_root=receipt_root,
+    )
+    if descriptors is None:
+        return _split_record(
+            context.repository_root,
+            evidence_root,
+            None,
+            parent_batch_id=parent_batch_id,
+            parent_query_id=parent_query_id,
+            reason=reason,
+            exhausted_attempt_number=exhausted_attempt_number,
+            child_batch_id=child_batch_id,
+            active_parent_ids={parent_query_id},
+            read_only_progress=True,
+            authority_context=context,
+            legacy_evidence=legacy_evidence,
+        )
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_SH)
+        try:
+            _verify_split_namespace_chain(
+                context.repository_root,
+                descriptors,
+                receipt_root=receipt_root,
+            )
+            return _split_record(
+                context.repository_root,
+                evidence_root,
+                current,
+                parent_batch_id=parent_batch_id,
+                parent_query_id=parent_query_id,
+                reason=reason,
+                exhausted_attempt_number=exhausted_attempt_number,
+                child_batch_id=child_batch_id,
+                active_parent_ids={parent_query_id},
+                read_only_progress=True,
+                authority_context=context,
+                legacy_evidence=legacy_evidence,
+            )
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _open_authority_split_namespace(
+    context: SourceAuthorityContext, *, receipt_root: Path
+) -> tuple[list[int], tuple[int, int] | None]:
+    """Open split_receipts and record ownership only when this call made its leaf."""
+    descriptors = [_open_root(context.repository_root)]
+    try:
+        current = descriptors[0]
+        for component in receipt_root.parent.parts:
+            child = _open_optional_directory(current, component)
+            if child is None:
+                raise ValueError("split authority acquisition audit root is missing")
+            descriptors.append(child)
+            current = child
+        leaf_name = receipt_root.name
+        leaf = _open_optional_directory(current, leaf_name)
+        created_identity: tuple[int, int] | None = None
+        if leaf is None:
+            created = False
+            try:
+                os.mkdir(leaf_name, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            else:
+                os.fsync(current)
+                created = True
+            leaf = _open_optional_directory(current, leaf_name)
+            if leaf is None:
+                raise ValueError("split authority namespace disappeared")
+            if created:
+                linked = os.stat(leaf_name, dir_fd=current, follow_symlinks=False)
+                created_identity = (linked.st_dev, linked.st_ino)
+        descriptors.append(leaf)
+        return descriptors, created_identity
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _rollback_owned_authority_split_namespace(
+    descriptors: Sequence[int],
+    created_identity: tuple[int, int] | None,
+    *,
+    receipt_root: Path,
+) -> None:
+    if created_identity is None or len(descriptors) < 2:
+        return
+    leaf = descriptors[-1]
+    parent = descriptors[-2]
+    opened = os.fstat(leaf)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != created_identity
+    ):
+        raise ValueError("split authority namespace ownership changed")
+    if os.listdir(leaf):
+        raise ValueError("split authority namespace is no longer empty")
+    linked = os.stat(
+        receipt_root.name,
+        dir_fd=parent,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(linked.st_mode)
+        or (linked.st_dev, linked.st_ino) != created_identity
+    ):
+        raise ValueError("split authority namespace ownership changed")
+    os.rmdir(receipt_root.name, dir_fd=parent)
+    os.fsync(parent)
+
+
+def _split_authority_context_identity(
+    context: SourceAuthorityContext,
+) -> tuple[Path, Path, str, Path, str, Path, Path]:
+    return (
+        context.repository_root,
+        context.authority_path,
+        context.authority_sha256,
+        context.acquisition_contract_path,
+        context.acquisition_contract_sha256,
+        context.raw_root,
+        context.acquisition_audit_root,
+    )
+
+
+def _after_authority_split_preflight() -> None:
+    """Deterministic mutation hook for authority-split TOCTOU tests."""
+
+
+def _before_authority_split_final_link() -> None:
+    """Deterministic hook immediately before authority-split final recheck."""
+
+
+def load_split_receipt_for_authority(
+    repository_root: Path,
+    parent_query_id: str,
+    *,
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+    evidence_root: Path,
+    read_only_progress: bool = False,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> SplitReceipt | None:
+    """Load a source/recovery split receipt through one exact authority pair."""
+    context = _load_split_authority_context(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    _verify_split_evidence_context(context, Path(evidence_root))
+    requested_id = _validate_sha256(parent_query_id, "parent_query_id")
+    receipt_root = _split_receipt_root_for_context(context)
+    descriptors = _open_split_namespace(
+        context.repository_root,
+        create=False,
+        receipt_root=receipt_root,
+    )
+    if descriptors is None:
+        return None
+    current = descriptors[-1]
+    try:
+        fcntl.flock(current, fcntl.LOCK_SH)
+        try:
+            receipt = _load_split_receipt_locked(
+                context.repository_root,
+                Path(evidence_root),
+                current,
+                requested_id,
+                active_parent_ids=set(),
+                read_only_progress=read_only_progress,
+                authority_context=context,
+                legacy_evidence=legacy_evidence,
+            )
+            _verify_split_namespace_chain(
+                context.repository_root,
+                descriptors,
+                receipt_root=receipt_root,
+            )
+            return receipt
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def publish_split_receipt_for_authority(
+    repository_root: Path,
+    *,
+    run_spec_path: Path,
+    acquisition_contract_path: Path,
+    evidence_root: Path,
+    parent_batch_id: str,
+    parent_query_id: str,
+    reason: str,
+    exhausted_attempt_number: int,
+    child_batch_id: str,
+    legacy_evidence: LegacyEvidenceCapability | None = None,
+) -> SplitReceipt:
+    """Publish under the split leaf lock with read-only authority reconstruction."""
+    context = _load_split_authority_context(
+        repository_root,
+        run_spec_path=run_spec_path,
+        acquisition_contract_path=acquisition_contract_path,
+    )
+    supplied = Path(evidence_root)
+    _verify_split_evidence_context(context, supplied)
+    parent_id = _validate_sha256(parent_query_id, "parent_query_id")
+    receipt_root = _split_receipt_root_for_context(context)
+    _prevalidate_authority_split_batches(
+        context,
+        parent_batch_id=parent_batch_id,
+        parent_query_id=parent_id,
+        child_batch_id=child_batch_id,
+        legacy_evidence=legacy_evidence,
+    )
+    _preflight_authority_split_record(
+        context,
+        receipt_root=receipt_root,
+        evidence_root=supplied,
+        parent_batch_id=parent_batch_id,
+        parent_query_id=parent_id,
+        reason=reason,
+        exhausted_attempt_number=exhausted_attempt_number,
+        child_batch_id=child_batch_id,
+        legacy_evidence=legacy_evidence,
+    )
+    _after_authority_split_preflight()
+    descriptors, owned_leaf = _open_authority_split_namespace(
+        context, receipt_root=receipt_root
+    )
+    current = descriptors[-1]
+    published = False
+    try:
+        fcntl.flock(current, fcntl.LOCK_EX)
+        try:
+            rebound = _load_split_authority_context(
+                repository_root,
+                run_spec_path=run_spec_path,
+                acquisition_contract_path=acquisition_contract_path,
+            )
+            if _split_authority_context_identity(rebound) != _split_authority_context_identity(context):
+                raise ValueError("split authority context changed")
+            _verify_split_evidence_context(rebound, supplied)
+            _prevalidate_authority_split_batches(
+                rebound,
+                parent_batch_id=parent_batch_id,
+                parent_query_id=parent_id,
+                child_batch_id=child_batch_id,
+                legacy_evidence=legacy_evidence,
+            )
+            record = _preflight_authority_split_record(
+                rebound,
+                receipt_root=receipt_root,
+                evidence_root=supplied,
+                parent_batch_id=parent_batch_id,
+                parent_query_id=parent_id,
+                reason=reason,
+                exhausted_attempt_number=exhausted_attempt_number,
+                child_batch_id=child_batch_id,
+                split_fd=current,
+                legacy_evidence=legacy_evidence,
+            )
+            contents = _canonical_json_bytes(record) + b"\n"
+            created_identity = None
+            try:
+                existing = _reconcile_batch_final(current, parent_id, contents)
+                if existing is None:
+                    _before_authority_split_final_link()
+                    final_context = _load_split_authority_context(
+                        repository_root,
+                        run_spec_path=run_spec_path,
+                        acquisition_contract_path=acquisition_contract_path,
+                    )
+                    if _split_authority_context_identity(
+                        final_context
+                    ) != _split_authority_context_identity(rebound):
+                        raise ValueError("split authority context changed")
+                    _verify_split_evidence_context(final_context, supplied)
+                    _prevalidate_authority_split_batches(
+                        final_context,
+                        parent_batch_id=parent_batch_id,
+                        parent_query_id=parent_id,
+                        child_batch_id=child_batch_id,
+                        legacy_evidence=legacy_evidence,
+                    )
+                    record = _preflight_authority_split_record(
+                        final_context,
+                        receipt_root=receipt_root,
+                        evidence_root=supplied,
+                        parent_batch_id=parent_batch_id,
+                        parent_query_id=parent_id,
+                        reason=reason,
+                        exhausted_attempt_number=exhausted_attempt_number,
+                        child_batch_id=child_batch_id,
+                        split_fd=current,
+                        legacy_evidence=legacy_evidence,
+                    )
+                    contents = _canonical_json_bytes(record) + b"\n"
+                    _verify_split_namespace_chain(
+                        final_context.repository_root,
+                        descriptors,
+                        receipt_root=receipt_root,
+                    )
+                    if _reconcile_batch_final(current, parent_id, contents) is None:
+                        created_identity = _publish_split_bytes_locked(
+                            current,
+                            parent_id,
+                            contents,
+                        )
+                    rebound = final_context
+                receipt = _load_split_receipt_locked(
+                    rebound.repository_root,
+                    supplied,
+                    current,
+                    parent_id,
+                    active_parent_ids=set(),
+                    read_only_progress=True,
+                    authority_context=rebound,
+                    legacy_evidence=legacy_evidence,
+                )
+                if receipt is None:
+                    raise ValueError("split receipt is missing after publication")
+                _verify_split_namespace_chain(
+                    rebound.repository_root,
+                    descriptors,
+                    receipt_root=receipt_root,
+                )
+                published = True
+                return receipt
+            except BaseException:
+                if created_identity is not None:
+                    _cleanup_owned_split_final(
+                        current,
+                        parent_id,
+                        contents,
+                        created_identity,
+                    )
+                raise
+        finally:
+            fcntl.flock(current, fcntl.LOCK_UN)
+    finally:
+        try:
+            if not published:
+                _rollback_owned_authority_split_namespace(
+                    descriptors,
+                    owned_leaf,
+                    receipt_root=receipt_root,
+                )
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
