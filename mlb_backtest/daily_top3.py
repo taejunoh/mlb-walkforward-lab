@@ -30,6 +30,7 @@ from .live_top3_contracts import (
     validate_target_date,
 )
 from .live_top3_service import build_live_top3_run
+from .live_top3_trace import build_trace_payload, validate_trace_payload
 from .secure_fs import (
     TrustedRoot,
     open_trusted_root,
@@ -219,6 +220,7 @@ def run_daily_top3(
                 expected_root_binding=trusted.binding,
             )
 
+        trace_sink: list[dict[str, object]] = []
         payload = _bound_call(
             trusted,
             build_live_top3_run,
@@ -230,6 +232,7 @@ def run_daily_top3(
             career_bf_bindings=career_bf_bindings,
             command_inputs={"date": target_date, "model_card": card_relative},
             execution_times=execution_times,
+            trace_sink=trace_sink,
         )
         validated = validate_run_payload(payload)
         json_path, markdown_path = _bound_call(
@@ -247,6 +250,19 @@ def run_daily_top3(
             slate,
             validated,
         )
+        # Test seams may replace the service/validator with a deliberately
+        # skeletal payload; a real validated run always has these fields.
+        if isinstance(validated, Mapping) and {
+            "content_sha256", "executed_at_utc", "target_date"
+        } <= set(validated):
+            _bound_call(
+                trusted,
+                _persist_bound_live_score_trace,
+                root_path,
+                trusted,
+                validated,
+                trace_sink,
+            )
         trusted.assert_bound()
         return validated, json_path, markdown_path
 
@@ -652,6 +668,96 @@ def _persist_bound_live_pregame_readiness_report(
     )
     trusted.assert_bound()
     return root_path / readiness_relative
+
+
+def _trace_relative_path(payload: Mapping[str, object]) -> Path:
+    return _report_relative_path(payload, "json").with_suffix(".trace.json")
+
+
+def persist_live_top3_trace(
+    root: Path,
+    payload: Mapping[str, object],
+    trace_sink: Sequence[Mapping[str, object]],
+) -> Path:
+    """Append one immutable score-trace sidecar under the trusted run root."""
+    root_path = normalize_live_root_path(Path(root))
+    with open_trusted_root(root_path) as trusted:
+        return _persist_bound_live_score_trace(
+            root_path, trusted, payload, trace_sink
+        )
+
+
+def _persist_bound_live_score_trace(
+    root_path: Path,
+    trusted: TrustedRoot,
+    payload: Mapping[str, object],
+    trace_sink: Sequence[Mapping[str, object]],
+) -> Path:
+    """Persist an immutable trace bound to the primary report on disk."""
+    safe = validate_run_payload(payload)
+    primary_relative = _report_relative_path(safe, "json")
+    trace_relative = _trace_relative_path(safe)
+    trusted.assert_bound()
+    primary_snapshot = read_regular_snapshot(
+        trusted, primary_relative, "experimental daily Top 3 JSON"
+    )
+    if primary_snapshot is None:
+        raise IntegrityError("experimental daily Top 3 JSON is missing")
+    rebind_regular_snapshot(
+        trusted, primary_snapshot, "experimental daily Top 3 JSON"
+    )
+    persisted_primary = validate_run_payload(json.loads(primary_snapshot.contents))
+    if persisted_primary["content_sha256"] != safe["content_sha256"]:
+        raise IntegrityError("trace primary report binding differs")
+    trace = build_trace_payload(
+        primary_report_relative=primary_relative.as_posix(),
+        primary_report_content_sha256=persisted_primary["content_sha256"],
+        model_card_sha256=persisted_primary["model_card_sha256"],
+        games=trace_sink,
+    )
+    trace_contents = canonical_json_bytes(trace)
+    existing = read_regular_snapshot(
+        trusted,
+        trace_relative,
+        "experimental daily live score trace",
+        missing_ok=True,
+    )
+    if existing is not None:
+        if existing.contents != trace_contents:
+            raise FileExistsError("experimental daily live score trace identity conflicts")
+        trace_snapshot = existing
+    else:
+        trace_snapshot = write_exclusive(
+            trusted,
+            trace_relative,
+            trace_contents,
+            "experimental daily live score trace",
+        )
+    rebind_regular_snapshot(
+        trusted, trace_snapshot, "experimental daily live score trace"
+    )
+    reread = read_regular_snapshot(
+        trusted, trace_relative, "experimental daily live score trace"
+    )
+    if reread is None:
+        raise IntegrityError("experimental daily live score trace is missing")
+    rebind_regular_snapshot(
+        trusted, reread, "experimental daily live score trace"
+    )
+    reread_trace = validate_trace_payload(
+        json.loads(reread.contents),
+        expected_primary_report_content_sha256=persisted_primary["content_sha256"],
+        expected_model_card_sha256=persisted_primary["model_card_sha256"],
+    )
+    if (
+        reread_trace["primary_report_relative"] != primary_relative.as_posix()
+        or reread_trace["primary_report_content_sha256"]
+        != persisted_primary["content_sha256"]
+        or reread_trace["model_card_sha256"] != persisted_primary["model_card_sha256"]
+    ):
+        raise IntegrityError("trace report binding differs")
+    trusted.assert_bound()
+    return root_path / trace_relative
 
 
 def main(argv: Sequence[str] | None = None) -> int:

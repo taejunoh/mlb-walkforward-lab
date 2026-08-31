@@ -547,10 +547,13 @@ def build_live_top3_run(
     career_bf_bindings: tuple[SourceBinding, ...],
     command_inputs: Mapping[str, object],
     execution_times: ExecutionTimes,
+    trace_sink: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Return one validated, content-hashed experimental run payload."""
     if not callable(final_schedule_observer):
         raise ValueError("final_schedule_observer must be callable")
+    if trace_sink is not None and not isinstance(trace_sink, list):
+        raise ValueError("trace_sink must be a list or None")
     career_by_pitcher = _validate_inputs(
         slate,
         history,
@@ -585,6 +588,7 @@ def build_live_top3_run(
             dict[str, object],
         ]
     ] = []
+    captured_trace_rows: list[dict[str, object]] = []
 
     for game in sorted(slate.games, key=lambda row: int(row["game_pk"])):
         game_pk = int(game["game_pk"])
@@ -824,6 +828,44 @@ def build_live_top3_run(
             unresolved_context,
         )
         tier(pick["pick_probability"], confidence, uncertainty_label)
+        if trace_sink is not None:
+            trace_row: dict[str, object] = {
+                "game_pk": game_pk,
+                "target_date": slate.target_date,
+                "away_team": game["away_team"],
+                "home_team": game["home_team"],
+                "scheduled_start_utc": game["scheduled_start_utc"],
+                "raw_features": json.loads(canonical_json_bytes(raw)),
+                "feature_sha256": hashlib.sha256(
+                    canonical_json_bytes(raw)
+                ).hexdigest(),
+                "model_card_sha256": card.file_sha256,
+                "away_scores": _plain_json(scored["away_scores"]),
+                "home_scores": _plain_json(scored["home_scores"]),
+                "qualities": _plain_json(scored["qualities"]),
+                "contributions": {
+                    name: WEIGHTS[name]
+                    * (
+                        float(scored["home_scores"][name])
+                        - float(scored["away_scores"][name])
+                    )
+                    for name in WEIGHTS
+                },
+                "total_edge": float(scored["edge"]),
+                "edge": float(scored["edge"]),
+                "p_home": float(p_home),
+                "predicted_side": pick["predicted_side"],
+                "pick_probability": float(pick["pick_probability"]),
+                "primary_rank": None,
+                "disposition": "UNSCORED_EXACT_NEUTRAL"
+                if pick["predicted_side"] == "none"
+                else "SCORED_NOT_TOP3",
+            }
+            for quality_field in ("away_qualities", "home_qualities"):
+                if quality_field in scored:
+                    trace_row[quality_field] = _plain_json(scored[quality_field])
+            captured_trace_rows.append(trace_row)
+            trace_sink.append(trace_row)
         if pick["predicted_side"] == "none":
             unscored.append(
                 _unranked_row(
@@ -883,6 +925,14 @@ def build_live_top3_run(
     preliminary = preliminary[:3]
     for rank, row in enumerate(preliminary, 1):
         row["rank"] = rank
+        if trace_sink is not None:
+            trace_row = next(
+                candidate
+                for candidate in captured_trace_rows
+                if candidate["game_pk"] == row["game_pk"]
+            )
+            trace_row["primary_rank"] = rank
+            trace_row["disposition"] = "PRELIMINARY"
     unscored.sort(key=lambda row: (row["scheduled_start_utc"], row["game_pk"]))
     excluded.sort(key=lambda row: (row["scheduled_start_utc"], row["game_pk"]))
 

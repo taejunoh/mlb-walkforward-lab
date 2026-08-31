@@ -76,6 +76,17 @@ that JSON. There is no mutable `latest` file and reruns do not overwrite an
 earlier report. If lineups are missing, wait for teams to post them and rerun
 the same command; the new observation receives a new identity.
 
+Each successful run also writes a sibling `<primary-stem>.trace.json` sidecar.
+It contains the already-computed raw feature rows, component scores, signed
+home-minus-away contributions, probabilities, and explicit ranked/non-ranked
+dispositions for reproducibility research. The sidecar is canonically hashed,
+bound to the actual primary report and frozen model-card digests, and is not a
+second prediction report. It remains preliminary research evidence only: it
+does not prove historical as-of reconstruction, accuracy, calibration, value,
+or a betting recommendation. A trace write failure is reported after any
+already-written primary/readiness artifacts are preserved; old reports are
+never retrofitted.
+
 ## Limits
 
 The command never reads target-date outcomes into features, refits the card,

@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from mlb_backtest import daily_top3, live_history, live_sources
 from mlb_backtest.live_top3_contracts import LiveHttpObservation, canonical_json_bytes
+from mlb_backtest.live_top3_trace import validate_trace_payload
 
 
 TARGET = "2026-07-21"
@@ -510,13 +511,32 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertTrue(first_markdown.is_file())
             first_readiness = first_json.with_suffix(".readiness.md")
             second_readiness = second_json.with_suffix(".readiness.md")
+            first_trace = first_json.with_suffix(".trace.json")
+            second_trace = second_json.with_suffix(".trace.json")
             self.assertTrue(first_readiness.is_file())
+            self.assertTrue(first_trace.is_file())
             self.assertTrue(second_json.is_file())
             self.assertTrue(second_markdown.is_file())
             self.assertTrue(second_readiness.is_file())
+            self.assertTrue(second_trace.is_file())
             self.assertEqual(json.loads(first_json.read_bytes()), payload)
             self.assertEqual(first_json.read_bytes(), canonical_json_bytes(payload))
             self.assertEqual(second_json.read_bytes(), canonical_json_bytes(payload))
+            trace = validate_trace_payload(
+                json.loads(first_trace.read_bytes()),
+                expected_primary_report_content_sha256=payload["content_sha256"],
+                expected_model_card_sha256=payload["model_card_sha256"],
+            )
+            self.assertEqual(trace["primary_report_relative"], first_json.relative_to(first_json.parents[3]).as_posix())
+            self.assertEqual(
+                {row["game_pk"] for row in trace["games"]},
+                {880001, 880002, 880003, 880004},
+            )
+            self.assertEqual(
+                {row["disposition"] for row in trace["games"]},
+                {"PRELIMINARY", "SCORED_NOT_TOP3"},
+            )
+            self.assertEqual(first_trace.read_bytes(), second_trace.read_bytes())
             self.assertEqual(first_markdown.read_bytes(), daily_top3.render_live_top3_markdown(payload))
             self.assertEqual(hashlib.sha256(first_markdown.read_bytes()).hexdigest(), GOLDEN_MARKDOWN_SHA256)
             readiness = first_readiness.read_text(encoding="utf-8")
