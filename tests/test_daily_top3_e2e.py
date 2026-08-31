@@ -32,8 +32,8 @@ CARD = Path(__file__).parents[1] / "audit" / "v5_1_bt" / "model_card.json"
 HISTORY_COMPLETED = "2026-07-21T10:00:01Z"
 LIVE_COMPLETED = "2026-07-21T16:00:01Z"
 SEALED_SLATE_SHA256 = "2fce5639267743df26cc1bd036dfd275dbd613364c4ffc4fbfd083cced957684"
-GOLDEN_CONTENT_SHA256 = "6f03e2ee3be1f214ecf7f262bd6a7f599633efa64caef8c43858cd06c37662f7"
-GOLDEN_MARKDOWN_SHA256 = "2db9b30617a719bb7fcc856775970e2db94c2b6948e8c48d2add5204e4de0db4"
+GOLDEN_CONTENT_SHA256 = "aee259577f69a4d9ee2baad47ac5643f51d8f4ead873adde9736d54a838fe902"
+GOLDEN_MARKDOWN_SHA256 = "99848026591af787e405cae7e6fe92834d6556c65ab6b3cf9a195502ca7e69d5"
 
 
 class _FixedHistoryDateTime(datetime):
@@ -99,8 +99,7 @@ def _venue(*, valid: bool = True) -> bytes:
     coordinates = {"latitude": 40.0, "longitude": -74.0} if valid else {"latitude": 99.0, "longitude": -74.0}
     return json.dumps({"venues": [{"id": 1, "name": "Fixture Park", "location": {
         "city": "Fixture City", "defaultCoordinates": coordinates,
-        "timeZone": {"id": "America/New_York"},
-    }}]}).encode()
+    }, "timeZone": {"id": "America/New_York"}}]}).encode()
 
 
 def _league_era() -> bytes:
@@ -179,7 +178,7 @@ class SealedLiveFetcher:
             body = _history_schedule()
             completed = HISTORY_COMPLETED
         elif source == "stats_api" and "/venues/" in url:
-            if urlsplit(url).path.rsplit("/", 1)[-1] != "1" or query.get("hydrate") != ["location"]:
+            if urlsplit(url).path.rsplit("/", 1)[-1] != "1" or query.get("hydrate") != ["location,timezone"]:
                 raise AssertionError("venue request identity differs")
             body = _venue(valid=self.variant != "invalid_venue")
             completed = HISTORY_COMPLETED
@@ -406,6 +405,28 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertEqual(
                 [row["starter_edge_abs"] for row in payload["preliminary_top3"]],
                 [1.506376631040581, 1.3027996827358095, 1.1126482172581404],
+            )
+            expected_schedule_flags = {
+                "away": [
+                    "doubleheader_unsupported",
+                    "home_city_unsupported",
+                    "prior_innings_unsupported",
+                    "rest_unsupported",
+                    "time_zones_neutral_missing_venue_coordinates",
+                    "travel_neutral_missing_venue_coordinates",
+                ],
+                "home": [
+                    "doubleheader_unsupported",
+                    "home_city_unsupported",
+                    "prior_innings_unsupported",
+                    "rest_unsupported",
+                    "time_zones_neutral_missing_venue_coordinates",
+                    "travel_neutral_missing_venue_coordinates",
+                ],
+            }
+            self.assertEqual(
+                [row["schedule_quality_flags"] for row in payload["preliminary_top3"]],
+                [expected_schedule_flags, expected_schedule_flags, expected_schedule_flags],
             )
             self.assertEqual(payload["content_sha256"], GOLDEN_CONTENT_SHA256)
             self.assertEqual(
