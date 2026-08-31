@@ -2018,7 +2018,7 @@ def _build_result_free_live_schedule_history(
     if not rows:
         raise ValueError("result-free schedule history has no Statcast-proven games")
     rows.sort(key=lambda row: (row["official_date"], row["game_pk"]))
-    expected = tuple(row["game_pk"] for row in rows)
+    expected = tuple(sorted(row["game_pk"] for row in rows))
     return ScheduleHistoryBuild(tuple(rows), opening.isoformat(), cutoff.isoformat(), True, source_manifest_sha256, expected)
 
 

@@ -26,7 +26,7 @@ from mlb_backtest.live_sources import normalize_live_root_path
 from mlb_backtest.live_top3_contracts import LiveHttpObservation
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.secure_fs import open_trusted_root
-from mlb_backtest.statcast import STATCAST_ROW_CAP, statcast_url
+from mlb_backtest.statcast import STATCAST_ROW_CAP, StatcastData, statcast_url
 
 
 def _career_payload() -> bytes:
@@ -1628,6 +1628,59 @@ class LiveHistoryTests(unittest.TestCase):
         )
         self.assertEqual(len(result.rows), 15)
         self.assertEqual(counting.iterations, 1)
+
+    def test_schedule_history_builder_keeps_row_and_verification_id_orders_distinct(self):
+        schedule = [
+            {
+                "game_pk": 823081,
+                "official_date": "2026-03-26",
+                "away_team": "Away 2",
+                "home_team": "Home 2",
+                "venue_id": 1,
+                "venue_name": "Fixture Park",
+                "doubleheader_marker": "N",
+            },
+            {
+                "game_pk": 823244,
+                "official_date": "2026-03-25",
+                "away_team": "Away 1",
+                "home_team": "Home 1",
+                "venue_id": 1,
+                "venue_name": "Fixture Park",
+                "doubleheader_marker": "N",
+            },
+        ]
+        statcast = StatcastData(
+            (
+                {"game_pk": 823081, "game_date": "2026-03-26", "inning": 1},
+                {"game_pk": 823244, "game_date": "2026-03-25", "inning": 1},
+            ),
+            (),
+        )
+        result = live_history._build_result_free_live_schedule_history(
+            schedule,
+            statcast,
+            {
+                "Away 1": "A1",
+                "Home 1": "H1",
+                "Away 2": "A2",
+                "Home 2": "H2",
+            },
+            {
+                1: {
+                    "venue_name": "Fixture Park",
+                    "venue_city": "City",
+                    "venue_latitude": 40.0,
+                    "venue_longitude": -74.0,
+                    "time_zone": "America/New_York",
+                }
+            },
+            date.fromisoformat("2026-03-25"),
+            date.fromisoformat("2026-03-26"),
+            "a" * 64,
+        )
+        self.assertEqual(tuple(row["game_pk"] for row in result.rows), (823244, 823081))
+        self.assertEqual(result.expected_game_pks, (823081, 823244))
 
     def test_completion_timestamp_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
