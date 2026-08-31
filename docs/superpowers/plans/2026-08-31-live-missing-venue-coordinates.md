@@ -45,7 +45,7 @@ assert parsed["time_zone"] == "America/Mexico_City"
 
 Adapt the exact call signature from existing parser tests. Add separate real feature-path tests passing paired None through venue authority, historical/target rows and prepared features. Assert both existing flags (`travel_neutral_missing_venue_coordinates`, `time_zones_neutral_missing_venue_coordinates`) and lower schedule quality than the corresponding complete-coordinate fixture. Assert no game/reference silently disappears and complete-coordinate parity remains. Capture expected failures before production edits.
 
-Include mixed complete-coordinate and missing-coordinate rows in a real history DataFrame, not only an all-None fixture: pandas may represent missing numeric cells as NaN. Any normalization at the internal DataFrame boundary must match the paired missing authority; it must not accept upstream explicit NaN coordinates or leak NaN into canonical JSON.
+Include mixed complete-coordinate and missing-coordinate records in the actual live history/target structures, not only an all-None fixture. Inspection confirmed this path uses dict/tuple records, not a pandas/DataFrame boundary. Do not introduce a synthetic DataFrame dependency. Reject upstream explicit NaN coordinates and prove paired null survives canonical JSON serialization.
 
 - [ ] **Step 2: Minimal parser and authority changes.**
 
@@ -93,7 +93,7 @@ Update the closed JSON Schema with the optional property (not required), exactly
 Run new tests first. Then run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /Users/taejunoh/.local/bin/python3 -m unittest tests.test_live_history tests.test_live_features tests.test_live_top3_service tests.test_live_top3_contracts tests.test_daily_top3
+PYTHONDONTWRITEBYTECODE=1 /Users/taejunoh/.local/bin/python3 -m unittest tests.test_live_history tests.test_live_features tests.test_live_top3_service tests.test_live_top3_contracts tests.test_daily_top3 tests.test_daily_top3_e2e
 git diff --check
 shasum -a 256 audit/v5_1_bt/model_card.json
 ```
