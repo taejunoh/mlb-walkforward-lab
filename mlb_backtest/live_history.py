@@ -1913,7 +1913,7 @@ def _schedule_games_by_pk_from_statcast(pitches: Iterable[Mapping[str, object]])
 def _venue_url(venue_id: int) -> str:
     if type(venue_id) is not int or venue_id <= 0:
         raise ValueError("venue_id must be a positive integer")
-    return f"{MLB_BASE}/venues/{venue_id}?" + urlencode({"hydrate": "location"})
+    return f"{MLB_BASE}/venues/{venue_id}?" + urlencode({"hydrate": "location,timezone"})
 
 
 def _parse_venue(payload: bytes, venue_id: int) -> dict[str, object]:
@@ -1923,7 +1923,7 @@ def _parse_venue(payload: bytes, venue_id: int) -> dict[str, object]:
         raw = values[0]
         location = raw["location"]
         coordinates = location["defaultCoordinates"]
-        timezone_id = location["timeZone"]["id"]
+        timezone_id = raw["timeZone"]["id"]
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise ValueError("venue reference is malformed") from exc
     if not isinstance(values, list) or len(values) != 1 or raw.get("id") != venue_id:

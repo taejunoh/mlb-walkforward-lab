@@ -202,8 +202,7 @@ def _statcast_with_unique_game_rows(game_day: str, row_count: int) -> bytes:
 def _venue() -> bytes:
     return json.dumps({"venues": [{"id": 1, "name": "Fixture Park", "location": {
         "city": "Fixture City", "defaultCoordinates": {"latitude": 40.0, "longitude": -74.0},
-        "timeZone": {"id": "America/New_York"},
-    }}]}).encode()
+    }, "timeZone": {"id": "America/New_York"}}]}).encode()
 
 
 def _history_fetcher(*, poison_target_day=False):
@@ -2004,9 +2003,37 @@ class LiveHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coordinates"):
             live_history._parse_venue(json.dumps(invalid).encode(), 1)
         invalid = json.loads(_venue())
-        invalid["venues"][0]["location"]["timeZone"]["id"] = "Mars/Olympus"
+        invalid["venues"][0]["timeZone"]["id"] = "Mars/Olympus"
         with self.assertRaisesRegex(ValueError, "IANA"):
             live_history._parse_venue(json.dumps(invalid).encode(), 1)
+        invalid = json.loads(_venue())
+        invalid["venues"][0].pop("timeZone")
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            live_history._parse_venue(json.dumps(invalid).encode(), 1)
+
+    def test_venue_reference_reads_timezone_from_actual_mlb_response(self):
+        payload = (Path(__file__).parent / "fixtures" / "venue_1_location_timezone.json").read_bytes()
+        parsed = live_history._parse_venue(payload, 1)
+        self.assertEqual(parsed["time_zone"], "America/Los_Angeles")
+
+    def test_venue_request_uses_location_and_timezone_hydration(self):
+        calls = []
+        delegate = _history_fetcher()
+
+        def recording_fetcher(source, url, *, max_bytes):
+            if "/venues/" in url:
+                calls.append(url)
+            return delegate(source, url, max_bytes=max_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            build_live_history(
+                Path(temporary), "2026-07-21", _card(),
+                fetcher=recording_fetcher, sleeper=lambda _delay: None,
+            )
+        self.assertEqual(
+            calls,
+            ["https://statsapi.mlb.com/api/v1/venues/1?hydrate=location%2Ctimezone"],
+        )
 
     def test_target_day_statcast_poison_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
