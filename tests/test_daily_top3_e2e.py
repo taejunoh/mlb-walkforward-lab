@@ -639,9 +639,43 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertNotEqual(first_readiness_bytes, middle_readiness.read_bytes())
             self.assertNotEqual(middle_readiness.read_bytes(), last_readiness.read_bytes())
             self.assertNotEqual(first_readiness_bytes, last_readiness.read_bytes())
-            self.assertIn("Validated away lineup count: `0`", first_readiness.read_text(encoding="utf-8"))
-            self.assertIn("Validated away lineup count: `9`", middle_readiness.read_text(encoding="utf-8"))
-            self.assertIn("PROBABLE\\_PITCHER\\_CHANGED", last_readiness.read_text(encoding="utf-8"))
+            first_readiness_text = first_readiness.read_text(encoding="utf-8")
+            middle_readiness_text = middle_readiness.read_text(encoding="utf-8")
+            last_readiness_text = last_readiness.read_text(encoding="utf-8")
+
+            def game_block(readiness_text, game_pk):
+                marker = f"### {game_pk} · "
+                start = readiness_text.index(marker)
+                end = readiness_text.find("\n### ", start + len(marker))
+                return readiness_text[start:] if end == -1 else readiness_text[start:end]
+
+            for index, game_pk in enumerate(range(880001, 880008)):
+                expected_away = 1000 + index
+                expected_home = 3000 + index
+                observed_away = (
+                    "unknown" if index == 6 else 9004 if index == 4 else expected_away
+                )
+                observed_home = "unknown" if index == 6 else expected_home
+                first_block = game_block(first_readiness_text, game_pk)
+                middle_block = game_block(middle_readiness_text, game_pk)
+                last_block = game_block(last_readiness_text, game_pk)
+
+                with self.subTest(game_pk=game_pk, observation="missing"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", first_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", first_block)
+                    self.assertIn("- Observed away pitcher-list ID: `unknown`", first_block)
+                    self.assertIn("- Observed home pitcher-list ID: `unknown`", first_block)
+                with self.subTest(game_pk=game_pk, observation="complete"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", middle_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", middle_block)
+                    self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", middle_block)
+                    self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", middle_block)
+                with self.subTest(game_pk=game_pk, observation="changed-final-schedule"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", last_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", last_block)
+                    self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", last_block)
+                    self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", last_block)
+                    self.assertIn("PROBABLE\\_PITCHER\\_CHANGED", last_block)
             self.assertNotEqual(first_json, middle_json)
             self.assertNotEqual(middle_json, last_json)
 
