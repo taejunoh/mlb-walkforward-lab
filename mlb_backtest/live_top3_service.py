@@ -448,15 +448,25 @@ def _candidate_failure_reasons(
         game.get("away_probable_pitcher_id"),
         game.get("home_probable_pitcher_id"),
     )
-    if "STARTER_CONFLICT" in reasons or any(
+    missing_starter_evidence = any(
         type(starter) is not int
         or starter <= 0
         or type(probable) is not int
         or probable <= 0
-        or starter != probable
+        for starter, probable in zip(starters, probable_starters, strict=True)
+    )
+    if missing_starter_evidence:
+        return nonprobable_reasons or {"INCOMPLETE_PREGAME_PARTICIPANTS"}
+    if "STARTER_CONFLICT" in reasons or any(
+        starter != probable
         for starter, probable in zip(starters, probable_starters, strict=True)
     ):
         return {"STARTER_CONFLICT"}
+    missing_lineup_reasons = nonprobable_reasons & {
+        "MISSING_AWAY_LINEUP", "MISSING_HOME_LINEUP"
+    }
+    if missing_lineup_reasons:
+        return nonprobable_reasons
     for side in ("away", "home"):
         lineup = getattr(participant, f"{side}_lineup")
         if (

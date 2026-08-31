@@ -8,6 +8,7 @@ and observation IDs used to authenticate observations.
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -32,8 +33,8 @@ CARD = Path(__file__).parents[1] / "audit" / "v5_1_bt" / "model_card.json"
 HISTORY_COMPLETED = "2026-07-21T10:00:01Z"
 LIVE_COMPLETED = "2026-07-21T16:00:01Z"
 SEALED_SLATE_SHA256 = "2fce5639267743df26cc1bd036dfd275dbd613364c4ffc4fbfd083cced957684"
-GOLDEN_CONTENT_SHA256 = "aee259577f69a4d9ee2baad47ac5643f51d8f4ead873adde9736d54a838fe902"
-GOLDEN_MARKDOWN_SHA256 = "99848026591af787e405cae7e6fe92834d6556c65ab6b3cf9a195502ca7e69d5"
+GOLDEN_CONTENT_SHA256 = "0e86e97aebfa8ebcfe0a9021f65be2fbf3227aa728e44ef5216688a8caa8699b"
+GOLDEN_MARKDOWN_SHA256 = "4e2a16042bae65f0939577a954a11b8960042132d83122ab15109690dc04e6ec"
 
 
 class _FixedHistoryDateTime(datetime):
@@ -241,6 +242,57 @@ class SealedLiveFetcher:
         )
 
 
+class SuccessiveObservationFetcher:
+    """Move one sealed fixture root through missing, complete, and changed observations."""
+
+    def __init__(self):
+        self.inner = SealedLiveFetcher()
+
+    @property
+    def current_schedule_calls(self):
+        return self.inner.current_schedule_calls
+
+    def __call__(self, source: str, url: str, *, max_bytes: int) -> LiveHttpObservation:
+        observed = self.inner(source, url, max_bytes=max_bytes)
+        if source == "stats_api" and "/game/" in url and "/boxscore" in url:
+            game_pk = int(urlsplit(url).path.split("/")[4])
+            index = game_pk - 880001
+            if self.current_schedule_calls <= 8:
+                observed = replace(
+                    observed,
+                    body=json.dumps(
+                        {
+                            "teams": {
+                                "away": {
+                                    "team": {"id": 100 + index},
+                                    "pitchers": [],
+                                    "players": {},
+                                },
+                                "home": {
+                                    "team": {"id": 200 + index},
+                                    "pitchers": [],
+                                    "players": {},
+                                },
+                            }
+                        }
+                    ).encode(),
+                )
+        elif (
+            source == "stats_api"
+            and "/schedule" in url
+            and self.current_schedule_calls > 16
+            and self.current_schedule_calls % 8 != 1
+        ):
+            altered = json.loads(observed.body)
+            for game in altered["dates"][0]["games"]:
+                game["teams"]["away"]["probablePitcher"]["id"] = 9999
+                game["teams"]["away"]["probablePitcher"][
+                    "fullName"
+                ] = "Replacement Pitcher"
+            observed = replace(observed, body=json.dumps(altered).encode())
+        return observed
+
+
 class OfflineCurrentFetcher:
     """A cache-reuse probe that permits no network request of any kind."""
 
@@ -308,7 +360,8 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def run_fixture(
         self, root: Path, *, variant: str | None = None, redirect: bool = False,
         tamper_card: bool = False, component_weight_tamper: bool = False,
-        fetcher: SealedLiveFetcher | None = None, durable_at_start: bool = False,
+        fetcher: SealedLiveFetcher | SuccessiveObservationFetcher | None = None,
+        durable_at_start: bool = False, observation_id_factory=None,
     ):
         card = root / "audit" / "v5_1_bt" / "model_card.json"
         card.parent.mkdir(parents=True, exist_ok=True)
@@ -319,7 +372,7 @@ class DailyTop3EndToEndTests(unittest.TestCase):
         if component_weight_tamper:
             card.write_bytes(card.read_bytes().replace(b'"starter": 0.35', b'"starter": 0.34'))
         fetcher = fetcher or SealedLiveFetcher(variant=variant, redirect=redirect)
-        fixed_id = _fixed_ids()
+        fixed_id = observation_id_factory or _fixed_ids()
 
         def durable():
             if durable_at_start:
@@ -436,7 +489,7 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 },
                 {
                     880005: ("UNSCORED", ("STARTER_CONFLICT",)),
-                    880006: ("UNSCORED", ("INVALID_HOME_LINEUP",)),
+                    880006: ("UNSCORED", ("MISSING_HOME_LINEUP",)),
                 },
             )
             self.assertEqual(
@@ -498,6 +551,66 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 hashlib.sha256((FIXTURES / "sealed_happy_slate.json").read_bytes()).hexdigest(),
                 SEALED_SLATE_SHA256,
             )
+
+    def test_fixture_e2e_preserves_successive_observation_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            fetcher = SuccessiveObservationFetcher()
+            observation_ids = _fixed_ids()
+
+            first, first_json, _first_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+            first_json_bytes = first_json.read_bytes()
+            middle, middle_json, _middle_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+            last, last_json, _last_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+
+            self.assertEqual(first["preliminary_top3"], [])
+            self.assertEqual(last["preliminary_top3"], [])
+            self.assertTrue(
+                all("pick_probability" not in row for row in first["unscored_games"])
+            )
+            self.assertTrue(
+                all("pick_probability" not in row for row in last["unscored_games"])
+            )
+            self.assertEqual(len(middle["preliminary_top3"]), 3)
+            self.assertTrue(
+                all(0 < row["pick_probability"] < 1 for row in middle["preliminary_top3"])
+            )
+            self.assertTrue(
+                all(
+                    "PROBABLE_PITCHER_CHANGED" in row["reason_codes"]
+                    for row in last["unscored_games"]
+                )
+            )
+
+            def live_observation_ids(payload):
+                return tuple(
+                    binding["observation_id"]
+                    for binding in payload["source_bindings"]
+                    if binding["binding_role"]
+                    in {"LIVE_SCHEDULE", "LIVE_PARTICIPANTS", "FINAL_SCHEDULE"}
+                )
+
+            first_ids = live_observation_ids(first)
+            middle_ids = live_observation_ids(middle)
+            last_ids = live_observation_ids(last)
+            self.assertNotEqual(first_ids, middle_ids)
+            self.assertNotEqual(middle_ids, last_ids)
+            self.assertNotEqual(first_ids, last_ids)
+            self.assertEqual(first_json.read_bytes(), first_json_bytes)
+            self.assertNotEqual(first_json, middle_json)
+            self.assertNotEqual(middle_json, last_json)
 
     def test_result_field_normalization_rejects_mlb_and_semantic_variants(self):
         rejected = (
@@ -655,12 +768,12 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def test_candidate_local_failures_preserve_other_scoreable_games(self):
         cases = (
             ("target venue absent", "target_venue_missing", "unscored_games", "MISSING_TARGET_VENUE_EVIDENCE"),
-            ("empty pitcher lists", "empty_pitchers", "unscored_games", "STARTER_CONFLICT"),
-            ("post-start appearance order", "poststart_pitchers", "unscored_games", "INVALID_AWAY_LINEUP"),
+            ("empty pitcher lists", "empty_pitchers", "unscored_games", "MISSING_AWAY_PITCHER_LIST"),
+            ("post-start appearance order", "poststart_pitchers", "unscored_games", "MISSING_AWAY_LINEUP"),
             ("final start conflict", "final_start_conflict", "excluded_games", "SCHEDULED_START_CHANGED"),
             ("final identity conflict", "final_identity_conflict", "excluded_games", "GAME_IDENTITY_CHANGED"),
             ("final status conflict", "final_status_conflict", "excluded_games", "PREGAME_STATUS_NOT_ACCEPTED"),
-            ("missing schedule starter", "missing_starter", "unscored_games", "STARTER_CONFLICT"),
+            ("missing schedule starter", "missing_starter", "unscored_games", "MISSING_SCHEDULE_PROBABLE"),
             ("unknown schedule status", "unknown_status", "excluded_games", "PREGAME_STATUS_NOT_ACCEPTED"),
         )
         for label, variant, population, reason in cases:

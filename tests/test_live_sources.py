@@ -592,6 +592,54 @@ class LiveSourceTests(unittest.TestCase):
         self.assertFalse(conflict.complete)
         self.assertIn("STARTER_CONFLICT", conflict.reason_codes)
 
+    def test_missing_pitcher_list_is_missing_evidence_not_starter_conflict(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        participants = parse_pregame_boxscore(
+            BOX_EMPTY_PITCHERS.read_bytes(), game_pk=777001
+        )
+
+        observed = compare_probable_pitchers(game, participants)
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_AWAY_PITCHER_LIST", observed.reason_codes)
+        self.assertIn("MISSING_HOME_PITCHER_LIST", observed.reason_codes)
+        self.assertNotIn("STARTER_CONFLICT", observed.reason_codes)
+
+    def test_missing_schedule_probable_is_retained_without_consistency(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        participants = parse_pregame_boxscore(BOX_COMPLETE.read_bytes(), game_pk=777001)
+        participants = compare_probable_pitchers(game, participants)
+
+        observed = compare_probable_pitchers(
+            {**game, "away_probable_pitcher_id": None}, participants
+        )
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_SCHEDULE_PROBABLE", observed.reason_codes)
+        self.assertNotIn("PROBABLE_CONSISTENT", observed.reason_codes)
+
+    def test_missing_one_side_and_known_opposite_mismatch_retain_both_reasons(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        boxscore = json.loads(BOX_COMPLETE.read_bytes())
+        boxscore["teams"]["away"]["pitchers"] = []
+        participants = parse_pregame_boxscore(
+            json.dumps(boxscore).encode(), game_pk=777001
+        )
+
+        observed = compare_probable_pitchers(
+            {**game, "home_probable_pitcher_id": 999}, participants
+        )
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_AWAY_PITCHER_LIST", observed.reason_codes)
+        self.assertIn("STARTER_CONFLICT", observed.reason_codes)
+
     def test_live_slate_writes_append_only_raw_manifests_receipts_and_bindings(self):
         schedule = SCHEDULE_COMPLETE.read_bytes()
         boxscore = BOX_COMPLETE.read_bytes()

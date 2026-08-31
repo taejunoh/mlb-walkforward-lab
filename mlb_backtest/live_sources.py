@@ -642,16 +642,20 @@ def compare_probable_pitchers(
         participants.home_pitcher_list_id,
     )
     reasons = set(participants.reason_codes)
+    reasons.discard("PROBABLE_CONSISTENT")
     if any(value is None for value in scheduled):
         reasons.add("MISSING_SCHEDULE_PROBABLE")
-    if any(
-        value is not None and value != evidence
-        for value, evidence in zip(scheduled, observed, strict=True)
-    ):
+    pairs = list(zip(scheduled, observed, strict=True))
+    known_pairs = [
+        (expected, observed)
+        for expected, observed in pairs
+        if type(expected) is int and expected > 0
+        and type(observed) is int and observed > 0
+    ]
+    if any(expected != observed for expected, observed in known_pairs):
         reasons.add("STARTER_CONFLICT")
-    elif all(
-        value is not None and value == evidence
-        for value, evidence in zip(scheduled, observed, strict=True)
+    elif len(known_pairs) == 2 and all(
+        expected == observed for expected, observed in known_pairs
     ):
         reasons.add("PROBABLE_CONSISTENT")
     complete = (

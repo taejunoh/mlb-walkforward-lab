@@ -466,6 +466,52 @@ def _build(
 
 
 class LiveTop3ServiceTests(unittest.TestCase):
+    def test_missing_participant_pitchers_are_unscored_with_missing_evidence(self):
+        game = _game(1)
+        participant = _participants(
+            1,
+            complete=False,
+            reasons=("MISSING_AWAY_PITCHER_LIST", "MISSING_HOME_PITCHER_LIST"),
+        )
+        participant = replace(
+            participant,
+            away_pitcher_list_id=None,
+            home_pitcher_list_id=None,
+        )
+        scorer = mock.Mock(side_effect=_scorer({1: 1.0}))
+
+        result = _build(
+            _slate((game,), participants={1: participant}),
+            _final_observer((game,)),
+            scorer=scorer,
+        )
+
+        self.assertEqual(result["preliminary_top3"], [])
+        self.assertEqual(
+            result["unscored_games"][0]["reason_codes"],
+            ["MISSING_AWAY_PITCHER_LIST", "MISSING_HOME_PITCHER_LIST"],
+        )
+        self.assertEqual(scorer.call_count, 0)
+
+    def test_missing_lineup_evidence_is_unscored_without_invalid_fallback(self):
+        game = _game(1)
+        participant = _participants(
+            1, complete=False, reasons=("MISSING_HOME_LINEUP",), home_lineup=()
+        )
+        scorer = mock.Mock(side_effect=_scorer({1: 1.0}))
+
+        result = _build(
+            _slate((game,), participants={1: participant}),
+            _final_observer((game,)),
+            scorer=scorer,
+        )
+
+        self.assertEqual(result["preliminary_top3"], [])
+        self.assertEqual(
+            result["unscored_games"][0]["reason_codes"], ["MISSING_HOME_LINEUP"]
+        )
+        self.assertEqual(scorer.call_count, 0)
+
     def test_ranked_output_preserves_side_specific_raw_schedule_quality_flags(self):
         game = _game(1)
 
@@ -632,7 +678,7 @@ class LiveTop3ServiceTests(unittest.TestCase):
             feature_builder=feature,
         )["unscored_games"][0]
         self.assertEqual(feature.call_count, 0)
-        self.assertEqual(row["reason_codes"], ["INVALID_HOME_LINEUP"])
+        self.assertEqual(row["reason_codes"], ["MISSING_HOME_LINEUP"])
         self.assertNotIn("pick_probability", row)
         self.assertNotIn("rank", row)
 
