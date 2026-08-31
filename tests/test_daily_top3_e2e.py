@@ -656,6 +656,12 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                     "unknown" if index == 6 else 9004 if index == 4 else expected_away
                 )
                 observed_home = "unknown" if index == 6 else expected_home
+                first_away_count = "unknown" if index == 6 else 0
+                first_home_count = "unknown" if index == 6 else 0
+                complete_away_count = "unknown" if index == 6 else 9
+                complete_home_count = (
+                    "unknown" if index == 6 else 0 if index == 5 else 9
+                )
                 first_block = game_block(first_readiness_text, game_pk)
                 middle_block = game_block(middle_readiness_text, game_pk)
                 last_block = game_block(last_readiness_text, game_pk)
@@ -665,16 +671,22 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                     self.assertIn(f"- Expected home starter ID: `{expected_home}`", first_block)
                     self.assertIn("- Observed away pitcher-list ID: `unknown`", first_block)
                     self.assertIn("- Observed home pitcher-list ID: `unknown`", first_block)
+                    self.assertIn(f"- Validated away lineup count: `{first_away_count}`", first_block)
+                    self.assertIn(f"- Validated home lineup count: `{first_home_count}`", first_block)
                 with self.subTest(game_pk=game_pk, observation="complete"):
                     self.assertIn(f"- Expected away starter ID: `{expected_away}`", middle_block)
                     self.assertIn(f"- Expected home starter ID: `{expected_home}`", middle_block)
                     self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", middle_block)
                     self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", middle_block)
+                    self.assertIn(f"- Validated away lineup count: `{complete_away_count}`", middle_block)
+                    self.assertIn(f"- Validated home lineup count: `{complete_home_count}`", middle_block)
                 with self.subTest(game_pk=game_pk, observation="changed-final-schedule"):
                     self.assertIn(f"- Expected away starter ID: `{expected_away}`", last_block)
                     self.assertIn(f"- Expected home starter ID: `{expected_home}`", last_block)
                     self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", last_block)
                     self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", last_block)
+                    self.assertIn(f"- Validated away lineup count: `{complete_away_count}`", last_block)
+                    self.assertIn(f"- Validated home lineup count: `{complete_home_count}`", last_block)
                     self.assertIn("PROBABLE\\_PITCHER\\_CHANGED", last_block)
             self.assertNotEqual(first_json, middle_json)
             self.assertNotEqual(middle_json, last_json)
