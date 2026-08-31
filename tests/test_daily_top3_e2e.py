@@ -508,13 +508,33 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             )
             self.assertTrue(first_json.is_file())
             self.assertTrue(first_markdown.is_file())
+            first_readiness = first_json.with_suffix(".readiness.md")
+            second_readiness = second_json.with_suffix(".readiness.md")
+            self.assertTrue(first_readiness.is_file())
             self.assertTrue(second_json.is_file())
             self.assertTrue(second_markdown.is_file())
+            self.assertTrue(second_readiness.is_file())
             self.assertEqual(json.loads(first_json.read_bytes()), payload)
             self.assertEqual(first_json.read_bytes(), canonical_json_bytes(payload))
             self.assertEqual(second_json.read_bytes(), canonical_json_bytes(payload))
             self.assertEqual(first_markdown.read_bytes(), daily_top3.render_live_top3_markdown(payload))
             self.assertEqual(hashlib.sha256(first_markdown.read_bytes()).hexdigest(), GOLDEN_MARKDOWN_SHA256)
+            readiness = first_readiness.read_text(encoding="utf-8")
+            self.assertIn("PARTICIPANT COMPLETENESS IS NOT SCORE READINESS", readiness)
+            self.assertIn("not listed in ranked output", readiness)
+            self.assertIn("Validated away lineup count: `9`", readiness)
+            self.assertIn("Validated home lineup count: `0`", readiness)
+            self.assertIn("Validated away lineup count: `unknown`", readiness)
+            self.assertIn(f"Primary report filename: `{first_json.name}`", readiness)
+            self.assertIn(f"Primary report content_sha256: `{payload['content_sha256']}`", readiness)
+            self.assertIn(f"Model card SHA-256: `{payload['model_card_sha256']}`", readiness)
+            for binding in payload["source_bindings"]:
+                if binding["binding_role"] in {"LIVE_PARTICIPANTS", "FINAL_SCHEDULE"}:
+                    self.assertIn(binding["observation_id"], readiness)
+                    self.assertIn(binding["durable_at_utc"], readiness)
+                    self.assertIn(binding["binding_sha256"], readiness)
+                    self.assertIn(binding["payload_sha256"], readiness)
+                    self.assertIn(binding["receipt_sha256"], readiness)
             self.assertEqual(first_json.name, f"20260721T160000Z-{GOLDEN_CONTENT_SHA256[:16]}.json")
             self.assertEqual(first_markdown.name, f"20260721T160000Z-{GOLDEN_CONTENT_SHA256[:16]}.md")
             self.assertEqual([result[4] for result in results], [8, 8])
@@ -564,16 +584,20 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 observation_id_factory=observation_ids,
             )
             first_json_bytes = first_json.read_bytes()
+            first_readiness = first_json.with_suffix(".readiness.md")
+            first_readiness_bytes = first_readiness.read_bytes()
             middle, middle_json, _middle_markdown, _ = self.run_fixture(
                 root,
                 fetcher=fetcher,
                 observation_id_factory=observation_ids,
             )
+            middle_readiness = middle_json.with_suffix(".readiness.md")
             last, last_json, _last_markdown, _ = self.run_fixture(
                 root,
                 fetcher=fetcher,
                 observation_id_factory=observation_ids,
             )
+            last_readiness = last_json.with_suffix(".readiness.md")
 
             self.assertEqual(first["preliminary_top3"], [])
             self.assertEqual(last["preliminary_top3"], [])
@@ -609,6 +633,15 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertNotEqual(middle_ids, last_ids)
             self.assertNotEqual(first_ids, last_ids)
             self.assertEqual(first_json.read_bytes(), first_json_bytes)
+            self.assertEqual(first_readiness.read_bytes(), first_readiness_bytes)
+            self.assertTrue(middle_readiness.is_file())
+            self.assertTrue(last_readiness.is_file())
+            self.assertNotEqual(first_readiness_bytes, middle_readiness.read_bytes())
+            self.assertNotEqual(middle_readiness.read_bytes(), last_readiness.read_bytes())
+            self.assertNotEqual(first_readiness_bytes, last_readiness.read_bytes())
+            self.assertIn("Validated away lineup count: `0`", first_readiness.read_text(encoding="utf-8"))
+            self.assertIn("Validated away lineup count: `9`", middle_readiness.read_text(encoding="utf-8"))
+            self.assertIn("PROBABLE\\_PITCHER\\_CHANGED", last_readiness.read_text(encoding="utf-8"))
             self.assertNotEqual(first_json, middle_json)
             self.assertNotEqual(middle_json, last_json)
 

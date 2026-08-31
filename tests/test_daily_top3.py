@@ -32,6 +32,94 @@ def _rehash(payload):
 
 
 class DailyTop3Tests(unittest.TestCase):
+    def test_readiness_renderer_binds_observations_without_inventing_values(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _participants, _slate
+
+        first = _game(1)
+        first["away_team"] = "Away | <Club>"
+        first["away_probable_pitcher_name"] = "Expected [Away]"
+        second = _game(2)
+        slate = _slate(
+            (first, second),
+            participants={2: _participants(2)},
+        )
+        payload = _build(slate, _final_observer((first, second)))
+
+        rendered = daily_top3.render_live_pregame_readiness_markdown(slate, payload)
+
+        self.assertIsInstance(rendered, str)
+        self.assertIn("RESEARCH ONLY", rendered)
+        self.assertIn("PARTICIPANT COMPLETENESS IS NOT SCORE READINESS", rendered)
+        self.assertIn("NOT A BETTING RECOMMENDATION", rendered)
+        self.assertIn("Away \\| &lt;Club&gt;", rendered)
+        self.assertIn("Expected \\[Away\\]", rendered)
+        self.assertIn("Expected away starter ID: `501`", rendered)
+        self.assertIn("Observed away pitcher-list ID: `unknown`", rendered)
+        self.assertIn("Validated away lineup count: `unknown`", rendered)
+        self.assertIn("Validated away lineup count: `9`", rendered)
+        self.assertIn("not listed in ranked output", rendered)
+        self.assertIn("Primary report content_sha256:", rendered)
+        self.assertIn("Model card SHA-256:", rendered)
+        participant_binding = next(
+            binding for binding in payload["source_bindings"]
+            if binding["binding_role"] == "LIVE_PARTICIPANTS" and binding["game_pks"] == [2]
+        )
+        for value in (
+            participant_binding["observation_id"],
+            participant_binding["durable_at_utc"],
+            participant_binding["binding_sha256"],
+            participant_binding["payload_sha256"],
+            participant_binding["receipt_sha256"],
+        ):
+            self.assertIn(value, rendered)
+
+    def test_readiness_persistence_is_exclusive_and_preserves_primary_report(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            json_path, markdown_path = daily_top3.persist_live_top3_report(root, payload)
+            original = {path: path.read_bytes() for path in (json_path, markdown_path)}
+            readiness = root / daily_top3._readiness_relative_path(payload)
+            with open_trusted_root(root) as trusted:
+                written = daily_top3._persist_bound_live_pregame_readiness_report(
+                    root, trusted, slate, payload
+                )
+            self.assertEqual(written, readiness)
+            original_readiness = readiness.read_bytes()
+            with self.assertRaises(FileExistsError):
+                with open_trusted_root(root) as trusted:
+                    daily_top3._persist_bound_live_pregame_readiness_report(
+                        root, trusted, slate, payload
+                    )
+            self.assertEqual(readiness.read_bytes(), original_readiness)
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+
+    def test_readiness_persistence_failure_leaves_primary_report_intact(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            json_path, markdown_path = daily_top3.persist_live_top3_report(root, payload)
+            original = {path: path.read_bytes() for path in (json_path, markdown_path)}
+            with mock.patch.object(daily_top3, "write_exclusive", side_effect=OSError("injected readiness failure")):
+                with self.assertRaises(OSError):
+                    with open_trusted_root(root) as trusted:
+                        daily_top3._persist_bound_live_pregame_readiness_report(
+                            root, trusted, slate, payload
+                        )
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+            self.assertFalse((root / daily_top3._readiness_relative_path(payload)).exists())
+
     def test_parse_args_defaults_date_in_eastern_time(self):
         from mlb_backtest import daily_top3
 
@@ -244,6 +332,11 @@ class DailyTop3Tests(unittest.TestCase):
                     "_persist_bound_live_top3_report",
                     return_value=expected_paths,
                 ) as persist,
+                mock.patch.object(
+                    daily_top3,
+                    "_persist_bound_live_pregame_readiness_report",
+                    return_value=root / "readiness.md",
+                ) as persist_readiness,
             ):
                 result = daily_top3.run_daily_top3(
                     root,
@@ -262,6 +355,9 @@ class DailyTop3Tests(unittest.TestCase):
         self.assertIsNotNone(final.call_args.kwargs["expected_root_binding"])
         self.assertEqual(persist.call_args.args[0], root)
         self.assertEqual(persist.call_args.args[2], {"payload": "validated"})
+        self.assertEqual(persist_readiness.call_args.args[0], root)
+        self.assertEqual(persist_readiness.call_args.args[2], slate)
+        self.assertEqual(persist_readiness.call_args.args[3], {"payload": "validated"})
 
     def test_main_does_not_persist_when_integrity_validation_fails(self):
         from mlb_backtest import daily_top3
