@@ -428,6 +428,14 @@ def _readiness_observed(participant: object, side: str) -> tuple[str, str]:
     return id_text, count_text
 
 
+def _readiness_classification(row: Mapping[str, object] | None) -> str:
+    if row is None:
+        return "not listed in ranked output"
+    if "rank" in row:
+        return f'{row["state"]} (rank {row["rank"]})'
+    return f'{row["state"]} (not ranked)'
+
+
 def render_live_pregame_readiness_markdown(
     slate: object, validated_payload: Mapping[str, object]
 ) -> str:
@@ -491,12 +499,7 @@ def render_live_pregame_readiness_markdown(
                     f'Away: {_readiness_expected(game, "away")}; Home: {_readiness_expected(game, "home")}',
                     f'Away: {_readiness_observed(participants.get(int(game["game_pk"])), "away")[0]}; Home: {_readiness_observed(participants.get(int(game["game_pk"])), "home")[0]}',
                     f'Away: {_readiness_observed(participants.get(int(game["game_pk"])), "away")[1]}; Home: {_readiness_observed(participants.get(int(game["game_pk"])), "home")[1]}',
-                    (
-                        f'{rows_by_game[int(game["game_pk"])] ["state"]} '
-                        f'(rank {rows_by_game[int(game["game_pk"])] ["rank"]})'
-                        if "rank" in rows_by_game.get(int(game["game_pk"]), {})
-                        else "not listed in ranked output"
-                    ),
+                    _readiness_classification(rows_by_game.get(int(game["game_pk"]))),
                 )
                 for game in games
             ],
@@ -510,15 +513,8 @@ def render_live_pregame_readiness_markdown(
         observed_away, count_away = _readiness_observed(participant, "away") if participant_binding else ("unknown", "unknown")
         observed_home, count_home = _readiness_observed(participant, "home") if participant_binding else ("unknown", "unknown")
         row = rows_by_game.get(game_pk)
-        if row is None:
-            classification = "not listed in ranked output"
-            reasons = "none"
-        elif "rank" in row:
-            classification = f'{row["state"]} (rank {row["rank"]})'
-            reasons = _reason_text(row)
-        else:
-            classification = "not listed in ranked output"
-            reasons = _reason_text(row)
+        classification = _readiness_classification(row)
+        reasons = "none" if row is None else _reason_text(row)
         sections.extend(
             (
                 "",

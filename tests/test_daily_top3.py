@@ -32,6 +32,48 @@ def _rehash(payload):
 
 
 class DailyTop3Tests(unittest.TestCase):
+    def test_readiness_renderer_preserves_recorded_unranked_states_and_missing_rows(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import (
+            _build,
+            _final_observer,
+            _game,
+            _participants,
+            _slate,
+        )
+
+        unscored = _game(1)
+        excluded = _game(2, status="Unknown")
+        no_row = _game(3)
+        unscored_participant = _participants(
+            1, complete=False, reasons=("MISSING_HOME_LINEUP",), home_lineup=()
+        )
+        payload_slate = _slate(
+            (unscored, excluded),
+            participants={
+                1: unscored_participant,
+                2: _participants(2),
+            },
+        )
+        payload = _build(payload_slate, _final_observer((unscored, excluded)))
+        readiness_slate = _slate(
+            (unscored, excluded, no_row),
+            participants={
+                1: unscored_participant,
+                2: _participants(2),
+                3: _participants(3),
+            },
+        )
+
+        rendered = daily_top3.render_live_pregame_readiness_markdown(
+            readiness_slate, payload
+        )
+
+        self.assertEqual(rendered.count("UNSCORED \\(not ranked\\)"), 2)
+        self.assertEqual(rendered.count("EXCLUDED \\(not ranked\\)"), 2)
+        self.assertIn("MISSING\\_HOME\\_LINEUP", rendered)
+        self.assertEqual(rendered.count("not listed in ranked output"), 2)
+
     def test_readiness_renderer_binds_observations_without_inventing_values(self):
         from mlb_backtest import daily_top3
         from tests.test_live_top3_service import _build, _final_observer, _game, _participants, _slate
@@ -58,7 +100,7 @@ class DailyTop3Tests(unittest.TestCase):
         self.assertIn("Observed away pitcher-list ID: `unknown`", rendered)
         self.assertIn("Validated away lineup count: `unknown`", rendered)
         self.assertIn("Validated away lineup count: `9`", rendered)
-        self.assertIn("not listed in ranked output", rendered)
+        self.assertIn("UNSCORED \\(not ranked\\)", rendered)
         self.assertIn("Primary report content_sha256:", rendered)
         self.assertIn("Model card SHA-256:", rendered)
         participant_binding = next(
