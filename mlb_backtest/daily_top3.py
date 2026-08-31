@@ -274,9 +274,19 @@ def _reason_text(row: Mapping[str, object]) -> str:
     return "; ".join(str(value) for value in row["reason_codes"]) or "none"
 
 
+def _schedule_quality_flags_text(row: Mapping[str, object]) -> str:
+    flags = row.get("schedule_quality_flags")
+    if flags is None:
+        return "not recorded"
+    return "; ".join(
+        f"{side}: {', '.join(flags[side]) or 'none'}"
+        for side in ("away", "home")
+    )
+
+
 def _ranked_table(rows: Sequence[Mapping[str, object]]) -> str:
     return _markdown_table(
-        ("Rank", "Game", "Pick", "Probability", "Completeness", "Start (UTC)", "Reasons"),
+        ("Rank", "Game", "Pick", "Probability", "Completeness", "Start (UTC)", "Reasons", "Schedule quality flags"),
         [
             (
                 row["rank"],
@@ -286,6 +296,7 @@ def _ranked_table(rows: Sequence[Mapping[str, object]]) -> str:
                 f'{float(row["data_completeness"]):.1%}',
                 row["scheduled_start_utc"],
                 _reason_text(row),
+                _schedule_quality_flags_text(row),
             )
             for row in rows
         ],

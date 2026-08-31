@@ -843,6 +843,14 @@ def build_live_top3_run(
                 "scheduled_start_utc": game["scheduled_start_utc"],
                 "observation_boundary_utc": boundary_utc,
                 "reason_codes": sorted(set(participant.reason_codes)),
+                "schedule_quality_flags": {
+                    side: sorted(
+                        set(
+                            raw.get(side, {}).get("schedule", {}).get("flags", [])
+                        )
+                    )
+                    for side in ("away", "home")
+                },
                 "model_card_sha256": card.file_sha256,
                 "feature_sha256": hashlib.sha256(
                     canonical_json_bytes(raw)

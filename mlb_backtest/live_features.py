@@ -88,20 +88,24 @@ def _validate_venue_authority(
         latitude = reference["venue_latitude"]
         longitude = reference["venue_longitude"]
         time_zone = reference["time_zone"]
+        missing_coordinates = latitude is None and longitude is None
         if (
             not isinstance(name, str)
             or not name
             or name in by_name
             or not isinstance(city, str)
             or not city
-            or isinstance(latitude, bool)
-            or not isinstance(latitude, (int, float))
-            or not math.isfinite(float(latitude))
-            or not -90 <= float(latitude) <= 90
-            or isinstance(longitude, bool)
-            or not isinstance(longitude, (int, float))
-            or not math.isfinite(float(longitude))
-            or not -180 <= float(longitude) <= 180
+            or not missing_coordinates
+            and (
+                isinstance(latitude, bool)
+                or not isinstance(latitude, (int, float))
+                or not math.isfinite(float(latitude))
+                or not -90 <= float(latitude) <= 90
+                or isinstance(longitude, bool)
+                or not isinstance(longitude, (int, float))
+                or not math.isfinite(float(longitude))
+                or not -180 <= float(longitude) <= 180
+            )
             or not isinstance(time_zone, str)
             or not time_zone
         ):
@@ -114,8 +118,8 @@ def _validate_venue_authority(
         by_name[name] = {
             "venue_id": venue_id,
             "city": city,
-            "latitude": float(latitude),
-            "longitude": float(longitude),
+            "latitude": None if missing_coordinates else float(latitude),
+            "longitude": None if missing_coordinates else float(longitude),
             "time_zone": time_zone,
         }
     return detached_by_id, by_name

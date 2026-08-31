@@ -2016,6 +2016,15 @@ class LiveHistoryTests(unittest.TestCase):
         parsed = live_history._parse_venue(payload, 1)
         self.assertEqual(parsed["time_zone"], "America/Los_Angeles")
 
+    def test_venue_reference_preserves_paired_missing_coordinates_from_mlb_response(self):
+        payload = (Path(__file__).parent / "fixtures" / "venue_5340_missing_coordinates.json").read_bytes()
+
+        parsed = live_history._parse_venue(payload, 5340)
+
+        self.assertIsNone(parsed["venue_latitude"])
+        self.assertIsNone(parsed["venue_longitude"])
+        self.assertEqual(parsed["time_zone"], "America/Mexico_City")
+
     def test_venue_request_uses_location_and_timezone_hydration(self):
         calls = []
         delegate = _history_fetcher()

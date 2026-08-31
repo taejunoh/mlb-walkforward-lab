@@ -106,6 +106,7 @@ RANKED_ROW_KEYS = frozenset(
         "source_binding_sha256s",
     }
 )
+OPTIONAL_RANKED_ROW_KEYS = frozenset({"schedule_quality_flags"})
 
 UNRANKED_ROW_KEYS = frozenset(
     {
@@ -504,7 +505,9 @@ def _validate_ranked(
         raise IntegrityError("ranked population must contain at most three rows")
     ranks: list[int] = []
     for row in value:
-        if not isinstance(row, Mapping) or set(row) != RANKED_ROW_KEYS:
+        if not isinstance(row, Mapping) or not (
+            RANKED_ROW_KEYS <= set(row) <= RANKED_ROW_KEYS | OPTIONAL_RANKED_ROW_KEYS
+        ):
             raise IntegrityError("ranked row fields differ")
         if row["state"] != state:
             raise IntegrityError("ranked row state differs")
@@ -527,9 +530,21 @@ def _validate_ranked(
         if row["model_card_sha256"] != model_card_sha256:
             raise IntegrityError("ranked row model card differs")
         _validate_sha(row["feature_sha256"], "feature_sha256")
+        if "schedule_quality_flags" in row:
+            _validate_schedule_quality_flags(row["schedule_quality_flags"])
         _validate_ranked_bindings(row, bindings)
     if sorted(ranks) != list(range(1, len(ranks) + 1)):
         raise IntegrityError("ranked population ranks must be independent 1..N")
+
+
+def _validate_schedule_quality_flags(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"away", "home"}:
+        raise IntegrityError("schedule quality flags differ")
+    for side in ("away", "home"):
+        flags = value[side]
+        _validate_string_array(flags, "schedule quality flags")
+        if flags != sorted(flags):
+            raise IntegrityError("schedule quality flags must be sorted")
 
 
 def _validate_ranked_bindings(

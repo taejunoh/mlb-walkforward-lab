@@ -629,6 +629,52 @@ class LiveFeatureTests(unittest.TestCase):
         self.assertEqual(historical["away"]["schedule"]["quality"], 5 / 6)
         self.assertEqual(live, historical)
 
+    def test_paired_missing_target_coordinates_keep_game_and_neutralize_travel_quality(self):
+        references = {
+            **dict(_bundle().venue_references),
+            44: {
+                "venue_name": "West Park",
+                "venue_city": "Los Angeles",
+                "venue_latitude": 34.0522,
+                "venue_longitude": -118.2437,
+                "time_zone": "America/Los_Angeles",
+            },
+        }
+        complete = _bundle(
+            feature_history=_travel_history(), venue_references=references
+        )
+        missing_references = {
+            **references,
+            33: {
+                **references[33],
+                "venue_latitude": None,
+                "venue_longitude": None,
+            },
+        }
+        missing = _bundle(
+            feature_history=_travel_history(), venue_references=missing_references
+        )
+
+        complete_raw = build_live_raw_game_features(
+            _participants(), _final(), complete, {501: 1, 601: 2}
+        )
+        missing_raw = build_live_raw_game_features(
+            _participants(), _final(), missing, {501: 1, 601: 2}
+        )
+
+        self.assertTrue(missing_raw["eligible"])
+        self.assertEqual(
+            missing_raw["away"]["schedule"]["flags"][:2],
+            [
+                "travel_neutral_missing_venue_coordinates",
+                "time_zones_neutral_missing_venue_coordinates",
+            ],
+        )
+        self.assertLess(
+            missing_raw["away"]["schedule"]["quality"],
+            complete_raw["away"]["schedule"]["quality"],
+        )
+
     def test_starter_conflict_and_partial_lineup_fail_closed(self):
         cases = (
             (
@@ -723,6 +769,33 @@ class LiveFeatureTests(unittest.TestCase):
                     _bundle(venue_references=venue_references),
                     {501: 1, 601: 2},
                 )
+
+    def test_venue_authority_preserves_paired_missing_coordinates_without_nan(self):
+        missing = {
+            "venue_name": "Mexico City Park",
+            "venue_city": "Mexico City",
+            "venue_latitude": None,
+            "venue_longitude": None,
+            "time_zone": "America/Mexico_City",
+        }
+        complete = dict(_bundle().venue_references[33])
+
+        by_id, by_name = live_features._validate_venue_authority(
+            {33: complete, 5340: missing}
+        )
+
+        self.assertIsNone(by_id[5340]["venue_latitude"])
+        self.assertIsNone(by_name["Mexico City Park"]["latitude"])
+        self.assertEqual(
+            canonical_json_bytes(by_id),
+            canonical_json_bytes(json.loads(canonical_json_bytes(by_id))),
+        )
+        for bad_pair in ((float("nan"), float("nan")), (None, -99.0)):
+            invalid = {**missing, "venue_latitude": bad_pair[0], "venue_longitude": bad_pair[1]}
+            with self.subTest(coordinates=bad_pair), self.assertRaisesRegex(
+                ValueError, "INVALID_VENUE_REFERENCE"
+            ):
+                live_features._validate_venue_authority({5340: invalid})
 
     def test_target_or_future_history_is_rejected_instead_of_silently_bounded(self):
         for day in (TARGET, "2025-05-02"):

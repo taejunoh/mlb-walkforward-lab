@@ -496,6 +496,30 @@ class LiveTop3ContractTests(unittest.TestCase):
         Draft202012Validator.check_schema(schema)
         validate(payload, schema)
 
+    def test_ranked_schedule_quality_flags_are_optional_but_closed_when_present(self):
+        payload = valid_payload()
+        row = payload["preliminary_top3"][0]
+        row["schedule_quality_flags"] = {
+            "away": ["travel_neutral_missing_venue_coordinates"],
+            "home": [],
+        }
+        self.assertEqual(validate_run_payload(rehash(payload)), payload)
+        schema = json.loads(
+            (Path(__file__).parents[1] / "schemas" / "experimental_daily_top3.schema.json").read_text()
+        )
+        validate(payload, schema)
+
+        for value in (
+            {"away": [], "home": [], "extra": []},
+            {"away": ["z", "a"], "home": []},
+            {"away": ["same", "same"], "home": []},
+            {"away": [1], "home": []},
+        ):
+            candidate = valid_payload()
+            candidate["preliminary_top3"][0]["schedule_quality_flags"] = value
+            with self.subTest(value=value), self.assertRaises(IntegrityError):
+                validate_run_payload(rehash(candidate))
+
     def test_schema_closes_query_identity_and_normalizes_posix_paths(self):
         schema_path = Path(__file__).parents[1] / "schemas" / "experimental_daily_top3.schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))

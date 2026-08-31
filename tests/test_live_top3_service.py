@@ -466,6 +466,25 @@ def _build(
 
 
 class LiveTop3ServiceTests(unittest.TestCase):
+    def test_ranked_output_preserves_side_specific_raw_schedule_quality_flags(self):
+        game = _game(1)
+
+        def feature(*args, **kwargs):
+            raw = _raw(*args, **kwargs)
+            raw["away"]["schedule"] = {"flags": ["away_flag", "away_flag"]}
+            raw["home"]["schedule"] = {"flags": ["home_flag"]}
+            return raw
+
+        result = _build(
+            _slate((game,)), _final_observer((game,)), feature_builder=feature
+        )
+
+        self.assertEqual(
+            result["preliminary_top3"][0]["schedule_quality_flags"],
+            {"away": ["away_flag"], "home": ["home_flag"]},
+        )
+        self.assertEqual(validate_run_payload(result), result)
+
     def test_prepares_history_once_and_reuses_authority_for_fifteen_games(self):
         game_pks = tuple(range(901, 916))
         games = tuple(

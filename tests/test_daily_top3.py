@@ -72,6 +72,27 @@ class DailyTop3Tests(unittest.TestCase):
         self.assertNotIn("Probability", unscored)
         self.assertNotIn("Rank", unscored)
 
+    def test_renderer_distinguishes_legacy_missing_schedule_flags_from_empty_flags(self):
+        from mlb_backtest import daily_top3
+
+        legacy = _payload()
+        legacy["preliminary_top3"][0].pop("schedule_quality_flags")
+        _rehash(legacy)
+        rendered_legacy = daily_top3.render_live_top3_markdown(legacy).decode("utf-8")
+        current = _payload()
+        current["preliminary_top3"][0]["schedule_quality_flags"] = {
+            "away": [], "home": ["time_zones_neutral_missing_venue_coordinates"]
+        }
+        _rehash(current)
+        rendered_current = daily_top3.render_live_top3_markdown(current).decode("utf-8")
+
+        self.assertIn("Schedule quality flags", rendered_legacy)
+        self.assertIn("not recorded", rendered_legacy)
+        self.assertIn(
+            "away: none; home: time\\_zones\\_neutral\\_missing\\_venue\\_coordinates",
+            rendered_current,
+        )
+
     def test_persist_writes_validated_json_then_markdown_in_experimental_namespace(self):
         from mlb_backtest import daily_top3
 

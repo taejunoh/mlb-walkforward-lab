@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import stat
 import threading
@@ -1922,25 +1923,40 @@ def _parse_venue(payload: bytes, venue_id: int) -> dict[str, object]:
         values = root["venues"]
         raw = values[0]
         location = raw["location"]
-        coordinates = location["defaultCoordinates"]
         timezone_id = raw["timeZone"]["id"]
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise ValueError("venue reference is malformed") from exc
     if not isinstance(values, list) or len(values) != 1 or raw.get("id") != venue_id:
         raise ValueError("venue reference identity differs")
     name, city = raw.get("name"), location.get("city")
-    latitude, longitude = coordinates.get("latitude"), coordinates.get("longitude")
+    coordinates = location.get("defaultCoordinates")
     if not isinstance(name, str) or not name or not isinstance(city, str) or not city:
         raise ValueError("venue reference text differs")
-    if type(latitude) not in {int, float} or type(longitude) not in {int, float} or not -90 <= float(latitude) <= 90 or not -180 <= float(longitude) <= 180:
-        raise ValueError("venue reference coordinates differ")
+    if coordinates is None:
+        latitude = longitude = None
+    else:
+        try:
+            latitude, longitude = coordinates["latitude"], coordinates["longitude"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("venue reference coordinates differ") from exc
+        if (
+            isinstance(latitude, bool)
+            or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+            or not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            raise ValueError("venue reference coordinates differ")
     if not isinstance(timezone_id, str) or not timezone_id:
         raise ValueError("venue reference time zone differs")
     try:
         ZoneInfo(timezone_id)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("venue reference requires an IANA time zone") from exc
-    return {"venue_name": name, "venue_city": city, "venue_latitude": float(latitude), "venue_longitude": float(longitude), "time_zone": timezone_id}
+    return {"venue_name": name, "venue_city": city, "venue_latitude": None if latitude is None else float(latitude), "venue_longitude": None if longitude is None else float(longitude), "time_zone": timezone_id}
 
 
 def _load_or_fetch_venue_references(
