@@ -235,6 +235,43 @@ class ScoringCardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_prediction_weight_authority(self.spec, "A", fabricated)
 
+    def test_loader_rejects_path_aliases_before_reading_the_card(self) -> None:
+        card = seal_scoring_model_card(self.spec, self.payload())
+        expected = Path(card.path)
+        aliases = (
+            str(expected.parent.parent / "H22/../H23/scoring_model_card.json"),
+            str(expected.relative_to(expected.parents[2])),
+            str(expected).replace("/lane_a/", "//lane_a/"),
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                with patch.object(
+                    scoring_cards,
+                    "read_regular_bytes",
+                    side_effect=AssertionError("alias must fail before read"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "path"):
+                        load_scoring_model_card(self.spec, alias, card.artifact_sha256)
+
+    def test_resolver_rejects_descriptor_path_aliases_before_reload(self) -> None:
+        card = seal_scoring_model_card(self.spec, self.payload())
+        expected = Path(card.path)
+        aliases = (
+            str(expected.parent.parent / "H22/../H23/scoring_model_card.json"),
+            str(expected.relative_to(expected.parents[2])),
+            str(expected).replace("/lane_a/", "//lane_a/"),
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                descriptor = dataclasses.replace(card, path=alias)
+                with patch.object(
+                    scoring_cards,
+                    "load_scoring_model_card",
+                    side_effect=AssertionError("alias must fail before reload"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "path"):
+                        resolve_prediction_weight_authority(self.spec, "A", descriptor)
+
     def test_resolver_accepts_only_the_closed_model_card_presence_union(self) -> None:
         card = seal_scoring_model_card(self.spec, self.payload())
         for model_id, descriptor in (

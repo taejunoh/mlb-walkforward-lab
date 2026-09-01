@@ -66,11 +66,29 @@ class PredictionWeightAuthority:
         )
 
 
-def _lexical_absolute(path: Path) -> Path:
+def _require_canonical_absolute_path(path: Path | str, label: str) -> Path:
+    """Reject aliases before any filesystem operation can observe them."""
     try:
-        return Path(os.path.abspath(os.fspath(path)))
+        raw = os.fspath(path)
     except (TypeError, ValueError) as exc:
-        raise ValueError("scoring card path differs") from exc
+        raise ValueError(f"{label} path differs") from exc
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{label} path differs")
+    candidate = Path(raw)
+    if (
+        not candidate.is_absolute()
+        or raw != str(candidate)
+        or raw != os.path.normpath(raw)
+    ):
+        raise ValueError(f"{label} path differs")
+    return candidate
+
+
+def _require_exact_card_path(path: Path | str, expected: Path, label: str) -> Path:
+    provided = _require_canonical_absolute_path(path, label)
+    if str(provided) != str(expected):
+        raise ValueError(f"{label} path differs")
+    return provided
 
 
 def _payload_card(payload: Mapping[str, object]) -> ScoringModelCard:
@@ -169,13 +187,14 @@ def seal_scoring_model_card(
 
 
 def load_scoring_model_card(
-    spec: ModelImprovementRunSpec, path: Path, expected_sha256: str
+    spec: ModelImprovementRunSpec, path: Path | str, expected_sha256: str
 ) -> ScoringModelCard:
     """Securely load one canonical, sidecar-bound scoring-card descriptor."""
     if not isinstance(spec, ModelImprovementRunSpec):
         raise ValueError("scoring card requires ModelImprovementRunSpec")
     expected = _require_sha256(expected_sha256, "expected scoring card sha256")
-    raw = read_regular_bytes(path, "scoring card")
+    provided_path = _require_canonical_absolute_path(path, "scoring card")
+    raw = read_regular_bytes(provided_path, "scoring card")
     actual = sha256(raw).hexdigest()
     if actual != expected:
         raise ValueError("scoring card digest differs")
@@ -189,11 +208,10 @@ def load_scoring_model_card(
     if values["schema"] != _SCHEMA:
         raise ValueError("scoring card schema differs")
     payload = {key: values[key] for key in _PAYLOAD_FIELDS}
-    card = ScoringModelCard.from_payload_mapping(payload, actual, str(path))
+    card = ScoringModelCard.from_payload_mapping(payload, actual, str(provided_path))
     _validate_bindings(spec, card)
     expected_path = scoring_model_card_path(spec, payload)
-    if _lexical_absolute(path) != _lexical_absolute(expected_path):
-        raise ValueError("scoring card derived path differs")
+    _require_exact_card_path(provided_path, expected_path, "scoring card derived")
     _load_sidecar(
         expected_path.with_suffix(expected_path.suffix + ".sha256"),
         actual,
@@ -241,14 +259,17 @@ def resolve_prediction_weight_authority(
         scoring_card, ScoringModelCard
     ):
         raise ValueError("nonbaseline model requires a scoring card")
+    expected_path = scoring_model_card_path(spec, scoring_card.as_mapping())
+    provided_path = _require_exact_card_path(
+        scoring_card.path, expected_path, "scoring card descriptor"
+    )
     loaded = load_scoring_model_card(
-        spec, Path(scoring_card.path), scoring_card.artifact_sha256
+        spec, provided_path, scoring_card.artifact_sha256
     )
     if (
         loaded.as_mapping() != scoring_card.as_mapping()
         or loaded.artifact_sha256 != scoring_card.artifact_sha256
-        or _lexical_absolute(Path(loaded.path))
-        != _lexical_absolute(Path(scoring_card.path))
+        or loaded.path != scoring_card.path
     ):
         raise ValueError("scoring card descriptor reload differs")
     if loaded.model_id != model_id:
