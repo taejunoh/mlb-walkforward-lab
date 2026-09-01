@@ -95,7 +95,14 @@ def feature_row():
     return SealedFeatureRow(**row_values())
 
 
-def scoring_card(*, model_id="A", lane_id="A", fold_id="H23", candidate_id=None):
+def scoring_card(
+    *,
+    model_id="A",
+    lane_id="A",
+    fold_id="H23",
+    candidate_id=None,
+    parent_card_sha256=None,
+):
     return ScoringModelCard(
         model_id=model_id,
         lane_id=lane_id,
@@ -104,7 +111,7 @@ def scoring_card(*, model_id="A", lane_id="A", fold_id="H23", candidate_id=None)
         run_spec_sha256=SHA,
         source_gate_sha256=SHA,
         baseline_replay_sha256=SHA,
-        parent_card_sha256=None,
+        parent_card_sha256=parent_card_sha256,
         feature_seal_sha256=SHA,
         prediction_contract_sha256=SHA,
         calibration_card_sha256=SHA,
@@ -328,6 +335,28 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PredictionSeal.from_payload_mapping(payload, SHA_B, "predictions.json")
 
+    def test_prediction_seal_final_card_binding_is_fold_and_model_specific(self):
+        with self.assertRaises(ValueError):
+            PredictionSeal(
+                "lane_a/A/O19", "O19", "A", None, SHA, SHA, SHA, SHA_B, SHA,
+                SHA, SHA, SHA_B, "predictions.json",
+            )
+        with self.assertRaises(ValueError):
+            PredictionSeal(
+                "baseline/v5.1/H24", "H24", "v5.1", None, SHA, SHA, SHA, SHA_B,
+                SHA, SHA, SHA, SHA_B, "predictions.json",
+            )
+        with self.assertRaises(ValueError):
+            PredictionSeal(
+                "h24/A/H24", "H24", "A", None, SHA, SHA, SHA, SHA_B, SHA,
+                None, SHA, SHA_B, "predictions.json",
+            )
+        valid = PredictionSeal(
+            "h24/A/H24", "H24", "A", None, SHA, SHA, SHA, SHA_B, SHA,
+            SHA, SHA, SHA_B, "predictions.json",
+        )
+        self.assertEqual(valid.frozen_model_card_sha256, SHA)
+
     def test_scoring_card_round_trip_is_pre_prediction_and_recursively_immutable(self):
         card = scoring_card()
         payload = card.as_mapping()
@@ -354,6 +383,26 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     scoring_card(**kwargs)
+
+    def test_scoring_card_requires_the_declared_parent_for_h24_and_lane_c(self):
+        for kwargs in (
+            {"fold_id": "H24"},
+            {"model_id": "A+B+C", "lane_id": "C", "fold_id": "H22"},
+            {"model_id": "A+B+C", "lane_id": "C", "fold_id": "H23"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    scoring_card(**kwargs)
+        self.assertEqual(
+            scoring_card(fold_id="H24", parent_card_sha256=SHA).parent_card_sha256,
+            SHA,
+        )
+        self.assertEqual(
+            scoring_card(
+                model_id="A+B+C", lane_id="C", fold_id="H23", parent_card_sha256=SHA
+            ).parent_card_sha256,
+            SHA,
+        )
 
     def test_scoring_card_validates_optional_and_lane_b_candidate_digests(self):
         lane_b = ScoringModelCard(

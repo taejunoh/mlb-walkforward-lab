@@ -790,6 +790,14 @@ class ScoringModelCard:
             object.__setattr__(
                 self, field, _require_optional_sha256(getattr(self, field), field)
             )
+        if self.fold_id == "H24" and self.parent_card_sha256 is None:
+            raise ValueError("H24 scoring cards require a parent card digest")
+        if (
+            self.model_id == "A+B+C"
+            and self.fold_id in {"H22", "H23"}
+            and self.parent_card_sha256 is None
+        ):
+            raise ValueError("Lane C scoring cards require an A+B parent card digest")
         object.__setattr__(
             self, "parameters", _require_json_mapping(self.parameters, "parameters")
         )
@@ -858,8 +866,13 @@ class PredictionSeal:
                 self.frozen_model_card_sha256, "frozen_model_card_sha256"
             ),
         )
-        if self.fold_id in {"H22", "H23"} and self.frozen_model_card_sha256 is not None:
-            raise ValueError("H22/H23 prediction seals cannot bind a frozen card")
+        if self.fold_id != "H24" and self.frozen_model_card_sha256 is not None:
+            raise ValueError("only H24 prediction seals can bind a frozen card")
+        if self.fold_id == "H24":
+            if self.model_id == "v5.1" and self.frozen_model_card_sha256 is not None:
+                raise ValueError("H24 baseline prediction seals cannot bind a frozen card")
+            if self.model_id != "v5.1" and self.frozen_model_card_sha256 is None:
+                raise ValueError("H24 nonbaseline prediction seals require a frozen card")
         artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
         object.__setattr__(self, "path", path)
