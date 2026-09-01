@@ -786,6 +786,106 @@ class PredictionRow:
 
 
 @dataclass(frozen=True, slots=True)
+class PredictionRowV2:
+    """The calibrated, label-free baseline prediction row wire format."""
+
+    model_id: str
+    game_pk: int
+    official_date: str
+    target_year: int
+    p_home: float
+    picked_side: str
+    pick_probability: float
+    confidence: float
+    starter_edge_abs: float
+    scheduled_start_utc: str
+    rank: int
+    feature_row_sha256: str
+    prediction_contract_sha256: str
+    scoring_model_card_sha256: str
+    calibration_card_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.model_id != "v5.1":
+            raise ValueError("V2 prediction rows are baseline v5.1 only")
+        object.__setattr__(
+            self, "game_pk", _require_positive_int(self.game_pk, "game_pk")
+        )
+        object.__setattr__(
+            self, "official_date", _require_date(self.official_date, "official_date")
+        )
+        object.__setattr__(
+            self, "target_year", _require_year(self.target_year, "target_year")
+        )
+        object.__setattr__(
+            self, "p_home", _require_number(self.p_home, "p_home", 0.0, 1.0)
+        )
+        if self.picked_side not in PICKED_SIDES:
+            raise ValueError("unknown picked_side")
+        object.__setattr__(
+            self,
+            "pick_probability",
+            _require_number(self.pick_probability, "pick_probability", 0.0, 1.0),
+        )
+        object.__setattr__(
+            self,
+            "confidence",
+            _require_number(self.confidence, "confidence", 0.0, 10.0),
+        )
+        object.__setattr__(
+            self,
+            "starter_edge_abs",
+            _require_number(self.starter_edge_abs, "starter_edge_abs", 0.0),
+        )
+        object.__setattr__(
+            self,
+            "scheduled_start_utc",
+            _require_utc(self.scheduled_start_utc, "scheduled_start_utc"),
+        )
+        if (
+            isinstance(self.rank, bool)
+            or not isinstance(self.rank, int)
+            or (self.rank == 0) != (self.picked_side == "none")
+            or self.rank < 0
+        ):
+            raise ValueError("rank must be zero iff picked_side is none")
+        if self.p_home > 0.5:
+            expected_side, expected_probability = "home", self.p_home
+        elif self.p_home < 0.5:
+            expected_side, expected_probability = "away", 1.0 - self.p_home
+        else:
+            expected_side, expected_probability = "none", 0.5
+        if self.picked_side != expected_side:
+            raise ValueError("picked_side must match p_home direction")
+        if self.pick_probability != expected_probability:
+            raise ValueError("pick_probability must match p_home")
+        for field in (
+            "feature_row_sha256",
+            "prediction_contract_sha256",
+            "scoring_model_card_sha256",
+            "calibration_card_sha256",
+        ):
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
+
+    def as_mapping(self) -> dict[str, object]:
+        return {field: getattr(self, field) for field in self.__dataclass_fields__}
+
+    @classmethod
+    def from_payload_mapping(cls, payload: Mapping[str, object]) -> "PredictionRowV2":
+        return cls(
+            **dict(
+                _require_exact_mapping(
+                    payload,
+                    frozenset(cls.__dataclass_fields__),
+                    "V2 prediction row payload",
+                )
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ScoringModelCard:
     """The immutable pre-prediction scoring authority for one candidate/fold."""
 
@@ -1013,6 +1113,71 @@ class PredictionSeal:
         fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
         return cls(
             **dict(_require_exact_mapping(payload, fields, "prediction seal payload")),
+            artifact_sha256=artifact_sha256,
+            path=path,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionSealV2:
+    """The V2 baseline descriptor; V1 descriptors are inspection-only."""
+
+    schema: str
+    ledger_id: str
+    fold_id: str
+    model_id: str
+    run_spec_sha256: str
+    source_gate_sha256: str
+    feature_seal_sha256: str
+    prediction_contract_sha256: str
+    scoring_model_card_sha256: str
+    calibration_card_sha256: str
+    population_sha256: str
+    frozen_model_card_sha256: str | None
+    rows_sha256: str
+    artifact_sha256: str
+    path: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "MODEL_IMPROVEMENT_PREDICTION_SEAL_V2":
+            raise ValueError("unknown V2 prediction seal schema")
+        if self.fold_id not in FOLD_IDS - {"H24"} or self.model_id != "v5.1":
+            raise ValueError("V2 prediction seal is baseline Task8-only")
+        if self.ledger_id != f"baseline/v5.1/{self.fold_id}":
+            raise ValueError("V2 prediction seal ledger_id differs")
+        for field in (
+            "run_spec_sha256",
+            "source_gate_sha256",
+            "feature_seal_sha256",
+            "prediction_contract_sha256",
+            "scoring_model_card_sha256",
+            "calibration_card_sha256",
+            "population_sha256",
+            "rows_sha256",
+        ):
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
+        if self.frozen_model_card_sha256 is not None:
+            raise ValueError("V2 baseline prediction seals cannot bind a frozen card")
+        artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
+        object.__setattr__(self, "artifact_sha256", artifact_sha256)
+        object.__setattr__(self, "path", path)
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+            if field not in {"artifact_sha256", "path"}
+        }
+
+    @classmethod
+    def from_payload_mapping(
+        cls, payload: Mapping[str, object], artifact_sha256: str, path: str
+    ) -> "PredictionSealV2":
+        fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
+        return cls(
+            **dict(_require_exact_mapping(payload, fields, "V2 prediction seal payload")),
             artifact_sha256=artifact_sha256,
             path=path,
         )

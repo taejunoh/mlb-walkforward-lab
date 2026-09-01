@@ -7,7 +7,9 @@ from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard,
     MetricPrimitive,
     PredictionRow,
+    PredictionRowV2,
     PredictionSeal,
+    PredictionSealV2,
     QualityRecipe,
     ScoringModelCard,
     SealedFeatureRow,
@@ -466,6 +468,7 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         )
         self.assertEqual(valid.frozen_model_card_sha256, SHA)
 
+
     def test_scoring_card_round_trip_is_pre_prediction_and_recursively_immutable(self):
         card = scoring_card()
         payload = card.as_mapping()
@@ -596,6 +599,79 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
             with self.subTest(parameters=type(parameters).__name__):
                 with self.assertRaises(ValueError):
                     self.frozen_card(parameters=parameters)
+
+
+class PredictionV2ContractTests(unittest.TestCase):
+    """The executable V2 wire format is distinct from inspection-only V1."""
+
+    def prediction_row(self, **overrides):
+        values = {
+            "model_id": "v5.1",
+            "game_pk": 123,
+            "official_date": "2022-04-01",
+            "target_year": 2022,
+            "p_home": 0.6,
+            "picked_side": "home",
+            "pick_probability": 0.6,
+            "confidence": 0.2,
+            "starter_edge_abs": 1.0,
+            "scheduled_start_utc": "2022-04-01T19:10:00Z",
+            "rank": 1,
+            "feature_row_sha256": SHA,
+            "prediction_contract_sha256": SHA,
+            "scoring_model_card_sha256": SHA_B,
+            "calibration_card_sha256": "c" * 64,
+        }
+        return PredictionRowV2(**(values | overrides))
+
+    def prediction_seal(self, **overrides):
+        values = {
+            "schema": "MODEL_IMPROVEMENT_PREDICTION_SEAL_V2",
+            "ledger_id": "baseline/v5.1/O22",
+            "fold_id": "O22",
+            "model_id": "v5.1",
+            "run_spec_sha256": SHA,
+            "source_gate_sha256": SHA,
+            "feature_seal_sha256": SHA,
+            "prediction_contract_sha256": SHA,
+            "scoring_model_card_sha256": SHA_B,
+            "calibration_card_sha256": "c" * 64,
+            "population_sha256": SHA,
+            "frozen_model_card_sha256": None,
+            "rows_sha256": SHA,
+            "artifact_sha256": SHA_B,
+            "path": "prediction_seal.json",
+        }
+        return PredictionSealV2(**(values | overrides))
+
+    def test_v2_row_is_label_free_and_requires_calibration_card_binding(self):
+        row = self.prediction_row()
+        self.assertEqual(PredictionRowV2.from_payload_mapping(row.as_mapping()), row)
+        self.assertFalse({"label", "outcome", "result", "won", "score"} & set(row.as_mapping()))
+        with self.assertRaises(ValueError):
+            self.prediction_row(calibration_card_sha256="not-a-digest")
+        with self.assertRaises(ValueError):
+            PredictionRowV2.from_payload_mapping(row.as_mapping() | {"label": 1})
+
+    def test_v2_seal_is_baseline_only_and_binds_feature_and_calibration_cards(self):
+        seal = self.prediction_seal()
+        self.assertEqual(
+            PredictionSealV2.from_payload_mapping(
+                seal.as_mapping(), seal.artifact_sha256, seal.path
+            ),
+            seal,
+        )
+        self.assertNotIn("artifact_sha256", seal.as_mapping())
+        self.assertNotIn("path", seal.as_mapping())
+        for overrides in (
+            {"ledger_id": "baseline/v5.1/H24", "fold_id": "H24"},
+            {"ledger_id": "lane_a/A/O22", "model_id": "A"},
+            {"feature_seal_sha256": "not-a-digest"},
+            {"calibration_card_sha256": "not-a-digest"},
+            {"frozen_model_card_sha256": SHA},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self.prediction_seal(**overrides)
 
 
 class LaneDispositionTests(unittest.TestCase):

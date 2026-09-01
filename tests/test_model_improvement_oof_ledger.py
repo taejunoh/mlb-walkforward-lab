@@ -31,6 +31,7 @@ from mlb_backtest.model_improvement.source_gate import SourceGateReceipt
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC = ROOT / "tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json"
 SCHEMA = ROOT / "schemas/model_improvement/prediction_seal.schema.json"
+V2_SCHEMA = ROOT / "schemas/model_improvement/prediction_seal_v2.schema.json"
 SHA = "a" * 64
 WEIGHTS = {
     "starter": 35,
@@ -172,6 +173,38 @@ class OofLedgerDocumentationContractTest(unittest.TestCase):
             self.assertNotIn(obsolete, task7)
         self.assertIn("Outcomes derive internally from the verified SourceInventory → GameEvidence", task7)
         self.assertIn("open_h24_outcomes_once", task7)
+
+
+class PredictionV2PathContractTest(unittest.TestCase):
+    """V2 gets a separate baseline-only schema and exact namespace."""
+
+    def test_v2_schema_and_paths_are_closed_and_baseline_only(self):
+        from mlb_backtest.model_improvement.oof_ledger_v2 import prediction_paths_v2
+
+        raw = json.loads(SYNTHETIC.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            raw["outputs"]["root"] = temporary
+            spec = build_run_spec(raw)
+            paths = prediction_paths_v2(spec, "baseline/v5.1/O22")
+            self.assertEqual(paths.rows.name, "prediction_rows.jsonl")
+            self.assertEqual(paths.rows_sidecar.name, "prediction_rows.jsonl.sha256")
+            self.assertEqual(paths.seal.name, "prediction_seal.json")
+            self.assertEqual(paths.seal_sidecar.name, "prediction_seal.json.sha256")
+            self.assertIn("/oof/baseline/v5.1/O22/v2/", str(paths.seal))
+            for ledger_id in (
+                "baseline/v5.1/H24", "lane_a/A/O22", "baseline/v5.1/O22/extra",
+                "baseline/v5.1/../O22", "baseline/v5.1//O22",
+            ):
+                with self.subTest(ledger_id=ledger_id), self.assertRaises(ValueError):
+                    prediction_paths_v2(spec, ledger_id)
+
+        schema = json.loads(V2_SCHEMA.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+        self.assertEqual(schema["properties"]["schema"]["const"], "MODEL_IMPROVEMENT_PREDICTION_SEAL_V2")
+        self.assertIn("prediction_row_v2", schema["$defs"])
+        self.assertIn("calibration_card_sha256", schema["$defs"]["prediction_row_v2"]["required"])
+        self.assertIn("feature_seal_sha256", schema["required"])
+        self.assertIn("calibration_card_sha256", schema["required"])
 
 
 def _component_map(value):
