@@ -46,17 +46,26 @@ def _schedule(*, date: str, final: bool, game_type: str = "R", status: str | Non
 def _binding(
     *, role: str, observation_id: str, payload: bytes, payload_relative: Path
 ) -> SourceBinding:
-    url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R"
+    if role == "HISTORY_SCHEDULE":
+        url = (
+            "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R"
+            f"&startDate={CUTOFF[:4]}-01-01&endDate={CUTOFF}"
+        )
+    else:
+        url = (
+            "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R"
+            f"&startDate={TARGET}&endDate={TARGET}"
+        )
     identity = {"url": url}
     if role == "HISTORY_SCHEDULE":
-        identity["as_of_date"] = CUTOFF
+        identity.update(as_of_date=CUTOFF, start=f"{CUTOFF[:4]}-01-01", end=CUTOFF, gameType="R", role="history")
     else:
         identity["observation_id"] = observation_id
         identity["target_date"] = TARGET
     values: dict[str, object] = {
         "source": "stats_api",
         "binding_role": role,
-        "game_pks": [1001 if role == "HISTORY_SCHEDULE" else 2001],
+        "game_pks": [] if role == "HISTORY_SCHEDULE" else [2001],
         "observation_id": observation_id,
         "query_identity_json": canonical_json_bytes(identity).decode().strip(),
         "requested_url": url,
@@ -111,7 +120,12 @@ def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> Sourc
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     _write(root, payload_relative, payload)
     _write(root, manifest_relative, manifest_bytes)
-    _write(root, manifest_relative.with_name(manifest_relative.name[:-5] + ".sha256"), f"{manifest_digest}\n".encode())
+    if binding.binding_role == "HISTORY_SCHEDULE":
+        _write(
+            root,
+            manifest_relative.with_name(manifest_relative.name[:-5] + ".sha256"),
+            f"{manifest_digest}\n".encode(),
+        )
 
     values = asdict(binding)
     values["manifest_sha256"] = manifest_digest
@@ -171,7 +185,15 @@ def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> Sourc
             Path("audit/experimental_daily/live_observation_claims") / f"{binding.observation_id}.json",
             canonical_json_bytes(claim),
         )
-        receipt = {**receipt, "schema_version": 1, "manifest_relative": manifest_relative.as_posix(), "claim_relative": (Path("audit/experimental_daily/live_observation_claims") / f"{binding.observation_id}.json").as_posix(), "claim_sha256": hashlib.sha256(canonical_json_bytes(claim)).hexdigest(), "started_at_utc": binding.response_completed_at_utc}
+        receipt = {
+            **receipt,
+            "schema_version": 1,
+            "manifest_relative": manifest_relative.as_posix(),
+            "claim_relative": (Path("audit/experimental_daily/live_observation_claims") / f"{binding.observation_id}.json").as_posix(),
+            "claim_sha256": hashlib.sha256(canonical_json_bytes(claim)).hexdigest(),
+            "started_at_utc": binding.response_completed_at_utc,
+        }
+        receipt.pop("game_pks")
         receipt_bytes = canonical_json_bytes(receipt)
         receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
         values = asdict(bound)
@@ -261,6 +283,27 @@ def write_source_fixture(
     )
 
 
+def _replace_report_binding(
+    report_path: Path, role: str, updates: dict[str, object]
+) -> None:
+    report = json.loads(report_path.read_text())
+    bindings = []
+    for binding in report["source_bindings"]:
+        if binding["binding_role"] != role:
+            bindings.append(binding)
+            continue
+        replacement = {**binding, **updates}
+        replacement.pop("binding_sha256")
+        replacement["binding_sha256"] = hashlib.sha256(
+            canonical_json_bytes(replacement)
+        ).hexdigest()
+        bindings.append(replacement)
+    report["source_bindings"] = bindings
+    report.pop("content_sha256")
+    report["content_sha256"] = hashlib.sha256(canonical_json_bytes(report)).hexdigest()
+    report_path.write_bytes(canonical_json_bytes(report))
+
+
 class TotalsSourcesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
@@ -273,7 +316,7 @@ class TotalsSourcesTests(unittest.TestCase):
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
         fixture = write_source_fixture(self.root)
-        bundle = load_totals_sources(self.root, fixture.report)
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
         self.assertEqual(bundle.target_date, TARGET)
         self.assertEqual(bundle.cutoff_date, CUTOFF)
@@ -282,6 +325,62 @@ class TotalsSourcesTests(unittest.TestCase):
         self.assertEqual(bundle.history_identity.payload_relative, fixture.history_payload.relative_to(self.root).as_posix())
         self.assertEqual(bundle.live_identity.payload_relative, fixture.live_payload.relative_to(self.root).as_posix())
 
+    def test_loader_rejects_absolute_report_path(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root)
+
+        with self.assertRaisesRegex(ValueError, "report path"):
+            load_totals_sources(self.root, fixture.report)
+
+    def test_loader_rejects_live_sidecars_that_the_contract_does_not_define(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        report = json.loads(fixture.report.read_text())
+        live = next(
+            item for item in report["source_bindings"] if item["binding_role"] == "LIVE_SCHEDULE"
+        )
+        receipt = Path(live["receipt_relative"])
+        (self.root / receipt.with_suffix(".sha256")).write_bytes(b"0" * 64 + b"\n")
+
+        with self.assertRaisesRegex(ValueError, "unexpected sidecar"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_authenticated_non_mlb_request(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        report = json.loads(fixture.report.read_text())
+        history = next(
+            item for item in report["source_bindings"]
+            if item["binding_role"] == "HISTORY_SCHEDULE"
+        )
+        bad_url = history["requested_url"].replace("sportId=1", "sportId=2")
+        identity = json.loads(history["query_identity_json"])
+        identity["url"] = bad_url
+        _replace_report_binding(
+            fixture.report,
+            "HISTORY_SCHEDULE",
+            {
+                "requested_url": bad_url,
+                "final_url": bad_url,
+                "query_identity_json": canonical_json_bytes(identity).decode().strip(),
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "schedule request differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_requires_live_binding_population_to_match_parsed_games(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        _replace_report_binding(fixture.report, "LIVE_SCHEDULE", {"game_pks": [9999]})
+
+        with self.assertRaisesRegex(ValueError, "binding game_pks"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
     def test_loader_rejects_payload_mutation_after_report_validation(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
@@ -289,7 +388,7 @@ class TotalsSourcesTests(unittest.TestCase):
         fixture.history_payload.write_bytes(b"{}")
 
         with self.assertRaisesRegex(ValueError, "history schedule payload differs"):
-            load_totals_sources(self.root, fixture.report)
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
     def test_loader_requires_one_binding_for_each_schedule_role(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
@@ -306,21 +405,21 @@ class TotalsSourcesTests(unittest.TestCase):
         fixture.report.write_bytes(canonical_json_bytes(report))
 
         with self.assertRaisesRegex(ValueError, "duplicate observation id|exactly one HISTORY_SCHEDULE"):
-            load_totals_sources(self.root, fixture.report)
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
     def test_loader_rejects_non_regular_or_postgame_schedule_rows(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
         spring = write_source_fixture(self.root, history_game_type="S")
         with self.assertRaisesRegex(ValueError, "game type"):
-            load_totals_sources(self.root, spring.report)
+            load_totals_sources(self.root, spring.report.relative_to(self.root))
 
         self.temporary.cleanup()
         self.temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.root = Path(self.temporary.name)
         postgame = write_source_fixture(self.root, live_status="Final")
         with self.assertRaisesRegex(ValueError, "final game requires both scores|not pregame"):
-            load_totals_sources(self.root, postgame.report)
+            load_totals_sources(self.root, postgame.report.relative_to(self.root))
 
     def test_loader_rebinds_every_component_before_returning(self) -> None:
         from mlb_backtest import experimental_totals_sources
@@ -344,7 +443,9 @@ class TotalsSourcesTests(unittest.TestCase):
             payload = Path(binding["payload_relative"])
             query_digest = hashlib.sha256(binding["query_identity_json"].encode()).hexdigest()
             manifest = payload.with_name(f"{binding['payload_sha256']}.{query_digest}.manifest.json")
-            targets.extend((payload, manifest, manifest.with_name(manifest.name[:-5] + ".sha256")))
+            targets.extend((payload, manifest))
+            if role == "HISTORY_SCHEDULE":
+                targets.append(manifest.with_name(manifest.name[:-5] + ".sha256"))
 
         for target in targets:
             with self.subTest(component=target):
@@ -364,7 +465,7 @@ class TotalsSourcesTests(unittest.TestCase):
                 ):
                     with self.assertRaises(ValueError):
                         experimental_totals_sources.load_totals_sources(
-                            self.root, fixture.report
+                            self.root, fixture.report.relative_to(self.root)
                         )
                 self.assertTrue(mutated)
 

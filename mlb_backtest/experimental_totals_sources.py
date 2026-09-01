@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import parse_qsl, urlsplit
 
 from .experimental_totals import validate_final_games, validate_target_games
 from .live_sources import parse_live_schedule
@@ -20,7 +19,7 @@ from .secure_fs import (
     read_regular_snapshot,
     rebind_regular_snapshot,
 )
-from .sources import parse_schedule
+from .sources import OUT_OF_RANGE_UNPLAYED_STATUSES, parse_schedule
 
 
 _MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -49,8 +48,8 @@ class AdmittedSourceIdentity:
     completion_sidecar_sha256: str
     manifest_relative: str
     manifest_sha256: str
-    manifest_sidecar_relative: str
-    manifest_sidecar_sha256: str
+    manifest_sidecar_relative: str | None
+    manifest_sidecar_sha256: str | None
     payload_relative: str
     payload_sha256: str
     byte_length: int
@@ -75,16 +74,27 @@ def _totals_sources_test_hook(stage: str, relative: Path) -> None:
 def _relative_below(root: TrustedRoot, path: Path, label: str) -> Path:
     supplied = Path(path)
     if supplied.is_absolute():
-        try:
-            supplied = Path(os.path.abspath(supplied)).relative_to(root.path)
-        except ValueError as exc:
-            raise ValueError(f"{label} escapes root") from exc
+        raise ValueError(f"{label} is unsafe")
     if (
         not supplied.parts
         or any(part in {"", ".", ".."} or "\\" in part for part in supplied.parts)
     ):
         raise ValueError(f"{label} is unsafe")
     return supplied
+
+
+def _strict_relative(value: object, label: str) -> Path:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} differs")
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} or "\\" in part for part in path.parts)
+    ):
+        raise ValueError(f"{label} differs")
+    return path
 
 
 def _read(
@@ -136,7 +146,7 @@ def _selected_binding(report: Mapping[str, object], role: str) -> SourceBinding:
     return selected[0]
 
 
-def _expected_paths(binding: SourceBinding) -> tuple[Path, Path, Path, Path]:
+def _expected_paths(binding: SourceBinding) -> tuple[Path | None, Path, Path, Path]:
     role = binding.binding_role
     if role == _HISTORY_ROLE:
         receipt = Path("audit/experimental_daily/history_receipts") / f"{binding.observation_id}.json"
@@ -145,7 +155,7 @@ def _expected_paths(binding: SourceBinding) -> tuple[Path, Path, Path, Path]:
         folder = Path("data/experimental_daily/history_cache") / source
     elif role == _LIVE_ROLE:
         receipt = Path("audit/experimental_daily/live_receipts") / f"{binding.observation_id}.json"
-        claim = Path("audit/experimental_daily/live_observation_claims") / f"{binding.observation_id}.json"
+        claim = None
         source = "mlb_live_schedule"
         folder = Path("data/experimental_daily/live_observations") / source
     else:  # pragma: no cover - all callers select a fixed role
@@ -158,6 +168,44 @@ def _expected_paths(binding: SourceBinding) -> tuple[Path, Path, Path, Path]:
     query_digest = hashlib.sha256(binding.query_identity_json.encode("utf-8")).hexdigest()
     manifest = folder / f"{binding.payload_sha256}.{query_digest}.manifest.json"
     return claim, receipt, payload, manifest
+
+
+def _validate_schedule_request(
+    binding: SourceBinding, query_identity: Mapping[str, object], *, target_date: str, cutoff_date: str
+) -> None:
+    if binding.source != "stats_api" or binding.requested_url != binding.final_url:
+        raise ValueError("schedule request differs")
+    parsed = urlsplit(binding.requested_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "statsapi.mlb.com"
+        or parsed.path != "/api/v1/schedule"
+    ):
+        raise ValueError("schedule request differs")
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if len({key for key, _value in pairs}) != len(pairs):
+        raise ValueError("schedule request differs")
+    values = dict(pairs)
+    if values.get("sportId") != "1" or values.get("gameType") != "R":
+        raise ValueError("schedule request differs")
+    if binding.binding_role == _HISTORY_ROLE:
+        expected_start = f"{cutoff_date[:4]}-01-01"
+        if (
+            values.get("startDate") != expected_start
+            or values.get("endDate") != cutoff_date
+            or query_identity.get("as_of_date") != cutoff_date
+            or query_identity.get("start") != expected_start
+            or query_identity.get("end") != cutoff_date
+            or query_identity.get("gameType") != "R"
+            or query_identity.get("role") != "history"
+        ):
+            raise ValueError("history schedule request differs")
+    elif (
+        values.get("startDate") != target_date
+        or values.get("endDate") != target_date
+        or query_identity.get("target_date") != target_date
+    ):
+        raise ValueError("live schedule request differs")
 
 
 def _require_sidecar(
@@ -175,7 +223,6 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
         raise ValueError("schedule payload is invalid") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("dates"), list):
         raise ValueError("schedule payload is invalid")
-    seen: set[int] = set()
     for date_entry in payload["dates"]:
         if not isinstance(date_entry, dict) or not isinstance(date_entry.get("games"), list):
             raise ValueError("schedule payload is invalid")
@@ -183,9 +230,8 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
             if not isinstance(game, dict) or game.get("gameType") != "R":
                 raise ValueError("schedule game type differs")
             game_pk = game.get("gamePk")
-            if type(game_pk) is not int or game_pk <= 0 or game_pk in seen:
+            if type(game_pk) is not int or game_pk <= 0:
                 raise ValueError("schedule gamePk differs")
-            seen.add(game_pk)
             sport = game.get("sport")
             if sport is not None and (not isinstance(sport, dict) or sport.get("id") != 1):
                 raise ValueError("schedule sport differs")
@@ -195,15 +241,8 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
             ):
                 raise ValueError("schedule league differs")
             official_date = game.get("officialDate", date_entry.get("date"))
-            if official_date != expected_date:
-                if role == _HISTORY_ROLE:
-                    try:
-                        if not isinstance(official_date, str) or date.fromisoformat(official_date) > date.fromisoformat(expected_date):
-                            raise ValueError("history schedule date differs")
-                    except ValueError as exc:
-                        raise ValueError("history schedule date differs") from exc
-                else:
-                    raise ValueError("live schedule date differs")
+            if role == _LIVE_ROLE and official_date != expected_date:
+                raise ValueError("live schedule date differs")
 
 
 def _closed_history_rows(raw: bytes, cutoff_date: str) -> tuple[object, ...]:
@@ -211,7 +250,11 @@ def _closed_history_rows(raw: bytes, cutoff_date: str) -> tuple[object, ...]:
     rows = []
     for game in parse_schedule(raw):
         if game["official_date"] > cutoff_date:
+            if game["status"] in OUT_OF_RANGE_UNPLAYED_STATUSES:
+                continue
             raise ValueError("history schedule date differs")
+        if game["status"] not in {"Final", "Completed Early"}:
+            raise ValueError("history schedule is not final")
         rows.append({
             "game_pk": game["game_pk"],
             "official_date": game["official_date"],
@@ -221,7 +264,7 @@ def _closed_history_rows(raw: bytes, cutoff_date: str) -> tuple[object, ...]:
             "venue_id": game["venue_id"],
             "away_runs": game["away_score"],
             "home_runs": game["home_score"],
-            "status": game["status"],
+            "status": "Final",
         })
     return tuple(validate_final_games(rows, cutoff_date=cutoff_date))
 
@@ -247,39 +290,61 @@ def _closed_target_rows(raw: bytes, target_date: str) -> tuple[object, ...]:
 def _admit_binding(
     trusted: TrustedRoot, binding: SourceBinding, *, target_date: str, cutoff_date: str
 ) -> tuple[AdmittedSourceIdentity, tuple[object, ...], tuple[RegularFileSnapshot, ...]]:
+    try:
+        query = json.loads(binding.query_identity_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("schedule query identity differs") from exc
+    if (
+        not isinstance(query, dict)
+        or canonical_json_bytes(query).decode("utf-8").rstrip("\n")
+        != binding.query_identity_json
+    ):
+        raise ValueError("schedule query identity differs")
+    _validate_schedule_request(
+        binding, query, target_date=target_date, cutoff_date=cutoff_date
+    )
     claim_relative, receipt_relative, payload_relative, manifest_relative = _expected_paths(binding)
     receipt_sidecar_relative = receipt_relative.with_suffix(".sha256")
     completion_relative = receipt_relative.with_suffix(".completion.json")
     completion_sidecar_relative = receipt_relative.with_suffix(".completion.sha256")
     manifest_sidecar_relative = manifest_relative.with_name(manifest_relative.name[:-5] + ".sha256")
 
-    claim = _read(trusted, claim_relative, "schedule receipt claim")
     receipt = _read(trusted, receipt_relative, "schedule receipt")
-    receipt_sidecar = _read(trusted, receipt_sidecar_relative, "schedule receipt seal", max_bytes=_SHA256_BYTES, missing_ok=binding.binding_role == _LIVE_ROLE)
+    if receipt is None:
+        raise ValueError("schedule receipt chain is incomplete")
+    receipt_value = _load_canonical_object(receipt.contents, "schedule receipt")
+    if binding.binding_role == _LIVE_ROLE:
+        claim_relative = _strict_relative(
+            receipt_value.get("claim_relative"), "live schedule claim path"
+        )
+    assert claim_relative is not None
+    claim = _read(trusted, claim_relative, "schedule receipt claim")
+    receipt_sidecar = _read(
+        trusted, receipt_sidecar_relative, "schedule receipt seal",
+        max_bytes=_SHA256_BYTES, missing_ok=binding.binding_role == _LIVE_ROLE,
+    )
     completion = _read(trusted, completion_relative, "schedule receipt completion")
     completion_sidecar = _read(trusted, completion_sidecar_relative, "schedule receipt completion seal", max_bytes=_SHA256_BYTES)
     manifest = _read(trusted, manifest_relative, "schedule manifest")
-    manifest_sidecar = _read(trusted, manifest_sidecar_relative, "schedule manifest seal", max_bytes=_SHA256_BYTES)
+    manifest_sidecar = (
+        _read(trusted, manifest_sidecar_relative, "schedule manifest seal", max_bytes=_SHA256_BYTES)
+        if binding.binding_role == _HISTORY_ROLE
+        else None
+    )
     payload = _read(trusted, payload_relative, "schedule payload")
-    if any(item is None for item in (claim, receipt, completion, completion_sidecar, manifest, manifest_sidecar, payload)):
+    required = (claim, receipt, completion, completion_sidecar, manifest, payload)
+    if binding.binding_role == _HISTORY_ROLE:
+        required += (receipt_sidecar, manifest_sidecar)
+    if any(item is None for item in required):
         raise ValueError("schedule receipt chain is incomplete")
     assert claim is not None and receipt is not None and completion is not None
-    assert completion_sidecar is not None and manifest is not None and manifest_sidecar is not None and payload is not None
+    assert completion_sidecar is not None and manifest is not None and payload is not None
+    if binding.binding_role == _LIVE_ROLE and receipt_sidecar is not None:
+        raise ValueError("live schedule has an unexpected sidecar")
 
     if len(payload.contents) != binding.byte_length or _snapshot_digest(payload) != binding.payload_sha256:
         prefix = "history" if binding.binding_role == _HISTORY_ROLE else "live"
         raise ValueError(f"{prefix} schedule payload differs")
-    query = json.loads(binding.query_identity_json)
-    if canonical_json_bytes(query).decode("utf-8").rstrip("\n") != binding.query_identity_json:
-        raise ValueError("schedule query identity differs")
-    if not isinstance(query, dict):
-        raise ValueError("schedule query identity differs")
-    if binding.binding_role == _HISTORY_ROLE:
-        if query.get("as_of_date") != cutoff_date:
-            raise ValueError("history schedule query differs")
-    elif query.get("target_date") != target_date:
-        raise ValueError("live schedule query differs")
-
     try:
         manifest_value = json.loads(manifest.contents.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -302,9 +367,10 @@ def _admit_binding(
     }
     if manifest_value != expected_manifest or _snapshot_digest(manifest) != binding.manifest_sha256:
         raise ValueError("schedule manifest differs")
-    _require_sidecar(manifest_sidecar, binding.manifest_sha256, "schedule manifest seal")
+    if binding.binding_role == _HISTORY_ROLE:
+        assert manifest_sidecar is not None
+        _require_sidecar(manifest_sidecar, binding.manifest_sha256, "schedule manifest seal")
 
-    receipt_value = _load_canonical_object(receipt.contents, "schedule receipt")
     receipt_digest = _snapshot_digest(receipt)
     if receipt_digest != binding.receipt_sha256:
         raise ValueError("schedule receipt differs")
@@ -348,8 +414,10 @@ def _admit_binding(
         }
         if claim_value != expected_claim:
             raise ValueError("live schedule claim differs")
+        live_receipt = dict(common_receipt)
+        live_receipt.pop("game_pks")
         expected_receipt = {
-            "schema_version": 1, **common_receipt,
+            "schema_version": 1, **live_receipt,
             "manifest_relative": manifest_relative.as_posix(),
             "claim_relative": claim_relative.as_posix(),
             "claim_sha256": _snapshot_digest(claim),
@@ -357,8 +425,6 @@ def _admit_binding(
         }
         if receipt_value != expected_receipt:
             raise ValueError("live schedule receipt differs")
-        if receipt_sidecar is not None:
-            _require_sidecar(receipt_sidecar, receipt_digest, "live schedule receipt seal")
         completion_value = _load_canonical_object(completion.contents, "live schedule completion")
         expected_completion = {
             "schema_version": 1, "source": binding.source,
@@ -373,9 +439,16 @@ def _admit_binding(
     _require_sidecar(completion_sidecar, _snapshot_digest(completion), "schedule completion seal")
 
     rows = _closed_history_rows(payload.contents, cutoff_date) if binding.binding_role == _HISTORY_ROLE else _closed_target_rows(payload.contents, target_date)
-    snapshots = (claim, receipt, completion, completion_sidecar, manifest, manifest_sidecar, payload)
+    if binding.binding_role == _HISTORY_ROLE:
+        if binding.game_pks:
+            raise ValueError("history schedule binding game_pks differs")
+    elif tuple(sorted(game.game_pk for game in rows)) != binding.game_pks:
+        raise ValueError("live schedule binding game_pks differs")
+    snapshots = (claim, receipt, completion, completion_sidecar, manifest, payload)
     if receipt_sidecar is not None:
         snapshots += (receipt_sidecar,)
+    if manifest_sidecar is not None:
+        snapshots += (manifest_sidecar,)
     _totals_sources_test_hook("before_rebind", payload_relative)
     for snapshot in snapshots:
         rebind_regular_snapshot(trusted, snapshot, "schedule source evidence", max_bytes=_MAX_JSON_BYTES)
@@ -384,12 +457,13 @@ def _admit_binding(
         query_identity_sha256=hashlib.sha256(binding.query_identity_json.encode()).hexdigest(),
         claim_relative=claim_relative.as_posix(), claim_sha256=_snapshot_digest(claim),
         receipt_relative=receipt_relative.as_posix(), receipt_sha256=receipt_digest,
-        receipt_sidecar_relative=receipt_sidecar_relative.as_posix() if receipt_sidecar else None,
+        receipt_sidecar_relative=receipt_sidecar_relative.as_posix() if receipt_sidecar is not None else None,
         receipt_sidecar_sha256=_snapshot_digest(receipt_sidecar) if receipt_sidecar else None,
         completion_relative=completion_relative.as_posix(), completion_sha256=_snapshot_digest(completion),
         completion_sidecar_relative=completion_sidecar_relative.as_posix(), completion_sidecar_sha256=_snapshot_digest(completion_sidecar),
         manifest_relative=manifest_relative.as_posix(), manifest_sha256=_snapshot_digest(manifest),
-        manifest_sidecar_relative=manifest_sidecar_relative.as_posix(), manifest_sidecar_sha256=_snapshot_digest(manifest_sidecar),
+        manifest_sidecar_relative=manifest_sidecar_relative.as_posix() if manifest_sidecar is not None else None,
+        manifest_sidecar_sha256=_snapshot_digest(manifest_sidecar) if manifest_sidecar is not None else None,
         payload_relative=payload_relative.as_posix(), payload_sha256=_snapshot_digest(payload), byte_length=len(payload.contents),
     )
     return identity, rows, snapshots
