@@ -58,7 +58,7 @@ from mlb_backtest.model_improvement.lane_disposition import (
 
 | File | Responsibility |
 | --- | --- |
-| `protocols/model_improvement/parallel_model_result_v1.json` | Complete immutable experiment declaration, created only after verified 2018–2021 acquisition. |
+| `protocols/model_improvement/parallel_model_result_v1.json` | Complete immutable experiment declaration, created only after verified 2018–2021 acquisition in a single declaration-only activation commit immediately after the frozen code-revision commit. |
 | `schemas/model_improvement/{parallel_model_result_run_spec,source_gate_receipt,feature_seal,prediction_seal,scoring_model_card,frozen_model_card,lane_disposition}.schema.json` | Closed schemas for every shared artifact. |
 | `mlb_backtest/model_improvement/canonical.py` | Canonical serialization and immutable filesystem operations. |
 | `mlb_backtest/model_improvement/contracts.py` | Shared frozen types (including `ScoringModelCard`) and pure mapping validation; it imports no scoring-card persistence API. |
@@ -343,7 +343,7 @@ git commit -m "feat: define model improvement contracts"
 - Create: `tests/test_model_improvement_run_spec.py`
 - Create: `tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json`
 
-- [ ] **Step 1: Write table-driven RED tests for every immutable binding: code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall; and a dedicated disposition persistence round trip.**
+- [ ] **Step 1: Write table-driven RED tests for every immutable binding: activation/code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall; and a dedicated disposition persistence round trip.**
 
 ```python
 import json
@@ -353,9 +353,43 @@ from pathlib import Path
 
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
 from mlb_backtest.model_improvement.lane_disposition import load_lane_disposition, seal_lane_disposition
-from mlb_backtest.model_improvement.run_spec import build_run_spec, load_run_spec
+from mlb_backtest.model_improvement.run_spec import (
+    build_run_spec, load_run_spec, load_verified_run_spec,
+)
 
 class RunSpecTest(unittest.TestCase):
+    def test_production_activation_is_a_clean_single_declaration_commit_after_code_revision(self):
+        # `make_temp_repo` commits implementation as C, then writes the production
+        # declaration with code_revision=C and commits only that path as D=HEAD.
+        with make_temp_repo() as repo:
+            code_revision = repo.commit_code_implementation()
+            declaration = repo.write_production_declaration(code_revision=code_revision)
+            activation = repo.commit_only(declaration)
+            self.assertEqual(repo.head(), activation)
+            self.assertEqual(repo.parent(activation), code_revision)
+            self.assertEqual(repo.diff_names(code_revision, activation),
+                             ("protocols/model_improvement/parallel_model_result_v1.json",))
+            # The process CWD deliberately points at another repository.  Verification
+            # must derive and query declaration.parent's owning repository instead.
+            with make_temp_repo() as unrelated_repo, unrelated_repo.as_process_cwd():
+                spec = load_verified_run_spec(declaration)
+            self.assertEqual(spec.code_revision, code_revision)
+
+    def test_verified_production_activation_rejects_dirty_untracked_extra_merge_and_wrong_parent(self):
+        # Each mutation starts from a fresh valid C -> D fixture above.  Dirty tracked
+        # files and untracked files fail before parsing; a second changed path, a merge
+        # activation, an activation whose parent is not code_revision, a worktree whose
+        # declaration bytes differ from HEAD:path, and a synthetic declaration all fail.
+        for mutation in (
+            "dirty_tracked", "untracked", "extra_changed_path", "merge_activation",
+            "wrong_parent", "worktree_bytes_differ_from_head_blob", "synthetic",
+            "wrong_external_repo_path", "cross_root_declaration_path",
+        ):
+            with self.subTest(mutation=mutation), make_valid_activation_repo() as repo:
+                path = repo.apply_activation_mutation(mutation)
+                with self.assertRaises(ValueError):
+                    load_verified_run_spec(path)
+
     def test_exact_contract_is_available_to_sibling_lanes(self):
         spec = load_run_spec(SPEC_PATH)
         self.assertEqual(spec.fold("H22").normalization_years, (2018, 2019, 2020, 2021))
@@ -399,13 +433,15 @@ class RunSpecTest(unittest.TestCase):
             )
 ```
 
+`make_temp_repo()`/`make_valid_activation_repo()` are test helpers, not production APIs. Each initializes an isolated repository, commits the completed RunSpec implementation as code commit `C`, writes the real production-path declaration with `code_revision=C`, then commits exactly that path as non-merge activation `D`. The mutation helper independently creates: a modified tracked file, an untracked file, an extra changed path in `C..D`, a two-parent merge `D`, a declaration whose `code_revision` is not `D^`, post-commit declaration-byte drift, and a `SYNTHETIC_TEST_ONLY` declaration. It also creates an external non-owning path and a cross-root production-relative path whose own repository has no matching tracked blob; both must fail. The clean activation test switches process CWD to a separate repository and must still pass. No test may use the repository under test or infer `code_revision` from a mutable working-tree `HEAD`.
+
 - [ ] **Step 2: Run RED.**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec -v`
 
 Expected: FAIL with `ModuleNotFoundError` for `run_spec`.
 
-- [ ] **Step 3: Add a recursively closed schema, `build_run_spec(raw: Mapping[str, object])`, and a synthetic fixture declaration.** Require top-level fields `schema_version`, `run_id`, `code_revision`, `source_authority`, `cutoffs`, `exclusions`, `folds`, `baseline`, `metrics`, `prediction_contract`, `prediction_contract_sha256`, `lane_b`, `lane_c`, `outputs`, and `h24_firewall`. Persist both the closed `prediction_contract` object and its digest; require `prediction_contract_sha256 == sha256(canonical_json_bytes(prediction_contract))`. `ModelImprovementRunSpec`, its raw payload, and `as_mapping()` each retain both fields. Add schema, fixture, and mutation tests for a missing object/digest, any unknown nested key, and each digest/content mismatch.
+- [ ] **Step 3: Add a recursively closed schema, `build_run_spec(raw: Mapping[str, object])`, and a synthetic fixture declaration.** Require top-level fields `schema_version`, `run_id`, `code_revision`, `source_authority`, `cutoffs`, `exclusions`, `folds`, `baseline`, `metrics`, `prediction_contract`, `prediction_contract_sha256`, `lane_b`, `lane_c`, `outputs`, and `h24_firewall`. `code_revision` is the immutable full 40-lowercase-hex **code commit**; it is never the declaration activation commit and no `spec_commit`/self-commit field exists. Persist both the closed `prediction_contract` object and its digest; require `prediction_contract_sha256 == sha256(canonical_json_bytes(prediction_contract))`. `ModelImprovementRunSpec`, its raw payload, and `as_mapping()` each retain both fields. Add schema, fixture, and mutation tests for a missing object/digest, any unknown nested key, and each digest/content mismatch.
 
 `prediction_contract` has no extension keys at any level and contains exactly:
 
@@ -432,7 +468,9 @@ The baseline declaration and v5.1 card pin `component_weights_pp={"starter":35,"
 
 - [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** The dataclass/raw payload/`as_mapping()` all include both `prediction_contract` and `prediction_contract_sha256`; the parser closes and hashes the object before accepting its digest. `fold` accepts H22/H23/H24 only; `output_path` accepts exactly the ten declared namespaces and a normal relative name without `..`, always resolves beneath `outputs.root`, and rejects all other namespaces/paths. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
 
-`load_verified_run_spec(path)` is a stricter parser only: it rejects `schema_version == "SYNTHETIC_TEST_ONLY"`, requires `path.resolve()` to equal the checked-in real declaration `protocols/model_improvement/parallel_model_result_v1.json`, and requires `code_revision` to equal the checked-out full 40-lowercase-hex `HEAD`. It does not call `verify_source_gate` or inspect source evidence; Task 4 owns source verification.
+`load_verified_run_spec(path)` is an activation verifier, not merely a stricter parser. It must first derive `owning_root` with exactly `git -C path.parent rev-parse --show-toplevel`, fail if that command cannot identify a repository, and require `path.resolve() == (Path(owning_root) / "protocols/model_improvement/parallel_model_result_v1.json").resolve()`. It rejects `schema_version == "SYNTHETIC_TEST_ONLY"` and rejects a dirty or untracked **owning-root** worktree. Process CWD is never trusted: every repository query is exactly against `git -C owning_root`—including status, `rev-parse HEAD`, `rev-parse HEAD^`, `show`, and `diff`.
+
+It must securely read the declaration bytes and require byte-for-byte equality with `git -C owning_root show HEAD:protocols/model_improvement/parallel_model_result_v1.json`; the path must therefore be a tracked blob at that owning root's `HEAD`. It requires that `git -C owning_root rev-list --parents -n 1 HEAD` show exactly one parent (no merge), reads that full parent SHA as `git -C owning_root rev-parse HEAD^`, requires `spec.code_revision == HEAD^`, and requires `git -C owning_root diff --name-only spec.code_revision..HEAD` to contain exactly the production declaration path and no other path. Thus a real declaration is added only in the single declaration-only activation commit immediately after the frozen code commit named by `code_revision`; it never asks the declaration to contain its own commit SHA. It does not call `verify_source_gate` or inspect source evidence; Task 4 owns source verification.
 
 Add the only disposition persistence APIs after `run_spec.py` exists:
 
@@ -513,7 +551,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: PASS because the test observes the source-gate block; the real protocol file remains absent.
 
-- [ ] **Step 7: After the external acquisition prerequisite is verified, invoke `build_run_spec()` with exact authenticated authority paths/digests and exclusively publish `protocols/model_improvement/parallel_model_result_v1.json`.** Immediately call `verify_source_gate()` and require the receipt to bind that exact RunSpec digest before any H22 feature task starts.
+- [ ] **Step 7: After the external acquisition prerequisite is verified, first commit all completed implementation as the frozen `code_revision` commit. Invoke `build_run_spec()` with that exact parent SHA and authenticated authority paths/digests, then add only `protocols/model_improvement/parallel_model_result_v1.json` in the immediately following single-parent declaration-only activation commit.** From the clean activation checkout, call `load_verified_run_spec()` and then `verify_source_gate()`; require the receipt to bind that exact RunSpec digest before any H22 feature task starts. Do not amend the activation commit or add any second path: doing either fails the activation verifier.
 
 ### Task 5: Seal full result-free feature primitives
 
