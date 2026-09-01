@@ -37,6 +37,18 @@ class FinalTotalGame:
     away_runs: int
     home_runs: int
 
+    def __post_init__(self) -> None:
+        _positive_int(self.game_pk, "game_pk")
+        _date(self.official_date, "official_date")
+        _utc_timestamp(self.scheduled_start_utc)
+        _positive_int(self.away_team_id, "away_team_id")
+        _positive_int(self.home_team_id, "home_team_id")
+        _positive_int(self.venue_id, "venue_id")
+        _nonnegative_int(self.away_runs, "away_runs")
+        _nonnegative_int(self.home_runs, "home_runs")
+        if self.away_team_id == self.home_team_id:
+            raise ValueError("away_team_id and home_team_id must differ")
+
 
 @dataclass(frozen=True, slots=True)
 class TargetTotalGame:
@@ -46,6 +58,16 @@ class TargetTotalGame:
     away_team_id: int
     home_team_id: int
     venue_id: int
+
+    def __post_init__(self) -> None:
+        _positive_int(self.game_pk, "game_pk")
+        _date(self.official_date, "official_date")
+        _utc_timestamp(self.scheduled_start_utc)
+        _positive_int(self.away_team_id, "away_team_id")
+        _positive_int(self.home_team_id, "home_team_id")
+        _positive_int(self.venue_id, "venue_id")
+        if self.away_team_id == self.home_team_id:
+            raise ValueError("away_team_id and home_team_id must differ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +507,12 @@ def select_candidate(
         checked = _prediction_rows(rows)
         if checked[0][1].candidate_id != candidate_id:
             raise ValueError("development projection candidate_id must match its key")
+    populations = {
+        candidate_id: frozenset(actual.game_pk for actual, _ in rows)
+        for candidate_id, rows in development.items()
+    }
+    if len(set(populations.values())) != 1:
+        raise ValueError("development game_pk populations must match")
     metrics = {candidate_id: evaluate_predictions(rows) for candidate_id, rows in development.items()}
     if any(metric.games < 100 for metric in metrics.values()):
         raise ValueError("development requires at least 100 rows per candidate")

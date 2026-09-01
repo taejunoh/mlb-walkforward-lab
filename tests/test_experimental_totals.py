@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from mlb_backtest.experimental_totals import (
     CANDIDATE_IDS,
     EvaluationMetrics,
+    FinalTotalGame,
     LineProbabilities,
     TotalProjection,
     UnprojectedTotal,
@@ -102,6 +103,13 @@ class ExperimentalTotalsTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_final_games((valid, invalid), cutoff_date="2026-05-31")
+
+    def test_direct_final_game_construction_enforces_closed_score_invariants(self) -> None:
+        arguments = (1, "2026-05-31", "2026-05-31T18:00:00Z", 10, 20, 30)
+        for away_runs, home_runs in ((True, 4), (-1, 4), (4.0, 4), (4, True)):
+            with self.subTest(away_runs=away_runs, home_runs=home_runs):
+                with self.assertRaisesRegex(ValueError, "runs"):
+                    FinalTotalGame(*arguments, away_runs, home_runs)
 
     def test_target_validation_is_closed_and_requires_target_date_and_pregame(self) -> None:
         target = make_target("2026-09-01")
@@ -328,6 +336,21 @@ class ExperimentalTotalsTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "candidate_id"):
             select_candidate(mismatched)
+        different_population = tuple(
+            (
+                replace(actual, game_pk=1000 + index),
+                projection,
+            )
+            for index, (actual, projection) in enumerate(equally_improved)
+        )
+        with self.assertRaisesRegex(ValueError, "game_pk populations"):
+            select_candidate(
+                {
+                    "LEAGUE_30": baseline,
+                    "TEAM_30": improved,
+                    "TEAM_VENUE_30": different_population,
+                }
+            )
 
     def test_metric_dataclass_is_value_object(self) -> None:
         self.assertEqual(
