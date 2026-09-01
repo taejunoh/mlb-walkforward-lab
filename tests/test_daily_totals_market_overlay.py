@@ -4,6 +4,8 @@ import json
 import hashlib
 import math
 import os
+import subprocess
+import sys
 from copy import deepcopy
 import unittest
 from dataclasses import FrozenInstanceError, replace
@@ -2462,6 +2464,208 @@ class SchemaTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_overlay_report(invalid)
 
+
+class IntegrationAcceptanceTests(unittest.TestCase):
+    """Hermetic Task 5 acceptance checks across the public CLI boundary."""
+
+    @classmethod
+    def _make_exact_authority_fixture(cls, root: Path) -> tuple[Path, Path]:
+        """Write a complete local authority chain without running the model."""
+        trace, raw = SecurePersistenceTests._authority(root)
+        raw_value = SecurePersistenceTests._raw_value(root, raw)
+        captured_at = datetime.now(timezone.utc).replace(microsecond=0)
+        raw_value["captured_at_utc"] = captured_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw = SecurePersistenceTests._write_raw(root, raw_value)
+        # Keep the CLI success path independent of the wall clock while retaining
+        # the sealed target date, game IDs, candidate, and residual count.
+        SecurePersistenceTests._rewrite_model_report(
+            root,
+            trace,
+            lambda report: [
+                game.update({"scheduled_start_utc": f"2026-09-01T23:{index:02d}:00Z"})
+                for index, game in enumerate(report["games"])
+            ],
+        )
+        return trace, raw
+
+    @staticmethod
+    def _run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        return subprocess.run(
+            [sys.executable, "-m", "mlb_backtest.daily_totals_market_overlay", *args],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_public_cli_consumes_hermetic_authority_and_persists_all_15_rows(self) -> None:
+        """Admission then comparison binds every artifact without model/network work."""
+        from mlb_backtest.daily_totals_market_overlay import validate_overlay_report
+        from mlb_backtest.daily_totals_market_overlay import load_and_validate_model_authority
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._make_exact_authority_fixture(root)
+            authority = load_and_validate_model_authority(root, trace)
+            self.assertEqual(authority.report["target_date"], TARGET_DATE)
+            self.assertEqual(authority.report["cutoff_date"], "2026-08-31")
+            self.assertEqual(authority.report["selected_candidate"], "TEAM_VENUE_30")
+            self.assertEqual(len(authority.report["games"]), 15)
+            self.assertEqual([game["game_pk"] for game in authority.report["games"]], list(FIXED_GAME_PKS))
+            self.assertTrue(all(game["status"] == "PROJECTED" for game in authority.report["games"]))
+            self.assertTrue(all(game["residual_count"] == 764 for game in authority.report["games"]))
+            authority_before = SecurePersistenceTests._model_authority_bytes(root, trace)
+            before_files = {
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            admitted = self._run_cli(
+                "admit-snapshot", "--root", str(root),
+                "--model-trace", trace.as_posix(), "--raw-capture", raw.as_posix(),
+                cwd=Path.cwd(),
+            )
+            self.assertEqual(admitted.returncode, 0, admitted.stderr)
+            self.assertEqual(admitted.stderr, "")
+            snapshot_relative = Path(admitted.stdout.strip())
+            self.assertEqual(admitted.stdout.count("\n"), 1)
+            self.assertFalse(snapshot_relative.is_absolute())
+            self.assertTrue(snapshot_relative.is_relative_to(Path("audit/experimental_daily_totals_market")))
+
+            compared = self._run_cli(
+                "compare", "--root", str(root),
+                "--model-trace", trace.as_posix(), "--market-snapshot", snapshot_relative.as_posix(),
+                cwd=Path.cwd(),
+            )
+            self.assertEqual(compared.returncode, 0, compared.stderr)
+            self.assertEqual(compared.stderr, "")
+            trace_relative = Path(compared.stdout.strip())
+            self.assertEqual(compared.stdout.count("\n"), 1)
+            self.assertFalse(trace_relative.is_absolute())
+            self.assertTrue(trace_relative.is_relative_to(Path("reports/experimental_daily_totals_overlay/2026-09-01")))
+
+            output_trace = json.loads((root / trace_relative).read_bytes())
+            report_relative = Path(output_trace["report_relative"])
+            report = json.loads((root / report_relative).read_bytes())
+            report_bytes = (root / report_relative).read_bytes()
+            report_sidecar = report_relative.with_suffix(".sha256")
+            markdown_relative = report_relative.with_suffix(".md")
+            self.assertEqual(
+                (root / report_sidecar).read_bytes(),
+                f"{hashlib.sha256(report_bytes).hexdigest()}\n".encode("ascii"),
+            )
+            self.assertEqual(output_trace["report_sha256"], hashlib.sha256(report_bytes).hexdigest())
+            self.assertEqual(output_trace["report_sidecar_sha256"], hashlib.sha256((root / report_sidecar).read_bytes()).hexdigest())
+            self.assertEqual(output_trace["markdown_sha256"], hashlib.sha256((root / markdown_relative).read_bytes()).hexdigest())
+            self.assertEqual(output_trace["content_sha256"], SecurePersistenceTests._digest({key: value for key, value in output_trace.items() if key != "content_sha256"}))
+            validated = validate_overlay_report(report)
+            self.assertEqual([row["game_pk"] for row in validated["games"]], list(FIXED_GAME_PKS))
+            self.assertEqual(len(validated["games"]), 15)
+            self.assertTrue(all(row["market_status"] == "QUOTED" for row in validated["games"]))
+            self.assertTrue(all(row["decision"] == "RESEARCH_PICK" for row in validated["games"]))
+            self.assertEqual(output_trace["report_relative"], report_relative.as_posix())
+            self.assertEqual(output_trace["market_snapshot_relative"], snapshot_relative.as_posix())
+
+            authority_after = SecurePersistenceTests._model_authority_bytes(root, trace)
+            self.assertEqual(authority_after, authority_before)
+            after_files = {
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            new_files = after_files - before_files
+            self.assertTrue(new_files)
+            self.assertTrue(all(
+                path.startswith("audit/experimental_daily_totals_market/")
+                or path.startswith("reports/experimental_daily_totals_overlay/")
+                for path in new_files
+            ))
+
+    def test_overlay_import_isolated_from_network_browser_and_model_runner(self) -> None:
+        """The public module imports offline with network/browser imports denied."""
+        script = """
+import builtins
+import mlb_backtest.daily_totals as totals
+
+blocked = ("urllib.request", "urllib3", "requests", "http.client", "selenium", "playwright", "sportsbook")
+real_import = builtins.__import__
+def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+    if any(name == item or name.startswith(item + ".") for item in blocked):
+        raise AssertionError("forbidden import: " + name)
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = guarded
+totals.build_daily_totals = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("model rerun"))
+import mlb_backtest.daily_totals_market_overlay as overlay
+assert overlay.SNAPSHOT_SCHEMA == "PROVISIONAL_DAILY_TOTALS_DK_SNAPSHOT_V1"
+print("isolated import: PASS")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path.cwd(),
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "isolated import: PASS")
+
+    def test_cli_persistence_fault_has_no_partial_success_claim(self) -> None:
+        """An injected output fault returns operational failure without stdout."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._make_exact_authority_fixture(root)
+            snapshot = overlay.admit_draftkings_snapshot(
+                root, trace, raw,
+                comparison_clock=lambda: datetime.now(timezone.utc),
+            )
+            real_writer = overlay._existing_or_write
+            calls = 0
+
+            def fail_after_first(*args: object, **kwargs: object):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected persistence fault")
+                return real_writer(*args, **kwargs)
+
+            with patch.object(overlay, "_existing_or_write", side_effect=fail_after_first), \
+                    patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                code = overlay.main([
+                    "compare", "--root", str(root),
+                    "--model-trace", trace.as_posix(),
+                    "--market-snapshot", snapshot.as_posix(),
+                ])
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout.write.call_args_list, [])
+                message = "".join(call.args[0] for call in stderr.write.call_args_list)
+                self.assertIn("operational failure", message)
+                self.assertNotIn("reports/experimental_daily_totals_overlay/2026-09-01/", message)
+
+            output_root = root / "reports/experimental_daily_totals_overlay"
+            if output_root.exists():
+                self.assertFalse(any(path.name.endswith(".trace.json") for path in output_root.rglob("*")))
+
+    def test_cli_rejects_path_and_type_attacks_without_writes(self) -> None:
+        """Absolute, parent, and backslash paths fail before touching output."""
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for supplied in ("../trace.json", "/tmp/trace.json", "reports\\trace.json"):
+                result = self._run_cli(
+                    "compare", "--root", str(root), "--model-trace", supplied,
+                    "--market-snapshot", "snapshot.json", cwd=Path.cwd(),
+                )
+                self.assertEqual(result.returncode, 2, supplied)
+                self.assertEqual(result.stdout, "", supplied)
+            self.assertFalse((root / "reports/experimental_daily_totals_overlay").exists())
 
 class PureMathTests(unittest.TestCase):
     def test_price_rules_accept_signed_integer_range(self) -> None:
