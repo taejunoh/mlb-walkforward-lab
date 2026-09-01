@@ -618,32 +618,132 @@ Expected: PASS because verified loading rejects the absent real production decla
 - Create: `schemas/model_improvement/feature_seal.schema.json`
 - Create: `mlb_backtest/model_improvement/sealed_features.py`
 - Create: `tests/test_model_improvement_sealed_features.py`
+- Modify: `mlb_backtest/model_improvement/canonical.py`
+- Modify: `tests/test_model_improvement_canonical.py`
+
+`rows.jsonl` is an immutable byte artifact, not a JSON array.  Before this
+task writes it, extend the Task 1 primitive with
+`write_immutable_bytes(path: Path, contents: bytes) -> bool`, using the same
+no-follow, staging, fsync, no-replace publication, secure reread, and
+concurrent-identical-writer behavior as `write_immutable_json`; make the JSON
+writer a canonical-JSON wrapper around that byte primitive.  Add focused
+canonical tests for binary/JSONL byte equality, a conflicting existing byte
+file, and a symlink/non-regular byte artifact.  Do not duplicate the secure
+writer in `sealed_features.py`.
+
+### Task 5 authority and byte-binding amendment
+
+The row field named `source_manifest_sha256` means the authoritative V5.2
+**source inventory aggregate**, not a snapshot-replay receipt.  Its exact
+value is `spec.source_authority.inventory.sha256`, the digest of the
+RunSpec-bound `source_inventory.json`; `snapshot_replay_sha256` has distinct
+replay semantics and must never be substituted.  The Task 4
+`SourceGateReceipt.inventory_sha256` must be required to equal that same
+RunSpec inventory digest.  No new RunSpec field is necessary because the
+closed `source_authority.inventory: {path, sha256}` binding already owns this
+authority.  The row's `exclusion_policy_sha256` is exactly
+`sha256(canonical_json_bytes(spec.exclusions))`, never a caller-selected
+digest.
+
+This requires a narrow Task 3/Task 4 migration before Task 5 implementation:
+the RunSpec tests must preserve and test the closed inventory binding and
+canonical exclusions projection; the source-gate schema/parser/loader and RED
+tests must reject a receipt whose `inventory_sha256` differs from
+`fresh.source_authority.inventory.sha256`.  Keep
+`snapshot_replay_sha256` separate.  These are compatibility requirements for
+the existing Task 3/4 code, not an invitation to add a duplicate aggregate
+field.
+
+Keep the low-level sealer deterministic, but make the authenticated receipt
+an explicit argument so a real caller cannot self-assert a source-gate digest:
+
+```python
+seal_feature_rows(
+    spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
+    feature_set_id: str,
+    fold_id: str,
+    rows: Sequence[SealedFeatureRow],
+    parent_feature_seal_sha256: str | None = None,
+    evidence_sha256: Sequence[str] = (),
+) -> FeatureSeal
+
+load_sealed_feature_rows(
+    spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
+    years: Sequence[int],
+    seal: FeatureSeal,
+) -> tuple[SealedFeatureRow, ...]
+```
+
+Neither low-level function calls `require_source_gate()`; that preserves
+closed synthetic tests.  Every real orchestration boundary must first call
+`verified_gate = require_source_gate(spec)`, securely load the explicit
+receipt path/digest supplied to that boundary, require exact payload,
+resolved-path, and artifact-digest equality with `verified_gate`, and pass
+only `verified_gate` onward.  The two feature functions require
+`source_gate.run_spec_sha256 == run_spec_sha256(spec)`,
+`source_gate.inventory_sha256 == spec.source_authority.inventory.sha256`,
+every row's `source_gate_sha256 == source_gate.artifact_sha256`, every row's
+`source_manifest_sha256 == spec.source_authority.inventory.sha256 ==
+source_gate.inventory_sha256`, every row's `exclusion_policy_sha256 ==
+sha256(canonical_json_bytes(spec.exclusions))`, and
+`seal.source_gate_sha256 == source_gate.artifact_sha256`.  Thus the real
+path cannot establish authority by supplying matching self-asserted row
+digests.  Update downstream Common/Lane A, Lane B, Lane C, and H24 call sites
+to pass their already verified receipt; no caller may retain the former
+receipt-free signature.
+
+The canonical `rows.jsonl` preimage is the exact concatenation, in strict
+ascending `(official_date, scheduled_start_utc, game_pk)` order, of
+`canonical_json_bytes(row.as_mapping())` for each row.  It has exactly one
+newline per row, no blank lines, and `rows_sha256` is SHA-256 of those exact
+raw bytes.  `population_sha256` is SHA-256 of
+`canonical_json_bytes([{"game_pk": game_pk, "official_date": official_date,
+"target_year": target_year}, ...])` over that same ordered row sequence.
+It contains no score, quality, feature hash, result, or outcome value.  Both
+sealing and loading recompute both preimages and reject an empty population,
+duplicate `game_pk`, duplicate population key, or any non-strict order.
+`load_feature_seal` checks only descriptor payload/sidecar/path structure;
+the receipt-bound `load_sealed_feature_rows` is the sole public row reader.
 
 - [ ] **Step 1: Write RED tests for six component sides, D-1/T-45 provenance, 2025/future/target outcome rejection, duplicate game rejection, environment/defense 50/0 fallback, and permitted Lane B denominator recipes.**
 
 ```python
 class SealedFeatureTest(unittest.TestCase):
     def test_seal_rereads_complete_result_free_rows(self):
-        seal = seal_feature_rows(spec, "common", "H22", complete_rows)
+        seal = seal_feature_rows(spec, verified_gate, "common", "H22", complete_rows)
         self.assertEqual(seal.schema, "MODEL_IMPROVEMENT_FEATURE_SEAL_V1")
         self.assertEqual(seal.fold_id, "H22")
         self.assertNotIn("artifact_sha256", seal.as_mapping())
         self.assertNotIn("path", seal.as_mapping())
         self.assertEqual(load_feature_seal(Path(seal.path), seal.artifact_sha256), seal)
-        self.assertEqual(load_sealed_feature_rows(spec, (2022,), seal), tuple(complete_rows))
+        self.assertEqual(load_sealed_feature_rows(spec, verified_gate, (2022,), seal), tuple(complete_rows))
 
     def test_outcome_or_future_provenance_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "outcome|history|cutoff"):
-            seal_feature_rows(spec, "common", "H22", [row_with_forbidden_home_win])
+            seal_feature_rows(spec, verified_gate, "common", "H22", [row_with_forbidden_home_win])
 
     def test_lane_c_feature_seal_requires_parent_and_evidence(self):
-        common = seal_feature_rows(spec, "common", "H22", complete_rows)
-        lane_c = seal_feature_rows(spec, "lane_c", "H22", complete_rows, common.artifact_sha256, ("b" * 64,))
+        common = seal_feature_rows(spec, verified_gate, "common", "H22", complete_rows)
+        lane_c = seal_feature_rows(spec, verified_gate, "lane_c", "H22", complete_rows, common.artifact_sha256, ("b" * 64,))
         self.assertEqual(lane_c.parent_feature_seal_sha256, common.artifact_sha256)
         self.assertEqual(lane_c.evidence_sha256, ("b" * 64,))
         with self.assertRaisesRegex(ValueError, "parent feature seal|evidence"):
-            seal_feature_rows(spec, "lane_c", "H22", complete_rows)
+            seal_feature_rows(spec, verified_gate, "lane_c", "H22", complete_rows)
 ```
+
+Add RED cases for: exact JSONL byte and population preimages; tampered
+row/rows bytes, sidecar, and seal payload; duplicate game/key and out-of-order
+rows; an empty population; wrong requested years/fold/feature set; a source
+gate receipt whose RunSpec or inventory differs; row/seal source-gate mismatch;
+source inventory versus snapshot replay substitution; an exclusion projection
+mismatch; missing component/side/input hashes; forbidden labels/results in
+input or persisted JSONL; noncanonical/blank JSONL lines; and an AST import
+denial proving `sealed_features` imports no outcome module or outcome fixture.
+The real-boundary test must prove a caller-provided receipt differing in
+payload, resolved path, or digest from `require_source_gate(spec)` is rejected
+before any rows or seal are written.
 
 - [ ] **Step 2: Run RED.**
 
@@ -669,7 +769,7 @@ class FeatureSeal:
     path: str
 ```
 
-Persist exactly `schema="MODEL_IMPROVEMENT_FEATURE_SEAL_V1"`, `feature_set_id`, `fold_id`, `run_spec_sha256`, `source_gate_sha256`, `population_sha256`, `rows_sha256`, `parent_feature_seal_sha256`, and `evidence_sha256`; `artifact_sha256` and `path` are returned runtime descriptors and excluded by `FeatureSeal.as_mapping()`. `feature_set_id` is closed to `common` and `lane_c`. A `common` seal requires `parent_feature_seal_sha256 is None` and empty `evidence_sha256`; a `lane_c` seal requires a nonempty parent common feature-seal digest for the same fold and a nonempty immutable evidence-digest tuple. The exact public signatures are `seal_feature_rows(spec: ModelImprovementRunSpec, feature_set_id: str, fold_id: str, rows: Sequence[SealedFeatureRow], parent_feature_seal_sha256: str | None = None, evidence_sha256: Sequence[str] = ()) -> FeatureSeal`, `load_feature_seal(path: Path, expected_sha256: str) -> FeatureSeal`, and `load_sealed_feature_rows(spec: ModelImprovementRunSpec, years: Sequence[int], seal: FeatureSeal) -> tuple[SealedFeatureRow, ...]`. This contract deliberately has no `target_years` field: callers select rows with the existing `years` parameter, while the accepted year set is validated from each row’s `target_year` and the declared `fold_id`; the loader returns that immutable tuple. `load_feature_seal` validates the structural `features/{feature_set_id}/{fold_id}/` path and common/lane-C parent/evidence shape; `load_sealed_feature_rows` additionally validates the descriptor against the supplied RunSpec, source gate, requested years, and persisted rows. Both recompute payload/row digests and reject a seal from another feature set. Validate source-gate/source-manifest/exclusion bindings, all component input hashes, baseline component score/quality preservation, and exactly earlier history. Validate each `MetricPrimitive` tree and preserve its normalized score, aggregation weight, recursive quality recipe, and child order. The only multiplier-enabled recipe families are existing starter/hitter-split, recent-form, and bullpen denominators; every other family rejects a Lane B multiplier. Seal JSONL rows and the feature-seal payload under `features`, hash/reread the payload, and load it through the same fields before returning.
+Persist exactly `schema="MODEL_IMPROVEMENT_FEATURE_SEAL_V1"`, `feature_set_id`, `fold_id`, `run_spec_sha256`, `source_gate_sha256`, `population_sha256`, `rows_sha256`, `parent_feature_seal_sha256`, and `evidence_sha256`; `artifact_sha256` and `path` are returned runtime descriptors and excluded by `FeatureSeal.as_mapping()`. `feature_set_id` is closed to `common` and `lane_c`. A `common` seal requires `parent_feature_seal_sha256 is None` and empty `evidence_sha256`; a `lane_c` seal requires a nonempty parent common feature-seal digest for the same fold and a nonempty immutable evidence-digest tuple. The exact public signatures are the receipt-bound signatures above; this contract deliberately has no `target_years` field: callers select rows with the existing `years` parameter, while the accepted year set is validated from each row’s `target_year` and the declared `fold_id`; the loader returns that immutable tuple. `load_feature_seal` validates the structural `features/{feature_set_id}/{fold_id}/` path and common/lane-C parent/evidence shape; receipt-bound `load_sealed_feature_rows` additionally validates the descriptor against the supplied RunSpec, authenticated source gate, requested years, and persisted rows. Both recompute the exact JSONL rows and label-free population preimages, recompute payload/row digests, and reject a seal from another feature set. Validate the source-gate/source-inventory/exclusion bindings defined above, all component input hashes, baseline component score/quality preservation, and exactly earlier history. Validate each `MetricPrimitive` tree and preserve its normalized score, aggregation weight, recursive quality recipe, and child order. The only multiplier-enabled recipe families are existing starter/hitter-split, recent-form, and bullpen denominators; every other family rejects a Lane B multiplier. Seal JSONL rows and the feature-seal payload under `features`, hash/reread both artifacts and sidecars, and load them through the same fields before returning.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -680,7 +780,7 @@ Expected: PASS; B has sufficient primitives and C starts with explicit neutral s
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add schemas/model_improvement/feature_seal.schema.json mlb_backtest/model_improvement/sealed_features.py tests/test_model_improvement_sealed_features.py
+git add schemas/model_improvement/feature_seal.schema.json mlb_backtest/model_improvement/sealed_features.py tests/test_model_improvement_sealed_features.py mlb_backtest/model_improvement/canonical.py tests/test_model_improvement_canonical.py
 git commit -m "feat: seal model improvement feature primitives"
 ```
 
