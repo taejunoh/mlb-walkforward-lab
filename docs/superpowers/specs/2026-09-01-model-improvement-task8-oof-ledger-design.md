@@ -30,7 +30,7 @@ not a permitted default.
 The approved implementation and runtime activation sequence is:
 
 ```text
-Task6P  source-derived, pre-target ProbabilityCalibrationCard authority
+Task6P  source-derived, pre-target CalibrationFeatureReceiptV1 and ProbabilityCalibrationCardV2 authority
 Task8A  Common OOF FeatureSeal admission + V2 baseline v5.1 label-free seals/loaders
 Task6A  baseline replay receipt, sealed only after the matching baseline seal
 Task8B  per-candidate pre-target calibration plus nonbaseline label-free seals/loaders
@@ -54,14 +54,19 @@ calibration authority and never rewrites the audited v5.1 card.
 
 ## Task6P probability-calibration authority
 
-`ProbabilityCalibrationCard` is the only authority allowed to turn a sealed
-edge into `p_home`. It is not a Task8 artifact and it is the only permitted
-label-bearing artifact before Task6B: its labels are strictly *prior-target*
-outcomes used for fitting, never target-fold outcomes or evaluation labels.
+`ProbabilityCalibrationCardV2` is the only executable authority allowed to
+turn a sealed edge into `p_home`. It is not a Task8 artifact and it is the
+only permitted label-bearing artifact before Task6B: its labels are strictly
+*prior-target* outcomes used for fitting, never target-fold outcomes or
+evaluation labels. `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1`,
+introduced by commit `2fa82cd`, is inspection-only and is never executable:
+it did not bind a typed source/evidence chain, authenticated weights, or a
+recomputed feature edge. Its loader must reject it for Task8/Task6A/Task8B
+execution rather than treating a structurally valid V1 payload as authority.
 
-There are seven immutable baseline calibration keys, keyed by exact fold
-identity, not merely target year. O22/H22 and O23/H23 may have identical
-permitted-year pools but are distinct immutable cards and distinct paths.
+There are seven immutable calibration keys, keyed by exact fold identity, not
+merely target year. O22/H22 and O23/H23 may have identical permitted-year
+pools but are distinct immutable receipts, cards, and paths.
 
 | calibration key | consumers | permitted official-date years |
 | --- | --- | --- |
@@ -73,35 +78,157 @@ permitted-year pools but are distinct immutable cards and distinct paths.
 | C23O | O23 | 2018--2022 |
 | C23H | H23 | 2018--2022 |
 
-For a key's pool, every calibration row must have an official date no later
-than its target-year `-1-12-31`; rows must also prove their own D-1 feature cutoff. A
-target-year row, a future source revision substituted for the bound source
-evidence, an arbitrary outcome mapping, or a caller-selected calibration path
+For a key's pool, every calibration input and emitted calibration row has an
+official date within its declared dates, a target year strictly earlier than
+the consumer target year, and a D-1 feature cutoff. A target-year row, a
+future source revision substituted for bound source evidence, an arbitrary
+outcome mapping, an arbitrary feature-row mapping, or a caller-selected path
 is a hard failure. There is no baseline C24 in this work: H24 remains
 prediction-only and must consume a separately frozen qualified card later.
 
-The closed primary schema is
-`MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1` with exactly:
+### Acyclic pre-RunSpec calibration-feature trust root
+
+The calibration feature evidence must exist **before** the RunSpec is sealed;
+otherwise a card that says its inputs agree with the RunSpec would be a
+self-signed authority. `probability_calibration_policy` therefore contains
+the exact, closed seven-entry `calibration_feature_receipts` mapping keyed by
+`C19`, `C20`, `C21`, `C22O`, `C22H`, `C23O`, and `C23H`. Each value is exactly
+`{"path": <canonical repository-relative normal path>, "sha256":
+<lowercase SHA-256>}`. The mapping's explicitly pinned path must name the
+receipt primary; no consumer derives or accepts a receipt path, digest, row list, or
+source root argument. The RunSpec digest pins this mapping, while the receipt
+does not bind the RunSpec digest and therefore cannot complete a cycle.
+
+`CalibrationFeatureReceiptV1` is a pre-RunSpec, label-free artifact and its
+only sibling row primary is canonical `calibration_feature_rows.jsonl`. It
+contains full canonical `SealedFeatureRow` mappings, not digest stubs. Its
+closed payload is exactly:
+
+```text
+schema, model_id, lane_id, fold_id, candidate_id, calibration_key,
+target_year, training_start, training_end,
+source_authority_sha256, source_inventory_sha256,
+game_evidence_inventory_relative_path, game_evidence_inventory_sha256,
+feature_contract_sha256, feature_code_revision,
+feature_rows_path, feature_rows_sha256, feature_population_sha256
+```
+
+It deliberately contains neither `run_spec_sha256` nor a weight binding. The
+receipt is reusable evidence of D-1 features; a later RunSpec selects and pins
+it, and a later calibration card binds the independently resolved current
+weight authority. Every full feature row must be strictly ordered by
+`(official_date, scheduled_start_utc, game_pk)`, unique by game/population,
+have `max_history_date == official_date - 1 day`, and bind the receipt's
+source inventory and authenticated source gate. Its `feature_row_sha256` is
+recomputed from the full row payload. A digest-only feature-provenance claim
+is insufficient.
+
+There is presently no source-to-feature producer/re-executor that can create
+such a receipt from the V5.2 authority. That producer is deliberately outside
+this plan. No real receipt is claimed, no synthetic receipt is usable outside
+tests, and a missing pinned receipt blocks before any V2 calibration,
+prediction, or replay output.
+
+### Per-fold execution order
+
+The seven receipt primaries must all exist before RunSpec sealing, but their
+admission is otherwise per `(identity, fold_id)` rather than a global
+"calibrate everything, then predict everything" stage. For each tuple the
+only permitted order is: (1) derive the fixed calibration key and receipt pin;
+(2) load/revalidate receipt, bound gate, typed inventory and verified games;
+(3) resolve the tuple's authenticated weights; (4) recompute each edge and
+prior-target `home_win`, then refit/compare the V2 card; (5) securely reread
+all inputs and admit the V2 card; (6) only then allow that tuple's Task8A
+prediction seal and Task6A replay. This prevents one fold's later authority
+from becoming a prerequisite or an input for another. Task8B inserts its
+independent pre-target weight-selection authority before step 3 and remains
+blocked while that authority is absent.
+
+### Typed source, outcome, and weight authority
+
+Task6P must use one shared read-only source-authority loader. It first calls
+the public `load_bound_source_gate_receipt(spec, supplied_gate)` wrapper,
+which derives the sole source-gate path, canonical-reloads it and its sidecar,
+compares the full supplied descriptor, and revalidates the activated
+source-gate binding without accepting an arbitrary path. It then reads the
+exact gate/RunSpec-bound inventory bytes, verifies their SHA-256, and parses
+them with the existing typed `v52_snapshot_store.parse_inventory`; it must not
+decode an untyped mapping. From that typed `SourceInventory` it loads the
+existing `VerifiedGameEvidenceInventory` with
+`load_verified_game_evidence_inventory(authority_root,
+read_only_progress=True, run_spec_path=..., acquisition_contract_path=...)`
+and requires its relative path and SHA-256 to equal the inventory's
+`game_evidence_inventory` binding. The source inventory, game-evidence
+inventory, receipt, and all source bindings are reloaded once before work and
+once immediately before return/publication; any drift is `ValueError`.
+
+For baseline, Task6P resolves weights only through
+`resolve_prediction_weight_authority(spec, "v5.1", None)`. It canonicalizes
+the resolver's repository-relative direct-card path to the repository root,
+then requires exact model, path, digest, and parsed six-component pp weights.
+Candidate code follows the same resolver with the already authenticated
+scoring card. A raw file SHA or a card-declared digest alone is not a weight
+authority.
+
+For every input feature row, Task6P recomputes rather than accepts its edge:
+
+```python
+edge = math.fsum(
+    weights[component] / 100.0
+    * (
+        feature.component_scores["home"][component]
+        - feature.component_scores["away"][component]
+    )
+    for component in COMPONENTS
+)
+```
+
+It derives `home_win` internally from the typed verified game row only after
+the label-free receipt is sealed: `terminal_status` is `Final` or `Completed
+Early`, `played is True`, `verification_status == "VERIFIED"`, scores are
+non-bool unequal nonnegative numbers, and `winner_team_id` is consistent with
+the home/away score. The emitted row records its source-game SHA-256 and the
+bound feature-row SHA-256. No caller supplies outcomes.
+
+The typed authority and feature receipt are checked before the row/fit work
+and again immediately before the card primary becomes visible. Missing any
+pinned receipt, card, sidecar, typed source input, or direct authority raises
+`CalibrationAuthorityBlockedError` with
+`BLOCKED_CALIBRATION_AUTHORITY_MISSING` before a V2 output is opened. A
+present primary with a missing/malformed sidecar, a digest/path/type mismatch,
+or any invalid content is `ValueError`, never a recoverable missing authority.
+
+### V2 cards and paths
+
+The executable primary schema is
+`MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V2` with exactly:
 
 ```text
 schema, model_id, lane_id, fold_id, candidate_id, calibration_key,
 target_year, training_start, training_end,
 run_spec_sha256, source_gate_sha256, prediction_contract_sha256,
+calibration_feature_receipt_path, calibration_feature_receipt_sha256,
 weight_authority_path, weight_authority_sha256,
 calibration_rows_path, calibration_rows_sha256,
 calibration_population_sha256,
-game_evidence_inventory_path, game_evidence_inventory_sha256,
+game_evidence_inventory_relative_path, game_evidence_inventory_sha256,
 fit_spec, alpha, beta
 ```
 
-`fit_spec` is a closed, immutable validation policy; `alpha` and `beta` are
-persisted coefficients, not opaque accepted values. Task6P only recomputes and
-validates an existing card; it does not publish a newly fitted card. The primary's
-runtime descriptor fields `artifact_sha256` and `path` are excluded from the
-payload as for every other artifact.
+The canonical V2 row has exactly `game_pk`, `official_date`, `target_year`,
+`edge`, `home_win`, `feature_row_sha256`, and `source_game_sha256`.
+`fit_spec` is a closed immutable validation policy; `alpha` and `beta` are
+persisted coefficients that Task6P recomputes from these rows, not opaque
+accepted values. Runtime descriptor fields `artifact_sha256` and `path` are
+excluded from every payload.
 
-The RunSpec contains policy, not an emitted-card digest, at the exact closed
-key `probability_calibration_policy`:
+The RunSpec contains policy and pre-existing **input receipt** pins, not an
+emitted-card digest, at the exact closed key
+`probability_calibration_policy`. Its `calibration_feature_receipts` member
+has exactly the seven calibration keys and each value has exactly `path` and
+`sha256`; every path is canonical repository-relative and every digest is a
+lowercase 64-hex SHA-256. Concrete values are pre-execution inputs, so a
+template, default path, or derived digest is never authority:
 
 ```json
 {
@@ -117,10 +244,19 @@ key `probability_calibration_policy`:
     "C23O": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"},
     "C23H": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"}
   },
-  "baseline_rows_relative_template": "baseline/v5.1/{fold_id}/calibration_rows.jsonl",
-  "baseline_card_relative_template": "baseline/v5.1/{fold_id}/probability_calibration_card.json",
-  "candidate_rows_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/calibration_rows.jsonl",
-  "candidate_card_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/probability_calibration_card.json"
+  "calibration_feature_receipts": {
+    "C19": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C20": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C21": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C22O": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C22H": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C23O": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
+    "C23H": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"}
+  },
+  "baseline_rows_relative_template": "baseline/v5.1/{fold_id}/v2/calibration_rows.jsonl",
+  "baseline_card_relative_template": "baseline/v5.1/{fold_id}/v2/probability_calibration_card.json",
+  "candidate_rows_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/v2/calibration_rows.jsonl",
+  "candidate_card_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/v2/probability_calibration_card.json"
 }
 ```
 
@@ -130,10 +266,9 @@ overrides. Its `fit_spec` schema name is
 `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1` and it has exactly the
 JSON members and constants shown above: the existing `fit_logistic` function
 is invoked as algorithm `fit_logistic_v1`, with no default/caller overrides.
-It intentionally contains
-neither card/rows digests nor source
-outcomes: those appear only in a subsequently emitted card and would otherwise
-make the source-gate authority circular. `candidate_segment` is canonical: a
+It intentionally contains neither V2 card/rows digests nor source outcomes:
+those appear only in a subsequently validated card and would otherwise make
+the source-gate authority circular. `candidate_segment` is canonical: a
 null `candidate_id` is the literal `_none`; a non-null value uses the existing
 safe single-segment candidate grammar `[A-Za-z0-9][A-Za-z0-9._-]*` (with `.`
 and `..` rejected). It is not caller-selected or aliased. The fold is always
@@ -156,40 +291,47 @@ or `C` `lane_id` segment (never the prediction-directory aliases `lane_a`,
 The exact `outputs.namespaces` closed list additionally contains `calibration`:
 `["source_gate", "features", "baseline", "calibration", "oof", "lane_a",
 "lane_b", "lane_c", "registry", "h24_predictions", "h24_reports"]`.
-`calibration_paths(spec, identity)` is the sole calibration path helper. It
+`calibration_paths_v2(spec, identity)` is the sole V2 output path helper. It
 validates the fixed identity mapping above, substitutes only its derived
 values into the policy templates, and calls only
 `spec.output_path("calibration", relative_name)`. `output_path` must enforce
 these closed calibration shapes and leaves before returning a path: baseline
-is `baseline/v5.1/{fold_id}/{calibration_rows.jsonl|probability_calibration_card.json}`;
-candidate is `{A|B|C}/{candidate_segment}/{fold_id}/{calibration_rows.jsonl|probability_calibration_card.json}`.
+is `baseline/v5.1/{fold_id}/v2/{calibration_rows.jsonl|probability_calibration_card.json}`;
+candidate is `{A|B|C}/{candidate_segment}/{fold_id}/v2/{calibration_rows.jsonl|probability_calibration_card.json}`.
 The helper derives the two primaries and their `.sha256` sidecars; no caller
 may invoke a calibration read/write with a hand-built path. All calibration
 tests use this helper and direct `output_path` tests reject every other
 calibration relative shape or leaf.
 
-The sibling rows primary is canonical JSONL with exactly `game_pk`,
-`official_date`, `target_year`, `edge`, `home_win`,
-`feature_provenance_sha256`, and `game_evidence_sha256`. Current Task6P is
-admission-only: it does not build, fit, rewrite, or publish card/rows data.
+The sibling V2 rows primary is canonical JSONL with exactly `game_pk`,
+`official_date`, `target_year`, `edge`, `home_win`, `feature_row_sha256`, and
+`source_game_sha256`. Current Task6P is admission-only: it does not build,
+fit, rewrite, or publish card/rows data. Its mandatory recomputation is only
+an admission comparison against a pre-existing V2 card and rows primary.
 
 Paths are derived, not provided:
 
 ```text
-baseline/v5.1/{fold_id}/calibration_rows.jsonl
-baseline/v5.1/{fold_id}/probability_calibration_card.json
-{lane_id}/{candidate_segment}/{fold_id}/calibration_rows.jsonl
-{lane_id}/{candidate_segment}/{fold_id}/probability_calibration_card.json
+baseline/v5.1/{fold_id}/v2/calibration_rows.jsonl
+baseline/v5.1/{fold_id}/v2/probability_calibration_card.json
+{lane_id}/{candidate_segment}/{fold_id}/v2/calibration_rows.jsonl
+{lane_id}/{candidate_segment}/{fold_id}/v2/probability_calibration_card.json
 ```
 
-`load_probability_calibration_card(spec, model_id, lane_id, fold_id, candidate_id)`
-and `require_probability_calibration_card(spec, model_id, lane_id, fold_id,
-candidate_id)` derive these paths and accept no path, rows, or outcomes. They
+`load_calibration_feature_receipt(spec, model_id, lane_id, fold_id,
+candidate_id)`, `load_probability_calibration_card_v2(spec, model_id,
+lane_id, fold_id, candidate_id)`, and
+`require_probability_calibration_card_v2(spec, model_id, lane_id, fold_id,
+candidate_id)` are the only operational APIs. They derive receipt pin and V2
+paths and accept no path, receipt, rows, weights, or outcomes. The old
+`load_probability_calibration_card` / `require_probability_calibration_card`
+V1 surface is inspection-only and must not be exported to Task6A, Task8, or
+Task8B execution. The V2 APIs
 first reject any request whose model/lane/candidate tuple or fold-derived key
 does not equal the fixed mapping above. The
-former returns the fully revalidated immutable card; the latter is the
+V2 loader returns the fully revalidated immutable card; the V2 require helper is the
 read-only admission gate used by seal/replay code. If the exact derived
-prior-outcome card, rows, or evidence authority is absent,
+prior-outcome card, rows, sidecar, receipt, or typed evidence authority is absent,
 the loader and every V2 sealer/replay caller raise the dedicated
 `CalibrationAuthorityBlockedError` (`RuntimeError`) whose immutable
 `code` and complete string are exactly `BLOCKED_CALIBRATION_AUTHORITY_MISSING`.
@@ -199,9 +341,9 @@ unchanged. A present-but-malformed or digest-mismatched authority instead
 raises `ValueError`. No value may be invented or inherited from the global
 2022--2024 v5.1 card.
 
-Every persisted path field is a canonical absolute path. The card and rows
+Every persisted card path field is a canonical absolute path. The card and rows
 paths must equal, byte-for-byte, the fold-derived paths under
-`spec.outputs.root/calibration` through `calibration_paths`; the existing
+`spec.outputs.root/calibration` through `calibration_paths_v2`; the existing
 `PredictionWeightAuthority.path` semantics remain unchanged. Instead, Task6P
 computes the card's `weight_authority_path` by securely resolving and
 canonicalizing the authenticated authority path: baseline's repository-relative
@@ -210,8 +352,8 @@ path is resolved against the repository root derived exactly as
 candidate Task7-card authority is already absolute. The persisted field is
 compared to that canonicalized absolute form, never to a raw descriptor
 `.path`; and
-`game_evidence_inventory_path` must equal the securely reloaded descriptor
-path after its existing authority-root rules succeed. The admission loader
+`game_evidence_inventory_relative_path` and SHA must equal the securely
+reloaded typed inventory binding. The admission loader
 securely rereads the complete card/rows/sidecars, weight authority, source
 gate, and game-evidence authority before derivation and again immediately
 before returning; it performs no writes. Seal/replay callers repeat that full
@@ -482,7 +624,7 @@ The baseline and nonbaseline scoring authorities are intentionally different:
 
 * **Baseline Task8A V2:** `ledger_id` must be `baseline/v5.1/{fold}` and
   `baseline_replay` must be `None`. Task8 securely derives and reloads the
-  exact fold-specific `ProbabilityCalibrationCard` before materializing a row. It
+  exact fold-specific `ProbabilityCalibrationCardV2` before materializing a row. It
   validates the card's source gate, contract, direct v5.1 weight authority,
   pre-target pool, feature and GameEvidence provenance, then uses its alpha
   and beta in `home_probability`. Its digest is required in every row and
@@ -501,11 +643,20 @@ The baseline and nonbaseline scoring authorities are intentionally different:
   `baseline_replay_sha256 == baseline_replay.artifact_sha256` must match.
   Task7's selected card remains an independent weight authority and never
   binds a calibration digest. Task8 derives and reloads the corresponding
-  candidate ProbabilityCalibrationCard from the same identity, then joins the
+  candidate `ProbabilityCalibrationCardV2` from the same identity, then joins the
   independently authenticated weight and calibration digests only in the V2
   prediction row/seal. Reusing the baseline calibrator after weights change is
   forbidden.
   Nonbaseline seals also set `frozen_model_card_sha256` to null.
+
+  The current Task8B historical candidate-weight choice remains blocked unless
+  its Task7 scoring card is accompanied by its own pre-target
+  `WeightSelectionReceipt` (or equivalent closed scoring-card selection
+  authority). A Task7 card digest authenticates bytes, but does not by itself
+  prove that the candidate was selected without target-fold outcomes. A
+  candidate calibration receipt/card cannot repair that independent selection
+  gap; Task8B must raise `CalibrationAuthorityBlockedError` before output
+  until it is supplied.
 
 ### Feature compatibility with the baseline replay
 
@@ -588,12 +739,16 @@ deleted, rewritten, or converted into a label-bearing prediction artifact.
 The Task6P + Task8 V2 implementation boundary is limited to:
 
 ```text
-Create  schemas/model_improvement/probability_calibration_card.schema.json
-Create  mlb_backtest/model_improvement/probability_calibration.py
+Create  schemas/model_improvement/calibration_feature_receipt.schema.json
+Create  schemas/model_improvement/probability_calibration_card_v2.schema.json
+Create  mlb_backtest/model_improvement/calibration_feature_receipts.py
+Modify  mlb_backtest/model_improvement/probability_calibration.py # V2 only; V1 inspection parser is non-executable
+Create  tests/test_model_improvement_calibration_feature_receipt.py
 Create  tests/test_model_improvement_probability_calibration.py
 Modify  schemas/model_improvement/parallel_model_result_run_spec.schema.json
 Modify  schemas/model_improvement/feature_seal.schema.json
 Modify  mlb_backtest/model_improvement/run_spec.py
+Modify  mlb_backtest/model_improvement/source_gate.py      # public read-only load_bound_source_gate_receipt
 Modify  mlb_backtest/model_improvement/sealed_features.py
 Modify  mlb_backtest/model_improvement/contracts.py       # add V2 row/seal calibration types
 Create  schemas/model_improvement/prediction_seal_v2.schema.json
@@ -623,8 +778,10 @@ Focused tests must prove:
 5. secure source-gate/inventory/FeatureSeal/RunSpec/prediction-contract
    mismatches at both write and reload;
 6. all seven fold-specific baseline pre-target calibration pools, including
-   distinct O22/H22 and O23/H23 cards; source-derived outcome/feature provenance,
-   card/sidecar/orphan, and missing-authority rejection; baseline direct-card
+   distinct O22/H22 and O23/H23 pre-RunSpec receipt pins; full label-free
+   feature-row, typed SourceInventory/VerifiedGameEvidence, direct-weight,
+   recomputed-edge/outcome/fit provenance; card/sidecar/orphan and
+   missing-authority rejection; primary-present/sidecar-missing invalidity; baseline direct-card
    success plus wrong path/digest/weights/calibration failure; Task8B
    candidate-specific derived-card/calibration and same-fold
    BaselineReplayReceiptV2 success plus every
@@ -633,7 +790,9 @@ Focused tests must prove:
    non-loadability, missing sidecar rejection, and immutable byte conflict;
 8. AST/module-import guards proving Task8 imports no outcome provider, metric
    evaluator, labelled-ledger API, or legacy top-level pipeline; and
-9. package exports of `PredictionSealV2`, `seal_oof_predictions_v2`,
+9. package exports of `CalibrationFeatureReceiptV1`,
+   `load_calibration_feature_receipt`, `load_probability_calibration_card_v2`,
+   `require_probability_calibration_card_v2`, `PredictionSealV2`, `seal_oof_predictions_v2`,
    `load_prediction_seal_v2`, and `load_prediction_rows_v2` only for Task8;
    V1 execution adapters must be rejected by Task6A/Task8B/Task6B.
 
@@ -924,11 +1083,14 @@ persistence/API. The V2 required `feature_seal_sha256` and
 `calibration_card_sha256` are in the PredictionSealV2 payload, V2 schema,
 sealer, descriptor loader, and row loader; published V1 material remains
 inspection-only.
-The staged Task6P/Task8A V2/Task6A/Task8B/Task6B order gives every baseline
-and nonbaseline probability a prior immutable, pre-target calibration
-authority; it leaves target-fold outcome authority exclusively to Task6B. The
-calibration source data is not claimed to exist: its absence blocks execution
-with `BLOCKED_CALIBRATION_AUTHORITY_MISSING`. The only necessary feature scope
+The staged Task6P/Task8A V2/Task6A/Task8B/Task6B order gives each **baseline**
+probability a prior immutable, pre-target calibration authority and leaves
+target-fold outcome authority exclusively to Task6B. Candidate Task8B stays
+blocked until its independently pre-target weight-selection authority exists.
+The calibration source data and its producer are not claimed to exist: missing
+pre-RunSpec receipt, typed evidence, V2 rows, card, or sidecar blocks execution
+with `BLOCKED_CALIBRATION_AUTHORITY_MISSING`; present invalid evidence is
+`ValueError`. The only necessary feature scope
 correction is Common OOF FeatureSeal
 admission for O19--O23, which is required to authenticate the Task7 OOF
 scoring-card population. Direct feature-seal equality is restricted to
