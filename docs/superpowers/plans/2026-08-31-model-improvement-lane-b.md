@@ -26,7 +26,7 @@
 
 ## Files and DAG
 
-Create lane_b_candidates.py, lane_b_scoring.py, lane_b_calibration.py, lane_b_evaluation.py, lane_b_ledger.py, lane_b_runner.py in mlb_backtest/model_improvement, with matching tests/test_model_improvement_lane_b_*.py files.
+Create lane_b_candidates.py, lane_b_scoring.py, lane_b_calibration.py, lane_b_ledger.py, lane_b_runner.py in mlb_backtest/model_improvement, with matching tests; Common owns evaluation.py and its tests.
 
 ~~~text
 verified Common/Lane-A paths with SOURCES_READY source gate -> grid -> score -> candidate OOF calibration
@@ -167,6 +167,12 @@ git commit -m "feat: preregister lane b candidates"
 - Consumes only a FeatureSeal whose feature_set_id is common, SealedFeatureRow.metric_primitives[side][component], component_scores, baseline_component_scores, Candidate, probability, predicted_pick, rank_daily, QualityRecipe, and MetricPrimitive.
 - Produces materialize_quality(recipe: QualityRecipe, multiplier: float) -> float, materialize_component(primitives: Sequence[MetricPrimitive], multiplier: float) -> tuple[float, float], materialize_side(primitives: Mapping[str, Sequence[MetricPrimitive]], component_scores: Mapping[str, float], component_qualities: Mapping[str, float], baseline_scores: Mapping[str, float], baseline_qualities: Mapping[str, float], multiplier: float) -> tuple[dict[str, float], dict[str, float]], score_candidate_rows(rows, candidate, alpha, beta) -> tuple[dict[str, object], ...], rank_pickable_rows(rows) -> tuple[dict[str, object], ...].
 - No outcome import.
+
+`confidence_from_prediction_contract` is not a Lane-B formula: it is the Common
+universal helper specified by `spec.prediction_contract`. It derives weighted
+completeness, signed starter/offense/bullpen edges, and chosen-side agreement,
+then calls existing `scoring.confidence_score`; it validates the returned
+0–10 value. Lane B must not compute a local confidence surrogate.
 
 - [ ] **Step 1: Write failing TestCase methods.**
 
@@ -313,7 +319,7 @@ def score_candidate_rows(rows, candidate, alpha, beta):
             "scheduled_start_utc": source.scheduled_start_utc, "edge": edge, "p_home": p_home,
             "picked_side": pick["predicted_side"],
             "pick_probability": pick["pick_probability"], "starter_edge_abs": abs(home["starter"] - away["starter"]),
-            "confidence": 10 * sum(candidate.weights_pp[n] / 100 * min(hq[n], aq[n]) for n in _COMPONENTS)})
+            "confidence": confidence_from_prediction_contract(spec, candidate, hq, aq, home, away, pick)})
     return tuple(sorted(result, key=lambda row: (row["official_date"], row["game_pk"])))
 
 
@@ -516,96 +522,67 @@ git add mlb_backtest/model_improvement/lane_b_cards.py tests/test_model_improvem
 git commit -m "feat: seal lane b scoring cards"
 ~~~
 
-### Task 5: Evaluate all games and date-paired Top-1
+### Task 5: Consume Common evaluation pairs
 
 **Files:**
 
-- Create: mlb_backtest/model_improvement/lane_b_evaluation.py
-- Create: tests/test_model_improvement_lane_b_evaluation.py
+- Modify: mlb_backtest/model_improvement/lane_b_ledger.py
+- Modify: tests/test_model_improvement_lane_b_ledger.py
 
 **Interfaces:**
 
-- Produces top1_by_date(rows, outcomes) -> dict[str, bool] and evaluate_candidate_against_baseline(candidate_rows, baseline_rows, outcomes) -> dict[str, object].
-- Ledger reads all_games.candidate_brier, all_games.candidate_log_loss, daily_top1.delta.
+- Produces no local evaluator. Each candidate calls Common `evaluate_predictions(spec, source_gate, candidate_seal, baseline_seal, outcomes) -> EvaluationPair`, keyed by its scoped `ledger_id` and `candidate_id`, then consumes the named candidate/baseline reports from the securely loaded pair.
+- The ledger reads the candidate report's `brier`, `log_loss`, and `daily_top1_delta_vs_baseline`; no local `top1` flag, mapping, int/bool coercion, or model-ID-keyed comparison is permitted.
 
 - [ ] **Step 1: Write failing evaluation TestCase.**
 
 ~~~python
 import unittest
-from mlb_backtest.model_improvement.lane_b_evaluation import evaluate_candidate_against_baseline
+from mlb_backtest.model_improvement.evaluation import evaluate_predictions
 
 
 class LaneBEvaluationTest(unittest.TestCase):
-    def test_all_games_and_top1_dates_are_separate_populations(self):
-        result = evaluate_candidate_against_baseline(self.candidate_rows, self.baseline_rows, self.outcomes)
-        self.assertEqual(4, result["all_games"]["N"])
-        self.assertEqual(2, result["daily_top1"]["N"])
+    def test_common_pair_is_keyed_by_candidate_ledger(self):
+        pair = evaluate_predictions(self.spec, self.source_gate, self.candidate_seal,
+                                    self.baseline_seal, self.outcomes)
+        self.assertEqual(self.candidate_seal.ledger_id, pair.ledger_id)
+        self.assertEqual(self.candidate_seal.candidate_id, pair.candidate_id)
 ~~~
 
 - [ ] **Step 2: Run RED.**
 
-Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_evaluation.LaneBEvaluationTest -v
+Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_evaluation tests.test_model_improvement_lane_b_ledger -v
 
-Expected: ModuleNotFoundError for lane_b_evaluation.
+Expected: FAIL until Lane B records a Common EvaluationPair.
 
 - [ ] **Step 3: Implement metrics and pairing.**
 
 ~~~python
-from mlb_backtest.diagnostics import paired_table
-from mlb_backtest.metrics import brier, log_loss, max_losing_streak
+from mlb_backtest.model_improvement.evaluation import evaluate_predictions
 
 
-def top1_by_date(rows, outcomes):
-    result = {}
-    for row in rows:
-        if row.get("top1") is True:
-            day, game_pk = str(row["official_date"]), row["game_pk"]
-            if day in result or game_pk not in outcomes or row["picked_side"] == "none":
-                raise ValueError("Daily Top1 rows differ")
-            result[day] = (row["picked_side"] == "home") == bool(outcomes[game_pk])
-    return result
-
-
-def evaluate_candidate_against_baseline(candidate_rows, baseline_rows, outcomes):
-    candidate, baseline = {r["game_pk"]: r for r in candidate_rows}, {r["game_pk"]: r for r in baseline_rows}
-    if len(candidate) != len(candidate_rows) or len(baseline) != len(baseline_rows) or set(candidate) != set(baseline) or set(candidate) != set(outcomes):
-        raise ValueError("eligible game population differs")
-    keys = sorted(candidate)
-    cb = sum(brier(candidate[k]["p_home"], outcomes[k]) for k in keys) / len(keys)
-    bb = sum(brier(baseline[k]["p_home"], outcomes[k]) for k in keys) / len(keys)
-    cl = sum(log_loss(candidate[k]["p_home"], outcomes[k]) for k in keys) / len(keys)
-    bl = sum(log_loss(baseline[k]["p_home"], outcomes[k]) for k in keys) / len(keys)
-    ct, bt = top1_by_date(candidate_rows, outcomes), top1_by_date(baseline_rows, outcomes)
-    if not ct or set(ct) != set(bt):
-        raise ValueError("Daily Top1 date population differs")
-    days, pairs = sorted(ct), paired_table([ct[d] for d in sorted(ct)], [bt[d] for d in sorted(bt)])
-    return {"all_games": {"N": len(keys), "candidate_brier": cb, "baseline_brier": bb, "brier_delta": cb - bb,
-                           "candidate_log_loss": cl, "baseline_log_loss": bl, "log_loss_delta": cl - bl},
-            "daily_top1": {"N": len(days), "paired": pairs, "delta": (pairs["model_only"] - pairs["baseline_only"]) / len(days),
-                           "candidate_max_losing_streak": max_losing_streak([ct[d] for d in days]),
-                           "baseline_max_losing_streak": max_losing_streak([bt[d] for d in days])}}
+# Lane B owns no metric, rank-one pairing, or outcome-label implementation.
+# The ledger only calls Common evaluation and records its immutable pair.
 ~~~
 
 - [ ] **Step 4: Add mismatched-population and different-selected-game tests then run GREEN.**
 
 ~~~python
     def test_mismatch_and_different_selected_game(self):
-        with self.assertRaisesRegex(ValueError, "eligible game population differs"):
-            evaluate_candidate_against_baseline(self.candidate_rows[:-1], self.baseline_rows, self.outcomes)
-        result = evaluate_candidate_against_baseline(self.different_game_candidate_rows,
-                                                     self.baseline_rows, self.outcomes)
-        self.assertEqual(2, result["daily_top1"]["N"])
+        pair = evaluate_predictions(self.spec, self.source_gate, self.candidate_seal,
+                                    self.baseline_seal, self.outcomes)
+        self.assertEqual(2, pair.candidate_report.daily_top1_count)
 ~~~
 
-Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_evaluation.LaneBEvaluationTest -v
+Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_evaluation tests.test_model_improvement_lane_b_ledger -v
 
-Expected: PASS; date pairing does not join by selected game_pk.
+Expected: PASS; Common date pairing does not join by selected game_pk.
 
 - [ ] **Step 5: Commit.**
 
 ~~~bash
-git add mlb_backtest/model_improvement/lane_b_evaluation.py tests/test_model_improvement_lane_b_evaluation.py
-git commit -m "feat: evaluate lane b metrics"
+git add mlb_backtest/model_improvement/lane_b_ledger.py tests/test_model_improvement_lane_b_ledger.py
+git commit -m "feat: consume common lane b evaluations"
 ~~~
 
 ### Task 6: Seal all H22 decisions and select/freeze the optional H23 card
@@ -617,7 +594,7 @@ git commit -m "feat: evaluate lane b metrics"
 
 **Interfaces:**
 
-- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_evaluation: EvaluationReport), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation: EvaluationReport), and a QUALIFIED LaneDisposition sealed after a successful Common post-evaluation card freeze.
+- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_pair: EvaluationPair), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation_pair: EvaluationPair), and a QUALIFIED LaneDisposition sealed after a successful Common post-evaluation card freeze.
 - H24 consumes only FrozenModelCard or LaneDisposition, not any Lane B registry entry.
 
 - [ ] **Step 1: Write failing H22/H23 TestCase methods.**
@@ -651,7 +628,7 @@ from mlb_backtest.model_improvement.canonical import canonical_json_bytes, read_
 from mlb_backtest.model_improvement.contracts import seal_frozen_model_card
 from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
 from mlb_backtest.model_improvement.lane_b_candidates import Candidate, validate_candidate
-from mlb_backtest.model_improvement.evaluation import EvaluationReport
+from mlb_backtest.model_improvement.evaluation import EvaluationPair
 from mlb_backtest.model_improvement.lane_disposition import (
     LANE_DISPOSITION_STATES, LANE_IDS, LaneDisposition, load_lane_disposition,
     seal_lane_disposition,
@@ -695,19 +672,20 @@ def build_lane_b_disposition(spec, lane_a_result):
         evidence_sha256=evidence, reason_codes=("LANE_A_NOT_H23_FROZEN",))
 
 
-def select_h23(spec, rows, lane_a_evaluation: EvaluationReport):
+def select_h23(spec, rows, lane_a_pair: EvaluationPair):
+    lane_a_report = lane_a_pair.candidate_report
     eligible = [r for r in rows if r["replay_status"] == "PASS"
-        and r["comparison"]["all_games"]["candidate_brier"] <= lane_a_evaluation.brier
-        and r["comparison"]["all_games"]["candidate_log_loss"] <= lane_a_evaluation.log_loss
-        and r["comparison"]["daily_top1"]["delta"] > 0]
+        and r["evaluation_pair"].candidate_report.brier <= lane_a_report.brier
+        and r["evaluation_pair"].candidate_report.log_loss <= lane_a_report.log_loss
+        and r["evaluation_pair"].candidate_report.daily_top1_delta_vs_baseline > 0]
     if not eligible:
         return seal_lane_disposition(spec, lane_id="B", state="REJECTED",
-            parent_card_sha256=None, evidence_sha256=(lane_a_evaluation.artifact_sha256,),
+            parent_card_sha256=None, evidence_sha256=(lane_a_pair.artifact_sha256,),
             reason_codes=("NO_H23_CANDIDATE_CLEARS_GATES",))
     return {**min(eligible, key=h22_order), "status": "SELECTED_H23"}
 
 
-def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation):
+def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation_pair):
     if not isinstance(selected, dict) or selected["status"] != "SELECTED_H23":
         raise ValueError("selected H23 candidate differs")
     if lane_a_card.model_id != "A" or lane_a_card.state != "H23_FROZEN":
@@ -733,7 +711,8 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
         "scoring_model_card_path": scoring_card.path,
         "scoring_model_card_sha256": scoring_card.artifact_sha256,
         "prediction_seal_sha256": prediction_seal.artifact_sha256,
-        "evaluation_sha256": evaluation.artifact_sha256,
+        "evaluation_sha256": evaluation_pair.candidate_report.artifact_sha256,
+        "evaluation_pair_sha256": evaluation_pair.artifact_sha256,
         "parameters": {**dict(scoring_card.parameters), "candidate_id": selected["candidate_id"],
                        "component_weights_pp": selected_weights}}
     return seal_frozen_model_card(spec, "lane_b", "H23/frozen_model_card.json", payload)
@@ -743,7 +722,7 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
 
 ~~~python
     def test_no_qualifier_rejects_and_wrong_parent_cannot_freeze(self):
-        result = select_h23(self.spec, self.worse_survivors, self.lane_a_evaluation)
+        result = select_h23(self.spec, self.worse_survivors, self.lane_a_pair)
         self.assertEqual("REJECTED", result.state)
         with self.assertRaisesRegex(ValueError, "not H23_FROZEN"):
             freeze_ab_card(self.spec, self.selected, self.lane_a_not_frozen,
@@ -771,7 +750,7 @@ git commit -m "feat: seal optional lane b card"
 
 **Interfaces:**
 
-- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_path, lane_a_h22_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256, selected_prediction_seal, selected_evaluation) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
+- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_pair_path, lane_a_h22_pair_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, baseline_replay, feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256, selected_prediction_seal, selected_evaluation_pair) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
 - H24 receives optional scoring-card.path/scoring-card.artifact_sha256, final-card.path/final-card.artifact_sha256, and disposition.path/disposition.artifact_sha256; runner does not import candidate_registry.
 
 - [ ] **Step 1: Write failing runner TestCase methods.**
@@ -865,8 +844,8 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
         raise ValueError("returned source gate differs from explicit receipt")
     features = load_feature_seal(Path(feature_seal_path), feature_seal_expected_sha256)
     feature_rows = load_sealed_feature_rows(spec, verified_gate, (2022,), features)
-    v51 = load_prediction_seal(Path(v51_h22_path), v51_h22_expected_sha256)
-    lane_a = load_prediction_seal(Path(lane_a_h22_path), lane_a_h22_expected_sha256)
+    v51 = load_prediction_seal(spec, Path(v51_h22_path), v51_h22_expected_sha256)
+    lane_a = load_prediction_seal(spec, Path(lane_a_h22_path), lane_a_h22_expected_sha256)
     v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
     if tuple(spec.fold("H22").oof_calibration_years) != (2019, 2020, 2021):
         raise RuntimeError("H22 chronology differs")
@@ -877,13 +856,13 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
             "v51_h22_artifact_sha256": v51.artifact_sha256, "lane_a_h22_artifact_sha256": lane_a.artifact_sha256}
 
 
-def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay,
+def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, baseline_replay,
                    feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256,
                    selected_prediction_seal, selected_evaluation):
     card = lane_a_result.card
     if card is None or card.model_id != "A" or card.state != "H23_FROZEN":
         return None, build_lane_b_disposition(spec, lane_a_result)
-    selected = select_h23(spec, survivors, lane_a_evaluation)
+    selected = select_h23(spec, survivors, lane_a_pair)
     if not isinstance(selected, dict):
         return None, selected
     candidate_id = selected["candidate_id"]
@@ -955,7 +934,7 @@ Expected: PASS; no H24 registry import or write occurs.
 
 - [ ] **Step 5: Run all checks and commit.**
 
-Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_candidates tests.test_model_improvement_lane_b_scoring tests.test_model_improvement_lane_b_calibration tests.test_model_improvement_lane_b_cards tests.test_model_improvement_lane_b_evaluation tests.test_model_improvement_lane_b_ledger tests.test_model_improvement_lane_b_runner tests.test_model_improvement_scoring_cards tests.test_scoring tests.test_normalize tests.test_metrics tests.test_ranking tests.test_leakage -v
+Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_candidates tests.test_model_improvement_lane_b_scoring tests.test_model_improvement_lane_b_calibration tests.test_model_improvement_lane_b_cards tests.test_model_improvement_lane_b_ledger tests.test_model_improvement_lane_b_runner tests.test_model_improvement_evaluation tests.test_model_improvement_scoring_cards tests.test_scoring tests.test_normalize tests.test_metrics tests.test_ranking tests.test_leakage -v
 
 Expected: PASS; every test is a unittest.TestCase method and v5.1 remains unchanged.
 
