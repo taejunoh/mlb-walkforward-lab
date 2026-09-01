@@ -7,9 +7,11 @@ import math
 import unittest
 
 from mlb_backtest.daily_totals import (
+    BuiltDailyTotals,
     MODEL_SCHEMA,
     REPORT_SCHEMA,
     render_totals_markdown,
+    validate_totals_trace,
     validate_totals_model_receipt,
     validate_totals_report,
 )
@@ -64,18 +66,18 @@ def make_valid_model_receipt() -> dict[str, object]:
         "cutoff_date": "2026-08-31",
         "history_source": _source("HISTORY_SCHEDULE"),
         "live_source": _source("LIVE_SCHEDULE"),
-        "windows": {"development_start": "2026-06-01", "development_end": "2026-07-31", "final_start": "2026-08-01", "final_end": "2026-08-31", "league_days": 30, "venue_days": 60, "team_shrinkage_games": 10, "venue_shrinkage_games": 20},
+        "windows": {"warmup_start": "2026-03-25", "warmup_end": "2026-05-31", "development_start": "2026-06-01", "development_end": "2026-07-31", "final_start": "2026-08-01", "final_end": "2026-08-31", "league_days": 30, "venue_days": 60, "team_shrinkage_games": 10, "venue_shrinkage_games": 20},
         "candidate_ids": ["LEAGUE_30", "TEAM_30", "TEAM_VENUE_30"],
         "candidate_definition_sha256": "",
         "development_metrics": {candidate: _metrics() for candidate in ("LEAGUE_30", "TEAM_30", "TEAM_VENUE_30")},
         "selected_candidate": "LEAGUE_30",
         "final_metrics": _metrics(),
-        "development_residual_samples": [5, 6, 7],
+        "development_residuals": [-1.25, 0.0, 1.5],
         "development_residual_sha256": "",
         "development_residual_count": 3,
     }
     payload["candidate_definition_sha256"] = _sha({"candidate_ids": payload["candidate_ids"], "windows": payload["windows"]})
-    payload["development_residual_sha256"] = _sha(payload["development_residual_samples"])
+    payload["development_residual_sha256"] = _sha(payload["development_residuals"])
     canonical = dict(payload)
     canonical.pop("content_sha256")
     payload["content_sha256"] = _sha(canonical)
@@ -101,7 +103,7 @@ def make_valid_report_payload() -> dict[str, object]:
         "selected_candidate": "LEAGUE_30",
         "development_metrics": receipt["development_metrics"],
         "final_metrics": receipt["final_metrics"],
-        "games": [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "PROJECTED", "candidate_id": "LEAGUE_30", "away_expected_runs": 3.2, "home_expected_runs": 4.1, "expected_total": 7.3, "interval_80": [5, 7], "residual_samples": [5, 6, 7], "residual_sha256": _sha([5, 6, 7]), "residual_count": 3}] ,
+        "games": [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "PROJECTED", "candidate_id": "LEAGUE_30", "away_expected_runs": 3.2, "home_expected_runs": 4.1, "expected_total": 7.3, "interval_80": [5, 7], "residual_samples": [5, 6, 7], "residual_sha256": _sha([5, 6, 7]), "residual_count": 3, "feature_cutoff": "2026-08-31", "source_digest": receipt["source_report_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]}] ,
     }
     canonical = dict(payload)
     canonical.pop("content_sha256")
@@ -129,7 +131,7 @@ class DailyTotalsContractTests(unittest.TestCase):
 
     def test_unprojected_variant_is_closed(self) -> None:
         report = make_valid_report_payload()
-        report["games"] = [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "UNPROJECTED", "reason": "UNKNOWN_TEAM"}]
+        report["games"] = [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "UNPROJECTED", "reason": "UNKNOWN_TEAM", "feature_cutoff": "2026-08-31", "source_digest": report["source_report_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "UNKNOWN_TEAM"]}]
         report["content_sha256"] = _sha({key: value for key, value in report.items() if key != "content_sha256"})
         self.assertEqual(validate_totals_report(report)["games"][0]["status"], "UNPROJECTED")
 
@@ -144,6 +146,40 @@ class DailyTotalsContractTests(unittest.TestCase):
         forbidden = {"pick", "odds", "edge", "playable_to", "profitability"}
         self.assertTrue(forbidden.isdisjoint(payload))
         self.assertEqual(validate_totals_report(payload)["status_labels"], ["RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED"])
+
+    def test_trace_is_closed_and_cross_binds_full_identities(self) -> None:
+        report = make_valid_report_payload()
+        trace = {
+            "schema": "PROVISIONAL_DAILY_TOTALS_TRACE_V1", "content_sha256": "",
+            "model_receipt_relative": report["model_receipt_relative"], "model_receipt_sha256": report["model_receipt_sha256"],
+            "report_relative": "reports/experimental_daily_totals/2026-09-01/report.json", "report_sha256": "6" * 64,
+            "report_sidecar_sha256": "7" * 64, "markdown_sha256": "8" * 64,
+            "source_report_relative": report["source_report_relative"], "source_report_sha256": report["source_report_sha256"],
+            "history_source": report["history_source"], "live_source": report["live_source"],
+        }
+        trace["content_sha256"] = _sha({key: value for key, value in trace.items() if key != "content_sha256"})
+        self.assertEqual(validate_totals_trace(trace), trace)
+        trace["history_source"]["payload_sha256"] = "9" * 64
+        with self.assertRaises(ValueError):
+            validate_totals_trace(trace)
+
+    def test_built_value_retains_canonical_immutable_bytes(self) -> None:
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": report["source_report_sha256"], "model_receipt_relative": report["model_receipt_relative"]}))
+        exposed = built.report
+        exposed["games"][0]["source_digest"] = "0" * 64  # type: ignore[index]
+        self.assertEqual(built.report["games"][0]["source_digest"], report["source_report_sha256"])
+
+    def test_rows_must_be_chronological_by_date_start_and_game_pk(self) -> None:
+        report = make_valid_report_payload()
+        row = dict(report["games"][0])  # type: ignore[index]
+        row["game_pk"] = 2
+        row["scheduled_start_utc"] = "2026-09-01T15:00:00Z"
+        report["games"] = [report["games"][0], row]
+        report["content_sha256"] = _sha({key: value for key, value in report.items() if key != "content_sha256"})
+        with self.assertRaises(ValueError):
+            validate_totals_report(report)
 
 
 if __name__ == "__main__":
