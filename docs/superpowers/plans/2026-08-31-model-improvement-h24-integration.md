@@ -51,21 +51,18 @@ Create these files:
 - `schemas/model_improvement/h24_comparison.schema.json`
 - `mlb_backtest/model_improvement/candidate_registry.py`
 - `mlb_backtest/model_improvement/h24_predictions.py`
-- `mlb_backtest/model_improvement/h24_outcomes.py`
 - `mlb_backtest/model_improvement/final_gate.py`
 - `mlb_backtest/model_improvement/h24_controller.py`
 - `scripts/run_model_improvement_h24.py`
 - `tests/fixtures/model_improvement/h24/eligible_rows.jsonl`
-- `tests/fixtures/model_improvement/h24/outcomes.jsonl`
 - `tests/test_model_improvement_registry.py`
 - `tests/test_model_improvement_h24_predictions.py`
-- `tests/test_model_improvement_h24_outcomes.py`
 - `tests/test_model_improvement_final_gate.py`
 - `tests/test_model_improvement_h24_controller.py`
 
 Do not modify `config/v5_1_bt.json`, any file below `audit/v5_1_bt/`, any existing v5.1 model card, or any live/experimental daily output.
 
-Common/Lane A owns `ModelImprovementRunSpec`, `SourceGateReceipt`, `FeatureSeal`, `SealedFeatureRow`, `ScoringModelCard`, `FrozenModelCard`, `LaneDisposition`, `PredictionRow`, and `PredictionSeal` in the Common modules. This plan must import those definitions and must not redefine them. This plan owns `RegisteredCandidate`, `CandidateRegistry`, `H24PredictionManifest`, `H24Phase`, `H24LedgerState`, `OutcomeCapability`, `H24OutcomeRow`, `EvaluatedPredictionRow`, `H24Comparison`, `FinalVerificationReceipt`, and `PromotionDecision` in the modules listed above.
+Common/Lane A owns `ModelImprovementRunSpec`, `SourceGateReceipt`, `FeatureSeal`, `SealedFeatureRow`, `ScoringModelCard`, `FrozenModelCard`, `LaneDisposition`, `PredictionRow`, `PredictionSeal`, and `OutcomeReceipt` in the Common modules. This plan must import those definitions and must not redefine them. This plan owns `RegisteredCandidate`, `CandidateRegistry`, `H24PredictionManifest`, `H24Phase`, `H24LedgerState`, `OutcomeCapability`, `H24Comparison`, `FinalVerificationReceipt`, and `PromotionDecision` in the modules listed above.
 
 ```python
 from mlb_backtest.model_improvement.contracts import MODEL_IDS, ScoringModelCard, load_frozen_model_card
@@ -276,37 +273,30 @@ def authorize_h24_outcome_open(
 - [ ] Run the controller suite and confirm all phase and crash-point tests pass.
 - [ ] Commit with `git commit -m "feat: enforce one-shot h24 phase ledger"`.
 
-### Task 5: Materialize the H24 outcome receipt for the sealed population
+### Task 5: Open the Common Task6B outcome receipt and consume evaluation pairs
 
 **Files:**
-- Create: `mlb_backtest/model_improvement/h24_outcomes.py`
-- Create: `tests/test_model_improvement_h24_outcomes.py`
-- Create: `tests/fixtures/model_improvement/h24/outcomes.jsonl`
+- Modify: `mlb_backtest/model_improvement/h24_controller.py`
+- Modify: `tests/test_model_improvement_h24_controller.py`
 - Create: `schemas/model_improvement/h24_comparison.schema.json`
 
-- [ ] Add a failing test that calls the H24 outcome-receipt producer with the registry capability and prediction manifest, and expects exactly one binary home-win observation for every eligible `game_pk` and every registered model.
-- [ ] Add failure cases for a missing/extra/duplicate outcome, nonbinary label, game postponement ambiguity, population mismatch, prediction digest mismatch, no capability, reused capability, and any 2025 row.
-- [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_outcomes -v` and confirm RED.
-- [ ] Implement:
+- [ ] Add failing controller tests for missing/extra/duplicate source-derived outcomes, postponement ambiguity, population mismatch, prediction digest mismatch, missing receipt, receipt path/digest mismatch, and a second outcome-open attempt. The H24 controller supplies authenticated SourceInventory → GameEvidence inputs to Common; it defines no H24 outcome-row type or raw outcome-row sequence.
+- [ ] Use only Common Task6B APIs: seal the typed receipt once with `seal_outcome_receipt`, securely reload it with `load_outcome_receipt`, and obtain immutable observations only with `load_outcome_rows`. All are bound to the verified RunSpec, SourceGateReceipt, matching FeatureSeal, and BaselineReplayReceipt; no H24 receipt wrapper or compatibility route is permitted.
+- [ ] Run the focused H24 controller tests and confirm RED.
+- [ ] Implement the H24 comparison handoff:
 
 ```python
-def seal_h24_outcome_receipt(
-    capability: OutcomeCapability,
-    prediction_manifest: H24PredictionManifest,
-    outcome_rows: Sequence[H24OutcomeRow],
-) -> tuple[EvaluatedPredictionRow, ...]:
-    """Consume the capability and join the exact sealed H24 population once."""
-
-def evaluate_h24_models(
-    spec: ModelImprovementRunSpec,
-    source_gate: SourceGateReceipt,
-    rows: Sequence[EvaluatedPredictionRow],
-    registry: CandidateRegistry,
-) -> H24Comparison:
-    """Call Common evaluation for each registered candidate and bind its pair."""
+outcome_receipt = seal_outcome_receipt(
+    spec, source_gate, common_feature_seal, baseline_replay,
+    source_inventory, game_evidence_inventory,
+)
+outcome_receipt = load_outcome_receipt(
+    spec, source_gate, common_feature_seal, baseline_replay,
+    outcome_receipt.path, outcome_receipt.artifact_sha256,
+)
 ```
 
-- [ ] Materialize the authenticated `OutcomeReceipt` once, then call Common `evaluate_predictions(spec, candidate_prediction_seal, baseline_prediction_seal, outcome_receipt)` for every nonbaseline registry candidate. `H24Comparison` is a registry-level index, not another evaluator: it stores each candidate's `ledger_id`, `candidate_id`, `EvaluationPair` path/digest, and named candidate/baseline report digests. It must not implement its own Brier, log loss, rank-one pairing, neutral-date handling, or observation coercion. Common owns the full-precision all-game metrics, independently selected date pairs, and maximum losing streak. Every downstream frozen-card consumer securely loads the `EvaluationPair` and checks its `outcome_receipt_path` and `outcome_receipt_sha256`; `outcomes_sha256` alone is never sufficient.
+- [ ] For every nonbaseline registry candidate, call Common `evaluate_predictions(spec, candidate_prediction_seal, baseline_prediction_seal, outcome_receipt)`. `H24Comparison` is a registry-level index, not another evaluator: it stores each candidate's `ledger_id`, `candidate_id`, and complete `EvaluationPair` path/digest. It first obtains that complete pair through `load_evaluation_pair(spec, path, expected_sha256)` and may then read its named candidate/baseline reports. It must not implement its own Brier, log loss, rank-one pairing, neutral-date handling, or observation coercion. Common owns the full-precision all-game metrics, independently selected date pairs, and maximum losing streak. Every downstream frozen-card consumer checks `outcome_receipt_path` and `outcome_receipt_sha256`; `outcomes_sha256` alone is never sufficient.
 - [ ] Store raw integer counts, full-precision metric values, signed deltas versus v5.1, and only pair-derived digests. Reject rounded values as gate inputs, and reject a pair whose candidate ID/ledger ID differs from the registry record.
 - [ ] Implement the closed comparison schema and canonical bytes/sidecar writer.
 - [ ] Run the outcome suite and confirm valid results pass and every population/capability violation fails.
@@ -363,7 +353,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   tests.test_model_improvement_registry \
   tests.test_model_improvement_h24_predictions \
   tests.test_model_improvement_h24_controller \
-  tests.test_model_improvement_h24_outcomes \
   tests.test_model_improvement_final_gate -v
 ```
 

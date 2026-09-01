@@ -49,6 +49,12 @@ class OofLedgerDocumentationContractTest(unittest.TestCase):
             "load_prediction_rows(spec, seal)",
             "evaluate_predictions(... outcomes)",
             "evaluate_predictions(spec, source_gate, candidate, baseline, outcomes)",
+            "seal_h24_outcome_receipt",
+            "H24OutcomeRow",
+            "EvaluatedPredictionRow",
+            "outcome_rows: Sequence",
+            "Sequence[H24OutcomeRow]",
+            "Sequence[EvaluatedPredictionRow]",
         )
         for path, text in zip(PLAN_PATHS, texts):
             self.assertFalse(any(token in text for token in forbidden), path)
