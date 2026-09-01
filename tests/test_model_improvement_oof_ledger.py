@@ -758,6 +758,25 @@ class BaselineOofLedgerV2Test(unittest.TestCase):
                 paths = prediction_paths_v2(self.spec, f"baseline/v5.1/{fold_id}")
                 self.assertIn(f"/v5.1/{fold_id}/v2/", str(paths.rows))
 
+    def test_v2_seals_one_pass_row_generator_without_an_orphan(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        card = self._calibration_card()
+        rows = (row for row in self.v2_rows)
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+        ):
+            seal = oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", rows,
+            )
+            self.assertEqual(
+                oof_ledger_v2.load_prediction_rows_v2(
+                    self.spec, self.gate, self.feature_seal, None, seal
+                ),
+                self.v2_rows,
+            )
+
     def test_package_exports_only_the_versioned_v2_prediction_surface(self):
         import mlb_backtest.model_improvement as package
 

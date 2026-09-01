@@ -238,16 +238,20 @@ def _feature_edge(feature: object, weights: Mapping[str, int]) -> float:
     )
 
 
+def _materialize_rows(rows: Sequence[PredictionRowV2]) -> tuple[object, ...]:
+    if isinstance(rows, (str, bytes, bytearray)):
+        raise ValueError("V2 prediction rows require a row sequence")
+    try:
+        return tuple(rows)
+    except TypeError as exc:
+        raise ValueError("V2 prediction rows require a row sequence") from exc
+
+
 def _validate_rows(
     spec: ModelImprovementRunSpec, fold_id: str, feature_rows: Sequence[object],
     rows: Sequence[PredictionRowV2], weight_sha256: str, calibration: ProbabilityCalibrationCardV2,
 ) -> tuple[PredictionRowV2, ...]:
-    if isinstance(rows, (str, bytes, bytearray)):
-        raise ValueError("V2 prediction rows require a row sequence")
-    try:
-        materialized = tuple(rows)
-    except TypeError as exc:
-        raise ValueError("V2 prediction rows require a row sequence") from exc
+    materialized = _materialize_rows(rows)
     if not materialized or not all(isinstance(row, PredictionRowV2) for row in materialized):
         raise ValueError("V2 prediction rows require a nonempty PredictionRowV2 population")
     if tuple(sorted(materialized, key=_row_key)) != materialized:
@@ -349,11 +353,14 @@ def seal_oof_predictions_v2(
     fold_id = _baseline_fold_from_ledger_id(ledger_id)
     if baseline_replay is not None:
         raise ValueError("V2 Task8A baseline prediction does not accept baseline replay")
+    materialized_rows = _materialize_rows(rows)
     paths = prediction_paths_v2(spec, ledger_id)
     _, gate, feature, feature_rows, calibration, weight_sha256 = _authenticate_inputs(
         spec, source_gate, feature_seal, baseline_replay, ledger_id
     )
-    ordered = _validate_rows(spec, fold_id, feature_rows, rows, weight_sha256, calibration)
+    ordered = _validate_rows(
+        spec, fold_id, feature_rows, materialized_rows, weight_sha256, calibration
+    )
     rows_bytes = _rows_bytes(ordered)
     rows_digest = sha256(rows_bytes).hexdigest()
     provisional = PredictionSealV2(
@@ -378,7 +385,8 @@ def seal_oof_predictions_v2(
         spec, source_gate, feature_seal, baseline_replay, ledger_id
     )
     final_rows = _validate_rows(
-        spec, fold_id, final_feature_rows, rows, final_weight_sha256, final_calibration
+        spec, fold_id, final_feature_rows, materialized_rows,
+        final_weight_sha256, final_calibration,
     )
     final_rows_bytes = _rows_bytes(final_rows)
     final_provisional = PredictionSealV2(
