@@ -348,6 +348,78 @@ class SecurePersistenceTests(unittest.TestCase):
                         overlay.load_and_validate_model_authority(root, trace)
                 self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
 
+    def test_model_authority_and_raw_admission_reject_each_deleted_leaf_before_clock(self) -> None:
+        """Every sealed authority/raw primary and sidecar is required before admission timing."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for kind in ("trace", "report", "report_sidecar", "receipt", "receipt_sidecar", "raw", "raw_sidecar"):
+            with self.subTest(kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                receipt = next((root / "audit/experimental_daily_totals/model").glob("*.json"))
+                paths = {
+                    "trace": root / trace,
+                    "report": root / "reports/experimental_daily_totals/2026-09-01/model.json",
+                    "report_sidecar": root / "reports/experimental_daily_totals/2026-09-01/model.sha256",
+                    "receipt": receipt,
+                    "receipt_sidecar": receipt.with_suffix(".sha256"),
+                    "raw": root / raw,
+                    "raw_sidecar": root / raw.with_suffix(".sha256"),
+                }
+                paths[kind].unlink()
+                clock_calls: list[str] = []
+                with self.assertRaises(ValueError):
+                    overlay.admit_draftkings_snapshot(
+                        root,
+                        trace,
+                        raw,
+                        comparison_clock=lambda: clock_calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                    )
+                self.assertEqual(clock_calls, [])
+                self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
+    def test_model_authority_rejects_symlink_directory_and_hardlink_leaf_replacements(self) -> None:
+        """No authority leaf replacement can be followed or accepted as a regular file."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for replacement in ("symlink", "directory", "hardlink"):
+            for kind in ("trace", "report", "report_sidecar", "receipt", "receipt_sidecar"):
+                with self.subTest(replacement=replacement, kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                    root = Path(temporary)
+                    trace, raw = self._authority(root)
+                    receipt = next((root / "audit/experimental_daily_totals/model").glob("*.json"))
+                    paths = {
+                        "trace": root / trace,
+                        "report": root / "reports/experimental_daily_totals/2026-09-01/model.json",
+                        "report_sidecar": root / "reports/experimental_daily_totals/2026-09-01/model.sha256",
+                        "receipt": receipt,
+                        "receipt_sidecar": receipt.with_suffix(".sha256"),
+                    }
+                    target = paths[kind]
+                    target.unlink()
+                    attacker: Path | None = None
+                    if replacement == "symlink":
+                        os.symlink("/dev/null", target)
+                    elif replacement == "directory":
+                        target.mkdir()
+                    else:
+                        attacker = root / "attacker-authority.bin"
+                        attacker_bytes = b"attacker authority bytes must remain unchanged"
+                        attacker.write_bytes(attacker_bytes)
+                        os.link(attacker, target)
+                    clock_calls: list[str] = []
+                    with self.assertRaises(ValueError):
+                        overlay.admit_draftkings_snapshot(
+                            root,
+                            trace,
+                            raw,
+                            comparison_clock=lambda: clock_calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                        )
+                    self.assertEqual(clock_calls, [])
+                    if attacker is not None:
+                        self.assertEqual(attacker.read_bytes(), attacker_bytes)
+                    self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
     def test_raw_admission_rejects_path_identity_shape_url_and_time_matrix(self) -> None:
         """Catch external capture malformations before the append-only snapshot exists."""
         from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
@@ -380,6 +452,76 @@ class SecurePersistenceTests(unittest.TestCase):
             os.link(root / raw, root / "raw-alias")
             with self.assertRaises(ValueError):
                 admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+
+    def test_raw_admission_rejects_valid_bytes_under_wrong_content_address(self) -> None:
+        """A correct sidecar cannot make raw bytes valid under the wrong 64-hex filename."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            contents = (root / raw).read_bytes()
+            digest = hashlib.sha256(contents).hexdigest()
+            wrong_digest = "0" * 64 if digest != "0" * 64 else "1" * 64
+            wrong = raw.parent / f"{wrong_digest}.json"
+            (root / wrong).write_bytes(contents)
+            (root / wrong.with_suffix(".sha256")).write_bytes(f"{digest}\n".encode("ascii"))
+            calls: list[str] = []
+            with self.assertRaises(ValueError):
+                admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    wrong,
+                    comparison_clock=lambda: calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
+    def test_raw_admission_rejects_bytes_mutated_after_sidecar(self) -> None:
+        """Changing a raw primary after its sidecar was sealed is rejected before timing."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            primary = root / raw
+            primary.write_bytes(primary.read_bytes() + b"\nmutated after sidecar")
+            calls: list[str] = []
+            with self.assertRaises(ValueError):
+                admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
+    def test_build_rejects_recanonicalized_snapshot_with_wrong_raw_byte_length(self) -> None:
+        """A self-consistent snapshot cannot lie about the bytes bound by raw_capture_byte_length."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            snapshot_path = root / snapshot
+            value = json.loads(snapshot_path.read_bytes())
+            value["raw_capture_byte_length"] += 1
+            value["content_sha256"] = self._digest({key: item for key, item in value.items() if key != "content_sha256"})
+            contents = canonical_json_bytes(value)
+            rebound_relative = snapshot.parent / f"{value['content_sha256']}.json"
+            snapshot_path.unlink()
+            snapshot_path.with_suffix(".sha256").unlink()
+            rebound = root / rebound_relative
+            rebound.write_bytes(contents)
+            rebound.with_suffix(".sha256").write_bytes(overlay._sidecar(contents))
+            with self.assertRaises(ValueError):
+                overlay.build_overlay(
+                    root,
+                    trace,
+                    rebound_relative,
+                    evaluated_clock=lambda: (_ for _ in ()).throw(AssertionError("evaluated clock")),
+                )
 
     def test_snapshot_and_evaluated_clock_binding_matrix(self) -> None:
         """Catch normalized evidence mutation before an evaluated clock is consulted."""
@@ -460,6 +602,194 @@ class SecurePersistenceTests(unittest.TestCase):
                 overlay.persist_overlay(root, built)
             self.assertFalse((root / built.trace_relative).exists())
             self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_snapshot_admission_writes_sidecar_before_primary(self) -> None:
+        """Admission commits the market snapshot sidecar before its primary JSON."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            original = overlay._existing_or_write
+            labels: list[str] = []
+
+            def record(*args: object, **kwargs: object) -> object:
+                labels.append(args[3])
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "_existing_or_write", side_effect=record):
+                overlay.admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(labels, ["market snapshot sidecar", "market snapshot"])
+
+    def test_identical_snapshot_admission_is_byte_exact_and_creates_no_new_paths(self) -> None:
+        """Repeated admission of fixed evidence returns the same path without appending files."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            def comparison() -> datetime:
+                return datetime(2026, 9, 1, 15, tzinfo=timezone.utc)
+
+            first = admit_draftkings_snapshot(root, trace, raw, comparison_clock=comparison)
+            namespace = root / "audit/experimental_daily_totals_market/draftkings"
+            before = {path.relative_to(root): path.read_bytes() for path in namespace.rglob("*") if path.is_file()}
+            second = admit_draftkings_snapshot(root, trace, raw, comparison_clock=comparison)
+            after = {path.relative_to(root): path.read_bytes() for path in namespace.rglob("*") if path.is_file()}
+            self.assertEqual(second, first)
+            self.assertEqual(after, before)
+
+    def test_snapshot_admission_rejects_conflicting_existing_sidecar(self) -> None:
+        """A conflicting existing snapshot sidecar fails without replacing evidence."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+            sidecar = root / snapshot.with_suffix(".sha256")
+            sidecar.write_bytes(b"conflicting sidecar")
+            before = {path.relative_to(root): path.read_bytes() for path in (root / snapshot).parent.rglob("*") if path.is_file()}
+            with self.assertRaises(FileExistsError):
+                admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+            after = {path.relative_to(root): path.read_bytes() for path in (root / snapshot).parent.rglob("*") if path.is_file()}
+            self.assertEqual(after, before)
+
+    def test_snapshot_admission_rejects_conflicting_existing_primary(self) -> None:
+        """A conflicting existing snapshot JSON fails after preserving its bytes."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+            primary = root / snapshot
+            primary.write_bytes(b"conflicting primary")
+            before = {path.relative_to(root): path.read_bytes() for path in primary.parent.rglob("*") if path.is_file()}
+            with self.assertRaises(FileExistsError):
+                admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+            after = {path.relative_to(root): path.read_bytes() for path in primary.parent.rglob("*") if path.is_file()}
+            self.assertEqual(after, before)
+
+    def test_snapshot_admission_rebind_failure_after_writes_preserves_partial_evidence(self) -> None:
+        """A post-write admission rebind fault raises and leaves the committed prefix intact."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+            expected_snapshot = admit_draftkings_snapshot(
+                root,
+                trace,
+                raw,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+            )
+            expected_primary = (root / expected_snapshot).read_bytes()
+            expected_sidecar = (root / expected_snapshot.with_suffix(".sha256")).read_bytes()
+            (root / expected_snapshot).unlink()
+            (root / expected_snapshot.with_suffix(".sha256")).unlink()
+            original = overlay.rebind_regular_snapshot
+            rebind_labels: list[str] = []
+
+            def fail_after_writes(trusted: object, evidence: object, label: str, **kwargs: object) -> None:
+                rebind_labels.append(label)
+                if label.startswith("snapshot admission:"):
+                    raise ValueError("injected post-write rebind failure")
+                original(trusted, evidence, label, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "rebind_regular_snapshot", side_effect=fail_after_writes):
+                with self.assertRaises(ValueError):
+                    overlay.admit_draftkings_snapshot(
+                        root,
+                        trace,
+                        raw,
+                        comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                    )
+            post_write_labels = [label for label in rebind_labels if label.startswith("snapshot admission:")]
+            self.assertEqual(len(post_write_labels), 1)
+            namespace = root / "audit/experimental_daily_totals_market/draftkings"
+            files = sorted(path for path in namespace.glob("*") if path.is_file())
+            self.assertEqual(len(files), 2)
+            self.assertEqual(files[0].suffix, ".json")
+            self.assertEqual(files[1].suffix, ".sha256")
+            self.assertEqual((root / expected_snapshot).read_bytes(), expected_primary)
+            self.assertEqual((root / expected_snapshot.with_suffix(".sha256")).read_bytes(), expected_sidecar)
+
+    def test_valid_admission_never_opens_the_source_url(self) -> None:
+        """Admission consumes local bytes only, even when the capture records a URL."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network access")) as urlopen, patch(
+                "socket.create_connection", side_effect=AssertionError("network access")
+            ) as create_connection:
+                snapshot = overlay.admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertTrue((root / snapshot).is_file())
+            urlopen.assert_not_called()
+            create_connection.assert_not_called()
+
+    def test_comparison_clock_runs_once_only_after_authority_and_raw_validation(self) -> None:
+        """Admission validates authority/raw first, then clocks immediately around snapshot assembly."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            (root / trace).unlink()
+            missing_authority_calls: list[str] = []
+            with self.assertRaises(ValueError):
+                overlay.admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: missing_authority_calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(missing_authority_calls, [])
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            original_raw_capture = overlay._raw_capture
+            original_clock = overlay._clock
+            original_snapshot_validator = overlay.validate_draftkings_snapshot
+            events: list[str] = []
+
+            def record_raw(*args: object, **kwargs: object) -> object:
+                events.append("raw")
+                return original_raw_capture(*args, **kwargs)  # type: ignore[arg-type]
+
+            def record_clock(*args: object, **kwargs: object) -> object:
+                events.append("clock")
+                return original_clock(*args, **kwargs)  # type: ignore[arg-type]
+
+            def record_snapshot(value: object) -> dict[str, object]:
+                events.append("snapshot")
+                return original_snapshot_validator(value)
+
+            with patch.object(overlay, "_raw_capture", side_effect=record_raw), patch.object(
+                overlay, "_clock", side_effect=record_clock
+            ), patch.object(overlay, "validate_draftkings_snapshot", side_effect=record_snapshot):
+                overlay.admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(events, ["raw", "clock", "snapshot"])
 
     def test_built_overlay_is_frozen_slotted_and_model_evidence_immutable(self) -> None:
         """Catch a mutable transport or an overlay write that changes model evidence."""
