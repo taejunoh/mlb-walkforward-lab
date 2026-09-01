@@ -11,10 +11,10 @@ outcome/evaluation chain per fold.
 Task6A → Task6B. Task8B is deferred and always blocks pending separate review.
 Task6P owns only source-derived prior-target
 calibration evidence/cards; Task8 owns only immutable label-free prediction
-rows and `PredictionSealV2`; Task6A produces the replay receipt required by
-nonbaseline scoring cards; Task6B alone opens target-fold outcomes through the
-RunSpec-bound V5.2 game-evidence authority and publishes receipt-bound
-evaluation reports/pairs. The global v5.1 2022--2024 alpha/beta and the
+rows and `PredictionSealV2`; Task6A produces the matching baseline replay
+receipt; Task6B alone opens target-fold outcomes through the RunSpec-bound
+V5.2 game-evidence authority and publishes baseline `OutcomeReceipt` rows.
+The global v5.1 2022--2024 alpha/beta and the
 invented alpha=0/beta=1 normalizer are explicitly inadmissible for OOF replay.
 
 **Tech Stack:** Python 3.11 standard library, existing model-improvement canonical/source-gate/feature-seal/scoring-card modules, `v52_snapshot_store`, `v52_game_evidence_inventory`, JSON Schema Draft 2020-12, `unittest`, Ruff, Git.
@@ -87,7 +87,7 @@ Task6P source-derived pre-target calibration evidence/cards
 Task8A V2 Common OOF FeatureSeal admission + calibrated baseline label-free seals/loaders
 Task6A V2 baseline replay receipt after its matching baseline seal
 Task8B deferred: fail BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING pending separate design
-Task6B SourceInventory → GameEvidence outcomes, reports, and final pair
+Task6B SourceInventory → GameEvidence baseline outcome receipt/rows
 ```
 
 Replace the old public import block with only these Task8/Task6 names:
@@ -114,9 +114,7 @@ load_prediction_seal_v2(spec, source_gate, feature_seal, baseline_replay,
 load_prediction_rows_v2(spec, source_gate, feature_seal, baseline_replay, seal)
 ```
 
-The candidate evaluator/report/pair call is future-only and deliberately has
-no current import or call signature; it awaits the separately reviewed Task8B
-candidate-selection authority. The current baseline-only outcome call is:
+The current baseline-only outcome call is:
 
 ```python
 outcome_receipt = load_outcome_receipt(
@@ -125,8 +123,7 @@ outcome_receipt = load_outcome_receipt(
 )
 ```
 
-Do not add a candidate evaluator/report/pair or Lane-C reload to current Lane
-plans; those are future-only after concrete Task8B authority review. Delete
+Do not add nonbaseline evaluation or reload APIs to the current plan. Delete
 all described labelled Task8 artefacts and all `JoinedLedger` imports.
 
 - [ ] **Step 4: Run GREEN and diff validation.**
@@ -167,7 +164,7 @@ git commit -m "docs: stage model improvement prediction and outcome contracts"
 **Task6P V2 authority override (normative):** The remaining historical prose
 in this Task 1 is superseded by this V2 contract. Before sealing RunSpec,
 create no data but support loading a label-free `CalibrationFeatureReceiptV1`
-whose closed fields are `schema, model_id, lane_id, fold_id, candidate_id,
+whose closed fields are `schema, model_id, lane_id, fold_id,
 calibration_key, target_year, training_start, training_end,
 source_authority_sha256, source_inventory_sha256,
 game_evidence_inventory_relative_path, game_evidence_inventory_sha256,
@@ -245,7 +242,7 @@ GameEvidence outcome digest, and a recomputed direct-card edge. Test target
 year insertion, future date, target-fold outcome, arbitrary mapping/path,
 source inventory/GameEvidence substitution, feature/weight substitution,
 duplicate/reordered row, fit-spec/alpha/beta mutation, alias, and all
-persisted-path substitutions, plus every model/lane/candidate/key mapping
+persisted-path substitutions, plus every model/lane/key mapping
 substitution. Add exact canonical-recomputation cases for `fit_logistic_v1`,
 non-finite alpha/beta, nonpositive beta, under-minimum rows, and missing
 classes. Test that only `calibration_paths` can obtain all permitted
@@ -385,7 +382,7 @@ EXPECTED_TASK8_YEARS = {
     "O23": 2023, "H22": 2022, "H23": 2023,
 }
 
-def test_common_oof_paths_are_admitted_but_lane_c_oof_and_h24_predictions_are_not(self):
+def test_common_oof_paths_admit_only_fixed_folds(self):
     for fold, year in EXPECTED_TASK8_YEARS.items():
         self.assertEqual(task8_target_year(fold), year)
         self.assertEqual(self.spec.output_path("features", f"common/{fold}/rows.jsonl").name,
@@ -393,9 +390,6 @@ def test_common_oof_paths_are_admitted_but_lane_c_oof_and_h24_predictions_are_no
     for forbidden in ("H24", "O24", "2025", "Q19"):
         with self.assertRaises(ValueError):
             task8_target_year(forbidden)
-    with self.assertRaises(ValueError):
-        self.spec.output_path("features", "lane_c/O19/rows.jsonl")
-
 def test_prediction_seal_v2_payload_requires_feature_and_calibration_sha256(self):
     seal = make_prediction_seal_v2(feature_seal_sha256=SHA, calibration_card_sha256=SHA2)
     self.assertEqual(PredictionSealV2.from_payload_mapping(
@@ -526,7 +520,7 @@ Expected: FAIL with `ModuleNotFoundError: mlb_backtest.model_improvement.oof_led
 Create the V2 schema with exactly the two closed definitions from the approved
 spec: `prediction_row_v2` has the 15 `PredictionRowV2.as_mapping()` fields and
 no result field; `prediction_seal_v2` has exactly
-`schema`, `ledger_id`, `fold_id`, `model_id`, `candidate_id`,
+`schema`, `ledger_id`, `fold_id`, `model_id`,
 `run_spec_sha256`, `source_gate_sha256`, `feature_seal_sha256`,
 `prediction_contract_sha256`, `scoring_model_card_sha256`,
 `calibration_card_sha256`, `population_sha256`, `frozen_model_card_sha256`,
@@ -657,7 +651,6 @@ class BaselineReplayReceiptV2:
     ledger_id: str
     fold_id: str
     model_id: str
-    candidate_id: None
     run_spec_sha256: str
     source_gate_sha256: str
     feature_seal_sha256: str
@@ -717,16 +710,10 @@ git commit -m "feat: seal baseline replay receipts"
 
 ### Task 5: Task8B — explicitly deferred, non-executable candidate work
 
-Task8B is outside the current executable plan. A Task7 scoring-card digest
-authenticates bytes, but does not prove that a historical candidate was chosen
-without target-fold outcomes. Until a separate concrete pre-target candidate
-selection-authority design is approved, every A/A+B/A+B+C Task8 entry point
-must fail before any path calculation or output with the exact code
-`BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING`. This task introduces no
-candidate-selection receipt, no substitute schema, no candidate
-loader, no candidate paths, and no Task8B tests beyond the focused blocked
-disposition test. A future plan may define those authorities after review; it
-must not reuse the baseline receipt/card as a substitute.
+Task8B/nonbaseline work is unadmitted and must fail before artifact I/O with
+`BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING`. A separate reviewed design must
+define weight-selection authority, schemas, APIs, paths, and tests; this plan
+introduces no nonbaseline receipt, loader, path, or success test.
 
 ### Task 6: Task6B — Derive and seal the one baseline outcome receipt per fold
 
@@ -785,7 +772,6 @@ class OutcomeReceipt:
     ledger_id: str
     fold_id: str
     model_id: str
-    candidate_id: None
     run_spec_sha256: str
     source_gate_sha256: str
     source_inventory_sha256: str
@@ -861,16 +847,10 @@ git add schemas/model_improvement/outcome_receipt.schema.json \
 git commit -m "feat: seal authenticated model improvement outcomes"
 ```
 
-### Future: candidate evaluation, reports, pairs, and Lane-C reload
+### Future-only nonbaseline work
 
-Evaluation/report/pair execution is deferred with Task8B. It requires a
-concrete approved candidate-selection authority before any candidate seal can
-exist; therefore it is not part of the current Task6B executable files,
-exports, fixtures, focused tests, or final validation. The current executable
-Task6B ends after baseline V2 `OutcomeReceipt` and `OutcomeRow` persistence.
-A future reviewed plan may specify candidate evaluation/reports/pairs and
-Lane-C reload rules; it must begin from the concrete Task8B authority design,
-not from a baseline outcome receipt alone.
+Task8B/nonbaseline evaluation remains unadmitted; a separate reviewed design
+must define weight-selection authority, schemas, APIs, paths, and tests.
 
 ### Task 8: Final focused package/export and downstream contract verification
 
@@ -934,12 +914,10 @@ baseline pools and its missing-authority block. Tasks 2–3 cover Common OOF
 feature admission, all seven Task8 fold/year pairs, V2
 `PredictionSealV2.feature_seal_sha256`/`calibration_card_sha256`, calibrated
 baseline four-file seals, and the sole row loader. Task 4 binds replay only
-after the matching V2 baseline seal. Task 5 covers Task7-card-gated,
-candidate-specific pre-target calibration and both Common/Lane-C compatibility
-relations. Tasks 6–7 cover SourceInventory-to-GameEvidence authentication,
-all forbidden evidence states, one baseline receipt per fold, receipt-bound
-reports/pairs, and final receipt provenance. Task 8 locks package exposure and
-the no-outcomes-in-Task8 boundary.
+after the matching V2 baseline seal. Task 5 is an explicit blocked placeholder.
+Task 6 covers SourceInventory-to-GameEvidence authentication, forbidden
+evidence states, and one baseline receipt per fold. Final verification locks
+baseline package exposure and the no-outcomes-in-Task8 boundary.
 
 **Placeholder scan:** This plan intentionally contains no `TODO`, `TBD`,
 "implement later", raw outcome mapping, unnamed output path, or omitted
