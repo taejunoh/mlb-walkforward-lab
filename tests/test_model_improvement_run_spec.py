@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from hashlib import sha256
 from pathlib import Path
+from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
@@ -132,6 +133,13 @@ class RunSpecTest(unittest.TestCase):
         for attack in attacks:
             with self.subTest(attack=attack):
                 self.assertTrue(list(validator.iter_errors(attack)))
+        for root in (".", "../x", "output\\root"):
+            raw = self.raw()
+            raw["outputs"]["root"] = root
+            with self.subTest(root=root):
+                self.assertTrue(list(validator.iter_errors(raw)))
+                with self.assertRaises(ValueError):
+                    build_run_spec(raw)
 
     def test_verified_loader_rejects_synthetic_and_wrong_path_or_head(self):
         with self.assertRaisesRegex(ValueError, "production path"):
@@ -150,7 +158,7 @@ class RunSpecTest(unittest.TestCase):
             ["git", "-C", str(root), *args], check=True, capture_output=True, text=True
         ).stdout.strip()
 
-    def _activation_repository(self, *, code_revision=None, extra_file=False, merge=False):
+    def _activation_repository(self, *, code_revision=None, extra_file=False, merge=False, parent_declaration=False):
         directory = tempfile.TemporaryDirectory(dir=REPOSITORY_ROOT)
         root = Path(directory.name)
         self._git(root, "init", "-q")
@@ -160,11 +168,20 @@ class RunSpecTest(unittest.TestCase):
         self._git(root, "add", "code.txt")
         self._git(root, "commit", "-qm", "C code")
         code_commit = self._git(root, "rev-parse", "HEAD")
+        declaration = root / "protocols/model_improvement/parallel_model_result_v1.json"
+        if parent_declaration:
+            raw = self.raw()
+            raw["schema_version"] = "PARALLEL_MODEL_RESULT_RUN_SPEC_V1"
+            raw["code_revision"] = code_commit
+            declaration.parent.mkdir(parents=True)
+            declaration.write_bytes(canonical_json_bytes(raw))
+            self._git(root, "add", "protocols/model_improvement/parallel_model_result_v1.json")
+            self._git(root, "commit", "-qm", "C prior declaration")
+            code_commit = self._git(root, "rev-parse", "HEAD")
         raw = self.raw()
         raw["schema_version"] = "PARALLEL_MODEL_RESULT_RUN_SPEC_V1"
         raw["code_revision"] = code_commit if code_revision is None else code_revision
-        declaration = root / "protocols/model_improvement/parallel_model_result_v1.json"
-        declaration.parent.mkdir(parents=True)
+        declaration.parent.mkdir(parents=True, exist_ok=True)
         declaration.write_bytes(canonical_json_bytes(raw))
         self._git(root, "add", "protocols/model_improvement/parallel_model_result_v1.json")
         if extra_file:
@@ -193,6 +210,14 @@ class RunSpecTest(unittest.TestCase):
         finally:
             os.chdir(original_cwd)
             other.cleanup()
+            activation.cleanup()
+
+    def test_verified_loader_parses_the_verified_blob_without_a_second_path_read(self):
+        activation, _root, declaration = self._activation_repository()
+        try:
+            with patch("mlb_backtest.model_improvement.run_spec.load_run_spec", side_effect=AssertionError("second path read")):
+                self.assertEqual(load_verified_run_spec(declaration).schema_version, "PARALLEL_MODEL_RESULT_RUN_SPEC_V1")
+        finally:
             activation.cleanup()
 
     def test_verified_loader_rejects_activation_drift_and_non_declaration_commits(self):
@@ -227,6 +252,7 @@ class RunSpecTest(unittest.TestCase):
             ("extra", {"extra_file": True}, "declaration-only"),
             ("merge", {"merge": True}, "single-parent"),
             ("wrong-code", {"code_revision": "0" * 40}, "code_revision"),
+            ("parent-declaration", {"parent_declaration": True}, "must add"),
         ):
             with self.subTest(name=name):
                 activation, _root, declaration = self._activation_repository(**kwargs)

@@ -18,12 +18,13 @@
     "prediction_contract_sha256": {"$ref": "#/$defs/digest"},
     "lane_b": {"$ref": "#/$defs/lane_b"},
     "lane_c": {"$ref": "#/$defs/lane_c"},
-    "outputs": {"type": "object", "additionalProperties": false, "required": ["root", "namespaces"], "properties": {"root": {"type": "string", "minLength": 1}, "namespaces": {"const": ["source_gate", "features", "baseline", "oof", "lane_a", "lane_b", "lane_c", "registry", "h24_predictions", "h24_reports"]}}},
+    "outputs": {"type": "object", "additionalProperties": false, "required": ["root", "namespaces"], "properties": {"root": {"$ref": "#/$defs/normal_output_root"}, "namespaces": {"const": ["source_gate", "features", "baseline", "oof", "lane_a", "lane_b", "lane_c", "registry", "h24_predictions", "h24_reports"]}}},
     "h24_firewall": {"type": "object", "additionalProperties": false, "required": ["forbid_outcomes_before_registry", "forbidden_outcome_years", "prediction_only_year"], "properties": {"forbid_outcomes_before_registry": {"const": true}, "forbidden_outcome_years": {"const": [2025]}, "prediction_only_year": {"const": 2024}}}
   },
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "normal_relative": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$)).+$"},
+    "normal_output_root": {"type": "string", "minLength": 1, "anyOf": [{"pattern": "^/(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$)).+$"}, {"pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$)).+$"}]},
     "path_digest": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"$ref": "#/$defs/normal_relative"}, "sha256": {"$ref": "#/$defs/digest"}}},
     "source_authority": {"type": "object", "additionalProperties": false, "required": ["authority_root", "source_run_spec", "acquisition_contract", "terminal_checkpoint", "inventory", "validation_receipts"], "properties": {"authority_root": {"$ref": "#/$defs/normal_relative"}, "source_run_spec": {"$ref": "#/$defs/path_digest"}, "acquisition_contract": {"$ref": "#/$defs/path_digest"}, "terminal_checkpoint": {"$ref": "#/$defs/path_digest"}, "inventory": {"$ref": "#/$defs/path_digest"}, "validation_receipts": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/path_digest"}}}},
     "fold": {"type": "object", "additionalProperties": false, "required": ["target_year", "normalization_years", "oof_calibration_years", "prediction_only"], "properties": {"target_year": {"type": "integer"}, "normalization_years": {"type": "array", "items": {"type": "integer"}}, "oof_calibration_years": {"type": "array", "items": {"type": "integer"}}, "prediction_only": {"type": "boolean"}}},

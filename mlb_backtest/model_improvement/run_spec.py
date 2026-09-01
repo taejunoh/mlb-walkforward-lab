@@ -68,7 +68,7 @@ def _output_root(value: object) -> str:
     """Accept an absolute root or a lexical repository-relative root only."""
     text = _text(value, "outputs.root")
     path = Path(text)
-    if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+    if "\\" in text or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("outputs.root must be a normal path")
     return path.as_posix()
 
@@ -385,13 +385,15 @@ def parse_run_spec(raw: object) -> ModelImprovementRunSpec:
 
 
 def load_run_spec(path: Path) -> ModelImprovementRunSpec:
-    raw_bytes = read_regular_bytes(path, "run spec")
+    return _parse_run_spec_bytes(read_regular_bytes(path, "run spec"))
+
+
+def _parse_run_spec_bytes(raw_bytes: bytes) -> ModelImprovementRunSpec:
     try:
         raw = json.loads(raw_bytes)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("run spec is not JSON") from exc
-    spec = parse_run_spec(raw)
-    return spec
+    return parse_run_spec(raw)
 
 
 def _repository_root() -> Path:
@@ -424,6 +426,28 @@ def _git_bytes_at(root: Path, *args: str) -> bytes:
     return completed.stdout
 
 
+def _git_object_exists(root: Path, object_name: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", object_name],
+            capture_output=True,
+            text=False,
+        )
+    except OSError as exc:
+        raise ValueError("could not read RunSpec owning repository") from exc
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1 or (
+        completed.returncode == 128
+        and (
+            b"does not exist in" in completed.stderr
+            or b"exists on disk, but not in" in completed.stderr
+        )
+    ):
+        return False
+    raise ValueError("could not read RunSpec owning repository")
+
+
 def _owning_repository(path: Path) -> Path:
     root_text = _git_at(path.parent, "rev-parse", "--show-toplevel").strip()
     root = Path(root_text)
@@ -448,12 +472,14 @@ def load_verified_run_spec(path: Path) -> ModelImprovementRunSpec:
     changed = _git_at(owning_root, "diff", "--name-only", f"{parent}..{head}").splitlines()
     if changed != [relative]:
         raise ValueError("activation commit is not declaration-only")
+    if _git_object_exists(owning_root, f"{parent}:{relative}"):
+        raise ValueError("activation commit must add declaration")
     tracked_bytes = _git_bytes_at(owning_root, "show", f"{head}:{relative}")
     if read_regular_bytes(path, "verified run spec") != tracked_bytes:
         raise ValueError("verified run spec differs from tracked blob")
     if _git_at(owning_root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise ValueError("verified run spec requires a clean worktree")
-    spec = load_run_spec(path)
+    spec = _parse_run_spec_bytes(tracked_bytes)
     if spec.schema_version == "SYNTHETIC_TEST_ONLY":
         raise ValueError("synthetic run spec cannot be verified")
     if spec.code_revision != parent:
