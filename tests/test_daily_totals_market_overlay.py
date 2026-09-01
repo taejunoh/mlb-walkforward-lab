@@ -734,13 +734,157 @@ class SecurePersistenceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         build_overlay(root, trace, snapshot, evaluated_clock=lambda bad=bad: bad)
 
+    def test_evidence_read_caps_reject_oversized_inputs_before_clock_or_output(self) -> None:
+        """Every untrusted input class is bounded before parsing or clock access."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        cases = (
+            ("raw capture", "raw", overlay._RAW_MAX_BYTES),
+            ("model trace", "trace", overlay._TRACE_MAX_BYTES),
+            ("model report", "report", overlay._MODEL_MAX_BYTES),
+            ("model receipt", "receipt", overlay._MODEL_MAX_BYTES),
+            ("normalized snapshot", "snapshot", overlay._SNAPSHOT_MAX_BYTES),
+        )
+        for label, kind, cap in cases:
+            with self.subTest(label=label), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                if kind == "raw":
+                    contents = b"x" * (cap + 1)
+                    digest = hashlib.sha256(contents).hexdigest()
+                    raw = Path("data/experimental_daily_totals_market/raw") / f"{digest}.json"
+                    (root / raw).write_bytes(contents)
+                    (root / raw.with_suffix(".sha256")).write_bytes(digest.encode("ascii") + b"\n")
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                    self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+                elif kind == "trace":
+                    (root / trace).write_bytes(b"x" * (cap + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                    self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+                elif kind == "report":
+                    trace_value = json.loads((root / trace).read_bytes())
+                    report = root / Path(trace_value["report_relative"])
+                    report.write_bytes(b"x" * (cap + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                    self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+                elif kind == "receipt":
+                    trace_value = json.loads((root / trace).read_bytes())
+                    receipt = root / Path(trace_value["model_receipt_relative"])
+                    receipt.write_bytes(b"x" * (cap + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                    self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+                else:
+                    trace, _, snapshot = self._admitted(root)
+                    (root / snapshot).write_bytes(b"x" * (cap + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        build_overlay(
+                            root, trace, snapshot,
+                            evaluated_clock=lambda: self.fail("evaluated clock consulted"),
+                        )
+                    self.assertFalse((root / overlay._OVERLAY_ROOT).exists())
+
+    def test_all_authority_and_market_sidecars_are_bounded_at_65_bytes(self) -> None:
+        """Authority, raw-capture, and normalized-snapshot sidecars share the 65-byte cap."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        for label, kind in (
+            ("model report sidecar", "report"),
+            ("model receipt sidecar", "receipt"),
+            ("raw capture sidecar", "raw"),
+            ("normalized snapshot sidecar", "snapshot"),
+        ):
+            with self.subTest(label=label), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                if kind in {"report", "receipt"}:
+                    trace_value = json.loads((root / trace).read_bytes())
+                    key = "report_relative" if kind == "report" else "model_receipt_relative"
+                    sidecar = root / Path(trace_value[key])
+                    sidecar = sidecar.with_suffix(".sha256")
+                    sidecar.write_bytes(b"x" * (overlay._SIDECAR_MAX_BYTES + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                elif kind == "raw":
+                    sidecar = root / raw.with_suffix(".sha256")
+                    sidecar.write_bytes(b"x" * (overlay._SIDECAR_MAX_BYTES + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        admit_draftkings_snapshot(
+                            root, trace, raw,
+                            comparison_clock=lambda: self.fail("comparison clock consulted"),
+                        )
+                else:
+                    trace, _, snapshot = self._admitted(root)
+                    sidecar = root / snapshot.with_suffix(".sha256")
+                    sidecar.write_bytes(b"x" * (overlay._SIDECAR_MAX_BYTES + 1))
+                    with self.assertRaisesRegex(ValueError, "maximum size"):
+                        build_overlay(
+                            root, trace, snapshot,
+                            evaluated_clock=lambda: self.fail("evaluated clock consulted"),
+                        )
+
+    def test_existing_overlay_markdown_and_trace_reads_are_bounded(self) -> None:
+        """Conflicting pre-existing Markdown/trace files cannot be read unboundedly."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        for label, relative, expected in (
+            ("Markdown", "markdown_relative", "markdown_bytes"),
+            ("trace", "trace_relative", "trace_bytes"),
+        ):
+            with self.subTest(label=label), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                _, _, built = self._build_public_case(root)
+                target = root / getattr(built, relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x" * (len(getattr(built, expected)) + 1))
+                with self.assertRaisesRegex(ValueError, "maximum size"):
+                    persist_overlay(root, built)
+                # A failed pre-existing output read must not publish the trace commit.
+                trace_path = root / getattr(built, "trace_relative")
+                if label == "Markdown":
+                    self.assertFalse(trace_path.exists())
+                else:
+                    self.assertEqual(trace_path.read_bytes(), b"x" * (len(getattr(built, expected)) + 1))
+                cap = overlay._MARKDOWN_MAX_BYTES if label == "Markdown" else overlay._TRACE_MAX_BYTES
+                self.assertLessEqual(len(getattr(built, expected)), cap)
+
     def test_build_covers_all_rows_math_and_policy_outcomes(self) -> None:
         """Exercise public build results for NO_QUOTE, push, stale, started, and zero picks."""
         from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
 
+        def low_nonpush_report(report: dict[str, object]) -> None:
+            samples = [8] * 600 + [9] * 164
+            report["games"][1].update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [8, 9],
+            })
+
         with TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
             trace, raw = self._authority(root)
+            self._rewrite_model_report(root, trace, low_nonpush_report)
             value = self._raw_value(root, raw)
             value["games"][0] = {"game_pk": FIXED_GAME_PKS[0], "status": "NO_QUOTE", "reason": "NOT_LISTED"}
             value["games"][1]["line_half_runs"] = 16
@@ -751,7 +895,7 @@ class SecurePersistenceTests(unittest.TestCase):
             self.assertEqual(normal, repeat)
             self.assertEqual([row["game_pk"] for row in normal.report["games"]], list(FIXED_GAME_PKS))
             self.assertEqual(normal.report["games"][0]["reason_codes"], ("NO_QUOTE",))
-            self.assertEqual(normal.report["games"][1]["reason_codes"], ("NONPUSH_SUPPORT_TOO_LOW", "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"))
+            self.assertEqual(normal.report["games"][1]["reason_codes"], ("NONPUSH_SUPPORT_TOO_LOW",))
             stale = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 16, tzinfo=timezone.utc))
             self.assertIn("QUOTE_STALE", stale.report["games"][2]["reason_codes"])
             started = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 16, 1, tzinfo=timezone.utc))
@@ -1757,7 +1901,8 @@ class SchemaTests(unittest.TestCase):
             "over_support": 0.5, "under_support": 0.5, "push_support": 0.0,
             "over_conditional_support": 0.5, "under_conditional_support": 0.5,
             "over_support_margin": 0.0, "under_support_margin": 0.0,
-            "selected_side": None, "decision": "PASS", "reason_codes": ["AMBIGUOUS_DIRECTION"],
+            "selected_side": None, "decision": "PASS",
+            "reason_codes": ["POINT_GAP_TOO_SMALL", "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"],
         } for pk in FIXED_GAME_PKS]
         value: dict[str, object] = {
             "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": list(STATUS_LABELS),
@@ -1907,6 +2052,37 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_overlay_policy(invalid)
 
+    def test_overlay_reason_sets_require_every_derived_gate(self) -> None:
+        """A PASS row must enumerate every failed non-temporal gate exactly once."""
+        exact = self._overlay_fixture()
+        validate_overlay_report(exact)
+        for omitted in ("POINT_GAP_TOO_SMALL", "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"):
+            invalid = deepcopy(exact)
+            invalid["games"][0]["reason_codes"].remove(omitted)
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(omitted=omitted), self.assertRaises(ValueError):
+                validate_overlay_report(invalid)
+
+    def test_overlay_reason_sets_allow_temporal_and_combined_failures(self) -> None:
+        """Temporal reasons may stand alone or accompany the exact derived set."""
+        temporal_only = self._overlay_fixture()
+        row = temporal_only["games"][0]
+        row.update({
+            "expected_total": 10.0, "over_support": 0.6, "under_support": 0.4,
+            "reason_codes": ["GAME_STARTED"],
+        })
+        self._set_supports(row, 0.6, 0.4)
+        temporal_only["content_sha256"] = self._digest(temporal_only)
+        validate_overlay_report(temporal_only)
+
+        combined = self._overlay_fixture()
+        combined["games"][0]["reason_codes"] = [
+            "GAME_STARTED", "QUOTE_STALE", "POINT_GAP_TOO_SMALL",
+            "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION",
+        ]
+        combined["content_sha256"] = self._digest(combined)
+        validate_overlay_report(combined)
+
     def test_overlay_rejection_matrix(self) -> None:
         base = self._overlay_fixture()
         for field, value in (("status_labels", ["bad"]), ("policy_schema", "OTHER"), ("policy_sha256", "d" * 64),
@@ -1973,7 +2149,7 @@ class SchemaTests(unittest.TestCase):
             "over_conditional_support": 0.5, "under_conditional_support": 0.5,
             "over_support_margin": 0.0, "under_support_margin": 0.0,
             "selected_side": None, "decision": "PASS",
-            "reason_codes": ["AMBIGUOUS_DIRECTION"],
+            "reason_codes": ["POINT_GAP_TOO_SMALL", "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"],
         } for pk in FIXED_GAME_PKS]
         report = {
             "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": list(STATUS_LABELS),
