@@ -39,7 +39,7 @@ The implementation owns these final module boundaries:
 | Task8A V2 | Common O19–O23/H22/H23 `FeatureSeal`, direct weights plus calibration card | `prediction_seal_v2.schema.json`, `oof_ledger_v2.py`, `test_model_improvement_oof_ledger.py` | baseline-only `PredictionSealV2`, `seal_oof_predictions_v2`, `load_prediction_seal_v2`, `load_prediction_rows_v2` |
 | Task6A | V2 sealed baseline prediction plus calibration card | `baseline_replay_receipt_v2.schema.json`, `baseline_replay_v2.py`, `test_model_improvement_baseline_replay.py` | `BaselineReplayReceiptV2`, `replay_v51_predictions_v2`, `load_baseline_replay_v2` |
 | Task8B | deferred candidate selection authority | none in this plan | fail `BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING` before loading/writing |
-| Task6B | verified SourceInventory → GameEvidenceInventory → baseline prediction | `outcome_receipt.schema.json`, `evaluation_report.schema.json`, `evaluation_pair.schema.json`, `outcomes.py`, `evaluation.py`, `test_model_improvement_outcomes.py`, `test_model_improvement_evaluation.py` | `OutcomeReceipt`, outcome loaders, `evaluate_predictions`, report/pair loaders |
+| Task6B | verified SourceInventory → GameEvidenceInventory → baseline outcome receipt/rows | `outcome_receipt.schema.json`, `outcomes.py`, `test_model_improvement_outcomes.py` | `OutcomeReceipt`, baseline outcome loaders |
 
 All descriptor payloads exclude their runtime `artifact_sha256` and `path`.
 Every JSON primary is canonical compact UTF-8 with one newline; every sidecar
@@ -103,10 +103,6 @@ from mlb_backtest.model_improvement.baseline_replay_v2 import (
 from mlb_backtest.model_improvement.outcomes import (
     OutcomeReceipt, load_outcome_receipt, load_outcome_rows, seal_outcome_receipt,
 )
-from mlb_backtest.model_improvement.evaluation import (
-    EvaluationPair, EvaluationReport, evaluate_predictions,
-    load_evaluation_pair, load_evaluation_report,
-)
 ```
 
 Replace every lane call site/documented adapter with the full Task8 call:
@@ -119,22 +115,20 @@ load_prediction_seal_v2(spec, source_gate, feature_seal, baseline_replay,
 load_prediction_rows_v2(spec, source_gate, feature_seal, baseline_replay, seal)
 ```
 
-and replace every raw-outcome evaluator call with:
+The candidate evaluator/report/pair call is future-only and deliberately has
+no current import or call signature; it awaits the separately reviewed Task8B
+candidate-selection authority. The current baseline-only outcome call is:
 
 ```python
 outcome_receipt = load_outcome_receipt(
     spec, source_gate, common_feature_seal, baseline_replay,
     outcome_receipt_path, outcome_receipt_sha256,
 )
-pair = evaluate_predictions(spec, candidate_prediction, baseline_prediction,
-                            outcome_receipt)
 ```
 
-State explicitly in Lane A/B/C/H24 sections that a downstream frozen-card
-consumer receives only the full `load_evaluation_pair(spec, path, expected_sha256)` result and must check its
-`outcome_receipt_path` plus `outcome_receipt_sha256`, never `outcomes_sha256`
-alone. Delete all described labelled Task8 artefacts and all `JoinedLedger`
-imports, rather than leaving an alternate compatibility path.
+Do not add a candidate evaluator/report/pair or Lane-C reload to current Lane
+plans; those are future-only after concrete Task8B authority review. Delete
+all described labelled Task8 artefacts and all `JoinedLedger` imports.
 
 - [ ] **Step 4: Run GREEN and diff validation.**
 
@@ -303,11 +297,10 @@ caller choice. Candidate templates therefore use literal `A`, `B`, or `C`
 lane segments, plus the canonical `_none`/safe candidate segment, rather than
 the prediction-directory aliases.
 
-Implement exactly `load_calibration_feature_receipt(spec, model_id, lane_id,
-fold_id, candidate_id)`, `load_probability_calibration_card_v2(spec, model_id,
-lane_id, fold_id, candidate_id)`, and
-`require_probability_calibration_card_v2(spec, model_id, lane_id, fold_id,
-candidate_id)`. They derive all paths and accept no caller
+Implement exactly `load_calibration_feature_receipt(spec, fold_id)`,
+`load_probability_calibration_card_v2(spec, fold_id)`, and
+`require_probability_calibration_card_v2(spec, fold_id)`. They derive only
+baseline paths and accept no caller
 path/receipt/outcomes/rows/weights; securely reread the full authority before
 derivation and immediately before return; and never write, build, fit, or
 publish anything. Do not claim the required historical rows already exist.
@@ -832,7 +825,7 @@ gate = load_source_gate_receipt(spec.output_path("source_gate", "source_gate_rec
 source_bytes = read_regular_bytes(authority_root / spec.source_authority.inventory.path,
                                   "Task6 source inventory")
 require(sha256(source_bytes).hexdigest() == spec.source_authority.inventory.sha256)
-source_inventory = v52_snapshot_store.load_source_inventory_bytes(source_bytes)
+source_inventory = v52_snapshot_store.parse_inventory(source_bytes)
 binding = source_inventory.game_evidence_inventory
 verified = load_verified_game_evidence_inventory(
     authority_root, read_only_progress=True,
@@ -882,89 +875,16 @@ git add schemas/model_improvement/outcome_receipt.schema.json \
 git commit -m "feat: seal authenticated model improvement outcomes"
 ```
 
-### Task 7: Task6B — Persist receipt-bound reports and an evaluation pair
+### Future: candidate evaluation, reports, pairs, and Lane-C reload
 
-**Files:**
-- Create: `schemas/model_improvement/evaluation_report.schema.json`
-- Create: `schemas/model_improvement/evaluation_pair.schema.json`
-- Create: `mlb_backtest/model_improvement/evaluation.py`
-- Modify: `mlb_backtest/model_improvement/__init__.py`
-- Create: `tests/test_model_improvement_evaluation.py`
-
-- [ ] **Step 1: Write RED tests for provenance, population, metrics, and final pair commit.**
-
-```python
-def test_pair_reloads_the_same_receipt_from_both_reports_before_metrics(self):
-    pair = evaluate_predictions(self.spec, self.lane_a_h22, self.baseline_h22,
-                                self.h22_outcome_receipt)
-    loaded = load_evaluation_pair(self.spec, pair.path, pair.artifact_sha256)
-    self.assertEqual(loaded.outcome_receipt_path, self.h22_outcome_receipt.path)
-    self.assertEqual(loaded.outcome_receipt_sha256, self.h22_outcome_receipt.artifact_sha256)
-    self.assertEqual(loaded.candidate_report.outcome_receipt_sha256,
-                     loaded.baseline_report.outcome_receipt_sha256)
-
-def test_lane_c_uses_parent_common_relation_not_direct_lane_c_digest_equality(self):
-    pair = evaluate_predictions(self.spec, self.lane_c_h22, self.baseline_h22,
-                                self.h22_outcome_receipt)
-    self.assertEqual(pair.fold_id, "H22")
-```
-
-Add RED cases for receipt path/digest substitution, report receipt disagreement,
-pair/report disagreement, candidate/baseline key/order/population mismatch,
-wrong fold/source/contract, Common direct relation failure, Lane-C parent
-relation failure, missing rank one, invalid rank, neutral dates, pair crash
-points, missing sidecars, and all immutable retries.
-
-- [ ] **Step 2: Run RED.**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_evaluation -v`
-
-Expected: FAIL with `ModuleNotFoundError: mlb_backtest.model_improvement.evaluation`.
-
-- [ ] **Step 3: Implement outcome-receipt admission before every metric.**
-
-Implement exactly:
-
-```text
-evaluate_predictions(spec, candidate, baseline, outcome_receipt) -> EvaluationPair
-load_evaluation_report(spec, path, expected_sha256) -> EvaluationReport
-load_evaluation_pair(spec, path, expected_sha256) -> EvaluationPair
-```
-
-At the first line of evaluation, secure-reload the baseline and candidate seal
-through Task8B and the explicitly named receipt through `load_outcome_receipt`
-at the exact derived `oof/baseline/v5.1/{fold}/v2/outcome_receipt.json` path.
-Compare the entire descriptor, not a digest string. Require same fold, target
-year, source gate, contract, ordered population digest, and one-for-one row
-keys. Then apply the Task8 branch compatibility exactly: A/A+B Common digest
-equality; A+B+C Lane-C own digest plus secure parent Common relation to the
-replay receipt.
-
-Build all-game Brier/log loss from verified `OutcomeRow.home_win` only after
-these checks. Build daily pairs sorted by official date and neutral dates as
-the exact preimages in the approved Task8 design. Write candidate/baseline
-reports with receipt path/digest and identical `outcomes_sha256`, then publish
-the final pair only after both report primaries are reloaded successfully.
-All V2 reports/pairs are derived beneath the same candidate `/v2` namespace.
-The pair path is derived from the candidate ledger identity; no report, pair,
-or receipt loader accepts an arbitrary namespace or alias.
-
-- [ ] **Step 4: Run GREEN, schemas, lint, and complete focused regression.**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_evaluation tests.test_model_improvement_outcomes tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_scoring_cards tests.test_model_improvement_sealed_features tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_source_gate tests.test_model_improvement_canonical -v && python3 -c 'import json; from jsonschema import Draft202012Validator; [Draft202012Validator.check_schema(json.load(open(path))) for path in ("schemas/model_improvement/evaluation_report.schema.json", "schemas/model_improvement/evaluation_pair.schema.json")]' && python3 -m ruff check mlb_backtest/model_improvement/evaluation.py tests/test_model_improvement_evaluation.py && git diff --check`
-
-Expected: PASS; no metric or frozen-card consumer can establish outcome provenance from `outcomes_sha256` alone.
-
-- [ ] **Step 5: Commit Task6B evaluation.**
-
-```bash
-git add schemas/model_improvement/evaluation_report.schema.json \
-  schemas/model_improvement/evaluation_pair.schema.json \
-  mlb_backtest/model_improvement/evaluation.py \
-  mlb_backtest/model_improvement/__init__.py \
-  tests/test_model_improvement_evaluation.py
-git commit -m "feat: persist receipt-bound model evaluations"
-```
+Evaluation/report/pair execution is deferred with Task8B. It requires a
+concrete approved candidate-selection authority before any candidate seal can
+exist; therefore it is not part of the current Task6B executable files,
+exports, fixtures, focused tests, or final validation. The current executable
+Task6B ends after baseline V2 `OutcomeReceipt` and `OutcomeRow` persistence.
+A future reviewed plan may specify candidate evaluation/reports/pairs and
+Lane-C reload rules; it must begin from the concrete Task8B authority design,
+not from a baseline outcome receipt alone.
 
 ### Task 8: Final focused package/export and downstream contract verification
 
@@ -1053,16 +973,11 @@ introduced in Tasks 2–3 and used in all later stages. Every Task8 caller uses
 `(spec, source_gate, feature_seal, baseline_replay, path_or_identity)`; the
 calibration loader derives its authority from that identity and accepts no
 caller path or outcomes. Task6B outcome loaders use the same authenticated
-prerequisite quartet; evaluation consumes a typed `OutcomeReceipt`, never
-labels. The Task8 target-year mapping is the only OOF-year authority, and
+prerequisite quartet. Evaluation is deferred with Task8B and has no current
+export. The Task8 target-year mapping is the only OOF-year authority, and
 `ModelImprovementRunSpec.fold()` remains H22/H23/H24-only.
 
 **Known implementation dependency:** Task6B must call the typed
-`SourceInventory` parser corresponding to the current
-`mlb_backtest.v52_snapshot_store.SourceInventory` wire contract before reading
-the `game_evidence_inventory` binding. The existing source inventory already
-contains this binding; implementation must expose/reuse a bytes-to-typed-value
-parser without adding a mapping bypass. If that parser is not public, add the
-smallest public `parse_source_inventory_bytes(raw: bytes) -> SourceInventory`
-helper in `v52_snapshot_store.py` with its own closed-schema/round-trip test
-before Task6B writes any outcome artefact.
+`v52_snapshot_store.parse_inventory(source_bytes)` parser before reading the
+`game_evidence_inventory` binding. The existing parser already returns the
+typed source inventory; no mapping bypass or new parser is permitted.

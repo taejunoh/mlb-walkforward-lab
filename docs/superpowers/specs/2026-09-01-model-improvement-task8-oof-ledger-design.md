@@ -833,12 +833,6 @@ def load_outcome_rows(
     receipt: OutcomeReceipt,
 ) -> tuple[OutcomeRow, ...]
 
-def evaluate_predictions(
-    spec: ModelImprovementRunSpec,
-    candidate: PredictionSealV2,
-    baseline: PredictionSealV2,
-    outcome_receipt: OutcomeReceipt,
-) -> EvaluationPair
 ```
 
 No API accepts a raw outcome source or outcome-authority path parameter.
@@ -965,7 +959,17 @@ missing/mismatched sidecars, different primary bytes, and a published receipt
 without both verified row artifacts fail closed. No outcome artifact is
 loadable by Task8.
 
-### Evaluation admission
+### Future-only evaluation/report/pair contract
+
+This entire evaluation/report/pair material is a future design placeholder,
+not current executable scope. Because Task8B currently blocks before candidate
+loading or writing with `BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING`, no
+candidate evaluation, `EvaluationReport`, `EvaluationPair`, `evaluate_predictions`,
+Lane-C reload, candidate fixture, export, or test is admitted now. Current
+Task6B execution ends after the baseline V2 `OutcomeReceipt` and `OutcomeRow`
+primary/sidecars. A later reviewed Task8B candidate-selection authority design
+must explicitly re-authorize and replace this placeholder before its contents
+can be implemented.
 
 `evaluate_predictions` accepts only securely reloaded candidate and baseline
 PredictionSeals plus a securely reloaded OutcomeReceipt. In production the
