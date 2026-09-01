@@ -263,4 +263,13 @@ def load_calibration_feature_receipt(
         spec.probability_calibration_policy.fold_keys[fold_id],
     ):
         raise ValueError("calibration feature receipt identity differs")
+    pool = spec.probability_calibration_policy.pools[
+        spec.probability_calibration_policy.fold_keys[fold_id]
+    ]
+    if (
+        receipt.payload["target_year"],
+        receipt.payload["training_start"],
+        receipt.payload["training_end"],
+    ) != (pool.target_year, pool.training_start, pool.training_end):
+        raise ValueError("calibration feature receipt pool differs")
     return receipt

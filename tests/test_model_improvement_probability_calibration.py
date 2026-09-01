@@ -684,6 +684,43 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         load_probability_calibration_card_v2(spec, gate, "O19")
                 paths.rows.write_bytes(output_rows)
+                for field, value in (
+                    ("target_year", 2020),
+                    ("training_start", "2018-01-02"),
+                    ("training_end", "2018-12-30"),
+                ):
+                    with self.subTest(field=field):
+                        mutated = receipt | {field: value}
+                        mutated_raw = canonical_json_bytes(mutated)
+                        receipt_path.write_bytes(mutated_raw)
+                        receipt_path.with_suffix(
+                            receipt_path.suffix + ".sha256"
+                        ).write_bytes(
+                            canonical_json_bytes(
+                                {"artifact_sha256": sha256(mutated_raw).hexdigest()}
+                            )
+                        )
+                        mutated_pins = dict(pins)
+                        mutated_pins["C19"] = AbsolutePathDigest(
+                            str(receipt_path), sha256(mutated_raw).hexdigest()
+                        )
+                        mutated_spec = replace(
+                            spec,
+                            probability_calibration_policy=replace(
+                                spec.probability_calibration_policy,
+                                calibration_feature_receipts=MappingProxyType(
+                                    mutated_pins
+                                ),
+                            ),
+                        )
+                        with self.assertRaisesRegex(ValueError, "pool"):
+                            module.load_calibration_feature_receipt(mutated_spec, "O19")
+                receipt_path.write_bytes(receipt_raw)
+                receipt_path.with_suffix(receipt_path.suffix + ".sha256").write_bytes(
+                    canonical_json_bytes(
+                        {"artifact_sha256": sha256(receipt_raw).hexdigest()}
+                    )
+                )
                 bad_receipt = receipt | {
                     "game_evidence_inventory_relative_path": "other.json"
                 }
