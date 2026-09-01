@@ -133,6 +133,21 @@ class SecurePersistenceTests(unittest.TestCase):
         return json.loads((root / raw).read_bytes())
 
     @staticmethod
+    def _model_authority_bytes(root: Path, trace: Path) -> list[bytes]:
+        trace_path = root / trace
+        trace_value = json.loads(trace_path.read_bytes())
+        report_path = root / Path(trace_value["report_relative"])
+        receipt_path = root / Path(trace_value["model_receipt_relative"])
+        paths = (
+            trace_path,
+            report_path,
+            report_path.with_suffix(".sha256"),
+            receipt_path,
+            receipt_path.with_suffix(".sha256"),
+        )
+        return [path.read_bytes() for path in paths]
+
+    @staticmethod
     def _write_raw(root: Path, value: object) -> Path:
         contents = json.dumps(value, indent=1).encode("utf-8")
         digest = hashlib.sha256(contents).hexdigest()
@@ -245,10 +260,12 @@ class SecurePersistenceTests(unittest.TestCase):
             trace, raw = self._authority(root)
             snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
             built = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            authority_before = self._model_authority_bytes(root, trace)
             forged = replace(built, input_snapshots=())
             with self.assertRaises(ValueError):
                 persist_overlay(root, forged)
             self.assertFalse((root / built.trace_relative).exists())
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
 
     def test_persist_rejects_tampered_bytes_and_noncanonical_paths_before_write(self) -> None:
         """Catch a self-consistent caller trace that changes a non-authority field."""
@@ -275,11 +292,13 @@ class SecurePersistenceTests(unittest.TestCase):
                 replace(built, trace_bytes=b" " + built.trace_bytes),
                 replace(built, report_relative=basename, report_sidecar_relative=basename.with_suffix(".sha256"), markdown_relative=basename.with_suffix(".md"), trace_relative=basename.with_suffix(".trace.json"), trace_bytes=canonical_json_bytes(basename_trace)),
             )
+            authority_before = self._model_authority_bytes(root, trace)
             for forged in cases:
                 with self.subTest(kind=forged.report_relative.name):
                     with self.assertRaises(ValueError):
                         persist_overlay(root, forged)
                     self.assertFalse((root / forged.trace_relative).exists())
+                    self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
 
     def test_persist_rebinds_again_after_parsing_trace(self) -> None:
         """Catch a post-parse replacement that the trace parse itself cannot observe."""
@@ -290,6 +309,7 @@ class SecurePersistenceTests(unittest.TestCase):
             trace, raw = self._authority(root)
             snapshot = overlay.admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
             built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            authority_before = self._model_authority_bytes(root, trace)
             original = overlay.rebind_regular_snapshot
             changed = False
 
@@ -304,6 +324,7 @@ class SecurePersistenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     overlay.persist_overlay(root, built)
             self.assertTrue(changed)
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
 
     def test_model_authority_rejects_each_missing_or_mutated_component_without_running_model(self) -> None:
         """Catch any authority leaf accepted without its no-follow bound bytes."""
@@ -434,9 +455,11 @@ class SecurePersistenceTests(unittest.TestCase):
             built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
             (root / built.report_sidecar_relative).parent.mkdir(parents=True, exist_ok=True)
             (root / built.report_sidecar_relative).write_bytes(b"conflict")
+            authority_before = self._model_authority_bytes(root, trace)
             with self.assertRaises(FileExistsError):
                 overlay.persist_overlay(root, built)
             self.assertFalse((root / built.trace_relative).exists())
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
 
     def test_built_overlay_is_frozen_slotted_and_model_evidence_immutable(self) -> None:
         """Catch a mutable transport or an overlay write that changes model evidence."""
@@ -484,6 +507,7 @@ class SecurePersistenceTests(unittest.TestCase):
             root = Path(temporary)
             trace, _, snapshot = self._admitted(root)
             built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            authority_before = self._model_authority_bytes(root, trace)
             for leaf in (built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative):
                 with self.subTest(leaf=leaf.name):
                     path = root / leaf
@@ -491,26 +515,247 @@ class SecurePersistenceTests(unittest.TestCase):
                     os.symlink("/dev/null", path)
                     with self.assertRaises(ValueError):
                         overlay.persist_overlay(root, built)
+                    self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
                     path.unlink()
 
     def test_write_failures_preserve_pretrace_evidence_and_never_return_success(self) -> None:
-        """Catch a writer fault that could publish a trace before its predecessors."""
+        """Each writer fault leaves exactly the successfully committed prefix."""
         import mlb_backtest.daily_totals_market_overlay as overlay
 
+        labels = ("overlay report sidecar", "overlay report", "overlay Markdown", "overlay trace")
         for failing in ("overlay report sidecar", "overlay report", "overlay Markdown", "overlay trace"):
             with self.subTest(failing=failing), TemporaryDirectory(dir=Path.cwd()) as temporary:
                 root = Path(temporary)
                 trace, _, snapshot = self._admitted(root)
                 built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                authority_before = self._model_authority_bytes(root, trace)
                 original = overlay._existing_or_write
+                calls: list[str] = []
+
                 def fail(*args: object, **kwargs: object) -> object:
+                    calls.append(args[3])
                     if args[3] == failing:
                         raise OSError("injected")
                     return original(*args, **kwargs)  # type: ignore[arg-type]
+
                 with patch.object(overlay, "_existing_or_write", side_effect=fail):
                     with self.assertRaises(OSError):
                         overlay.persist_overlay(root, built)
-                self.assertFalse((root / built.trace_relative).exists())
+                self.assertEqual(calls, list(labels[:labels.index(failing) + 1]))
+                targets = (
+                    built.report_sidecar_relative,
+                    built.report_relative,
+                    built.markdown_relative,
+                    built.trace_relative,
+                )
+                expected_bytes = (
+                    overlay._sidecar(built.report_bytes),
+                    built.report_bytes,
+                    built.markdown_bytes,
+                    built.trace_bytes,
+                )
+                for index, (target, expected) in enumerate(zip(targets, expected_bytes)):
+                    path = root / target
+                    if index <= labels.index(failing) - 1:
+                        self.assertTrue(path.is_file())
+                        self.assertEqual(path.read_bytes(), expected)
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_pretrace_rebind_failure_preserves_output_prefix_without_trace(self) -> None:
+        """A pre-trace input rebind fault preserves sidecar, JSON, and Markdown only."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            authority_before = self._model_authority_bytes(root, trace)
+            target = f"overlay pre-trace: {built.report_sidecar_relative.as_posix()}"
+            original = overlay.rebind_regular_snapshot
+            calls: list[str] = []
+
+            def fail(trusted: object, evidence: object, label: str, **kwargs: object) -> None:
+                calls.append(label)
+                if label == target:
+                    raise ValueError("identity instability")
+                original(trusted, evidence, label, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "rebind_regular_snapshot", side_effect=fail):
+                with self.assertRaises(ValueError):
+                    overlay.persist_overlay(root, built)
+            self.assertEqual(calls[-1], target)
+            for relative, expected in (
+                (built.report_sidecar_relative, overlay._sidecar(built.report_bytes)),
+                (built.report_relative, built.report_bytes),
+                (built.markdown_relative, built.markdown_bytes),
+            ):
+                self.assertEqual((root / relative).read_bytes(), expected)
+            self.assertFalse((root / built.trace_relative).exists())
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_posttrace_rebind_failure_preserves_all_four_exact_artifacts(self) -> None:
+        """A final post-trace rebind fault leaves the complete committed bundle."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            authority_before = self._model_authority_bytes(root, trace)
+            target = f"overlay post-trace: {built.trace_relative.as_posix()}"
+            original = overlay.rebind_regular_snapshot
+            calls: list[str] = []
+
+            def fail(trusted: object, evidence: object, label: str, **kwargs: object) -> None:
+                calls.append(label)
+                if label == target:
+                    raise ValueError("identity instability")
+                original(trusted, evidence, label, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "rebind_regular_snapshot", side_effect=fail):
+                with self.assertRaises(ValueError):
+                    overlay.persist_overlay(root, built)
+            self.assertEqual(calls[-1], target)
+            self.assertEqual(calls.count(target), 1)
+            for relative, expected in (
+                (built.report_sidecar_relative, overlay._sidecar(built.report_bytes)),
+                (built.report_relative, built.report_bytes),
+                (built.markdown_relative, built.markdown_bytes),
+                (built.trace_relative, built.trace_bytes),
+            ):
+                self.assertEqual((root / relative).read_bytes(), expected)
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_output_hardlinks_are_rejected_without_mutating_attacker_bytes(self) -> None:
+        """Each output leaf rejects an attacker hardlink and leaves its source untouched."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for index, target_name in enumerate(("report_sidecar_relative", "report_relative", "markdown_relative", "trace_relative")):
+            with self.subTest(leaf=target_name), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                authority_before = self._model_authority_bytes(root, trace)
+                target = root / getattr(built, target_name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                attacker = root / f"attacker-{index}.bin"
+                attacker_bytes = b"attacker bytes must remain unchanged"
+                attacker.write_bytes(attacker_bytes)
+                os.link(attacker, target)
+                with self.assertRaises(ValueError):
+                    overlay.persist_overlay(root, built)
+                self.assertEqual(attacker.read_bytes(), attacker_bytes)
+                self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_public_apis_reject_actual_directories_at_input_and_output_leaves(self) -> None:
+        """Actual directories at every raw, normalized, and output leaf are rejected."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for leaf in ("raw", "raw sidecar"):
+            with self.subTest(leaf=leaf), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                target = root / (raw if leaf == "raw" else raw.with_suffix(".sha256"))
+                target.unlink()
+                target.mkdir()
+                with self.assertRaises(ValueError):
+                    overlay.admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+
+        for leaf in ("snapshot", "snapshot sidecar"):
+            with self.subTest(leaf=leaf), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                target = root / (snapshot if leaf == "snapshot" else snapshot.with_suffix(".sha256"))
+                target.unlink()
+                target.mkdir()
+                with self.assertRaises(ValueError):
+                    overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+
+        targets_builder = (
+            "report_sidecar_relative", "report_relative", "markdown_relative", "trace_relative",
+        )
+        for attribute in targets_builder:
+            with self.subTest(leaf=attribute), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                authority_before = self._model_authority_bytes(root, trace)
+                target = root / getattr(built, attribute)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.mkdir()
+                with self.assertRaises(ValueError):
+                    overlay.persist_overlay(root, built)
+                self.assertTrue(target.is_dir())
+                self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+    def test_rebind_identity_instability_is_rejected_at_each_public_boundary(self) -> None:
+        """Injected rebind instability fails admission, build, pre-trace, and post-trace stages."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        original = overlay.rebind_regular_snapshot
+
+        def fail_at(target: str, operation: object) -> list[str]:
+            calls: list[str] = []
+
+            def fail(trusted: object, evidence: object, label: str, **kwargs: object) -> None:
+                calls.append(label)
+                if label == target:
+                    raise ValueError("identity instability")
+                original(trusted, evidence, label, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "rebind_regular_snapshot", side_effect=fail):
+                with self.assertRaises(ValueError):
+                    operation()
+            self.assertEqual(calls[-1], target)
+            return calls
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            authority_before = self._model_authority_bytes(root, trace)
+
+            admission_target = f"snapshot admission inputs: {raw.as_posix()}"
+            fail_at(admission_target, lambda: overlay.admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc)))
+            self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            authority_before = self._model_authority_bytes(root, trace)
+            target = f"overlay build: {snapshot.as_posix()}"
+            calls = fail_at(target, lambda: overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc)))
+            self.assertEqual(calls[-1], target)
+            self.assertFalse((root / overlay._OVERLAY_ROOT).exists())
+            self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
+
+        for final_stage in (False, True):
+            with self.subTest(final_stage=final_stage), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                authority_before = self._model_authority_bytes(root, trace)
+                target = (
+                    f"overlay post-trace: {built.trace_relative.as_posix()}"
+                    if final_stage else f"overlay pre-trace: {built.report_sidecar_relative.as_posix()}"
+                )
+                fail_at(target, lambda: overlay.persist_overlay(root, built))
+                expected = (
+                    (built.report_sidecar_relative, overlay._sidecar(built.report_bytes)),
+                    (built.report_relative, built.report_bytes),
+                    (built.markdown_relative, built.markdown_bytes),
+                    (built.trace_relative, built.trace_bytes),
+                )
+                if final_stage:
+                    for relative, contents in expected:
+                        self.assertEqual((root / relative).read_bytes(), contents)
+                else:
+                    for relative, contents in expected[:3]:
+                        self.assertEqual((root / relative).read_bytes(), contents)
+                    self.assertFalse((root / built.trace_relative).exists())
+                self.assertEqual(self._model_authority_bytes(root, trace), authority_before)
 
     def test_public_unique_over_pick_has_exact_support_and_margin(self) -> None:
         """A fresh admitted capture can publish an exact OVER research pick."""
