@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from numbers import Real
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +87,7 @@ def compare_sample_support(
 
 
 def _finite_probability(value: object, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be a finite probability")
     result = float(value)
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:

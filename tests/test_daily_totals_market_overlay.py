@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import unittest
 from dataclasses import FrozenInstanceError
+from fractions import Fraction
 
 from mlb_backtest.daily_totals_market_overlay import (
     PriceSupport,
@@ -82,6 +83,12 @@ class PureMathTests(unittest.TestCase):
         self.assertEqual(result.quoted_break_even, 110 / 210)
         self.assertEqual(result.support_margin, 0.75 - 110 / 210)
 
+    def test_price_support_accepts_finite_real_probabilities(self) -> None:
+        result = price_support(Fraction(3, 4), Fraction(1, 4), -110)
+        self.assertIsInstance(result.conditional_support, float)
+        self.assertEqual(result.conditional_support, 0.75)
+        self.assertIsInstance(result.support_margin, float)
+
     def test_price_support_returns_none_for_all_pushes(self) -> None:
         self.assertEqual(
             price_support(0.0, 0.0, 100),
@@ -94,12 +101,24 @@ class PureMathTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     price_support(value, 0.0, 100)  # type: ignore[arg-type]
+        for value in invalid:
+            with self.subTest(loss_support=value):
+                with self.assertRaises(ValueError):
+                    price_support(0.0, value, 100)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             price_support(0.6, 0.41, 100)
 
     def test_price_support_rejects_invalid_price(self) -> None:
         with self.assertRaises(ValueError):
             price_support(0.5, 0.5, 99)
+
+    def test_net_profit_and_break_even_reject_invalid_prices(self) -> None:
+        for function in (american_net_profit, quoted_break_even):
+            with self.subTest(function=function.__name__):
+                with self.assertRaises(ValueError):
+                    function(99)
+                with self.assertRaises(ValueError):
+                    function(True)  # type: ignore[arg-type]
 
     def test_select_direction_chooses_strictly_larger_margin(self) -> None:
         over = price_support(0.8, 0.2, -110)
