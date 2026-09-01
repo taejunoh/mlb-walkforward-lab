@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
+from mlb_backtest import execution_registry
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
 import mlb_backtest.model_improvement.source_gate as source_gate
 from mlb_backtest.model_improvement.run_spec import (
@@ -128,10 +129,25 @@ class SourceGateTest(unittest.TestCase):
                 calls.append(name)
                 return result
             return inner
+        checkpoint = execution_registry.AcquisitionCheckpoint(
+            sequence=1,
+            receipt_sha256=sha256(
+                canonical_json_bytes({"kind": "terminal_checkpoint"})
+            ).hexdigest(),
+            prior_checkpoint_sha256=None,
+            stage="REMAINING",
+            recorded_at_utc="2026-01-01T00:00:00.000000Z",
+            git_head="0" * 40,
+            execution_receipt_sha256="1" * 64,
+            query_batch_ids=(), query_batch_sha256s=(),
+            query_evidence_receipt_sha256s=(), stage_evidence_receipt_sha256s=(),
+            split_receipt_sha256s=(), completed_query_ids=(), pending_query_ids=(),
+            quarantined_query_ids=(), split_query_ids=(), stage_evidence_receipt_paths=(),
+        )
         return (
             patch("mlb_backtest.model_improvement.source_gate.protocols.load_source_run_spec", record("source", SimpleNamespace(run_id="source"))),
             patch("mlb_backtest.model_improvement.source_gate.execution_registry.validate_sources_ready_evidence_set", record("validate")),
-            patch("mlb_backtest.model_improvement.source_gate.execution_registry.load_terminal_acquisition_checkpoint", record("checkpoint", SimpleNamespace(receipt_sha256="c" * 64))),
+            patch("mlb_backtest.model_improvement.source_gate.execution_registry.load_terminal_acquisition_checkpoint", record("checkpoint", checkpoint)),
             patch("mlb_backtest.model_improvement.source_gate.v52_verify_sources.load_snapshot_replay_inputs", record("inputs", SimpleNamespace())),
             patch("mlb_backtest.model_improvement.source_gate.v52_verify_sources.replay_verified_snapshots", record("replay", snapshots)),
         )
@@ -245,7 +261,7 @@ class SourceGateTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_new_primary_is_removed_if_mandatory_sidecar_publish_fails(self):
+    def test_sidecar_publish_failure_leaves_primary_absent(self):
         temporary, _root, declaration, _authority = self.make_activation()
         try:
             spec = load_verified_run_spec(declaration)
@@ -293,6 +309,54 @@ class SourceGateTest(unittest.TestCase):
                 verify_source_gate(spec)
             self.assertEqual(primary.read_bytes(), expected_bytes)
             self.assertFalse(sidecar.exists())
+        finally:
+            temporary.cleanup()
+
+    def test_primary_publish_failure_leaves_reusable_sidecar_then_retry_succeeds(self):
+        temporary, _root, declaration, _authority = self.make_activation()
+        try:
+            spec = load_verified_run_spec(declaration)
+            primary = spec.output_path("source_gate", "source_gate_receipt.json")
+            sidecar = primary.with_suffix(primary.suffix + ".sha256")
+            real_writer = source_gate.write_immutable_json
+
+            def fail_primary(path, value):
+                if path == primary:
+                    raise ValueError("injected primary failure")
+                return real_writer(path, value)
+
+            patches = self.source_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                source_gate, "write_immutable_json", side_effect=fail_primary
+            ), self.assertRaisesRegex(
+                ValueError, "injected primary failure"
+            ):
+                verify_source_gate(spec)
+            self.assertFalse(primary.exists())
+            self.assertTrue(sidecar.exists())
+            patches = self.source_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                receipt = verify_source_gate(spec)
+            self.assertEqual(Path(receipt.path), primary)
+            self.assertTrue(primary.exists())
+            self.assertTrue(sidecar.exists())
+        finally:
+            temporary.cleanup()
+
+    def test_wrong_checkpoint_type_rejects_before_receipt_publish(self):
+        temporary, _root, declaration, _authority = self.make_activation()
+        try:
+            spec = load_verified_run_spec(declaration)
+            patches = list(self.source_patches())
+            patches[2] = patch(
+                "mlb_backtest.model_improvement.source_gate.execution_registry.load_terminal_acquisition_checkpoint",
+                return_value=SimpleNamespace(receipt_sha256="0" * 64),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], self.assertRaisesRegex(
+                ValueError, "checkpoint binding"
+            ):
+                verify_source_gate(spec)
+            self.assertFalse(spec.output_path("source_gate", "source_gate_receipt.json").exists())
         finally:
             temporary.cleanup()
 
