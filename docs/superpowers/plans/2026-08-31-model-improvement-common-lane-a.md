@@ -343,6 +343,8 @@ git commit -m "feat: define model improvement contracts"
 - Create: `tests/test_model_improvement_run_spec.py`
 - Create: `tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json`
 
+`run_spec.py` owns the non-persisted `VerifiedRunSpecActivation` descriptor and the verified-loader attachment; the RunSpec JSON schema owns no such field. `test_model_improvement_run_spec.py` owns the C→D activation, descriptor-exclusion, CWD-independence, and mutation-rejection cases. Task 4 consumes that verified runtime contract but must not mutate or serialize it.
+
 - [ ] **Step 1: Write table-driven RED tests for every immutable binding: activation/code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall; and a dedicated disposition persistence round trip.**
 
 ```python
@@ -374,6 +376,26 @@ class RunSpecTest(unittest.TestCase):
             with make_temp_repo() as unrelated_repo, unrelated_repo.as_process_cwd():
                 spec = load_verified_run_spec(declaration)
             self.assertEqual(spec.code_revision, code_revision)
+            self.assertIsNotNone(spec.verified_activation)
+            self.assertEqual(spec.verified_activation.declaration_path, str(declaration.resolve()))
+            self.assertEqual(
+                spec.verified_activation.declaration_sha256,
+                sha256(repo.git_show_head("protocols/model_improvement/parallel_model_result_v1.json")).hexdigest(),
+            )
+            self.assertEqual(spec.verified_activation.run_spec_sha256, run_spec_sha256(spec))
+
+    def test_verified_activation_is_runtime_only_and_cannot_change_the_run_spec_digest(self):
+        ordinary = load_run_spec(SYNTHETIC_SPEC_PATH)
+        self.assertIsNone(ordinary.verified_activation)
+        with make_valid_activation_repo() as repo:
+            verified = load_verified_run_spec(repo.declaration_path)
+            self.assertNotIn("verified_activation", verified.as_mapping())
+            self.assertNotIn("verified_activation", verified.persisted_payload())
+            self.assertEqual(run_spec_sha256(verified), verified.verified_activation.run_spec_sha256)
+            self.assertEqual(
+                run_spec_sha256(build_run_spec(verified.as_mapping())),
+                run_spec_sha256(verified),
+            )
 
     def test_verified_production_activation_rejects_dirty_untracked_extra_merge_and_wrong_parent(self):
         # Each mutation starts from a fresh valid C -> D fixture above.  Dirty tracked
@@ -433,7 +455,7 @@ class RunSpecTest(unittest.TestCase):
             )
 ```
 
-`make_temp_repo()`/`make_valid_activation_repo()` are test helpers, not production APIs. Each initializes an isolated repository, commits the completed RunSpec implementation as code commit `C`, writes the real production-path declaration with `code_revision=C`, then commits exactly that path as non-merge activation `D`. The mutation helper independently creates: a modified tracked file, an untracked file, an extra changed path in `C..D`, a two-parent merge `D`, a declaration whose `code_revision` is not `D^`, post-commit declaration-byte drift, and a `SYNTHETIC_TEST_ONLY` declaration. It also creates an external non-owning path and a cross-root production-relative path whose own repository has no matching tracked blob; both must fail. The clean activation test switches process CWD to a separate repository and must still pass. No test may use the repository under test or infer `code_revision` from a mutable working-tree `HEAD`.
+`make_temp_repo()`/`make_valid_activation_repo()` are test helpers, not production APIs. Each initializes an isolated repository, commits the completed RunSpec implementation as code commit `C`, writes the real production-path declaration with `code_revision=C`, then commits exactly that path as non-merge activation `D`. The mutation helper independently creates: a modified tracked file, an untracked file, an extra changed path in `C..D`, a two-parent merge `D`, a declaration whose `code_revision` is not `D^`, post-commit declaration-byte drift, and a `SYNTHETIC_TEST_ONLY` declaration. It also creates an external non-owning path and a cross-root production-relative path whose own repository has no matching tracked blob; both must fail. The clean activation test switches process CWD to a separate repository and must still pass. `build_run_spec` and `load_run_spec` must return `verified_activation=None`; only `load_verified_run_spec` attaches the runtime descriptor. No test may use the repository under test or infer `code_revision` from a mutable working-tree `HEAD`.
 
 - [ ] **Step 2: Run RED.**
 
@@ -468,9 +490,11 @@ The baseline declaration and v5.1 card pin `component_weights_pp={"starter":35,"
 
 - [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** The dataclass/raw payload/`as_mapping()` all include both `prediction_contract` and `prediction_contract_sha256`; the parser closes and hashes the object before accepting its digest. `fold` accepts H22/H23/H24 only; `output_path` accepts exactly the ten declared namespaces and a normal relative name without `..`, always resolves beneath `outputs.root`, and rejects all other namespaces/paths. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
 
+`VerifiedRunSpecActivation` is a frozen **runtime-only** descriptor with exactly `declaration_path` (the absolute resolved production-declaration path), `declaration_sha256` (SHA-256 of the exact tracked declaration bytes), and `run_spec_sha256` (the semantic canonical RunSpec digest). `ModelImprovementRunSpec.verified_activation: VerifiedRunSpecActivation | None` is optional and defaults to `None`. It is deliberately excluded from the persisted JSON Schema, raw payload, `persisted_payload()`, `as_mapping()`, and `run_spec_sha256`; it is neither a declaration field nor a second persisted artifact, so it cannot introduce a declaration/hash cycle. `build_run_spec` and ordinary `load_run_spec` always return `verified_activation=None`. Only the successful verified-loading path below attaches this descriptor after every activation check has passed.
+
 `load_verified_run_spec(path)` is an activation verifier, not merely a stricter parser. It must first derive `owning_root` with exactly `git -C path.parent rev-parse --show-toplevel`, fail if that command cannot identify a repository, and require `path.resolve() == (Path(owning_root) / "protocols/model_improvement/parallel_model_result_v1.json").resolve()`. It rejects `schema_version == "SYNTHETIC_TEST_ONLY"` and rejects a dirty or untracked **owning-root** worktree. Process CWD is never trusted: every repository query is exactly against `git -C owning_root`—including status, `rev-parse HEAD`, `rev-parse HEAD^`, `show`, and `diff`.
 
-It must securely read the declaration bytes and require byte-for-byte equality with `git -C owning_root show HEAD:protocols/model_improvement/parallel_model_result_v1.json`; the path must therefore be a tracked blob at that owning root's `HEAD`. It requires that `git -C owning_root rev-list --parents -n 1 HEAD` show exactly one parent (no merge), reads that full parent SHA as `git -C owning_root rev-parse HEAD^`, requires `spec.code_revision == HEAD^`, and requires `git -C owning_root diff --name-only spec.code_revision..HEAD` to contain exactly the production declaration path and no other path. Thus a real declaration is added only in the single declaration-only activation commit immediately after the frozen code commit named by `code_revision`; it never asks the declaration to contain its own commit SHA. It does not call `verify_source_gate` or inspect source evidence; Task 4 owns source verification.
+It must securely read the declaration bytes and require byte-for-byte equality with `git -C owning_root show HEAD:protocols/model_improvement/parallel_model_result_v1.json`; the path must therefore be a tracked blob at that owning root's `HEAD`. It requires that `git -C owning_root rev-list --parents -n 1 HEAD` show exactly one parent (no merge), reads that full parent SHA as `git -C owning_root rev-parse HEAD^`, requires `spec.code_revision == HEAD^`, and requires `git -C owning_root diff --name-only spec.code_revision..HEAD` to contain exactly the production declaration path and no other path. Only then attach `VerifiedRunSpecActivation(path.resolve(), sha256(tracked_bytes), run_spec_sha256(parsed_spec))` and return that new verified object. Thus a real declaration is added only in the single declaration-only activation commit immediately after the frozen code commit named by `code_revision`; it never asks the declaration to contain its own commit SHA. It does not call `verify_source_gate` or inspect source evidence; Task 4 owns source verification.
 
 Add the only disposition persistence APIs after `run_spec.py` exists:
 
@@ -513,9 +537,42 @@ git commit -m "feat: define model improvement run spec builder"
 
 ```python
 class SourceGateTest(unittest.TestCase):
-    def test_real_h22_preflight_stays_blocked_without_verified_2018_inputs(self):
-        with self.assertRaisesRegex(ValueError, "2018|SOURCES_READY|source"):
-            verify_source_gate(load_run_spec(SPEC_PATH))
+    def test_absent_real_production_declaration_fails_verified_loading(self):
+        with self.assertRaisesRegex(ValueError, "declaration|activation|path"):
+            load_verified_run_spec(PRODUCTION_SPEC_PATH)
+
+    def test_valid_activation_reaches_the_2018_source_block_without_writing_a_receipt(self):
+        # C -> D is a real clean declaration activation.  Its declared authority is
+        # intentionally missing (and a second fixture has a wrong digest), so source
+        # validation, not activation provenance, rejects before any receipt is written.
+        with make_valid_activation_repo(authority="missing_or_digest_invalid") as repo:
+            spec = load_verified_run_spec(repo.declaration_path)
+            with self.assertRaisesRegex(ValueError, "2018|SOURCES_READY|source"):
+                verify_source_gate(spec)
+            self.assertFalse(repo.source_gate_receipt_path.exists())
+
+    def test_source_gate_rejects_ordinary_synthetic_fake_and_dirty_activation_descriptors(self):
+        ordinary = load_run_spec(SYNTHETIC_SPEC_PATH)
+        synthetic = build_run_spec(SYNTHETIC_RAW)
+        fake = dataclasses.replace(
+            ordinary,
+            verified_activation=VerifiedRunSpecActivation("/tmp/fake", "0" * 64, run_spec_sha256(ordinary)),
+        )
+        for presented in (ordinary, synthetic, fake):
+            with self.subTest(presented=presented):
+                with self.assertRaises(ValueError):
+                    verify_source_gate(presented)
+        with make_valid_activation_repo() as repo:
+            spec = load_verified_run_spec(repo.declaration_path)
+            repo.make_worktree_dirty()
+            with self.assertRaises(ValueError):
+                require_source_gate(spec)
+
+    def test_activation_descriptor_is_not_serialized_or_semantically_hashed(self):
+        with make_valid_activation_repo() as repo:
+            verified = load_verified_run_spec(repo.declaration_path)
+            self.assertNotIn("verified_activation", verified.as_mapping())
+            self.assertEqual(run_spec_sha256(verified), verified.verified_activation.run_spec_sha256)
 
     def test_receipt_loader_checks_expected_digest(self):
         with self.assertRaisesRegex(ValueError, "source gate digest differs"):
@@ -528,9 +585,11 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `source_gate`.
 
-- [ ] **Step 3: Implement persisted `SourceGateReceipt` payload fields `run_spec_sha256`, `source_run_spec_sha256`, `acquisition_contract_sha256`, `checkpoint_sha256`, `inventory_sha256`, `validation_receipts_sha256`, `snapshot_replay_sha256`, `required_years`, and `status`; attach runtime descriptor fields `artifact_sha256` and `path` only after hashing canonical payload bytes. Implement `verify_source_gate(spec)`, `load_source_gate_receipt(path, expected_sha256)`, and `require_source_gate(spec)`.**
+- [ ] **Step 3: Implement persisted `SourceGateReceipt` payload fields `run_spec_sha256`, `source_run_spec_sha256`, `acquisition_contract_sha256`, `checkpoint_sha256`, `inventory_sha256`, `validation_receipts_sha256`, `snapshot_replay_sha256`, `required_years`, and `status`; attach runtime descriptor fields `artifact_sha256` and `path` only after hashing canonical payload bytes. Implement `_revalidate_activated_spec(presented)`, `verify_source_gate(spec)`, `load_source_gate_receipt(path, expected_sha256)`, and `require_source_gate(spec)`.**
 
-`verify_source_gate` must call `protocols.load_source_run_spec`, `execution_registry.validate_sources_ready_evidence_set`, `execution_registry.load_terminal_acquisition_checkpoint`, `v52_verify_sources.load_snapshot_replay_inputs`, and `v52_verify_sources.replay_verified_snapshots` with only paths declared in RunSpec. Check every bound file digest before and after those calls, require the replayed six source families across 2018–2024, then write the receipt only in `source_gate`. It accepts neither arbitrary bytes nor caller-supplied inventory/authority/output path. `require_source_gate` rereads the receipt and reruns verification, requiring equal digest.
+`_revalidate_activated_spec(presented)` is mandatory as the first operation of both `verify_source_gate` and `require_source_gate`. A supplied runtime descriptor is never trusted: require a non-null `presented.verified_activation`, use its absolute `declaration_path` only to call a **fresh** `load_verified_run_spec`, then require exact equality of (a) fresh and presented activation descriptors (`declaration_path`, tracked-byte `declaration_sha256`, semantic `run_spec_sha256`), (b) `run_spec_sha256(fresh)` and the descriptor's semantic digest, and (c) fresh versus presented canonical `as_mapping()` bytes/digest. Reject ordinary, synthetic, missing, fake, or post-activation-dirty presentations. Thereafter source-gate code uses only the fresh verified object, never `presented` or its descriptor. This revalidation preserves the no-hash-cycle rule because the descriptor remains runtime-only and excluded from the persisted RunSpec payload/hash.
+
+`verify_source_gate` must call `_revalidate_activated_spec` first, then call `protocols.load_source_run_spec`, `execution_registry.validate_sources_ready_evidence_set`, `execution_registry.load_terminal_acquisition_checkpoint`, `v52_verify_sources.load_snapshot_replay_inputs`, and `v52_verify_sources.replay_verified_snapshots` with only paths declared in that fresh RunSpec. Check every bound file digest before and after those calls, require the replayed six source families across 2018–2024, then write the receipt only in `source_gate`. It accepts neither arbitrary bytes nor caller-supplied inventory/authority/output path. `require_source_gate` likewise revalidates first, rereads the receipt and reruns verification using the fresh object, requiring exact persisted payload, path, and digest equality of the two receipts.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -547,11 +606,11 @@ git commit -m "feat: authenticate model improvement source gate"
 
 - [ ] **Step 6: Stop real-fold activation until acquisition supplies verified 2018–2021 evidence and exact authority paths/digests.** Do not create `protocols/model_improvement/parallel_model_result_v1.json` with invented or placeholder values.
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_source_gate.SourceGateTest.test_real_h22_preflight_stays_blocked_without_verified_2018_inputs -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_source_gate.SourceGateTest.test_absent_real_production_declaration_fails_verified_loading -v`
 
-Expected: PASS because the test observes the source-gate block; the real protocol file remains absent.
+Expected: PASS because verified loading rejects the absent real production declaration; the separate clean C→D fixture test reaches and observes the missing/invalid 2018 source-gate block without writing a receipt.
 
-- [ ] **Step 7: After the external acquisition prerequisite is verified, first commit all completed implementation as the frozen `code_revision` commit. Invoke `build_run_spec()` with that exact parent SHA and authenticated authority paths/digests, then add only `protocols/model_improvement/parallel_model_result_v1.json` in the immediately following single-parent declaration-only activation commit.** From the clean activation checkout, call `load_verified_run_spec()` and then `verify_source_gate()`; require the receipt to bind that exact RunSpec digest before any H22 feature task starts. Do not amend the activation commit or add any second path: doing either fails the activation verifier.
+- [ ] **Step 7: After the external acquisition prerequisite is verified, first commit all completed implementation as the frozen `code_revision` commit. Invoke `build_run_spec()` with that exact parent SHA and authenticated authority paths/digests, then add only `protocols/model_improvement/parallel_model_result_v1.json` in the immediately following single-parent declaration-only activation commit.** From the clean activation checkout, call `load_verified_run_spec()` and then `require_source_gate()`; retain and compare its returned receipt at the real orchestration boundary before any H22 feature task starts. Do not amend the activation commit or add any second path: doing either fails the activation verifier. The activation descriptor is not serialized into the declaration or copied to another artifact.
 
 ### Task 5: Seal full result-free feature primitives
 
@@ -956,4 +1015,4 @@ Expected: no whitespace error; only files owned by this plan are present.
 
 Lane B reads `spec.lane_b`, shared feature seals including rematerializable metric primitives, the H23-frozen A card, and common evaluation; it seals each selected candidate scoring card before candidate-qualified prediction paths, then publishes either `QUALIFIED` A+B or `REJECTED` evidence through `LaneDisposition` and never owns a registry. Lane C reads exactly `environment=(park, weather_roof)` and `defense=(oaa, framing, blocking_throwing)` from `spec.lane_c`, consumes `SealedFeatureRow` and the A+B card, seals separate H22-development and H23-selection scoring cards before their corresponding prediction seals, and emits either H22 development evidence or H23 `QUALIFIED` A+B+C/`ABSENT`/`REJECTED` evidence through `LaneDisposition`; only the H23 card/seal/evaluation can produce a frozen card. It seals H22/H23 coverage features and registry-pinned prediction-only H24 features without H24 outcomes, and never changes package exports. H24 owns the one candidate registry and consumes Common’s RunSpec, source-gate receipt, `BaselineReplayReceipt`, feature/prediction seals, evaluations, scoring cards, dispositions, and frozen cards.
 
-No real H22 is authorized until `verify_source_gate()` validates the actual 2018–2021 source authority and deterministic replay.
+No real H22 orchestration is authorized until a fresh `load_verified_run_spec()` followed by `require_source_gate()` validates the actual 2018–2021 source authority and deterministic replay; pure Common fit/validator APIs continue to operate only on already-bound inputs for synthetic tests.

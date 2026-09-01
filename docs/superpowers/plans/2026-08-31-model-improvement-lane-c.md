@@ -434,7 +434,7 @@ git commit -m "feat: bind Lane C rows to exact as-of cutoffs"
 
 - [ ] **Step 1: Write failing tests for key shape, per-fold completeness, and all-neutral qualification.**
 
-The test constructs three concrete `SealedFeatureRow` mappings from the Common synthetic fixture, one each for H22, H23, and prediction-only H24, and asserts 10 keys per game (2 sides × 2 environment slots plus 3 defense slots). It supplies one `NEUTRAL` observation for every key and asserts `coverage_complete == True`, `coverage_complete_by_fold == {"H22": True, "H23": True, "H24": True}`, `candidate_qualified == False`, and `admitted_count == 0`. A missing key and an extra key must populate separate `missing_keys` and `unknown_keys` arrays and set `coverage_complete == False`.
+The test constructs three concrete `SealedFeatureRow` mappings from the Common synthetic fixture, one each for H22, H23, and prediction-only H24, and asserts 10 keys per game (2 sides × 2 environment slots plus 3 defense slots). It supplies one `NEUTRAL` observation for every key and asserts `coverage_complete == True`, `coverage_complete_by_fold == {"H22": True, "H23": True, "H24": True}`, `candidate_qualified == False`, and `admitted_count == 0`. A missing key and an extra key must populate separate `missing_keys` and `unknown_keys` arrays and set `coverage_complete == False`. It must also prove that the pure `validate_lane_c_prerequisites` accepts a correctly bound synthetic spec/receipt without invoking `require_source_gate`, while `run_lane_c_preflight` rejects an ordinary/synthetic RunSpec or an explicit receipt that differs from the receipt returned by `require_source_gate`.
 
 ```python
 class LaneCCoverageTest(unittest.TestCase):
@@ -475,7 +475,10 @@ from mlb_backtest.model_improvement.lane_c_contracts import (
 )
 from mlb_backtest.model_improvement.run_spec import ModelImprovementRunSpec, run_spec_sha256
 from mlb_backtest.model_improvement.sealed_features import FeatureSeal, load_sealed_feature_rows
-from mlb_backtest.model_improvement.source_gate import SourceGateReceipt, require_source_gate
+from mlb_backtest.model_improvement.source_gate import (
+    SourceGateReceipt, load_source_gate_receipt, require_source_gate,
+)
+from mlb_backtest.model_improvement.run_spec import load_verified_run_spec
 
 
 @dataclass(frozen=True)
@@ -497,12 +500,32 @@ class LaneCCoverageReport:
     candidate_qualified: bool
 
 
+def run_lane_c_preflight(
+    run_spec_path: Path,
+    source_gate_path: Path,
+    source_gate_expected_sha256: str,
+    feature_seals: Mapping[str, FeatureSeal],
+) -> tuple[ModelImprovementRunSpec, SourceGateReceipt, tuple[SealedFeatureRow, ...]]:
+    """Real orchestration boundary; all lower-level APIs receive its bound inputs."""
+    spec = load_verified_run_spec(run_spec_path)
+    verified_gate = require_source_gate(spec)
+    supplied_gate = load_source_gate_receipt(source_gate_path, source_gate_expected_sha256)
+    if (supplied_gate.as_mapping() != verified_gate.as_mapping()
+            or Path(supplied_gate.path).resolve() != Path(verified_gate.path).resolve()
+            or supplied_gate.artifact_sha256 != verified_gate.artifact_sha256):
+        raise ValueError("returned source gate differs from explicit receipt")
+    return spec, supplied_gate, validate_lane_c_prerequisites(spec, supplied_gate, feature_seals)
+
+
 def validate_lane_c_prerequisites(
     spec: ModelImprovementRunSpec,
     source_gate: SourceGateReceipt,
     feature_seals: Mapping[str, FeatureSeal],
 ):
-    require_source_gate(spec)
+    # Pure validator: synthetic tests may construct an already-bound spec/receipt.
+    # Only run_lane_c_preflight may run activation or source-gate verification.
+    if source_gate.run_spec_sha256 != run_spec_sha256(spec):
+        raise ValueError("SourceGateReceipt is bound to a different RunSpec")
     years = {"H22": 2022, "H23": 2023, "H24": 2024}
     if set(feature_seals) != set(years):
         raise ValueError("Lane C requires H22, H23, and H24 FeatureSeals")
@@ -593,6 +616,8 @@ def reconcile_coverage(
         candidate_qualified=qualified,
     )
 ```
+
+`run_lane_c_preflight` is the only real Lane C orchestration entrypoint: it must start with `load_verified_run_spec`, call `require_source_gate`, securely reload the caller's explicit source-gate path/digest, and require exact payload/path/artifact-digest equality with the receipt returned by `require_source_gate` before it calls the pure validator. `validate_lane_c_prerequisites`, coverage/replay helpers, row materialization, scoring-card/prediction sealing, and fit/evaluation helpers take already-bound `spec`/`SourceGateReceipt` inputs and must not call `require_source_gate`; this keeps their synthetic tests possible without weakening the real entrypoint.
 
 `sha256_sealed_rows()` and `run_spec_sha256()` are the existing Common canonical digest APIs. Do not recompute expected population from optional-source rows. A complete all-neutral report is explicitly not qualified; missing/unknown/duplicate keys are never auto-neutralized. `replay_complete` is true only after every admitted row has passed deterministic replay; an empty `replay_failed_keys` list alone is not sufficient.
 

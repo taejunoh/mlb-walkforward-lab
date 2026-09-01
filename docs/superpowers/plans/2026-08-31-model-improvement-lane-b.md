@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Consume only ModelImprovementRunSpec/load_verified_run_spec, SourceGateReceipt/require_source_gate/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json. Real Lane B orchestration starts with verified loading and the returned source-gate receipt; lower-level card, ledger, and fit/selection functions accept already-bound synthetic-or-real inputs and never invoke activation/source-gate verification themselves.
 - Import the pure `ScoringModelCard` type from `mlb_backtest.model_improvement.contracts`; import `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` only from `mlb_backtest.model_improvement.scoring_cards`. `contracts` must not import scoring-card persistence/resolver functions back.
 - Import `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and disposition seal/load operations directly from `mlb_backtest.model_improvement.lane_disposition`; `contracts` owns no disposition alias.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
@@ -778,21 +778,54 @@ git commit -m "feat: seal optional lane b card"
 ~~~python
 import ast
 import unittest
+from unittest import mock
 from mlb_backtest.model_improvement.lane_b_runner import run_lane_b_h22
 
 
 class LaneBRunnerTest(unittest.TestCase):
-    def test_blocked_gate_fails_before_h22(self):
-        with self.assertRaisesRegex(RuntimeError, "source gate is not SOURCES_READY"):
-            run_lane_b_h22(self.spec_path, self.blocked_gate_path, self.blocked_gate_artifact_sha256,
-                            self.feature_seal_path, self.feature_seal_artifact_sha256,
-                            self.v51_h22_path, self.v51_h22_artifact_sha256,
-                            self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
+    def test_invalid_or_not_ready_source_rejects_before_any_lane_b_artifact_load(self):
+        # This is a clean C -> D activation, but the authority supplied to its
+        # RunSpec is missing/digest-invalid or resolves to a not-ready source gate.
+        # `require_source_gate` must reject;
+        # the runner never tries its explicit gate, feature, or prediction artifacts.
+        for run_spec_path in (
+            self.activated_but_invalid_source_spec_path,
+            self.activated_not_ready_source_spec_path,
+        ):
+            with self.subTest(run_spec_path=run_spec_path):
+                with (
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_source_gate_receipt") as load_gate,
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_feature_seal") as load_feature,
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_sealed_feature_rows") as load_rows,
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_prediction_seal") as load_prediction,
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_prediction_rows") as load_prediction_rows,
+                ):
+                    with self.assertRaisesRegex(ValueError, "2018|SOURCES_READY|source"):
+                        run_lane_b_h22(run_spec_path, self.blocked_gate_path, self.blocked_gate_artifact_sha256,
+                                       self.feature_seal_path, self.feature_seal_artifact_sha256,
+                                       self.v51_h22_path, self.v51_h22_artifact_sha256,
+                                       self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
+                    for loader in (load_gate, load_feature, load_rows, load_prediction, load_prediction_rows):
+                        loader.assert_not_called()
 
     def test_registry_is_not_imported(self):
         tree = ast.parse(self.runner_source.read_text(encoding="utf-8"))
         names = {a.name for node in ast.walk(tree) if isinstance(node, ast.Import) for a in node.names}
         self.assertNotIn("mlb_backtest.model_improvement.candidate_registry", names)
+
+    def test_h22_entrypoint_requires_verified_activation_and_exact_gate_receipt(self):
+        with self.assertRaisesRegex(ValueError, "activation|verified|source gate"):
+            run_lane_b_h22(self.synthetic_spec_path, self.valid_gate_path, self.valid_gate_artifact_sha256,
+                           self.feature_seal_path, self.feature_seal_artifact_sha256,
+                           self.v51_h22_path, self.v51_h22_artifact_sha256,
+                           self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
+        # A clean C -> D declaration activation returns its own receipt.  A caller
+        # path/digest that loads a different valid receipt must still fail closed.
+        with self.assertRaisesRegex(ValueError, "returned source gate differs"):
+            run_lane_b_h22(self.activated_spec_path, self.other_gate_path, self.other_gate_artifact_sha256,
+                           self.feature_seal_path, self.feature_seal_artifact_sha256,
+                           self.v51_h22_path, self.v51_h22_artifact_sha256,
+                           self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
 ~~~
 
 - [ ] **Step 2: Run RED.**
@@ -809,24 +842,27 @@ from mlb_backtest.model_improvement.contracts import load_frozen_model_card
 from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
 from mlb_backtest.model_improvement.lane_b_ledger import build_lane_b_disposition, freeze_ab_card, select_h23
 from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal
-from mlb_backtest.model_improvement.run_spec import load_run_spec
+from mlb_backtest.model_improvement.run_spec import load_verified_run_spec
 from mlb_backtest.model_improvement.sealed_features import load_feature_seal, load_sealed_feature_rows
-from mlb_backtest.model_improvement.source_gate import load_source_gate_receipt
+from mlb_backtest.model_improvement.source_gate import load_source_gate_receipt, require_source_gate
 from mlb_backtest.model_improvement.canonical import read_regular_bytes, sha256_bytes
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
 def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path,
                    feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256,
                    lane_a_h22_path, lane_a_h22_expected_sha256):
-    spec = load_run_spec(Path(run_spec_path))
+    spec = load_verified_run_spec(Path(run_spec_path))
+    verified_gate = require_source_gate(spec)
     gate = load_source_gate_receipt(Path(source_gate_path), source_gate_expected_sha256)
+    if (gate.as_mapping() != verified_gate.as_mapping()
+            or Path(gate.path).resolve() != Path(verified_gate.path).resolve()
+            or gate.artifact_sha256 != verified_gate.artifact_sha256):
+        raise ValueError("returned source gate differs from explicit receipt")
     features = load_feature_seal(Path(feature_seal_path), feature_seal_expected_sha256)
     feature_rows = load_sealed_feature_rows(spec, (2022,), features)
     v51 = load_prediction_seal(Path(v51_h22_path), v51_h22_expected_sha256)
     lane_a = load_prediction_seal(Path(lane_a_h22_path), lane_a_h22_expected_sha256)
     v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
-    if gate.as_mapping()["status"] != "SOURCES_READY":
-        raise RuntimeError("source gate is not SOURCES_READY")
     if tuple(spec.fold("H22").oof_calibration_years) != (2019, 2020, 2021):
         raise RuntimeError("H22 chronology differs")
     if {r.game_pk for r in v51_rows} != {r.game_pk for r in lane_a_rows} or any(hasattr(r, "home_win") for r in feature_rows):
