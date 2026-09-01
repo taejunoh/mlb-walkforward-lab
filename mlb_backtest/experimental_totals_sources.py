@@ -516,42 +516,52 @@ def _admit_binding(
 def load_totals_sources(root: Path, report_path: Path) -> TotalsSourceBundle:
     """Admit exactly one report's D-1 and live MLB schedule evidence, read-only."""
     with open_trusted_root(Path(root)) as trusted:
-        report_relative = _relative_below(trusted, report_path, "report path")
-        report_snapshot = _read(trusted, report_relative, "daily report")
-        if report_snapshot is None:
-            raise ValueError("daily report differs")
-        report = _load_canonical_object(report_snapshot.contents, "daily report")
-        validated = validate_run_payload(report)
-        history_binding = _selected_binding(validated, _HISTORY_ROLE)
-        live_binding = _selected_binding(validated, _LIVE_ROLE)
-        history_identity, history_games, history_snapshots = _admit_binding(
-            trusted, history_binding,
-            target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
+        return load_totals_sources_bound(trusted.path, trusted, report_path)
+
+
+def load_totals_sources_bound(
+    root: Path, trusted: TrustedRoot, report_path: Path
+) -> TotalsSourceBundle:
+    """Admit schedule evidence through a caller-held trusted root capability."""
+    if Path(root).absolute() != trusted.path:
+        raise ValueError("trusted root differs from requested root")
+    trusted.assert_bound()
+    report_relative = _relative_below(trusted, report_path, "report path")
+    report_snapshot = _read(trusted, report_relative, "daily report")
+    if report_snapshot is None:
+        raise ValueError("daily report differs")
+    report = _load_canonical_object(report_snapshot.contents, "daily report")
+    validated = validate_run_payload(report)
+    history_binding = _selected_binding(validated, _HISTORY_ROLE)
+    live_binding = _selected_binding(validated, _LIVE_ROLE)
+    history_identity, history_games, history_snapshots = _admit_binding(
+        trusted, history_binding,
+        target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
+    )
+    live_identity, target_games, live_snapshots = _admit_binding(
+        trusted, live_binding,
+        target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
+    )
+    _totals_sources_test_hook("before_final_rebind", report_relative)
+    for snapshot in history_snapshots + live_snapshots:
+        rebind_regular_snapshot(
+            trusted, snapshot, "schedule source evidence", max_bytes=_MAX_JSON_BYTES
         )
-        live_identity, target_games, live_snapshots = _admit_binding(
-            trusted, live_binding,
-            target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
-        )
-        _totals_sources_test_hook("before_final_rebind", report_relative)
-        for snapshot in history_snapshots + live_snapshots:
-            rebind_regular_snapshot(
-                trusted, snapshot, "schedule source evidence", max_bytes=_MAX_JSON_BYTES
-            )
-        rebind_regular_snapshot(trusted, report_snapshot, "daily report", max_bytes=_MAX_JSON_BYTES)
-        trusted.assert_bound()
-        _require_absent(
-            trusted,
-            Path(live_identity.receipt_relative).with_suffix(".sha256"),
-            "live schedule receipt sidecar",
-        )
-        _require_absent(
-            trusted,
-            Path(live_identity.claim_relative).with_suffix(".sha256"),
-            "live schedule claim sidecar",
-        )
-        trusted.assert_bound()
-        return TotalsSourceBundle(
-            target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
-            history_identity=history_identity, live_identity=live_identity,
-            history_games=history_games, target_games=target_games,
-        )
+    rebind_regular_snapshot(trusted, report_snapshot, "daily report", max_bytes=_MAX_JSON_BYTES)
+    trusted.assert_bound()
+    _require_absent(
+        trusted,
+        Path(live_identity.receipt_relative).with_suffix(".sha256"),
+        "live schedule receipt sidecar",
+    )
+    _require_absent(
+        trusted,
+        Path(live_identity.claim_relative).with_suffix(".sha256"),
+        "live schedule claim sidecar",
+    )
+    trusted.assert_bound()
+    return TotalsSourceBundle(
+        target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
+        history_identity=history_identity, live_identity=live_identity,
+        history_games=history_games, target_games=target_games,
+    )

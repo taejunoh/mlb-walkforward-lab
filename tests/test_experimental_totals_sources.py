@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from mlb_backtest.live_top3_contracts import SourceBinding, canonical_json_bytes
+from mlb_backtest.secure_fs import open_trusted_root
 
 
 TARGET = "2025-05-01"
@@ -365,6 +366,22 @@ class TotalsSourcesTests(unittest.TestCase):
             ).hexdigest(),
             bundle.live_identity.manifest_sidecar_sha256,
         )
+
+    def test_bound_loader_uses_and_preserves_caller_trusted_root(self) -> None:
+        from mlb_backtest import experimental_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        with open_trusted_root(self.root) as trusted:
+            with mock.patch.object(
+                experimental_totals_sources,
+                "open_trusted_root",
+                side_effect=AssertionError("bound loader opened another root"),
+            ):
+                bundle = experimental_totals_sources.load_totals_sources_bound(
+                    self.root, trusted, fixture.report.relative_to(self.root)
+                )
+            self.assertEqual(bundle.target_date, TARGET)
+            trusted.assert_bound()
 
     def test_loader_rejects_history_before_authenticated_start_date(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
