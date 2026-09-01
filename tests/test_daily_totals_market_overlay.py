@@ -82,12 +82,12 @@ class SchemaTests(unittest.TestCase):
             "selected_side": None, "decision": "PASS", "reason_codes": ["AMBIGUOUS_DIRECTION"],
         } for pk in FIXED_GAME_PKS]
         value: dict[str, object] = {
-            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
+            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": list(STATUS_LABELS),
             "target_date": TARGET_DATE, "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
             "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
             "market_snapshot_relative": "audit/snapshot.json", "market_snapshot_sha256": "c" * 64,
             "policy_schema": POLICY_SCHEMA,
-            "policy_sha256": hashlib.sha256(canonical_json_bytes(POLICY)).hexdigest(),
+            "policy_sha256": hashlib.sha256(canonical_json_bytes(dict(POLICY))).hexdigest(),
             "evaluated_at_utc": "2026-09-01T15:00:00Z", "games": rows,
         }
         value["content_sha256"] = cls._digest(value)
@@ -98,7 +98,7 @@ class SchemaTests(unittest.TestCase):
         snapshot = self._snapshot_fixture()
         overlay = self._overlay_fixture()
         Draft202012Validator(json.loads((root / "experimental_daily_totals_draftkings_snapshot.schema.json").read_text())).validate(snapshot)
-        Draft202012Validator(json.loads((root / "experimental_daily_totals_overlay_policy.schema.json").read_text())).validate(POLICY)
+        Draft202012Validator(json.loads((root / "experimental_daily_totals_overlay_policy.schema.json").read_text())).validate(dict(POLICY))
         Draft202012Validator(json.loads((root / "experimental_daily_totals_overlay.schema.json").read_text())).validate(overlay)
 
     def test_schema_population_and_order_rejections(self) -> None:
@@ -267,18 +267,56 @@ class SchemaTests(unittest.TestCase):
             "reason_codes": ["AMBIGUOUS_DIRECTION"],
         } for pk in FIXED_GAME_PKS]
         report = {
-            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
+            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": list(STATUS_LABELS),
             "target_date": TARGET_DATE, "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
             "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
             "market_snapshot_relative": "audit/snapshot.json", "market_snapshot_sha256": "c" * 64,
             "policy_schema": POLICY_SCHEMA,
-            "policy_sha256": hashlib.sha256(canonical_json_bytes(POLICY)).hexdigest(),
+            "policy_sha256": hashlib.sha256(canonical_json_bytes(dict(POLICY))).hexdigest(),
             "evaluated_at_utc": "2026-09-01T15:00:00Z", "games": rows,
         }
         report["content_sha256"] = self._digest(report)
         copied = validate_overlay_report(report)
         self.assertEqual(copied, report)
         self.assertIsNot(copied, report)
+
+    def test_fixed_contract_authorities_are_immutable(self) -> None:
+        with self.assertRaises(TypeError):
+            POLICY["required_residual_count"] = 1  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            STATUS_LABELS[0] = "ALTERED"  # type: ignore[index]
+
+    def test_direct_validators_reject_stale_hashes_order_and_root_shape(self) -> None:
+        snapshot = self._snapshot_fixture()
+        snapshot["content_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            validate_draftkings_snapshot(snapshot)
+        snapshot = self._snapshot_fixture()
+        for invalid in (
+            {key: value for key, value in snapshot.items() if key != "games"},
+            {**snapshot, "unexpected": True},
+        ):
+            with self.subTest(snapshot_keys=sorted(invalid)):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+
+        overlay = self._overlay_fixture()
+        overlay["content_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            validate_overlay_report(overlay)
+        overlay = self._overlay_fixture()
+        reordered = deepcopy(overlay)
+        reordered["games"] = list(reversed(reordered["games"]))
+        reordered["content_sha256"] = self._digest(reordered)
+        with self.assertRaises(ValueError):
+            validate_overlay_report(reordered)
+        for invalid in (
+            {key: value for key, value in overlay.items() if key != "games"},
+            {**overlay, "unexpected": True},
+        ):
+            with self.subTest(overlay_keys=sorted(invalid)):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
 
 
 class PureMathTests(unittest.TestCase):

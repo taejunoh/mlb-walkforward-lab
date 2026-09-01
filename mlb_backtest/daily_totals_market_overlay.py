@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 import re
 import json
+import hashlib
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Rational, Real
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from .live_top3_contracts import canonical_json_bytes, validate_target_date
@@ -20,19 +22,22 @@ SNAPSHOT_SCHEMA = "PROVISIONAL_DAILY_TOTALS_DK_SNAPSHOT_V1"
 POLICY_SCHEMA = "PROVISIONAL_DAILY_TOTALS_OVERLAY_POLICY_V1"
 OVERLAY_SCHEMA = "PROVISIONAL_DAILY_TOTALS_OVERLAY_V1"
 TARGET_DATE = "2026-09-01"
-STATUS_LABELS = ["RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED"]
+_STATUS_LABELS = ("RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED")
+STATUS_LABELS = _STATUS_LABELS
 FIXED_GAME_PKS = (
     822929, 823340, 824391, 824472, 822687, 824716, 823661, 824070,
     824633, 822854, 824148, 824313, 823984, 825038, 823908,
 )
-POLICY = {
-    "schema": POLICY_SCHEMA,
-    "required_residual_count": 764,
-    "maximum_quote_age_seconds": 900,
-    "minimum_nonpush_support": 0.80,
-    "minimum_point_gap_runs": 1.00,
-    "minimum_support_margin": 0.05,
-}
+_POLICY_ITEMS = (
+    ("schema", POLICY_SCHEMA),
+    ("required_residual_count", 764),
+    ("maximum_quote_age_seconds", 900),
+    ("minimum_nonpush_support", 0.80),
+    ("minimum_point_gap_runs", 1.00),
+    ("minimum_support_margin", 0.05),
+)
+_POLICY_AUTHORITY = MappingProxyType(dict(_POLICY_ITEMS))
+POLICY = _POLICY_AUTHORITY
 _SNAPSHOT_KEYS = frozenset({
     "schema", "content_sha256", "target_date", "model_trace_relative",
     "model_trace_sha256", "model_report_relative", "model_report_sha256",
@@ -79,7 +84,7 @@ def _canonical_mapping(value: object, label: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be an object")
     try:
-        copied = json.loads(canonical_json_bytes(value))
+        copied = json.loads(canonical_json_bytes(dict(value)))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be finite canonical JSON") from exc
     if not isinstance(copied, dict):
@@ -96,7 +101,6 @@ def _sha(value: object, label: str) -> str:
 def _content_digest(value: Mapping[str, object]) -> str:
     without = dict(value)
     without.pop("content_sha256", None)
-    import hashlib
     return hashlib.sha256(canonical_json_bytes(without)).hexdigest()
 
 
@@ -243,7 +247,7 @@ def validate_draftkings_snapshot(value: object) -> dict[str, object]:
 def validate_overlay_policy(value: object) -> dict[str, object]:
     """Validate and defensively copy the immutable V1 overlay policy."""
     safe = _canonical_mapping(value, "overlay policy")
-    if set(safe) != set(POLICY) or safe != POLICY:
+    if set(safe) != {key for key, _ in _POLICY_ITEMS} or safe != _POLICY_AUTHORITY:
         raise ValueError("overlay policy differs")
     for field in ("required_residual_count", "maximum_quote_age_seconds"):
         if type(safe[field]) is not int:
@@ -328,14 +332,14 @@ def validate_overlay_report(value: object) -> dict[str, object]:
     safe = _canonical_mapping(value, "overlay report")
     if set(safe) != _OVERLAY_KEYS or safe["schema"] != OVERLAY_SCHEMA:
         raise ValueError("overlay report fields differ")
-    if safe["status_labels"] != STATUS_LABELS:
+    if safe["status_labels"] != list(_STATUS_LABELS):
         raise ValueError("overlay status labels differ")
     _target(safe["target_date"], "overlay target date")
     for field in ("model_report_relative", "model_trace_relative", "market_snapshot_relative"):
         _relative(safe[field], f"overlay {field}")
     for field in ("model_report_sha256", "model_trace_sha256", "market_snapshot_sha256", "policy_sha256"):
         _sha(safe[field], f"overlay {field}")
-    if safe["policy_schema"] != POLICY_SCHEMA or safe["policy_sha256"] != _content_digest(POLICY):
+    if safe["policy_schema"] != POLICY_SCHEMA or safe["policy_sha256"] != _content_digest(_POLICY_AUTHORITY):
         raise ValueError("overlay policy binding differs")
     _utc_timestamp(safe["evaluated_at_utc"], "overlay evaluated at")
     games = safe["games"]
