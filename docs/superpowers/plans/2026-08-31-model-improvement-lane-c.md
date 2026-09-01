@@ -44,7 +44,7 @@ from pathlib import Path
 
 `LaneDisposition` is the generic Common disposition API. Lane C uses only states `QUALIFIED`, `ABSENT`, and `REJECTED`; it does not define a C-specific absence enum. `load_frozen_model_card(spec, path, expected_sha256)` and the Common `PredictionSeal` are the typed APIs consumed by this plan. Runtime artifact descriptors are compared with `.artifact_sha256`; that field is excluded from canonical payloads. If an upstream plan has not published one of these names, resolve that interface in the upstream plan before starting Lane C; do not add aliases here.
 
-Before Lane C starts, Common must publish `LANE_IDS`, `load_sealed_feature_rows(spec, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(spec, path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_scoring_model_card(spec, namespace, relative_name, payload)`, `load_scoring_model_card(spec, path, expected_sha256)`, `resolve_prediction_weight_authority(spec, model_id, scoring_card)`, `seal_frozen_model_card(spec, namespace, relative_name, payload)`, `load_frozen_model_card(spec, path, expected_sha256)`, `seal_feature_rows(spec, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. `ScoringModelCard` is the pure type from `contracts`; its seal/load/resolve functions come only from `scoring_cards`, and `contracts` must not import them back. Lane C calls these APIs rather than recomputing or weakening upstream seals. Validate `"C" in LANE_IDS` rather than declaring a local lane-ID domain.
+Before Lane C starts, Common must publish `LANE_IDS`, `load_sealed_feature_rows(spec, source_gate, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(spec, path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_scoring_model_card(spec, namespace, relative_name, payload)`, `load_scoring_model_card(spec, path, expected_sha256)`, `resolve_prediction_weight_authority(spec, model_id, scoring_card)`, `seal_frozen_model_card(spec, namespace, relative_name, payload)`, `load_frozen_model_card(spec, path, expected_sha256)`, `seal_feature_rows(spec, source_gate, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. `source_gate` is always the authenticated `SourceGateReceipt` obtained at the real controller boundary (or a synthetic already-bound fixture in pure tests); Lane C must never self-assert a receipt digest. `ScoringModelCard` is the pure type from `contracts`; its seal/load/resolve functions come only from `scoring_cards`, and `contracts` must not import them back. Lane C calls these APIs rather than recomputing or weakening upstream seals. Validate `"C" in LANE_IDS` rather than declaring a local lane-ID domain.
 
 The Common `ModelImprovementRunSpec` is the only authority for fold membership, forbidden years, cutoffs, and artifact paths. `lane_c_output_path(spec, relative)` must be exactly:
 
@@ -439,10 +439,10 @@ The test constructs three concrete `SealedFeatureRow` mappings from the Common s
 ```python
 class LaneCCoverageTest(unittest.TestCase):
     def test_all_neutral_is_complete_but_not_qualified(self):
-        keys = build_expected_coverage_keys(self.spec, self.feature_seals, self.rows)
+        keys = build_expected_coverage_keys(self.spec, self.source_gate, self.feature_seals, self.rows)
         report = reconcile_coverage(
             keys, tuple(neutral_observation(key) for key in keys),
-            run_spec=self.spec, feature_seals=self.feature_seals,
+            run_spec=self.spec, source_gate=self.source_gate, feature_seals=self.feature_seals,
             replay_receipt_sha256=self.replay_receipt.artifact_sha256,
         )
         self.assertTrue(report.coverage_complete)
@@ -514,7 +514,7 @@ def run_lane_c_preflight(
             or Path(supplied_gate.path).resolve() != Path(verified_gate.path).resolve()
             or supplied_gate.artifact_sha256 != verified_gate.artifact_sha256):
         raise ValueError("returned source gate differs from explicit receipt")
-    return spec, supplied_gate, validate_lane_c_prerequisites(spec, supplied_gate, feature_seals)
+    return spec, verified_gate, validate_lane_c_prerequisites(spec, verified_gate, feature_seals)
 
 
 def validate_lane_c_prerequisites(
@@ -532,7 +532,7 @@ def validate_lane_c_prerequisites(
     if any(seal.source_gate_sha256 != source_gate.artifact_sha256 for seal in feature_seals.values()):
         raise ValueError("FeatureSeal is bound to a different SourceGateReceipt")
     rows = tuple(row for fold_id, year in years.items()
-                 for row in load_sealed_feature_rows(spec, (year,), feature_seals[fold_id]))
+                 for row in load_sealed_feature_rows(spec, source_gate, (year,), feature_seals[fold_id]))
     if any(row.target_year not in years.values() for row in rows):
         raise ValueError("Lane C rows include an unapproved year")
     return rows
@@ -540,12 +540,13 @@ def validate_lane_c_prerequisites(
 
 def build_expected_coverage_keys(
     spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
     feature_seals: Mapping[str, FeatureSeal],
     rows: Sequence[SealedFeatureRow] | None = None,
 ) -> tuple[CoverageKey, ...]:
     if rows is None:
         rows = tuple(row for fold_id, year in {"H22": 2022, "H23": 2023, "H24": 2024}.items()
-                     for row in load_sealed_feature_rows(spec, (year,), feature_seals[fold_id]))
+                     for row in load_sealed_feature_rows(spec, source_gate, (year,), feature_seals[fold_id]))
     keys = set()
     for row in rows:
         fold_id = {2022: "H22", 2023: "H23", 2024: "H24"}.get(row.target_year)
@@ -566,6 +567,7 @@ def reconcile_coverage(
     observations: Sequence[LaneCObservation],
     *,
     run_spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
     feature_seals: Mapping[str, FeatureSeal],
     replay_receipt_sha256: str,
     replay_failed_keys: Sequence[CoverageKey] = (),
@@ -574,7 +576,7 @@ def reconcile_coverage(
 ) -> LaneCCoverageReport:
     if sealed_rows is None:
         sealed_rows = tuple(row for fold_id, year in {"H22": 2022, "H23": 2023, "H24": 2024}.items()
-                            for row in load_sealed_feature_rows(run_spec, (year,), feature_seals[fold_id]))
+                            for row in load_sealed_feature_rows(run_spec, source_gate, (year,), feature_seals[fold_id]))
     row_by_game = {row.game_pk: row for row in sealed_rows}
     expected_set = set(expected)
     counts = Counter(item.key for item in observations)
@@ -808,7 +810,7 @@ The tests must prove:
 ```python
 def test_neutral_parts_keep_score_50_quality_0_without_redistribution(self):
     parts = build_validated_parts(self.spec, self.observations, self.transform, self.replay_receipt)
-    result = build_lane_c_candidate(self.spec, self.parent_feature_seals, self.ab_rows,
+    result = build_lane_c_candidate(self.spec, self.source_gate, self.parent_feature_seals, self.ab_rows,
                                     parts, self.qualified_report, self.replay_receipt)
     self.assertEqual(result[0].component_scores["away"]["environment"], 68.0)
     self.assertEqual(result[0].component_scores["away"]["defense"], 61.0)
@@ -853,9 +855,9 @@ def test_h22_and_h23_use_distinct_fold_bound_cards_and_prediction_paths(self):
     self.assertEqual(h22_card.feature_seal_sha256, self.lane_c_feature_seals["H22"].artifact_sha256)
     self.assertEqual(h23_card.feature_seal_sha256, self.lane_c_feature_seals["H23"].artifact_sha256)
     h22_rows = materialize_lane_c_prediction_rows(
-        self.spec, "H22", self.lane_c_feature_seals["H22"], h22_card)
+        self.spec, self.source_gate, "H22", self.lane_c_feature_seals["H22"], h22_card)
     h23_rows = materialize_lane_c_prediction_rows(
-        self.spec, "H23", self.lane_c_feature_seals["H23"], h23_card)
+        self.spec, self.source_gate, "H23", self.lane_c_feature_seals["H23"], h23_card)
     self.assertTrue(h22_rows)
     self.assertTrue(h23_rows)
     for fold_id, card, rows in (("H22", h22_card, h22_rows), ("H23", h23_card, h23_rows)):
@@ -887,10 +889,10 @@ def test_lane_c_materializer_rejects_cross_fold_or_tampered_scoring_authority(se
     )
     with self.assertRaisesRegex(ValueError, "fold FeatureSeal"):
         materialize_lane_c_prediction_rows(
-            self.spec, "H22", self.lane_c_feature_seals["H22"], h23_card)
+            self.spec, self.source_gate, "H22", self.lane_c_feature_seals["H22"], h23_card)
     with self.assertRaisesRegex(ValueError, "H22 or H23"):
         materialize_lane_c_prediction_rows(
-            self.spec, "H24", self.lane_c_feature_seals["H24"], h23_card)
+            self.spec, self.source_gate, "H24", self.lane_c_feature_seals["H24"], h23_card)
 
 def test_lane_c_scoring_and_materialization_reject_non_lane_c_wrong_fold_and_gate_mismatch(self):
     with self.assertRaisesRegex(ValueError, "feature_set_id"):
@@ -918,20 +920,20 @@ def test_lane_c_scoring_and_materialization_reject_non_lane_c_wrong_fold_and_gat
     )
     with self.assertRaisesRegex(ValueError, "feature_set_id"):
         materialize_lane_c_prediction_rows(
-            self.spec, "H22", self.parent_feature_seals["H22"], h22_card)
+            self.spec, self.source_gate, "H22", self.parent_feature_seals["H22"], h22_card)
     with self.assertRaisesRegex(ValueError, "fold"):
         materialize_lane_c_prediction_rows(
-            self.spec, "H22", self.lane_c_feature_seals["H23"], h22_card)
+            self.spec, self.source_gate, "H22", self.lane_c_feature_seals["H23"], h22_card)
     # Fixture persists a schema-valid H22 card whose source_gate_sha256 is foreign;
     # only materialization can prove its mismatch against the supplied FeatureSeal.
     with self.assertRaisesRegex(ValueError, "source gate"):
         materialize_lane_c_prediction_rows(
-            self.spec, "H22", self.lane_c_feature_seals["H22"],
+            self.spec, self.source_gate, "H22", self.lane_c_feature_seals["H22"],
             self.source_gate_mismatch_h22_card,
         )
 ```
 
-`build_validated_parts()` accepts a `LaneCReplayReceipt` and rejects every observation whose digest is not listed in its immutable entries; neutral rows become score `50.0` and quality `0.0`, never a fabricated optional value. The candidate test must call `seal_lane_c_candidate_rows(spec, parent_common_seals, candidate_rows, coverage, replay_receipt)`, assert separate H22/H23/H24 Common FeatureSeal descriptors, reload each with `load_sealed_feature_rows`, and prove no unsealed row is accepted by materialization or handoff. It must then test `materialize_lane_c_prediction_rows` against the fold-bound seal/card, including row contract/card digests, no labels, deterministic unique population, and rejection of Common/non-`lane_c`, wrong-fold, and card-vs-seal source-gate-mismatched FeatureSeals before `seal_lane_c_fold_prediction` receives only the resulting tuple. Test fixtures are synthetic and in-memory.
+`build_validated_parts()` accepts a `LaneCReplayReceipt` and rejects every observation whose digest is not listed in its immutable entries; neutral rows become score `50.0` and quality `0.0`, never a fabricated optional value. The candidate test must call `seal_lane_c_candidate_rows(spec, source_gate, parent_common_seals, candidate_rows, coverage, replay_receipt)`, assert separate H22/H23/H24 Common FeatureSeal descriptors, reload each with `load_sealed_feature_rows(spec, source_gate, ...)`, and prove no unsealed row is accepted by materialization or handoff. It must then test `materialize_lane_c_prediction_rows(spec, source_gate, ...)` against the fold-bound seal/card, including row contract/card digests, no labels, deterministic unique population, and rejection of Common/non-`lane_c`, wrong-fold, and card-vs-seal source-gate-mismatched FeatureSeals before `seal_lane_c_fold_prediction` receives only the resulting tuple. Test fixtures are synthetic and in-memory.
 
 - [ ] **Step 2: Run candidate tests to verify RED.**
 
@@ -1039,13 +1041,14 @@ def lane_c_output_path(spec: ModelImprovementRunSpec, relative: str):
     return spec.output_path("lane_c", relative)
 ```
 
-`build_lane_c_candidate()` returns `tuple[SealedFeatureRow, ...]` and must accept `spec`, the parent `FeatureSeal` mapping for H22/H23/H24, `Sequence[SealedFeatureRow]`, `Sequence[LaneCTransformedPart]`, a `LaneCCoverageReport`, and the sealed `LaneCReplayReceipt`. It first loads each parent fold’s rows through `load_sealed_feature_rows(spec, (year,), parent_feature_seals[fold_id])`, verifies population/game identity and `row.source_gate_sha256 == parent_feature_seals[fold_id].source_gate_sha256`, then copies each row’s nested `component_scores`, `component_qualities`, `metric_primitives`, and `component_inputs_sha256` maps through `row.as_mapping()`. It rebuilds the row only through Common `sealed_feature_row_payload` and `compute_feature_row_sha256`; it never returns dictionaries such as `away_scores` or `qualities`. It rejects `candidate_qualified == False`, missing transform keys, wrong RunSpec/FeatureSeal/replay-receipt digests, outcome fields, and any transformed part whose observation digest is not present in the immutable replay receipt. It calls the existing `environment_score(park, weather_roof)` and `defense_score(oaa, framing, blocking_throwing)`; missing parts remain score 50/quality 0 and weights are never redistributed. Game-level context completeness is `min(away_context_quality, home_context_quality)` only when materializing prediction rows for ranking; it does not overwrite either shared row map. Candidate transforms are never built from unvalidated observations. The returned rows are not eligible for scoring or handoff until `seal_lane_c_candidate_rows()` creates and reloads the three Common lane_c FeatureSeals.
+`build_lane_c_candidate()` returns `tuple[SealedFeatureRow, ...]` and must accept `spec`, authenticated `source_gate`, the parent `FeatureSeal` mapping for H22/H23/H24, `Sequence[SealedFeatureRow]`, `Sequence[LaneCTransformedPart]`, a `LaneCCoverageReport`, and the sealed `LaneCReplayReceipt`. It first loads each parent fold’s rows through `load_sealed_feature_rows(spec, source_gate, (year,), parent_feature_seals[fold_id])`, verifies population/game identity and `row.source_gate_sha256 == source_gate.artifact_sha256 == parent_feature_seals[fold_id].source_gate_sha256`, then copies each row’s nested `component_scores`, `component_qualities`, `metric_primitives`, and `component_inputs_sha256` maps through `row.as_mapping()`. It rebuilds the row only through Common `sealed_feature_row_payload` and `compute_feature_row_sha256`; it never returns dictionaries such as `away_scores` or `qualities`. It rejects `candidate_qualified == False`, missing transform keys, wrong RunSpec/SourceGate/FeatureSeal/replay-receipt digests, outcome fields, and any transformed part whose observation digest is not present in the immutable replay receipt. It calls the existing `environment_score(park, weather_roof)` and `defense_score(oaa, framing, blocking_throwing)`; missing parts remain score 50/quality 0 and weights are never redistributed. Game-level context completeness is `min(away_context_quality, home_context_quality)` only when materializing prediction rows for ranking; it does not overwrite either shared row map. Candidate transforms are never built from unvalidated observations. The returned rows are not eligible for scoring or handoff until `seal_lane_c_candidate_rows()` creates and reloads the three Common lane_c FeatureSeals.
 
 The row update must be explicit. The nested Common maps are recursively frozen, so start from the fresh JSON values returned by `row.as_mapping()`; never mutate a row map in place. Construct the replacement with the Common digest helper, then assert the same helper’s row projection before returning it:
 
 ```python
 def build_lane_c_candidate(
     spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
     parent_feature_seals: Mapping[str, FeatureSeal],
     ab_rows: Sequence[SealedFeatureRow],
     parts: Sequence[LaneCTransformedPart],
@@ -1057,6 +1060,9 @@ def build_lane_c_candidate(
         raise ValueError("Lane C candidate is not qualified")
     if coverage.run_spec_sha256 != run_spec_sha256(spec):
         raise ValueError("coverage RunSpec digest differs")
+    if any(seal.source_gate_sha256 != source_gate.artifact_sha256
+           for seal in parent_feature_seals.values()):
+        raise ValueError("parent FeatureSeal source gate differs")
     if coverage.feature_seal_sha256 != {
         fold: parent_feature_seals[fold].artifact_sha256
         for fold in ("H22", "H23", "H24")
@@ -1065,7 +1071,7 @@ def build_lane_c_candidate(
     if coverage.replay_receipt_sha256 != replay_receipt.artifact_sha256:
         raise ValueError("coverage replay receipt digest differs")
     parent_rows = tuple(row for fold_id, year in {"H22": 2022, "H23": 2023, "H24": 2024}.items()
-                        for row in load_sealed_feature_rows(spec, (year,), parent_feature_seals[fold_id]))
+                        for row in load_sealed_feature_rows(spec, source_gate, (year,), parent_feature_seals[fold_id]))
     parent_by_game = {row.game_pk: row for row in parent_rows}
     by_key = {part.key: part for part in parts}
     output = []
@@ -1138,6 +1144,7 @@ Seal the returned rows before any prediction materialization or handoff:
 ```python
 def seal_lane_c_candidate_rows(
     spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
     parent_common_seals: Mapping[str, FeatureSeal],
     candidate_rows: Sequence[SealedFeatureRow],
     coverage: LaneCCoverageReport,
@@ -1157,14 +1164,14 @@ def seal_lane_c_candidate_rows(
     }
     seals = {}
     for fold_id, rows in by_fold.items():
-        parent_rows = load_sealed_feature_rows(spec, (years[fold_id],), parent_common_seals[fold_id])
+        parent_rows = load_sealed_feature_rows(spec, source_gate, (years[fold_id],), parent_common_seals[fold_id])
         if {row.game_pk for row in rows} != {row.game_pk for row in parent_rows}:
             raise ValueError(f"Lane C {fold_id} rows do not match parent FeatureSeal population")
         if any(row.source_gate_sha256 != parent_common_seals[fold_id].source_gate_sha256
                for row in rows):
             raise ValueError(f"Lane C {fold_id} row source gate differs from parent FeatureSeal")
         seals[fold_id] = seal_feature_rows(
-            spec, "lane_c", fold_id, rows,
+            spec, source_gate, "lane_c", fold_id, rows,
             parent_feature_seal_sha256=parent_common_seals[fold_id].artifact_sha256,
             evidence_sha256=(coverage_digest, replay_receipt.artifact_sha256,
                              parent_common_seals[fold_id].artifact_sha256),
@@ -1172,7 +1179,7 @@ def seal_lane_c_candidate_rows(
     return seals
 ```
 
-`seal_lane_c_candidate_rows()` creates only Common `FeatureSeal` artifacts using the exact revised `seal_feature_rows(spec, "lane_c", fold_id, rows, parent_feature_seal_sha256=..., evidence_sha256=...)` API; it adds no C-specific seal fields. It creates separate lane_c seals for H22, H23, and prediction-only H24, and includes the immutable replay receipt digest in each seal’s evidence. The parent common seal and coverage digest are carried by the Common seal’s existing source-gate/population/rows bindings, the candidate rows’ `component_inputs_sha256`, and disposition evidence. The returned mapping must be loaded separately with `load_sealed_feature_rows(spec, (2022,), lane_c_feature_seals["H22"])`, `load_sealed_feature_rows(spec, (2023,), lane_c_feature_seals["H23"])`, and `load_sealed_feature_rows(spec, (2024,), lane_c_feature_seals["H24"])`; unsealed candidate rows cannot reach materialization, scoring, or H23/H24 handoff.
+`seal_lane_c_candidate_rows()` creates only Common `FeatureSeal` artifacts using the exact revised `seal_feature_rows(spec, source_gate, "lane_c", fold_id, rows, parent_feature_seal_sha256=..., evidence_sha256=...)` API; it adds no C-specific seal fields. It creates separate lane_c seals for H22, H23, and prediction-only H24, and includes the immutable replay receipt digest in each seal’s evidence. The parent common seal and coverage digest are carried by the Common seal’s existing source-gate/population/rows bindings, the candidate rows’ `component_inputs_sha256`, and disposition evidence. The returned mapping must be loaded separately with `load_sealed_feature_rows(spec, source_gate, (2022,), lane_c_feature_seals["H22"])`, `load_sealed_feature_rows(spec, source_gate, (2023,), lane_c_feature_seals["H23"])`, and `load_sealed_feature_rows(spec, source_gate, (2024,), lane_c_feature_seals["H24"])`; unsealed candidate rows cannot reach materialization, scoring, or H23/H24 handoff.
 
 - [ ] **Step 4: Seal Lane C's own scoring card before prediction, then implement prediction-digest qualification and generic disposition handoff.**
 
@@ -1217,6 +1224,7 @@ def seal_lane_c_scoring_card(
 
 def materialize_lane_c_prediction_rows(
     spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
     fold_id: str,
     feature_seal: FeatureSeal,
     scoring_card: ScoringModelCard,
@@ -1231,10 +1239,12 @@ def materialize_lane_c_prediction_rows(
         raise ValueError("Lane C materialization requires FeatureSeal feature_set_id lane_c")
     if feature_seal.fold_id != fold_id:
         raise ValueError("Lane C FeatureSeal fold differs from materialization fold")
+    if feature_seal.source_gate_sha256 != source_gate.artifact_sha256:
+        raise ValueError("Lane C FeatureSeal source gate differs from materialization source gate")
 
     # This loader is the only row source: it securely rereads the declared FeatureSeal
     # population rather than accepting caller-provided SealedFeatureRow objects.
-    sealed_rows = load_sealed_feature_rows(spec, (target_year,), feature_seal)
+    sealed_rows = load_sealed_feature_rows(spec, source_gate, (target_year,), feature_seal)
     verified_card = load_scoring_model_card(
         spec, Path(scoring_card.path), scoring_card.artifact_sha256,
     )
@@ -1482,7 +1492,7 @@ def build_lane_c_fold_result(
 
 `seal_lane_c_scoring_card()` is fold-parameterized and runs before every Lane C H22/H23 prediction. It accepts only `fold_id in {"H22","H23"}`, requires the supplied `FeatureSeal.feature_set_id == "lane_c"` and equal `FeatureSeal.fold_id`, and requires `FeatureSeal.source_gate_sha256 == source_gate.artifact_sha256` before it constructs the payload's `source_gate_sha256`. It writes exactly `lane_c/{fold_id}/scoring_model_card.json`, preserves the A+B six-key weights byte-for-byte, and binds the A+B parent, calibration/coverage/replay evidence, and the universal RunSpec contract digest. Common FeatureSeals, cross-fold FeatureSeals, and source-gate mismatches fail before any card write.
 
-`materialize_lane_c_prediction_rows(spec, fold_id, feature_seal, scoring_card) -> tuple[PredictionRow, ...]` is the sole Lane C scorer. It accepts only H22/H23, first requires the supplied `FeatureSeal.feature_set_id == "lane_c"` and equal `FeatureSeal.fold_id`, securely reloads exactly that target year's rows through the fold's seal, then securely reloads the declared `ScoringModelCard` and requires its `source_gate_sha256 == FeatureSeal.source_gate_sha256`. It then calls `resolve_prediction_weight_authority(spec, "A+B+C", verified_card)`. It rejects a wrong model/lane/fold/source-gate/FeatureSeal/RunSpec-contract/card digest, any row outside the fold population, duplicate game, or an authority that differs from the card's six-key integer weights. It obtains normalization parameters only from the already sealed fold-calibration artifact named by `ScoringModelCard.calibration_card_sha256`; fitting, labels, and H24 outcomes are forbidden here.
+`materialize_lane_c_prediction_rows(spec, source_gate, fold_id, feature_seal, scoring_card) -> tuple[PredictionRow, ...]` is the sole Lane C scorer. It accepts only H22/H23, first requires the supplied authenticated `SourceGateReceipt`, `FeatureSeal.feature_set_id == "lane_c"`, equal `FeatureSeal.fold_id`, and `FeatureSeal.source_gate_sha256 == source_gate.artifact_sha256`, securely reloads exactly that target year's rows through the fold's seal, then securely reloads the declared `ScoringModelCard` and requires its `source_gate_sha256 == FeatureSeal.source_gate_sha256`. It then calls `resolve_prediction_weight_authority(spec, "A+B+C", verified_card)`. It rejects a wrong model/lane/fold/source-gate/FeatureSeal/RunSpec-contract/card digest, any row outside the fold population, duplicate game, or an authority that differs from the card's six-key integer weights. It obtains normalization parameters only from the already sealed fold-calibration artifact named by `ScoringModelCard.calibration_card_sha256`; fitting, labels, and H24 outcomes are forbidden here.
 
 For every row, the materializer applies the exact Common `prediction_contract`: its declared weighted home-minus-away edge formula, declared weighted minimum-quality completeness formula, frozen normalization clip `[0.10, 0.90]`, and exact `home`/`away`/`none` pick rule. It sets `confidence = 10 * completeness`, carries the sealed `starter_edge_abs` and `feature_row_sha256`, sets `model_id="A+B+C"`, and populates `prediction_contract_sha256=spec.prediction_contract_sha256` and `scoring_model_card_sha256=verified_card.artifact_sha256`. It emits no label/outcome field. It ranks only non-neutral rows using Common `rank_daily` by the RunSpec tie order—`pick_probability desc`, `confidence desc`, `starter_edge_abs desc`, `scheduled_start_utc asc`, `game_pk asc`—assigns neutral rows rank `0`, and returns one deterministic `(official_date, scheduled_start_utc, game_pk)` ordered, unique game population.
 

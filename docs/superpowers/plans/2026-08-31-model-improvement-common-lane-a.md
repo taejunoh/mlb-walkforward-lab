@@ -36,6 +36,9 @@ from mlb_backtest.model_improvement.source_gate import (
 from mlb_backtest.model_improvement.sealed_features import (
     FeatureSeal, load_feature_seal, load_sealed_feature_rows, seal_feature_rows,
 )
+from mlb_backtest.model_improvement.canonical import (
+    canonical_json_bytes, write_immutable_bytes, write_immutable_json,
+)
 from mlb_backtest.model_improvement.oof_ledger import (
     JoinedLedger, join_oof_outcomes, load_joined_ledger, load_prediction_seal,
     load_joined_prediction_rows, load_prediction_rows, seal_oof_predictions,
@@ -589,7 +592,7 @@ Expected: FAIL with `ModuleNotFoundError` for `source_gate`.
 
 `_revalidate_activated_spec(presented)` is mandatory as the first operation of both `verify_source_gate` and `require_source_gate`. A supplied runtime descriptor is never trusted: require a non-null `presented.verified_activation`, use its absolute `declaration_path` only to call a **fresh** `load_verified_run_spec`, then require exact equality of (a) fresh and presented activation descriptors (`declaration_path`, tracked-byte `declaration_sha256`, semantic `run_spec_sha256`), (b) `run_spec_sha256(fresh)` and the descriptor's semantic digest, and (c) fresh versus presented canonical `as_mapping()` bytes/digest. Reject ordinary, synthetic, missing, fake, or post-activation-dirty presentations. Thereafter source-gate code uses only the fresh verified object, never `presented` or its descriptor. This revalidation preserves the no-hash-cycle rule because the descriptor remains runtime-only and excluded from the persisted RunSpec payload/hash.
 
-`verify_source_gate` must call `_revalidate_activated_spec` first, then call `protocols.load_source_run_spec`, `execution_registry.validate_sources_ready_evidence_set`, `execution_registry.load_terminal_acquisition_checkpoint`, `v52_verify_sources.load_snapshot_replay_inputs`, and `v52_verify_sources.replay_verified_snapshots` with only paths declared in that fresh RunSpec. Check every bound file digest before and after those calls, require the replayed six source families across 2018–2024, then write the receipt only in `source_gate`. It accepts neither arbitrary bytes nor caller-supplied inventory/authority/output path. `require_source_gate` likewise revalidates first, rereads the receipt and reruns verification using the fresh object, requiring exact persisted payload, path, and digest equality of the two receipts.
+`source_gate_receipt.schema.json`, `SourceGateReceipt.from_payload_mapping`, and the standalone `load_source_gate_receipt(path, expected_sha256)` are intentionally **structural-only**: they canonical-parse/re-hash the payload and sidecar and construct a descriptor, but cannot prove the receipt inventory is bound to a RunSpec they do not receive. `verify_source_gate` must call `_revalidate_activated_spec` first, then call `protocols.load_source_run_spec`, `execution_registry.validate_sources_ready_evidence_set`, `execution_registry.load_terminal_acquisition_checkpoint`, `v52_verify_sources.load_snapshot_replay_inputs`, and `v52_verify_sources.replay_verified_snapshots` with only paths declared in that fresh RunSpec. Check every bound file digest before and after those calls, require the replayed six source families across 2018–2024, construct `inventory_sha256` from exactly `fresh.source_authority.inventory.sha256`, then write the receipt only in `source_gate`. It accepts neither arbitrary bytes nor caller-supplied inventory/authority/output path. Add `_load_bound_receipt(spec, path, expected_sha256)`: after secure structural loading, it requires both `receipt.run_spec_sha256 == run_spec_sha256(spec)` and `receipt.inventory_sha256 == spec.source_authority.inventory.sha256`. `require_source_gate` likewise revalidates first, obtains the fresh verified receipt, calls `_load_bound_receipt` for the persisted receipt, and requires exact persisted payload, path, and digest equality of the two receipts. RED/green boundary cases must prove that a structurally valid receipt with a foreign inventory digest can load standalone but is rejected by `_load_bound_receipt` and `require_source_gate`, while `verify_source_gate` never serializes that foreign digest.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -631,6 +634,28 @@ canonical tests for binary/JSONL byte equality, a conflicting existing byte
 file, and a symlink/non-regular byte artifact.  Do not duplicate the secure
 writer in `sealed_features.py`.
 
+The Task 5 sidecars are mandatory and are not implicit behavior of
+`write_immutable_bytes`: `rows.jsonl.sha256` and
+`feature_seal.json.sha256` are each canonical JSON with exactly
+`{"artifact_sha256": digest}`.  `rows.jsonl.sha256` binds the exact JSONL raw
+bytes and `feature_seal.json.sha256` binds the canonical FeatureSeal payload
+bytes.  The sealer publishes immutable artifacts in this exact crash-safe
+order: rows sidecar, FeatureSeal sidecar, `rows.jsonl` primary,
+`feature_seal.json` primary.  The final primary is the commit point; a crash
+before it leaves only unreferenced prerequisite artifacts.  On retry, an
+existing sidecar without its later primary is an allowed prerequisite and may
+only be byte-identical; the publisher resumes at the first absent stage.  An
+existing primary requires its exact regular canonical sidecar already to be
+present, while a conflicting, missing-required, symlink, or non-regular
+artifact/sidecar fails closed and is never deleted, replaced, or repaired.
+`load_feature_seal` must require and
+canonical-validate its own sidecar; `load_sealed_feature_rows` must derive,
+securely read, canonical-validate, and compare both the rows primary and
+`rows.jsonl.sha256` before parsing a row.  Add RED tests for missing,
+different, symlink, and non-regular sidecars for both paths, publication crash
+points/retry, and the guarantee that an orphan rows primary without the final
+FeatureSeal primary is not a usable seal.
+
 ### Task 5 authority and byte-binding amendment
 
 The row field named `source_manifest_sha256` means the authoritative V5.2
@@ -647,12 +672,13 @@ digest.
 
 This requires a narrow Task 3/Task 4 migration before Task 5 implementation:
 the RunSpec tests must preserve and test the closed inventory binding and
-canonical exclusions projection; the source-gate schema/parser/loader and RED
-tests must reject a receipt whose `inventory_sha256` differs from
-`fresh.source_authority.inventory.sha256`.  Keep
-`snapshot_replay_sha256` separate.  These are compatibility requirements for
-the existing Task 3/4 code, not an invitation to add a duplicate aggregate
-field.
+canonical exclusions projection; the schema/parser/standalone loader remain
+structural-only, while `_load_bound_receipt(spec, ...)`,
+`require_source_gate(spec)`, and the fresh-spec `verify_source_gate` boundary
+reject a receipt whose `inventory_sha256` differs from
+`fresh.source_authority.inventory.sha256`.  Keep `snapshot_replay_sha256`
+separate.  These are compatibility requirements for the existing Task 3/4
+code, not an invitation to add a duplicate aggregate field.
 
 Keep the low-level sealer deterministic, but make the authenticated receipt
 an explicit argument so a real caller cannot self-assert a source-gate digest:

@@ -356,7 +356,7 @@ git commit -m "feat: score lane b candidates"
 **Interfaces:**
 
 - Consumes ModelImprovementRunSpec, FeatureSeal, completed JoinedLedger objects, Candidate.
-- Produces CandidateFoldCard and `fit_candidate_fold_card(spec, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id) -> CandidateFoldCard`.
+- Produces CandidateFoldCard and `fit_candidate_fold_card(spec, source_gate, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id) -> CandidateFoldCard`; the supplied `SourceGateReceipt` is the already authenticated receipt from the real boundary or a consistently bound synthetic fixture.
 
 - [ ] **Step 1: Write the failing chronology TestCase.**
 
@@ -367,7 +367,7 @@ from mlb_backtest.model_improvement.lane_b_calibration import fit_candidate_fold
 
 class LaneBCalibrationTest(unittest.TestCase):
     def test_h23_uses_o19_to_o22_only(self):
-        card = fit_candidate_fold_card(self.spec, self.feature_seal, self.joined_ledgers, self.candidate, "H23")
+        card = fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal, self.joined_ledgers, self.candidate, "H23")
         self.assertEqual((2019, 2020, 2021, 2022), card.calibration_years)
         self.assertEqual(2023, card.target_year)
 ~~~
@@ -407,7 +407,8 @@ class CandidateFoldCard:
 
 
 def fit_candidate_fold_card(
-    spec, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id,
+    spec: ModelImprovementRunSpec, source_gate: SourceGateReceipt,
+    feature_seal: FeatureSeal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id,
 ):
     years = _FOLD_YEARS.get(fold_id)
     if years is None or spec.fold(fold_id).target_year <= max(years):
@@ -427,7 +428,7 @@ def fit_candidate_fold_card(
         raise ValueError("OOF duplicate games differ")
     if any(value not in (0, 1) for value in labels.values()):
         raise ValueError("OOF labels differ")
-    rows = load_sealed_feature_rows(spec, years, feature_seal)
+    rows = load_sealed_feature_rows(spec, source_gate, years, feature_seal)
     if {row.game_pk for row in rows} != set(labels):
         raise ValueError("feature and OOF populations differ")
     trial = score_candidate_rows(rows, candidate, 0., 1.)
@@ -443,9 +444,9 @@ def fit_candidate_fold_card(
 ~~~python
     def test_target_year_and_duplicate_games_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "OOF years"):
-            fit_candidate_fold_card(self.spec, self.feature_seal, self.target_year_ledgers, self.candidate, "H23")
+            fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal, self.target_year_ledgers, self.candidate, "H23")
         with self.assertRaisesRegex(ValueError, "populations differ"):
-            fit_candidate_fold_card(self.spec, self.missing_feature_seal, self.joined_ledgers, self.candidate, "H23")
+            fit_candidate_fold_card(self.spec, self.source_gate, self.missing_feature_seal, self.joined_ledgers, self.candidate, "H23")
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_calibration.LaneBCalibrationTest -v
@@ -842,9 +843,13 @@ from mlb_backtest.model_improvement.contracts import load_frozen_model_card
 from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
 from mlb_backtest.model_improvement.lane_b_ledger import build_lane_b_disposition, freeze_ab_card, select_h23
 from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal
-from mlb_backtest.model_improvement.run_spec import load_verified_run_spec
-from mlb_backtest.model_improvement.sealed_features import load_feature_seal, load_sealed_feature_rows
-from mlb_backtest.model_improvement.source_gate import load_source_gate_receipt, require_source_gate
+from mlb_backtest.model_improvement.run_spec import ModelImprovementRunSpec, load_verified_run_spec
+from mlb_backtest.model_improvement.sealed_features import (
+    FeatureSeal, load_feature_seal, load_sealed_feature_rows,
+)
+from mlb_backtest.model_improvement.source_gate import (
+    SourceGateReceipt, load_source_gate_receipt, require_source_gate,
+)
 from mlb_backtest.model_improvement.canonical import read_regular_bytes, sha256_bytes
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
@@ -859,7 +864,7 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
             or gate.artifact_sha256 != verified_gate.artifact_sha256):
         raise ValueError("returned source gate differs from explicit receipt")
     features = load_feature_seal(Path(feature_seal_path), feature_seal_expected_sha256)
-    feature_rows = load_sealed_feature_rows(spec, (2022,), features)
+    feature_rows = load_sealed_feature_rows(spec, verified_gate, (2022,), features)
     v51 = load_prediction_seal(Path(v51_h22_path), v51_h22_expected_sha256)
     lane_a = load_prediction_seal(Path(lane_a_h22_path), lane_a_h22_expected_sha256)
     v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
@@ -867,7 +872,7 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
         raise RuntimeError("H22 chronology differs")
     if {r.game_pk for r in v51_rows} != {r.game_pk for r in lane_a_rows} or any(hasattr(r, "home_win") for r in feature_rows):
         raise RuntimeError("sealed input population differs or exposes outcomes")
-    return {"run_spec_sha256": run_spec_sha256(spec), "source_gate_artifact_sha256": gate.artifact_sha256,
+    return {"run_spec_sha256": run_spec_sha256(spec), "source_gate_artifact_sha256": verified_gate.artifact_sha256,
             "feature_seal_artifact_sha256": features.artifact_sha256,
             "v51_h22_artifact_sha256": v51.artifact_sha256, "lane_a_h22_artifact_sha256": lane_a.artifact_sha256}
 
