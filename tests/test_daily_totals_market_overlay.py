@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 from copy import deepcopy
 import unittest
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -127,6 +128,27 @@ class SecurePersistenceTests(unittest.TestCase):
         (root / raw_relative.with_suffix(".sha256")).write_bytes(raw_digest.encode("ascii") + b"\n")
         return trace_relative, raw_relative
 
+    @staticmethod
+    def _raw_value(root: Path, raw: Path) -> dict[str, object]:
+        return json.loads((root / raw).read_bytes())
+
+    @staticmethod
+    def _write_raw(root: Path, value: object) -> Path:
+        contents = json.dumps(value, indent=1).encode("utf-8")
+        digest = hashlib.sha256(contents).hexdigest()
+        relative = Path("data/experimental_daily_totals_market/raw") / f"{digest}.json"
+        (root / relative).write_bytes(contents)
+        (root / relative.with_suffix(".sha256")).write_bytes(digest.encode("ascii") + b"\n")
+        return relative
+
+    @classmethod
+    def _admitted(cls, root: Path) -> tuple[Path, Path, Path]:
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        trace, raw = cls._authority(root)
+        snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+        return trace, raw, snapshot
+
     def test_admit_build_and_trace_commit_use_local_bound_evidence(self) -> None:
         """Catch a write sequence that publishes before all model/raw evidence is bound."""
         from mlb_backtest.daily_totals_market_overlay import (
@@ -238,6 +260,160 @@ class SecurePersistenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     overlay.persist_overlay(root, built)
             self.assertTrue(changed)
+
+    def test_model_authority_rejects_each_missing_or_mutated_component_without_running_model(self) -> None:
+        """Catch any authority leaf accepted without its no-follow bound bytes."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for kind in ("trace", "report", "report_sidecar", "receipt", "receipt_sidecar"):
+            with self.subTest(kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _ = self._authority(root)
+                receipt = next((root / "audit/experimental_daily_totals/model").glob("*.json"))
+                paths = {
+                    "trace": root / trace,
+                    "report": root / "reports/experimental_daily_totals/2026-09-01/model.json",
+                    "report_sidecar": root / "reports/experimental_daily_totals/2026-09-01/model.sha256",
+                    "receipt": receipt,
+                    "receipt_sidecar": receipt.with_suffix(".sha256"),
+                }
+                paths[kind].write_bytes(b"changed")
+                with patch("mlb_backtest.daily_totals.build_daily_totals", side_effect=AssertionError("model rerun")):
+                    with self.assertRaises(ValueError):
+                        overlay.load_and_validate_model_authority(root, trace)
+                self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
+    def test_raw_admission_rejects_path_identity_shape_url_and_time_matrix(self) -> None:
+        """Catch external capture malformations before the append-only snapshot exists."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        mutations: list[tuple[str, callable]] = [
+            ("extra_root", lambda value: {**value, "extra": True}),
+            ("missing_root", lambda value: {key: item for key, item in value.items() if key != "games"}),
+            ("bad_url", lambda value: {**value, "source_url": "http://sportsbook.draftkings.com/markets"}),
+            ("canonical_time", lambda value: {**value, "captured_at_utc": "2026-09-01T14:59:00.0Z"}),
+            ("after_bound", lambda value: {**value, "captured_at_utc": "2026-09-01T15:01:00Z"}),
+            ("at_start", lambda value: {**value, "captured_at_utc": "2026-09-01T16:00:00Z"}),
+            ("unknown_game", lambda value: {**value, "games": [{**value["games"][0], "game_pk": 1}] + value["games"][1:]}),
+            ("duplicate_game", lambda value: {**value, "games": value["games"][:-1] + [value["games"][0]]}),
+        ]
+        for name, mutate in mutations:
+            with self.subTest(name=name), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                candidate = self._write_raw(root, mutate(self._raw_value(root, raw)))
+                calls: list[object] = []
+                with self.assertRaises(ValueError):
+                    admit_draftkings_snapshot(root, trace, candidate, comparison_clock=lambda: calls.append(1) or datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+                self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+                self.assertEqual(calls, [] if name in {"extra_root", "missing_root", "bad_url", "canonical_time", "unknown_game", "duplicate_game"} else [1])
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            with self.assertRaises(ValueError):
+                admit_draftkings_snapshot(root, trace, Path("../escape.json"), comparison_clock=lambda: (_ for _ in ()).throw(AssertionError("clock")))
+            os.link(root / raw, root / "raw-alias")
+            with self.assertRaises(ValueError):
+                admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+
+    def test_snapshot_and_evaluated_clock_binding_matrix(self) -> None:
+        """Catch normalized evidence mutation before an evaluated clock is consulted."""
+        from mlb_backtest.daily_totals_market_overlay import build_overlay
+
+        for kind in ("snapshot", "sidecar"):
+            with self.subTest(kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                target = root / (snapshot if kind == "snapshot" else snapshot.with_suffix(".sha256"))
+                target.write_bytes(b"changed")
+                calls: list[object] = []
+                with self.assertRaises(ValueError):
+                    build_overlay(root, trace, snapshot, evaluated_clock=lambda: calls.append(1) or datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                self.assertEqual(calls, [])
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            for bad in (datetime(2026, 9, 1, 15, 1), datetime(2026, 9, 1, 15, 1, tzinfo=timezone(timedelta(hours=1))), datetime(2026, 9, 1, 14, 59, tzinfo=timezone.utc)):
+                with self.subTest(clock=bad):
+                    with self.assertRaises(ValueError):
+                        build_overlay(root, trace, snapshot, evaluated_clock=lambda bad=bad: bad)
+
+    def test_build_covers_all_rows_math_and_policy_outcomes(self) -> None:
+        """Exercise public build results for NO_QUOTE, push, stale, started, and zero picks."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            value = self._raw_value(root, raw)
+            value["games"][0] = {"game_pk": FIXED_GAME_PKS[0], "status": "NO_QUOTE", "reason": "NOT_LISTED"}
+            value["games"][1]["line_half_runs"] = 16
+            altered = self._write_raw(root, value)
+            snapshot = admit_draftkings_snapshot(root, trace, altered, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+            normal = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            repeat = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            self.assertEqual(normal, repeat)
+            self.assertEqual([row["game_pk"] for row in normal.report["games"]], list(FIXED_GAME_PKS))
+            self.assertEqual(normal.report["games"][0]["reason_codes"], ("NO_QUOTE",))
+            self.assertEqual(normal.report["games"][1]["reason_codes"], ("NONPUSH_SUPPORT_TOO_LOW", "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"))
+            stale = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 16, tzinfo=timezone.utc))
+            self.assertIn("QUOTE_STALE", stale.report["games"][2]["reason_codes"])
+            started = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 16, 1, tzinfo=timezone.utc))
+            self.assertIn("GAME_STARTED", started.report["games"][1]["reason_codes"])
+            with self.assertRaises(ValueError):
+                build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 14, 58, tzinfo=timezone.utc))
+
+    def test_append_only_order_conflict_fault_and_rebind_matrix(self) -> None:
+        """Catch publication reordered before trace, conflicting, or falsely successful."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            original = overlay._existing_or_write
+            written: list[str] = []
+
+            def record(*args: object, **kwargs: object) -> object:
+                written.append(args[3])
+                return original(*args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "_existing_or_write", side_effect=record):
+                paths = overlay.persist_overlay(root, built)
+            self.assertEqual(written, ["overlay report sidecar", "overlay report", "overlay Markdown", "overlay trace"])
+            original_bytes = [(root / path).read_bytes() for path in paths]
+            self.assertEqual(overlay.persist_overlay(root, built), paths)
+            self.assertEqual([(root / path).read_bytes() for path in paths], original_bytes)
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            (root / built.report_sidecar_relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / built.report_sidecar_relative).write_bytes(b"conflict")
+            with self.assertRaises(FileExistsError):
+                overlay.persist_overlay(root, built)
+            self.assertFalse((root / built.trace_relative).exists())
+
+    def test_built_overlay_is_frozen_slotted_and_model_evidence_immutable(self) -> None:
+        """Catch a mutable transport or an overlay write that changes model evidence."""
+        from mlb_backtest.daily_totals_market_overlay import build_overlay, persist_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw, snapshot = self._admitted(root)
+            report = root / "reports/experimental_daily_totals/2026-09-01/model.json"
+            receipt = next((root / "audit/experimental_daily_totals/model").glob("*.json"))
+            authority_paths = [root / trace, report, report.with_suffix(".sha256"), receipt, receipt.with_suffix(".sha256")]
+            before = [path.read_bytes() for path in authority_paths]
+            built = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            self.assertFalse(hasattr(built, "__dict__"))
+            self.assertIsInstance(built.report_bytes, bytes)
+            self.assertIsInstance(built.markdown_bytes, bytes)
+            self.assertIsInstance(built.trace_bytes, bytes)
+            with self.assertRaises(FrozenInstanceError):
+                built.report_bytes = b"changed"  # type: ignore[misc]
+            persist_overlay(root, built)
+            self.assertEqual([path.read_bytes() for path in authority_paths], before)
 
 
 class SchemaTests(unittest.TestCase):
