@@ -1667,8 +1667,8 @@ class SecurePersistenceTests(unittest.TestCase):
             row = built.report["games"][0]
             self.assertEqual(row["selected_side"], None)
             self.assertEqual(row["decision"], "PASS")
-            # Build's selected-margin gate necessarily accompanies ambiguity;
-            # the semantic validator also accepts AMBIGUOUS_DIRECTION alone.
+            # Build's selected-margin gate necessarily accompanies ambiguity,
+            # and the semantic validator requires the complete derived set.
             self.assertEqual(row["reason_codes"], ("SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"))
             paths = persist_overlay(root, built)
             self.assertTrue((root / paths[-1]).is_file())

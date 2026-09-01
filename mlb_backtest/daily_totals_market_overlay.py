@@ -385,7 +385,7 @@ def _overlay_game(value: object) -> dict[str, object]:
             derived.append("NONPUSH_SUPPORT_TOO_LOW")
         if point_gap < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
             derived.append("POINT_GAP_TOO_SMALL")
-        if selected is not None and (selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]):
+        if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
             derived.append("SUPPORT_MARGIN_TOO_LOW")
         if selected is None:
             derived.append("AMBIGUOUS_DIRECTION")
