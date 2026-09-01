@@ -397,7 +397,7 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
 
     def test_prediction_seal_descriptor_free_payload_round_trip(self):
         seal = PredictionSeal(
-            "lane_a/A/H23", "H23", "A", None, SHA, SHA, SHA, SHA_B, SHA,
+            "lane_a/A/H23", "H23", "A", None, SHA, SHA, SHA, SHA, SHA_B, SHA,
             None, SHA, SHA_B, "predictions.json",
         )
         payload = seal.as_mapping()
@@ -411,25 +411,58 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PredictionSeal.from_payload_mapping(payload, SHA_B, "predictions.json")
 
+    def test_prediction_seal_requires_feature_seal_digest_and_rejects_tampering(self):
+        seal = PredictionSeal(
+            ledger_id="lane_a/A/H23", fold_id="H23", model_id="A", candidate_id=None,
+            run_spec_sha256=SHA, source_gate_sha256=SHA,
+            feature_seal_sha256=SHA,
+            prediction_contract_sha256=SHA, scoring_model_card_sha256=SHA_B,
+            population_sha256=SHA, frozen_model_card_sha256=None,
+            rows_sha256=SHA, artifact_sha256=SHA_B, path="predictions.json",
+        )
+        self.assertEqual(
+            PredictionSeal.from_payload_mapping(seal.as_mapping(), SHA_B, "predictions.json"),
+            seal,
+        )
+        missing = seal.as_mapping()
+        del missing["feature_seal_sha256"]
+        with self.assertRaises(ValueError):
+            PredictionSeal.from_payload_mapping(missing, SHA_B, "predictions.json")
+        tampered = seal.as_mapping() | {"feature_seal_sha256": "not-a-digest"}
+        with self.assertRaises(ValueError):
+            PredictionSeal.from_payload_mapping(tampered, SHA_B, "predictions.json")
+
     def test_prediction_seal_final_card_binding_is_fold_and_model_specific(self):
         with self.assertRaises(ValueError):
             PredictionSeal(
-                "lane_a/A/O19", "O19", "A", None, SHA, SHA, SHA, SHA_B, SHA,
-                SHA, SHA, SHA_B, "predictions.json",
+                ledger_id="lane_a/A/O19", fold_id="O19", model_id="A", candidate_id=None,
+                run_spec_sha256=SHA, source_gate_sha256=SHA, feature_seal_sha256=SHA,
+                prediction_contract_sha256=SHA, scoring_model_card_sha256=SHA_B,
+                population_sha256=SHA, frozen_model_card_sha256=SHA, rows_sha256=SHA,
+                artifact_sha256=SHA_B, path="predictions.json",
             )
         with self.assertRaises(ValueError):
             PredictionSeal(
-                "baseline/v5.1/H24", "H24", "v5.1", None, SHA, SHA, SHA, SHA_B,
-                SHA, SHA, SHA, SHA_B, "predictions.json",
+                ledger_id="baseline/v5.1/H24", fold_id="H24", model_id="v5.1", candidate_id=None,
+                run_spec_sha256=SHA, source_gate_sha256=SHA, feature_seal_sha256=SHA,
+                prediction_contract_sha256=SHA, scoring_model_card_sha256=SHA_B,
+                population_sha256=SHA, frozen_model_card_sha256=SHA, rows_sha256=SHA,
+                artifact_sha256=SHA_B, path="predictions.json",
             )
         with self.assertRaises(ValueError):
             PredictionSeal(
-                "h24/A/H24", "H24", "A", None, SHA, SHA, SHA, SHA_B, SHA,
-                None, SHA, SHA_B, "predictions.json",
+                ledger_id="h24/A/H24", fold_id="H24", model_id="A", candidate_id=None,
+                run_spec_sha256=SHA, source_gate_sha256=SHA, feature_seal_sha256=SHA,
+                prediction_contract_sha256=SHA, scoring_model_card_sha256=SHA_B,
+                population_sha256=SHA, frozen_model_card_sha256=None, rows_sha256=SHA,
+                artifact_sha256=SHA_B, path="predictions.json",
             )
         valid = PredictionSeal(
-            "h24/A/H24", "H24", "A", None, SHA, SHA, SHA, SHA_B, SHA,
-            SHA, SHA, SHA_B, "predictions.json",
+            ledger_id="h24/A/H24", fold_id="H24", model_id="A", candidate_id=None,
+            run_spec_sha256=SHA, source_gate_sha256=SHA, feature_seal_sha256=SHA,
+            prediction_contract_sha256=SHA, scoring_model_card_sha256=SHA_B,
+            population_sha256=SHA, frozen_model_card_sha256=SHA, rows_sha256=SHA,
+            artifact_sha256=SHA_B, path="predictions.json",
         )
         self.assertEqual(valid.frozen_model_card_sha256, SHA)
 
@@ -511,8 +544,11 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
     def test_final_card_points_back_to_pre_prediction_scoring_card_without_cycle(self):
         scoring = scoring_card()
         seal = PredictionSeal(
-            "lane_a/A/H23", "H23", "A", None, SHA, SHA, SHA,
-            scoring.artifact_sha256, SHA, None, SHA, SHA_B, "predictions.json",
+            ledger_id="lane_a/A/H23", fold_id="H23", model_id="A", candidate_id=None,
+            run_spec_sha256=SHA, source_gate_sha256=SHA, feature_seal_sha256=SHA,
+            prediction_contract_sha256=SHA, scoring_model_card_sha256=scoring.artifact_sha256,
+            population_sha256=SHA, frozen_model_card_sha256=None, rows_sha256=SHA,
+            artifact_sha256=SHA_B, path="predictions.json",
         )
         final = self.frozen_card()
         self.assertIsNone(seal.frozen_model_card_sha256)

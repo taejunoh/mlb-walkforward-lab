@@ -20,6 +20,9 @@ from mlb_backtest.model_improvement.run_spec import (
     load_run_spec,
     load_verified_run_spec,
     run_spec_sha256,
+    TASK8_FOLD_IDS,
+    TASK8_FOLD_TARGET_YEAR,
+    task8_target_year,
     VerifiedRunSpecActivation,
 )
 
@@ -67,6 +70,30 @@ class RunSpecTest(unittest.TestCase):
         self.assertTrue(str(spec.output_path("features", "lane_c/H24/feature_seal.json")).endswith("features/lane_c/H24/feature_seal.json"))
         self.assertTrue(spec.h24_firewall.forbid_outcomes_before_registry)
         self.assertEqual(run_spec_sha256(spec), sha256(canonical_json_bytes(spec.as_mapping())).hexdigest())
+
+    def test_task8_fold_year_map_is_exact_and_rejects_non_oof_folds(self):
+        expected = {
+            "O19": 2019, "O20": 2020, "O21": 2021, "O22": 2022,
+            "O23": 2023, "H22": 2022, "H23": 2023,
+        }
+        self.assertEqual(dict(TASK8_FOLD_TARGET_YEAR), expected)
+        self.assertEqual(TASK8_FOLD_IDS, tuple(expected))
+        for fold_id, year in expected.items():
+            self.assertEqual(task8_target_year(fold_id), year)
+        for fold_id in ("H24", "O24", "Q19", "2025", ""):
+            with self.subTest(fold_id=fold_id), self.assertRaises(ValueError):
+                task8_target_year(fold_id)
+
+    def test_common_oof_paths_are_admitted_but_lane_c_oof_is_not(self):
+        spec = load_run_spec(SPEC_PATH)
+        for fold_id in TASK8_FOLD_IDS:
+            for name in ("feature_seal.json", "rows.jsonl"):
+                self.assertEqual(
+                    spec.output_path("features", f"common/{fold_id}/{name}").name,
+                    name,
+                )
+        with self.assertRaises(ValueError):
+            spec.output_path("features", "lane_c/O19/rows.jsonl")
 
     def test_prediction_contract_digest_and_closed_mutations(self):
         raw = self.raw()

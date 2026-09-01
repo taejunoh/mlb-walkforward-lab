@@ -167,6 +167,20 @@ _FOLD_EXPECTATIONS = {
     "H24": FoldSpec(2024, (2020, 2021, 2022, 2023), (2019, 2020, 2021, 2022, 2023), True),
 }
 
+# Task8's fixed rolling-origin OOF population and historical fold-year map.
+TASK8_FOLD_TARGET_YEAR: Mapping[str, int] = MappingProxyType({
+    "O19": 2019, "O20": 2020, "O21": 2021, "O22": 2022, "O23": 2023,
+    "H22": 2022, "H23": 2023,
+})
+TASK8_FOLD_IDS = tuple(TASK8_FOLD_TARGET_YEAR)
+
+
+def task8_target_year(fold_id: str) -> int:
+    try:
+        return TASK8_FOLD_TARGET_YEAR[fold_id]
+    except KeyError as exc:
+        raise ValueError("Task8 fold differs") from exc
+
 
 def _fold(value: object, fold_id: str) -> FoldSpec:
     values = _exact(value, {"target_year", "normalization_years", "oof_calibration_years", "prediction_only"}, f"fold {fold_id}")
@@ -342,7 +356,9 @@ class ModelImprovementRunSpec:
         relative = _normal_relative(relative_name, "output relative name")
         parts = Path(relative).parts
         if namespace == "features":
-            allowed = {("common", fold) for fold in ("H22", "H23", "H24")} | {("lane_c", fold) for fold in ("H22", "H23", "H24")}
+            allowed = {
+                ("common", fold) for fold in ("O19", "O20", "O21", "O22", "O23", "H22", "H23", "H24")
+            } | {("lane_c", fold) for fold in ("H22", "H23", "H24")}
             if len(parts) != 3 or tuple(parts[:2]) not in allowed or parts[2] not in {"feature_seal.json", "rows.jsonl"}:
                 raise ValueError("feature output path differs")
         configured_root = Path(str(self.outputs["root"]))

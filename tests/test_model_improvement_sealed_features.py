@@ -59,13 +59,14 @@ def feature_row(
     official_date: str,
     start: str,
     history_date: str | None = None,
+    target_year: int | None = None,
 ) -> SealedFeatureRow:
     primitive = MetricPrimitive(50.0, 1.0, fixed_recipe())
     values = {
         "game_pk": game_pk,
         "official_date": official_date,
         "scheduled_start_utc": start,
-        "target_year": 2022,
+        "target_year": target_year if target_year is not None else date.fromisoformat(official_date).year,
         "max_history_date": history_date or (
             date.fromisoformat(official_date) - timedelta(days=1)
         ).isoformat(),
@@ -187,6 +188,30 @@ class SealedFeatureTest(unittest.TestCase):
         self.assertEqual(lane_c.parent_feature_seal_sha256, common.artifact_sha256)
         with self.assertRaisesRegex(ValueError, "parent feature seal|evidence"):
             seal_feature_rows(self.spec, self.gate, "lane_c", "H22", self.rows)
+
+    def test_common_oof_rows_use_task8_target_year_map_and_lane_c_oof_is_forbidden(self):
+        oof_row = feature_row(
+            self.spec, self.gate, 190, "2019-04-01", "2019-04-01T17:00:00Z"
+        )
+        seal = seal_feature_rows(self.spec, self.gate, "common", "O19", (oof_row,))
+        self.assertEqual(seal.fold_id, "O19")
+        self.assertEqual(
+            load_sealed_feature_rows(self.spec, self.gate, (2019,), seal), (oof_row,)
+        )
+        with self.assertRaisesRegex(ValueError, "fold|OOF"):
+            seal_feature_rows(
+                self.spec, self.gate, "lane_c", "O19", (oof_row,),
+                seal.artifact_sha256, (SHA,),
+            )
+
+    def test_common_h24_rows_retain_historical_fold_validation(self):
+        h24_row = feature_row(
+            self.spec, self.gate, 240, "2024-04-01", "2024-04-01T17:00:00Z"
+        )
+        seal = seal_feature_rows(self.spec, self.gate, "common", "H24", (h24_row,))
+        self.assertEqual(
+            load_sealed_feature_rows(self.spec, self.gate, (2024,), seal), (h24_row,)
+        )
 
     def test_missing_or_different_sidecar_rejects_the_artifact(self):
         seal = seal_feature_rows(self.spec, self.gate, "common", "H22", self.rows)

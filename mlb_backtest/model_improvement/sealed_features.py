@@ -20,13 +20,19 @@ from .contracts import (
     _require_sequence,
     _require_sha256,
 )
-from .run_spec import ModelImprovementRunSpec, run_spec_sha256
+from .run_spec import (
+    ModelImprovementRunSpec,
+    TASK8_FOLD_IDS,
+    run_spec_sha256,
+    task8_target_year,
+)
 from .source_gate import SourceGateReceipt
 
 
 _SCHEMA = "MODEL_IMPROVEMENT_FEATURE_SEAL_V1"
 _FEATURE_SETS = frozenset({"common", "lane_c"})
 _FOLDS = frozenset({"H22", "H23", "H24"})
+_COMMON_FOLDS = frozenset(TASK8_FOLD_IDS)
 _FIELDS = frozenset({
     "schema", "feature_set_id", "fold_id", "run_spec_sha256",
     "source_gate_sha256", "population_sha256", "rows_sha256",
@@ -53,7 +59,8 @@ class FeatureSeal:
             raise ValueError("feature seal schema differs")
         if self.feature_set_id not in _FEATURE_SETS:
             raise ValueError("feature seal feature set differs")
-        if self.fold_id not in _FOLDS:
+        allowed_folds = (_COMMON_FOLDS | _FOLDS) if self.feature_set_id == "common" else _FOLDS
+        if self.fold_id not in allowed_folds:
             raise ValueError("feature seal fold differs")
         for field in (
             "run_spec_sha256", "source_gate_sha256", "population_sha256", "rows_sha256",
@@ -181,8 +188,19 @@ def _validate_rows(
     _validate_gate(spec, source_gate)
     if dict(spec.cutoffs) != {"history": "D-1", "snapshot": "T-45"}:
         raise ValueError("feature cutoff policy differs")
-    if feature_set_id not in _FEATURE_SETS or fold_id not in _FOLDS:
+    if feature_set_id not in _FEATURE_SETS:
         raise ValueError("feature set or fold differs")
+    if feature_set_id == "common":
+        if fold_id in _COMMON_FOLDS:
+            expected_year = task8_target_year(fold_id)
+        elif fold_id in _FOLDS:
+            expected_year = spec.fold(fold_id).target_year
+        else:
+            raise ValueError("feature set or fold differs")
+    else:
+        if fold_id not in _FOLDS:
+            raise ValueError("feature set or fold differs")
+        expected_year = spec.fold(fold_id).target_year
     materialized = tuple(rows)
     if not materialized:
         raise ValueError("feature seal requires a nonempty population")
@@ -195,7 +213,6 @@ def _validate_rows(
     population_keys = {(row.game_pk, row.official_date, row.target_year) for row in materialized}
     if len(population_keys) != len(materialized):
         raise ValueError("feature rows contain duplicate population key")
-    expected_year = spec.fold(fold_id).target_year
     exclusion = sha256(canonical_json_bytes(spec.as_mapping()["exclusions"])).hexdigest()
     for row in materialized:
         official_date = date.fromisoformat(row.official_date)

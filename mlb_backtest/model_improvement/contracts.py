@@ -912,6 +912,7 @@ class PredictionSeal:
     candidate_id: str | None
     run_spec_sha256: str
     source_gate_sha256: str
+    feature_seal_sha256: str
     prediction_contract_sha256: str
     scoring_model_card_sha256: str
     population_sha256: str
@@ -927,6 +928,7 @@ class PredictionSeal:
         for field in (
             "run_spec_sha256",
             "source_gate_sha256",
+            "feature_seal_sha256",
             "prediction_contract_sha256",
             "scoring_model_card_sha256",
             "population_sha256",
