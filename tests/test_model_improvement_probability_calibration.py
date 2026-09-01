@@ -675,6 +675,49 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                 loaded = load_probability_calibration_card_v2(spec, "O19")
                 self.assertEqual(loaded.alpha, alpha)
                 self.assertEqual(loaded.beta, beta)
+                for malformed_rows in (
+                    output_rows.replace(b"\n", b"\r\n"),
+                    output_rows.rstrip(b"\n"),
+                    output_rows + b"\n",
+                    output_rows.replace(b"\n", b"\n\n", 1),
+                ):
+                    with self.subTest(malformed_rows=malformed_rows):
+                        malformed_card = card | {
+                            "calibration_rows_sha256": sha256(
+                                malformed_rows
+                            ).hexdigest()
+                        }
+                        malformed_card_raw = canonical_json_bytes(malformed_card)
+                        paths.rows.write_bytes(malformed_rows)
+                        paths.rows_sidecar.write_bytes(
+                            canonical_json_bytes(
+                                {"artifact_sha256": sha256(malformed_rows).hexdigest()}
+                            )
+                        )
+                        paths.card.write_bytes(malformed_card_raw)
+                        paths.card_sidecar.write_bytes(
+                            canonical_json_bytes(
+                                {
+                                    "artifact_sha256": sha256(
+                                        malformed_card_raw
+                                    ).hexdigest()
+                                }
+                            )
+                        )
+                        with self.assertRaises(ValueError):
+                            load_probability_calibration_card_v2(spec, "O19")
+                paths.rows.write_bytes(output_rows)
+                paths.rows_sidecar.write_bytes(
+                    canonical_json_bytes(
+                        {"artifact_sha256": sha256(output_rows).hexdigest()}
+                    )
+                )
+                paths.card.write_bytes(card_raw)
+                paths.card_sidecar.write_bytes(
+                    canonical_json_bytes(
+                        {"artifact_sha256": sha256(card_raw).hexdigest()}
+                    )
+                )
                 original_derive = module._derive_rows_v2
                 calls = 0
 

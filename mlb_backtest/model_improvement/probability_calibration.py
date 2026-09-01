@@ -731,7 +731,16 @@ def _load_v2_once(
     ):
         raise ValueError("probability calibration V2 typed authority differs")
     rows_raw = read_regular_bytes(paths.rows, "calibration rows")
-    if sha256(rows_raw).hexdigest() != card.calibration_rows_sha256:
+    # Validate canonical JSONL framing before trusting its digest or parsing it.
+    # A correctly recomputed card/sidecar must not make non-canonical bytes
+    # admissible.
+    if (
+        not rows_raw
+        or not rows_raw.endswith(b"\n")
+        or b"\r" in rows_raw
+        or b"\n\n" in rows_raw
+        or sha256(rows_raw).hexdigest() != card.calibration_rows_sha256
+    ):
         raise ValueError("calibration rows digest differs")
     _sidecar(
         paths.rows_sidecar, card.calibration_rows_sha256, "calibration rows sidecar"
