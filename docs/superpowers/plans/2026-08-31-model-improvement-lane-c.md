@@ -966,7 +966,7 @@ from mlb_backtest.model_improvement.scoring_cards import (
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json,
 )
-from mlb_backtest.model_improvement.evaluation import EvaluationPair, load_evaluation_pair
+from mlb_backtest.model_improvement.evaluation import EvaluationPair
 from mlb_backtest.model_improvement.lane_c_contracts import (
     CoverageKey, LaneCObservation, LaneCSourceContract, observation_sha256,
     validate_observation,
@@ -1408,18 +1408,19 @@ def build_lane_c_fold_result(
     if lane_c_scoring_card is None:
         return None, seal_lane_disposition(spec, "C", "REJECTED", parent_hash,
                                            evidence, ("SCORING_MODEL_CARD_MISSING",))
-    lane_c_evaluation_pair = load_evaluation_pair(
-        spec, Path(lane_c_evaluation_pair.path), lane_c_evaluation_pair.artifact_sha256)
     lane_c_candidate_report = lane_c_evaluation_pair.candidate_report
     lane_c_baseline_report = lane_c_evaluation_pair.baseline_report
     if (lane_c_evaluation_pair.run_spec_sha256 != run_spec_sha256(spec)
+            or lane_c_evaluation_pair.source_gate_sha256 != source_gate.artifact_sha256
             or lane_c_evaluation_pair.ledger_id != lane_c_prediction.ledger_id
             or lane_c_evaluation_pair.candidate_id != lane_c_prediction.candidate_id
             or lane_c_evaluation_pair.fold_id != fold_id
             or lane_c_candidate_report.prediction_seal_sha256 != lane_c_prediction.artifact_sha256
             or lane_c_candidate_report.model_id != "A+B+C"
+            or lane_c_candidate_report.source_gate_sha256 != source_gate.artifact_sha256
             or lane_c_candidate_report.fold_id != fold_id
             or lane_c_baseline_report.model_id != "v5.1"
+            or lane_c_baseline_report.source_gate_sha256 != source_gate.artifact_sha256
             or lane_c_baseline_report.fold_id != fold_id):
         return None, seal_lane_disposition(spec, "C", "REJECTED", parent_hash,
                                            evidence, ("EVALUATION_PAIR_BINDING_MISMATCH",))
@@ -1515,7 +1516,7 @@ For every row, the materializer applies the exact Common `prediction_contract`: 
 
 `seal_lane_c_fold_prediction(spec, fold_id, rows)` accepts only that already materialized `tuple[PredictionRow, ...]`; it may validate the fold/model/universal-contract/unique-game invariants, but takes no FeatureSeal, card, raw row, calibration, or outcome argument and performs no scoring. It delegates persistence only to Common `seal_oof_predictions`, which writes exactly `oof/lane_c/A+B+C/{fold_id}/prediction_seal.json`; both H22 and H23 `PredictionSeal.frozen_model_card_sha256` values are `None`.
 
-`build_lane_c_fold_result()` is the only evaluation/disposition boundary and always calls `seal_lane_disposition`; it never directly constructs `LaneDisposition`. It calls Common `evaluate_predictions(spec, source_gate, lane_c_prediction, baseline_prediction, outcomes)` and retains its sealed `EvaluationPair`. With `fold_id="H22"`, it permits only development evaluation and returns no `FrozenModelCard`; its H22 scoring card, prediction seal, and pair cannot be substituted into or referenced by the final A+B+C card. With `fold_id="H23"`, it requires H22/H23 plus prediction-only H24 coverage/seals complete, at least one admitted row, replay success, a Lane C H23 scoring card and H23 prediction artifact digest different from parent A+B, and a sealed H23 `EvaluationPair`; only that H23 scoring card/seal/pair can produce `H23_FROZEN`. It never reads H24 outcomes. `ABSENT` and `REJECTED` never create a frozen card or candidate prediction artifact.
+The external Lane C controller is the sole evaluation orchestrator: after sealing the lane-C prediction and obtaining the matching baseline prediction plus authenticated outcomes, it calls Common `evaluate_predictions(spec, source_gate, lane_c_prediction, baseline_prediction, outcomes)`, securely loads the resulting `EvaluationPair`, and passes that already loaded pair to `build_lane_c_fold_result`. `build_lane_c_fold_result()` never calls the evaluator or accepts outcomes/baseline inputs; it is the downstream disposition/final-card boundary and always calls `seal_lane_disposition` rather than directly constructing `LaneDisposition`. Before consuming its pair it requires pair and both named report `source_gate_sha256` values to equal the supplied `source_gate.artifact_sha256`, then checks the RunSpec, ledger, candidate, fold, model, and prediction bindings. With `fold_id="H22"`, it permits only the externally evaluated development result and returns no `FrozenModelCard`; its H22 scoring card, prediction seal, and pair cannot be substituted into or referenced by the final A+B+C card. With `fold_id="H23"`, it requires H22/H23 plus prediction-only H24 coverage/seals complete, at least one admitted row, replay success, a Lane C H23 scoring card and H23 prediction artifact digest different from parent A+B, and that externally sealed H23 `EvaluationPair`; only that H23 scoring card/seal/pair can produce `H23_FROZEN`. It never reads H24 outcomes. `ABSENT` and `REJECTED` never create a frozen card or candidate prediction artifact.
 
 - [ ] **Step 5: Use only exact Common frozen-card and disposition persistence APIs.**
 
@@ -1532,19 +1533,20 @@ def seal_lane_c_card(
     evidence_sha256: Sequence[str],
     lane_c_evaluation_pair: EvaluationPair,
 ) -> FrozenModelCard:
-    lane_c_evaluation_pair = load_evaluation_pair(
-        spec, Path(lane_c_evaluation_pair.path), lane_c_evaluation_pair.artifact_sha256)
     lane_c_candidate_report = lane_c_evaluation_pair.candidate_report
     lane_c_baseline_report = lane_c_evaluation_pair.baseline_report
     if (lane_c_scoring_card.fold_id != "H23"
             or lane_c_scoring_card.feature_seal_sha256 != lane_c_feature_seals["H23"].artifact_sha256
             or lane_c_prediction.fold_id != "H23"
             or lane_c_evaluation_pair.fold_id != "H23"
+            or lane_c_evaluation_pair.source_gate_sha256 != source_gate.artifact_sha256
             or lane_c_evaluation_pair.ledger_id != lane_c_prediction.ledger_id
             or lane_c_evaluation_pair.candidate_id != lane_c_prediction.candidate_id
             or lane_c_candidate_report.model_id != "A+B+C"
+            or lane_c_candidate_report.source_gate_sha256 != source_gate.artifact_sha256
             or lane_c_candidate_report.prediction_seal_sha256 != lane_c_prediction.artifact_sha256
-            or lane_c_baseline_report.model_id != "v5.1"):
+            or lane_c_baseline_report.model_id != "v5.1"
+            or lane_c_baseline_report.source_gate_sha256 != source_gate.artifact_sha256):
         raise ValueError("final Lane C card accepts only the H23 scoring card and prediction seal")
     parent_weights = dict(parent_ab_card.parameters["component_weights_pp"])
     if (set(parent_weights) != {"starter", "offense", "bullpen", "environment", "defense", "schedule"}
@@ -1576,7 +1578,7 @@ def seal_lane_c_card(
     return seal_frozen_model_card(spec, "lane_c", "H23/frozen_model_card.json", payload)
 ```
 
-Use the Common frozen-card schema and exact `seal_frozen_model_card` payload/sealer/loader contract; do not add a `lane_c_frozen_card.schema.json`, direct mapping write, fabricated descriptor, or C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, RunSpec `prediction_contract_sha256`, exact H23 Lane C scoring-card path/digest, exact H23 Lane C prediction seal, source-gate/H23-feature-seal/RunSpec/baseline-replay hashes, and both `evaluation_pair_sha256` plus the securely named candidate-report `evaluation_sha256`; it never embeds outcome rows. Before either fold-result or final-card use, reload `lane_c_evaluation_pair` with `load_evaluation_pair(spec, pair.path, pair.artifact_sha256)`, retain its explicitly named `candidate_report` and `baseline_report`, and reject a ledger/candidate/fold/model/prediction mismatch. Thus the card binds the pair digest and its candidate-report digest, while the pair’s own closed payload binds both named report digests. The final card may bind the coverage digest as preflight evidence, but it must not reference an H22 scoring card, H22 prediction seal, H22 evaluation pair/report, or any substitute for the H23 scoring card/seal/pair/report. `parameters.component_weights_pp` must be byte-for-byte equal to both the A+B parent and the H23 scoring card’s validated six-key weights; Lane C changes feature evidence only and never weights. Before sealing, validate `lane_c_prediction.fold_id == "H23"`, `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256`, `lane_c_prediction.scoring_model_card_sha256 == lane_c_scoring_card.artifact_sha256`, and `lane_c_prediction.frozen_model_card_sha256 is None`; the final card is created only after H23 prediction/evaluation pair and is never used to authorize its own H23 seal. Use the generic `seal_lane_disposition`/`load_lane_disposition(spec, path, expected_sha256)` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
+Use the Common frozen-card schema and exact `seal_frozen_model_card` payload/sealer/loader contract; do not add a `lane_c_frozen_card.schema.json`, direct mapping write, fabricated descriptor, or C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, RunSpec `prediction_contract_sha256`, exact H23 Lane C scoring-card path/digest, exact H23 Lane C prediction seal, source-gate/H23-feature-seal/RunSpec/baseline-replay hashes, and both `evaluation_pair_sha256` plus the securely named candidate-report `evaluation_sha256`; it never embeds outcome rows. The controller, not either C boundary, securely loads the pair after Common evaluation; both `build_lane_c_fold_result` and `seal_lane_c_card` consume that already loaded pair and independently require its and both named reports' `source_gate_sha256` values to equal the supplied source-gate digest, then reject a ledger/candidate/fold/model/prediction mismatch. Thus the card binds the pair digest and its candidate-report digest, while the pair’s own closed payload binds both named report digests. The final card may bind the coverage digest as preflight evidence, but it must not reference an H22 scoring card, H22 prediction seal, H22 evaluation pair/report, or any substitute for the H23 scoring card/seal/pair/report. `parameters.component_weights_pp` must be byte-for-byte equal to both the A+B parent and the H23 scoring card’s validated six-key weights; Lane C changes feature evidence only and never weights. Before sealing, validate `lane_c_prediction.fold_id == "H23"`, `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256`, `lane_c_prediction.scoring_model_card_sha256 == lane_c_scoring_card.artifact_sha256`, and `lane_c_prediction.frozen_model_card_sha256 is None`; the final card is created only after H23 prediction/evaluation pair and is never used to authorize its own H23 seal. Use the generic `seal_lane_disposition`/`load_lane_disposition(spec, path, expected_sha256)` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
 
 The Common artifact-hash convention applies unchanged to the C card: `artifact_sha256` and `path` are runtime descriptor fields, excluded from the canonical frozen-card payload. `seal_frozen_model_card` writes/rereads the payload, hashes canonical persisted bytes before creating descriptor fields, and `load_frozen_model_card(spec, path, expected_sha256)` verifies the digest and the RunSpec-bound `lane_c` path.
 
@@ -1625,13 +1627,25 @@ class LaneCHandoffTest(unittest.TestCase):
         self.assertEqual(disposition.state, "ABSENT")
         self.assertEqual(disposition.reason_codes, ("NO_ADMITTED_OBSERVATIONS",))
 
+    def test_foreign_pair_or_named_report_source_gate_rejects_before_disposition_or_card(self):
+        with self.assertRaisesRegex(ValueError, "source gate"):
+            build_lane_c_fold_result(
+                self.spec, "H23", self.complete_report, self.source_gate,
+                self.parent_feature_seals, self.lane_c_feature_seals,
+                self.replay_receipt, self.parent_ab_card, self.parent_ab_prediction,
+                self.lane_c_h23_scoring_card, self.lane_c_h23_prediction,
+                self.foreign_gate_h23_evaluation_pair,
+                self.evidence_sha256, self.reason_codes,
+            )
+
     def test_incomplete_h24_seal_is_rejected_without_card(self):
         card, disposition = build_lane_c_fold_result(
             self.spec, "H23", self.h24_incomplete_report, self.source_gate,
             self.parent_feature_seals, self.lane_c_feature_seals,
             self.replay_receipt,
             self.parent_ab_card, self.parent_ab_prediction,
-            self.lane_c_h23_scoring_card, self.lane_c_h23_prediction, self.h23_evaluation, self.evidence_sha256,
+            self.lane_c_h23_scoring_card, self.lane_c_h23_prediction,
+            self.h23_evaluation_pair, self.evidence_sha256,
             self.reason_codes,
         )
         self.assertIsNone(card)
@@ -1645,7 +1659,7 @@ class LaneCHandoffTest(unittest.TestCase):
             self.replay_receipt,
             self.parent_ab_card, self.parent_ab_prediction,
             self.lane_c_h22_scoring_card, self.lane_c_h22_prediction,
-            self.h22_evaluation, self.evidence_sha256, self.reason_codes,
+            self.h22_evaluation_pair, self.evidence_sha256, self.reason_codes,
         )
         self.assertIsNone(card)
         self.assertEqual(disposition.state, "QUALIFIED")
@@ -1660,7 +1674,7 @@ class LaneCHandoffTest(unittest.TestCase):
         card = seal_lane_c_card(
             self.spec, self.source_gate, self.lane_c_feature_seals, self.parent_ab_card,
             self.parent_ab_prediction, self.lane_c_h23_scoring_card, self.different_lane_c_h23_prediction,
-            self.qualified_report, self.evidence_sha256, self.h23_evaluation,
+            self.qualified_report, self.evidence_sha256, self.h23_evaluation_pair,
         )
         self.assertEqual(card.state, "H23_FROZEN")
         self.assertEqual(card.parent_card_sha256, self.parent_ab_card.artifact_sha256)

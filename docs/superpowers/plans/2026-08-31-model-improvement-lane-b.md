@@ -531,7 +531,7 @@ git commit -m "feat: seal lane b scoring cards"
 
 **Interfaces:**
 
-- Produces no local evaluator. Each candidate calls Common `evaluate_predictions(spec, source_gate, candidate_seal, baseline_seal, outcomes) -> EvaluationPair`, keyed by its scoped `ledger_id` and `candidate_id`, then consumes the named candidate/baseline reports from the securely loaded pair.
+- Produces no local evaluator. Each candidate calls Common `evaluate_predictions(spec, source_gate, candidate_seal, baseline_seal, outcomes) -> EvaluationPair`, keyed by its scoped `ledger_id` and `candidate_id`, then consumes the named candidate/baseline reports from the securely loaded pair only after comparing the pair and both report `source_gate_sha256` values to the supplied `source_gate.artifact_sha256`.
 - The ledger reads the candidate report's `brier`, `log_loss`, and `daily_top1_delta_vs_baseline`; no local `top1` flag, mapping, int/bool coercion, or model-ID-keyed comparison is permitted.
 
 - [ ] **Step 1: Write failing evaluation TestCase.**
@@ -594,7 +594,7 @@ git commit -m "feat: consume common lane b evaluations"
 
 **Interfaces:**
 
-- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_pair: EvaluationPair), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation_pair: EvaluationPair), and a QUALIFIED LaneDisposition sealed after a successful Common post-evaluation card freeze.
+- Produces h22_order(row, source_gate), reduce_h22(rows, source_gate), write_candidate_entry(path, entry), select_h23(spec, source_gate, rows, lane_a_pair: EvaluationPair), build_lane_b_disposition(spec, source_gate, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation_pair: EvaluationPair), and a QUALIFIED LaneDisposition sealed after a successful Common post-evaluation card freeze. Every pair boundary requires `pair.source_gate_sha256 == source_gate.artifact_sha256` and the same equality on its named candidate/baseline reports before reading a metric or writing a disposition/card.
 - H24 consumes only FrozenModelCard or LaneDisposition, not any Lane B registry entry.
 
 - [ ] **Step 1: Write failing H22/H23 TestCase methods.**
@@ -606,13 +606,22 @@ from mlb_backtest.model_improvement.lane_b_ledger import reduce_h22, select_h23,
 
 class LaneBLedgerTest(unittest.TestCase):
     def test_h22_keeps_twelve_and_labels_invalid_replay(self):
-        kept, rejected = reduce_h22(self.rows)
+        kept, rejected = reduce_h22(self.rows, self.source_gate)
         self.assertEqual(12, len(kept))
         self.assertEqual("H22_INVALID_REPLAY", next(r for r in rejected if r["candidate_id"] == self.invalid_id)["reason"])
 
     def test_not_frozen_lane_a_is_absent_dependency(self):
-        result = build_lane_b_disposition(self.spec, self.lane_a_not_frozen)
+        result = build_lane_b_disposition(self.spec, self.source_gate, self.lane_a_not_frozen)
         self.assertEqual("ABSENT", result.state)
+
+    def test_foreign_pair_or_named_report_source_gate_rejects_before_metric_or_write(self):
+        with self.assertRaisesRegex(ValueError, "source gate"):
+            reduce_h22(self.rows_with_foreign_pair_gate, self.source_gate)
+        with self.assertRaisesRegex(ValueError, "source gate"):
+            freeze_ab_card(self.spec, self.selected, self.lane_a_frozen_card,
+                           self.scoring_card, self.source_gate, self.baseline_replay,
+                           self.feature_seal, self.prediction_seal,
+                           self.pair_with_foreign_named_report_gate)
 ~~~
 
 - [ ] **Step 2: Run RED.**
@@ -636,26 +645,38 @@ from mlb_backtest.model_improvement.lane_disposition import (
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 
 
-def h22_order(row):
+def require_pair_source_gate(pair: EvaluationPair, source_gate):
+    candidate_report, baseline_report = pair.candidate_report, pair.baseline_report
+    if (pair.source_gate_sha256 != source_gate.artifact_sha256
+            or candidate_report.source_gate_sha256 != source_gate.artifact_sha256
+            or baseline_report.source_gate_sha256 != source_gate.artifact_sha256):
+        raise ValueError("evaluation pair/source gate binding differs")
+    return candidate_report, baseline_report
+
+
+def h22_order(row, source_gate):
     pair = row["evaluation_pair"]
-    report = pair.candidate_report
+    report, baseline_report = require_pair_source_gate(pair, source_gate)
     if (pair.ledger_id != row["ledger_id"] or pair.candidate_id != row["candidate_id"]
-            or report.model_id != "A+B"):
+            or report.model_id != "A+B" or baseline_report.model_id != "v5.1"):
         raise ValueError("candidate evaluation pair identity differs")
     return (report.brier, report.log_loss, -report.daily_top1_delta_vs_baseline,
             row["candidate_id"])
 
 
-def reduce_h22(rows):
+def reduce_h22(rows, source_gate):
     if len(rows) != 210 or len({r["candidate_id"] for r in rows}) != 210:
         raise ValueError("H22 requires all 210 candidate IDs")
+    for row in rows:
+        require_pair_source_gate(row["evaluation_pair"], source_gate)
     valid = [r for r in rows if r["replay_status"] == "PASS"
-             and r["evaluation_pair"].candidate_report.all_games_count > 0
-             and r["evaluation_pair"].candidate_report.daily_top1_count > 0]
-    ids = {r["candidate_id"] for r in sorted(valid, key=h22_order)[:12]}
+             and require_pair_source_gate(r["evaluation_pair"], source_gate)[0].all_games_count > 0
+             and require_pair_source_gate(r["evaluation_pair"], source_gate)[0].daily_top1_count > 0]
+    ids = {r["candidate_id"] for r in sorted(valid, key=lambda row: h22_order(row, source_gate))[:12]}
     kept = [{**r, "status": "KEPT_H22", "reason": "H22_ORDERED_SURVIVOR"} for r in rows if r["candidate_id"] in ids]
     rejected = [{**r, "status": "REJECTED_H22", "reason": "H22_REDUCTION_LIMIT" if r in valid else "H22_INVALID_REPLAY"} for r in rows if r["candidate_id"] not in ids]
-    return sorted(kept, key=h22_order), sorted(rejected, key=lambda r: r["candidate_id"])
+    return (sorted(kept, key=lambda row: h22_order(row, source_gate)),
+            sorted(rejected, key=lambda r: r["candidate_id"]))
 
 
 def write_candidate_entry(path, entry):
@@ -666,8 +687,15 @@ def write_candidate_entry(path, entry):
     return sha256_bytes(persisted)
 
 
-def build_lane_b_disposition(spec, lane_a_result):
+def build_lane_b_disposition(spec, source_gate, lane_a_result):
     parent = lane_a_result.card
+    candidate_report, baseline_report = require_pair_source_gate(
+        lane_a_result.evaluation_pair, source_gate)
+    if (lane_a_result.candidate_evaluation.source_gate_sha256 != source_gate.artifact_sha256
+            or lane_a_result.baseline_evaluation.source_gate_sha256 != source_gate.artifact_sha256
+            or lane_a_result.candidate_evaluation.artifact_sha256 != candidate_report.artifact_sha256
+            or lane_a_result.baseline_evaluation.artifact_sha256 != baseline_report.artifact_sha256):
+        raise ValueError("Lane A named evaluation report/source gate binding differs")
     evidence = (lane_a_result.disposition.artifact_sha256,
                 lane_a_result.prediction.artifact_sha256,
                 lane_a_result.evaluation_pair.artifact_sha256,
@@ -680,17 +708,21 @@ def build_lane_b_disposition(spec, lane_a_result):
         evidence_sha256=evidence, reason_codes=("LANE_A_NOT_H23_FROZEN",))
 
 
-def select_h23(spec, rows, lane_a_pair: EvaluationPair):
-    lane_a_report = lane_a_pair.candidate_report
+def select_h23(spec, source_gate, rows, lane_a_pair: EvaluationPair):
+    lane_a_report, lane_a_baseline_report = require_pair_source_gate(lane_a_pair, source_gate)
+    if lane_a_baseline_report.model_id != "v5.1":
+        raise ValueError("Lane A comparison baseline differs")
+    for row in rows:
+        require_pair_source_gate(row["evaluation_pair"], source_gate)
     eligible = [r for r in rows if r["replay_status"] == "PASS"
-        and r["evaluation_pair"].candidate_report.brier <= lane_a_report.brier
-        and r["evaluation_pair"].candidate_report.log_loss <= lane_a_report.log_loss
-        and r["evaluation_pair"].candidate_report.daily_top1_delta_vs_baseline > 0]
+        and require_pair_source_gate(r["evaluation_pair"], source_gate)[0].brier <= lane_a_report.brier
+        and require_pair_source_gate(r["evaluation_pair"], source_gate)[0].log_loss <= lane_a_report.log_loss
+        and require_pair_source_gate(r["evaluation_pair"], source_gate)[0].daily_top1_delta_vs_baseline > 0]
     if not eligible:
         return seal_lane_disposition(spec, lane_id="B", state="REJECTED",
             parent_card_sha256=None, evidence_sha256=(lane_a_pair.artifact_sha256,),
             reason_codes=("NO_H23_CANDIDATE_CLEARS_GATES",))
-    return {**min(eligible, key=h22_order), "status": "SELECTED_H23"}
+    return {**min(eligible, key=lambda row: h22_order(row, source_gate)), "status": "SELECTED_H23"}
 
 
 def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation_pair):
@@ -698,6 +730,10 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
         raise ValueError("selected H23 candidate differs")
     if lane_a_card.model_id != "A" or lane_a_card.state != "H23_FROZEN":
         raise ValueError("Lane A parent card is not H23_FROZEN")
+    candidate_report, baseline_report = require_pair_source_gate(evaluation_pair, source_gate)
+    if (candidate_report.model_id != "A+B" or baseline_report.model_id != "v5.1"
+            or candidate_report.prediction_seal_sha256 != prediction_seal.artifact_sha256):
+        raise ValueError("selected evaluation pair differs from frozen prediction")
     selected_weights = dict(selected["weights_pp"])
     validate_candidate(Candidate(selected["candidate_id"], selected_weights,
                                  selected["shrinkage_multiplier"]))
@@ -719,7 +755,7 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
         "scoring_model_card_path": scoring_card.path,
         "scoring_model_card_sha256": scoring_card.artifact_sha256,
         "prediction_seal_sha256": prediction_seal.artifact_sha256,
-        "evaluation_sha256": evaluation_pair.candidate_report.artifact_sha256,
+        "evaluation_sha256": candidate_report.artifact_sha256,
         "evaluation_pair_sha256": evaluation_pair.artifact_sha256,
         "parameters": {**dict(scoring_card.parameters), "candidate_id": selected["candidate_id"],
                        "component_weights_pp": selected_weights}}
@@ -730,7 +766,7 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
 
 ~~~python
     def test_no_qualifier_rejects_and_wrong_parent_cannot_freeze(self):
-        result = select_h23(self.spec, self.worse_survivors, self.lane_a_pair)
+        result = select_h23(self.spec, self.source_gate, self.worse_survivors, self.lane_a_pair)
         self.assertEqual("REJECTED", result.state)
         with self.assertRaisesRegex(ValueError, "not H23_FROZEN"):
             freeze_ab_card(self.spec, self.selected, self.lane_a_not_frozen,
@@ -857,8 +893,11 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
     lane_a_pair = load_evaluation_pair(
         spec, Path(lane_a_h22_pair_path), lane_a_h22_pair_expected_sha256)
     if (lane_a_pair.run_spec_sha256 != run_spec_sha256(spec)
+            or lane_a_pair.source_gate_sha256 != verified_gate.artifact_sha256
             or lane_a_pair.candidate_report.model_id != "A"
+            or lane_a_pair.candidate_report.source_gate_sha256 != verified_gate.artifact_sha256
             or lane_a_pair.baseline_report.model_id != "v5.1"
+            or lane_a_pair.baseline_report.source_gate_sha256 != verified_gate.artifact_sha256
             or lane_a_pair.candidate_report.fold_id != "H22"
             or lane_a_pair.baseline_report.fold_id != "H22"):
         raise ValueError("Lane A H22 evaluation pair binding differs")
@@ -886,8 +925,8 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, bas
                    selected_evaluation_pair_expected_sha256):
     card = lane_a_result.card
     if card is None or card.model_id != "A" or card.state != "H23_FROZEN":
-        return None, build_lane_b_disposition(spec, lane_a_result)
-    selected = select_h23(spec, survivors, lane_a_pair)
+        return None, build_lane_b_disposition(spec, source_gate, lane_a_result)
+    selected = select_h23(spec, source_gate, survivors, lane_a_pair)
     if not isinstance(selected, dict):
         return None, selected
     candidate_id = selected["candidate_id"]
@@ -908,10 +947,15 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, bas
             or selected_evaluation_pair.ledger_id != selected_prediction_seal.ledger_id
             or selected_evaluation_pair.candidate_id != candidate_id
             or selected_evaluation_pair.run_spec_sha256 != run_spec_sha256(spec)
+            or selected_evaluation_pair.source_gate_sha256 != source_gate.artifact_sha256
             or selected_evaluation_pair.candidate_report.model_id != "A+B"
+            or selected_evaluation_pair.candidate_report.source_gate_sha256
+                != source_gate.artifact_sha256
             or selected_evaluation_pair.candidate_report.prediction_seal_sha256
                 != selected_prediction_seal.artifact_sha256
-            or selected_evaluation_pair.baseline_report.model_id != "v5.1"):
+            or selected_evaluation_pair.baseline_report.model_id != "v5.1"
+            or selected_evaluation_pair.baseline_report.source_gate_sha256
+                != source_gate.artifact_sha256):
         raise ValueError("selected Lane B H23 prediction/evaluation binding differs")
     frozen = freeze_ab_card(spec, selected, card, scoring_card, source_gate, baseline_replay, feature_seal,
                             selected_prediction_seal, selected_evaluation_pair)
