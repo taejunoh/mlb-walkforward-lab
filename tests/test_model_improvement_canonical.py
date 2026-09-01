@@ -1,6 +1,8 @@
 import hashlib
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -40,6 +42,82 @@ class CanonicalArtifactTests(unittest.TestCase):
             self.assertTrue(write_immutable_json(path, {"version": 1}))
             self.assertFalse(write_immutable_json(path, {"version": 1}))
             self.assertEqual(path.read_bytes(), b'{"version":1}\n')
+
+    def test_concurrent_identical_writers_publish_one_complete_artifact(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "artifact.json"
+            value = {"payload": "x" * 50_000_000}
+            expected = canonical_json_bytes(value)
+            first_started = threading.Event()
+            first_finished = threading.Event()
+            outcomes = []
+
+            def first_writer():
+                first_started.set()
+                try:
+                    outcomes.append(write_immutable_json(path, value))
+                except BaseException as exc:
+                    outcomes.append(exc)
+                finally:
+                    first_finished.set()
+
+            def second_writer():
+                try:
+                    self.assertTrue(first_started.wait(timeout=10))
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        if path.exists():
+                            if path.stat().st_size < len(expected) or first_finished.is_set():
+                                outcomes.append(write_immutable_json(path, value))
+                                return
+                        elif first_finished.is_set():
+                            outcomes.append(write_immutable_json(path, value))
+                            return
+                        time.sleep(0.0001)
+                    raise AssertionError("first writer did not publish in time")
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            first = threading.Thread(target=first_writer)
+            second = threading.Thread(target=second_writer)
+            first.start()
+            second.start()
+            first.join(timeout=30)
+            second.join(timeout=30)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(outcomes), 2)
+            self.assertFalse(any(isinstance(outcome, BaseException) for outcome in outcomes))
+            self.assertEqual(sorted(outcomes), [False, True])
+            self.assertEqual(path.read_bytes(), expected)
+
+    def test_staging_failure_cleans_private_file_without_final_poisoning(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            parent = Path(directory)
+            path = parent / "artifact.json"
+            value = {"payload": "x" * 4_000_000}
+            removed = threading.Event()
+
+            def remove_staging_file():
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    candidates = tuple(parent.glob(".artifact.json.tmp-*"))
+                    if candidates:
+                        candidates[0].unlink()
+                        removed.set()
+                        return
+                    time.sleep(0.0001)
+
+            remover = threading.Thread(target=remove_staging_file)
+            remover.start()
+            try:
+                with self.assertRaises(ValueError):
+                    write_immutable_json(path, value)
+            finally:
+                remover.join(timeout=30)
+            self.assertTrue(removed.is_set())
+            self.assertFalse(path.exists())
+            self.assertEqual(tuple(parent.glob(".artifact.json.tmp-*")), ())
 
     def test_write_immutable_json_rejects_changed_retry(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:

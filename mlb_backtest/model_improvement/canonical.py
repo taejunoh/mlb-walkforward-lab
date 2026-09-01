@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,27 +45,22 @@ def write_immutable_json(path: Path, value: object) -> bool:
     contents = canonical_json_bytes(value)
     with _open_parent(path, create=True) as (parent_fd, leaf, absolute):
         descriptor = -1
-        created = False
+        staging_name: str | None = None
         try:
-            descriptor = os.open(
-                leaf,
-                _leaf_open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            created = True
+            descriptor, staging_name = _open_staging(parent_fd, leaf, str(path))
             opened = os.fstat(descriptor)
             _require_regular(opened, str(path))
             _write_all(descriptor, contents, str(path))
             os.fsync(descriptor)
             created_identity = _identity(os.fstat(descriptor))
-        except FileExistsError:
-            existing, _ = _read_regular_from_parent(parent_fd, leaf, str(path))
-            if existing == contents:
-                return False
-            raise ValueError(f"immutable artifact differs: {path}")
         except OSError as exc:
+            if staging_name is not None:
+                _unlink_staging(parent_fd, staging_name)
             raise ValueError(f"unsafe immutable artifact: {path}") from exc
+        except BaseException:
+            if staging_name is not None:
+                _unlink_staging(parent_fd, staging_name)
+            raise
         finally:
             if descriptor >= 0:
                 try:
@@ -72,8 +68,30 @@ def write_immutable_json(path: Path, value: object) -> bool:
                 except OSError:
                     pass
 
-        if not created:
-            raise ValueError(f"unsafe immutable artifact: {path}")
+        try:
+            try:
+                os.link(
+                    staging_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                existing, _ = _read_regular_from_parent(
+                    parent_fd, leaf, str(path)
+                )
+                if existing == contents:
+                    return False
+                raise ValueError(f"immutable artifact differs: {path}")
+            except OSError as exc:
+                raise ValueError(f"unsafe immutable artifact: {path}") from exc
+            _unlink_staging(parent_fd, staging_name)
+            staging_name = None
+            os.fsync(parent_fd)
+        finally:
+            if staging_name is not None:
+                _unlink_staging(parent_fd, staging_name)
 
         # The descriptor is deliberately closed before this path-based reread.
         # This proves that the published name still denotes the bytes we wrote.
@@ -83,6 +101,35 @@ def write_immutable_json(path: Path, value: object) -> bool:
         _assert_path_identity(absolute, created_identity, str(path))
         os.fsync(parent_fd)
         return True
+
+
+def _open_staging(parent_fd: int, leaf: str, label: str) -> tuple[int, str]:
+    """Create a private regular staging inode under an already-held parent."""
+    flags = _leaf_open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    for _ in range(32):
+        name = f".{leaf}.tmp-{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        try:
+            _require_regular(os.fstat(descriptor), label)
+            return descriptor, name
+        except BaseException:
+            os.close(descriptor)
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    raise ValueError(f"could not create immutable staging file: {label}")
+
+
+def _unlink_staging(parent_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
 
 
 @contextmanager
@@ -317,7 +364,9 @@ def _assert_path_identity(
         with _open_parent(absolute, create=False) as (parent_fd, leaf, _):
             named = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             _require_regular(named, label)
-            if _identity(named) != expected:
+            # Hard-link publication changes ctime while the inode is staged;
+            # dev/inode and content metadata must remain bound.
+            if _identity(named)[:-1] != expected[:-1]:
                 raise ValueError(f"unsafe regular file changed after reading: {label}")
     except ValueError:
         raise
