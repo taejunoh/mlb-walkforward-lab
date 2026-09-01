@@ -62,11 +62,16 @@ class SourceGateReceipt:
 
     def __post_init__(self) -> None:
         for field in (
-            "run_spec_sha256", "source_run_spec_sha256",
-            "acquisition_contract_sha256", "checkpoint_sha256",
-            "inventory_sha256", "snapshot_replay_sha256",
+            "run_spec_sha256",
+            "source_run_spec_sha256",
+            "acquisition_contract_sha256",
+            "checkpoint_sha256",
+            "inventory_sha256",
+            "snapshot_replay_sha256",
         ):
-            object.__setattr__(self, field, _require_sha256(getattr(self, field), field))
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
         receipts = tuple(
             _require_sha256(value, "validation_receipts_sha256")
             for value in _require_sequence(
@@ -107,7 +112,9 @@ class SourceGateReceipt:
         return cls(**dict(values), artifact_sha256=artifact_sha256, path=path)
 
 
-def _revalidate_activated_spec(presented: ModelImprovementRunSpec) -> ModelImprovementRunSpec:
+def _revalidate_activated_spec(
+    presented: ModelImprovementRunSpec,
+) -> ModelImprovementRunSpec:
     """Return a fresh activation, never trusting a caller-held descriptor."""
     if not isinstance(presented, ModelImprovementRunSpec):
         raise ValueError("source gate requires a verified RunSpec activation")
@@ -119,9 +126,13 @@ def _revalidate_activated_spec(presented: ModelImprovementRunSpec) -> ModelImpro
     if fresh_activation is None or fresh_activation != activation:
         raise ValueError("source gate activation descriptor differs")
     fresh_digest = run_spec_sha256(fresh)
-    if fresh_digest != activation.run_spec_sha256 or fresh_digest != run_spec_sha256(presented):
+    if fresh_digest != activation.run_spec_sha256 or fresh_digest != run_spec_sha256(
+        presented
+    ):
         raise ValueError("source gate RunSpec activation digest differs")
-    if canonical_json_bytes(fresh.as_mapping()) != canonical_json_bytes(presented.as_mapping()):
+    if canonical_json_bytes(fresh.as_mapping()) != canonical_json_bytes(
+        presented.as_mapping()
+    ):
         raise ValueError("source gate RunSpec declaration differs")
     return fresh
 
@@ -155,7 +166,9 @@ def _bound_paths(spec: ModelImprovementRunSpec) -> tuple[Path, dict[str, Path]]:
     return root, paths
 
 
-def _verify_bound_files(spec: ModelImprovementRunSpec, paths: Mapping[str, Path]) -> None:
+def _verify_bound_files(
+    spec: ModelImprovementRunSpec, paths: Mapping[str, Path]
+) -> None:
     authority = spec.source_authority
     expected: dict[str, str] = {
         "source_run_spec": authority.source_run_spec.sha256,
@@ -172,7 +185,10 @@ def _verify_bound_files(spec: ModelImprovementRunSpec, paths: Mapping[str, Path]
     if set(paths) != set(expected):
         raise ValueError("source gate bound path set differs")
     for name, path in paths.items():
-        if sha256(read_regular_bytes(path, f"source gate {name}")).hexdigest() != expected[name]:
+        if (
+            sha256(read_regular_bytes(path, f"source gate {name}")).hexdigest()
+            != expected[name]
+        ):
             raise ValueError(f"source gate bound digest differs: {name}")
 
 
@@ -217,7 +233,9 @@ def _receipt_path(spec: ModelImprovementRunSpec) -> Path:
     return spec.output_path("source_gate", "source_gate_receipt.json")
 
 
-def _load_bound_receipt(spec: ModelImprovementRunSpec, path: Path, digest: str) -> SourceGateReceipt:
+def _load_bound_receipt(
+    spec: ModelImprovementRunSpec, path: Path, digest: str
+) -> SourceGateReceipt:
     receipt = load_source_gate_receipt(path, digest)
     if receipt.run_spec_sha256 != run_spec_sha256(spec):
         raise ValueError("source gate RunSpec binding differs")
@@ -239,10 +257,15 @@ def verify_source_gate(spec: ModelImprovementRunSpec) -> SourceGateReceipt:
         for index in range(len(fresh.source_authority.validation_receipts))
     )
     execution_registry.validate_sources_ready_evidence_set(
-        authority_root, source_spec, inventory_path=paths["inventory"],
-        checkpoint_path=paths["terminal_checkpoint"], validation_receipts=receipt_paths,
+        authority_root,
+        source_spec,
+        inventory_path=paths["inventory"],
+        checkpoint_path=paths["terminal_checkpoint"],
+        validation_receipts=receipt_paths,
     )
-    checkpoint = execution_registry.load_terminal_acquisition_checkpoint(authority_root, source_spec)
+    checkpoint = execution_registry.load_terminal_acquisition_checkpoint(
+        authority_root, source_spec
+    )
     expected_checkpoint = fresh.source_authority.terminal_checkpoint.sha256
     if (
         not isinstance(checkpoint, execution_registry.AcquisitionCheckpoint)
@@ -250,17 +273,26 @@ def verify_source_gate(spec: ModelImprovementRunSpec) -> SourceGateReceipt:
     ):
         raise ValueError("source gate terminal checkpoint binding differs")
     inputs = v52_verify_sources.load_snapshot_replay_inputs(
-        authority_root, source_spec, acquisition_contract_path=paths["acquisition_contract"]
+        authority_root,
+        source_spec,
+        acquisition_contract_path=paths["acquisition_contract"],
     )
-    replay_digest = _snapshot_digest(v52_verify_sources.replay_verified_snapshots(inputs))
+    replay_digest = _snapshot_digest(
+        v52_verify_sources.replay_verified_snapshots(inputs)
+    )
     _verify_bound_files(fresh, paths)
     provisional = SourceGateReceipt(
-        run_spec_sha256(fresh), fresh.source_authority.source_run_spec.sha256,
+        run_spec_sha256(fresh),
+        fresh.source_authority.source_run_spec.sha256,
         fresh.source_authority.acquisition_contract.sha256,
         fresh.source_authority.terminal_checkpoint.sha256,
         fresh.source_authority.inventory.sha256,
         tuple(item.sha256 for item in fresh.source_authority.validation_receipts),
-        replay_digest, _YEARS, "SOURCES_READY", "0" * 64, str(_receipt_path(fresh)),
+        replay_digest,
+        _YEARS,
+        "SOURCES_READY",
+        "0" * 64,
+        str(_receipt_path(fresh)),
     )
     payload = provisional.as_mapping()
     path = _receipt_path(fresh)
@@ -304,6 +336,35 @@ def load_source_gate_receipt(path: Path, expected_sha256: str) -> SourceGateRece
     ):
         raise ValueError("source gate sidecar differs")
     return receipt
+
+
+def load_bound_source_gate_receipt(
+    spec: ModelImprovementRunSpec, supplied_gate: SourceGateReceipt
+) -> SourceGateReceipt:
+    """Reload the sole activated gate without creating or replaying anything.
+
+    This deliberately does *not* call :func:`require_source_gate`: calibration
+    admission may only consume an already-published gate and must never turn a
+    missing one into a verification/publication attempt.
+    """
+    if not isinstance(supplied_gate, SourceGateReceipt):
+        raise ValueError("source gate descriptor differs")
+    fresh = _revalidate_activated_spec(spec)
+    root, paths = _bound_paths(fresh)
+    _verify_bound_files(fresh, paths)
+    path = _receipt_path(fresh)
+    raw = read_regular_bytes(path, "source gate receipt")
+    loaded = _load_bound_receipt(fresh, path, sha256(raw).hexdigest())
+    if (
+        loaded.as_mapping() != supplied_gate.as_mapping()
+        or loaded.artifact_sha256 != supplied_gate.artifact_sha256
+        or loaded.path != supplied_gate.path
+    ):
+        raise ValueError("source gate descriptor reload differs")
+    # Recheck the activated bindings after the receipt read; a caller cannot
+    # race a mutable source tree between the two observations.
+    _verify_bound_files(fresh, paths)
+    return loaded
 
 
 def require_source_gate(spec: ModelImprovementRunSpec) -> SourceGateReceipt:

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {"sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "model_id", "lane_id", "fold_id", "calibration_key", "target_year", "training_start", "training_end", "run_spec_sha256", "source_gate_sha256", "prediction_contract_sha256", "calibration_feature_receipt_path", "calibration_feature_receipt_sha256", "weight_authority_path", "weight_authority_sha256", "calibration_rows_path", "calibration_rows_sha256", "calibration_population_sha256", "game_evidence_inventory_relative_path", "game_evidence_inventory_sha256", "fit_spec", "alpha", "beta"],
+  "properties": {
+    "schema": {"const": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V2"}, "model_id": {"const": "v5.1"}, "lane_id": {"const": "baseline"}, "fold_id": {"type": "string"}, "calibration_key": {"type": "string"}, "target_year": {"type": "integer"}, "training_start": {"type": "string"}, "training_end": {"type": "string"},
+    "run_spec_sha256": {"$ref": "#/$defs/sha"}, "source_gate_sha256": {"$ref": "#/$defs/sha"}, "prediction_contract_sha256": {"$ref": "#/$defs/sha"}, "calibration_feature_receipt_path": {"type": "string", "pattern": "^/"}, "calibration_feature_receipt_sha256": {"$ref": "#/$defs/sha"}, "weight_authority_path": {"type": "string", "pattern": "^/"}, "weight_authority_sha256": {"$ref": "#/$defs/sha"}, "calibration_rows_path": {"type": "string", "pattern": "^/"}, "calibration_rows_sha256": {"$ref": "#/$defs/sha"}, "calibration_population_sha256": {"$ref": "#/$defs/sha"}, "game_evidence_inventory_relative_path": {"type": "string", "pattern": "^(?!/).+"}, "game_evidence_inventory_sha256": {"$ref": "#/$defs/sha"}, "fit_spec": {"type": "object"}, "alpha": {"type": "number"}, "beta": {"type": "number", "exclusiveMinimum": 0}
+  }
+}

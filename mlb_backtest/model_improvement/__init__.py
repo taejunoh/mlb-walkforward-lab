@@ -6,12 +6,13 @@ from .canonical import (
     sha256_bytes,
     write_immutable_json,
 )
-from .contracts import PredictionSeal, ProbabilityCalibrationCard
+from .contracts import PredictionSeal, ProbabilityCalibrationCard, ProbabilityCalibrationCardV2
+from .calibration_feature_receipts import CalibrationFeatureReceiptV1, load_calibration_feature_receipt
 from .probability_calibration import (
     CalibrationAuthorityBlockedError,
-    calibration_paths,
-    load_probability_calibration_card,
-    require_probability_calibration_card,
+    calibration_paths_v2,
+    load_probability_calibration_card_v2,
+    require_probability_calibration_card_v2,
 )
 from .oof_ledger import (
     load_prediction_rows,
@@ -26,10 +27,13 @@ __all__ = [
     "write_immutable_json",
     "PredictionSeal",
     "ProbabilityCalibrationCard",
+    "ProbabilityCalibrationCardV2",
+    "CalibrationFeatureReceiptV1",
+    "load_calibration_feature_receipt",
     "CalibrationAuthorityBlockedError",
-    "calibration_paths",
-    "load_probability_calibration_card",
-    "require_probability_calibration_card",
+    "calibration_paths_v2",
+    "load_probability_calibration_card_v2",
+    "require_probability_calibration_card_v2",
     "seal_oof_predictions",
     "load_prediction_seal",
     "load_prediction_rows",

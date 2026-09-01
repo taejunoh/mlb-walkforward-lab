@@ -378,7 +378,10 @@ def _freeze_component_numbers(
         frozen[side] = MappingProxyType(
             {
                 component: _require_number(
-                    components[component], f"{label}.{side}.{component}", minimum, maximum
+                    components[component],
+                    f"{label}.{side}.{component}",
+                    minimum,
+                    maximum,
                 )
                 for component in COMPONENTS
             }
@@ -518,7 +521,10 @@ class SealedFeatureRow:
                 self,
                 field,
                 _freeze_component_numbers(
-                    getattr(self, field), field, 0.0, 1.0 if "qualities" in field else 100.0
+                    getattr(self, field),
+                    field,
+                    0.0,
+                    1.0 if "qualities" in field else 100.0,
                 ),
             )
         object.__setattr__(
@@ -723,7 +729,9 @@ class PredictionRow:
             _require_number(self.pick_probability, "pick_probability", 0.0, 1.0),
         )
         object.__setattr__(
-            self, "confidence", _require_number(self.confidence, "confidence", 0.0, 10.0)
+            self,
+            "confidence",
+            _require_number(self.confidence, "confidence", 0.0, 10.0),
         )
         object.__setattr__(
             self,
@@ -815,9 +823,11 @@ class ScoringModelCard:
         candidate_required = self.lane_id == "B" or (
             self.lane_id == "H24" and self.model_id == "A+B"
         )
-        candidate_forbidden = self.lane_id == "A" or (
-            self.lane_id == "C"
-        ) or (self.lane_id == "H24" and self.model_id in {"A", "A+B+C"})
+        candidate_forbidden = (
+            self.lane_id == "A"
+            or (self.lane_id == "C")
+            or (self.lane_id == "H24" and self.model_id in {"A", "A+B+C"})
+        )
         payload_required = self.lane_id in {"B", "C"} or (
             self.lane_id == "H24" and self.model_id in {"A+B", "A+B+C"}
         )
@@ -825,7 +835,9 @@ class ScoringModelCard:
             object.__setattr__(
                 self, "candidate_id", _require_text(self.candidate_id, "candidate_id")
             )
-            if not _CANDIDATE_SEGMENT_RE.fullmatch(self.candidate_id) or self.candidate_id in {".", ".."}:
+            if not _CANDIDATE_SEGMENT_RE.fullmatch(
+                self.candidate_id
+            ) or self.candidate_id in {".", ".."}:
                 raise ValueError("candidate_id must be a safe candidate_id segment")
         elif candidate_forbidden and self.candidate_id is not None:
             raise ValueError("scoring card candidate_id differs")
@@ -872,10 +884,12 @@ class ScoringModelCard:
         object.__setattr__(
             self,
             "parameters",
-            MappingProxyType({
-                **parameters,
-                "component_weights_pp": weights,
-            }),
+            MappingProxyType(
+                {
+                    **parameters,
+                    "component_weights_pp": weights,
+                }
+            ),
         )
         artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
@@ -898,7 +912,9 @@ class ScoringModelCard:
     ) -> "ScoringModelCard":
         fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
         return cls(
-            **dict(_require_exact_mapping(payload, fields, "scoring model card payload")),
+            **dict(
+                _require_exact_mapping(payload, fields, "scoring model card payload")
+            ),
             artifact_sha256=artifact_sha256,
             path=path,
         )
@@ -948,9 +964,13 @@ class PredictionSeal:
             raise ValueError("only H24 prediction seals can bind a frozen card")
         if self.fold_id == "H24":
             if self.model_id == "v5.1" and self.frozen_model_card_sha256 is not None:
-                raise ValueError("H24 baseline prediction seals cannot bind a frozen card")
+                raise ValueError(
+                    "H24 baseline prediction seals cannot bind a frozen card"
+                )
             if self.model_id != "v5.1" and self.frozen_model_card_sha256 is None:
-                raise ValueError("H24 nonbaseline prediction seals require a frozen card")
+                raise ValueError(
+                    "H24 nonbaseline prediction seals require a frozen card"
+                )
         artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
         object.__setattr__(self, "path", path)
@@ -962,11 +982,19 @@ class PredictionSeal:
             expected = ("baseline", "v5.1", self.fold_id)
         elif self.model_id == "A" and self.candidate_id is None:
             expected = ("lane_a", "A", self.fold_id)
-        elif self.model_id == "A+B" and isinstance(self.candidate_id, str) and self.candidate_id:
+        elif (
+            self.model_id == "A+B"
+            and isinstance(self.candidate_id, str)
+            and self.candidate_id
+        ):
             expected = ("lane_b", self.candidate_id, self.fold_id)
         elif self.model_id == "A+B+C" and self.candidate_id is None:
             expected = ("lane_c", "A+B+C", self.fold_id)
-        if self.fold_id == "H24" and self.candidate_id is None and self.model_id in FROZEN_CARD_MODEL_IDS:
+        if (
+            self.fold_id == "H24"
+            and self.candidate_id is None
+            and self.model_id in FROZEN_CARD_MODEL_IDS
+        ):
             expected = ("h24", self.model_id, self.fold_id)
         if expected is None or tuple(parts) != expected:
             raise ValueError("prediction seal ledger_id scope differs")
@@ -1106,24 +1134,46 @@ class ProbabilityCalibrationCard:
     path: str
 
     def __post_init__(self) -> None:
-        if self.model_id not in MODEL_IDS or not isinstance(self.lane_id, str) or not self.lane_id:
+        if (
+            self.model_id not in MODEL_IDS
+            or not isinstance(self.lane_id, str)
+            or not self.lane_id
+        ):
             raise ValueError("probability calibration model identity differs")
-        if self.candidate_id is not None and not _CANDIDATE_SEGMENT_RE.fullmatch(self.candidate_id):
+        if self.candidate_id is not None and not _CANDIDATE_SEGMENT_RE.fullmatch(
+            self.candidate_id
+        ):
             raise ValueError("probability calibration candidate differs")
         if not isinstance(self.calibration_key, str) or not self.calibration_key:
             raise ValueError("probability calibration key differs")
-        object.__setattr__(self, "target_year", _require_year(self.target_year, "target_year"))
-        object.__setattr__(self, "training_start", _require_date(self.training_start, "training_start"))
-        object.__setattr__(self, "training_end", _require_date(self.training_end, "training_end"))
+        object.__setattr__(
+            self, "target_year", _require_year(self.target_year, "target_year")
+        )
+        object.__setattr__(
+            self, "training_start", _require_date(self.training_start, "training_start")
+        )
+        object.__setattr__(
+            self, "training_end", _require_date(self.training_end, "training_end")
+        )
         if self.training_start > self.training_end:
             raise ValueError("probability calibration dates differ")
         for field in (
-            "run_spec_sha256", "source_gate_sha256", "prediction_contract_sha256",
-            "weight_authority_sha256", "calibration_rows_sha256",
-            "calibration_population_sha256", "game_evidence_inventory_sha256",
+            "run_spec_sha256",
+            "source_gate_sha256",
+            "prediction_contract_sha256",
+            "weight_authority_sha256",
+            "calibration_rows_sha256",
+            "calibration_population_sha256",
+            "game_evidence_inventory_sha256",
         ):
-            object.__setattr__(self, field, _require_sha256(getattr(self, field), field))
-        for field in ("weight_authority_path", "calibration_rows_path", "game_evidence_inventory_path"):
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
+        for field in (
+            "weight_authority_path",
+            "calibration_rows_path",
+            "game_evidence_inventory_path",
+        ):
             value = getattr(self, field)
             if not isinstance(value, str) or not value or not value.startswith("/"):
                 raise ValueError(f"{field} must be an absolute path")
@@ -1140,8 +1190,11 @@ class ProbabilityCalibrationCard:
 
     def as_mapping(self) -> dict[str, object]:
         return {
-            field: _thaw_json(getattr(self, field)) if field == "fit_spec" else getattr(self, field)
-            for field in self.__dataclass_fields__ if field not in {"artifact_sha256", "path"}
+            field: _thaw_json(getattr(self, field))
+            if field == "fit_spec"
+            else getattr(self, field)
+            for field in self.__dataclass_fields__
+            if field not in {"artifact_sha256", "path"}
         }
 
     @classmethod
@@ -1150,7 +1203,121 @@ class ProbabilityCalibrationCard:
     ) -> "ProbabilityCalibrationCard":
         fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
         return cls(
-            **dict(_require_exact_mapping(payload, fields, "probability calibration card payload")),
+            **dict(
+                _require_exact_mapping(
+                    payload, fields, "probability calibration card payload"
+                )
+            ),
+            artifact_sha256=artifact_sha256,
+            path=path,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityCalibrationCardV2:
+    """Executable, receipt-bound calibration descriptor (V1 is inspection only)."""
+
+    model_id: str
+    lane_id: str
+    fold_id: str
+    calibration_key: str
+    target_year: int
+    training_start: str
+    training_end: str
+    run_spec_sha256: str
+    source_gate_sha256: str
+    prediction_contract_sha256: str
+    calibration_feature_receipt_path: str
+    calibration_feature_receipt_sha256: str
+    weight_authority_path: str
+    weight_authority_sha256: str
+    calibration_rows_path: str
+    calibration_rows_sha256: str
+    calibration_population_sha256: str
+    game_evidence_inventory_relative_path: str
+    game_evidence_inventory_sha256: str
+    fit_spec: Mapping[str, object]
+    alpha: float
+    beta: float
+    artifact_sha256: str
+    path: str
+
+    def __post_init__(self) -> None:
+        if self.model_id != "v5.1" or self.lane_id != "baseline":
+            raise ValueError("V2 probability calibration identity differs")
+        _require_text(self.fold_id, "fold_id")
+        _require_text(self.calibration_key, "calibration_key")
+        object.__setattr__(
+            self, "target_year", _require_year(self.target_year, "target_year")
+        )
+        object.__setattr__(
+            self, "training_start", _require_date(self.training_start, "training_start")
+        )
+        object.__setattr__(
+            self, "training_end", _require_date(self.training_end, "training_end")
+        )
+        for field in (
+            "run_spec_sha256",
+            "source_gate_sha256",
+            "prediction_contract_sha256",
+            "calibration_feature_receipt_sha256",
+            "weight_authority_sha256",
+            "calibration_rows_sha256",
+            "calibration_population_sha256",
+            "game_evidence_inventory_sha256",
+        ):
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
+        for field in (
+            "calibration_feature_receipt_path",
+            "weight_authority_path",
+            "calibration_rows_path",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.startswith("/"):
+                raise ValueError(f"{field} must be an absolute path")
+        object.__setattr__(
+            self,
+            "game_evidence_inventory_relative_path",
+            _require_text(
+                self.game_evidence_inventory_relative_path,
+                "game_evidence_inventory_relative_path",
+            ),
+        )
+        if not isinstance(self.fit_spec, Mapping):
+            raise ValueError("probability calibration fit_spec differs")
+        object.__setattr__(self, "fit_spec", _freeze_json(self.fit_spec))
+        object.__setattr__(self, "alpha", _require_number(self.alpha, "alpha"))
+        object.__setattr__(
+            self, "beta", _require_number(self.beta, "beta", minimum=0.0)
+        )
+        if self.beta <= 0:
+            raise ValueError("beta must be positive")
+        digest, path = _require_descriptor(self.artifact_sha256, self.path)
+        object.__setattr__(self, "artifact_sha256", digest)
+        object.__setattr__(self, "path", path)
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            field: _thaw_json(getattr(self, field))
+            if field == "fit_spec"
+            else getattr(self, field)
+            for field in self.__dataclass_fields__
+            if field not in {"artifact_sha256", "path"}
+        }
+
+    @classmethod
+    def from_payload_mapping(
+        cls, payload: Mapping[str, object], artifact_sha256: str, path: str
+    ) -> "ProbabilityCalibrationCardV2":
+        fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
+        return cls(
+            **dict(
+                _require_exact_mapping(
+                    payload, fields, "probability calibration V2 card payload"
+                )
+            ),
             artifact_sha256=artifact_sha256,
             path=path,
         )

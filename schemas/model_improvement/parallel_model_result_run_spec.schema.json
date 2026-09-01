@@ -203,6 +203,15 @@
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
         },
+        "absolute_digest": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+                "path": {"type": "string", "pattern": "^/(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$)).+$"},
+                "sha256": {"$ref": "#/$defs/digest"}
+            }
+        },
         "normal_relative": {
             "type": "string",
             "minLength": 1,
@@ -822,16 +831,15 @@
         "probability_calibration_policy": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["schema", "fold_keys", "fit_spec", "pools", "baseline_rows_relative_template", "baseline_card_relative_template", "candidate_rows_relative_template", "candidate_card_relative_template"],
+            "required": ["schema", "fold_keys", "fit_spec", "pools", "calibration_feature_receipts", "baseline_rows_relative_template", "baseline_card_relative_template"],
             "properties": {
                 "schema": {"const": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1"},
                 "fold_keys": {"const": {"O19": "C19", "O20": "C20", "O21": "C21", "O22": "C22O", "H22": "C22H", "O23": "C23O", "H23": "C23H"}},
                 "fit_spec": {"type": "object", "additionalProperties": false, "required": ["schema", "algorithm", "edge_divisor", "iterations", "l2", "tolerance", "min_rows", "required_classes"], "properties": {"schema": {"const": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1"}, "algorithm": {"const": "fit_logistic_v1"}, "edge_divisor": {"const": 10.0}, "iterations": {"const": 100}, "l2": {"const": 0.000001}, "tolerance": {"const": 0.0000000001}, "min_rows": {"const": 2}, "required_classes": {"const": [0, 1]}}},
                 "pools": {"const": {"C19": {"target_year": 2019, "training_start": "2018-01-01", "training_end": "2018-12-31"}, "C20": {"target_year": 2020, "training_start": "2018-01-01", "training_end": "2019-12-31"}, "C21": {"target_year": 2021, "training_start": "2018-01-01", "training_end": "2020-12-31"}, "C22O": {"target_year": 2022, "training_start": "2018-01-01", "training_end": "2021-12-31"}, "C22H": {"target_year": 2022, "training_start": "2018-01-01", "training_end": "2021-12-31"}, "C23O": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"}, "C23H": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"}}},
-                "baseline_rows_relative_template": {"const": "baseline/v5.1/{fold_id}/calibration_rows.jsonl"},
-                "baseline_card_relative_template": {"const": "baseline/v5.1/{fold_id}/probability_calibration_card.json"},
-                "candidate_rows_relative_template": {"const": "{lane_id}/{candidate_segment}/{fold_id}/calibration_rows.jsonl"},
-                "candidate_card_relative_template": {"const": "{lane_id}/{candidate_segment}/{fold_id}/probability_calibration_card.json"}
+                "calibration_feature_receipts": {"type": "object", "additionalProperties": false, "required": ["C19", "C20", "C21", "C22O", "C22H", "C23O", "C23H"], "properties": {"C19": {"$ref": "#/$defs/absolute_digest"}, "C20": {"$ref": "#/$defs/absolute_digest"}, "C21": {"$ref": "#/$defs/absolute_digest"}, "C22O": {"$ref": "#/$defs/absolute_digest"}, "C22H": {"$ref": "#/$defs/absolute_digest"}, "C23O": {"$ref": "#/$defs/absolute_digest"}, "C23H": {"$ref": "#/$defs/absolute_digest"}}},
+                "baseline_rows_relative_template": {"const": "baseline/v5.1/{fold_id}/v2/calibration_rows.jsonl"},
+                "baseline_card_relative_template": {"const": "baseline/v5.1/{fold_id}/v2/probability_calibration_card.json"}
             }
         }
     }
