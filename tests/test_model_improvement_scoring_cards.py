@@ -49,6 +49,7 @@ def baseline_card_payload() -> dict[str, object]:
 class ScoringCardTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.external = tempfile.TemporaryDirectory(dir=ROOT)
         raw = json.loads(SYNTHETIC.read_text(encoding="utf-8"))
         raw["outputs"]["root"] = self.temporary.name
         baseline_path = Path(self.temporary.name) / "baseline-card.json"
@@ -63,6 +64,7 @@ class ScoringCardTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+        self.external.cleanup()
 
     def payload(
         self,
@@ -252,6 +254,22 @@ class ScoringCardTest(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(ValueError, "path"):
                         load_scoring_model_card(self.spec, alias, card.artifact_sha256)
+
+    def test_loader_rejects_external_or_wrong_namespace_before_reading(self) -> None:
+        card = seal_scoring_model_card(self.spec, self.payload())
+        external = Path(self.external.name) / "external-scoring-card.json"
+        wrong_namespace = Path(self.temporary.name) / "baseline/scoring_model_card.json"
+        for path in (external, wrong_namespace):
+            with self.subTest(path=path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(canonical_json_bytes({"regular": True}))
+                with patch.object(
+                    scoring_cards,
+                    "read_regular_bytes",
+                    side_effect=AssertionError("non-card namespace must fail before read"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "path"):
+                        load_scoring_model_card(self.spec, path, card.artifact_sha256)
 
     def test_resolver_rejects_descriptor_path_aliases_before_reload(self) -> None:
         card = seal_scoring_model_card(self.spec, self.payload())

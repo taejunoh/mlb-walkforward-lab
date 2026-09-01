@@ -40,6 +40,7 @@ _PAYLOAD_FIELDS = frozenset(
     }
 )
 _PERSISTED_FIELDS = frozenset({"schema"}) | _PAYLOAD_FIELDS
+_CARD_NAMESPACES = ("lane_a", "lane_b", "lane_c", "h24_predictions")
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +90,20 @@ def _require_exact_card_path(path: Path | str, expected: Path, label: str) -> Pa
     if str(provided) != str(expected):
         raise ValueError(f"{label} path differs")
     return provided
+
+
+def _require_scoring_card_namespace(
+    spec: ModelImprovementRunSpec, path: Path, label: str
+) -> None:
+    """Admit only the four lexical RunSpec namespaces before reading a card."""
+    output_root = spec.output_path("lane_a", "scoring_model_card.json").parents[1]
+    for namespace in _CARD_NAMESPACES:
+        try:
+            path.relative_to(output_root / namespace)
+        except ValueError:
+            continue
+        return
+    raise ValueError(f"{label} path differs")
 
 
 def _payload_card(payload: Mapping[str, object]) -> ScoringModelCard:
@@ -194,6 +209,7 @@ def load_scoring_model_card(
         raise ValueError("scoring card requires ModelImprovementRunSpec")
     expected = _require_sha256(expected_sha256, "expected scoring card sha256")
     provided_path = _require_canonical_absolute_path(path, "scoring card")
+    _require_scoring_card_namespace(spec, provided_path, "scoring card")
     raw = read_regular_bytes(provided_path, "scoring card")
     actual = sha256(raw).hexdigest()
     if actual != expected:
