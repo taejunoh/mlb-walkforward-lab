@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from mlb_backtest.daily_totals import (
     BuiltDailyTotals,
     MODEL_SCHEMA,
     REPORT_SCHEMA,
     render_totals_markdown,
+    persist_daily_totals,
     validate_totals_trace,
     validate_totals_model_receipt,
     validate_totals_report,
@@ -103,12 +109,16 @@ def make_valid_report_payload() -> dict[str, object]:
         "selected_candidate": "LEAGUE_30",
         "development_metrics": receipt["development_metrics"],
         "final_metrics": receipt["final_metrics"],
-        "games": [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "PROJECTED", "candidate_id": "LEAGUE_30", "away_expected_runs": 3.2, "home_expected_runs": 4.1, "expected_total": 7.3, "interval_80": [5, 7], "residual_samples": [5, 6, 7], "residual_sha256": _sha([5, 6, 7]), "residual_count": 3, "feature_cutoff": "2026-08-31", "source_digest": receipt["source_report_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]}] ,
+        "games": [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "PROJECTED", "candidate_id": "LEAGUE_30", "away_expected_runs": 3.2, "home_expected_runs": 4.1, "expected_total": 7.3, "interval_80": [5, 7], "residual_samples": [5, 6, 7], "residual_sha256": _sha([5, 6, 7]), "residual_count": 3, "feature_cutoff": "2026-08-31", "source_digest": receipt["history_source"]["payload_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]}] ,
     }
     canonical = dict(payload)
     canonical.pop("content_sha256")
     payload["content_sha256"] = _sha(canonical)
     return payload
+
+
+def _recontent(payload: dict[str, object]) -> None:
+    payload["content_sha256"] = _sha({key: value for key, value in payload.items() if key != "content_sha256"})
 
 
 class DailyTotalsContractTests(unittest.TestCase):
@@ -131,7 +141,7 @@ class DailyTotalsContractTests(unittest.TestCase):
 
     def test_unprojected_variant_is_closed(self) -> None:
         report = make_valid_report_payload()
-        report["games"] = [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "UNPROJECTED", "reason": "UNKNOWN_TEAM", "feature_cutoff": "2026-08-31", "source_digest": report["source_report_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "UNKNOWN_TEAM"]}]
+        report["games"] = [{"game_pk": 1, "official_date": "2026-09-01", "scheduled_start_utc": "2026-09-01T16:00:00Z", "away_team_id": 2, "home_team_id": 3, "venue_id": 4, "status": "UNPROJECTED", "reason": "UNKNOWN_TEAM", "feature_cutoff": "2026-08-31", "source_digest": report["history_source"]["payload_sha256"], "data_quality_flags": ["ADMITTED_SCHEDULE", "UNKNOWN_TEAM"]}]
         report["content_sha256"] = _sha({key: value for key, value in report.items() if key != "content_sha256"})
         self.assertEqual(validate_totals_report(report)["games"][0]["status"], "UNPROJECTED")
 
@@ -169,7 +179,7 @@ class DailyTotalsContractTests(unittest.TestCase):
         built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": report["source_report_sha256"], "model_receipt_relative": report["model_receipt_relative"]}))
         exposed = built.report
         exposed["games"][0]["source_digest"] = "0" * 64  # type: ignore[index]
-        self.assertEqual(built.report["games"][0]["source_digest"], report["source_report_sha256"])
+        self.assertEqual(built.report["games"][0]["source_digest"], report["history_source"]["payload_sha256"])
 
     def test_rows_must_be_chronological_by_date_start_and_game_pk(self) -> None:
         report = make_valid_report_payload()
@@ -180,6 +190,29 @@ class DailyTotalsContractTests(unittest.TestCase):
         report["content_sha256"] = _sha({key: value for key, value in report.items() if key != "content_sha256"})
         with self.assertRaises(ValueError):
             validate_totals_report(report)
+
+    def test_persist_writes_trace_commit_after_re_admission(self) -> None:
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / report["source_report_relative"]
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            source_sha = hashlib.sha256(b"source").hexdigest()
+            receipt["source_report_sha256"] = source_sha
+            _recontent(receipt)
+            report["source_report_sha256"] = source_sha
+            report["model_receipt_relative"] = f"audit/experimental_daily_totals/model/{receipt['content_sha256']}.json"
+            report["model_receipt_sha256"] = _sha(receipt)
+            _recontent(report)
+            built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": source_sha, "model_receipt_relative": report["model_receipt_relative"]}))
+            admitted = SimpleNamespace(target_date=report["target_date"], cutoff_date=report["cutoff_date"], history_identity=report["history_source"], live_identity=report["live_source"])
+            with patch("mlb_backtest.daily_totals.load_totals_sources", return_value=admitted), patch("mlb_backtest.daily_totals._source_identity", side_effect=lambda value: value):
+                _receipt, _report, _markdown, trace_path = persist_daily_totals(root, built)
+            trace = validate_totals_trace(json.loads(trace_path.read_text()))
+            self.assertEqual(trace["history_source"], report["history_source"])
+            self.assertEqual(trace["live_source"], report["live_source"])
 
 
 if __name__ == "__main__":

@@ -342,7 +342,8 @@ def validate_totals_report(value: object) -> dict[str, object]:
     _metrics(safe["final_metrics"], "totals report final metrics", minimum=100)
     if not isinstance(safe["games"], list) or not safe["games"]:
         raise ValueError("totals report games differ")
-    games = [_game(game, target, cutoff, safe["source_report_sha256"], candidate) for game in safe["games"]]
+    history_source = _identity(safe["history_source"], "HISTORY_SCHEDULE")
+    games = [_game(game, target, cutoff, history_source["payload_sha256"], candidate) for game in safe["games"]]
     keys = [(game["official_date"], game["scheduled_start_utc"], game["game_pk"]) for game in games]
     if keys != sorted(keys) or len({game["game_pk"] for game in games}) != len(games):
         raise ValueError("totals report game ordering differs")
@@ -434,12 +435,12 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
             result = project_game(history, game, selected)
             base = {"game_pk": game.game_pk, "official_date": game.official_date, "scheduled_start_utc": game.scheduled_start_utc, "away_team_id": game.away_team_id, "home_team_id": game.home_team_id, "venue_id": game.venue_id}
             if isinstance(result, UnprojectedTotal):
-                game_rows.append({**base, "status": result.status, "reason": result.reason, "feature_cutoff": bundle.cutoff_date, "source_digest": source_sha, "data_quality_flags": ["ADMITTED_SCHEDULE", result.reason]})
+                game_rows.append({**base, "status": result.status, "reason": result.reason, "feature_cutoff": bundle.cutoff_date, "source_digest": bundle.history_identity.payload_sha256, "data_quality_flags": ["ADMITTED_SCHEDULE", result.reason]})
                 continue
             if not isinstance(result, TotalProjection):
                 raise ValueError("projection result differs")
             samples = _discrete_samples(development_residuals, result.expected_total)
-            game_rows.append({**base, "status": "PROJECTED", "candidate_id": selected, "away_expected_runs": result.away_expected_runs, "home_expected_runs": result.home_expected_runs, "expected_total": result.expected_total, "interval_80": list(interval_80(samples)), "residual_samples": list(samples), "residual_sha256": _sha_json(list(samples)), "residual_count": len(samples), "feature_cutoff": bundle.cutoff_date, "source_digest": source_sha, "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]})
+            game_rows.append({**base, "status": "PROJECTED", "candidate_id": selected, "away_expected_runs": result.away_expected_runs, "home_expected_runs": result.home_expected_runs, "expected_total": result.expected_total, "interval_80": list(interval_80(samples)), "residual_samples": list(samples), "residual_sha256": _sha_json(list(samples)), "residual_count": len(samples), "feature_cutoff": bundle.cutoff_date, "source_digest": bundle.history_identity.payload_sha256, "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]})
         report: dict[str, object] = {
             "schema": REPORT_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
             "target_date": target, "cutoff_date": bundle.cutoff_date,
@@ -538,15 +539,37 @@ def persist_daily_totals(root: Path, built: BuiltDailyTotals) -> tuple[Path, Pat
         source_snapshot = read_regular_snapshot(trusted, Path(str(report["source_report_relative"])), "daily totals source report")
         if source_snapshot is None or _sha_bytes(source_snapshot.contents) != report["source_report_sha256"]:
             raise ValueError("daily totals source report differs")
+        # Re-admit the full evidence chain before the first output write.  The
+        # report bytes alone are insufficient because it only names the chain.
+        source_relative = Path(str(report["source_report_relative"]))
+        admitted = load_totals_sources(root_path, source_relative)
+        if (
+            admitted.target_date != report["target_date"]
+            or admitted.cutoff_date != report["cutoff_date"]
+            or _source_identity(admitted.history_identity) != receipt["history_source"]
+            or _source_identity(admitted.live_identity) != receipt["live_source"]
+            or _source_identity(admitted.history_identity) != report["history_source"]
+            or _source_identity(admitted.live_identity) != report["live_source"]
+        ):
+            raise ValueError("daily totals admitted source identity differs")
+        rebind_regular_snapshot(trusted, source_snapshot, "daily totals source report")
         receipt_sidecar = _existing_or_write(trusted, receipt_relative.with_suffix(".sha256"), _sidecar(receipt_contents), "daily totals model receipt sidecar")
         receipt_snapshot = _existing_or_write(trusted, receipt_relative, receipt_contents, "daily totals model receipt")
         report_sidecar = _existing_or_write(trusted, report_relative.with_suffix(".sha256"), report_sidecar_contents, "daily totals report sidecar")
         report_snapshot = _existing_or_write(trusted, report_relative, report_contents, "daily totals report")
         markdown_snapshot = _existing_or_write(trusted, report_relative.with_suffix(".md"), markdown_contents, "daily totals Markdown")
-        trace_contents = canonical_json_bytes(_trace_payload(report_relative, receipt_relative, receipt_contents, report_contents, report_sidecar_contents, markdown_contents, str(report["source_report_relative"]), str(report["source_report_sha256"])))
+        trace_contents = canonical_json_bytes(_trace_payload(report_relative, receipt_relative, receipt_contents, report_contents, report_sidecar_contents, markdown_contents, str(report["source_report_relative"]), str(report["source_report_sha256"]), report["history_source"], report["live_source"]))
         trace_snapshot = _existing_or_write(trusted, report_relative.with_suffix(".trace.json"), trace_contents, "daily totals trace")
         for snapshot, label in ((receipt_sidecar, "daily totals model receipt sidecar"), (receipt_snapshot, "daily totals model receipt"), (report_sidecar, "daily totals report sidecar"), (report_snapshot, "daily totals report"), (markdown_snapshot, "daily totals Markdown"), (trace_snapshot, "daily totals trace"), (source_snapshot, "daily totals source report")):
             rebind_regular_snapshot(trusted, snapshot, label)
+        persisted_trace = validate_totals_trace(json.loads(trace_snapshot.contents))
+        if (
+            persisted_trace["history_source"] != report["history_source"]
+            or persisted_trace["live_source"] != report["live_source"]
+            or persisted_trace["report_sha256"] != _sha_bytes(report_contents)
+            or persisted_trace["model_receipt_sha256"] != _sha_bytes(receipt_contents)
+        ):
+            raise ValueError("daily totals trace binding differs")
         trusted.assert_bound()
     return root_path / receipt_relative, root_path / report_relative, root_path / report_relative.with_suffix(".md"), root_path / report_relative.with_suffix(".trace.json")
 
