@@ -2,9 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist authenticated, label-free OOF predictions first, then baseline replay evidence, nonbaseline predictions, and finally one source-derived outcome/evaluation chain per fold.
+**Goal:** Establish an immutable, source-derived and pre-target probability
+calibration authority, then persist authenticated label-free OOF predictions,
+baseline replay evidence, nonbaseline predictions, and one source-derived
+outcome/evaluation chain per fold.
 
-**Architecture:** The work is deliberately staged as Task8A → Task6A → Task8B → Task6B. Task8 owns only immutable prediction rows and `PredictionSeal`; Task6A produces the replay receipt required by nonbaseline scoring cards, and Task6B alone derives outcomes from the RunSpec-bound V5.2 game-evidence authority and publishes receipt-bound evaluation reports/pairs.
+**Architecture:** The work is deliberately staged as Task6P → Task8A V2 →
+Task6A → Task8B → Task6B. Task6P owns only source-derived prior-target
+calibration evidence/cards; Task8 owns only immutable label-free prediction
+rows and `PredictionSealV2`; Task6A produces the replay receipt required by
+nonbaseline scoring cards; Task6B alone opens target-fold outcomes through the
+RunSpec-bound V5.2 game-evidence authority and publishes receipt-bound
+evaluation reports/pairs. The global v5.1 2022--2024 alpha/beta and the
+invented alpha=0/beta=1 normalizer are explicitly inadmissible for OOF replay.
 
 **Tech Stack:** Python 3.11 standard library, existing model-improvement canonical/source-gate/feature-seal/scoring-card modules, `v52_snapshot_store`, `v52_game_evidence_inventory`, JSON Schema Draft 2020-12, `unittest`, Ruff, Git.
 
@@ -16,15 +26,18 @@ Implement only from the normative specification
 `docs/superpowers/specs/2026-09-01-model-improvement-task8-oof-ledger-design.md`.
 Do not create `JoinedLedger`, `join_oof_outcomes`, a labelled Task8 JSONL,
 or an outcome mapping/label/path argument. Do not run the unrelated full test
-suite, download data, change a v5.1 card, or create an H24 prediction seal.
+suite, download data, rewrite the audited v5.1 card, or create an H24
+prediction seal. Task6P may create a new derived calibration authority; it
+does not alter the audited card.
 
 The implementation owns these final module boundaries:
 
 | Stage | Persistent authority | Files created | Public API admitted at the end |
 | --- | --- | --- | --- |
-| Task8A | Common O19–O23/H22/H23 `FeatureSeal`, direct RunSpec v5.1 card | `prediction_seal.schema.json`, `oof_ledger.py`, `test_model_improvement_oof_ledger.py` | baseline-only `seal_oof_predictions`, `load_prediction_seal`, `load_prediction_rows` |
-| Task6A | sealed baseline prediction | `baseline_replay_receipt.schema.json`, `baseline_replay.py`, `test_model_improvement_baseline_replay.py` | `BaselineReplayReceipt`, `replay_v51_predictions`, `load_baseline_replay` |
-| Task8B | same-fold `BaselineReplayReceipt` plus Task7 scoring card | no new module; extend `oof_ledger.py` and its test | all non-H24 model identities through the same three Task8 APIs |
+| Task6P | SourceInventory → GameEvidence prior-target calibration evidence | `probability_calibration_card.schema.json`, `probability_calibration.py`, `test_model_improvement_probability_calibration.py` | `ProbabilityCalibrationCard`, `load_probability_calibration_card` |
+| Task8A V2 | Common O19–O23/H22/H23 `FeatureSeal`, direct weights plus calibration card | `prediction_seal_v2.schema.json`, `oof_ledger_v2.py`, `test_model_improvement_oof_ledger.py` | baseline-only `PredictionSealV2`, `seal_oof_predictions_v2`, `load_prediction_seal_v2`, `load_prediction_rows_v2` |
+| Task6A | V2 sealed baseline prediction plus calibration card | V2 `baseline_replay_receipt.schema.json`, `baseline_replay.py`, `test_model_improvement_baseline_replay.py` | V2 `BaselineReplayReceipt`, `replay_v51_predictions`, `load_baseline_replay` |
+| Task8B | same-fold V2 replay, Task7 scoring card, per-candidate calibration card | `prediction_seal_v2.schema.json`, `scoring_model_card.schema.json`, `oof_ledger_v2.py`, and tests | all non-H24 model identities through the same three V2 Task8 APIs |
 | Task6B | verified SourceInventory → GameEvidenceInventory → baseline prediction | `outcome_receipt.schema.json`, `evaluation_report.schema.json`, `evaluation_pair.schema.json`, `outcomes.py`, `evaluation.py`, `test_model_improvement_outcomes.py`, `test_model_improvement_evaluation.py` | `OutcomeReceipt`, outcome loaders, `evaluate_predictions`, report/pair loaders |
 
 All descriptor payloads exclude their runtime `artifact_sha256` and `path`.
@@ -70,17 +83,18 @@ Expected: FAIL because the Common and Lane plans still advertise `JoinedLedger`,
 In the Common plan replace its Task8/Task6 order with:
 
 ```text
-Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders
-Task6A baseline replay receipt after its matching baseline seal
-Task8B nonbaseline label-free seals/loaders after same-fold replay receipt
+Task6P source-derived pre-target calibration evidence/cards
+Task8A V2 Common OOF FeatureSeal admission + calibrated baseline label-free seals/loaders
+Task6A V2 baseline replay receipt after its matching baseline seal
+Task8B candidate calibration plus nonbaseline label-free seals/loaders after same-fold replay receipt
 Task6B SourceInventory → GameEvidence outcomes, reports, and final pair
 ```
 
 Replace the old public import block with only these Task8/Task6 names:
 
 ```python
-from mlb_backtest.model_improvement.oof_ledger import (
-    load_prediction_rows, load_prediction_seal, seal_oof_predictions,
+from mlb_backtest.model_improvement.oof_ledger_v2 import (
+    load_prediction_rows_v2, load_prediction_seal_v2, seal_oof_predictions_v2,
 )
 from mlb_backtest.model_improvement.baseline_replay import (
     BaselineReplayReceipt, load_baseline_replay, replay_v51_predictions,
@@ -97,11 +111,11 @@ from mlb_backtest.model_improvement.evaluation import (
 Replace every lane call site/documented adapter with the full Task8 call:
 
 ```python
-seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay,
-                     ledger_id, rows)
-load_prediction_seal(spec, source_gate, feature_seal, baseline_replay,
-                     path, expected_sha256)
-load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)
+seal_oof_predictions_v2(spec, source_gate, feature_seal, baseline_replay,
+                        ledger_id, rows)
+load_prediction_seal_v2(spec, source_gate, feature_seal, baseline_replay,
+                        path, expected_sha256)
+load_prediction_rows_v2(spec, source_gate, feature_seal, baseline_replay, seal)
 ```
 
 and replace every raw-outcome evaluator call with:
@@ -139,7 +153,117 @@ git add docs/superpowers/plans/2026-08-31-model-improvement-common-lane-a.md \
 git commit -m "docs: stage model improvement prediction and outcome contracts"
 ```
 
-### Task 1: Task8A — Admit Common OOF feature seals and bind `PredictionSeal.feature_seal_sha256`
+### Task 1: Task6P — Seal source-derived, pre-target probability calibration
+
+**Files:**
+- Create: `schemas/model_improvement/probability_calibration_card.schema.json`
+- Modify: `schemas/model_improvement/parallel_model_result_run_spec.schema.json`
+- Create: `mlb_backtest/model_improvement/probability_calibration.py`
+- Modify: `mlb_backtest/model_improvement/run_spec.py`
+- Modify: `mlb_backtest/model_improvement/contracts.py`
+- Modify: `mlb_backtest/model_improvement/__init__.py`
+- Modify: `mlb_backtest/normalize.py`
+- Create: `tests/test_model_improvement_probability_calibration.py`
+- Modify: `tests/test_normalize.py`
+
+- [ ] **Step 1: Write RED tests for the only admitted calibration keys and
+  their evidence boundary.**
+
+The exact baseline key/pool table is C19=(O19, 2018), C20=(O20, 2018--19),
+C21=(O21, 2018--20), C22=(O22/H22, 2018--21), and C23=(O23/H23,
+2018--22). Each row has `official_date <= YYYY-1-12-31`, an independently
+verified D-1 feature provenance digest, a source-derived completed
+GameEvidence outcome digest, and a recomputed direct-card edge. Test target
+year insertion, future date, target-fold outcome, arbitrary mapping/path,
+source inventory/GameEvidence substitution, feature/weight substitution,
+duplicate/reordered row, no-class/too-few-row, alpha/beta mutation, alias,
+and all sidecar/primary crash points. A missing admissible prior-outcome
+authority must raise `BLOCKED_CALIBRATION_AUTHORITY_MISSING` before Task8
+opens a prediction output.
+
+- [ ] **Step 2: Define the closed card and immutable writer/loader.**
+
+Persist `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1` with exactly:
+
+```text
+schema, model_id, lane_id, fold_id, candidate_id, calibration_key,
+target_year, training_start, training_end,
+run_spec_sha256, source_gate_sha256, prediction_contract_sha256,
+weight_authority_path, weight_authority_sha256,
+calibration_rows_path, calibration_rows_sha256,
+calibration_population_sha256,
+game_evidence_inventory_path, game_evidence_inventory_sha256,
+fit_spec, alpha, beta
+```
+
+`fit_spec` is closed: `fit_pre_target_calibration`, edge scale 10, L2 1e-6,
+100 iterations, tolerance 1e-10, and clip [0.10, 0.90]. It is not a caller
+option. For baseline the only derived files are
+`baseline/v5.1/calibration/{target_year}/calibration_rows.jsonl` and
+`baseline/v5.1/calibration/{target_year}/probability_calibration_card.json`.
+Rows are canonical JSONL with exactly `game_pk`, `official_date`,
+`target_year`, `edge`, `home_win`, `feature_provenance_sha256`, and
+`game_evidence_sha256`; their labels never enter Task8.
+
+The loader derives the key/path from model identity; it takes no caller path,
+outcome mapping, or rows. It securely reloads source gate, SourceInventory,
+GameEvidenceInventory, rows, direct weight authority, and sidecars; recomputes
+edge, population, and alpha/beta; and rejects any disagreement. Write rows
+sidecar, card sidecar, rows primary, then card primary. Only the card primary
+commits. Do not claim the required historical rows already exist.
+
+`CalibrationAuthorityBlockedError` is a dedicated `RuntimeError`; both its
+`.code` and `str(error)` are exactly
+`BLOCKED_CALIBRATION_AUTHORITY_MISSING`. Missing prior-target source evidence,
+rows, or card is this block and produces no V2 prediction/replay output;
+present but invalid bytes/bindings remain `ValueError` evidence failures.
+
+Do not use `normalize.fit_frozen_calibration`: its 2022 lower boundary rejects
+the required 2018--21 pools. Add
+`fit_pre_target_calibration(rows, *, training_start, training_end)` to
+`mlb_backtest/normalize.py` and cover it in `tests/test_normalize.py`. It uses
+the existing deterministic logistic mechanics but accepts only policy-exact
+inclusive bounds supplied internally by Task6P; it must leave
+`fit_frozen_calibration` unchanged. Tests prove C19--C23 acceptance,
+out-of-pool-date rejection, and unchanged frozen 2022--24 behavior.
+
+- [ ] **Step 3: Add the RunSpec calibration policy, not speculative result
+  digests.**
+
+The immutable RunSpec adds one closed canonical object named
+`probability_calibration_policy` with exact fields `schema`,
+`baseline_key_by_fold`, `pools`, `fit_spec`,
+`baseline_rows_relative_template`, `baseline_card_relative_template`,
+`candidate_rows_relative_template`, and `candidate_card_relative_template`.
+`schema` is `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1`; the exact
+five key/date values and templates are those in the normative design. Its
+`fit_spec` uses `algorithm="fit_pre_target_calibration"`, edge scale 10, L2
+1e-6, 100 iterations, tolerance 1e-10, and clips 0.10/0.90. The RunSpec must
+not contain a future card digest: binding a result digest into the same
+RunSpec that source-gates its inputs creates a circular authority. Each emitted
+card instead binds `run_spec_sha256` and the SourceGate digest; V2 prediction
+artifacts bind the emitted card digest.
+
+- [ ] **Step 4: Validate and commit Task6P.**
+
+Run focused calibration/RunSpec/source-gate/contracts/canonical tests, validate
+both changed/new Draft 2020-12 schemas, run Ruff on the new module/test, and
+`git diff --check`.
+
+```bash
+git add schemas/model_improvement/probability_calibration_card.schema.json \
+  schemas/model_improvement/parallel_model_result_run_spec.schema.json \
+  mlb_backtest/model_improvement/probability_calibration.py \
+  mlb_backtest/model_improvement/run_spec.py \
+  mlb_backtest/model_improvement/contracts.py \
+  mlb_backtest/model_improvement/__init__.py \
+  mlb_backtest/normalize.py \
+  tests/test_model_improvement_probability_calibration.py \
+  tests/test_normalize.py
+git commit -m "feat: seal pre-target probability calibration authority"
+```
+
+### Task 2: Task8A V2 — Admit Common OOF feature seals and bind calibrated predictions
 
 **Files:**
 - Modify: `schemas/model_improvement/feature_seal.schema.json`
@@ -169,12 +293,12 @@ def test_common_oof_paths_are_admitted_but_lane_c_oof_and_h24_predictions_are_no
     with self.assertRaises(ValueError):
         self.spec.output_path("features", "lane_c/O19/rows.jsonl")
 
-def test_prediction_seal_payload_requires_feature_seal_sha256(self):
-    seal = make_prediction_seal(feature_seal_sha256=SHA)
-    self.assertEqual(PredictionSeal.from_payload_mapping(
+def test_prediction_seal_v2_payload_requires_feature_and_calibration_sha256(self):
+    seal = make_prediction_seal_v2(feature_seal_sha256=SHA, calibration_card_sha256=SHA2)
+    self.assertEqual(PredictionSealV2.from_payload_mapping(
         seal.as_mapping(), seal.artifact_sha256, seal.path), seal)
     with self.assertRaises(ValueError):
-        PredictionSeal.from_payload_mapping(
+        PredictionSealV2.from_payload_mapping(
             seal.as_mapping() | {"feature_seal_sha256": "not-a-digest"}, SHA, "/x")
 ```
 
@@ -182,7 +306,8 @@ def test_prediction_seal_payload_requires_feature_seal_sha256(self):
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_contracts -v`
 
-Expected: FAIL because O19–O23 feature paths are rejected and `PredictionSeal` has no `feature_seal_sha256` field.
+Expected: FAIL because O19–O23 feature paths are rejected and there is no
+separate V2 row/seal type with the required calibration binding.
 
 - [ ] **Step 3: Make the minimal shared-contract change.**
 
@@ -209,17 +334,21 @@ H22/H23/H24-only. In `sealed_features.py`, use `task8_target_year` for Common
 OOF row year and official-date-year validation, while retaining `spec.fold()`
 for all H22/H23/H24 checks; Lane C never accepts OOF folds.
 
-Add this required `PredictionSeal` field between `source_gate_sha256` and
-`prediction_contract_sha256`:
+Preserve the published V1 `PredictionRow`, `PredictionSeal`, schema, module,
+paths, and public functions unchanged for inspection. Add separate
+`PredictionRowV2`/`PredictionSealV2` types, with this required V2 seal field
+between `source_gate_sha256` and `prediction_contract_sha256`:
 
 ```python
 feature_seal_sha256: str
 ```
 
-Validate it with `_require_sha256`, include it in `as_mapping()` and require it
-in `from_payload_mapping()`. Update all existing in-repository constructors
-and schema fixtures to provide the explicit 64-hex field. Do not add a target
-year to `FeatureSeal`.
+Task8A V2 also adds `calibration_card_sha256` to both `PredictionRowV2` and
+`PredictionSealV2`; it is required, 64-hex, and equals the securely reloaded
+ProbabilityCalibrationCard descriptor. Add V2 constructors, schemas, and
+fixtures without changing V1 bytes. The V2 seal schema is
+`MODEL_IMPROVEMENT_PREDICTION_SEAL_V2`; a V1 artifact is never an executable
+Task6A/Task8B/Task6B prerequisite. Do not add a target year to `FeatureSeal`.
 
 - [ ] **Step 4: Run GREEN and validate the changed feature schema.**
 
@@ -240,11 +369,11 @@ git add schemas/model_improvement/feature_seal.schema.json \
 git commit -m "feat: admit common OOF feature seal bindings"
 ```
 
-### Task 2: Task8A — Implement baseline-only label-free prediction sealing and reloading
+### Task 3: Task8A V2 — Implement calibrated baseline-only label-free prediction sealing and reloading
 
 **Files:**
-- Create: `schemas/model_improvement/prediction_seal.schema.json`
-- Create: `mlb_backtest/model_improvement/oof_ledger.py`
+- Create: `schemas/model_improvement/prediction_seal_v2.schema.json`
+- Create: `mlb_backtest/model_improvement/oof_ledger_v2.py`
 - Modify: `mlb_backtest/model_improvement/__init__.py`
 - Create: `tests/test_model_improvement_oof_ledger.py`
 
@@ -252,12 +381,12 @@ git commit -m "feat: admit common OOF feature seal bindings"
 
 ```python
 def test_baseline_prediction_seal_has_no_labels_and_binds_every_feature_row(self):
-    seal = seal_oof_predictions(
+    seal = seal_oof_predictions_v2(
         self.spec, self.gate, self.common_o19_seal, None,
         "baseline/v5.1/O19", self.baseline_rows,
     )
     self.assertEqual(seal.feature_seal_sha256, self.common_o19_seal.artifact_sha256)
-    self.assertEqual(load_prediction_rows(
+    self.assertEqual(load_prediction_rows_v2(
         self.spec, self.gate, self.common_o19_seal, None, seal),
         self.baseline_rows,
     )
@@ -265,12 +394,12 @@ def test_baseline_prediction_seal_has_no_labels_and_binds_every_feature_row(self
     self.assertFalse({"label", "outcome", "result", "won", "score"} & set(payload))
 
 def test_baseline_four_file_crash_recovery_has_only_final_seal_commit_point(self):
-    with patch("mlb_backtest.model_improvement.oof_ledger.write_immutable_bytes",
+    with patch("mlb_backtest.model_improvement.oof_ledger_v2.write_immutable_bytes",
                side_effect=OSError("row primary failure")):
         with self.assertRaises(OSError):
-            seal_oof_predictions(self.spec, self.gate, self.common_o19_seal, None,
+            seal_oof_predictions_v2(self.spec, self.gate, self.common_o19_seal, None,
                                  "baseline/v5.1/O19", self.baseline_rows)
-    paths = prediction_paths(self.spec, "baseline/v5.1/O19")
+    paths = prediction_paths_v2(self.spec, "baseline/v5.1/O19")
     self.assertTrue(paths.rows_sidecar.exists())
     self.assertTrue(paths.seal_sidecar.exists())
     self.assertFalse(paths.rows.exists())
@@ -287,19 +416,21 @@ relative, wrong-leaf path failure before `read_regular_bytes` is called.
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger -v`
 
-Expected: FAIL with `ModuleNotFoundError: mlb_backtest.model_improvement.oof_ledger`.
+Expected: FAIL with `ModuleNotFoundError: mlb_backtest.model_improvement.oof_ledger_v2`.
 
 - [ ] **Step 3: Implement the closed schema, exact identities, and baseline transaction.**
 
-Create the schema with exactly the two closed definitions from the approved
-spec: `prediction_row` has the 14 `PredictionRow.as_mapping()` fields and no
-result field; `prediction_seal` has exactly
+Create the V2 schema with exactly the two closed definitions from the approved
+spec: `prediction_row_v2` has the 15 `PredictionRowV2.as_mapping()` fields and
+no result field; `prediction_seal_v2` has exactly
 `schema`, `ledger_id`, `fold_id`, `model_id`, `candidate_id`,
 `run_spec_sha256`, `source_gate_sha256`, `feature_seal_sha256`,
 `prediction_contract_sha256`, `scoring_model_card_sha256`,
-`population_sha256`, `frozen_model_card_sha256`, `rows_sha256`.
+`calibration_card_sha256`, `population_sha256`, `frozen_model_card_sha256`,
+`rows_sha256`.
 
-In `oof_ledger.py`, make identity parsing and derived paths private and pure:
+In `oof_ledger_v2.py`, make identity parsing and derived paths private and pure;
+keep the published V1 module untouched:
 
 ```text
 @dataclass(frozen=True, slots=True)
@@ -309,10 +440,10 @@ class PredictionPaths:
     seal: Path
     seal_sidecar: Path
 
-prediction_paths(spec, ledger_id) -> PredictionPaths
-seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows) -> PredictionSeal
-load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256) -> PredictionSeal
-load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal) -> tuple[PredictionRow, ...]
+prediction_paths_v2(spec, ledger_id) -> PredictionPaths
+seal_oof_predictions_v2(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows) -> PredictionSealV2
+load_prediction_seal_v2(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256) -> PredictionSealV2
+load_prediction_rows_v2(spec, source_gate, feature_seal, baseline_replay, seal) -> tuple[PredictionRowV2, ...]
 ```
 
 Task8A rejects a non-`None` replay and all nonbaseline identities before a
@@ -324,10 +455,12 @@ load all rows through `load_sealed_feature_rows(spec, gate, (year,), seal)`.
 Require a one-for-one match of every feature row to every prediction row by
 game PK, official date, scheduled UTC, target year, and `feature_row_sha256`.
 
-For v5.1, secure-read `spec.baseline.card.path`, compare its raw digest to
-`spec.baseline.card.sha256`, validate the direct baseline card and exact
-RunSpec component weights, then require that digest in all prediction rows and
-the seal. Set `frozen_model_card_sha256=None`.
+For v5.1, secure-read the direct baseline weight authority and derive/reload
+the exact C19--C23 ProbabilityCalibrationCard before materializing any row.
+Compare the weight/card source gate/contract/pool/provenance bindings and use
+the card alpha/beta in `home_probability`; require its digest in every row and
+seal. `alpha=0,beta=1` and the global 2022--2024 calibration are rejection
+cases. Set `frozen_model_card_sha256=None`.
 
 Serialize rows exactly as:
 
@@ -352,22 +485,24 @@ JSONL, and reject an uncommitted row-primary orphan.
 
 - [ ] **Step 4: Run GREEN, schema validation, AST boundary test, and lint.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("schemas/model_improvement/prediction_seal.schema.json")))' && python3 -m ruff check mlb_backtest/model_improvement/oof_ledger.py mlb_backtest/model_improvement/contracts.py mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/sealed_features.py tests/test_model_improvement_oof_ledger.py`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("schemas/model_improvement/prediction_seal_v2.schema.json")))' && python3 -m ruff check mlb_backtest/model_improvement/oof_ledger_v2.py mlb_backtest/model_improvement/contracts.py mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/sealed_features.py tests/test_model_improvement_oof_ledger.py`
 
-Expected: PASS; the AST test confirms `oof_ledger.py` imports neither
+Expected: PASS; the AST test confirms `oof_ledger_v2.py` imports neither
 `outcomes`, `evaluation`, a metric evaluator, nor a legacy top-level pipeline.
+The calibration loader is an explicit typed authority and does not expose raw
+label rows to Task8.
 
 - [ ] **Step 5: Commit Task8A.**
 
 ```bash
-git add schemas/model_improvement/prediction_seal.schema.json \
-  mlb_backtest/model_improvement/oof_ledger.py \
+git add schemas/model_improvement/prediction_seal_v2.schema.json \
+  mlb_backtest/model_improvement/oof_ledger_v2.py \
   mlb_backtest/model_improvement/__init__.py \
   tests/test_model_improvement_oof_ledger.py
 git commit -m "feat: seal baseline label-free OOF predictions"
 ```
 
-### Task 3: Task6A — Seal an exact baseline replay receipt after baseline prediction publication
+### Task 4: Task6A — Seal an exact calibrated baseline replay receipt after prediction publication
 
 **Files:**
 - Create: `schemas/model_improvement/baseline_replay_receipt.schema.json`
@@ -380,7 +515,7 @@ git commit -m "feat: seal baseline label-free OOF predictions"
 ```python
 def test_replay_receipt_is_published_only_after_matching_baseline_prediction(self):
     receipt = replay_v51_predictions(self.spec, self.gate, self.common_o19_seal)
-    seal = load_prediction_seal(self.spec, self.gate, self.common_o19_seal, None,
+    seal = load_prediction_seal_v2(self.spec, self.gate, self.common_o19_seal, None,
                                 receipt.prediction_seal_path,
                                 receipt.prediction_seal_sha256)
     self.assertEqual(receipt.feature_seal_sha256, self.common_o19_seal.artifact_sha256)
@@ -407,7 +542,9 @@ Expected: FAIL with `ModuleNotFoundError: mlb_backtest.model_improvement.baselin
 
 - [ ] **Step 3: Implement the receipt type, schema, replay, and secure loader.**
 
-Define the frozen descriptor exactly:
+Define the V2 frozen descriptor exactly; the canonical payload field `schema`
+is the literal `MODEL_IMPROVEMENT_BASELINE_REPLAY_RECEIPT_V2` and the runtime
+descriptor-only fields `artifact_sha256` and `path` are excluded from it:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -422,6 +559,8 @@ class BaselineReplayReceipt:
     feature_seal_sha256: str
     prediction_contract_sha256: str
     scoring_model_card_sha256: str
+    calibration_card_path: str
+    calibration_card_sha256: str
     population_sha256: str
     replay_one_rows_sha256: str
     replay_two_rows_sha256: str
@@ -436,13 +575,17 @@ class BaselineReplayReceipt:
 
 `replay_v51_predictions(spec, source_gate, feature_seal)` accepts only a
 Common Task8 fold. It securely loads the source gate/FeatureSeal/feature rows,
-materializes two independent in-memory v5.1 `tuple[PredictionRow, ...]`
-streams from the direct RunSpec card, compares canonical bytes, each mapping,
-row digest and population digest exactly, then calls Task8A exactly once:
+the direct weight authority, and the exact pre-target
+`ProbabilityCalibrationCard`; it materializes two independent in-memory v5.1
+`tuple[PredictionRowV2, ...]` streams using that card's alpha/beta, compares
+canonical bytes, each mapping, row digest and population digest exactly, then
+calls `seal_oof_predictions_v2` exactly once. The receipt repeats the derived calibration path
+and digest and its loader secure-reloads the card before replaying either
+stream. A V1 baseline seal/receipt is inadmissible.
 
 ```python
-seal = seal_oof_predictions(spec, gate, common_feature_seal, None,
-                            f"baseline/v5.1/{fold_id}", replay_one_rows)
+seal = seal_oof_predictions_v2(spec, gate, common_feature_seal, None,
+                               f"baseline/v5.1/{fold_id}", replay_one_rows)
 ```
 
 Derive only `baseline/v5.1/{fold}/baseline_replay_receipt.json` under the
@@ -455,7 +598,8 @@ receipt binding, including both equal replay stream digests.
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_baseline_replay tests.test_model_improvement_oof_ledger tests.test_model_improvement_contracts tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_canonical -v && python3 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("schemas/model_improvement/baseline_replay_receipt.schema.json")))' && python3 -m ruff check mlb_backtest/model_improvement/baseline_replay.py tests/test_model_improvement_baseline_replay.py`
 
-Expected: PASS; an immutable baseline seal is a prerequisite and its replay receipt is the only Task6A commit point.
+Expected: PASS; an immutable calibrated baseline V2 seal is a prerequisite and
+its replay receipt is the only Task6A commit point.
 
 - [ ] **Step 5: Commit Task6A.**
 
@@ -467,10 +611,14 @@ git add schemas/model_improvement/baseline_replay_receipt.schema.json \
 git commit -m "feat: seal baseline replay receipts"
 ```
 
-### Task 4: Task8B — Admit nonbaseline seals only through same-fold replay and card authority
+### Task 5: Task8B — Calibrate and admit nonbaseline seals through same-fold replay and card authority
 
 **Files:**
-- Modify: `mlb_backtest/model_improvement/oof_ledger.py`
+- Modify: `schemas/model_improvement/probability_calibration_card.schema.json`
+- Modify: `schemas/model_improvement/prediction_seal_v2.schema.json`
+- Modify: `schemas/model_improvement/scoring_model_card.schema.json`
+- Modify: `mlb_backtest/model_improvement/probability_calibration.py`
+- Modify: `mlb_backtest/model_improvement/oof_ledger_v2.py`
 - Modify: `mlb_backtest/model_improvement/__init__.py`
 - Modify: `tests/test_model_improvement_oof_ledger.py`
 
@@ -478,22 +626,22 @@ git commit -m "feat: seal baseline replay receipts"
 
 ```python
 def test_lane_a_requires_same_fold_baseline_replay_and_derived_card(self):
-    seal = seal_oof_predictions(self.spec, self.gate, self.common_h22_seal,
+    seal = seal_oof_predictions_v2(self.spec, self.gate, self.common_h22_seal,
                                 self.h22_replay, "lane_a/A/H22", self.a_rows)
     self.assertEqual(seal.feature_seal_sha256, self.common_h22_seal.artifact_sha256)
     for bad in (None, self.h23_replay):
         with self.assertRaises(ValueError):
-            seal_oof_predictions(self.spec, self.gate, self.common_h22_seal,
+            seal_oof_predictions_v2(self.spec, self.gate, self.common_h22_seal,
                                  bad, "lane_a/A/H22", self.a_rows)
 
 def test_lane_c_uses_its_own_feature_digest_and_verified_common_parent(self):
-    seal = seal_oof_predictions(self.spec, self.gate, self.lane_c_h22_seal,
+    seal = seal_oof_predictions_v2(self.spec, self.gate, self.lane_c_h22_seal,
                                 self.h22_replay, "lane_c/A+B+C/H22", self.c_rows)
     self.assertEqual(seal.feature_seal_sha256, self.lane_c_h22_seal.artifact_sha256)
     self.assertNotEqual(seal.feature_seal_sha256, self.h22_replay.feature_seal_sha256)
 ```
 
-Cover wrong Task7 path/digest/model/lane/fold/candidate/card contract,
+Cover missing candidate calibration, wrong Task7 path/digest/model/lane/fold/candidate/card contract,
 baseline-replay descriptor forgery, direct Lane-C-to-baseline digest equality,
 wrong parent Common seal, reordered or different-year Lane-C rows, all H24
 identities, and reload-time failure after any prerequisite mutation.
@@ -506,7 +654,7 @@ Expected: FAIL because Task8A rejects every nonbaseline ledger.
 
 - [ ] **Step 3: Extend only the Task8 identity/card/replay admission branch.**
 
-Extend `prediction_paths` to admit precisely:
+Extend `prediction_paths_v2` to admit precisely:
 
 ```text
 lane_a/A/{O19..O23,H22,H23}
@@ -521,7 +669,14 @@ digest and compare full descriptor values. Derive the Task7 scoring-card path
 from identity and call `load_scoring_model_card(spec, derived_path, digest)`;
 never accept a card path. Require the loaded card's model/lane/fold/candidate,
 RunSpec, source gate, contract, feature seal, and
-`baseline_replay_sha256 == replay.artifact_sha256` to match.
+`baseline_replay_sha256 == replay.artifact_sha256` to match. Require the
+Task7 scoring-card schema and runtime contract to make
+`calibration_card_sha256` non-null. Derive, not accept, the matching
+candidate-specific ProbabilityCalibrationCard path; revalidate its
+candidate/model/lane/fold, source gate, contract, weight-authority, strict
+pre-target pool, GameEvidence/feature provenance, and fit before calculating
+any candidate probability. Baseline calibration reuse after a weight change is
+an error.
 
 Use this exact compatibility branch:
 
@@ -547,20 +702,24 @@ both public loaders.
 
 - [ ] **Step 4: Run GREEN and focused regressions.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_scoring_cards tests.test_model_improvement_sealed_features tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_source_gate tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement/oof_ledger.py tests/test_model_improvement_oof_ledger.py && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_scoring_cards tests.test_model_improvement_sealed_features tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_source_gate tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement/oof_ledger_v2.py tests/test_model_improvement_oof_ledger.py && git diff --check`
 
 Expected: PASS; nonbaseline output requires a same-fold replay and a derived scoring card, while Task8 stays label-free.
 
 - [ ] **Step 5: Commit Task8B.**
 
 ```bash
-git add mlb_backtest/model_improvement/oof_ledger.py \
+git add schemas/model_improvement/probability_calibration_card.schema.json \
+  schemas/model_improvement/prediction_seal_v2.schema.json \
+  schemas/model_improvement/scoring_model_card.schema.json \
+  mlb_backtest/model_improvement/probability_calibration.py \
+  mlb_backtest/model_improvement/oof_ledger_v2.py \
   mlb_backtest/model_improvement/__init__.py \
   tests/test_model_improvement_oof_ledger.py
 git commit -m "feat: bind nonbaseline OOF seals to replay evidence"
 ```
 
-### Task 5: Task6B — Derive and seal the one baseline outcome receipt per fold
+### Task 6: Task6B — Derive and seal the one baseline outcome receipt per fold
 
 **Files:**
 - Create: `schemas/model_improvement/outcome_receipt.schema.json`
@@ -689,7 +848,7 @@ git add schemas/model_improvement/outcome_receipt.schema.json \
 git commit -m "feat: seal authenticated model improvement outcomes"
 ```
 
-### Task 6: Task6B — Persist receipt-bound reports and an evaluation pair
+### Task 7: Task6B — Persist receipt-bound reports and an evaluation pair
 
 **Files:**
 - Create: `schemas/model_improvement/evaluation_report.schema.json`
@@ -772,7 +931,7 @@ git add schemas/model_improvement/evaluation_report.schema.json \
 git commit -m "feat: persist receipt-bound model evaluations"
 ```
 
-### Task 7: Final focused package/export and downstream contract verification
+### Task 8: Final focused package/export and downstream contract verification
 
 **Files:**
 - Modify: `mlb_backtest/model_improvement/__init__.py`
@@ -782,15 +941,15 @@ git commit -m "feat: persist receipt-bound model evaluations"
 - [ ] **Step 1: Write RED export and import-boundary assertions.**
 
 ```python
-def test_task8_exports_only_label_free_prediction_surface(self):
+def test_task8_exports_only_v2_label_free_prediction_surface(self):
     exported = set(model_improvement.__all__)
-    self.assertTrue({"PredictionSeal", "seal_oof_predictions", "load_prediction_seal",
-                     "load_prediction_rows"} <= exported)
+    self.assertTrue({"PredictionSealV2", "seal_oof_predictions_v2", "load_prediction_seal_v2",
+                     "load_prediction_rows_v2"} <= exported)
     self.assertFalse({"JoinedLedger", "join_oof_outcomes", "load_joined_ledger",
                       "load_joined_prediction_rows"} & exported)
 
-def test_task8_module_has_no_outcome_or_metric_import(self):
-    tree = ast.parse(Path(oof_ledger.__file__).read_text(encoding="utf-8"))
+def test_task8_v2_module_has_no_outcome_or_metric_import(self):
+    tree = ast.parse(Path(oof_ledger_v2.__file__).read_text(encoding="utf-8"))
     imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     self.assertFalse({".outcomes", ".evaluation"} & imported)
 ```
@@ -803,19 +962,22 @@ Expected: FAIL until package exports omit superseded labelled interfaces and the
 
 - [ ] **Step 3: Export the finalized public surface once.**
 
-Export `PredictionSeal`, Task8's three functions, `BaselineReplayReceipt` and
-its two functions, `OutcomeRow`, `OutcomeReceipt` and three outcome functions,
-and `EvaluationReport`, `EvaluationPair`, `evaluate_predictions`,
-`load_evaluation_report`, `load_evaluation_pair`. Do not export internal path
-parsers, source inventory parsers, raw JSONL readers, or any labelled ledger
+Export `ProbabilityCalibrationCard` and
+`load_probability_calibration_card`; `PredictionSealV2`, Task8's three V2
+functions; `BaselineReplayReceipt` and its two functions; `OutcomeRow`,
+`OutcomeReceipt` and three outcome functions; and `EvaluationReport`,
+`EvaluationPair`, `evaluate_predictions`, `load_evaluation_report`,
+`load_evaluation_pair`. Do not export internal path parsers, source inventory
+parsers, raw JSONL readers, calibration-row writers, or any labelled ledger
 API. Keep the `TYPE_CHECKING` import from `baseline_replay` out of Task8
 runtime imports.
 
 - [ ] **Step 4: Run the final focused validation.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_outcomes tests.test_model_improvement_evaluation tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement tests/test_model_improvement_oof_ledger.py tests/test_model_improvement_baseline_replay.py tests/test_model_improvement_outcomes.py tests/test_model_improvement_evaluation.py && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_normalize tests.test_model_improvement_probability_calibration tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_outcomes tests.test_model_improvement_evaluation tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement mlb_backtest/normalize.py tests/test_normalize.py tests/test_model_improvement_probability_calibration.py tests/test_model_improvement_oof_ledger.py tests/test_model_improvement_baseline_replay.py tests/test_model_improvement_outcomes.py tests/test_model_improvement_evaluation.py && git diff --check`
 
-Expected: PASS; all four stages remain independently covered and no full suite is started.
+Expected: PASS; Task6P plus all four Task8A/Task6A/Task8B/Task6B stages
+remain independently covered and no full suite is started.
 
 - [ ] **Step 5: Commit the final public API check.**
 
@@ -828,14 +990,17 @@ git commit -m "test: lock staged model improvement public boundaries"
 
 ## Self-review
 
-**Spec coverage:** Task 0 repairs every named stale plan. Tasks 1–2 cover
-Common OOF feature admission, all seven Task8 fold/year pairs, the required
-`PredictionSeal.feature_seal_sha256`, baseline-only four-file seals, and the
-sole row loader. Task 3 binds replay only after the matching baseline seal.
-Task 4 covers derived nonbaseline cards and both Common/Lane-C compatibility
-relations. Tasks 5–6 cover SourceInventory-to-GameEvidence authentication,
+**Spec coverage:** Task 0 repairs every named stale plan. Task 1 establishes
+the only pre-target probability-calibration authority, including the five
+baseline pools and its missing-authority block. Tasks 2–3 cover Common OOF
+feature admission, all seven Task8 fold/year pairs, V2
+`PredictionSealV2.feature_seal_sha256`/`calibration_card_sha256`, calibrated
+baseline four-file seals, and the sole row loader. Task 4 binds replay only
+after the matching V2 baseline seal. Task 5 covers Task7-card-gated,
+candidate-specific pre-target calibration and both Common/Lane-C compatibility
+relations. Tasks 6–7 cover SourceInventory-to-GameEvidence authentication,
 all forbidden evidence states, one baseline receipt per fold, receipt-bound
-reports/pairs, and final receipt provenance. Task 7 locks package exposure and
+reports/pairs, and final receipt provenance. Task 8 locks package exposure and
 the no-outcomes-in-Task8 boundary.
 
 **Placeholder scan:** This plan intentionally contains no `TODO`, `TBD`,
@@ -844,13 +1009,15 @@ function body disguised as an implementation sketch. Each implementation
 step states the exact validation, input authority, byte preimage, and
 persistence order required of the named function.
 
-**Type consistency:** `PredictionSeal.feature_seal_sha256` is introduced in
-Task 1 and used in all later stages. Every Task8 caller uses
-`(spec, source_gate, feature_seal, baseline_replay, path_or_identity)`; Task6B outcome
-loaders use the same authenticated prerequisite quartet; evaluation consumes a
-typed `OutcomeReceipt`, never labels. The Task8 target-year mapping is the
-only OOF-year authority, and `ModelImprovementRunSpec.fold()` remains
-H22/H23/H24-only.
+**Type consistency:** `ProbabilityCalibrationCard` is introduced in Task 1;
+V2 `PredictionSealV2.feature_seal_sha256` and `calibration_card_sha256` are
+introduced in Tasks 2–3 and used in all later stages. Every Task8 caller uses
+`(spec, source_gate, feature_seal, baseline_replay, path_or_identity)`; the
+calibration loader derives its authority from that identity and accepts no
+caller path or outcomes. Task6B outcome loaders use the same authenticated
+prerequisite quartet; evaluation consumes a typed `OutcomeReceipt`, never
+labels. The Task8 target-year mapping is the only OOF-year authority, and
+`ModelImprovementRunSpec.fold()` remains H22/H23/H24-only.
 
 **Known implementation dependency:** Task6B must call the typed
 `SourceInventory` parser corresponding to the current
