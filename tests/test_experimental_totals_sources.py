@@ -120,12 +120,11 @@ def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> Sourc
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     _write(root, payload_relative, payload)
     _write(root, manifest_relative, manifest_bytes)
-    if binding.binding_role == "HISTORY_SCHEDULE":
-        _write(
-            root,
-            manifest_relative.with_name(manifest_relative.name[:-5] + ".sha256"),
-            f"{manifest_digest}\n".encode(),
-        )
+    _write(
+        root,
+        manifest_relative.with_name(manifest_relative.name[:-5] + ".sha256"),
+        f"{manifest_digest}\n".encode(),
+    )
 
     values = asdict(binding)
     values["manifest_sha256"] = manifest_digest
@@ -347,6 +346,22 @@ class TotalsSourcesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected sidecar"):
             load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
+    def test_loader_requires_live_manifest_sidecar(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        report = json.loads(fixture.report.read_text())
+        live = next(
+            item for item in report["source_bindings"] if item["binding_role"] == "LIVE_SCHEDULE"
+        )
+        payload = Path(live["payload_relative"])
+        query_digest = hashlib.sha256(live["query_identity_json"].encode()).hexdigest()
+        manifest = payload.with_name(f"{live['payload_sha256']}.{query_digest}.manifest.json")
+        (self.root / manifest.with_name(manifest.name[:-5] + ".sha256")).unlink()
+
+        with self.assertRaisesRegex(ValueError, "schedule manifest"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
     def test_loader_rejects_authenticated_non_mlb_request(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
@@ -444,8 +459,7 @@ class TotalsSourcesTests(unittest.TestCase):
             query_digest = hashlib.sha256(binding["query_identity_json"].encode()).hexdigest()
             manifest = payload.with_name(f"{binding['payload_sha256']}.{query_digest}.manifest.json")
             targets.extend((payload, manifest))
-            if role == "HISTORY_SCHEDULE":
-                targets.append(manifest.with_name(manifest.name[:-5] + ".sha256"))
+            targets.append(manifest.with_name(manifest.name[:-5] + ".sha256"))
 
         for target in targets:
             with self.subTest(component=target):

@@ -326,15 +326,13 @@ def _admit_binding(
     completion = _read(trusted, completion_relative, "schedule receipt completion")
     completion_sidecar = _read(trusted, completion_sidecar_relative, "schedule receipt completion seal", max_bytes=_SHA256_BYTES)
     manifest = _read(trusted, manifest_relative, "schedule manifest")
-    manifest_sidecar = (
-        _read(trusted, manifest_sidecar_relative, "schedule manifest seal", max_bytes=_SHA256_BYTES)
-        if binding.binding_role == _HISTORY_ROLE
-        else None
+    manifest_sidecar = _read(
+        trusted, manifest_sidecar_relative, "schedule manifest seal", max_bytes=_SHA256_BYTES
     )
     payload = _read(trusted, payload_relative, "schedule payload")
-    required = (claim, receipt, completion, completion_sidecar, manifest, payload)
+    required = (claim, receipt, completion, completion_sidecar, manifest, manifest_sidecar, payload)
     if binding.binding_role == _HISTORY_ROLE:
-        required += (receipt_sidecar, manifest_sidecar)
+        required += (receipt_sidecar,)
     if any(item is None for item in required):
         raise ValueError("schedule receipt chain is incomplete")
     assert claim is not None and receipt is not None and completion is not None
@@ -367,9 +365,8 @@ def _admit_binding(
     }
     if manifest_value != expected_manifest or _snapshot_digest(manifest) != binding.manifest_sha256:
         raise ValueError("schedule manifest differs")
-    if binding.binding_role == _HISTORY_ROLE:
-        assert manifest_sidecar is not None
-        _require_sidecar(manifest_sidecar, binding.manifest_sha256, "schedule manifest seal")
+    assert manifest_sidecar is not None
+    _require_sidecar(manifest_sidecar, binding.manifest_sha256, "schedule manifest seal")
 
     receipt_digest = _snapshot_digest(receipt)
     if receipt_digest != binding.receipt_sha256:
