@@ -25,7 +25,7 @@ from mlb_backtest.daily_totals import (
     validate_totals_report,
 )
 from mlb_backtest.daily_totals import _per_game_coverage
-from mlb_backtest.experimental_totals import FinalTotalGame, TotalProjection
+from mlb_backtest.experimental_totals import FinalTotalGame, TargetTotalGame, TotalProjection
 from mlb_backtest.experimental_totals import CANDIDATE_IDS
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
 
@@ -125,6 +125,13 @@ def make_valid_report_payload() -> dict[str, object]:
 
 def _recontent(payload: dict[str, object]) -> None:
     payload["content_sha256"] = _sha({key: value for key, value in payload.items() if key != "content_sha256"})
+
+
+def _prediction_rows(candidate: str, start_pk: int, count: int, day: str) -> tuple[tuple[FinalTotalGame, TotalProjection], ...]:
+    return tuple(
+        (FinalTotalGame(start_pk + index, day, f"{day}T16:00:00Z", 2, 3, 4, 3, 4), TotalProjection("PROJECTED", candidate, 3.0, 4.0, 7.0))
+        for index in range(count)
+    )
 
 
 class DailyTotalsContractTests(unittest.TestCase):
@@ -320,6 +327,42 @@ class DailyTotalsContractTests(unittest.TestCase):
             self.assertEqual(loader.call_args.args[0], root)
             self.assertEqual(loader.call_args.args[2], Path("reports/experimental_daily/2026-09-01/source.json"))
             self.assertEqual(walk.call_args.args[2:], ("2026-06-01", "2026-07-31"))
+
+    def test_build_rejects_under_minimum_final_after_exact_final_window(self) -> None:
+        development = {candidate: _prediction_rows(candidate, 1, 100, "2026-06-01") for candidate in CANDIDATE_IDS}
+        final = {"LEAGUE_30": _prediction_rows("LEAGUE_30", 1001, 99, "2026-08-01")}
+        bundle = SimpleNamespace(target_date="2026-09-01", cutoff_date="2026-08-31", history_games=(), target_games=(), history_identity=_source("HISTORY_SCHEDULE"), live_identity=_source("LIVE_SCHEDULE"))
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / "reports/experimental_daily/2026-09-01/source.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=bundle), patch("mlb_backtest.daily_totals.walk_forward_predictions", side_effect=(development, final)) as walk, patch("mlb_backtest.daily_totals.select_candidate", return_value="LEAGUE_30") as select:
+                with self.assertRaisesRegex(ValueError, "final evaluation requires at least 100"):
+                    build_daily_totals(root, "2026-09-01", Path("reports/experimental_daily/2026-09-01/source.json"))
+            select.assert_called_once_with(development)
+            self.assertEqual(walk.call_args_list[1].args[1:], (("LEAGUE_30",), "2026-08-01", "2026-08-31"))
+            self.assertFalse((root / "audit").exists())
+            self.assertFalse((root / "reports/experimental_daily_totals").exists())
+
+    def test_build_selects_once_and_preserves_every_target_in_chronological_order(self) -> None:
+        development = {candidate: _prediction_rows(candidate, 1, 100, "2026-06-01") for candidate in CANDIDATE_IDS}
+        final = {"LEAGUE_30": _prediction_rows("LEAGUE_30", 1001, 100, "2026-08-01")}
+        targets = (TargetTotalGame(20, "2026-09-01", "2026-09-01T18:00:00Z", 2, 3, 4), TargetTotalGame(10, "2026-09-01", "2026-09-01T16:00:00Z", 5, 6, 7))
+        bundle = SimpleNamespace(target_date="2026-09-01", cutoff_date="2026-08-31", history_games=(), target_games=targets, history_identity=SimpleNamespace(payload_sha256="3" * 64), live_identity=SimpleNamespace(payload_sha256="3" * 64))
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / "reports/experimental_daily/2026-09-01/source.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            projection = TotalProjection("PROJECTED", "LEAGUE_30", 3.0, 4.0, 7.0)
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=bundle), patch("mlb_backtest.daily_totals.walk_forward_predictions", side_effect=(development, final)) as walk, patch("mlb_backtest.daily_totals.select_candidate", return_value="LEAGUE_30") as select, patch("mlb_backtest.daily_totals.project_game", return_value=projection), patch("mlb_backtest.daily_totals._source_identity", side_effect=(_source("HISTORY_SCHEDULE"), _source("LIVE_SCHEDULE"))):
+                built = build_daily_totals(root, "2026-09-01", Path("reports/experimental_daily/2026-09-01/source.json"))
+            select.assert_called_once_with(development)
+            self.assertEqual(len(walk.call_args_list), 2)
+            self.assertEqual(walk.call_args_list[0].args[2:], ("2026-06-01", "2026-07-31"))
+            self.assertEqual(walk.call_args_list[1].args[1:], (("LEAGUE_30",), "2026-08-01", "2026-08-31"))
+            self.assertEqual([row["game_pk"] for row in built.report["games"]], [10, 20])
 
 
 if __name__ == "__main__":
