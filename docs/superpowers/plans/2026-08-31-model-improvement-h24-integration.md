@@ -4,9 +4,11 @@
 
 **Goal:** Seal the outputs of the common, Lane A, Lane B, and optional Lane C workflows before any H24 label access, execute one identical-population H24 comparison, and emit an immutable promotion or `NO_PROMOTION` decision without modifying the v5.1 card.
 
-**Architecture:** A pre-outcome registry module validates and seals the required `v5.1` baseline plus only the qualified optional definitions (`A`, `A+B`, `A+B+C`). A prediction-only module scores and ranks H24 without importing outcomes. A separate outcome-capable module opens H24 labels exactly once after every prediction seal exists, computes common metrics, and writes the final decision. An append-only phase ledger makes premature label access, post-freeze mutation, duplicate H24 execution, and same-registry retry after `OUTCOMES_OPENED` fail closed.
+**Architecture:** A pre-outcome registry module validates and seals the required `v5.1` baseline plus only the qualified optional definitions (`A`, `A+B`, `A+B+C`). A prediction-only module scores and ranks H24 without importing outcomes. A separate outcome-capable module opens the typed H24 `OutcomeReceipt` exactly once after every prediction seal exists, computes common metrics, and writes the final decision. An append-only phase ledger makes premature outcome access, post-freeze mutation, duplicate H24 execution, and same-registry retry after `OUTCOMES_OPENED` fail closed.
 
 **Tech Stack:** Python 3.11 standard library, existing `mlb_backtest` scoring/normalization/diagnostic primitives, canonical JSON and SHA-256 artifacts, `unittest`, Ruff, Git.
+
+H24 consumes the shared staged contract in this order: **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. Prediction seals are created and loaded only through `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Task6B supplies typed `OutcomeReceipt` values; common evaluation is exactly `evaluate_predictions(spec, candidate, baseline, outcome_receipt)`.
 
 ---
 
@@ -269,7 +271,7 @@ def authorize_h24_outcome_open(
 - [ ] Run the controller suite and confirm all phase and crash-point tests pass.
 - [ ] Commit with `git commit -m "feat: enforce one-shot h24 phase ledger"`.
 
-### Task 5: Join H24 outcomes on the sealed population
+### Task 5: Materialize the H24 outcome receipt for the sealed population
 
 **Files:**
 - Create: `mlb_backtest/model_improvement/h24_outcomes.py`
@@ -277,13 +279,13 @@ def authorize_h24_outcome_open(
 - Create: `tests/fixtures/model_improvement/h24/outcomes.jsonl`
 - Create: `schemas/model_improvement/h24_comparison.schema.json`
 
-- [ ] Add a failing test that calls `join_h24_outcomes(capability, prediction_manifest, outcome_rows)` and expects exactly one binary home-win label for every eligible `game_pk` and every registered model.
+- [ ] Add a failing test that calls the H24 outcome-receipt producer with the registry capability and prediction manifest, and expects exactly one binary home-win observation for every eligible `game_pk` and every registered model.
 - [ ] Add failure cases for a missing/extra/duplicate outcome, nonbinary label, game postponement ambiguity, population mismatch, prediction digest mismatch, no capability, reused capability, and any 2025 row.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_outcomes -v` and confirm RED.
 - [ ] Implement:
 
 ```python
-def join_h24_outcomes(
+def seal_h24_outcome_receipt(
     capability: OutcomeCapability,
     prediction_manifest: H24PredictionManifest,
     outcome_rows: Sequence[H24OutcomeRow],
@@ -299,7 +301,7 @@ def evaluate_h24_models(
     """Call Common evaluation for each registered candidate and bind its pair."""
 ```
 
-- [ ] Materialize the authenticated labels once, then call Common `evaluate_predictions(spec, source_gate, candidate_prediction_seal, baseline_prediction_seal, outcomes)` for every nonbaseline registry candidate. `H24Comparison` is a registry-level index, not another evaluator: it stores each candidate's `ledger_id`, `candidate_id`, `EvaluationPair` path/digest, and named candidate/baseline report digests. It must not implement its own Brier, log loss, rank-one pairing, neutral-date handling, or label coercion. Common owns the full-precision all-game metrics, independently selected date pairs, and maximum losing streak.
+- [ ] Materialize the authenticated `OutcomeReceipt` once, then call Common `evaluate_predictions(spec, candidate_prediction_seal, baseline_prediction_seal, outcome_receipt)` for every nonbaseline registry candidate. `H24Comparison` is a registry-level index, not another evaluator: it stores each candidate's `ledger_id`, `candidate_id`, `EvaluationPair` path/digest, and named candidate/baseline report digests. It must not implement its own Brier, log loss, rank-one pairing, neutral-date handling, or observation coercion. Common owns the full-precision all-game metrics, independently selected date pairs, and maximum losing streak. Every downstream frozen-card consumer securely loads the `EvaluationPair` and checks its `outcome_receipt_path` and `outcome_receipt_sha256`; `outcomes_sha256` alone is never sufficient.
 - [ ] Store raw integer counts, full-precision metric values, signed deltas versus v5.1, and only pair-derived digests. Reject rounded values as gate inputs, and reject a pair whose candidate ID/ledger ID differs from the registry record.
 - [ ] Implement the closed comparison schema and canonical bytes/sidecar writer.
 - [ ] Run the outcome suite and confirm valid results pass and every population/capability violation fails.
@@ -372,7 +374,7 @@ Expected: all tests pass, no skipped contract or leakage test.
 ## Completion criteria
 
 - The pre-H24 registry binds all present candidates, each candidate's exact H24 feature seal, and an explicit Lane C presence/absence disposition.
-- Every registered model has an H24 prediction seal over the same population before labels open.
+- Every registered model has an H24 prediction seal over the same population before the outcome receipt opens.
 - Outcome access is one-shot and impossible before prediction sealing.
 - The final comparison uses all-game probability metrics and date-paired Daily Top-1 metrics as specified.
 - `NO_PROMOTION` is a successful, valid terminal decision.

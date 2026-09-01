@@ -12,6 +12,8 @@
 
 ## Scope and shared interfaces
 
+Lane C follows the canonical staged order **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. Its prediction boundary uses `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Evaluation uses the typed `OutcomeReceipt` and `evaluate_predictions(spec, candidate, baseline, outcome_receipt)` only.
+
 The approved design is `docs/superpowers/specs/2026-08-31-parallel-model-result-improvement-design.md`. H22 (2022) is development, H23 (2023) is selection, and H24 (2024) is prediction-only here. Lane C cannot read any outcomes, H24 outcomes, odds, final-state substitutions, or production/live paths.
 
 The following names are owned by Common/Lane A and are dependencies, not new Lane C types:
@@ -32,6 +34,12 @@ from mlb_backtest.model_improvement.run_spec import (
 from mlb_backtest.model_improvement.source_gate import (
     SourceGateReceipt, load_source_gate_receipt, require_source_gate,
 )
+from mlb_backtest.model_improvement.baseline_replay import BaselineReplayReceipt
+from mlb_backtest.model_improvement.oof_ledger import (
+    load_prediction_rows, load_prediction_seal, seal_oof_predictions,
+)
+from mlb_backtest.model_improvement.outcomes import OutcomeReceipt, load_outcome_receipt
+from mlb_backtest.model_improvement.evaluation import EvaluationPair, evaluate_predictions
 from mlb_backtest.model_improvement.sealed_features import (
     FeatureSeal, load_feature_seal, load_sealed_feature_rows,
 )
@@ -966,7 +974,6 @@ from mlb_backtest.model_improvement.scoring_cards import (
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json,
 )
-from mlb_backtest.model_improvement.evaluation import EvaluationPair
 from mlb_backtest.model_improvement.lane_c_contracts import (
     CoverageKey, LaneCObservation, LaneCSourceContract, observation_sha256,
     validate_observation,
@@ -975,7 +982,6 @@ from mlb_backtest.model_improvement.lane_c_coverage import LaneCCoverageReport, 
 from mlb_backtest.model_improvement.lane_c_replay import (
     LaneCReplayReceipt, load_replay_receipt,
 )
-from mlb_backtest.model_improvement.oof_ledger import seal_oof_predictions
 from mlb_backtest.model_improvement.lane_disposition import LANE_IDS, LaneDisposition, seal_lane_disposition
 from mlb_backtest.model_improvement.run_spec import ModelImprovementRunSpec, run_spec_sha256
 from mlb_backtest.model_improvement.sealed_features import (
@@ -1385,6 +1391,9 @@ def materialize_lane_c_prediction_rows(
 
 def seal_lane_c_fold_prediction(
     spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
+    feature_seal: FeatureSeal,
+    baseline_replay: BaselineReplayReceipt,
     fold_id: str,
     rows: tuple[PredictionRow, ...],
 ) -> PredictionSeal:
@@ -1402,9 +1411,11 @@ def seal_lane_c_fold_prediction(
         )
     ):
         raise ValueError("Lane C materialized prediction rows violate fold or contract binding")
-    # No FeatureSeal/Card/outcome argument is accepted here: materialization above is
-    # the sole scorer and the Common sealer owns all row/seal binding and persistence.
-    return seal_oof_predictions(spec, f"lane_c/A+B+C/{fold_id}", rows)
+    # Task8 owns persistence; no raw outcome mapping is accepted here.
+    return seal_oof_predictions(
+        spec, source_gate, feature_seal, baseline_replay,
+        f"lane_c/A+B+C/{fold_id}", rows,
+    )
 
 def build_lane_c_fold_result(
     spec: ModelImprovementRunSpec,
@@ -1555,9 +1566,9 @@ def build_lane_c_fold_result(
 
 For every row, the materializer applies the exact Common `prediction_contract`: its declared weighted home-minus-away edge formula, declared weighted minimum-quality completeness formula, declared `scoring.confidence_score` call (including signed starter/offense/bullpen agreement and all retained component qualities), frozen normalization clip `[0.10, 0.90]`, and exact `home`/`away`/`none` pick rule. It calls the Common confidence helper and validates the returned 0–10 value, carries the sealed `starter_edge_abs` and `feature_row_sha256`, sets `model_id="A+B+C"`, and populates `prediction_contract_sha256=spec.prediction_contract_sha256` and `scoring_model_card_sha256=verified_card.artifact_sha256`. It emits no label/outcome field. It ranks only non-neutral rows using Common `rank_daily` by the RunSpec tie order—`pick_probability desc`, `confidence desc`, `starter_edge_abs desc`, `scheduled_start_utc asc`, `game_pk asc`—assigns neutral rows rank `0`, and returns one deterministic `(official_date, scheduled_start_utc, game_pk)` ordered, unique game population.
 
-`seal_lane_c_fold_prediction(spec, fold_id, rows)` accepts only that already materialized `tuple[PredictionRow, ...]`; it may validate the fold/model/universal-contract/unique-game invariants, but takes no FeatureSeal, card, raw row, calibration, or outcome argument and performs no scoring. It delegates persistence only to Common `seal_oof_predictions`, which writes exactly `oof/lane_c/A+B+C/{fold_id}/prediction_seal.json`; both H22 and H23 `PredictionSeal.frozen_model_card_sha256` values are `None`.
+`seal_lane_c_fold_prediction(spec, source_gate, feature_seal, baseline_replay, fold_id, rows)` accepts only that already materialized `tuple[PredictionRow, ...]`; it may validate the fold/model/universal-contract/unique-game invariants, but takes no raw outcome mapping and performs no scoring. It delegates persistence only to Common `seal_oof_predictions`, which writes exactly `oof/lane_c/A+B+C/{fold_id}/prediction_seal.json`; both H22 and H23 `PredictionSeal.frozen_model_card_sha256` values are `None`.
 
-The external Lane C controller is the sole evaluation orchestrator: after sealing the lane-C prediction and obtaining the matching baseline prediction plus authenticated outcomes, it calls Common `evaluate_predictions(spec, source_gate, lane_c_prediction, baseline_prediction, outcomes)`, securely loads the resulting `EvaluationPair`, and passes that already loaded pair to `build_lane_c_fold_result`. `build_lane_c_fold_result()` never calls the evaluator or accepts outcomes/baseline inputs; it is the downstream disposition/final-card boundary and always calls `seal_lane_disposition` rather than directly constructing `LaneDisposition`. Before consuming its pair it requires pair and both named report `source_gate_sha256` values to equal the supplied `source_gate.artifact_sha256`, then checks the RunSpec, ledger, candidate, fold, model, and prediction bindings. With `fold_id="H22"`, it permits only the externally evaluated development result and returns no `FrozenModelCard`; its H22 scoring card, prediction seal, and pair cannot be substituted into or referenced by the final A+B+C card. With `fold_id="H23"`, it requires H22/H23 plus prediction-only H24 coverage/seals complete, at least one admitted row, replay success, a Lane C H23 scoring card and H23 prediction artifact digest different from parent A+B, and that externally sealed H23 `EvaluationPair`; only that H23 scoring card/seal/pair can produce `H23_FROZEN`. It never reads H24 outcomes. `ABSENT` and `REJECTED` never create a frozen card or candidate prediction artifact.
+The external Lane C controller is the sole evaluation orchestrator: after sealing the lane-C prediction and obtaining the matching baseline prediction plus authenticated `OutcomeReceipt`, it calls Common `evaluate_predictions(spec, lane_c_prediction, baseline_prediction, outcome_receipt)`, securely loads the resulting `EvaluationPair`, and passes that already loaded pair to `build_lane_c_fold_result`. `build_lane_c_fold_result()` never calls the evaluator or accepts raw outcomes/baseline inputs; it is the downstream disposition/final-card boundary and always calls `seal_lane_disposition` rather than directly constructing `LaneDisposition`. Before consuming its pair it requires pair and both named report `source_gate_sha256` values to equal the supplied `source_gate.artifact_sha256`, then checks `outcome_receipt_path` plus `outcome_receipt_sha256` (never `outcomes_sha256` alone), followed by the RunSpec, ledger, candidate, fold, model, and prediction bindings. With `fold_id="H22"`, it permits only the externally evaluated development result and returns no `FrozenModelCard`; its H22 scoring card, prediction seal, and pair cannot be substituted into or referenced by the final A+B+C card. With `fold_id="H23"`, it requires H22/H23 plus prediction-only H24 coverage/seals complete, at least one admitted row, replay success, a Lane C H23 scoring card and H23 prediction artifact digest different from parent A+B, and that externally sealed H23 `EvaluationPair`; only that H23 scoring card/seal/pair can produce `H23_FROZEN`. It never reads H24 outcomes. `ABSENT` and `REJECTED` never create a frozen card or candidate prediction artifact.
 
 - [ ] **Step 5: Use only exact Common frozen-card and disposition persistence APIs.**
 

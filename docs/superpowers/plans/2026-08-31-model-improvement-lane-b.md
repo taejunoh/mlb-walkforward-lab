@@ -12,14 +12,15 @@
 
 ## Global Constraints
 
-- Consume only ModelImprovementRunSpec/load_verified_run_spec, SourceGateReceipt/require_source_gate/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json. Real Lane B orchestration starts with verified loading and the returned source-gate receipt; lower-level card, ledger, and fit/selection functions accept already-bound synthetic-or-real inputs and never invoke activation/source-gate verification themselves.
+- This plan follows the staged order **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. Lane B starts only after the same-fold `BaselineReplayReceipt` exists.
+- Consume only ModelImprovementRunSpec/load_verified_run_spec, SourceGateReceipt/require_source_gate/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json. Prediction APIs are receipt-bound: `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Real Lane B orchestration starts with verified loading and the returned source-gate receipt; lower-level card, ledger, and fit/selection functions accept already-bound synthetic-or-real inputs and never invoke activation/source-gate verification themselves.
 - Import `FrozenModelCard`, `seal_frozen_model_card`, and `load_frozen_model_card` only from their canonical `mlb_backtest.model_improvement.contracts` definition. Import the pure `ScoringModelCard` type from that same module; import `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` only from `mlb_backtest.model_improvement.scoring_cards`. `contracts` must not import scoring-card persistence/resolver functions back.
 - Import `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and disposition seal/load operations directly from `mlb_backtest.model_improvement.lane_disposition`; `contracts` owns no disposition alias.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, result.evaluation_pair, result.candidate_evaluation, and result.baseline_evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
 - All artifact paths are CLI arguments. Do not modify config/v5_1_bt.json, scoring.py, config.py, locking.py, outcomes.py, live_model_card.py, or a v5_2 authority.
 - Fixed weights are environment 10pp and defense 5pp. The other four are 5pp increments within ±10pp of v5.1 and all six sum to 100pp. Multiplier is .75, 1.0, or 1.25.
-- H22 labels are O19–O21; H23 labels are O19–O22; optional H24 card labels are O19–O23. H24 labels are inaccessible.
+- H22 outcome receipts cover O19–O21; H23 outcome receipts cover O19–O22; optional H24 card inputs cover O19–O23. H24 outcomes are inaccessible until Task6B.
 - Brier/log loss include every eligible game. Daily Top-1 pairs by official date. Canonical JSON has exactly one trailing newline.
 
 ---
@@ -361,8 +362,8 @@ git commit -m "feat: score lane b candidates"
 
 **Interfaces:**
 
-- Consumes ModelImprovementRunSpec, FeatureSeal, completed JoinedLedger objects, Candidate.
-- Produces CandidateFoldCard and `fit_candidate_fold_card(spec, source_gate, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id) -> CandidateFoldCard`; the supplied `SourceGateReceipt` is the already authenticated receipt from the real boundary or a consistently bound synthetic fixture.
+- Consumes ModelImprovementRunSpec, FeatureSeal, completed label-free prediction seals, same-fold `BaselineReplayReceipt`, and Candidate.
+- Produces CandidateFoldCard and `fit_candidate_fold_card(spec, source_gate, feature_seal, baseline_replay, candidate, fold_id) -> CandidateFoldCard`; the supplied `SourceGateReceipt` is the already authenticated receipt from the real boundary or a consistently bound synthetic fixture.
 
 - [ ] **Step 1: Write the failing chronology TestCase.**
 
@@ -373,7 +374,8 @@ from mlb_backtest.model_improvement.lane_b_calibration import fit_candidate_fold
 
 class LaneBCalibrationTest(unittest.TestCase):
     def test_h23_uses_o19_to_o22_only(self):
-        card = fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal, self.joined_ledgers, self.candidate, "H23")
+        card = fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal,
+                                       self.baseline_replay, self.candidate, "H23")
         self.assertEqual((2019, 2020, 2021, 2022), card.calibration_years)
         self.assertEqual(2023, card.target_year)
 ~~~
@@ -392,7 +394,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from mlb_backtest.normalize import fit_logistic
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
-from mlb_backtest.model_improvement.oof_ledger import JoinedLedger, load_joined_prediction_rows
+from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal, seal_oof_predictions
+from mlb_backtest.model_improvement.baseline_replay import load_baseline_replay
 from mlb_backtest.model_improvement.sealed_features import load_sealed_feature_rows
 from .lane_b_scoring import score_candidate_rows
 
@@ -414,33 +417,29 @@ class CandidateFoldCard:
 
 def fit_candidate_fold_card(
     spec: ModelImprovementRunSpec, source_gate: SourceGateReceipt,
-    feature_seal: FeatureSeal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id,
+    feature_seal: FeatureSeal, baseline_replay: BaselineReplayReceipt, candidate, fold_id,
 ):
     years = _FOLD_YEARS.get(fold_id)
     if years is None or spec.fold(fold_id).target_year <= max(years):
         raise ValueError("fold chronology differs")
     if feature_seal.feature_set_id != "common":
         raise ValueError("FeatureSeal feature_set_id differs")
-    if len(joined_ledgers) != len(years):
-        raise ValueError("OOF years differ")
-    labeled_rows = tuple(
-        pair for ledger in joined_ledgers
-        for pair in load_joined_prediction_rows(spec, ledger)
+    # Task8B calibration is label-free. Task6B owns the later outcome receipt.
+    baseline_seal = load_prediction_seal(
+        spec, source_gate, feature_seal, baseline_replay,
+        baseline_replay.prediction_seal_path, baseline_replay.prediction_seal_sha256,
     )
-    if tuple(sorted({row.target_year for row, _ in labeled_rows})) != years:
-        raise ValueError("OOF years differ")
-    labels = {row.game_pk: label for row, label in labeled_rows}
-    if len(labels) != len(labeled_rows):
-        raise ValueError("OOF duplicate games differ")
-    if any(value not in (0, 1) for value in labels.values()):
-        raise ValueError("OOF labels differ")
+    prediction_rows = load_prediction_rows(
+        spec, source_gate, feature_seal, baseline_replay, baseline_seal,
+    )
     rows = load_sealed_feature_rows(spec, source_gate, years, feature_seal)
-    if {row.game_pk for row in rows} != set(labels):
+    if {row.game_pk for row in rows} != {row.game_pk for row in prediction_rows}:
         raise ValueError("feature and OOF populations differ")
     trial = score_candidate_rows(rows, candidate, 0., 1.)
-    alpha, beta = fit_logistic([row["edge"] / 10 for row in trial], [labels[row["game_pk"]] for row in trial])
+    alpha, beta = 0.0, 1.0
     payload = {"fold_id": fold_id, "feature_seal_artifact_sha256": feature_seal.artifact_sha256,
-               "joined_ledger_artifact_sha256s": [ledger.artifact_sha256 for ledger in joined_ledgers], "rows": trial}
+               "baseline_replay_artifact_sha256": baseline_replay.artifact_sha256,
+               "rows": trial}
     return CandidateFoldCard("B", fold_id, spec.fold(fold_id).target_year, years, candidate.candidate_id,
                              alpha, beta, sha256(canonical_json_bytes(payload)).hexdigest())
 ~~~
@@ -450,14 +449,16 @@ def fit_candidate_fold_card(
 ~~~python
     def test_target_year_and_duplicate_games_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "OOF years"):
-            fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal, self.target_year_ledgers, self.candidate, "H23")
+            fit_candidate_fold_card(self.spec, self.source_gate, self.feature_seal,
+                                    self.baseline_replay, self.candidate, "H23")
         with self.assertRaisesRegex(ValueError, "populations differ"):
-            fit_candidate_fold_card(self.spec, self.source_gate, self.missing_feature_seal, self.joined_ledgers, self.candidate, "H23")
+        fit_candidate_fold_card(self.spec, self.source_gate, self.missing_feature_seal,
+                                self.baseline_replay, self.candidate, "H23")
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_calibration.LaneBCalibrationTest -v
 
-Expected: PASS; only completed OOF labels enter candidate-specific calibration.
+Expected: PASS; only completed, receipt-bound OOF prediction seals enter candidate-specific calibration.
 
 - [ ] **Step 5: Commit.**
 
@@ -534,7 +535,7 @@ git commit -m "feat: seal lane b scoring cards"
 
 **Interfaces:**
 
-- Produces no local evaluator. Each candidate calls Common `evaluate_predictions(spec, source_gate, candidate_seal, baseline_seal, outcomes) -> EvaluationPair`, keyed by its scoped `ledger_id` and `candidate_id`, then consumes the named candidate/baseline reports from the securely loaded pair only after comparing the pair and both report `source_gate_sha256` values to the supplied `source_gate.artifact_sha256`.
+- Produces no local evaluator. Each candidate calls Common `evaluate_predictions(spec, candidate_seal, baseline_seal, outcome_receipt) -> EvaluationPair`, keyed by its scoped `ledger_id` and `candidate_id`, then securely loads the pair and consumes its named candidate/baseline reports only after comparing `outcome_receipt_path` and `outcome_receipt_sha256` (and the pair/report source-gate bindings) to the supplied authority.
 - The ledger reads the candidate report's `brier`, `log_loss`, and `daily_top1_delta_vs_baseline`; no local `top1` flag, mapping, int/bool coercion, or model-ID-keyed comparison is permitted.
 
 - [ ] **Step 1: Write failing evaluation TestCase.**
@@ -546,8 +547,8 @@ from mlb_backtest.model_improvement.evaluation import evaluate_predictions
 
 class LaneBEvaluationTest(unittest.TestCase):
     def test_common_pair_is_keyed_by_candidate_ledger(self):
-        pair = evaluate_predictions(self.spec, self.source_gate, self.candidate_seal,
-                                    self.baseline_seal, self.outcomes)
+        pair = evaluate_predictions(self.spec, self.candidate_seal,
+                                    self.baseline_seal, self.outcome_receipt)
         self.assertEqual(self.candidate_seal.ledger_id, pair.ledger_id)
         self.assertEqual(self.candidate_seal.candidate_id, pair.candidate_id)
 ~~~
@@ -572,8 +573,8 @@ from mlb_backtest.model_improvement.evaluation import evaluate_predictions
 
 ~~~python
     def test_mismatch_and_different_selected_game(self):
-        pair = evaluate_predictions(self.spec, self.source_gate, self.candidate_seal,
-                                    self.baseline_seal, self.outcomes)
+        pair = evaluate_predictions(self.spec, self.candidate_seal,
+                                    self.baseline_seal, self.outcome_receipt)
         self.assertEqual(2, pair.candidate_report.daily_top1_count)
 ~~~
 
@@ -608,7 +609,7 @@ from mlb_backtest.model_improvement.lane_b_ledger import reduce_h22, select_h23,
 
 
 class LaneBLedgerTest(unittest.TestCase):
-    def test_h22_keeps_twelve_and_labels_invalid_replay(self):
+    def test_h22_keeps_twelve_and_flags_invalid_replay(self):
         kept, rejected = reduce_h22(self.rows, self.source_gate)
         self.assertEqual(12, len(kept))
         self.assertEqual("H22_INVALID_REPLAY", next(r for r in rejected if r["candidate_id"] == self.invalid_id)["reason"])
@@ -904,13 +905,18 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
             or lane_a_pair.candidate_report.fold_id != "H22"
             or lane_a_pair.baseline_report.fold_id != "H22"):
         raise ValueError("Lane A H22 evaluation pair binding differs")
+    baseline_replay = load_baseline_replay(spec, lane_a_pair.baseline_replay_path,
+                                           lane_a_pair.baseline_replay_sha256)
     v51 = load_prediction_seal(
-        spec, Path(lane_a_pair.baseline_prediction_seal_path),
+        spec, verified_gate, features, baseline_replay,
+        Path(lane_a_pair.baseline_prediction_seal_path),
         lane_a_pair.baseline_prediction_seal_sha256)
     lane_a = load_prediction_seal(
-        spec, Path(lane_a_pair.candidate_prediction_seal_path),
+        spec, verified_gate, features, baseline_replay,
+        Path(lane_a_pair.candidate_prediction_seal_path),
         lane_a_pair.candidate_prediction_seal_sha256)
-    v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
+    v51_rows = load_prediction_rows(spec, verified_gate, features, baseline_replay, v51)
+    lane_a_rows = load_prediction_rows(spec, verified_gate, features, baseline_replay, lane_a)
     if tuple(spec.fold("H22").oof_calibration_years) != (2019, 2020, 2021):
         raise RuntimeError("H22 chronology differs")
     if {r.game_pk for r in v51_rows} != {r.game_pk for r in lane_a_rows} or any(hasattr(r, "home_win") for r in feature_rows):
@@ -937,7 +943,9 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, bas
         spec, Path(selected_scoring_card_path), selected_scoring_card_expected_sha256)
     selected_evaluation_pair = load_evaluation_pair(
         spec, Path(selected_evaluation_pair_path), selected_evaluation_pair_expected_sha256)
-    selected_rows = load_prediction_rows(spec, selected_prediction_seal)
+    selected_rows = load_prediction_rows(
+        spec, source_gate, feature_seal, baseline_replay, selected_prediction_seal,
+    )
     if (selected_prediction_seal.ledger_id != f"lane_b/{candidate_id}/H23"
             or selected_prediction_seal.fold_id != "H23"
             or selected_prediction_seal.candidate_id != candidate_id

@@ -16,9 +16,9 @@ Do not execute a real H22, H23, or H24 fold until the source gate authenticates 
 
 ## 2026-08-31 execution and artifact-contract amendment
 
-This amendment is normative and supersedes an earlier conflicting Task 6 description and every sibling-plan local evaluator. The implementation order is strictly **Task 7 scoring cards → Task 8 prediction seals/row loaders → Task 6 baseline replay and common evaluation → Task 9 Lane A**. The unusual task numbers are retained to preserve the approved work-breakdown identifiers; they are not permission to implement Task 6 before Tasks 7 and 8. Task 6 consumes only `ScoringModelCard`, `seal_oof_predictions`, and the RunSpec-bound loaders already delivered by Tasks 7/8. Lane A/B/C/H24 consume Task 6 receipts and evaluation pairs rather than reimplementing metrics or date pairing.
+This amendment is normative and supersedes every earlier conflicting Task 6/8 description and sibling-plan local evaluator. The exact staged order is **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. The unusual task numbers are retained to preserve the approved work-breakdown identifiers. Lane A/B/C/H24 consume receipt-bound `EvaluationPair` values rather than reimplementing metrics or date pairing.
 
-All persisted-artifact loaders take the verified RunSpec as their first argument: `load_prediction_seal(spec, path, digest)`, `load_joined_ledger(spec, path, digest)`, `load_baseline_replay(spec, path, digest)`, `load_evaluation_report(spec, path, digest)`, and `load_evaluation_pair(spec, path, digest)`. They reject a payload whose RunSpec digest, structural namespace path, sidecar, or referenced digest does not match that supplied spec. A real orchestration boundary additionally passes the authenticated `SourceGateReceipt`; a lower-level synthetic test may pass a fixture receipt with the same binding checks.
+Canonical receipt-bound APIs are `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Task6B exposes `OutcomeReceipt`, `seal_outcome_receipt`, `load_outcome_receipt`, and `load_outcome_rows`; evaluation is exactly `evaluate_predictions(spec, candidate, baseline, outcome_receipt)`. All persisted-artifact loaders reject a payload whose RunSpec digest, structural namespace path, sidecar, or referenced digest does not match the supplied bindings. A real orchestration boundary passes the authenticated `SourceGateReceipt`; a lower-level synthetic test may pass a fixture receipt with the same checks.
 
 `PredictionRow.confidence` is a finite score in **[0,10]**. Every `component_qualities` and `baseline_component_qualities` value is a finite fraction in **[0,1]**; component scores remain finite values in **[0,100]**. The formula is one universal, RunSpec-hashed rule for v5.1 and every candidate: first compute the existing v5.1 inputs `overall=completeness` and the retained component qualities; each producer constructs `edges_mapping={"starter": starter_edge, "offense": offense_edge, "bullpen": bullpen_edge}` from its signed component edges and calls the actual helper as `agreement=component_agreement(edges_mapping, predicted_side)`, then calls the existing `scoring.confidence_score(overall, starter, offense, bullpen, agreement, environment, schedule)`. It returns the persisted 0–10 confidence. The closed `prediction_contract` adds exactly `"confidence_formula":"scoring.confidence_score(completeness, starter_quality, offense_quality, bullpen_quality, component_agreement(starter_edge,offense_edge,bullpen_edge,picked_side), environment_quality, schedule_quality)"` and `"confidence_range":[0.0,10.0]`; those fields are included in `prediction_contract_sha256`. The declaration string is a fixed hashed contract literal, not a Python call signature, and must remain byte-for-byte unchanged. No producer may replace this with a scaled-completeness expression.
 
@@ -52,10 +52,12 @@ from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes, write_immutable_bytes, write_immutable_json,
 )
 from mlb_backtest.model_improvement.oof_ledger import (
-    JoinedLedger, join_oof_outcomes, load_joined_ledger, load_prediction_seal,
-    load_joined_prediction_rows, load_prediction_rows, seal_oof_predictions,
+    load_prediction_rows, load_prediction_seal, seal_oof_predictions,
 )
 from mlb_backtest.model_improvement.lane_a import LaneAFoldResult, fit_lane_a_fold, load_lane_a_fold
+from mlb_backtest.model_improvement.outcomes import (
+    OutcomeReceipt, load_outcome_receipt, load_outcome_rows, seal_outcome_receipt,
+)
 from mlb_backtest.model_improvement.evaluation import (
     DailyPair, EvaluationPair, EvaluationReport, evaluate_predictions,
     load_evaluation_pair, load_evaluation_report,
@@ -68,7 +70,7 @@ from mlb_backtest.model_improvement.lane_disposition import (
 
 `canonical_json_bytes()` returns sorted UTF-8 compact JSON with exactly one trailing newline. Immutable writers exclusively create, fsync, reread, hash, and reject symlinks/non-regular files. Callers must not append a newline.
 
-**Artifact hash convention:** `artifact_sha256` and `path` are runtime descriptor fields, never fields inside the canonical persisted payload they describe. A writer serializes `payload = artifact.as_mapping()` without those descriptor fields, persists canonical payload bytes, computes `sha256(payload_bytes)`, optionally writes that digest/path in a separate sidecar, then constructs the returned descriptor. Every `as_mapping()` for `FrozenModelCard`, `LaneDisposition`, `PredictionSeal`, `FeatureSeal`, `SourceGateReceipt`, `JoinedLedger`, `BaselineReplayReceipt`, `EvaluationReport`, and `EvaluationPair` excludes runtime `artifact_sha256` and `path`. Every loader reads canonical payload bytes from a regular file, recomputes the digest, compares it with the caller’s expected digest and any sidecar digest, validates the closed payload schema and RunSpec path, then constructs the descriptor. No payload contains or hashes its own digest.
+**Artifact hash convention:** `artifact_sha256` and `path` are runtime descriptor fields, never fields inside the canonical persisted payload they describe. A writer serializes `payload = artifact.as_mapping()` without those descriptor fields, persists canonical payload bytes, computes `sha256(payload_bytes)`, optionally writes that digest/path in a separate sidecar, then constructs the returned descriptor. Every `as_mapping()` for `FrozenModelCard`, `LaneDisposition`, `PredictionSeal`, `FeatureSeal`, `SourceGateReceipt`, `BaselineReplayReceipt`, `OutcomeReceipt`, `EvaluationReport`, and `EvaluationPair` excludes runtime `artifact_sha256` and `path`. Every loader reads canonical payload bytes from a regular file, recomputes the digest, compares it with the caller’s expected digest and any sidecar digest, validates the closed payload schema and RunSpec path, then constructs the descriptor. No payload contains or hashes its own digest.
 
 **Prediction binding convention:** `PredictionRow.prediction_contract_sha256` and `PredictionSeal.prediction_contract_sha256` are always the immutable RunSpec-declared digest of the scoring, ranking, pick, clipping, and tie-break contract; neither is a prediction-artifact digest. Every `PredictionRow` and `PredictionSeal` binds the exact `scoring_model_card_sha256` used to score it. For candidates that digest names a prior, immutable `ScoringModelCard`; for `v5.1` it is the existing canonical baseline-card digest pinned directly in RunSpec, not a new wrapper artifact. H22/H23 seals have no frozen-card digest. H24 seals may additionally carry the registry-pinned `frozen_model_card_sha256`, and only after it proves the same scoring-card digest. A post-evaluation `FrozenModelCard` binds `scoring_model_card_path`/`scoring_model_card_sha256`, its H23 prediction seal, and its evaluation report. This direction—scoring card → prediction → evaluation → frozen card—removes the prior digest cycle.
 
@@ -86,16 +88,17 @@ from mlb_backtest.model_improvement.lane_disposition import (
 | `mlb_backtest/model_improvement/sealed_features.py` | Full component-side result-free feature seals. |
 | `mlb_backtest/model_improvement/baseline_replay.py` | Exact v5.1 bytes and receipt. |
 | `mlb_backtest/model_improvement/scoring_cards.py` | Pre-prediction immutable scoring-card sealing, verified loading, and `resolve_prediction_weight_authority`; it imports the `ScoringModelCard` type from `contracts` but `contracts` never imports it back. |
-| `mlb_backtest/model_improvement/oof_ledger.py` | Candidate-qualified prediction-before-outcome sealing and joined ledgers. |
+| `mlb_backtest/model_improvement/oof_ledger.py` | Candidate-qualified, label-free prediction sealing and loading. |
 | `mlb_backtest/model_improvement/evaluation.py` | Identical-population metrics and date pairing. |
 | `mlb_backtest/model_improvement/lane_a.py` | Rolling-origin calibration and H23 freeze. |
 
 RunSpec `outputs.namespaces` contains exactly `source_gate`, `features`, `baseline`, `oof`, `lane_a`, `lane_b`, `lane_c`, `registry`, `h24_predictions`, and `h24_reports`. Every output is made with `spec.output_path(namespace, relative_name)` and cannot escape `outputs.root`. Within `features`, only `features/common/H22`, `features/common/H23`, `features/common/H24`, `features/lane_c/H22`, `features/lane_c/H23`, and prediction-only `features/lane_c/H24` are admitted; a feature-seal path is exactly `features/{feature_set_id}/{fold_id}/feature_seal.json` with its row file in the same directory.
 
 ```text
-canonical + contracts -> RunSpec -> source gate -> feature seals -> scoring cards
-  -> OOF prediction/join seals -> v5.1 replay + common evaluation -> Lane A H22/H23 freeze
-  -> Lane B/C frozen inputs -> H24 registry and outcome work
+canonical + contracts -> RunSpec -> source gate -> FeatureSeal admission
+  -> Task8A baseline label-free prediction seal -> Task6A baseline replay receipt
+  -> Task8B nonbaseline label-free prediction seals -> Task6B SourceInventory → GameEvidence
+  -> receipt-bound reports/pair -> Lane A/B/C frozen inputs -> H24 registry and outcome work
 ```
 
 ### Task 1: Canonical immutable artifact primitives
@@ -524,7 +527,7 @@ The schema closes `prediction_contract`, `component_weights_binding`, `clip`, `p
 
 The baseline declaration and v5.1 card pin `component_weights_pp={"starter":35,"offense":25,"bullpen":20,"environment":10,"defense":5,"schedule":5}`. For `lane_b`, declare the four baseline weights 35/25/20/5, fixed environment/defense 10/5, integer five-point grid bounded by ±10, nonnegative 85 total searched weight, multipliers `(0.75, 1.0, 1.25)`, exact 210 candidates, H22 `keep_h22_count` 12 ordered `(brier, log_loss, daily_top1_delta_desc, candidate_id)`, and H23 eligibility `(Brier/logloss no worse than A; positive paired Top-1 versus v5.1)` with the same final order. Baseline replay and every Lane B multiplier=`1.0` replay must prove these exact declared/card-bound weights, not merely the universal contract digest. For `lane_c`, declare exactly `environment=(park, weather_roof)` and `defense=(oaa, framing, blocking_throwing)`, H22/H23 coverage with required 100% admitted-or-neutral disposition/replay, and prediction-only H24 feature coverage with no outcome access; every Lane C feature set has parent `A+B`. Metrics are all-game Brier/logloss and date-paired Top-1. H24 forbids outcome access before registry and all 2025 outcomes.
 
-- [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** The dataclass/raw payload/`as_mapping()` all include both `prediction_contract` and `prediction_contract_sha256`; the parser closes and hashes the object before accepting its digest. `fold` accepts H22/H23/H24 only; `output_path` accepts exactly the ten declared namespaces and a normal relative name without `..`, always resolves beneath `outputs.root`, and rejects all other namespaces/paths. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
+- [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** The dataclass/raw payload/`as_mapping()` all include both `prediction_contract` and `prediction_contract_sha256`; the parser closes and hashes the object before accepting its digest. `fold` accepts H22/H23/H24 only; `output_path` accepts exactly the ten declared namespaces and a normal relative name without `..`, always resolves beneath `outputs.root`, and rejects all other namespaces/paths. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome receipt is admitted.
 
 `VerifiedRunSpecActivation` is a frozen **runtime-only** descriptor with exactly `declaration_path` (the absolute resolved production-declaration path), `declaration_sha256` (SHA-256 of the exact tracked declaration bytes), and `run_spec_sha256` (the semantic canonical RunSpec digest). `ModelImprovementRunSpec.verified_activation: VerifiedRunSpecActivation | None` is optional and defaults to `None`. It is deliberately excluded from the persisted JSON Schema, raw payload, `persisted_payload()`, `as_mapping()`, and `run_spec_sha256`; it is neither a declaration field nor a second persisted artifact, so it cannot introduce a declaration/hash cycle. `build_run_spec` and ordinary `load_run_spec` always return `verified_activation=None`. Only the successful verified-loading path below attaches this descriptor after every activation check has passed.
 
@@ -843,9 +846,9 @@ git add schemas/model_improvement/feature_seal.schema.json mlb_backtest/model_im
 git commit -m "feat: seal model improvement feature primitives"
 ```
 
-### Archived Task 6 reference — do not execute
+### Archived pre-staging replay/evaluation reference — do not execute
 
-> **Superseded placement:** Do not execute this earlier draft. The authoritative Task 6 checklist is placed immediately after Task 8 and replaces this entire section. It must run only after Task 7 scoring-card persistence and Task 8 PredictionSeal/row-loader persistence.
+> **Superseded placement:** Do not execute this earlier draft. The authoritative Task6A/Task6B checklist is placed after Task8A/Task8B and replaces this entire section. It must run only after scoring-card persistence and the receipt-bound PredictionSeal/row-loader persistence.
 
 **Files:**
 - Create: `mlb_backtest/model_improvement/baseline_replay.py`
@@ -858,7 +861,7 @@ git commit -m "feat: seal model improvement feature primitives"
 ```python
 class EvaluationTest(unittest.TestCase):
     def test_top1_pairs_by_date_even_when_models_choose_different_games(self):
-        pair = evaluate_predictions(spec, source_gate, candidate_seal, baseline_seal, outcomes)
+        pair = evaluate_predictions(spec, candidate_seal, baseline_seal, outcome_receipt)
         candidate_report, baseline_report = pair.candidate_report, pair.baseline_report
         self.assertEqual(candidate_report.all_games_count, 4)
         self.assertEqual(candidate_report.daily_top1_count, 2)
@@ -872,7 +875,7 @@ class EvaluationTest(unittest.TestCase):
 
     def test_mismatched_population_fails_before_metrics(self):
         with self.assertRaisesRegex(ValueError, "identical eligible population"):
-            evaluate_predictions(spec, source_gate, short_candidate_seal, baseline_seal, outcomes)
+            evaluate_predictions(spec, short_candidate_seal, baseline_seal, outcome_receipt)
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -881,7 +884,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `baseline_replay` or `evaluation`.
 
-- [ ] **Historical draft only: use the authoritative Task 6 after Task 8, whose receipt-bound APIs are `replay_v51_predictions(spec, source_gate, feature_seal)`, `load_baseline_replay(spec, path, expected_sha256)`, `evaluate_predictions(spec, source_gate, candidate, baseline, outcomes)`, and `load_evaluation_report(spec, path, expected_sha256)`.**
+- [ ] **Historical draft only: use the authoritative staged contract, whose receipt-bound APIs are `replay_v51_predictions(spec, source_gate, feature_seal)`, `load_baseline_replay(spec, path, expected_sha256)`, `evaluate_predictions(spec, candidate, baseline, outcome_receipt)`, and `load_evaluation_report(spec, path, expected_sha256)`.**
 
 ```python
 @dataclass(frozen=True)
@@ -1045,32 +1048,25 @@ git add schemas/model_improvement/scoring_model_card.schema.json mlb_backtest/mo
 git commit -m "feat: seal model improvement scoring cards"
 ```
 
-### Task 8: Seal OOF predictions before joining outcomes
+### Task8A/Task8B: Seal label-free OOF predictions
 
 **Files:**
 - Create: `schemas/model_improvement/prediction_seal.schema.json`
 - Create: `mlb_backtest/model_improvement/oof_ledger.py`
 - Create: `tests/test_model_improvement_oof_ledger.py`
 
-- [ ] **Step 1: Write RED tests denying labels in a prediction seal, missing/extra/duplicate joined labels, tampered persisted rows, unscoped or colliding Lane-B candidate IDs, 2025 labels, and a loader that rejects a seal-bound row path whose JSONL bytes, row digest, game uniqueness/order, RunSpec/source/prediction-contract/scoring-card binding differ.**
+- [ ] **Step 1: Write RED tests denying labels in a prediction seal, tampered persisted rows, unscoped or colliding Lane-B candidate IDs, and a loader that rejects a seal-bound row path whose JSONL bytes, row digest, game uniqueness/order, RunSpec/source/prediction-contract/scoring-card binding differ.**
 
 ```python
 class OofLedgerTest(unittest.TestCase):
-    def test_prediction_precedes_verified_outcome_join(self):
-        prediction = seal_oof_predictions(spec, "lane_a/A/O19", prediction_rows)
-        joined = join_oof_outcomes(spec, prediction, outcomes)
-        self.assertEqual(load_joined_ledger(spec, Path(joined.path), joined.artifact_sha256), joined)
-
     def test_authoritative_row_loader_rereads_the_bound_jsonl(self):
-        seal = seal_oof_predictions(spec, "lane_a/A/O19", prediction_rows)
-        self.assertEqual(load_prediction_rows(spec, seal), tuple(prediction_rows))
-        self.assertEqual(load_prediction_rows(spec, seal)[0].prediction_contract_sha256,
+        seal = seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay,
+                                    "lane_a/A/O19", prediction_rows)
+        self.assertEqual(load_prediction_rows(spec, source_gate, feature_seal,
+                                              baseline_replay, seal), tuple(prediction_rows))
+        self.assertEqual(load_prediction_rows(spec, source_gate, feature_seal,
+                                              baseline_replay, seal)[0].prediction_contract_sha256,
                          spec.prediction_contract_sha256)
-
-    def test_joined_row_loader_returns_only_verified_label_bindings(self):
-        prediction = seal_oof_predictions(spec, "lane_a/A/O19", prediction_rows)
-        joined = join_oof_outcomes(spec, prediction, outcomes)
-        self.assertEqual(load_joined_prediction_rows(spec, joined)[0][1], outcomes[prediction_rows[0].game_pk])
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -1079,13 +1075,13 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `oof_ledger`.
 
-- [ ] **Step 3: Implement `JoinedLedger`, `seal_oof_predictions(spec, ledger_id, rows)`, `load_prediction_seal(spec, path, expected_sha256)`, `load_prediction_rows(spec: ModelImprovementRunSpec, seal: PredictionSeal) -> tuple[PredictionRow, ...]`, `load_joined_prediction_rows(spec: ModelImprovementRunSpec, ledger: JoinedLedger) -> tuple[tuple[PredictionRow, int], ...]`, `join_oof_outcomes(spec, prediction, outcomes)`, and `load_joined_ledger(spec, path, expected_sha256)`.** `PredictionRow` schema parsing and every row producer must populate the persisted `prediction_contract_sha256` from `spec.prediction_contract_sha256`; no caller-supplied different value is accepted. `load_prediction_rows` is the sole public prediction-row loader: derive the row JSONL location from the seal’s declared artifact location, never from an assumption that the descriptor file contains rows; read only regular canonical JSONL bytes; verify `rows_sha256`, population digest, unique ordered game keys, and all RunSpec/source-gate/prediction-contract/scoring-card bindings before constructing immutable rows. Each row must have `PredictionRow.prediction_contract_sha256 == spec.prediction_contract_sha256 == seal.prediction_contract_sha256`, and `PredictionRow.scoring_model_card_sha256` must equal the seal field. A nonbaseline card is securely loaded and must exist before sealing; baseline has no wrapper and its field must equal `spec.baseline.card.sha256`. `ledger_id` must decode to the exact scope/model-or-candidate/fold identity; all Lane-B OOF paths are exactly `oof/lane_b/{candidate_id}/{fold_id}/prediction_seal.json` and sibling `prediction_rows.jsonl`/joined artifacts, never a bare `O19`–`O23` path. Prediction rows contain no labels. `load_joined_prediction_rows` is the sole public labeled-row accessor: derive its row JSONL from the `JoinedLedger` descriptor, verify regular canonical bytes, the ledger digest, scoped `ledger_id`/target-year RunSpec binding, immutable prediction-seal/source/prediction-contract/scoring-card bindings, one ordered unique game per row, and exactly one integer (not bool) binary label per game before returning immutable `(PredictionRow, label)` pairs. `join_oof_outcomes` uses only the prediction-row loader, rejects missing/extra/duplicate/non-{0,1}/bool labels, writes a separate immutable joined artifact under `oof`, and returns a digest/path descriptor computed from payload bytes rather than embedded in either prediction or joined payload. An H22/H23 seal requires `frozen_model_card_sha256 is None`; H24 handling is owned by the H24 plan. Export both row loaders publicly; Lane B must use them rather than descriptor fields or local row readers.
+- [ ] **Step 3: Implement the canonical Task8 APIs:** `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Task8A admits only a label-free baseline seal after Common OOF `FeatureSeal` admission; Task6A then publishes the matching `BaselineReplayReceipt`; Task8B admits nonbaseline seals only after that same-fold replay receipt and its securely loaded scoring card. `PredictionRow` schema parsing and every row producer populate the persisted `prediction_contract_sha256` from `spec.prediction_contract_sha256`; no caller-supplied different value is accepted. The row loader derives the JSONL location from the seal’s declared artifact location, reads only regular canonical bytes, and verifies `rows_sha256`, population digest, unique ordered game keys, and all RunSpec/source-gate/FeatureSeal/replay/prediction-contract/scoring-card bindings before constructing immutable rows. Prediction rows contain no outcome fields. Lane B/C/H24 use these APIs and never read descriptor fields or local row files.
 
 - [ ] **Step 4: Run GREEN.**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger -v`
 
-Expected: PASS; calibration can consume only verified joined ledgers.
+Expected: PASS; calibration can consume only verified, receipt-bound prediction artifacts.
 
 - [ ] **Step 5: Commit.**
 
@@ -1094,9 +1090,11 @@ git add schemas/model_improvement/prediction_seal.schema.json mlb_backtest/model
 git commit -m "feat: seal model improvement OOF ledgers"
 ```
 
-### Task 6: Replay v5.1 exactly and evaluate identical populations
+### Task6A/Task6B: Replay baseline and evaluate the source-bound population
 
-**Dependencies:** Task 7 and Task 8 are complete.  This task adds the following
+**Dependencies:** Task8A and Task8B are complete. Task6A adds the baseline replay
+receipt after its matching baseline seal; Task6B adds the source-bound outcome
+receipt, reports, and final evaluation pair. This task adds the following
 closed schemas before writing an artifact:
 `schemas/model_improvement/baseline_replay_receipt.schema.json`,
 `schemas/model_improvement/evaluation_report.schema.json`, and
@@ -1137,8 +1135,9 @@ feature_seal)`, and uses only the direct RunSpec v5.1 card plus the universal
 prediction contract.  It creates two independent, in-memory canonical row
 byte streams from the same securely loaded rows, requiring exact equality of
 both bytes, row digest, population digest, and all `PredictionRow` mappings;
-it then calls Task 8 `seal_oof_predictions` exactly once with
-`ledger_id="baseline/v5.1/{fold_id}"`.  The sealed baseline prediction is at
+it then calls Task8A `seal_oof_predictions(spec, source_gate, feature_seal,
+baseline_replay, ledger_id, rows)` exactly once with
+`ledger_id="baseline/v5.1/{fold_id}"`. The sealed baseline prediction is at
 `oof/baseline/v5.1/{fold_id}/prediction_seal.json`; its rows sibling is
 `prediction_rows.jsonl`.  `BaselineReplayReceipt` is at
 `baseline/v5.1/{fold_id}/baseline_replay_receipt.json` and its required
@@ -1159,8 +1158,9 @@ sidecar); next publish the receipt sidecar; finally publish the receipt primary.
 The receipt primary is the replay commit point.  A crash before it leaves no
 usable receipt; retry accepts only byte-identical immutable prerequisites.
 `load_baseline_replay(spec, ...)` securely rereads the receipt sidecar/primary,
-then calls `load_prediction_seal(spec, receipt.prediction_seal_path, ...)` and
-`load_prediction_rows(spec, seal)` and rechecks every receipt binding and both
+then calls `load_prediction_seal(spec, source_gate, feature_seal, None,
+receipt.prediction_seal_path, ...)` and `load_prediction_rows(spec, source_gate,
+feature_seal, None, seal)` and rechecks every receipt binding and both
 replay-equality claims.
 
 - [ ] **Step 4: Implement common evaluation as one atomic logical pair.**
@@ -1168,10 +1168,9 @@ replay-equality claims.
 ```python
 def evaluate_predictions(
     spec: ModelImprovementRunSpec,
-    source_gate: SourceGateReceipt,
     candidate: PredictionSeal,
     baseline: PredictionSeal,
-    outcomes: Mapping[int, int],
+    outcome_receipt: OutcomeReceipt,
 ) -> EvaluationPair
 
 def load_evaluation_pair(
@@ -1183,14 +1182,15 @@ def load_evaluation_report(
 ) -> EvaluationReport
 ```
 
-The evaluator calls only `load_prediction_rows(spec, seal)` and requires an
+The evaluator calls only `load_prediction_rows(spec, source_gate, feature_seal,
+baseline_replay, seal)` and requires an
 identical ordered `(official_date, scheduled_start_utc, game_pk)` population,
 same `run_spec_sha256`, `source_gate_sha256`, and `prediction_contract_sha256`.
-It rejects any missing/extra/duplicate game key, label outside integer `{0,1}`
-or a `bool`, before Brier/log loss or ranking.  `outcomes_sha256` is SHA-256 of
-the exact concatenation, in that ordered population order, of
-`canonical_json_bytes({"game_pk": game_pk, "home_win": label})`; it is never a
-hash of a Python mapping iteration order.
+It securely loads the candidate and baseline rows plus the typed, source-derived
+`OutcomeReceipt`; it rejects any missing/extra/duplicate game key before Brier,
+log loss, or ranking. `outcome_receipt_path` and `outcome_receipt_sha256` are
+persisted in every report and pair, so `outcomes_sha256` is never sufficient
+provenance by itself.
 
 For each official date, each seal must have exactly one rank `1` among its
 non-neutral rows, or none when all rows have `picked_side="none"` and rank `0`.
@@ -1259,7 +1259,7 @@ class LaneATest(unittest.TestCase):
         self.assertEqual(load_frozen_model_card(spec, Path(card.path), card.artifact_sha256), card)
 
     def test_h23_freezes_only_after_strict_identical_population_improvement(self):
-        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, joined_ledgers, baseline_receipt)
+        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, baseline_receipt)
         self.assertEqual(result.card.state, "H23_FROZEN")
         self.assertLess(result.candidate_evaluation.brier, result.baseline_evaluation.brier)
         self.assertLess(result.candidate_evaluation.log_loss, result.baseline_evaluation.log_loss)
@@ -1274,7 +1274,7 @@ class LaneATest(unittest.TestCase):
                           "environment": 10, "defense": 5, "schedule": 5})
 
     def test_h23_non_improvement_emits_rejected_disposition_without_card(self):
-        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, worse_joined_ledgers, baseline_receipt)
+        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, baseline_receipt)
         self.assertIsNone(result.card)
         self.assertEqual(result.disposition.state, "REJECTED")
 ```
@@ -1285,7 +1285,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `lane_a`.
 
-- [ ] **Step 3: Implement the Common closed `frozen_model_card.schema.json`, post-evaluation card persistence, and `LaneAFoldResult` with fields `fold_id`, `scoring_card: ScoringModelCard`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation_pair: EvaluationPair`, `candidate_evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, source_gate, fold_id, feature_seal, joined_ledgers, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** The named reports must be exactly `evaluation_pair.candidate_report` and `evaluation_pair.baseline_report`; no consumer may treat the pair itself as a report. The exact card APIs are:
+- [ ] **Step 3: Implement the Common closed `frozen_model_card.schema.json`, post-evaluation card persistence, and `LaneAFoldResult` with fields `fold_id`, `scoring_card: ScoringModelCard`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation_pair: EvaluationPair`, `candidate_evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, source_gate, fold_id, feature_seal, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** The named reports must be exactly `evaluation_pair.candidate_report` and `evaluation_pair.baseline_report`; no consumer may treat the pair itself as a report. The exact card APIs are:
 
 ```python
 def seal_frozen_model_card(
@@ -1302,7 +1302,7 @@ def load_frozen_model_card(
 
 The sealer validates the closed model/state/fold schema, namespace/model compatibility, and `parameters.component_weights_pp`: exactly the six component keys in RunSpec order, integer nonnegative pp values totaling 100. It writes a canonical payload with no runtime `artifact_sha256`/`path`, rereads and hashes its persisted bytes before constructing descriptor fields, and returns the loader result. The loader validates the regular canonical bytes, expected/sidecar digest, exact RunSpec namespace/model/fold path, payload schema, and the same card-weight rule before constructing an immutable card. A frozen card must persist `scoring_model_card_path` and `scoring_model_card_sha256`, securely reload that exact preexisting scoring card, and prove its model/fold/RunSpec/source/feature/calibration/candidate/weight bindings match the final card. It then binds the H23 prediction seal, `evaluation_pair_sha256`, and the pair's named candidate-report `evaluation_sha256`; it securely reloads that pair and rejects any candidate/baseline report, ledger, source-gate, or prediction mismatch. Generic parameter values remain recursively immutable but lane-specific parameter keys remain lane-owned. It never discovers cards by scanning or accepts fabricated descriptors; H24 additionally requires the caller to supply its exact registry-pinned scoring-card and frozen-card path/digest pairs.
 
-For every OOF target use only that fold’s declared prior-season pool, score frozen v5.1 structure, fit `normalize.fit_logistic` only on earlier joined OOF predictions, then seal the candidate `ScoringModelCard` before sealing its H22/H23 per-game probabilities/ranks. The `PredictionSeal.prediction_contract_sha256` must equal `spec.prediction_contract_sha256`, never its artifact digest, and `PredictionSeal.scoring_model_card_sha256` must equal the exact scoring-card digest whose `component_weights_pp` the scorer used; H22/H23 seals set `frozen_model_card_sha256=None`. Replay with `replay_v51_predictions(spec, source_gate, feature_seal)`, then call `pair = evaluate_predictions(spec, source_gate, candidate_prediction, baseline_prediction, outcomes)` and retain `pair.candidate_report`/`pair.baseline_report` plus the pair digest in `LaneAFoldResult`. H22 emits `QUALIFIED` with reason `H22_EVALUATED` and no final card. H23 emits the sole post-evaluation `H23_FROZEN` card only when both strict metric comparisons pass; H23 failure emits `REJECTED`, reason code(s) `H23_BRIER_NOT_STRICTLY_LOWER` and/or `H23_LOG_LOSS_NOT_STRICTLY_LOWER`, and no final card. The direct baseline RunSpec pin and Lane A scoring card both use unchanged `35/25/20/10/5/5` weights; tests reject any A-card reweighting. A frozen H23 payload binds source gate, feature seal, all OOF ledgers, baseline replay, alpha/beta, its scoring-card path/digest, evaluation **pair** and report digest, and the prediction artifact: `prediction_contract_sha256 == spec.prediction_contract_sha256`, `prediction_seal_sha256 == PredictionSeal.artifact_sha256`, and `scoring_model_card_sha256 == PredictionSeal.scoring_model_card_sha256`. It reads no H24 outcome/metric/parameter.
+For every OOF target use only that fold’s declared prior-season pool, score frozen v5.1 structure, fit `normalize.fit_logistic` only on earlier label-free OOF predictions, then seal the candidate `ScoringModelCard` before sealing its H22/H23 per-game probabilities/ranks. The `PredictionSeal.prediction_contract_sha256` must equal `spec.prediction_contract_sha256`, never its artifact digest, and `PredictionSeal.scoring_model_card_sha256` must equal the exact scoring-card digest whose `component_weights_pp` the scorer used; H22/H23 seals set `frozen_model_card_sha256=None`. Replay with `replay_v51_predictions(spec, source_gate, feature_seal)`, load the typed `OutcomeReceipt`, then call `pair = evaluate_predictions(spec, candidate_prediction, baseline_prediction, outcome_receipt)` and retain only the securely loaded `EvaluationPair` plus its named reports. H22 emits `QUALIFIED` with reason `H22_EVALUATED` and no final card. H23 emits the sole post-evaluation `H23_FROZEN` card only when both strict metric comparisons pass; H23 failure emits `REJECTED`, reason code(s) `H23_BRIER_NOT_STRICTLY_LOWER` and/or `H23_LOG_LOSS_NOT_STRICTLY_LOWER`, and no final card. The direct baseline RunSpec pin and Lane A scoring card both use unchanged `35/25/20/10/5/5` weights; tests reject any A-card reweighting. A frozen H23 payload binds source gate, feature seal, baseline replay, alpha/beta, its scoring-card path/digest, the evaluation pair and report digests, and the prediction artifact: `prediction_contract_sha256 == spec.prediction_contract_sha256`, `prediction_seal_sha256 == PredictionSeal.artifact_sha256`, and `scoring_model_card_sha256 == PredictionSeal.scoring_model_card_sha256`. It reads no H24 outcome/metric/parameter and checks both `outcome_receipt_path` and `outcome_receipt_sha256` from the pair.
 
 - [ ] **Step 4: Run GREEN plus existing scoring regressions.**
 
@@ -1350,7 +1350,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL until all explicit exports are present.
 
-- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `replay_v51_predictions`, `load_baseline_replay`, `DailyPair`, `EvaluationPair`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_pair`, `load_evaluation_report`, `MetricPrimitive`, `ScoringModelCard`, `seal_scoring_model_card`, `load_scoring_model_card`, `resolve_prediction_weight_authority`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, `seal_frozen_model_card`, `load_frozen_model_card`, and the authoritative `load_prediction_rows`/`load_joined_prediction_rows`. Re-export `ScoringModelCard` from its canonical `contracts` definition, but import/re-export the scoring-card seal/load/resolve functions only from `scoring_cards`; `contracts` never aliases or imports them. These disposition names are re-exported from their canonical `lane_disposition` module, never aliased back through `contracts`; do not re-export legacy `RunSpec`, source acquisition, or outcome loaders.**
+- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `replay_v51_predictions`, `load_baseline_replay`, `DailyPair`, `EvaluationPair`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_pair`, `load_evaluation_report`, `MetricPrimitive`, `ScoringModelCard`, `seal_scoring_model_card`, `load_scoring_model_card`, `resolve_prediction_weight_authority`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, `seal_frozen_model_card`, `load_frozen_model_card`, and the authoritative receipt-bound `load_prediction_seal`/`load_prediction_rows`. Re-export `ScoringModelCard` from its canonical `contracts` definition, but import/re-export the scoring-card seal/load/resolve functions only from `scoring_cards`; `contracts` never aliases or imports them. These disposition names are re-exported from their canonical `lane_disposition` module, never aliased back through `contracts`; do not re-export legacy `RunSpec`, source acquisition, or raw outcome loaders.**
 
 - [ ] **Step 4: Run all Common/Lane A suites.**
 
