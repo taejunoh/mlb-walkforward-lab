@@ -281,17 +281,31 @@ def authorize_h24_outcome_open(
 - Create: `schemas/model_improvement/h24_comparison.schema.json`
 
 - [ ] Add failing controller tests for missing/extra/duplicate source-derived outcomes, postponement ambiguity, population mismatch, prediction digest mismatch, missing receipt, receipt path/digest mismatch, and a second outcome-open attempt. The H24 controller supplies authenticated SourceInventory → GameEvidence inputs to Common; it defines no H24 outcome-row type or raw outcome-row sequence.
-- [ ] Use only Common Task6B APIs: seal the typed receipt once with `seal_outcome_receipt`, securely reload it with `load_outcome_receipt`, and obtain immutable observations only with `load_outcome_rows`. All are bound to the verified RunSpec, SourceGateReceipt, matching FeatureSeal, and BaselineReplayReceipt; no H24 receipt wrapper or compatibility route is permitted. Common derives the authenticated SourceInventory → GameEvidence authorities internally from those verified inputs; callers never provide either inventory as a sealer argument.
+- [ ] Use only Common Task6B APIs: seal the typed receipt once with `seal_outcome_receipt`, securely reload it with `load_outcome_receipt`, and obtain immutable observations only with `load_outcome_rows`. All are bound to the verified RunSpec, SourceGateReceipt, matching FeatureSeal, and BaselineReplayReceipt; no H24 receipt wrapper or compatibility route is permitted. Common derives the authenticated SourceInventory → GameEvidence authorities internally from those verified inputs; callers never provide either inventory as a sealer argument, and capability is not a Common API argument.
 - [ ] Run the focused H24 controller tests and confirm RED.
-- [ ] Implement the H24 comparison handoff:
+- [ ] Make `open_h24_outcomes_once(...)` the sole H24 controller boundary. It calls `authorize_h24_outcome_open` to atomically advance `OUTCOMES_OPENED` and obtain a process-local one-use `OutcomeCapability`; it then calls `capability.consume_once()` exactly once immediately before Common sealing, securely loads the receipt, and returns only that loaded typed receipt:
 
 ```python
-outcome_receipt = seal_outcome_receipt(spec, source_gate, common_feature_seal, baseline_replay, baseline_prediction_seal)
-outcome_receipt = load_outcome_receipt(
-    spec, source_gate, common_feature_seal, baseline_replay,
-    outcome_receipt.path, outcome_receipt.artifact_sha256,
-)
+def open_h24_outcomes_once(
+    ledger: H24LedgerState,
+    registry: CandidateRegistry,
+    predictions: H24PredictionManifest,
+    spec: ModelImprovementRunSpec,
+    source_gate: SourceGateReceipt,
+    common_feature_seal: FeatureSeal,
+    baseline_replay: BaselineReplayReceipt,
+    baseline_prediction_seal: PredictionSeal,
+) -> OutcomeReceipt:
+    capability = authorize_h24_outcome_open(ledger, registry, predictions)
+    capability.consume_once()
+    outcome_receipt = seal_outcome_receipt(spec, source_gate, common_feature_seal, baseline_replay, baseline_prediction_seal)
+    return load_outcome_receipt(
+        spec, source_gate, common_feature_seal, baseline_replay,
+        outcome_receipt.path, outcome_receipt.artifact_sha256,
+    )
 ```
+
+- [ ] If Common sealing or loading fails, the ledger remains `OUTCOMES_OPENED` with no rollback; the same-registry retry is forbidden. Plan tests/mocks must prove that direct controller invocation without capability raises `OutcomeCapabilityRequired`, Common sealing occurs only after `capability.consume_once()`, and a second wrapper call raises `SAME_REGISTRY_RETRY_FORBIDDEN`. The CLI/controller calls only `open_h24_outcomes_once`; it never calls Common outcome sealing/loading directly.
 
 - [ ] For every nonbaseline registry candidate, call Common `evaluate_predictions(spec, candidate_prediction_seal, baseline_prediction_seal, outcome_receipt)`. `H24Comparison` is a registry-level index, not another evaluator: it stores each candidate's `ledger_id`, `candidate_id`, and complete `EvaluationPair` path/digest. It first obtains that complete pair through `load_evaluation_pair(spec, path, expected_sha256)` and may then read its named candidate/baseline reports. It must not implement its own Brier, log loss, rank-one pairing, neutral-date handling, or observation coercion. Common owns the full-precision all-game metrics, independently selected date pairs, and maximum losing streak. Every downstream frozen-card consumer checks `outcome_receipt_path` and `outcome_receipt_sha256`; `outcomes_sha256` alone is never sufficient.
 - [ ] Store raw integer counts, full-precision metric values, signed deltas versus v5.1, and only pair-derived digests. Reject rounded values as gate inputs, and reject a pair whose candidate ID/ledger ID differs from the registry record.
@@ -330,9 +344,9 @@ def evaluate_promotion_gate(
 - Create: `scripts/run_model_improvement_h24.py`
 - Modify: `tests/test_model_improvement_h24_controller.py`
 
-- [ ] Add failing CLI tests requiring explicit paths for RunSpec, source gate, registry, every registry-declared H24 feature seal, every card, outcome file, and output root; reject defaults, path discovery, a missing Lane C H24 seal, a dirty card/feature digest, and a pre-existing `OUTCOMES_OPENED` record. The real entrypoint test must prove that an ordinary/synthetic RunSpec is rejected before registry work, that a clean verified activation calls `require_source_gate`, and that an explicit source-gate path/digest differing in payload, resolved path, or artifact digest from that returned receipt is rejected before any prediction/output/phase-ledger write.
+- [ ] Add failing CLI tests requiring explicit paths for RunSpec, source gate, registry, every registry-declared H24 feature seal, every card, and output root; reject defaults, path discovery, any outcome CLI option or fixture input, a missing Lane C H24 seal, a dirty card/feature digest, and a pre-existing `OUTCOMES_OPENED` record. Outcomes derive internally from the verified SourceInventory → GameEvidence through Task6B. The real entrypoint test must prove that an ordinary/synthetic RunSpec is rejected before registry work, that a clean verified activation calls `require_source_gate`, and that an explicit source-gate path/digest differing in payload, resolved path, or artifact digest from that returned receipt is rejected before any prediction/output/phase-ledger write.
 - [ ] Run the controller suite and confirm RED.
-- [ ] Implement a thin CLI whose first actions are `spec = load_verified_run_spec(explicit_run_spec_path)`, `verified_gate = require_source_gate(spec)`, and secure `load_source_gate_receipt(explicit_source_gate_path, expected_sha256)`. Require exact canonical payload, resolved path, and artifact-digest equality between the caller-supplied receipt and `verified_gate`; after that comparison use the returned verified `spec` and receipt only. It then validates all other pre-outcome artifacts, computes `rows = score_h24_candidates(spec, verified_gate, registry, feature_seals)`, seals only with `manifest = seal_h24_predictions(spec, registry, rows, output_dir)`, rereads their hashes, advances the phase ledger, opens outcomes once, evaluates, writes the comparison and decision, rereads both, and advances `REPORT_SEALED`. `build_candidate_registry`, `score_h24_candidates`, `seal_h24_predictions`, and all downstream pure validators must not call `load_verified_run_spec` or `require_source_gate`; they verify the RunSpec/receipt bindings passed by this controller instead.
+- [ ] Implement a thin CLI whose first actions are `spec = load_verified_run_spec(explicit_run_spec_path)`, `verified_gate = require_source_gate(spec)`, and secure `load_source_gate_receipt(explicit_source_gate_path, expected_sha256)`. Require exact canonical payload, resolved path, and artifact-digest equality between the caller-supplied receipt and `verified_gate`; after that comparison use the returned verified `spec` and receipt only. It then validates all other pre-outcome artifacts, computes `rows = score_h24_candidates(spec, verified_gate, registry, feature_seals)`, seals only with `manifest = seal_h24_predictions(spec, registry, rows, output_dir)`, rereads their hashes, advances the phase ledger, calls only `open_h24_outcomes_once(...)`, evaluates, writes the comparison and decision, rereads both, and advances `REPORT_SEALED`. `build_candidate_registry`, `score_h24_candidates`, `seal_h24_predictions`, and all downstream pure validators must not call `load_verified_run_spec` or `require_source_gate`; they verify the RunSpec/receipt bindings passed by this controller instead.
 - [ ] Return exit `0` for a valid report, including `NO_PROMOTION`; return exit `1` for contract/preflight rejection and exit `2` for a forbidden same-registry rerun after outcomes opened. Never catch an integrity failure and retry automatically.
 - [ ] Add `--dry-run-contract` that validates paths and hashes but cannot score, open outcomes, or create phase records.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_controller -v` and confirm all CLI tests pass.
