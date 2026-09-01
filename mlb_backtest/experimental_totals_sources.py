@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -48,8 +49,8 @@ class AdmittedSourceIdentity:
     completion_sidecar_sha256: str
     manifest_relative: str
     manifest_sha256: str
-    manifest_sidecar_relative: str | None
-    manifest_sidecar_sha256: str | None
+    manifest_sidecar_relative: str
+    manifest_sidecar_sha256: str
     payload_relative: str
     payload_sha256: str
     byte_length: int
@@ -245,10 +246,14 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
                 raise ValueError("live schedule date differs")
 
 
-def _closed_history_rows(raw: bytes, cutoff_date: str) -> tuple[object, ...]:
+def _closed_history_rows(
+    raw: bytes, cutoff_date: str, start_date: str
+) -> tuple[object, ...]:
     _validate_schedule_population(raw, role=_HISTORY_ROLE, expected_date=cutoff_date)
     rows = []
     for game in parse_schedule(raw):
+        if game["official_date"] < start_date:
+            raise ValueError("history schedule date differs")
         if game["official_date"] > cutoff_date:
             if game["status"] in OUT_OF_RANGE_UNPLAYED_STATUSES:
                 continue
@@ -363,10 +368,27 @@ def _admit_binding(
         "row_count": row_count,
         "schema_version": 1,
     }
+    retrieved_at = manifest_value.get("retrieved_at_utc")
+    if not isinstance(retrieved_at, str):
+        raise ValueError("schedule manifest differs")
+    try:
+        parsed_retrieved_at = datetime.fromisoformat(retrieved_at)
+    except ValueError as exc:
+        raise ValueError("schedule manifest differs") from exc
+    if (
+        parsed_retrieved_at.tzinfo is None
+        or parsed_retrieved_at.utcoffset() != timedelta(0)
+        or parsed_retrieved_at.isoformat() != retrieved_at
+        or type(manifest_value.get("schema_version")) is not int
+        or manifest_value.get("schema_version") != 1
+        or type(manifest_value.get("row_count")) is not int
+    ):
+        raise ValueError("schedule manifest differs")
     if manifest_value != expected_manifest or _snapshot_digest(manifest) != binding.manifest_sha256:
         raise ValueError("schedule manifest differs")
-    assert manifest_sidecar is not None
-    _require_sidecar(manifest_sidecar, binding.manifest_sha256, "schedule manifest seal")
+    manifest_sidecar = _require_sidecar(
+        manifest_sidecar, binding.manifest_sha256, "schedule manifest seal"
+    )
 
     receipt_digest = _snapshot_digest(receipt)
     if receipt_digest != binding.receipt_sha256:
@@ -435,17 +457,24 @@ def _admit_binding(
             raise ValueError("live schedule completion differs")
     _require_sidecar(completion_sidecar, _snapshot_digest(completion), "schedule completion seal")
 
-    rows = _closed_history_rows(payload.contents, cutoff_date) if binding.binding_role == _HISTORY_ROLE else _closed_target_rows(payload.contents, target_date)
+    rows = (
+        _closed_history_rows(
+            payload.contents, cutoff_date, f"{cutoff_date[:4]}-01-01"
+        )
+        if binding.binding_role == _HISTORY_ROLE
+        else _closed_target_rows(payload.contents, target_date)
+    )
     if binding.binding_role == _HISTORY_ROLE:
         if binding.game_pks:
             raise ValueError("history schedule binding game_pks differs")
     elif tuple(sorted(game.game_pk for game in rows)) != binding.game_pks:
         raise ValueError("live schedule binding game_pks differs")
-    snapshots = (claim, receipt, completion, completion_sidecar, manifest, payload)
+    snapshots = (
+        claim, receipt, completion, completion_sidecar, manifest, manifest_sidecar,
+        payload,
+    )
     if receipt_sidecar is not None:
         snapshots += (receipt_sidecar,)
-    if manifest_sidecar is not None:
-        snapshots += (manifest_sidecar,)
     _totals_sources_test_hook("before_rebind", payload_relative)
     for snapshot in snapshots:
         rebind_regular_snapshot(trusted, snapshot, "schedule source evidence", max_bytes=_MAX_JSON_BYTES)
@@ -459,8 +488,8 @@ def _admit_binding(
         completion_relative=completion_relative.as_posix(), completion_sha256=_snapshot_digest(completion),
         completion_sidecar_relative=completion_sidecar_relative.as_posix(), completion_sidecar_sha256=_snapshot_digest(completion_sidecar),
         manifest_relative=manifest_relative.as_posix(), manifest_sha256=_snapshot_digest(manifest),
-        manifest_sidecar_relative=manifest_sidecar_relative.as_posix() if manifest_sidecar is not None else None,
-        manifest_sidecar_sha256=_snapshot_digest(manifest_sidecar) if manifest_sidecar is not None else None,
+        manifest_sidecar_relative=manifest_sidecar_relative.as_posix(),
+        manifest_sidecar_sha256=_snapshot_digest(manifest_sidecar),
         payload_relative=payload_relative.as_posix(), payload_sha256=_snapshot_digest(payload), byte_length=len(payload.contents),
     )
     return identity, rows, snapshots

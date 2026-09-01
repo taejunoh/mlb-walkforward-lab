@@ -99,7 +99,13 @@ def _write(root: Path, relative: Path, contents: bytes) -> Path:
     return path
 
 
-def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> SourceBinding:
+def _write_evidence(
+    root: Path,
+    binding: SourceBinding,
+    payload: bytes,
+    *,
+    manifest_overrides: dict[str, object] | None = None,
+) -> SourceBinding:
     raw_source = "mlb_schedule" if binding.binding_role == "HISTORY_SCHEDULE" else "mlb_live_schedule"
     identity = json.loads(binding.query_identity_json)
     query_digest = hashlib.sha256(canonical_json_bytes(identity).rstrip(b"\n")).hexdigest()
@@ -116,6 +122,8 @@ def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> Sourc
         "row_count": 1,
         "schema_version": 1,
     }
+    if manifest_overrides is not None:
+        manifest.update(manifest_overrides)
     manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode()
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     _write(root, payload_relative, payload)
@@ -222,13 +230,16 @@ def _write_evidence(root: Path, binding: SourceBinding, payload: bytes) -> Sourc
 def write_source_fixture(
     root: Path,
     *,
+    history_date: str = CUTOFF,
     history_game_type: str = "R",
     live_game_type: str = "R",
     live_status: str | None = None,
+    history_manifest_overrides: dict[str, object] | None = None,
+    live_manifest_overrides: dict[str, object] | None = None,
 ) -> SourceFixture:
     from tests.test_live_top3_service import _build, _final_observer, _game, _slate
 
-    history_payload = _schedule(date=CUTOFF, final=True, game_type=history_game_type)
+    history_payload = _schedule(date=history_date, final=True, game_type=history_game_type)
     live_payload = _schedule(
         date=TARGET, final=False, game_type=live_game_type, status=live_status
     )
@@ -244,6 +255,7 @@ def write_source_fixture(
             ),
         ),
         history_payload,
+        manifest_overrides=history_manifest_overrides,
     )
     live = _write_evidence(
         root,
@@ -257,6 +269,7 @@ def write_source_fixture(
             ),
         ),
         live_payload,
+        manifest_overrides=live_manifest_overrides,
     )
     report = _build(_slate((_game(1),)), _final_observer((_game(1),)))
     report["target_date"] = TARGET
@@ -323,6 +336,53 @@ class TotalsSourcesTests(unittest.TestCase):
         self.assertEqual(bundle.target_games[0].game_pk, 2001)
         self.assertEqual(bundle.history_identity.payload_relative, fixture.history_payload.relative_to(self.root).as_posix())
         self.assertEqual(bundle.live_identity.payload_relative, fixture.live_payload.relative_to(self.root).as_posix())
+        self.assertTrue(
+            bundle.live_identity.manifest_sidecar_relative.endswith(".manifest.sha256")
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                (self.root / bundle.live_identity.manifest_sidecar_relative).read_bytes()
+            ).hexdigest(),
+            bundle.live_identity.manifest_sidecar_sha256,
+        )
+
+    def test_loader_rejects_history_before_authenticated_start_date(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root, history_date="2024-12-31")
+
+        with self.assertRaisesRegex(ValueError, "history schedule date differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_boolean_manifest_schema_version(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root, history_manifest_overrides={"schema_version": True}
+        )
+
+        with self.assertRaisesRegex(ValueError, "schedule manifest differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_boolean_manifest_row_count(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root, live_manifest_overrides={"row_count": True}
+        )
+
+        with self.assertRaisesRegex(ValueError, "schedule manifest differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_malformed_manifest_retrieval_time(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root, live_manifest_overrides={"retrieved_at_utc": "not-a-timestamp"}
+        )
+
+        with self.assertRaisesRegex(ValueError, "schedule manifest differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
     def test_loader_rejects_absolute_report_path(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
