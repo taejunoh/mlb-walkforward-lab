@@ -13,9 +13,9 @@
 ## Global Constraints
 
 - Consume only ModelImprovementRunSpec/load_verified_run_spec, SourceGateReceipt/require_source_gate/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json. Real Lane B orchestration starts with verified loading and the returned source-gate receipt; lower-level card, ledger, and fit/selection functions accept already-bound synthetic-or-real inputs and never invoke activation/source-gate verification themselves.
-- Import the pure `ScoringModelCard` type from `mlb_backtest.model_improvement.contracts`; import `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` only from `mlb_backtest.model_improvement.scoring_cards`. `contracts` must not import scoring-card persistence/resolver functions back.
+- Import `FrozenModelCard`, `seal_frozen_model_card`, and `load_frozen_model_card` only from their canonical `mlb_backtest.model_improvement.contracts` definition. Import the pure `ScoringModelCard` type from that same module; import `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` only from `mlb_backtest.model_improvement.scoring_cards`. `contracts` must not import scoring-card persistence/resolver functions back.
 - Import `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and disposition seal/load operations directly from `mlb_backtest.model_improvement.lane_disposition`; `contracts` owns no disposition alias.
-- Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
+- Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, result.evaluation_pair, result.candidate_evaluation, and result.baseline_evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
 - All artifact paths are CLI arguments. Do not modify config/v5_1_bt.json, scoring.py, config.py, locking.py, outcomes.py, live_model_card.py, or a v5_2 authority.
 - Fixed weights are environment 10pp and defense 5pp. The other four are 5pp increments within ±10pp of v5.1 and all six sum to 100pp. Multiplier is .75, 1.0, or 1.25.
@@ -637,15 +637,21 @@ from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 
 
 def h22_order(row):
-    value = row["comparison"]
-    return (value["all_games"]["candidate_brier"], value["all_games"]["candidate_log_loss"],
-            -value["daily_top1"]["delta"], row["candidate_id"])
+    pair = row["evaluation_pair"]
+    report = pair.candidate_report
+    if (pair.ledger_id != row["ledger_id"] or pair.candidate_id != row["candidate_id"]
+            or report.model_id != "A+B"):
+        raise ValueError("candidate evaluation pair identity differs")
+    return (report.brier, report.log_loss, -report.daily_top1_delta_vs_baseline,
+            row["candidate_id"])
 
 
 def reduce_h22(rows):
     if len(rows) != 210 or len({r["candidate_id"] for r in rows}) != 210:
         raise ValueError("H22 requires all 210 candidate IDs")
-    valid = [r for r in rows if r["replay_status"] == "PASS" and r["comparison"]["all_games"]["N"] > 0 and r["comparison"]["daily_top1"]["N"] > 0]
+    valid = [r for r in rows if r["replay_status"] == "PASS"
+             and r["evaluation_pair"].candidate_report.all_games_count > 0
+             and r["evaluation_pair"].candidate_report.daily_top1_count > 0]
     ids = {r["candidate_id"] for r in sorted(valid, key=h22_order)[:12]}
     kept = [{**r, "status": "KEPT_H22", "reason": "H22_ORDERED_SURVIVOR"} for r in rows if r["candidate_id"] in ids]
     rejected = [{**r, "status": "REJECTED_H22", "reason": "H22_REDUCTION_LIMIT" if r in valid else "H22_INVALID_REPLAY"} for r in rows if r["candidate_id"] not in ids]
@@ -664,7 +670,9 @@ def build_lane_b_disposition(spec, lane_a_result):
     parent = lane_a_result.card
     evidence = (lane_a_result.disposition.artifact_sha256,
                 lane_a_result.prediction.artifact_sha256,
-                lane_a_result.evaluation.artifact_sha256)
+                lane_a_result.evaluation_pair.artifact_sha256,
+                lane_a_result.candidate_evaluation.artifact_sha256,
+                lane_a_result.baseline_evaluation.artifact_sha256)
     if parent is not None and parent.model_id == "A" and parent.state == "H23_FROZEN":
         raise ValueError("frozen Lane A result must not be absent")
     return seal_lane_disposition(spec, lane_id="B", state="ABSENT",
@@ -727,7 +735,7 @@ def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, basel
         with self.assertRaisesRegex(ValueError, "not H23_FROZEN"):
             freeze_ab_card(self.spec, self.selected, self.lane_a_not_frozen,
                            self.scoring_card, self.source_gate, self.baseline_replay,
-                           self.feature_seal, self.prediction_seal, self.evaluation)
+                           self.feature_seal, self.prediction_seal, self.evaluation_pair)
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_ledger.LaneBLedgerTest -v
@@ -750,7 +758,7 @@ git commit -m "feat: seal optional lane b card"
 
 **Interfaces:**
 
-- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_pair_path, lane_a_h22_pair_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, baseline_replay, feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256, selected_prediction_seal, selected_evaluation_pair) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
+- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, lane_a_h22_pair_path, lane_a_h22_pair_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, baseline_replay, feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256, selected_prediction_seal, selected_evaluation_pair_path, selected_evaluation_pair_expected_sha256) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256). H22 obtains both the A candidate seal and v5.1 baseline seal only from the securely loaded Common evaluation pair; it accepts no loose baseline seal path.
 - H24 receives optional scoring-card.path/scoring-card.artifact_sha256, final-card.path/final-card.artifact_sha256, and disposition.path/disposition.artifact_sha256; runner does not import candidate_registry.
 
 - [ ] **Step 1: Write failing runner TestCase methods.**
@@ -779,13 +787,14 @@ class LaneBRunnerTest(unittest.TestCase):
                     mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_sealed_feature_rows") as load_rows,
                     mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_prediction_seal") as load_prediction,
                     mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_prediction_rows") as load_prediction_rows,
+                    mock.patch("mlb_backtest.model_improvement.lane_b_runner.load_evaluation_pair") as load_pair,
                 ):
                     with self.assertRaisesRegex(ValueError, "2018|SOURCES_READY|source"):
                         run_lane_b_h22(run_spec_path, self.blocked_gate_path, self.blocked_gate_artifact_sha256,
                                        self.feature_seal_path, self.feature_seal_artifact_sha256,
-                                       self.v51_h22_path, self.v51_h22_artifact_sha256,
-                                       self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
-                    for loader in (load_gate, load_feature, load_rows, load_prediction, load_prediction_rows):
+                                       self.lane_a_h22_pair_path,
+                                       self.lane_a_h22_pair_artifact_sha256)
+                    for loader in (load_gate, load_feature, load_rows, load_prediction, load_prediction_rows, load_pair):
                         loader.assert_not_called()
 
     def test_registry_is_not_imported(self):
@@ -797,15 +806,15 @@ class LaneBRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "activation|verified|source gate"):
             run_lane_b_h22(self.synthetic_spec_path, self.valid_gate_path, self.valid_gate_artifact_sha256,
                            self.feature_seal_path, self.feature_seal_artifact_sha256,
-                           self.v51_h22_path, self.v51_h22_artifact_sha256,
-                           self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
+                           self.lane_a_h22_pair_path,
+                           self.lane_a_h22_pair_artifact_sha256)
         # A clean C -> D declaration activation returns its own receipt.  A caller
         # path/digest that loads a different valid receipt must still fail closed.
         with self.assertRaisesRegex(ValueError, "returned source gate differs"):
             run_lane_b_h22(self.activated_spec_path, self.other_gate_path, self.other_gate_artifact_sha256,
                            self.feature_seal_path, self.feature_seal_artifact_sha256,
-                           self.v51_h22_path, self.v51_h22_artifact_sha256,
-                           self.lane_a_h22_path, self.lane_a_h22_artifact_sha256)
+                           self.lane_a_h22_pair_path,
+                           self.lane_a_h22_pair_artifact_sha256)
 ~~~
 
 - [ ] **Step 2: Run RED.**
@@ -820,6 +829,7 @@ Expected: ModuleNotFoundError for lane_b_runner.
 from pathlib import Path
 from mlb_backtest.model_improvement.contracts import load_frozen_model_card
 from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
+from mlb_backtest.model_improvement.evaluation import load_evaluation_pair
 from mlb_backtest.model_improvement.lane_b_ledger import build_lane_b_disposition, freeze_ab_card, select_h23
 from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal
 from mlb_backtest.model_improvement.run_spec import ModelImprovementRunSpec, load_verified_run_spec
@@ -833,8 +843,8 @@ from mlb_backtest.model_improvement.canonical import read_regular_bytes, sha256_
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
 def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path,
-                   feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256,
-                   lane_a_h22_path, lane_a_h22_expected_sha256):
+                   feature_seal_expected_sha256, lane_a_h22_pair_path,
+                   lane_a_h22_pair_expected_sha256):
     spec = load_verified_run_spec(Path(run_spec_path))
     verified_gate = require_source_gate(spec)
     gate = load_source_gate_receipt(Path(source_gate_path), source_gate_expected_sha256)
@@ -844,8 +854,20 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
         raise ValueError("returned source gate differs from explicit receipt")
     features = load_feature_seal(Path(feature_seal_path), feature_seal_expected_sha256)
     feature_rows = load_sealed_feature_rows(spec, verified_gate, (2022,), features)
-    v51 = load_prediction_seal(spec, Path(v51_h22_path), v51_h22_expected_sha256)
-    lane_a = load_prediction_seal(spec, Path(lane_a_h22_path), lane_a_h22_expected_sha256)
+    lane_a_pair = load_evaluation_pair(
+        spec, Path(lane_a_h22_pair_path), lane_a_h22_pair_expected_sha256)
+    if (lane_a_pair.run_spec_sha256 != run_spec_sha256(spec)
+            or lane_a_pair.candidate_report.model_id != "A"
+            or lane_a_pair.baseline_report.model_id != "v5.1"
+            or lane_a_pair.candidate_report.fold_id != "H22"
+            or lane_a_pair.baseline_report.fold_id != "H22"):
+        raise ValueError("Lane A H22 evaluation pair binding differs")
+    v51 = load_prediction_seal(
+        spec, Path(lane_a_pair.baseline_prediction_seal_path),
+        lane_a_pair.baseline_prediction_seal_sha256)
+    lane_a = load_prediction_seal(
+        spec, Path(lane_a_pair.candidate_prediction_seal_path),
+        lane_a_pair.candidate_prediction_seal_sha256)
     v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
     if tuple(spec.fold("H22").oof_calibration_years) != (2019, 2020, 2021):
         raise RuntimeError("H22 chronology differs")
@@ -853,12 +875,15 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
         raise RuntimeError("sealed input population differs or exposes outcomes")
     return {"run_spec_sha256": run_spec_sha256(spec), "source_gate_artifact_sha256": verified_gate.artifact_sha256,
             "feature_seal_artifact_sha256": features.artifact_sha256,
-            "v51_h22_artifact_sha256": v51.artifact_sha256, "lane_a_h22_artifact_sha256": lane_a.artifact_sha256}
+            "lane_a_h22_evaluation_pair_artifact_sha256": lane_a_pair.artifact_sha256,
+            "v51_h22_artifact_sha256": v51.artifact_sha256,
+            "lane_a_h22_artifact_sha256": lane_a.artifact_sha256}
 
 
 def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, baseline_replay,
                    feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256,
-                   selected_prediction_seal, selected_evaluation):
+                   selected_prediction_seal, selected_evaluation_pair_path,
+                   selected_evaluation_pair_expected_sha256):
     card = lane_a_result.card
     if card is None or card.model_id != "A" or card.state != "H23_FROZEN":
         return None, build_lane_b_disposition(spec, lane_a_result)
@@ -868,6 +893,8 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, bas
     candidate_id = selected["candidate_id"]
     scoring_card = load_scoring_model_card(
         spec, Path(selected_scoring_card_path), selected_scoring_card_expected_sha256)
+    selected_evaluation_pair = load_evaluation_pair(
+        spec, Path(selected_evaluation_pair_path), selected_evaluation_pair_expected_sha256)
     selected_rows = load_prediction_rows(spec, selected_prediction_seal)
     if (selected_prediction_seal.ledger_id != f"lane_b/{candidate_id}/H23"
             or selected_prediction_seal.fold_id != "H23"
@@ -878,16 +905,22 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_pair, source_gate, bas
             or {row.model_id for row in selected_rows} != {"A+B"}
             or {row.scoring_model_card_sha256 for row in selected_rows} != {scoring_card.artifact_sha256}
             or {row.target_year for row in selected_rows} != {spec.fold("H23").target_year}
-            or selected_evaluation.model_id != candidate_id
-            or selected_evaluation.run_spec_sha256 != run_spec_sha256(spec)
-            or selected_evaluation.prediction_sha256 != selected_prediction_seal.artifact_sha256):
+            or selected_evaluation_pair.ledger_id != selected_prediction_seal.ledger_id
+            or selected_evaluation_pair.candidate_id != candidate_id
+            or selected_evaluation_pair.run_spec_sha256 != run_spec_sha256(spec)
+            or selected_evaluation_pair.candidate_report.model_id != "A+B"
+            or selected_evaluation_pair.candidate_report.prediction_seal_sha256
+                != selected_prediction_seal.artifact_sha256
+            or selected_evaluation_pair.baseline_report.model_id != "v5.1"):
         raise ValueError("selected Lane B H23 prediction/evaluation binding differs")
     frozen = freeze_ab_card(spec, selected, card, scoring_card, source_gate, baseline_replay, feature_seal,
-                            selected_prediction_seal, selected_evaluation)
+                            selected_prediction_seal, selected_evaluation_pair)
     qualified = seal_lane_disposition(spec, lane_id="B", state="QUALIFIED",
         parent_card_sha256=card.artifact_sha256,
         evidence_sha256=(frozen.artifact_sha256, selected_prediction_seal.artifact_sha256,
-                         selected_evaluation.artifact_sha256),
+                         selected_evaluation_pair.artifact_sha256,
+                         selected_evaluation_pair.candidate_report.artifact_sha256,
+                         selected_evaluation_pair.baseline_report.artifact_sha256),
         reason_codes=("H23_GATE_PASS",))
     return frozen, qualified
 
@@ -908,9 +941,10 @@ def verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_ar
     def test_no_card_and_double_newline_replay_are_rejected(self):
         card, disposition = self.runner.run_lane_b_h23(
             self.spec, self.lane_a_rejected_result, self.survivors,
-            self.lane_a_rejected_result.evaluation, self.source_gate, self.baseline_replay,
+            self.lane_a_rejected_result.evaluation_pair, self.source_gate, self.baseline_replay,
             self.feature_seal, self.scoring_card_path, self.scoring_card_artifact_sha256,
-            self.lane_b_h23_prediction, self.lane_b_h23_evaluation)
+            self.lane_b_h23_prediction, self.lane_b_h23_evaluation_pair_path,
+            self.lane_b_h23_evaluation_pair_artifact_sha256)
         self.assertIsNone(card)
         self.assertEqual("ABSENT", disposition.state)
         self.manifest_path.write_bytes(b"{}\n\n")
@@ -922,10 +956,11 @@ def verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_ar
         with self.assertRaisesRegex(ValueError, "selected Lane B H23"):
             self.runner.run_lane_b_h23(
                 self.spec, self.lane_a_frozen_result, self.survivors,
-                self.lane_a_frozen_result.evaluation, self.source_gate,
+                self.lane_a_frozen_result.evaluation_pair, self.source_gate,
                 self.baseline_replay, self.feature_seal,
                 self.scoring_card_path, self.scoring_card_artifact_sha256,
-                self.wrong_candidate_prediction, self.lane_b_h23_evaluation)
+                self.wrong_candidate_prediction, self.lane_b_h23_evaluation_pair_path,
+                self.lane_b_h23_evaluation_pair_artifact_sha256)
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_runner.LaneBRunnerTest -v

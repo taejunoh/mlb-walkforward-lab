@@ -328,7 +328,7 @@ class FrozenModelCard:
     model_id: str; state: str; fold_id: str; run_spec_sha256: str; source_gate_sha256: str
     baseline_replay_sha256: str; parent_card_sha256: str | None; feature_seal_sha256: str
     prediction_contract_sha256: str; scoring_model_card_path: str; scoring_model_card_sha256: str
-    prediction_seal_sha256: str; evaluation_sha256: str
+    prediction_seal_sha256: str; evaluation_pair_sha256: str; evaluation_sha256: str
     parameters: Mapping[str, object]; artifact_sha256: str; path: str
 
 ```
@@ -1201,10 +1201,10 @@ class LaneATest(unittest.TestCase):
         self.assertEqual(load_frozen_model_card(spec, Path(card.path), card.artifact_sha256), card)
 
     def test_h23_freezes_only_after_strict_identical_population_improvement(self):
-        result = fit_lane_a_fold(spec, "H23", feature_seal, joined_ledgers, baseline_receipt)
+        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, joined_ledgers, baseline_receipt)
         self.assertEqual(result.card.state, "H23_FROZEN")
-        self.assertLess(result.evaluation.brier, result.baseline_evaluation.brier)
-        self.assertLess(result.evaluation.log_loss, result.baseline_evaluation.log_loss)
+        self.assertLess(result.candidate_evaluation.brier, result.baseline_evaluation.brier)
+        self.assertLess(result.candidate_evaluation.log_loss, result.baseline_evaluation.log_loss)
         self.assertEqual(result.prediction.prediction_contract_sha256, spec.prediction_contract_sha256)
         self.assertEqual(result.prediction.scoring_model_card_sha256,
                          result.scoring_card.artifact_sha256)
@@ -1216,7 +1216,7 @@ class LaneATest(unittest.TestCase):
                           "environment": 10, "defense": 5, "schedule": 5})
 
     def test_h23_non_improvement_emits_rejected_disposition_without_card(self):
-        result = fit_lane_a_fold(spec, "H23", feature_seal, worse_joined_ledgers, baseline_receipt)
+        result = fit_lane_a_fold(spec, source_gate, "H23", feature_seal, worse_joined_ledgers, baseline_receipt)
         self.assertIsNone(result.card)
         self.assertEqual(result.disposition.state, "REJECTED")
 ```
@@ -1227,7 +1227,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `lane_a`.
 
-- [ ] **Step 3: Implement the Common closed `frozen_model_card.schema.json`, post-evaluation card persistence, and `LaneAFoldResult` with fields `fold_id`, `scoring_card: ScoringModelCard`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation_pair: EvaluationPair`, `evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, source_gate, fold_id, feature_seal, joined_ledgers, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** The exact card APIs are:
+- [ ] **Step 3: Implement the Common closed `frozen_model_card.schema.json`, post-evaluation card persistence, and `LaneAFoldResult` with fields `fold_id`, `scoring_card: ScoringModelCard`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation_pair: EvaluationPair`, `candidate_evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, source_gate, fold_id, feature_seal, joined_ledgers, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** The named reports must be exactly `evaluation_pair.candidate_report` and `evaluation_pair.baseline_report`; no consumer may treat the pair itself as a report. The exact card APIs are:
 
 ```python
 def seal_frozen_model_card(
@@ -1242,7 +1242,7 @@ def load_frozen_model_card(
 ) -> FrozenModelCard
 ```
 
-The sealer validates the closed model/state/fold schema, namespace/model compatibility, and `parameters.component_weights_pp`: exactly the six component keys in RunSpec order, integer nonnegative pp values totaling 100. It writes a canonical payload with no runtime `artifact_sha256`/`path`, rereads and hashes its persisted bytes before constructing descriptor fields, and returns the loader result. The loader validates the regular canonical bytes, expected/sidecar digest, exact RunSpec namespace/model/fold path, payload schema, and the same card-weight rule before constructing an immutable card. A frozen card must persist `scoring_model_card_path` and `scoring_model_card_sha256`, securely reload that exact preexisting scoring card, and prove its model/fold/RunSpec/source/feature/calibration/candidate/weight bindings match the final card. It then binds the H23 prediction seal and H23 evaluation digest. Generic parameter values remain recursively immutable but lane-specific parameter keys remain lane-owned. It never discovers cards by scanning or accepts fabricated descriptors; H24 additionally requires the caller to supply its exact registry-pinned scoring-card and frozen-card path/digest pairs.
+The sealer validates the closed model/state/fold schema, namespace/model compatibility, and `parameters.component_weights_pp`: exactly the six component keys in RunSpec order, integer nonnegative pp values totaling 100. It writes a canonical payload with no runtime `artifact_sha256`/`path`, rereads and hashes its persisted bytes before constructing descriptor fields, and returns the loader result. The loader validates the regular canonical bytes, expected/sidecar digest, exact RunSpec namespace/model/fold path, payload schema, and the same card-weight rule before constructing an immutable card. A frozen card must persist `scoring_model_card_path` and `scoring_model_card_sha256`, securely reload that exact preexisting scoring card, and prove its model/fold/RunSpec/source/feature/calibration/candidate/weight bindings match the final card. It then binds the H23 prediction seal, `evaluation_pair_sha256`, and the pair's named candidate-report `evaluation_sha256`; it securely reloads that pair and rejects any candidate/baseline report, ledger, source-gate, or prediction mismatch. Generic parameter values remain recursively immutable but lane-specific parameter keys remain lane-owned. It never discovers cards by scanning or accepts fabricated descriptors; H24 additionally requires the caller to supply its exact registry-pinned scoring-card and frozen-card path/digest pairs.
 
 For every OOF target use only that fold’s declared prior-season pool, score frozen v5.1 structure, fit `normalize.fit_logistic` only on earlier joined OOF predictions, then seal the candidate `ScoringModelCard` before sealing its H22/H23 per-game probabilities/ranks. The `PredictionSeal.prediction_contract_sha256` must equal `spec.prediction_contract_sha256`, never its artifact digest, and `PredictionSeal.scoring_model_card_sha256` must equal the exact scoring-card digest whose `component_weights_pp` the scorer used; H22/H23 seals set `frozen_model_card_sha256=None`. Replay with `replay_v51_predictions(spec, source_gate, feature_seal)`, then call `pair = evaluate_predictions(spec, source_gate, candidate_prediction, baseline_prediction, outcomes)` and retain `pair.candidate_report`/`pair.baseline_report` plus the pair digest in `LaneAFoldResult`. H22 emits `QUALIFIED` with reason `H22_EVALUATED` and no final card. H23 emits the sole post-evaluation `H23_FROZEN` card only when both strict metric comparisons pass; H23 failure emits `REJECTED`, reason code(s) `H23_BRIER_NOT_STRICTLY_LOWER` and/or `H23_LOG_LOSS_NOT_STRICTLY_LOWER`, and no final card. The direct baseline RunSpec pin and Lane A scoring card both use unchanged `35/25/20/10/5/5` weights; tests reject any A-card reweighting. A frozen H23 payload binds source gate, feature seal, all OOF ledgers, baseline replay, alpha/beta, its scoring-card path/digest, evaluation **pair** and report digest, and the prediction artifact: `prediction_contract_sha256 == spec.prediction_contract_sha256`, `prediction_seal_sha256 == PredictionSeal.artifact_sha256`, and `scoring_model_card_sha256 == PredictionSeal.scoring_model_card_sha256`. It reads no H24 outcome/metric/parameter.
 
