@@ -40,10 +40,26 @@ class RunSpecTest(unittest.TestCase):
         self.assertEqual(spec.fold("H22").normalization_years, (2018, 2019, 2020, 2021))
         self.assertEqual(spec.fold("H24").oof_calibration_years, (2019, 2020, 2021, 2022, 2023))
         self.assertEqual(dict(spec.cutoffs), {"history": "D-1", "snapshot": "T-45"})
-        self.assertRegex(spec.source_authority.inventory.sha256, r"^[0-9a-f]{64}$")
         self.assertEqual(
-            sha256(canonical_json_bytes(dict(spec.exclusions))).hexdigest(),
-            sha256(canonical_json_bytes(dict(build_run_spec(self.raw()).exclusions))).hexdigest(),
+            spec.source_authority.inventory.sha256,
+            self.raw()["source_authority"]["inventory"]["sha256"],
+        )
+        expected_exclusions = {
+            "excluded_years": [2025],
+            "forbidden_outcome_years": [2025],
+            "forbid_h24_outcomes": True,
+        }
+        parsed_exclusions = {
+            "excluded_years": list(spec.exclusions["excluded_years"]),
+            "forbidden_outcome_years": list(spec.exclusions["forbidden_outcome_years"]),
+            "forbid_h24_outcomes": spec.exclusions["forbid_h24_outcomes"],
+        }
+        self.assertEqual(
+            parsed_exclusions, expected_exclusions,
+        )
+        self.assertEqual(
+            sha256(canonical_json_bytes(parsed_exclusions)).hexdigest(),
+            "fde54501d2d20653e324d25a45e0a36f3d8dbd4c3f1f5d7bafd9cfe5ab30f207",
         )
         self.assertEqual(spec.lane_b.keep_h22_count, 12)
         self.assertEqual(spec.lane_b.h23_order, ("brier", "log_loss", "daily_top1_delta_desc", "candidate_id"))
