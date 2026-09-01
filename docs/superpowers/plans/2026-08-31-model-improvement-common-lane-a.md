@@ -969,6 +969,19 @@ class ScoringCardTest(unittest.TestCase):
         self.assertEqual(ref.component_weights_pp, spec.baseline.card.component_weights_pp)
         with self.assertRaisesRegex(ValueError, "v5.1.*scoring card"):
             seal_scoring_model_card(spec, make_v51_payload())
+
+    def test_resolver_reloads_baseline_and_candidate_authorities_not_descriptors(self):
+        spec = make_temp_repo_local_baseline_spec(self.tmp_path)
+        card = seal_scoring_model_card(spec, make_a_payload(fold_id="H23"))
+        tamper_regular_file(Path(card.path))
+        with self.assertRaisesRegex(ValueError, "scoring card.*digest|canonical"):
+            resolve_prediction_weight_authority(spec, "A", card)
+        tamper_regular_file(Path(spec.baseline.card.path))
+        with self.assertRaisesRegex(ValueError, "baseline.*digest|canonical"):
+            resolve_prediction_weight_authority(spec, "v5.1", None)
+        fabricated = dataclasses.replace(card, path=str(self.tmp_path / "forged.json"))
+        with self.assertRaisesRegex(ValueError, "descriptor.*reload|path"):
+            resolve_prediction_weight_authority(spec, "A", fabricated)
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -1013,9 +1026,9 @@ Persist exactly `schema="MODEL_IMPROVEMENT_SCORING_MODEL_CARD_V1"`, `model_id`, 
 
 The required sidecar is exactly the canonical JSON payload `{"artifact_sha256": digest}\n` at the derived primary path plus `.sha256` (for example `scoring_model_card.json.sha256`); `digest` is the SHA-256 of the primary card's canonical payload bytes. Commit order is sidecar first, primary last: exclusively create/fsync/reread the exact sidecar, then exclusively create/fsync/reread the primary, then secure-load both and return the descriptor. A retry may finish an orphan sidecar only when the primary is absent and the existing sidecar's exact canonical bytes name the newly computed primary digest; it must not overwrite either file. A primary without its exact sidecar is rejected by every loader and never treated as committed.
 
-Common validates this closed payload, its hashes, and its sole derived path; it cannot infer that a caller-provided digest denotes the correct semantic upstream object. Before calling the sealer, each lane adapter must securely load and compare the verified `SourceGateReceipt`, `FeatureSeal`, calibration object, applicable parent/final card, and (as relevant) selected candidate or Lane-C coverage object, then copy only their matched digests into the payload. H24 performs the same comparisons against registry-pinned final parents. Mismatch fails before the Common call.
+Common validates this closed payload, its hashes, and its sole derived path; it cannot infer that a caller-provided digest denotes the correct semantic upstream object. Before calling the sealer, each lane adapter must securely load and compare the verified `SourceGateReceipt`, `FeatureSeal`, calibration object, and applicable parent/final card, then copy only their matched digests into the payload. Lane B additionally validates its registered selected Candidate. Lane C validates its typed in-process coverage report against those securely reloaded artifacts; it does not pretend that report is independently loadable. H24 follows a digest equality chain through securely loaded H23 scoring/frozen cards and registry-pinned H24 feature evidence; it does not accept or load an in-memory Lane-C coverage object. Mismatch fails before the Common call.
 
-`resolve_prediction_weight_authority` is the only common scorer entry point for this choice. It accepts `(model_id="v5.1", scoring_card=None)` only when `spec.baseline.card.path`, `spec.baseline.card.sha256`, and `spec.baseline.card.component_weights_pp` verify. It accepts `(model_id in {"A","A+B","A+B+C"}, verified scoring_card)` only when its model, contract digest, and weights verify. All other combinations fail closed. This produces a uniform `scoring_model_card_sha256`: baseline uses `spec.baseline.card.sha256`; a candidate uses its `ScoringModelCard.artifact_sha256`.
+`resolve_prediction_weight_authority` is the only common scorer entry point for this choice. It never trusts an input descriptor. For `(model_id="v5.1", scoring_card=None)`, it opens exactly `spec.baseline.card.path` with no-follow regular-file checks, reads the full canonical bytes, recomputes their SHA-256, validates the baseline-card schema, and requires that digest and the exact six integer weights equal the direct RunSpec pins before returning the authority. For `(model_id in {"A","A+B","A+B+C"}, scoring_card)`, it always calls `load_scoring_model_card(spec, Path(scoring_card.path), scoring_card.artifact_sha256)` and requires the securely loaded descriptor's full closed payload, derived path, and artifact digest to equal the supplied descriptor before checking its model, contract digest, and weights. A missing, tampered, noncanonical, symlink/non-regular, stale, or fabricated descriptor fails closed. All other combinations fail closed. This produces a uniform `scoring_model_card_sha256`: baseline uses `spec.baseline.card.sha256`; a candidate uses the secure loader's `ScoringModelCard.artifact_sha256`.
 
 `ScoringModelCard` remains the pure dataclass defined in `contracts.py`. Only `scoring_cards.py` owns and exports `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority`; it imports the dataclass from `contracts.py`, while `contracts.py` imports none of those persistence or resolver functions. Every advertised import and package re-export preserves this one-way dependency.
 

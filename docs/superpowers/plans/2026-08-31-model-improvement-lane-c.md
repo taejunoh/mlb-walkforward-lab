@@ -30,10 +30,10 @@ from mlb_backtest.model_improvement.run_spec import (
     ModelImprovementRunSpec, load_verified_run_spec, run_spec_sha256,
 )
 from mlb_backtest.model_improvement.source_gate import (
-    SourceGateReceipt, require_source_gate,
+    SourceGateReceipt, load_source_gate_receipt, require_source_gate,
 )
 from mlb_backtest.model_improvement.sealed_features import (
-    FeatureSeal, load_sealed_feature_rows,
+    FeatureSeal, load_feature_seal, load_sealed_feature_rows,
 )
 from mlb_backtest.model_improvement.lane_disposition import (
     LANE_DISPOSITION_STATES, LANE_IDS, LaneDisposition, load_lane_disposition,
@@ -44,7 +44,7 @@ from pathlib import Path
 
 `LaneDisposition` is the generic Common disposition API. Lane C uses only states `QUALIFIED`, `ABSENT`, and `REJECTED`; it does not define a C-specific absence enum. `load_frozen_model_card(spec, path, expected_sha256)` and the Common `PredictionSeal` are the typed APIs consumed by this plan. Runtime artifact descriptors are compared with `.artifact_sha256`; that field is excluded from canonical payloads. If an upstream plan has not published one of these names, resolve that interface in the upstream plan before starting Lane C; do not add aliases here.
 
-Before Lane C starts, Common must publish `LANE_IDS`, `load_sealed_feature_rows(spec, source_gate, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(spec, path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_scoring_model_card(spec, payload)`, `scoring_model_card_path(spec, payload)`, `load_scoring_model_card(spec, path, expected_sha256)`, `resolve_prediction_weight_authority(spec, model_id, scoring_card)`, `seal_frozen_model_card(spec, namespace, relative_name, payload)`, `load_frozen_model_card(spec, path, expected_sha256)`, `seal_feature_rows(spec, source_gate, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. `source_gate` is always the authenticated `SourceGateReceipt` obtained at the real controller boundary (or a synthetic already-bound fixture in pure tests); Lane C must never self-assert a receipt digest. `ScoringModelCard` is the pure type from `contracts`; its seal/load/resolve functions come only from `scoring_cards`, and `contracts` must not import them back. Lane C calls these APIs rather than recomputing or weakening upstream seals. Validate `"C" in LANE_IDS` rather than declaring a local lane-ID domain.
+Before Lane C starts, Common must publish `LANE_IDS`, `load_sealed_feature_rows(spec, source_gate, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(spec, path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_scoring_model_card(spec, payload)`, `scoring_model_card_path(spec, payload)`, `load_scoring_model_card(spec, path, expected_sha256)`, `resolve_prediction_weight_authority(spec, model_id, scoring_card)`, `seal_frozen_model_card(spec, namespace, relative_name, payload)`, `load_frozen_model_card(spec, path, expected_sha256)`, `seal_feature_rows(spec, source_gate, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. The existing fold-calibration loader has the exact extension `load_fold_calibration_parameters(spec, fold_id, expected_sha256, explicit_path: Path | None = None) -> tuple[float, float]`: it no-follow/canonical reloads the unique RunSpec fold path when `explicit_path is None`, otherwise additionally requires that supplied path to equal the derived path. `source_gate` is always the authenticated `SourceGateReceipt` obtained at the real controller boundary (or a synthetic already-bound fixture in pure tests); Lane C must never self-assert a receipt digest. `ScoringModelCard` is the pure type from `contracts`; its seal/load/resolve functions come only from `scoring_cards`, and `contracts` must not import them back. Lane C calls these APIs rather than recomputing or weakening upstream seals. Validate `"C" in LANE_IDS` rather than declaring a local lane-ID domain.
 
 The Common `ModelImprovementRunSpec` is the only authority for fold membership, forbidden years, cutoffs, and artifact paths. `lane_c_output_path(spec, relative)` must be exactly:
 
@@ -843,12 +843,12 @@ def test_h22_and_h23_use_distinct_fold_bound_cards_and_prediction_paths(self):
     h22_card = seal_lane_c_scoring_card(
         self.spec, "H22", self.source_gate, self.lane_c_feature_seals["H22"],
         self.parent_ab_card, self.qualified_report, self.replay_receipt,
-        self.h22_calibration_card_sha256,
+        self.h22_calibration_card_path, self.h22_calibration_card_sha256,
     )
     h23_card = seal_lane_c_scoring_card(
         self.spec, "H23", self.source_gate, self.lane_c_feature_seals["H23"],
         self.parent_ab_card, self.qualified_report, self.replay_receipt,
-        self.h23_calibration_card_sha256,
+        self.h23_calibration_card_path, self.h23_calibration_card_sha256,
     )
     self.assertTrue(h22_card.path.endswith("lane_c/H22/scoring_model_card.json"))
     self.assertTrue(h23_card.path.endswith("lane_c/H23/scoring_model_card.json"))
@@ -880,12 +880,12 @@ def test_lane_c_materializer_rejects_cross_fold_or_tampered_scoring_authority(se
     h22_card = seal_lane_c_scoring_card(
         self.spec, "H22", self.source_gate, self.lane_c_feature_seals["H22"],
         self.parent_ab_card, self.qualified_report, self.replay_receipt,
-        self.h22_calibration_card_sha256,
+        self.h22_calibration_card_path, self.h22_calibration_card_sha256,
     )
     h23_card = seal_lane_c_scoring_card(
         self.spec, "H23", self.source_gate, self.lane_c_feature_seals["H23"],
         self.parent_ab_card, self.qualified_report, self.replay_receipt,
-        self.h23_calibration_card_sha256,
+        self.h23_calibration_card_path, self.h23_calibration_card_sha256,
     )
     with self.assertRaisesRegex(ValueError, "fold FeatureSeal"):
         materialize_lane_c_prediction_rows(
@@ -899,24 +899,24 @@ def test_lane_c_scoring_and_materialization_reject_non_lane_c_wrong_fold_and_gat
         seal_lane_c_scoring_card(
             self.spec, "H22", self.source_gate, self.parent_feature_seals["H22"],
             self.parent_ab_card, self.qualified_report, self.replay_receipt,
-            self.h22_calibration_card_sha256,
+            self.h22_calibration_card_path, self.h22_calibration_card_sha256,
         )
     with self.assertRaisesRegex(ValueError, "fold"):
         seal_lane_c_scoring_card(
             self.spec, "H22", self.source_gate, self.lane_c_feature_seals["H23"],
             self.parent_ab_card, self.qualified_report, self.replay_receipt,
-            self.h22_calibration_card_sha256,
+            self.h22_calibration_card_path, self.h22_calibration_card_sha256,
         )
     with self.assertRaisesRegex(ValueError, "source gate"):
         seal_lane_c_scoring_card(
             self.spec, "H22", self.mismatched_source_gate, self.lane_c_feature_seals["H22"],
             self.parent_ab_card, self.qualified_report, self.replay_receipt,
-            self.h22_calibration_card_sha256,
+            self.h22_calibration_card_path, self.h22_calibration_card_sha256,
         )
     h22_card = seal_lane_c_scoring_card(
         self.spec, "H22", self.source_gate, self.lane_c_feature_seals["H22"],
         self.parent_ab_card, self.qualified_report, self.replay_receipt,
-        self.h22_calibration_card_sha256,
+        self.h22_calibration_card_path, self.h22_calibration_card_sha256,
     )
     with self.assertRaisesRegex(ValueError, "feature_set_id"):
         materialize_lane_c_prediction_rows(
@@ -933,7 +933,7 @@ def test_lane_c_scoring_and_materialization_reject_non_lane_c_wrong_fold_and_gat
         )
 ```
 
-`build_validated_parts()` accepts a `LaneCReplayReceipt` and rejects every observation whose digest is not listed in its immutable entries; neutral rows become score `50.0` and quality `0.0`, never a fabricated optional value. The candidate test must call `seal_lane_c_candidate_rows(spec, source_gate, parent_common_seals, candidate_rows, coverage, replay_receipt)`, assert separate H22/H23/H24 Common FeatureSeal descriptors, reload each with `load_sealed_feature_rows(spec, source_gate, ...)`, and prove no unsealed row is accepted by materialization or handoff. It must then test `seal_lane_c_scoring_card` yields only the exact derived H22/H23 path, `candidate_id is None`, `candidate_payload_sha256 == coverage_sha256(coverage)`, and a mandatory exact sidecar; it must reject a missing/tampered sidecar and any parent/calibration/coverage object mismatch before the Common call. It then tests `materialize_lane_c_prediction_rows(spec, source_gate, ...)` against the fold-bound seal/card, including row contract/card digests, no labels, deterministic unique population, and rejection of Common/non-`lane_c`, wrong-fold, and card-vs-seal source-gate-mismatched FeatureSeals before `seal_lane_c_fold_prediction` receives only the resulting tuple. Test fixtures are synthetic and in-memory.
+`build_validated_parts()` accepts a `LaneCReplayReceipt` and rejects every observation whose digest is not listed in its immutable entries; neutral rows become score `50.0` and quality `0.0`, never a fabricated optional value. The candidate test must call `seal_lane_c_candidate_rows(spec, source_gate, parent_common_seals, candidate_rows, coverage, replay_receipt)`, assert separate H22/H23/H24 Common FeatureSeal descriptors, reload each with `load_sealed_feature_rows(spec, source_gate, ...)`, and prove no unsealed row is accepted by materialization or handoff. Its scoring-card fixture supplies each typed descriptor with its current path/digest plus `h22/h23_calibration_card_path` and digest. It must prove the adapter reloads source gate, feature seal, parent card, replay receipt, and calibration before write; reject a fabricated descriptor, a mutated primary/sidecar, a wrong explicit calibration path, and any parent/calibration/coverage mismatch. It then asserts only the exact derived H22/H23 path, `candidate_id is None`, `candidate_payload_sha256 == coverage_sha256(coverage)`, and a mandatory exact sidecar. It then tests `materialize_lane_c_prediction_rows(spec, source_gate, ...)` against the fold-bound seal/card, including row contract/card digests, no labels, deterministic unique population, and rejection of Common/non-`lane_c`, wrong-fold, and card-vs-seal source-gate-mismatched FeatureSeals before `seal_lane_c_fold_prediction` receives only the resulting tuple. Test fixtures are synthetic and in-memory.
 
 - [ ] **Step 2: Run candidate tests to verify RED.**
 
@@ -1192,32 +1192,73 @@ def seal_lane_c_scoring_card(
     parent_ab_card: FrozenModelCard,
     coverage: LaneCCoverageReport,
     replay_receipt: LaneCReplayReceipt,
+    calibration_card_path: Path,
     calibration_card_sha256: str,
 ) -> ScoringModelCard:
     if fold_id not in ("H22", "H23"):
         raise ValueError("Lane C scoring cards are pre-prediction H22 or H23 artifacts")
-    if lane_c_feature_seal.feature_set_id != "lane_c":
+    verified_gate = load_source_gate_receipt(
+        Path(source_gate.path), source_gate.artifact_sha256,
+    )
+    if (
+        verified_gate.as_mapping() != source_gate.as_mapping()
+        or verified_gate.path != source_gate.path
+        or verified_gate.artifact_sha256 != source_gate.artifact_sha256
+        or verified_gate.run_spec_sha256 != run_spec_sha256(spec)
+        or verified_gate.inventory_sha256 != spec.source_authority.inventory.sha256
+    ):
+        raise ValueError("Lane C source gate descriptor differs from secure reload")
+    verified_feature_seal = load_feature_seal(
+        Path(lane_c_feature_seal.path), lane_c_feature_seal.artifact_sha256,
+    )
+    if verified_feature_seal != lane_c_feature_seal:
+        raise ValueError("Lane C FeatureSeal descriptor differs from secure reload")
+    load_sealed_feature_rows(
+        spec, verified_gate, (spec.fold(fold_id).target_year,), verified_feature_seal,
+    )
+    verified_parent = load_frozen_model_card(
+        spec, Path(parent_ab_card.path), parent_ab_card.artifact_sha256,
+    )
+    if verified_parent != parent_ab_card:
+        raise ValueError("Lane C parent card descriptor differs from secure reload")
+    verified_replay = load_replay_receipt(spec, replay_receipt)
+    if verified_replay != replay_receipt:
+        raise ValueError("Lane C replay receipt descriptor differs from secure reload")
+    # With an explicit path this loader no-follow rereads exactly that path,
+    # checks its canonical bytes/digest and fold, then returns frozen parameters.
+    load_fold_calibration_parameters(
+        spec, fold_id, calibration_card_sha256, calibration_card_path,
+    )
+    if verified_feature_seal.feature_set_id != "lane_c":
         raise ValueError("Lane C scoring card requires FeatureSeal feature_set_id lane_c")
-    if lane_c_feature_seal.fold_id != fold_id:
+    if verified_feature_seal.fold_id != fold_id:
         raise ValueError("Lane C FeatureSeal fold differs from scoring-card fold")
-    if lane_c_feature_seal.source_gate_sha256 != source_gate.artifact_sha256:
+    if verified_feature_seal.source_gate_sha256 != verified_gate.artifact_sha256:
         raise ValueError("Lane C FeatureSeal source gate differs from scoring-card source gate")
-    parent_weights = dict(parent_ab_card.parameters["component_weights_pp"])
+    if (
+        coverage.run_spec_sha256 != run_spec_sha256(spec)
+        or coverage.feature_seal_sha256.get(fold_id) != verified_feature_seal.artifact_sha256
+        or coverage.replay_receipt_sha256 != verified_replay.artifact_sha256
+        or not coverage.coverage_complete_by_fold.get(fold_id, False)
+        or not coverage.replay_complete
+    ):
+        raise ValueError("Lane C coverage differs from securely reloaded evidence")
+    parent_weights = dict(verified_parent.parameters["component_weights_pp"])
     payload = {
         "model_id": "A+B+C", "lane_id": "C", "fold_id": fold_id, "candidate_id": None,
         "run_spec_sha256": run_spec_sha256(spec),
-        "source_gate_sha256": source_gate.artifact_sha256,
-        "baseline_replay_sha256": parent_ab_card.baseline_replay_sha256,
-        "parent_card_sha256": parent_ab_card.artifact_sha256,
-        "feature_seal_sha256": lane_c_feature_seal.artifact_sha256,
+        "source_gate_sha256": verified_gate.artifact_sha256,
+        "baseline_replay_sha256": verified_parent.baseline_replay_sha256,
+        "parent_card_sha256": verified_parent.artifact_sha256,
+        "feature_seal_sha256": verified_feature_seal.artifact_sha256,
         "prediction_contract_sha256": spec.prediction_contract_sha256,
         "calibration_card_sha256": calibration_card_sha256,
         "candidate_payload_sha256": coverage_sha256(coverage),
         "parameters": {
             "component_weights_pp": parent_weights,
             "coverage_sha256": coverage_sha256(coverage),
-            "replay_receipt_sha256": replay_receipt.artifact_sha256,
-            "fold_feature_seal_sha256": lane_c_feature_seal.artifact_sha256,
+            "replay_receipt_sha256": verified_replay.artifact_sha256,
+            "fold_feature_seal_sha256": verified_feature_seal.artifact_sha256,
         },
     }
     return seal_scoring_model_card(spec, payload)
@@ -1508,7 +1549,7 @@ def build_lane_c_fold_result(
     return card, disposition
 ```
 
-`seal_lane_c_scoring_card()` is fold-parameterized and runs before every Lane C H22/H23 prediction. It accepts only `fold_id in {"H22","H23"}`, requires the supplied `FeatureSeal.feature_set_id == "lane_c"` and equal `FeatureSeal.fold_id`, and requires `FeatureSeal.source_gate_sha256 == source_gate.artifact_sha256` before it constructs the payload's `source_gate_sha256`. Before its Common call it securely loads and compares the SourceGateReceipt, FeatureSeal, H22/H23 calibration card, A+B parent scoring/final card, replay receipt, and the exact Lane-C coverage object; their verified digests must equal every corresponding payload field. It sets `candidate_id=None` and `candidate_payload_sha256=coverage_sha256(coverage)`, then calls only `seal_scoring_model_card(spec, payload)`, whose sole accepted derived path is `lane_c/{fold_id}/scoring_model_card.json`. It preserves the A+B six-key weights byte-for-byte and binds the A+B parent, calibration/coverage/replay evidence, and the universal RunSpec contract digest. Common validates the closed payload/hash/path, but this adapter owns those object-level comparisons. Common FeatureSeals, cross-fold FeatureSeals, coverage/parent/calibration mismatches, and source-gate mismatches fail before any card write.
+`seal_lane_c_scoring_card()` is fold-parameterized and runs before every Lane C H22/H23 prediction. Its typed `SourceGateReceipt`, `FeatureSeal`, `FrozenModelCard`, and `LaneCReplayReceipt` inputs each carry their path/digest; the caller separately supplies `calibration_card_path` plus `calibration_card_sha256`. It accepts only `fold_id in {"H22","H23"}` and secure-reloads each current artifact before construction: `load_source_gate_receipt(Path(source_gate.path), source_gate.artifact_sha256)` plus RunSpec/inventory binding, structural `load_feature_seal(Path(feature.path), feature.artifact_sha256)` followed by receipt-bound `load_sealed_feature_rows(spec, verified_gate, (target_year,), verified_feature)`, `load_frozen_model_card(spec, Path(parent.path), parent.artifact_sha256)`, `load_replay_receipt(spec, replay_receipt)`, and a no-follow/canonical `load_fold_calibration_parameters(spec, fold_id, calibration_card_sha256, calibration_card_path)`. That loader's fourth path argument is optional only for existing materialization calls, which must derive the unique fold path from RunSpec; when the sealer supplies it, it must equal that derived path. Each reloaded descriptor must exactly equal the supplied descriptor; the calibration loader must prove its exact path, digest, and fold before returning parameters. It then requires `feature_set_id == "lane_c"`, equal fold, and source-gate binding. `LaneCCoverageReport` remains a typed in-process reconciliation result, not a separately loadable H24 artifact: it is checked against the securely reloaded fold feature seal and replay receipt (`run_spec_sha256`, fold seal digest, replay digest, complete/replay-complete state) before its digest is used. It sets `candidate_id=None` and `candidate_payload_sha256=coverage_sha256(coverage)`, then calls only `seal_scoring_model_card(spec, payload)`, whose sole accepted derived path is `lane_c/{fold_id}/scoring_model_card.json`. It preserves the A+B six-key weights byte-for-byte and binds the A+B parent, calibration/coverage/replay evidence, and the universal RunSpec contract digest. Common validates the closed payload/hash/path, but this adapter owns these secure object-level comparisons. Common FeatureSeals, cross-fold FeatureSeals, coverage/parent/calibration/replay mismatches, fabricated descriptors, and source-gate mismatches fail before any card write.
 
 `materialize_lane_c_prediction_rows(spec, source_gate, fold_id, feature_seal, scoring_card) -> tuple[PredictionRow, ...]` is the sole Lane C scorer. It accepts only H22/H23, first requires the supplied authenticated `SourceGateReceipt`, `FeatureSeal.feature_set_id == "lane_c"`, equal `FeatureSeal.fold_id`, and `FeatureSeal.source_gate_sha256 == source_gate.artifact_sha256`, securely reloads exactly that target year's rows through the fold's seal, then securely reloads the declared `ScoringModelCard` and requires its `source_gate_sha256 == FeatureSeal.source_gate_sha256`. It then calls `resolve_prediction_weight_authority(spec, "A+B+C", verified_card)`. It rejects a wrong model/lane/fold/source-gate/FeatureSeal/RunSpec-contract/card digest, any row outside the fold population, duplicate game, or an authority that differs from the card's six-key integer weights. It obtains normalization parameters only from the already sealed fold-calibration artifact named by `ScoringModelCard.calibration_card_sha256`; fitting, labels, and H24 outcomes are forbidden here.
 
