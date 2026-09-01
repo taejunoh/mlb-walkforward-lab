@@ -11,6 +11,7 @@ import json
 import math
 from numbers import Real
 from pathlib import Path, PurePosixPath
+import re
 import sys
 
 from .experimental_totals import (
@@ -176,23 +177,37 @@ def _date(value: object, label: str) -> str:
     return result
 
 
+def _utc_timestamp(value: object, label: str) -> str:
+    """Require an exact RFC3339 UTC timestamp, rather than a trailing ``Z``."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value
+    ):
+        raise ValueError(f"{label} differs")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"{label} differs") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError(f"{label} differs")
+    return value
+
+
 def _identity(value: object, role: str) -> dict[str, object]:
     safe = _canonical_mapping(value, f"{role} source")
     if set(safe) != _SOURCE_KEYS or safe["binding_role"] != role:
         raise ValueError(f"{role} source fields differ")
     for field in _SOURCE_KEYS:
+        if role == "LIVE_SCHEDULE" and field in {"receipt_sidecar_relative", "receipt_sidecar_sha256"}:
+            continue
         if field.endswith("_sha256"):
-            if safe[field] is not None:
-                _sha(safe[field], f"{role} source {field}")
+            _sha(safe[field], f"{role} source {field}")
         elif field.endswith("_relative"):
-            if safe[field] is not None:
-                _relative(safe[field], f"{role} source {field}")
+            _relative(safe[field], f"{role} source {field}")
     if type(safe["byte_length"]) is not int or safe["byte_length"] < 0:
         raise ValueError(f"{role} source byte_length differs")
     if role == "HISTORY_SCHEDULE":
-        if safe["receipt_sidecar_relative"] is None or safe["receipt_sidecar_sha256"] is None:
-            raise ValueError("history source receipt sidecar differs")
-    elif safe["receipt_sidecar_relative"] is not None or safe["receipt_sidecar_sha256"] is not None:
+        return safe
+    if safe["receipt_sidecar_relative"] is not None or safe["receipt_sidecar_sha256"] is not None:
         raise ValueError("live source receipt sidecar differs")
     return safe
 
@@ -288,8 +303,7 @@ def _game(value: object, target_date: str, cutoff_date: str, source_digest: str,
             raise ValueError(f"report game {field} differs")
     if safe["away_team_id"] == safe["home_team_id"] or _date(safe["official_date"], "report game date") != target_date:
         raise ValueError("report game identity differs")
-    if not isinstance(safe["scheduled_start_utc"], str) or not safe["scheduled_start_utc"].endswith("Z"):
-        raise ValueError("report game start differs")
+    _utc_timestamp(safe["scheduled_start_utc"], "report game start")
     if safe["feature_cutoff"] != cutoff_date or _sha(safe["source_digest"], "report game source digest") != source_digest:
         raise ValueError("report game source binding differs")
     flags = safe["data_quality_flags"]
@@ -561,10 +575,13 @@ def persist_daily_totals(root: Path, built: BuiltDailyTotals) -> tuple[Path, Pat
         report_sidecar = _existing_or_write(trusted, report_relative.with_suffix(".sha256"), report_sidecar_contents, "daily totals report sidecar")
         report_snapshot = _existing_or_write(trusted, report_relative, report_contents, "daily totals report")
         markdown_snapshot = _existing_or_write(trusted, report_relative.with_suffix(".md"), markdown_contents, "daily totals Markdown")
+        # Trace creation is the commit point.  Prove every earlier artifact
+        # first, so any pre-trace mismatch leaves no committed trace behind.
+        for snapshot, label in ((receipt_sidecar, "daily totals model receipt sidecar"), (receipt_snapshot, "daily totals model receipt"), (report_sidecar, "daily totals report sidecar"), (report_snapshot, "daily totals report"), (markdown_snapshot, "daily totals Markdown"), (source_snapshot, "daily totals source report")):
+            rebind_regular_snapshot(trusted, snapshot, label)
         trace_contents = canonical_json_bytes(_trace_payload(report_relative, receipt_relative, receipt_contents, report_contents, report_sidecar_contents, markdown_contents, str(report["source_report_relative"]), str(report["source_report_sha256"]), report["history_source"], report["live_source"]))
         trace_snapshot = _existing_or_write(trusted, report_relative.with_suffix(".trace.json"), trace_contents, "daily totals trace")
-        for snapshot, label in ((receipt_sidecar, "daily totals model receipt sidecar"), (receipt_snapshot, "daily totals model receipt"), (report_sidecar, "daily totals report sidecar"), (report_snapshot, "daily totals report"), (markdown_snapshot, "daily totals Markdown"), (trace_snapshot, "daily totals trace"), (source_snapshot, "daily totals source report")):
-            rebind_regular_snapshot(trusted, snapshot, label)
+        rebind_regular_snapshot(trusted, trace_snapshot, "daily totals trace")
         persisted_trace = validate_totals_trace(json.loads(trace_snapshot.contents))
         if (
             persisted_trace["history_source"] != report["history_source"]

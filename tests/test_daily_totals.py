@@ -175,6 +175,19 @@ class DailyTotalsContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_totals_report(report)
 
+    def test_report_rejects_non_rfc3339_utc_start_and_null_required_identity_path(self) -> None:
+        for start in ("not-a-timeZ", "2026-09-01T16:00:00+00:00", 1):
+            report = make_valid_report_payload()
+            report["games"][0]["scheduled_start_utc"] = start  # type: ignore[index]
+            _recontent(report)
+            with self.assertRaises(ValueError):
+                validate_totals_report(report)
+        report = make_valid_report_payload()
+        report["history_source"]["claim_relative"] = None
+        _recontent(report)
+        with self.assertRaises(ValueError):
+            validate_totals_report(report)
+
     def test_receipt_requires_exact_windows_and_minimum_development_final_rows(self) -> None:
         receipt = make_valid_model_receipt()
         receipt["windows"]["warmup_end"] = "2026-05-30"  # type: ignore[index]
