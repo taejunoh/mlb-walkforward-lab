@@ -1127,7 +1127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
     except KeyboardInterrupt:
-        return 130
+        print("operational failure: interrupted", file=sys.stderr)
+        return 1
     except (ValueError, FileExistsError, json.JSONDecodeError) as exc:
         print(f"integrity/contract failure: {exc}", file=sys.stderr)
         return 2

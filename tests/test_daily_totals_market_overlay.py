@@ -161,6 +161,24 @@ class CliTests(unittest.TestCase):
             with patch.object(overlay, "admit_draftkings_snapshot", side_effect=OSError("unavailable")):
                 self.assertEqual(overlay.main(args), 1)
 
+    def test_cli_maps_keyboard_interrupt_to_operational_failure(self) -> None:
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            args = [
+                "admit-snapshot", "--root", str(root),
+                "--model-trace", "trace.json", "--raw-capture", "raw.json",
+            ]
+            with patch.object(overlay, "admit_draftkings_snapshot", side_effect=KeyboardInterrupt), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                self.assertEqual(overlay.main(args), 1)
+                self.assertEqual(stdout.write.call_args_list, [])
+                message = "".join(call.args[0] for call in stderr.write.call_args_list)
+                self.assertIn("operational failure", message)
+                self.assertNotIn("raw.json", message)
+
 
 class SecurePersistenceTests(unittest.TestCase):
     def test_public_secure_persistence_interfaces_exist(self) -> None:
