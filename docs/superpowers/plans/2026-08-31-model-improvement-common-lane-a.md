@@ -19,7 +19,8 @@ Only this plan creates `mlb_backtest/model_improvement/__init__.py`. Lane B/C mu
 ```python
 from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard, LaneDisposition, MetricPrimitive, PredictionRow, PredictionSeal,
-    QualityRecipe, SealedFeatureRow, load_frozen_model_card, seal_frozen_model_card,
+    QualityRecipe, SealedFeatureRow, compute_feature_row_sha256, load_frozen_model_card,
+    seal_frozen_model_card, sealed_feature_row_payload,
 )
 from mlb_backtest.model_improvement.baseline_replay import BaselineReplayReceipt, load_baseline_replay
 from mlb_backtest.model_improvement.run_spec import (
@@ -33,7 +34,7 @@ from mlb_backtest.model_improvement.sealed_features import (
 )
 from mlb_backtest.model_improvement.oof_ledger import (
     JoinedLedger, join_oof_outcomes, load_joined_ledger, load_prediction_seal,
-    load_prediction_rows, seal_oof_predictions,
+    load_joined_prediction_rows, load_prediction_rows, seal_oof_predictions,
 )
 from mlb_backtest.model_improvement.lane_a import LaneAFoldResult, fit_lane_a_fold, load_lane_a_fold
 from mlb_backtest.model_improvement.evaluation import EvaluationReport, evaluate_predictions, load_evaluation_report
@@ -290,7 +291,7 @@ Close these exact domains: `MODEL_IDS={"v5.1","A","A+B","A+B+C"}`, `FROZEN_CARD_
 
 Implement `_freeze_json(value)` and `_thaw_json(value)`: mapping inputs become recursive `MappingProxyType`, sequences become tuples, and scalars must be JSON scalars. Apply them to card parameters, feature-row maps, recipe children/weights, and disposition evidence/reasons; `as_mapping()` always returns fresh mutable JSON-compatible values. Validate exact `SIDES = ("away", "home")` and `COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")`, ISO dates/UTC strings, score and quality [0,100], probability [0,1], 64 lowercase hex digests, and the environment/defense recipe fallback of 50/0. `MetricPrimitive.normalized_score` is the pre-quality `normalize.metric_score(value, mean, sd, direction)` result in [0,100], never an already quality-shrunk score. Preserve ordered primitives and require their nonnegative aggregation weights to sum to exactly one under the documented `math.fsum` tolerance. Keep the fixed/ratio/weighted-sum/minimum recipe constraints in this task.
 
-Add `sealed_feature_row_payload(row) -> Mapping[str, object>` which projects every persisted row field except `feature_row_sha256`, and `compute_feature_row_sha256(payload: Mapping[str, object]) -> str`, using Task 1 canonical SHA-256. `SealedFeatureRow.__post_init__` must require `feature_row_sha256 == compute_feature_row_sha256(sealed_feature_row_payload(self))`. This digest is separate from `FeatureSeal.rows_sha256`, which remains a digest over fully materialized rows.
+Add `sealed_feature_row_payload(row: SealedFeatureRow | Mapping[str, object]) -> Mapping[str, object>` which projects every persisted row field except `feature_row_sha256` from an immutable row or a fresh JSON row mapping, and `compute_feature_row_sha256(payload: Mapping[str, object]) -> str`, using Task 1 canonical SHA-256. `SealedFeatureRow.__post_init__` must require `feature_row_sha256 == compute_feature_row_sha256(sealed_feature_row_payload(self))`. This digest is separate from `FeatureSeal.rows_sha256`, which remains a digest over fully materialized rows.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -594,6 +595,11 @@ class OofLedgerTest(unittest.TestCase):
     def test_authoritative_row_loader_rereads_the_bound_jsonl(self):
         seal = seal_oof_predictions(spec, "O19", prediction_rows)
         self.assertEqual(load_prediction_rows(spec, seal), tuple(prediction_rows))
+
+    def test_joined_row_loader_returns_only_verified_label_bindings(self):
+        prediction = seal_oof_predictions(spec, "O19", prediction_rows)
+        joined = join_oof_outcomes(spec, prediction, outcomes)
+        self.assertEqual(load_joined_prediction_rows(spec, joined)[0][1], outcomes[prediction_rows[0].game_pk])
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -602,7 +608,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `oof_ledger`.
 
-- [ ] **Step 3: Implement `JoinedLedger`, `seal_oof_predictions(spec, ledger_id, rows)`, `load_prediction_seal(path, expected_sha256)`, `load_prediction_rows(spec: ModelImprovementRunSpec, seal: PredictionSeal) -> tuple[PredictionRow, ...]`, `join_oof_outcomes(spec, prediction, outcomes)`, and `load_joined_ledger(path, expected_sha256)`.** `load_prediction_rows` is the sole public prediction-row loader: derive the row JSONL location from the seal’s declared artifact location, never from an assumption that the descriptor file contains rows; read only regular canonical JSONL bytes; verify `rows_sha256`, population digest, unique ordered game keys, and all RunSpec/source-gate/prediction-contract/model-card bindings before constructing immutable rows. Prediction rows contain no labels. `join_oof_outcomes` uses only this loader, validates one binary label per game, writes a separate immutable joined artifact under `oof`, and returns a digest/path descriptor computed from payload bytes rather than embedded in either prediction or joined payload. Export `load_prediction_rows` publicly; Lane B must use it rather than defining a local row reader.
+- [ ] **Step 3: Implement `JoinedLedger`, `seal_oof_predictions(spec, ledger_id, rows)`, `load_prediction_seal(path, expected_sha256)`, `load_prediction_rows(spec: ModelImprovementRunSpec, seal: PredictionSeal) -> tuple[PredictionRow, ...]`, `load_joined_prediction_rows(spec: ModelImprovementRunSpec, ledger: JoinedLedger) -> tuple[tuple[PredictionRow, int], ...]`, `join_oof_outcomes(spec, prediction, outcomes)`, and `load_joined_ledger(path, expected_sha256)`.** `load_prediction_rows` is the sole public prediction-row loader: derive the row JSONL location from the seal’s declared artifact location, never from an assumption that the descriptor file contains rows; read only regular canonical JSONL bytes; verify `rows_sha256`, population digest, unique ordered game keys, and all RunSpec/source-gate/prediction-contract/model-card bindings before constructing immutable rows. Prediction rows contain no labels. `load_joined_prediction_rows` is the sole public labeled-row accessor: derive its row JSONL from the `JoinedLedger` descriptor, verify regular canonical bytes, the ledger digest, `ledger_id`/target-year RunSpec binding, immutable prediction-seal/source/prediction-contract/card bindings, one ordered unique game per row, and exactly one binary label per game before returning immutable `(PredictionRow, label)` pairs. `join_oof_outcomes` uses only the prediction-row loader, validates one binary label per game, writes a separate immutable joined artifact under `oof`, and returns a digest/path descriptor computed from payload bytes rather than embedded in either prediction or joined payload. Export both row loaders publicly; Lane B must use them rather than descriptor fields or local row readers.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -717,7 +723,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL until all explicit exports are present.
 
-- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `load_baseline_replay`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_report`, `MetricPrimitive`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, `seal_frozen_model_card`, `load_frozen_model_card`, and the authoritative `load_prediction_rows`; do not re-export legacy `RunSpec`, source acquisition, or outcome loaders.**
+- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `load_baseline_replay`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_report`, `MetricPrimitive`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, `seal_frozen_model_card`, `load_frozen_model_card`, and the authoritative `load_prediction_rows`/`load_joined_prediction_rows`; do not re-export legacy `RunSpec`, source acquisition, or outcome loaders.**
 
 - [ ] **Step 4: Run all Common/Lane A suites.**
 

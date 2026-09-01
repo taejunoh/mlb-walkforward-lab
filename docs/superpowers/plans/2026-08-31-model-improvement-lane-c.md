@@ -814,13 +814,13 @@ Expected: `ERROR` because `lane_c_candidate` does not exist.
 
 ```python
 from collections.abc import Callable, Mapping, Sequence
-import dataclasses
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard, LaneDisposition, PredictionSeal, SealedFeatureRow,
-    LANE_IDS, load_frozen_model_card, seal_frozen_model_card,
+    LANE_IDS, compute_feature_row_sha256, load_frozen_model_card,
+    seal_frozen_model_card, sealed_feature_row_payload,
 )
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json,
@@ -896,17 +896,11 @@ def lane_c_output_path(spec: ModelImprovementRunSpec, relative: str):
     return spec.output_path("lane_c", relative)
 ```
 
-`build_lane_c_candidate()` returns `tuple[SealedFeatureRow, ...]` and must accept `spec`, the parent `FeatureSeal` mapping for H22/H23/H24, `Sequence[SealedFeatureRow]`, `Sequence[LaneCTransformedPart]`, a `LaneCCoverageReport`, and the sealed `LaneCReplayReceipt`. It first loads each parent fold’s rows through `load_sealed_feature_rows(spec, (year,), parent_feature_seals[fold_id])`, verifies population/game identity and `row.source_gate_sha256 == parent_feature_seals[fold_id].source_gate_sha256`, then copies each row’s nested `component_scores`, `component_qualities`, `metric_primitives`, and `component_inputs_sha256` mappings, applies `dataclasses.replace(row, ...)`, and recomputes `feature_row_sha256` from the canonical row payload. It never returns dictionaries such as `away_scores` or `qualities`. It rejects `candidate_qualified == False`, missing transform keys, wrong RunSpec/FeatureSeal/replay-receipt digests, outcome fields, and any transformed part whose observation digest is not present in the immutable replay receipt. It calls the existing `environment_score(park, weather_roof)` and `defense_score(oaa, framing, blocking_throwing)`; missing parts remain score 50/quality 0 and weights are never redistributed. Game-level context completeness is `min(away_context_quality, home_context_quality)` only when materializing prediction rows for ranking; it does not overwrite either shared row map. Candidate transforms are never built from unvalidated observations. The returned rows are not eligible for scoring or handoff until `seal_lane_c_candidate_rows()` creates and reloads the three Common lane_c FeatureSeals.
+`build_lane_c_candidate()` returns `tuple[SealedFeatureRow, ...]` and must accept `spec`, the parent `FeatureSeal` mapping for H22/H23/H24, `Sequence[SealedFeatureRow]`, `Sequence[LaneCTransformedPart]`, a `LaneCCoverageReport`, and the sealed `LaneCReplayReceipt`. It first loads each parent fold’s rows through `load_sealed_feature_rows(spec, (year,), parent_feature_seals[fold_id])`, verifies population/game identity and `row.source_gate_sha256 == parent_feature_seals[fold_id].source_gate_sha256`, then copies each row’s nested `component_scores`, `component_qualities`, `metric_primitives`, and `component_inputs_sha256` maps through `row.as_mapping()`. It rebuilds the row only through Common `sealed_feature_row_payload` and `compute_feature_row_sha256`; it never returns dictionaries such as `away_scores` or `qualities`. It rejects `candidate_qualified == False`, missing transform keys, wrong RunSpec/FeatureSeal/replay-receipt digests, outcome fields, and any transformed part whose observation digest is not present in the immutable replay receipt. It calls the existing `environment_score(park, weather_roof)` and `defense_score(oaa, framing, blocking_throwing)`; missing parts remain score 50/quality 0 and weights are never redistributed. Game-level context completeness is `min(away_context_quality, home_context_quality)` only when materializing prediction rows for ranking; it does not overwrite either shared row map. Candidate transforms are never built from unvalidated observations. The returned rows are not eligible for scoring or handoff until `seal_lane_c_candidate_rows()` creates and reloads the three Common lane_c FeatureSeals.
 
-The row update must be explicit:
+The row update must be explicit. The nested Common maps are recursively frozen, so start from the fresh JSON values returned by `row.as_mapping()`; never mutate a row map in place. Construct the replacement with the Common digest helper, then assert the same helper’s row projection before returning it:
 
 ```python
-def recompute_feature_row_sha256(row: SealedFeatureRow) -> str:
-    payload = asdict(row)
-    payload.pop("feature_row_sha256")
-    return sha256_bytes(canonical_json_bytes(payload))
-
-
 def build_lane_c_candidate(
     spec: ModelImprovementRunSpec,
     parent_feature_seals: Mapping[str, FeatureSeal],
@@ -981,15 +975,15 @@ def build_lane_c_candidate(
                     }
                     for part in slot_parts
                 ]))
-        candidate = dataclasses.replace(
-            row, component_scores=scores, component_qualities=qualities,
-            metric_primitives=primitives, component_inputs_sha256=input_hashes,
-            feature_row_sha256=recompute_feature_row_sha256(dataclasses.replace(
-                row, component_scores=scores, component_qualities=qualities,
-                metric_primitives=primitives, component_inputs_sha256=input_hashes,
-                feature_row_sha256="",
-            )),
-        )
+        payload = row.as_mapping()
+        payload.update(component_scores=scores, component_qualities=qualities,
+                       metric_primitives=primitives, component_inputs_sha256=input_hashes)
+        payload = sealed_feature_row_payload(payload)
+        candidate = SealedFeatureRow(
+            **payload, feature_row_sha256=compute_feature_row_sha256(payload))
+        if candidate.feature_row_sha256 != compute_feature_row_sha256(
+                sealed_feature_row_payload(candidate)):
+            raise RuntimeError("Common feature-row digest projection differs")
         output.append(candidate)
     return tuple(output)
 ```

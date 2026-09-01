@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
 - All artifact paths are CLI arguments. Do not modify config/v5_1_bt.json, scoring.py, config.py, locking.py, outcomes.py, live_model_card.py, or a v5_2 authority.
@@ -353,7 +353,7 @@ git commit -m "feat: score lane b candidates"
 **Interfaces:**
 
 - Consumes ModelImprovementRunSpec, FeatureSeal, completed PredictionSeal objects, Candidate.
-- Produces CandidateFoldCard and fit_candidate_fold_card(spec, feature_seal, oof_seals, candidate, fold_id) -> CandidateFoldCard.
+- Produces CandidateFoldCard and fit_candidate_fold_card(spec, feature_seal, joined_ledgers, candidate, fold_id) -> CandidateFoldCard.
 
 - [ ] **Step 1: Write the failing chronology TestCase.**
 
@@ -364,7 +364,7 @@ from mlb_backtest.model_improvement.lane_b_calibration import fit_candidate_fold
 
 class LaneBCalibrationTest(unittest.TestCase):
     def test_h23_uses_o19_to_o22_only(self):
-        card = fit_candidate_fold_card(self.spec, self.feature_seal, self.oof_seals, self.candidate, "H23")
+        card = fit_candidate_fold_card(self.spec, self.feature_seal, self.joined_ledgers, self.candidate, "H23")
         self.assertEqual((2019, 2020, 2021, 2022), card.calibration_years)
         self.assertEqual(2023, card.target_year)
 ~~~
@@ -382,6 +382,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from mlb_backtest.normalize import fit_logistic
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
+from mlb_backtest.model_improvement.oof_ledger import load_joined_prediction_rows
+from mlb_backtest.model_improvement.sealed_features import load_sealed_feature_rows
 from .lane_b_scoring import score_candidate_rows
 
 _FOLD_YEARS = {"H22": (2019, 2020, 2021), "H23": (2019, 2020, 2021, 2022),
@@ -400,24 +402,32 @@ class CandidateFoldCard:
     calibration_input_sha256: str
 
 
-def fit_candidate_fold_card(spec, feature_seal, oof_seals, candidate, fold_id):
+def fit_candidate_fold_card(spec, feature_seal, joined_ledgers, candidate, fold_id):
     years = _FOLD_YEARS.get(fold_id)
     if years is None or spec.fold(fold_id).target_year <= max(years):
         raise ValueError("fold chronology differs")
     if feature_seal.feature_set_id != "common":
         raise ValueError("FeatureSeal feature_set_id differs")
-    if tuple(sorted(seal.target_year for seal in oof_seals)) != years:
+    if len(joined_ledgers) != len(years):
         raise ValueError("OOF years differ")
-    labels = {row.game_pk: row.home_win for seal in oof_seals for row in seal.rows}
+    labeled_rows = tuple(
+        pair for ledger in joined_ledgers
+        for pair in load_joined_prediction_rows(spec, ledger)
+    )
+    if tuple(sorted({row.target_year for row, _ in labeled_rows})) != years:
+        raise ValueError("OOF years differ")
+    labels = {row.game_pk: label for row, label in labeled_rows}
+    if len(labels) != len(labeled_rows):
+        raise ValueError("OOF duplicate games differ")
     if any(value not in (0, 1) for value in labels.values()):
         raise ValueError("OOF labels differ")
-    rows = tuple(row for row in feature_seal.rows if row.target_year in years)
+    rows = load_sealed_feature_rows(spec, years, feature_seal)
     if {row.game_pk for row in rows} != set(labels):
         raise ValueError("feature and OOF populations differ")
     trial = score_candidate_rows(rows, candidate, 0., 1.)
     alpha, beta = fit_logistic([row["edge"] / 10 for row in trial], [labels[row["game_pk"]] for row in trial])
     payload = {"fold_id": fold_id, "feature_seal_artifact_sha256": feature_seal.artifact_sha256,
-               "oof_seal_artifact_sha256s": [seal.artifact_sha256 for seal in oof_seals], "rows": trial}
+               "joined_ledger_artifact_sha256s": [ledger.artifact_sha256 for ledger in joined_ledgers], "rows": trial}
     return CandidateFoldCard("B", fold_id, spec.fold(fold_id).target_year, years, candidate.candidate_id,
                              alpha, beta, sha256(canonical_json_bytes(payload)).hexdigest())
 ~~~
@@ -427,9 +437,9 @@ def fit_candidate_fold_card(spec, feature_seal, oof_seals, candidate, fold_id):
 ~~~python
     def test_target_year_and_duplicate_games_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "OOF years"):
-            fit_candidate_fold_card(self.spec, self.feature_seal, self.target_year_seals, self.candidate, "H23")
+            fit_candidate_fold_card(self.spec, self.feature_seal, self.target_year_ledgers, self.candidate, "H23")
         with self.assertRaisesRegex(ValueError, "populations differ"):
-            fit_candidate_fold_card(self.spec, self.missing_feature_seal, self.oof_seals, self.candidate, "H23")
+            fit_candidate_fold_card(self.spec, self.missing_feature_seal, self.joined_ledgers, self.candidate, "H23")
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_calibration.LaneBCalibrationTest -v
@@ -678,7 +688,7 @@ git commit -m "feat: seal optional lane b card"
 
 **Interfaces:**
 
-- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_path, lane_a_h22_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, prediction_seal, parameters) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
+- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_path, lane_a_h22_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, selected_prediction_seal, selected_evaluation, parameters) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
 - H24 receives optional card.path/card.artifact_sha256 and disposition.path/disposition.artifact_sha256; runner does not import candidate_registry.
 
 - [ ] **Step 1: Write failing runner TestCase methods.**
@@ -743,18 +753,30 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
             "v51_h22_artifact_sha256": v51.artifact_sha256, "lane_a_h22_artifact_sha256": lane_a.artifact_sha256}
 
 
-def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, prediction_seal, parameters):
+def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay,
+                   feature_seal, selected_prediction_seal, selected_evaluation, parameters):
     card = lane_a_result.card
     if card is None or card.model_id != "A" or card.state != "H23_FROZEN":
         return None, build_lane_b_disposition(spec, lane_a_result)
     selected = select_h23(spec, survivors, lane_a_evaluation)
     if not isinstance(selected, dict):
         return None, selected
+    candidate_id = selected["candidate_id"]
+    selected_rows = load_prediction_rows(spec, selected_prediction_seal)
+    if (selected_prediction_seal.ledger_id != "H23"
+            or not selected_rows
+            or {row.model_id for row in selected_rows} != {candidate_id}
+            or {row.target_year for row in selected_rows} != {spec.fold("H23").target_year}
+            or selected_evaluation.model_id != candidate_id
+            or selected_evaluation.run_spec_sha256 != run_spec_sha256(spec)
+            or selected_evaluation.prediction_sha256 != selected_prediction_seal.artifact_sha256):
+        raise ValueError("selected Lane B H23 prediction/evaluation binding differs")
     frozen = freeze_ab_card(spec, selected, card, source_gate, baseline_replay, feature_seal,
-                            prediction_seal, lane_a_evaluation, parameters)
+                            selected_prediction_seal, selected_evaluation, parameters)
     qualified = seal_lane_disposition(spec, lane_id="B", state="QUALIFIED",
         parent_card_sha256=card.artifact_sha256,
-        evidence_sha256=(frozen.artifact_sha256, lane_a_evaluation.artifact_sha256),
+        evidence_sha256=(frozen.artifact_sha256, selected_prediction_seal.artifact_sha256,
+                         selected_evaluation.artifact_sha256),
         reason_codes=("H23_GATE_PASS",))
     return frozen, qualified
 
@@ -769,20 +791,30 @@ def verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_ar
             "prediction_contract_sha256": card.prediction_contract_sha256}
 ~~~
 
-- [ ] **Step 4: Add no-card, duplicate-output, and double-newline replay tests then run GREEN.**
+- [ ] **Step 4: Add no-card, selected-candidate prediction/evaluation mismatch, duplicate-output, and double-newline replay tests then run GREEN.**
 
 ~~~python
     def test_no_card_and_double_newline_replay_are_rejected(self):
         card, disposition = self.runner.run_lane_b_h23(
             self.spec, self.lane_a_rejected_result, self.survivors,
             self.lane_a_rejected_result.evaluation, self.source_gate, self.baseline_replay,
-            self.feature_seal, self.lane_a_rejected_result.prediction, self.parameters)
+            self.feature_seal, self.lane_b_h23_prediction, self.lane_b_h23_evaluation,
+            self.parameters)
         self.assertIsNone(card)
         self.assertEqual("ABSENT", disposition.state)
         self.manifest_path.write_bytes(b"{}\n\n")
         with self.assertRaisesRegex(RuntimeError, "newline format"):
             self.runner.verify_lane_b_replay(self.spec, self.manifest_path, self.card_path,
                                               self.card_artifact_sha256)
+
+    def test_selected_candidate_requires_its_h23_prediction_and_evaluation(self):
+        with self.assertRaisesRegex(ValueError, "selected Lane B H23"):
+            self.runner.run_lane_b_h23(
+                self.spec, self.lane_a_frozen_result, self.survivors,
+                self.lane_a_frozen_result.evaluation, self.source_gate,
+                self.baseline_replay, self.feature_seal,
+                self.wrong_candidate_prediction, self.lane_b_h23_evaluation,
+                self.parameters)
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_runner.LaneBRunnerTest -v

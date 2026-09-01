@@ -166,7 +166,7 @@ Verify exact upstream artifact hashes, parent-card hashes, fold IDs, `H23_FROZEN
 - Create: `tests/test_model_improvement_h24_predictions.py`
 - Create: `tests/fixtures/model_improvement/h24/eligible_rows.jsonl`
 
-- [ ] Add a failing synthetic test for `score_h24_candidates(registry, feature_seals, cards)` that expects one prediction per `(model_id, game_pk)`, identical eligible `game_pk` populations, deterministic daily ranks, and no outcome fields in memory or serialized output. The test must prove that `A+B+C` reads its `lane_c` rows while all other models read the common rows.
+- [ ] Add a failing synthetic test that calls `score_h24_candidates(spec, registry, feature_seals)` exactly and expects one prediction per `(model_id, game_pk)`, identical eligible `game_pk` populations, deterministic daily ranks, and no outcome fields in memory or serialized output. The registry pins the only permitted card paths/digests, so the test supplies no `cards` fixture or argument. It must prove that `A+B+C` reads its `lane_c` rows while all other models read the common rows.
 - [ ] Add failure cases for duplicate `game_pk`, non-H24 dates, nonfinite probability, mismatched population hashes, post-registry card mutation, and an `A+B+C` input when absent from the registry.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_predictions -v` and confirm RED.
 - [ ] Implement these public functions:
