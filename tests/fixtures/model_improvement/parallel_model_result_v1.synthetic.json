@@ -93,7 +93,7 @@
     "baseline": {
         "card": {
             "path": "tests/fixtures/model_improvement/v51_card.json",
-            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "sha256": "857848bdf90cade414745c6ffd8fcd066e84759f43f08bd73e716842d8e5e114",
             "component_weights_pp": {
                 "starter": 35,
                 "offense": 25,
@@ -162,6 +162,24 @@
         }
     },
   "prediction_contract_sha256": "eda2b44aae29b8936136d0043bd4cea2811da37de1e37e3a1672a48c88e5b155",
+    "probability_calibration_policy": {
+        "schema": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1",
+        "fold_keys": {"O19": "C19", "O20": "C20", "O21": "C21", "O22": "C22O", "H22": "C22H", "O23": "C23O", "H23": "C23H"},
+        "fit_spec": {"schema": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1", "algorithm": "fit_logistic_v1", "edge_divisor": 10.0, "iterations": 100, "l2": 1e-6, "tolerance": 1e-10, "min_rows": 2, "required_classes": [0, 1]},
+        "pools": {
+            "C19": {"target_year": 2019, "training_start": "2018-01-01", "training_end": "2018-12-31"},
+            "C20": {"target_year": 2020, "training_start": "2018-01-01", "training_end": "2019-12-31"},
+            "C21": {"target_year": 2021, "training_start": "2018-01-01", "training_end": "2020-12-31"},
+            "C22O": {"target_year": 2022, "training_start": "2018-01-01", "training_end": "2021-12-31"},
+            "C22H": {"target_year": 2022, "training_start": "2018-01-01", "training_end": "2021-12-31"},
+            "C23O": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"},
+            "C23H": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"}
+        },
+        "baseline_rows_relative_template": "baseline/v5.1/{fold_id}/calibration_rows.jsonl",
+        "baseline_card_relative_template": "baseline/v5.1/{fold_id}/probability_calibration_card.json",
+        "candidate_rows_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/calibration_rows.jsonl",
+        "candidate_card_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/probability_calibration_card.json"
+    },
     "lane_b": {
         "base_weights_pp": {
             "starter": 35,
@@ -254,6 +272,7 @@
             "source_gate",
             "features",
             "baseline",
+            "calibration",
             "oof",
             "lane_a",
             "lane_b",

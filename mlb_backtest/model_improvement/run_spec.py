@@ -19,9 +19,34 @@ from .contracts import COMPONENTS, _freeze_json, _thaw_json
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEAD = re.compile(r"^[0-9a-f]{40}$")
 _NAMESPACES = (
-    "source_gate", "features", "baseline", "oof", "lane_a", "lane_b",
+    "source_gate", "features", "baseline", "calibration", "oof", "lane_a", "lane_b",
     "lane_c", "registry", "h24_predictions", "h24_reports",
 )
+_CALIBRATION_FOLD_KEYS = {
+    "O19": "C19", "O20": "C20", "O21": "C21", "O22": "C22O",
+    "H22": "C22H", "O23": "C23O", "H23": "C23H",
+}
+_CALIBRATION_POOLS = {
+    "C19": (2019, "2018-01-01", "2018-12-31"),
+    "C20": (2020, "2018-01-01", "2019-12-31"),
+    "C21": (2021, "2018-01-01", "2020-12-31"),
+    "C22O": (2022, "2018-01-01", "2021-12-31"),
+    "C22H": (2022, "2018-01-01", "2021-12-31"),
+    "C23O": (2023, "2018-01-01", "2022-12-31"),
+    "C23H": (2023, "2018-01-01", "2022-12-31"),
+}
+_CALIBRATION_FIT_SPEC = {
+    "schema": "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1",
+    "algorithm": "fit_logistic_v1", "edge_divisor": 10.0,
+    "iterations": 100, "l2": 1e-6, "tolerance": 1e-10,
+    "min_rows": 2, "required_classes": [0, 1],
+}
+_CALIBRATION_TEMPLATES = {
+    "baseline_rows_relative_template": "baseline/v5.1/{fold_id}/calibration_rows.jsonl",
+    "baseline_card_relative_template": "baseline/v5.1/{fold_id}/probability_calibration_card.json",
+    "candidate_rows_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/calibration_rows.jsonl",
+    "candidate_card_relative_template": "{lane_id}/{candidate_segment}/{fold_id}/probability_calibration_card.json",
+}
 _ORDER = ("brier", "log_loss", "daily_top1_delta_desc", "candidate_id")
 _WEIGHTS = {"starter": 35, "offense": 25, "bullpen": 20, "environment": 10, "defense": 5, "schedule": 5}
 _CONTRACT = {
@@ -100,6 +125,85 @@ def _exact_ints(value: object, expected: tuple[int, ...], label: str) -> tuple[i
     if any(type(item) is not int for item in actual) or actual != expected:
         raise ValueError(f"{label} differs")
     return actual
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityCalibrationFitSpec:
+    schema: str
+    algorithm: str
+    edge_divisor: float
+    iterations: int
+    l2: float
+    tolerance: float
+    min_rows: int
+    required_classes: tuple[int, ...]
+
+    def as_mapping(self) -> dict[str, object]:
+        return {"schema": self.schema, "algorithm": self.algorithm,
+                "edge_divisor": self.edge_divisor, "iterations": self.iterations,
+                "l2": self.l2, "tolerance": self.tolerance,
+                "min_rows": self.min_rows, "required_classes": list(self.required_classes)}
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityCalibrationPool:
+    target_year: int
+    training_start: str
+    training_end: str
+
+    def as_mapping(self) -> dict[str, object]:
+        return {"target_year": self.target_year, "training_start": self.training_start,
+                "training_end": self.training_end}
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityCalibrationPolicy:
+    schema: str
+    fold_keys: Mapping[str, str]
+    fit_spec: ProbabilityCalibrationFitSpec
+    pools: Mapping[str, ProbabilityCalibrationPool]
+    baseline_rows_relative_template: str
+    baseline_card_relative_template: str
+    candidate_rows_relative_template: str
+    candidate_card_relative_template: str
+
+    def as_mapping(self) -> dict[str, object]:
+        return {"schema": self.schema, "fold_keys": dict(self.fold_keys),
+                "fit_spec": self.fit_spec.as_mapping(),
+                "pools": {key: self.pools[key].as_mapping() for key in _CALIBRATION_POOLS},
+                **_CALIBRATION_TEMPLATES}
+
+
+def _probability_calibration_policy(value: object) -> ProbabilityCalibrationPolicy:
+    keys = {"schema", "fold_keys", "fit_spec", "pools", *_CALIBRATION_TEMPLATES}
+    values = _exact(value, keys, "probability calibration policy")
+    if values["schema"] != "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1":
+        raise ValueError("probability calibration policy schema differs")
+    fold_keys = _exact(values["fold_keys"], set(_CALIBRATION_FOLD_KEYS), "probability calibration fold keys")
+    if dict(fold_keys) != _CALIBRATION_FOLD_KEYS:
+        raise ValueError("probability calibration fold keys differ")
+    fit = _exact(values["fit_spec"], set(_CALIBRATION_FIT_SPEC), "probability calibration fit spec")
+    if canonical_json_bytes(fit) != canonical_json_bytes(_CALIBRATION_FIT_SPEC):
+        raise ValueError("probability calibration fit spec differs")
+    pools_value = _exact(values["pools"], set(_CALIBRATION_POOLS), "probability calibration pools")
+    pools: dict[str, ProbabilityCalibrationPool] = {}
+    for key, expected in _CALIBRATION_POOLS.items():
+        pool = _exact(pools_value[key], {"target_year", "training_start", "training_end"}, f"probability calibration pool {key}")
+        if (pool["target_year"], pool["training_start"], pool["training_end"]) != expected:
+            raise ValueError("probability calibration pool differs")
+        pools[key] = ProbabilityCalibrationPool(*expected)
+    for key, expected in _CALIBRATION_TEMPLATES.items():
+        if values[key] != expected:
+            raise ValueError("probability calibration path template differs")
+    fit_spec = ProbabilityCalibrationFitSpec(
+        "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1", "fit_logistic_v1",
+        10.0, 100, 1e-6, 1e-10, 2, (0, 1),
+    )
+    return ProbabilityCalibrationPolicy(
+        "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1",
+        MappingProxyType(dict(_CALIBRATION_FOLD_KEYS)), fit_spec, MappingProxyType(pools),
+        **_CALIBRATION_TEMPLATES,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +443,7 @@ class ModelImprovementRunSpec:
     metrics: Mapping[str, tuple[str, ...]]
     prediction_contract: Mapping[str, object]
     prediction_contract_sha256: str
+    probability_calibration_policy: ProbabilityCalibrationPolicy
     lane_b: LaneBSpec
     lane_c: LaneCSpec
     outputs: Mapping[str, object]
@@ -353,6 +458,10 @@ class ModelImprovementRunSpec:
     def output_path(self, namespace: str, relative_name: str) -> Path:
         if namespace not in _NAMESPACES:
             raise ValueError("unknown output namespace")
+        if namespace == "calibration" and (
+            not isinstance(relative_name, str) or "//" in relative_name
+        ):
+            raise ValueError("calibration output path differs")
         relative = _normal_relative(relative_name, "output relative name")
         parts = Path(relative).parts
         if namespace == "features":
@@ -361,6 +470,15 @@ class ModelImprovementRunSpec:
             } | {("lane_c", fold) for fold in ("H22", "H23", "H24")}
             if len(parts) != 3 or tuple(parts[:2]) not in allowed or parts[2] not in {"feature_seal.json", "rows.jsonl"}:
                 raise ValueError("feature output path differs")
+        if namespace == "calibration":
+            allowed_leaves = {"calibration_rows.jsonl", "probability_calibration_card.json"}
+            baseline = len(parts) == 4 and parts[:2] == ("baseline", "v5.1") and parts[2] in _CALIBRATION_FOLD_KEYS
+            candidate = (
+                len(parts) == 4 and parts[0] in {"A", "B", "C"}
+                and _candidate_segment(parts[1]) and parts[2] in _CALIBRATION_FOLD_KEYS
+            )
+            if (not (baseline or candidate)) or parts[-1] not in allowed_leaves:
+                raise ValueError("calibration output path differs")
         configured_root = Path(str(self.outputs["root"]))
         root = configured_root if configured_root.is_absolute() else _repository_root() / configured_root
         candidate = root / namespace / relative
@@ -377,13 +495,18 @@ class ModelImprovementRunSpec:
             "exclusions": _thaw_json(self.exclusions), "folds": {key: self.folds[key].as_mapping() for key in ("H22", "H23", "H24")},
             "baseline": self.baseline.as_mapping(), "metrics": {key: list(value) for key, value in self.metrics.items()},
             "prediction_contract": _thaw_json(self.prediction_contract), "prediction_contract_sha256": self.prediction_contract_sha256,
+            "probability_calibration_policy": self.probability_calibration_policy.as_mapping(),
             "lane_b": self.lane_b.as_mapping(), "lane_c": self.lane_c.as_mapping(),
             "outputs": _thaw_json(self.outputs), "h24_firewall": self.h24_firewall.as_mapping(),
         }
 
 
+def _candidate_segment(value: object) -> bool:
+    return isinstance(value, str) and value not in {".", ".."} and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value))
+
+
 def build_run_spec(raw: Mapping[str, object]) -> ModelImprovementRunSpec:
-    values = _exact(raw, {"schema_version", "run_id", "code_revision", "source_authority", "cutoffs", "exclusions", "folds", "baseline", "metrics", "prediction_contract", "prediction_contract_sha256", "lane_b", "lane_c", "outputs", "h24_firewall"}, "run spec")
+    values = _exact(raw, {"schema_version", "run_id", "code_revision", "source_authority", "cutoffs", "exclusions", "folds", "baseline", "metrics", "prediction_contract", "prediction_contract_sha256", "probability_calibration_policy", "lane_b", "lane_c", "outputs", "h24_firewall"}, "run spec")
     if values["schema_version"] not in {"SYNTHETIC_TEST_ONLY", "PARALLEL_MODEL_RESULT_RUN_SPEC_V1"}:
         raise ValueError("unknown schema version")
     code_revision = _text(values["code_revision"], "code_revision")
@@ -421,6 +544,7 @@ def build_run_spec(raw: Mapping[str, object]) -> ModelImprovementRunSpec:
         values["schema_version"], _text(values["run_id"], "run_id"), code_revision, _source_authority(values["source_authority"]),
         MappingProxyType(dict(cutoffs)), _freeze_json(exclusions), folds, _baseline(values["baseline"]),
         MappingProxyType({"all_game": ("brier", "log_loss"), "daily": ("top1_date_paired",)}), contract, contract_digest,
+        _probability_calibration_policy(values["probability_calibration_policy"]),
         _lane_b(values["lane_b"]), _lane_c(values["lane_c"]), _freeze_json({"root": root, "namespaces": list(_NAMESPACES)}), _firewall(values["h24_firewall"]),
     )
 
