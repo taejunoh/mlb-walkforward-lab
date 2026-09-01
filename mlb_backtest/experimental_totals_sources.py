@@ -217,6 +217,15 @@ def _require_sidecar(
     return snapshot
 
 
+def _require_absent(
+    trusted: TrustedRoot, relative: Path, label: str
+) -> None:
+    if _read(
+        trusted, relative, label, max_bytes=_SHA256_BYTES, missing_ok=True
+    ) is not None:
+        raise ValueError(f"{label} differs")
+
+
 def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) -> None:
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -344,6 +353,11 @@ def _admit_binding(
     assert completion_sidecar is not None and manifest is not None and payload is not None
     if binding.binding_role == _LIVE_ROLE and receipt_sidecar is not None:
         raise ValueError("live schedule has an unexpected sidecar")
+    if binding.binding_role == _LIVE_ROLE:
+        _require_absent(
+            trusted, claim_relative.with_suffix(".sha256"),
+            "live schedule claim sidecar",
+        )
 
     if len(payload.contents) != binding.byte_length or _snapshot_digest(payload) != binding.payload_sha256:
         prefix = "history" if binding.binding_role == _HISTORY_ROLE else "live"
@@ -520,6 +534,17 @@ def load_totals_sources(root: Path, report_path: Path) -> TotalsSourceBundle:
                 trusted, snapshot, "schedule source evidence", max_bytes=_MAX_JSON_BYTES
             )
         rebind_regular_snapshot(trusted, report_snapshot, "daily report", max_bytes=_MAX_JSON_BYTES)
+        trusted.assert_bound()
+        _require_absent(
+            trusted,
+            Path(live_identity.receipt_relative).with_suffix(".sha256"),
+            "live schedule receipt sidecar",
+        )
+        _require_absent(
+            trusted,
+            Path(live_identity.claim_relative).with_suffix(".sha256"),
+            "live schedule claim sidecar",
+        )
         trusted.assert_bound()
         return TotalsSourceBundle(
             target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),

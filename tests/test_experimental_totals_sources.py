@@ -406,6 +406,30 @@ class TotalsSourcesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected sidecar"):
             load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
+    def test_loader_rechecks_late_created_live_receipt_sidecar(self) -> None:
+        from mlb_backtest import experimental_totals_sources
+
+        fixture = write_source_fixture(self.root)
+        report = json.loads(fixture.report.read_text())
+        live = next(
+            item for item in report["source_bindings"] if item["binding_role"] == "LIVE_SCHEDULE"
+        )
+        forbidden = Path(live["receipt_relative"]).with_suffix(".sha256")
+
+        def create_late_sidecar(stage: str, _relative: Path) -> None:
+            if stage == "before_final_rebind":
+                (self.root / forbidden).write_bytes(b"0" * 64 + b"\n")
+
+        with mock.patch.object(
+            experimental_totals_sources,
+            "_totals_sources_test_hook",
+            side_effect=create_late_sidecar,
+        ):
+            with self.assertRaisesRegex(ValueError, "receipt sidecar"):
+                experimental_totals_sources.load_totals_sources(
+                    self.root, fixture.report.relative_to(self.root)
+                )
+
     def test_loader_requires_live_manifest_sidecar(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
