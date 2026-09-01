@@ -441,6 +441,8 @@ def _prediction_rows(
             abs_tol=1e-12,
         ):
             raise ValueError("expected_total must equal side means")
+    if len({projection.candidate_id for _, projection in rows}) != 1:
+        raise ValueError("prediction rows must be homogeneous by candidate_id")
     return rows
 
 
@@ -477,6 +479,10 @@ def select_candidate(
     """Select only a candidate strictly better than the preregistered baseline."""
     if not isinstance(development, dict) or set(development) != set(CANDIDATE_IDS):
         raise ValueError("development must contain exactly the preregistered candidates")
+    for candidate_id, rows in development.items():
+        checked = _prediction_rows(rows)
+        if checked[0][1].candidate_id != candidate_id:
+            raise ValueError("development projection candidate_id must match its key")
     metrics = {candidate_id: evaluate_predictions(rows) for candidate_id, rows in development.items()}
     if any(metric.games < 100 for metric in metrics.values()):
         raise ValueError("development requires at least 100 rows per candidate")

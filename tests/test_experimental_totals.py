@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 from datetime import date, timedelta
 
 from mlb_backtest.experimental_totals import (
@@ -136,6 +137,53 @@ class ExperimentalTotalsTests(unittest.TestCase):
             ),
         )
 
+    def test_target_date_score_mutation_cannot_change_that_date_prediction(self) -> None:
+        history = validate_final_games(
+            make_history_through("2026-06-15"), cutoff_date="2026-06-15"
+        )
+        original = walk_forward_predictions(
+            history, ("TEAM_30",), "2026-06-10", "2026-06-10"
+        )
+        target_actual, target_projection = original["TEAM_30"][0]
+        mutated = tuple(
+            replace(game, away_runs=99, home_runs=99)
+            if game.game_pk == target_actual.game_pk
+            else game
+            for game in history
+        )
+        mutated_prediction = walk_forward_predictions(
+            mutated, ("TEAM_30",), "2026-06-10", "2026-06-10"
+        )["TEAM_30"][0][1]
+        self.assertEqual(target_projection, mutated_prediction)
+
+    def test_may_to_august_history_projects_a_september_first_target(self) -> None:
+        start = date(2026, 5, 1)
+        history = validate_final_games(
+            tuple(
+                make_game(
+                    (start + timedelta(days=offset)).isoformat(),
+                    game_pk=5000 + offset,
+                    away_runs=4,
+                    home_runs=5,
+                )
+                for offset in range((date(2026, 8, 31) - start).days + 1)
+            ),
+            cutoff_date="2026-08-31",
+        )
+        target = validate_target_games(
+            (make_target("2026-09-01", game_pk=9999),), target_date="2026-09-01"
+        )[0]
+        self.assertEqual(
+            project_game(history, target, "TEAM_VENUE_30"),
+            TotalProjection(
+                "PROJECTED",
+                "TEAM_VENUE_30",
+                4.0 * ((30 * 4 + 10 * 4.5) / 40 / 4.5),
+                5.0 * ((30 * 5 + 10 * 4.5) / 40 / 4.5),
+                9.083333333333332,
+            ),
+        )
+
     def test_candidates_use_independent_shrunk_rate_oracle(self) -> None:
         # The 30-day league mean is away=8, home=3 and per-team=5.5. Team 10
         # scores 8 and allows 2; team 20 scores 3 and allows 7 in each game.
@@ -184,15 +232,19 @@ class ExperimentalTotalsTests(unittest.TestCase):
         valid = validate_target_games(
             (make_target("2026-06-01", game_pk=4),), target_date="2026-06-01"
         )[0]
+        projections = tuple(
+            project_game(history, target, "TEAM_VENUE_30")
+            for target in (unknown_team, valid, unknown_venue)
+        )
         self.assertEqual(
-            project_game(history, unknown_team, "TEAM_VENUE_30"),
+            projections[0],
             UnprojectedTotal("UNPROJECTED", "UNKNOWN_TEAM"),
         )
         self.assertEqual(
-            project_game(history, unknown_venue, "TEAM_VENUE_30"),
+            projections[2],
             UnprojectedTotal("UNPROJECTED", "UNKNOWN_VENUE"),
         )
-        self.assertIsInstance(project_game(history, valid, "TEAM_VENUE_30"), TotalProjection)
+        self.assertIsInstance(projections[1], TotalProjection)
 
     def test_metrics_selection_and_residual_distribution_match_oracles(self) -> None:
         history = validate_final_games(
@@ -212,7 +264,21 @@ class ExperimentalTotalsTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.mae, 1.0)
         self.assertAlmostEqual(metrics.rmse, 1.0)
         self.assertAlmostEqual(metrics.poisson_deviance, expected_deviance)
+        zero_actual = validate_final_games(
+            (make_game("2026-06-03", game_pk=3, away_runs=0, home_runs=0),),
+            cutoff_date="2026-06-03",
+        )[0]
+        zero_metrics = evaluate_predictions(
+            ((zero_actual, TotalProjection("PROJECTED", "TEAM_30", 2.0, 2.0, 4.0)),)
+        )
+        self.assertEqual(zero_metrics.poisson_deviance, 8.0)
         self.assertEqual(residual_samples(projections, 8.4), (7, 9))
+        clamped_rows = (
+            (zero_actual, TotalProjection("PROJECTED", "TEAM_30", 2.5, 2.5, 5.0)),
+            (history[0], TotalProjection("PROJECTED", "TEAM_30", 3.25, 3.25, 6.5)),
+        )
+        self.assertEqual(residual_samples((clamped_rows[0],), 0.1), (0,))
+        self.assertEqual(residual_samples((clamped_rows[1],), 7.0), (8,))
         self.assertEqual(interval_80((3, 4, 5, 6, 7, 8, 9, 10, 11, 12)), (3, 11))
         self.assertEqual(interval_coverage((7, 8, 9, 10), (8, 9)), 0.5)
         self.assertEqual(
@@ -234,22 +300,31 @@ class ExperimentalTotalsTests(unittest.TestCase):
             (game, TotalProjection("PROJECTED", "TEAM_30", 4.0, 5.0, 9.0))
             for _ in range(100)
         )
-        same_as_baseline = tuple(
-            (game, TotalProjection("PROJECTED", "TEAM_VENUE_30", 4.0, 4.0, 8.0))
+        equally_improved = tuple(
+            (game, TotalProjection("PROJECTED", "TEAM_VENUE_30", 4.0, 5.0, 9.0))
             for _ in range(100)
         )
         with self.assertRaisesRegex(ValueError, "100"):
-            select_candidate({"LEAGUE_30": baseline[:-1], "TEAM_30": improved[:-1], "TEAM_VENUE_30": same_as_baseline[:-1]})
+            select_candidate({"LEAGUE_30": baseline[:-1], "TEAM_30": improved[:-1], "TEAM_VENUE_30": equally_improved[:-1]})
         self.assertEqual(
             select_candidate(
                 {
                     "LEAGUE_30": baseline,
                     "TEAM_30": improved,
-                    "TEAM_VENUE_30": same_as_baseline,
+                    "TEAM_VENUE_30": equally_improved,
                 }
             ),
             "TEAM_30",
         )
+        with self.assertRaisesRegex(ValueError, "homogeneous"):
+            evaluate_predictions((baseline[0], improved[0]))
+        mismatched = {
+            "LEAGUE_30": baseline,
+            "TEAM_30": equally_improved,
+            "TEAM_VENUE_30": equally_improved,
+        }
+        with self.assertRaisesRegex(ValueError, "candidate_id"):
+            select_candidate(mismatched)
 
     def test_metric_dataclass_is_value_object(self) -> None:
         self.assertEqual(
