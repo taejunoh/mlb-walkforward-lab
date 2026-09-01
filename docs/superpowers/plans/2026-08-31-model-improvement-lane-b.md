@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, ScoringModelCard/seal_scoring_model_card/load_scoring_model_card, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Import the pure `ScoringModelCard` type from `mlb_backtest.model_improvement.contracts`; import `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` only from `mlb_backtest.model_improvement.scoring_cards`. `contracts` must not import scoring-card persistence/resolver functions back.
 - Import `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and disposition seal/load operations directly from `mlb_backtest.model_improvement.lane_disposition`; `contracts` owns no disposition alias.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
@@ -29,8 +30,9 @@ Create lane_b_candidates.py, lane_b_scoring.py, lane_b_calibration.py, lane_b_ev
 
 ~~~text
 verified Common/Lane-A paths with SOURCES_READY source gate -> grid -> score -> candidate OOF calibration
- -> evaluation -> H22 immutable 210-entry ledger -> H23 dependency gate
- -> A+B H23_FROZEN card OR LaneDisposition -> H24 registry outside Lane B
+ -> candidate-specific ScoringModelCard -> candidate-qualified prediction seal -> evaluation
+ -> H22 immutable 210-entry ledger -> H23 dependency gate
+ -> post-evaluation A+B H23_FROZEN card OR LaneDisposition -> H24 registry outside Lane B
 ~~~
 
 ### Task 1: Preregister the exact candidate grid
@@ -457,7 +459,63 @@ git add mlb_backtest/model_improvement/lane_b_calibration.py tests/test_model_im
 git commit -m "feat: fit lane b rolling calibration"
 ~~~
 
-### Task 4: Evaluate all games and date-paired Top-1
+### Task 4: Seal candidate-specific scoring cards before prediction
+
+**Files:**
+
+- Create: `mlb_backtest/model_improvement/lane_b_cards.py`
+- Create: `tests/test_model_improvement_lane_b_cards.py`
+
+**Interfaces:**
+
+- Produces `seal_candidate_scoring_card(spec, fold_id, candidate, calibration_card, source_gate, baseline_replay, feature_seal) -> ScoringModelCard` and `candidate_prediction_ledger_id(candidate_id, fold_id) -> str`.
+- This is the only Lane-B route from a selected grid candidate to a PredictionRow/PredictionSeal. It runs before that candidate’s prediction seal and never writes a FrozenModelCard.
+
+- [ ] **Step 1: Write RED tests for exact candidate-qualified identity, pre-prediction ordering, and all bound inputs.**
+
+~~~python
+class LaneBScoringCardTest(unittest.TestCase):
+    def test_candidate_card_binds_grid_calibration_and_explicit_noncolliding_path(self):
+        card = seal_candidate_scoring_card(
+            self.spec, "H23", self.candidate, self.calibration_card,
+            self.source_gate, self.baseline_replay, self.feature_seal,
+        )
+        self.assertEqual(card.model_id, "A+B")
+        self.assertEqual(card.candidate_id, self.candidate.candidate_id)
+        self.assertEqual(card.parameters["component_weights_pp"], self.candidate.weights_pp)
+        self.assertEqual(card.prediction_contract_sha256, self.spec.prediction_contract_sha256)
+        self.assertEqual(card.path, str(self.spec.output_path(
+            "lane_b", f"H23/candidates/{self.candidate.candidate_id}/scoring_model_card.json")))
+        self.assertEqual(candidate_prediction_ledger_id(self.candidate.candidate_id, "H23"),
+                         f"lane_b/{self.candidate.candidate_id}/H23")
+        self.assertNotEqual(candidate_prediction_ledger_id(self.candidate.candidate_id, "H23"),
+                            candidate_prediction_ledger_id(self.other_candidate.candidate_id, "H23"))
+~~~
+
+- [ ] **Step 2: Run RED.**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_cards -v`
+
+Expected: FAIL because Lane-B scoring-card helpers do not exist.
+
+- [ ] **Step 3: Implement the adapter around Common scoring-card persistence.**
+
+`candidate_prediction_ledger_id` must return only `lane_b/{candidate_id}/{fold_id}` after validating the exact registered `Candidate` ID and `fold_id` in `{O19,O20,O21,O22,O23,H22,H23,H24}`. `seal_candidate_scoring_card` writes only `lane_b/{fold_id}/candidates/{candidate_id}/scoring_model_card.json`; no bare fold filename or shared candidate directory is admitted. It passes a closed payload to Common `seal_scoring_model_card` with `model_id="A+B"`, `lane_id="B"`, `fold_id`, `candidate_id`, RunSpec/source/baseline/feature digests, `parent_card_sha256` for the H23-frozen A card when required, `calibration_card_sha256`, `candidate_payload_sha256=sha256(canonical_json_bytes(candidate_payload(candidate)))`, `prediction_contract_sha256=spec.prediction_contract_sha256`, and parameters containing exactly the candidate’s six pp weights plus multiplier/alpha/beta. It securely rereads the persisted card before any call to `seal_oof_predictions`; predictions use that returned digest in both rows and seal. H22/H23 candidate seals set `frozen_model_card_sha256=None`.
+
+- [ ] **Step 4: Add mismatched calibration/grid/path and duplicate candidate-ID tests, then run GREEN.**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_cards tests.test_model_improvement_lane_b_calibration -v`
+
+Expected: PASS; every candidate/fold has one immutable, non-colliding scoring authority before prediction.
+
+- [ ] **Step 5: Commit.**
+
+~~~bash
+git add mlb_backtest/model_improvement/lane_b_cards.py tests/test_model_improvement_lane_b_cards.py
+git commit -m "feat: seal lane b scoring cards"
+~~~
+
+### Task 5: Evaluate all games and date-paired Top-1
 
 **Files:**
 
@@ -549,7 +607,7 @@ git add mlb_backtest/model_improvement/lane_b_evaluation.py tests/test_model_imp
 git commit -m "feat: evaluate lane b metrics"
 ~~~
 
-### Task 5: Seal all H22 decisions and select/freeze the optional H23 card
+### Task 6: Seal all H22 decisions and select/freeze the optional H23 card
 
 **Files:**
 
@@ -558,7 +616,7 @@ git commit -m "feat: evaluate lane b metrics"
 
 **Interfaces:**
 
-- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_evaluation: EvaluationReport), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation: EvaluationReport, parameters), and a QUALIFIED LaneDisposition sealed after a successful Common card freeze.
+- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_evaluation: EvaluationReport), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation: EvaluationReport), and a QUALIFIED LaneDisposition sealed after a successful Common post-evaluation card freeze.
 - H24 consumes only FrozenModelCard or LaneDisposition, not any Lane B registry entry.
 
 - [ ] **Step 1: Write failing H22/H23 TestCase methods.**
@@ -590,6 +648,7 @@ Expected: ModuleNotFoundError for lane_b_ledger.
 ~~~python
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json
 from mlb_backtest.model_improvement.contracts import seal_frozen_model_card
+from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
 from mlb_backtest.model_improvement.lane_b_candidates import Candidate, validate_candidate
 from mlb_backtest.model_improvement.evaluation import EvaluationReport
 from mlb_backtest.model_improvement.lane_disposition import (
@@ -647,7 +706,7 @@ def select_h23(spec, rows, lane_a_evaluation: EvaluationReport):
     return {**min(eligible, key=h22_order), "status": "SELECTED_H23"}
 
 
-def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation, parameters):
+def freeze_ab_card(spec, selected, lane_a_card, scoring_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation):
     if not isinstance(selected, dict) or selected["status"] != "SELECTED_H23":
         raise ValueError("selected H23 candidate differs")
     if lane_a_card.model_id != "A" or lane_a_card.state != "H23_FROZEN":
@@ -655,17 +714,26 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
     selected_weights = dict(selected["weights_pp"])
     validate_candidate(Candidate(selected["candidate_id"], selected_weights,
                                  selected["shrinkage_multiplier"]))
-    if parameters.get("component_weights_pp", selected_weights) != selected_weights:
-        raise ValueError("selected candidate/card component weights differ")
+    if (scoring_card.model_id != "A+B" or scoring_card.lane_id != "B"
+            or scoring_card.fold_id != "H23" or scoring_card.candidate_id != selected["candidate_id"]
+            or scoring_card.parameters.get("component_weights_pp") != selected_weights
+            or scoring_card.prediction_contract_sha256 != spec.prediction_contract_sha256):
+        raise ValueError("selected candidate/scoring card bindings differ")
+    if (prediction_seal.scoring_model_card_sha256 != scoring_card.artifact_sha256
+            or prediction_seal.frozen_model_card_sha256 is not None
+            or prediction_seal.prediction_contract_sha256 != spec.prediction_contract_sha256):
+        raise ValueError("selected prediction/scoring card binding differs")
     payload = {"model_id": "A+B", "state": "H23_FROZEN", "fold_id": "H23",
         "run_spec_sha256": run_spec_sha256(spec), "source_gate_sha256": source_gate.artifact_sha256,
         "baseline_replay_sha256": baseline_replay.artifact_sha256,
         "parent_card_sha256": lane_a_card.artifact_sha256,
         "feature_seal_sha256": feature_seal.artifact_sha256,
-        "prediction_contract_sha256": prediction_seal.artifact_sha256,
+        "prediction_contract_sha256": spec.prediction_contract_sha256,
+        "scoring_model_card_path": scoring_card.path,
+        "scoring_model_card_sha256": scoring_card.artifact_sha256,
         "prediction_seal_sha256": prediction_seal.artifact_sha256,
         "evaluation_sha256": evaluation.artifact_sha256,
-        "parameters": {**parameters, "candidate_id": selected["candidate_id"],
+        "parameters": {**dict(scoring_card.parameters), "candidate_id": selected["candidate_id"],
                        "component_weights_pp": selected_weights}}
     return seal_frozen_model_card(spec, "lane_b", "H23/frozen_model_card.json", payload)
 ~~~
@@ -678,13 +746,13 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
         self.assertEqual("REJECTED", result.state)
         with self.assertRaisesRegex(ValueError, "not H23_FROZEN"):
             freeze_ab_card(self.spec, self.selected, self.lane_a_not_frozen,
-                           self.source_gate, self.baseline_replay, self.feature_seal,
-                           self.prediction_seal, self.evaluation, self.parameters)
+                           self.scoring_card, self.source_gate, self.baseline_replay,
+                           self.feature_seal, self.prediction_seal, self.evaluation)
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_ledger.LaneBLedgerTest -v
 
-Expected: PASS; non-frozen A ends before search, rejected B writes no card, selected candidate/grid/card `component_weights_pp` are identical, and selection order is Brier, log loss, Top-1 delta descending, candidate ID.
+Expected: PASS; non-frozen A ends before search, rejected B writes no card, selected candidate/grid/scoring-card/final-card `component_weights_pp` are identical, and selection order is Brier, log loss, Top-1 delta descending, candidate ID.
 
 - [ ] **Step 5: Commit.**
 
@@ -693,7 +761,7 @@ git add mlb_backtest/model_improvement/lane_b_ledger.py tests/test_model_improve
 git commit -m "feat: seal optional lane b card"
 ~~~
 
-### Task 6: Explicit-path runner and replay
+### Task 7: Explicit-path runner and replay
 
 **Files:**
 
@@ -702,8 +770,8 @@ git commit -m "feat: seal optional lane b card"
 
 **Interfaces:**
 
-- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_path, lane_a_h22_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, selected_prediction_seal, selected_evaluation, parameters) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
-- H24 receives optional card.path/card.artifact_sha256 and disposition.path/disposition.artifact_sha256; runner does not import candidate_registry.
+- Produces run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path, feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256, lane_a_h22_path, lane_a_h22_expected_sha256), run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay, feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256, selected_prediction_seal, selected_evaluation) -> tuple[FrozenModelCard | None, LaneDisposition], verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_artifact_sha256).
+- H24 receives optional scoring-card.path/scoring-card.artifact_sha256, final-card.path/final-card.artifact_sha256, and disposition.path/disposition.artifact_sha256; runner does not import candidate_registry.
 
 - [ ] **Step 1: Write failing runner TestCase methods.**
 
@@ -738,6 +806,7 @@ Expected: ModuleNotFoundError for lane_b_runner.
 ~~~python
 from pathlib import Path
 from mlb_backtest.model_improvement.contracts import load_frozen_model_card
+from mlb_backtest.model_improvement.scoring_cards import load_scoring_model_card
 from mlb_backtest.model_improvement.lane_b_ledger import build_lane_b_disposition, freeze_ab_card, select_h23
 from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal
 from mlb_backtest.model_improvement.run_spec import load_run_spec
@@ -768,7 +837,8 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
 
 
 def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gate, baseline_replay,
-                   feature_seal, selected_prediction_seal, selected_evaluation, parameters):
+                   feature_seal, selected_scoring_card_path, selected_scoring_card_expected_sha256,
+                   selected_prediction_seal, selected_evaluation):
     card = lane_a_result.card
     if card is None or card.model_id != "A" or card.state != "H23_FROZEN":
         return None, build_lane_b_disposition(spec, lane_a_result)
@@ -776,17 +846,24 @@ def run_lane_b_h23(spec, lane_a_result, survivors, lane_a_evaluation, source_gat
     if not isinstance(selected, dict):
         return None, selected
     candidate_id = selected["candidate_id"]
+    scoring_card = load_scoring_model_card(
+        spec, Path(selected_scoring_card_path), selected_scoring_card_expected_sha256)
     selected_rows = load_prediction_rows(spec, selected_prediction_seal)
-    if (selected_prediction_seal.ledger_id != "H23"
+    if (selected_prediction_seal.ledger_id != f"lane_b/{candidate_id}/H23"
+            or selected_prediction_seal.fold_id != "H23"
+            or selected_prediction_seal.candidate_id != candidate_id
+            or selected_prediction_seal.scoring_model_card_sha256 != scoring_card.artifact_sha256
+            or selected_prediction_seal.frozen_model_card_sha256 is not None
             or not selected_rows
-            or {row.model_id for row in selected_rows} != {candidate_id}
+            or {row.model_id for row in selected_rows} != {"A+B"}
+            or {row.scoring_model_card_sha256 for row in selected_rows} != {scoring_card.artifact_sha256}
             or {row.target_year for row in selected_rows} != {spec.fold("H23").target_year}
             or selected_evaluation.model_id != candidate_id
             or selected_evaluation.run_spec_sha256 != run_spec_sha256(spec)
             or selected_evaluation.prediction_sha256 != selected_prediction_seal.artifact_sha256):
         raise ValueError("selected Lane B H23 prediction/evaluation binding differs")
-    frozen = freeze_ab_card(spec, selected, card, source_gate, baseline_replay, feature_seal,
-                            selected_prediction_seal, selected_evaluation, parameters)
+    frozen = freeze_ab_card(spec, selected, card, scoring_card, source_gate, baseline_replay, feature_seal,
+                            selected_prediction_seal, selected_evaluation)
     qualified = seal_lane_disposition(spec, lane_id="B", state="QUALIFIED",
         parent_card_sha256=card.artifact_sha256,
         evidence_sha256=(frozen.artifact_sha256, selected_prediction_seal.artifact_sha256,
@@ -812,8 +889,8 @@ def verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_ar
         card, disposition = self.runner.run_lane_b_h23(
             self.spec, self.lane_a_rejected_result, self.survivors,
             self.lane_a_rejected_result.evaluation, self.source_gate, self.baseline_replay,
-            self.feature_seal, self.lane_b_h23_prediction, self.lane_b_h23_evaluation,
-            self.parameters)
+            self.feature_seal, self.scoring_card_path, self.scoring_card_artifact_sha256,
+            self.lane_b_h23_prediction, self.lane_b_h23_evaluation)
         self.assertIsNone(card)
         self.assertEqual("ABSENT", disposition.state)
         self.manifest_path.write_bytes(b"{}\n\n")
@@ -827,8 +904,8 @@ def verify_lane_b_replay(spec, h22_manifest_path, ab_card_path, expected_card_ar
                 self.spec, self.lane_a_frozen_result, self.survivors,
                 self.lane_a_frozen_result.evaluation, self.source_gate,
                 self.baseline_replay, self.feature_seal,
-                self.wrong_candidate_prediction, self.lane_b_h23_evaluation,
-                self.parameters)
+                self.scoring_card_path, self.scoring_card_artifact_sha256,
+                self.wrong_candidate_prediction, self.lane_b_h23_evaluation)
 ~~~
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_runner.LaneBRunnerTest -v
@@ -837,7 +914,7 @@ Expected: PASS; no H24 registry import or write occurs.
 
 - [ ] **Step 5: Run all checks and commit.**
 
-Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_candidates tests.test_model_improvement_lane_b_scoring tests.test_model_improvement_lane_b_calibration tests.test_model_improvement_lane_b_evaluation tests.test_model_improvement_lane_b_ledger tests.test_model_improvement_lane_b_runner tests.test_scoring tests.test_normalize tests.test_metrics tests.test_ranking tests.test_leakage -v
+Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_candidates tests.test_model_improvement_lane_b_scoring tests.test_model_improvement_lane_b_calibration tests.test_model_improvement_lane_b_cards tests.test_model_improvement_lane_b_evaluation tests.test_model_improvement_lane_b_ledger tests.test_model_improvement_lane_b_runner tests.test_model_improvement_scoring_cards tests.test_scoring tests.test_normalize tests.test_metrics tests.test_ranking tests.test_leakage -v
 
 Expected: PASS; every test is a unittest.TestCase method and v5.1 remains unchanged.
 
@@ -854,5 +931,5 @@ git commit -m "feat: orchestrate lane b replay"
 - H22 emits 210 immutable decisions; first 12 replay-valid candidates are ordered Brier asc, log loss asc, date-paired Top-1 delta desc, candidate ID asc. Invalid replay reason is H22_INVALID_REPLAY.
 - H23 requires Brier/log loss no worse than Lane A and positive paired Top-1 delta versus v5.1, then uses the same ordering.
 - Lane A not H23_FROZEN yields LaneDisposition `state="ABSENT"` with reason `LANE_A_NOT_H23_FROZEN` and does not search. No H23 qualifier yields LaneDisposition REJECTED with reason NO_H23_CANDIDATE_CLEARS_GATES and writes no A+B card.
-- Successful A+B has model_id A+B, state H23_FROZEN, Lane A parent-card SHA-256, and prediction-contract SHA-256. H24 registers it later.
+- Successful A+B seals its selected grid/calibration `ScoringModelCard` before its candidate-qualified H23 prediction. Its post-evaluation final card has model_id A+B, state H23_FROZEN, Lane A parent-card SHA-256, RunSpec prediction-contract SHA-256, and the exact scoring-card path/digest plus H23 prediction/evaluation digests. H24 registers both identities later.
 - Candidate calibration is O19–O21, O19–O22, O19–O23 for H22, H23, optional H24; exact p=.5 remains no-pick.

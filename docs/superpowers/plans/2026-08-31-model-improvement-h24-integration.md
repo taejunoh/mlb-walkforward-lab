@@ -22,10 +22,10 @@ The implementation order is:
 
 ```text
 common RunSpec + verified 2018-2024 source gate
-  -> sealed common primitive rows and Lane A card
-  -> frozen Lane B card
-  -> optional frozen Lane C card plus replay-safe H24 lane_c feature seal, or explicit ABSENT disposition
-  -> pre-H24 candidate registry seal
+  -> sealed common primitive rows and post-evaluation Lane A final card
+  -> post-evaluation Lane B final card
+  -> optional post-evaluation Lane C final card plus replay-safe H24 lane_c feature seal, or explicit ABSENT disposition
+  -> candidate-specific H24 ScoringModelCards + pre-H24 registry seal
   -> H24 prediction seals for every registered model
   -> OUTCOMES_OPENED transition exactly once
   -> identical-population outcome join and comparison
@@ -58,16 +58,20 @@ Create these files:
 
 Do not modify `config/v5_1_bt.json`, any file below `audit/v5_1_bt/`, any existing v5.1 model card, or any live/experimental daily output.
 
-Common/Lane A owns `ModelImprovementRunSpec`, `SourceGateReceipt`, `FeatureSeal`, `SealedFeatureRow`, `FrozenModelCard`, `LaneDisposition`, `PredictionRow`, and `PredictionSeal` in the Common modules. This plan must import those definitions and must not redefine them. This plan owns `RegisteredCandidate`, `CandidateRegistry`, `H24PredictionManifest`, `H24Phase`, `H24LedgerState`, `OutcomeCapability`, `H24OutcomeRow`, `EvaluatedPredictionRow`, `H24Comparison`, `FinalVerificationReceipt`, and `PromotionDecision` in the modules listed above.
+Common/Lane A owns `ModelImprovementRunSpec`, `SourceGateReceipt`, `FeatureSeal`, `SealedFeatureRow`, `ScoringModelCard`, `FrozenModelCard`, `LaneDisposition`, `PredictionRow`, and `PredictionSeal` in the Common modules. This plan must import those definitions and must not redefine them. This plan owns `RegisteredCandidate`, `CandidateRegistry`, `H24PredictionManifest`, `H24Phase`, `H24LedgerState`, `OutcomeCapability`, `H24OutcomeRow`, `EvaluatedPredictionRow`, `H24Comparison`, `FinalVerificationReceipt`, and `PromotionDecision` in the modules listed above.
 
 ```python
-from mlb_backtest.model_improvement.contracts import MODEL_IDS, load_frozen_model_card
+from mlb_backtest.model_improvement.contracts import MODEL_IDS, ScoringModelCard, load_frozen_model_card
+from mlb_backtest.model_improvement.scoring_cards import (
+    load_scoring_model_card, resolve_prediction_weight_authority,
+    seal_scoring_model_card,
+)
 from mlb_backtest.model_improvement.lane_disposition import (
     LANE_DISPOSITION_STATES, LANE_IDS, LaneDisposition, load_lane_disposition,
 )
 ```
 
-H24 imports Common `MODEL_IDS` and validates every model ID against that closed set; its registry schema enumerates exactly those four values, not a local type alias. `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and the disposition loader come only from `lane_disposition`, never from `contracts`. It consumes a frozen card only through `load_frozen_model_card(spec, path, expected_sha256)`, where `path` and `expected_sha256` are the exact registry-pinned `card_path`/`card_sha256` fields. It does not construct cards from mappings, discover files, or accept a caller-supplied card descriptor in place of that load.
+H24 imports Common `MODEL_IDS` and the pure `ScoringModelCard` type from `contracts`, and validates every model ID against that closed set; its registry schema enumerates exactly those four values, not a local type alias. `seal_scoring_model_card`, `load_scoring_model_card`, and `resolve_prediction_weight_authority` come only from `scoring_cards`; `contracts` never imports any of them, preventing a contracts↔scoring-cards cycle. `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and the disposition loader come only from `lane_disposition`, never from `contracts`. For every nonbaseline candidate it consumes a H24 `ScoringModelCard` only through `load_scoring_model_card(spec, path, expected_sha256)` and the prior final card only through `load_frozen_model_card(spec, path, expected_sha256)`, where each path/digest is registry-pinned. `v5.1` has no generated scoring-card or final-card wrapper: its scoring identity is the existing canonical card path/digest/weights directly pinned in RunSpec and its final-card fields are null. It does not construct cards from mappings, discover files, or accept a caller-supplied descriptor in place of those pins.
 
 ### Task 1: Define the closed candidate-registry schema
 
@@ -76,7 +80,7 @@ H24 imports Common `MODEL_IDS` and validates every model ID against that closed 
 - Create: `tests/test_model_improvement_registry.py`
 - Create: `mlb_backtest/model_improvement/candidate_registry.py`
 
-- [ ] Add a failing test that constructs a fully qualified registry with model IDs in any order and expects canonical order `v5.1`, `A`, `A+B`, `A+B+C`. Also test the valid baseline-only registry. Reject unknown IDs, a missing `v5.1`, more than one card per ID, `A+B` without `A`, and `A+B+C` without `A+B`; verify baseline v5.1 weights are exactly `35/25/20/10/5/5` and every optional card has the closed six-key integer `component_weights_pp` binding.
+- [ ] Add a failing test that constructs a fully qualified registry with model IDs in any order and expects canonical order `v5.1`, `A`, `A+B`, `A+B+C`. Also test the valid baseline-only registry. Reject unknown IDs, a missing `v5.1`, more than one identity per ID, `A+B` without `A`, and `A+B+C` without `A+B`; verify the direct RunSpec baseline v5.1 path/digest/weights are exactly `35/25/20/10/5/5`, every optional H24 scoring card has the closed six-key integer `component_weights_pp` binding, and every optional final card binds its declared scoring-card path/digest.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_registry.CandidateRegistryContractTest -v` and confirm the import or assertion fails.
 - [ ] Define frozen dataclasses with these public signatures:
 
@@ -84,8 +88,10 @@ H24 imports Common `MODEL_IDS` and validates every model ID against that closed 
 @dataclass(frozen=True)
 class RegisteredCandidate:
     model_id: str  # validate membership in Common MODEL_IDS
-    card_path: str
-    card_sha256: str
+    scoring_model_card_path: str
+    scoring_model_card_sha256: str
+    frozen_model_card_path: str | None
+    frozen_model_card_sha256: str | None
     feature_seal_path: str
     feature_seal_sha256: str
     prediction_contract_sha256: str
@@ -103,8 +109,10 @@ def build_candidate_registry(
     run_spec: ModelImprovementRunSpec,
     source_gate: SourceGateReceipt,
     baseline_replay: BaselineReplayReceipt,
-    optional_card_paths: Mapping[str, Path],
-    optional_card_sha256: Mapping[str, str],
+    optional_scoring_card_paths: Mapping[str, Path],
+    optional_scoring_card_sha256: Mapping[str, str],
+    optional_frozen_card_paths: Mapping[str, Path],
+    optional_frozen_card_sha256: Mapping[str, str],
     lane_dispositions: Mapping[str, LaneDisposition],
     h24_population_sha256: str,
 ) -> CandidateRegistry:
@@ -120,7 +128,8 @@ def load_candidate_registry(path: Path, expected_sha256: str) -> CandidateRegist
     """Reread a regular file, verify its digest and closed schema, and parse it."""
 ```
 
-- [ ] Implement the closed JSON Schema with `additionalProperties: false`, exact 64-character lowercase SHA-256 fields, exactly the Common `MODEL_IDS` values, and one-to-four candidate records. Every candidate binds one explicit H24 `FeatureSeal` path/digest: `v5.1`, `A`, and `A+B` bind the identical `feature_set_id="common"` seal, while `A+B+C` binds the separately sealed `feature_set_id="lane_c"` H24 rows.
+- [ ] Implement the closed JSON Schema with `additionalProperties: false`, exact 64-character lowercase SHA-256 fields, exactly the Common `MODEL_IDS` values, and one-to-four candidate records. Every candidate binds one explicit H24 `FeatureSeal` path/digest: `v5.1`, `A`, and `A+B` bind the identical `feature_set_id="common"` seal, while `A+B+C` binds the separately sealed `feature_set_id="lane_c"` H24 rows. The baseline record exactly copies the direct RunSpec v5.1 canonical card path/digest into `scoring_model_card_path`/`scoring_model_card_sha256` and has null frozen-card fields. Every optional record pins both the H24 scoring-card path/digest and the already qualified H23 final-card path/digest; neither identity may be omitted or discovered.
+- [ ] Before sealing the registry, create or securely reload exactly one H24 `ScoringModelCard` for each qualified optional final card at `h24_predictions/{model_id}/scoring_model_card.json`. Its `fold_id` is `H24`, its parent is that exact final-card digest, its feature seal is the exact H24 registry feature seal, its weights equal the final card’s validated weights, and its `prediction_contract_sha256` is the RunSpec digest. The baseline creates no wrapper and continues to use the direct RunSpec canonical-card reference. The registry persists the resulting scoring-card and final-card path/digest pairs together; no prediction may begin before the registry has reread both pairs.
 - [ ] Implement canonical serialization with sorted keys, UTF-8, compact separators, and a trailing newline; use exclusive creation and reject symlinks, non-regular files, and digest mismatches on reread.
 - [ ] Run the focused test and confirm all registry tests pass.
 - [ ] Commit only these three files with `git commit -m "feat: seal model improvement candidate registry"`.
@@ -131,8 +140,8 @@ def load_candidate_registry(path: Path, expected_sha256: str) -> CandidateRegist
 - Modify: `mlb_backtest/model_improvement/candidate_registry.py`
 - Modify: `tests/test_model_improvement_registry.py`
 
-- [ ] Add failing tests requiring the registry builder to verify the common RunSpec, source-gate receipt, exact v5.1 replay receipt, one Common `LaneDisposition` for each of A/B/C, the H24 common feature seal, and the optional H24 Lane C feature seal. A `QUALIFIED` disposition must have the corresponding frozen card; `ABSENT` or `REJECTED` must not. Parent dependencies are strict: B can qualify only when A qualifies, and C can qualify only when B qualifies and its H24 `lane_c` feature seal securely rereads with the card-pinned digest.
-- [ ] Add tamper cases for every referenced digest, a Lane B card not derived from the registered Lane A card, a Lane C card not derived from the registered A+B card, a C card paired with a common or wrong-parent H24 feature seal, differing H24 eligible populations, and any artifact created after a supplied pre-H24 freeze boundary.
+- [ ] Add failing tests requiring the registry builder to verify the common RunSpec, source-gate receipt, exact v5.1 replay receipt, one Common `LaneDisposition` for each of A/B/C, the H24 common feature seal, and the optional H24 Lane C feature seal. A `QUALIFIED` disposition must have both the corresponding H24 scoring card and final card; `ABSENT` or `REJECTED` must have neither. Parent dependencies are strict: B can qualify only when A qualifies, and C can qualify only when B qualifies and its H24 `lane_c` feature seal securely rereads with the scoring-card-pinned digest.
+- [ ] Add tamper cases for every referenced digest, a Lane B final card not derived from the registered Lane A card, a Lane C final card not derived from the registered A+B card, an H24 scoring card whose parent/fold/weights disagree with its final card, a C card paired with a common or wrong-parent H24 feature seal, differing H24 eligible populations, and any artifact created after a supplied pre-H24 freeze boundary.
 - [ ] Run the focused registry suite and confirm the new tamper cases fail.
 - [ ] Add this exact final input contract and `validate_registry_inputs(inputs: RegistryInputs) -> None`:
 
@@ -143,8 +152,10 @@ class RegistryInputs:
     source_gate: SourceGateReceipt
     baseline_replay: BaselineReplayReceipt
     common_h24_feature_seal: FeatureSeal
-    optional_card_paths: Mapping[str, Path]
-    optional_card_sha256: Mapping[str, str]
+    optional_scoring_card_paths: Mapping[str, Path]
+    optional_scoring_card_sha256: Mapping[str, str]
+    optional_frozen_card_paths: Mapping[str, Path]
+    optional_frozen_card_sha256: Mapping[str, str]
     lane_c_h24_feature_seal: FeatureSeal | None
     lane_dispositions: Mapping[str, LaneDisposition]
     h24_population_sha256: str
@@ -157,7 +168,7 @@ def build_candidate_registry(inputs: RegistryInputs) -> CandidateRegistry:
     """Build the sole registry only after validate_registry_inputs succeeds."""
 ```
 
-Verify exact upstream artifact hashes, parent-card hashes, fold IDs, `H23_FROZEN` states, H24 feature-seal `feature_set_id`/parent/evidence bindings, and one identical `population_sha256` across every candidate without importing any outcome module. `validate_registry_inputs` must first require the optional-card path/digest map to contain only `A`, `A+B`, and `A+B+C`, then call only `load_frozen_model_card(inputs.run_spec, inputs.optional_card_paths[model_id], inputs.optional_card_sha256[model_id])` for each present candidate; reject descriptor objects passed in place of those pins. Verify the loaded card’s exact six-key `parameters.component_weights_pp`, the baseline v5.1 `35/25/20/10/5/5` pin, A’s unchanged baseline pin, B’s selected-grid/candidate equality, and C’s byte-identical A+B inheritance. Every registered prediction must bind `PredictionSeal.prediction_contract_sha256 == run_spec.prediction_contract_sha256` and `PredictionSeal.model_card_sha256 == candidate.card_sha256`; this validates actual weights through the registry-pinned canonical card, without a `model_parameters_sha256` field. The `A+B+C` card parameters must pin its H24 Lane C feature-seal digest; no directory scan or latest-file selection is allowed.
+Verify exact upstream artifact hashes, parent-card hashes, fold IDs, `H23_FROZEN` states, H24 feature-seal `feature_set_id`/parent/evidence bindings, and one identical `population_sha256` across every candidate without importing any outcome module. `validate_registry_inputs` must first require the optional scoring/final-card path/digest maps to contain only `A`, `A+B`, and `A+B+C`, then call only `load_scoring_model_card(inputs.run_spec, inputs.optional_scoring_card_paths[model_id], inputs.optional_scoring_card_sha256[model_id])` and `load_frozen_model_card(inputs.run_spec, inputs.optional_frozen_card_paths[model_id], inputs.optional_frozen_card_sha256[model_id])` for each present candidate; reject descriptor objects passed in place of those pins. Verify the loaded H24 scoring card has the exact six-key `parameters.component_weights_pp`, `fold_id="H24"`, the required H24 feature seal, and the pinned final-card digest as its parent. Independently verify the final card’s own H23 scoring-card path/digest, H23 final state, parent hierarchy, and weights; then require the H24 scoring weights/model to match that final card. Verify the direct RunSpec v5.1 `35/25/20/10/5/5` pin, A’s unchanged baseline pin, B’s selected-grid/candidate equality, and C’s byte-identical A+B inheritance. Every registered H24 `PredictionRow` and `PredictionSeal` must bind `prediction_contract_sha256 == run_spec.prediction_contract_sha256` and `scoring_model_card_sha256 == candidate.scoring_model_card_sha256`. Only the H24 `PredictionSeal` additionally binds `frozen_model_card_sha256 == candidate.frozen_model_card_sha256` for optional candidates; the baseline seal has `frozen_model_card_sha256 is None`. The `A+B+C` H24 scoring card parameters must pin its H24 Lane C feature-seal digest; no directory scan or latest-file selection is allowed.
 - [ ] Make `build_candidate_registry` accept only validated `RegistryInputs`; prove with `modulefinder` or an AST import test that `candidate_registry.py` cannot import `h24_outcomes`, `outcomes`, or an outcome fixture.
 - [ ] Run the focused registry suite and confirm the valid fixture passes and every tamper fixture fails.
 - [ ] Commit with `git commit -m "feat: bind pre-h24 candidate evidence"`.
@@ -169,8 +180,8 @@ Verify exact upstream artifact hashes, parent-card hashes, fold IDs, `H23_FROZEN
 - Create: `tests/test_model_improvement_h24_predictions.py`
 - Create: `tests/fixtures/model_improvement/h24/eligible_rows.jsonl`
 
-- [ ] Add a failing synthetic test that calls `score_h24_candidates(spec, registry, feature_seals)` exactly and expects one prediction per `(model_id, game_pk)`, identical eligible `game_pk` populations, deterministic daily ranks, and no outcome fields in memory or serialized output. The registry pins the only permitted card paths/digests, so the test supplies no `cards` fixture or argument. It must prove that `A+B+C` reads its `lane_c` rows while all other models read the common rows.
-- [ ] Add failure cases for duplicate `game_pk`, non-H24 dates, nonfinite probability, mismatched population hashes, post-registry card mutation, and an `A+B+C` input when absent from the registry.
+- [ ] Add a failing synthetic test that calls `score_h24_candidates(spec, registry, feature_seals)` exactly, then calls `seal_h24_predictions(spec, registry, rows, output_dir)`, and expects one prediction per `(model_id, game_pk)`, identical eligible `game_pk` populations, deterministic daily ranks, and no outcome fields in memory or serialized output. The registry pins the only permitted card paths/digests, so the test supplies no `cards` fixture or argument. Spy or inject the resolver to prove `score_h24_candidates` calls `resolve_prediction_weight_authority(spec, "v5.1", None)` exactly for baseline and calls it once for every registered optional candidate with that candidate's securely loaded H24 `ScoringModelCard`; reject an omitted call or an optional `None`. It must prove that `A+B+C` reads its `lane_c` rows while all other models read the common rows, and that sealing rejects a row whose universal contract, scoring-card digest, or registry-derived final-card binding differs.
+- [ ] Add failure cases for duplicate `game_pk`, non-H24 dates, nonfinite probability, mismatched population hashes, post-registry scoring-card or final-card mutation, a scoring card whose parent/weights/feature seal disagree with the pinned final card, a baseline wrapper card, and an `A+B+C` input when absent from the registry.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_predictions -v` and confirm RED.
 - [ ] Implement these public functions:
 
@@ -180,7 +191,7 @@ def score_h24_candidates(
     registry: CandidateRegistry,
     feature_seals: Mapping[str, FeatureSeal],
 ) -> tuple[PredictionRow, ...]:
-    """Load each optional card only from its registry-pinned path/digest, then score it."""
+    """Load each registry-pinned card, resolve its scoring authority, then score it."""
 
 def validate_identical_prediction_population(
     rows: Sequence[PredictionRow],
@@ -189,13 +200,15 @@ def validate_identical_prediction_population(
     """Return the common population digest after exact per-model equality checks."""
 
 def seal_h24_predictions(
+    spec: ModelImprovementRunSpec,
+    registry: CandidateRegistry,
     rows: Sequence[PredictionRow],
     output_dir: Path,
 ) -> H24PredictionManifest:
-    """Seal one canonical prediction artifact per model and their common manifest."""
+    """Derive registry bindings, validate rows, then seal canonical per-model artifacts."""
 ```
 
-- [ ] Securely load each registry-pinned feature seal and rows, and for every optional card call only `load_frozen_model_card(spec, Path(candidate.card_path), candidate.card_sha256)` after matching exact registry path/digest; derive edge and completeness only with that card’s `component_weights_pp` under the universal RunSpec prediction contract, and require one identical `game_pk` population digest. Reject a caller mapping whose key/path/digest differs from the registry. Each sealed prediction must carry the universal contract digest and the exact registry card digest as `model_card_sha256`. Reuse the frozen deterministic ranking key from the common plan; do not call the legacy v5.1 top-level pipeline. Serialize one canonical JSONL file and SHA-256 sidecar per model, then a population manifest binding all model and feature-seal digests.
+- [ ] Securely load each registry-pinned feature seal and rows. For every optional candidate call only `load_scoring_model_card(spec, Path(candidate.scoring_model_card_path), candidate.scoring_model_card_sha256)` and `load_frozen_model_card(spec, Path(candidate.frozen_model_card_path), candidate.frozen_model_card_sha256)` after matching exact registry paths/digests; prove the scoring card is H24, has that final-card digest as parent, matches that final card’s model/weights, and is bound to the registry feature seal. `score_h24_candidates` must call `resolve_prediction_weight_authority(spec, "v5.1", None)` for baseline and must call `resolve_prediction_weight_authority(spec, candidate.model_id, loaded_h24_scoring_card)` for every optional candidate before deriving any score; `None` is valid only for v5.1, and an optional caller/card bypass fails closed. Derive edge and completeness only with that returned authority’s `component_weights_pp` under the universal RunSpec prediction contract, and require one identical `game_pk` population digest. Reject a caller mapping whose key/path/digest differs from the registry. `seal_h24_predictions(spec, registry, rows, output_dir)` must derive each model's scoring-card and optional final-card binding solely from the securely reread registry, validate each row's `prediction_contract_sha256 == spec.prediction_contract_sha256` and `scoring_model_card_sha256` against that derived binding, and derive (rather than accept from a caller) the optional `PredictionSeal.frozen_model_card_sha256`; baseline derives a null final-card binding. Every seal uses canonical `ledger_id="h24/{model_id}/H24"`, so each model has an unambiguous path and one seal. Each H24 `PredictionRow` and `PredictionSeal` must carry the universal contract digest and exact `scoring_model_card_sha256`; only the optional candidate seal additionally sets `frozen_model_card_sha256` to the exact registry final-card digest, while the baseline seal sets it to null. Reuse the frozen deterministic ranking key from the common plan; do not call the legacy v5.1 top-level pipeline. Serialize one canonical JSONL file and SHA-256 sidecar per model, then a population manifest binding all model, scoring-card, final-card, and feature-seal digests.
 - [ ] Add an AST import-denial test proving this module does not import `h24_outcomes`, `outcomes`, or any file below an outcome root.
 - [ ] Run the prediction suite and confirm all cases pass.
 - [ ] Commit with `git commit -m "feat: seal identical-population h24 predictions"`.
@@ -313,7 +326,7 @@ def evaluate_promotion_gate(
 
 - [ ] Add failing CLI tests requiring explicit paths for RunSpec, source gate, registry, every registry-declared H24 feature seal, every card, outcome file, and output root; reject defaults, path discovery, a missing Lane C H24 seal, a dirty card/feature digest, and a pre-existing `OUTCOMES_OPENED` record.
 - [ ] Run the controller suite and confirm RED.
-- [ ] Implement a thin CLI that validates all pre-outcome artifacts, seals predictions, rereads their hashes, advances the phase ledger, opens outcomes once, evaluates, writes the comparison and decision, rereads both, and advances `REPORT_SEALED`.
+- [ ] Implement a thin CLI that validates all pre-outcome artifacts, computes `rows = score_h24_candidates(spec, registry, feature_seals)`, seals only with `manifest = seal_h24_predictions(spec, registry, rows, output_dir)`, rereads their hashes, advances the phase ledger, opens outcomes once, evaluates, writes the comparison and decision, rereads both, and advances `REPORT_SEALED`.
 - [ ] Return exit `0` for a valid report, including `NO_PROMOTION`; return exit `1` for contract/preflight rejection and exit `2` for a forbidden same-registry rerun after outcomes opened. Never catch an integrity failure and retry automatically.
 - [ ] Add `--dry-run-contract` that validates paths and hashes but cannot score, open outcomes, or create phase records.
 - [ ] Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_h24_controller -v` and confirm all CLI tests pass.
