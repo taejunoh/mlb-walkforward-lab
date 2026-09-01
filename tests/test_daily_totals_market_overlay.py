@@ -175,6 +175,55 @@ class SecurePersistenceTests(unittest.TestCase):
         trace_path.write_bytes(canonical_json_bytes(trace_value))
 
     @classmethod
+    def _alternate_model_report(cls, root: Path, trace: Path) -> tuple[Path, bytes, str]:
+        """Write a second individually valid report with exact content/sidecar bindings."""
+        trace_value = json.loads((root / trace).read_bytes())
+        report_path = root / Path(trace_value["report_relative"])
+        report = json.loads(report_path.read_bytes())
+        game = report["games"][0]
+        game.update({"away_expected_runs": 6.0, "home_expected_runs": 5.0, "expected_total": 11.0})
+        report["content_sha256"] = cls._digest({key: item for key, item in report.items() if key != "content_sha256"})
+        contents = canonical_json_bytes(report)
+        relative = report_path.with_name("alternate-model.json").relative_to(root)
+        sidecar = hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n"
+        destination = root / relative
+        destination.write_bytes(contents)
+        destination.with_suffix(".sha256").write_bytes(sidecar)
+        return relative, contents, hashlib.sha256(sidecar).hexdigest()
+
+    @classmethod
+    def _alternate_model_receipt(cls, root: Path, trace: Path) -> tuple[Path, bytes, str]:
+        """Write a second individually valid receipt with exact content/sidecar bindings."""
+        trace_value = json.loads((root / trace).read_bytes())
+        receipt_path = root / Path(trace_value["model_receipt_relative"])
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["final_metrics"] = dict(receipt["final_metrics"], mae=1.0)
+        receipt["content_sha256"] = cls._digest({key: item for key, item in receipt.items() if key != "content_sha256"})
+        contents = canonical_json_bytes(receipt)
+        relative = Path("audit/experimental_daily_totals/model") / f"{receipt['content_sha256']}.json"
+        sidecar = hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n"
+        destination = root / relative
+        destination.write_bytes(contents)
+        destination.with_suffix(".sha256").write_bytes(sidecar)
+        return relative, contents, hashlib.sha256(sidecar).hexdigest()
+
+    @classmethod
+    def _rewrite_snapshot(cls, root: Path, snapshot: Path, mutate: object) -> Path:
+        """Recanonicalize a snapshot and its exact sidecar after one valid-shape mutation."""
+        primary = root / snapshot
+        value = json.loads(primary.read_bytes())
+        mutate(value)
+        value["content_sha256"] = cls._digest({key: item for key, item in value.items() if key != "content_sha256"})
+        contents = canonical_json_bytes(value)
+        relative = snapshot.parent / f"{value['content_sha256']}.json"
+        primary.unlink()
+        primary.with_suffix(".sha256").unlink()
+        destination = root / relative
+        destination.write_bytes(contents)
+        destination.with_suffix(".sha256").write_bytes(hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n")
+        return relative
+
+    @classmethod
     def _build_public_case(
         cls, root: Path, raw_mutator: object | None = None, mutate_report: object | None = None,
     ):
@@ -497,6 +546,91 @@ class SecurePersistenceTests(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
 
+    def test_public_model_chain_rejects_individually_valid_cross_bindings(self) -> None:
+        """Canonical alternate model objects must not cross the trace/report/receipt boundary."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        cases = (
+            "trace_report_path", "trace_report_sha", "trace_receipt_path", "trace_receipt_sha",
+            "report_receipt_path", "report_receipt_sha",
+        )
+        for kind in cases:
+            with self.subTest(kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, raw = self._authority(root)
+                trace_path = root / trace
+                trace_value = json.loads(trace_path.read_bytes())
+                original_report = root / Path(trace_value["report_relative"])
+                original_receipt = root / Path(trace_value["model_receipt_relative"])
+                alternate_report, alternate_report_bytes, _ = self._alternate_model_report(root, trace)
+                alternate_receipt, alternate_receipt_bytes, _ = self._alternate_model_receipt(root, trace)
+
+                def write_report(value: dict[str, object]) -> None:
+                    value["content_sha256"] = self._digest({key: item for key, item in value.items() if key != "content_sha256"})
+                    contents = canonical_json_bytes(value)
+                    original_report.write_bytes(contents)
+                    original_report.with_suffix(".sha256").write_bytes(hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n")
+
+                def write_trace(value: dict[str, object]) -> None:
+                    value["content_sha256"] = self._digest({key: item for key, item in value.items() if key != "content_sha256"})
+                    trace_path.write_bytes(canonical_json_bytes(value))
+
+                if kind == "trace_report_path":
+                    # The trace is canonical and points at a canonical alternate report,
+                    # but its report byte binding remains the original hash.
+                    trace_value["report_relative"] = alternate_report.as_posix()
+                    write_trace(trace_value)
+                elif kind == "trace_report_sha":
+                    # Both report bytes and sidecar are exact for the alternate report;
+                    # only the trace's sealed report hashes are stale.
+                    original_report.write_bytes(alternate_report_bytes)
+                    original_report.with_suffix(".sha256").write_bytes(hashlib.sha256(alternate_report_bytes).hexdigest().encode("ascii") + b"\n")
+                elif kind == "trace_receipt_path":
+                    # Trace points at a canonical alternate receipt while the report
+                    # still binds the original receipt path and bytes.
+                    trace_value["model_receipt_relative"] = alternate_receipt.as_posix()
+                    trace_value["model_receipt_sha256"] = hashlib.sha256(alternate_receipt_bytes).hexdigest()
+                    write_trace(trace_value)
+                elif kind == "trace_receipt_sha":
+                    # The receipt and its sidecar are exact for alternate canonical
+                    # bytes, while both sealed consumers retain the original hashes.
+                    original_receipt.write_bytes(alternate_receipt_bytes)
+                    original_receipt.with_suffix(".sha256").write_bytes(hashlib.sha256(alternate_receipt_bytes).hexdigest().encode("ascii") + b"\n")
+                elif kind == "report_receipt_path":
+                    report = json.loads(original_report.read_bytes())
+                    report["model_receipt_relative"] = alternate_receipt.as_posix()
+                    report["model_receipt_sha256"] = hashlib.sha256(alternate_receipt_bytes).hexdigest()
+                    write_report(report)
+                else:
+                    report = json.loads(original_report.read_bytes())
+                    report["model_receipt_sha256"] = hashlib.sha256(alternate_receipt_bytes).hexdigest()
+                    write_report(report)
+
+                # Every altered primary/sidecar/trace remains canonical and individually
+                # schema-valid; rejection must come from the public cross-binding checks.
+                from mlb_backtest.daily_totals import (
+                    validate_totals_model_receipt, validate_totals_report, validate_totals_trace,
+                )
+
+                for primary in (original_report, root / alternate_report, original_receipt, root / alternate_receipt):
+                    contents = primary.read_bytes()
+                    self.assertEqual(primary.with_suffix(".sha256").read_bytes(), hashlib.sha256(contents).hexdigest().encode("ascii") + b"\n")
+                validate_totals_trace(json.loads(trace_path.read_bytes()))
+                validate_totals_report(json.loads(original_report.read_bytes()))
+                validate_totals_report(json.loads((root / alternate_report).read_bytes()))
+                validate_totals_model_receipt(json.loads(original_receipt.read_bytes()))
+                validate_totals_model_receipt(json.loads((root / alternate_receipt).read_bytes()))
+                with self.assertRaises(ValueError):
+                    overlay.load_and_validate_model_authority(root, trace)
+                calls: list[str] = []
+                with self.assertRaises(ValueError):
+                    overlay.admit_draftkings_snapshot(
+                        root, trace, raw,
+                        comparison_clock=lambda: calls.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                    )
+                self.assertEqual(calls, [])
+                self.assertFalse((root / overlay._SNAPSHOT_ROOT).exists())
+
     def test_build_rejects_recanonicalized_snapshot_with_wrong_raw_byte_length(self) -> None:
         """A self-consistent snapshot cannot lie about the bytes bound by raw_capture_byte_length."""
         import mlb_backtest.daily_totals_market_overlay as overlay
@@ -522,6 +656,61 @@ class SecurePersistenceTests(unittest.TestCase):
                     rebound_relative,
                     evaluated_clock=lambda: (_ for _ in ()).throw(AssertionError("evaluated clock")),
                 )
+
+    def test_public_build_rejects_recanonicalized_cross_bound_snapshot_fields_before_clock(self) -> None:
+        """Valid-shape snapshot mutations cannot cross-bind model, raw, or timing evidence."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        cases = (
+            "model_trace_path", "model_trace_sha", "model_report_path", "model_report_sha",
+            "raw_path", "raw_sha", "raw_length", "captured_and_comparison",
+        )
+        for kind in cases:
+            with self.subTest(kind=kind), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                alternate_path = "reports/experimental_daily_totals/alternate-model.trace.json"
+                alternate_report_path = "reports/experimental_daily_totals/alternate-model.json"
+                alternate_raw_path = "data/experimental_daily_totals_market/raw/" + ("f" * 64) + ".json"
+
+                def mutate(value: dict[str, object]) -> None:
+                    if kind == "model_trace_path":
+                        value["model_trace_relative"] = alternate_path
+                    elif kind == "model_trace_sha":
+                        value["model_trace_sha256"] = "0" * 64
+                    elif kind == "model_report_path":
+                        value["model_report_relative"] = alternate_report_path
+                    elif kind == "model_report_sha":
+                        value["model_report_sha256"] = "0" * 64
+                    elif kind == "raw_path":
+                        value["raw_capture_relative"] = alternate_raw_path
+                    elif kind == "raw_sha":
+                        value["raw_capture_sha256"] = "0" * 64
+                    elif kind == "raw_length":
+                        value["raw_capture_byte_length"] = int(value["raw_capture_byte_length"]) + 1
+                    else:
+                        # Both timestamps remain individually valid and ordered, but
+                        # they no longer match the captured raw payload.
+                        value["captured_at_utc"] = "2026-09-01T15:00:00Z"
+                        value["comparison_bound_at_utc"] = "2026-09-01T15:00:01Z"
+
+                rebound = self._rewrite_snapshot(root, snapshot, mutate)
+                rebound_bytes = (root / rebound).read_bytes()
+                self.assertEqual(
+                    (root / rebound.with_suffix(".sha256")).read_bytes(),
+                    hashlib.sha256(rebound_bytes).hexdigest().encode("ascii") + b"\n",
+                )
+                validate_draftkings_snapshot(json.loads(rebound_bytes))
+                calls: list[str] = []
+                with self.assertRaises(ValueError):
+                    overlay.build_overlay(
+                        root,
+                        trace,
+                        rebound,
+                        evaluated_clock=lambda: calls.append("evaluated") or datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+                    )
+                self.assertEqual(calls, [])
+                self.assertFalse((root / overlay._OVERLAY_ROOT).exists())
 
     def test_snapshot_and_evaluated_clock_binding_matrix(self) -> None:
         """Catch normalized evidence mutation before an evaluated clock is consulted."""
@@ -569,6 +758,62 @@ class SecurePersistenceTests(unittest.TestCase):
             self.assertIn("GAME_STARTED", started.report["games"][1]["reason_codes"])
             with self.assertRaises(ValueError):
                 build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 14, 58, tzinfo=timezone.utc))
+
+    def test_public_quote_age_boundary_is_inclusive_at_900_seconds(self) -> None:
+        """The stale gate starts strictly after 900 seconds, including exact boundary age."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(
+                root,
+                trace,
+                raw,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+            )
+            exact = build_overlay(
+                root,
+                trace,
+                snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 14, tzinfo=timezone.utc),
+            )
+            beyond = build_overlay(
+                root,
+                trace,
+                snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 14, 1, tzinfo=timezone.utc),
+            )
+            self.assertNotIn("QUOTE_STALE", exact.report["games"][0]["reason_codes"])
+            self.assertIn("QUOTE_STALE", beyond.report["games"][0]["reason_codes"])
+
+    def test_public_game_started_boundary_is_inclusive_at_scheduled_start(self) -> None:
+        """A game is started at its scheduled instant, but not one microsecond before it."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(
+                root,
+                trace,
+                raw,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+            )
+            before = build_overlay(
+                root,
+                trace,
+                snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 59, 59, 999999, tzinfo=timezone.utc),
+            )
+            exact = build_overlay(
+                root,
+                trace,
+                snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 16, tzinfo=timezone.utc),
+            )
+            self.assertNotIn("GAME_STARTED", before.report["games"][0]["reason_codes"])
+            self.assertIn("GAME_STARTED", exact.report["games"][0]["reason_codes"])
 
     def test_append_only_order_conflict_fault_and_rebind_matrix(self) -> None:
         """Catch publication reordered before trace, conflicting, or falsely successful."""
@@ -790,6 +1035,90 @@ class SecurePersistenceTests(unittest.TestCase):
                     comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
                 )
             self.assertEqual(events, ["raw", "clock", "snapshot"])
+
+    def test_valid_admission_comparison_clock_runs_once_after_authority(self) -> None:
+        """A valid admission clocks exactly once, after the model authority is loaded."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            original_authority = overlay.load_and_validate_model_authority
+            original_raw = overlay._raw_capture
+            original_snapshot_validator = overlay.validate_draftkings_snapshot
+            events: list[str] = []
+
+            def record_authority(*args: object, **kwargs: object) -> object:
+                events.append("authority")
+                return original_authority(*args, **kwargs)  # type: ignore[arg-type]
+
+            def record_raw(*args: object, **kwargs: object) -> object:
+                events.append("raw")
+                return original_raw(*args, **kwargs)  # type: ignore[arg-type]
+
+            def record_snapshot(value: object) -> dict[str, object]:
+                events.append("snapshot")
+                return original_snapshot_validator(value)
+
+            with patch.object(overlay, "load_and_validate_model_authority", side_effect=record_authority), patch.object(
+                overlay, "_raw_capture", side_effect=record_raw
+            ), patch.object(overlay, "validate_draftkings_snapshot", side_effect=record_snapshot):
+                overlay.admit_draftkings_snapshot(
+                    root,
+                    trace,
+                    raw,
+                    comparison_clock=lambda: events.append("comparison") or datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+                )
+            self.assertEqual(events, ["authority", "raw", "comparison", "snapshot"])
+
+    def test_valid_build_evaluated_clock_runs_once_after_model_and_snapshot_validation(self) -> None:
+        """Build clocks once after both public inputs validate, and never for invalid inputs."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            original_authority = overlay.load_and_validate_model_authority
+            original_snapshot_loader = overlay._load_snapshot
+            events: list[str] = []
+
+            def record_authority(*args: object, **kwargs: object) -> object:
+                events.append("authority")
+                return original_authority(*args, **kwargs)  # type: ignore[arg-type]
+
+            def record_snapshot(*args: object, **kwargs: object) -> object:
+                events.append("snapshot")
+                return original_snapshot_loader(*args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(overlay, "load_and_validate_model_authority", side_effect=record_authority), patch.object(
+                overlay, "_load_snapshot", side_effect=record_snapshot
+            ):
+                overlay.build_overlay(
+                    root,
+                    trace,
+                    snapshot,
+                    evaluated_clock=lambda: events.append("evaluated") or datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+                )
+            self.assertEqual(events, ["authority", "snapshot", "evaluated"])
+
+        for invalid_authority, invalid_snapshot in (True, False), (False, True):
+            with self.subTest(invalid_authority=invalid_authority, invalid_snapshot=invalid_snapshot), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                if invalid_authority:
+                    self._rewrite_model_report(root, trace, lambda report: report["games"][0].update({"residual_count": 763, "residual_sha256": "0" * 64}))
+                if invalid_snapshot:
+                    snapshot = self._rewrite_snapshot(root, snapshot, lambda value: value.update({"raw_capture_byte_length": int(value["raw_capture_byte_length"]) + 1}))
+                calls: list[str] = []
+                with self.assertRaises(ValueError):
+                    overlay.build_overlay(
+                        root,
+                        trace,
+                        snapshot,
+                        evaluated_clock=lambda: calls.append("evaluated") or datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+                    )
+                self.assertEqual(calls, [])
+                self.assertFalse((root / overlay._OVERLAY_ROOT).exists())
 
     def test_built_overlay_is_frozen_slotted_and_model_evidence_immutable(self) -> None:
         """Catch a mutable transport or an overlay write that changes model evidence."""
@@ -1307,6 +1636,81 @@ class SecurePersistenceTests(unittest.TestCase):
                 self.assertEqual(row["selected_side"], "OVER")
                 paths = persist_overlay(root, built)
                 self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_nearest_attainable_support_margin_thresholds_cover_both_directions(self) -> None:
+        """With 764 samples, exact .55 support is unreachable (764*.55 = 420.2), so 420/421 straddle it."""
+        cases = (
+            ("OVER", 16, 10.0, ([9, 7], [7, 9])),
+            ("UNDER", 20, 8.0, ([9, 11], [9, 11])),
+        )
+        for direction, line_half_runs, expected_total, (sample_values, interval_hint) in cases:
+            for winning_count in (420, 421):
+                with self.subTest(direction=direction, winning_count=winning_count), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                    root = Path(temporary)
+                    winning, losing = sample_values
+                    samples = [winning] * winning_count + [losing] * (764 - winning_count)
+
+                    def raw_threshold(value: dict[str, object]) -> None:
+                        value["games"][0].update({
+                            "line_half_runs": line_half_runs,
+                            "over_american_odds": 100,
+                            "under_american_odds": 100,
+                        })
+
+                    def report_threshold(report: dict[str, object]) -> None:
+                        report["games"][0].update({
+                            "away_expected_runs": expected_total / 2,
+                            "home_expected_runs": expected_total / 2,
+                            "expected_total": expected_total,
+                            "residual_samples": samples,
+                            "residual_sha256": self._digest(samples),
+                            "interval_80": list(interval_hint),
+                        })
+
+                    _, _, built = self._build_public_case(root, raw_threshold, report_threshold)
+                    row = built.report["games"][0]
+                    self.assertEqual(row["selected_side"], direction)
+                    if winning_count == 420:
+                        self.assertEqual(row["reason_codes"], ("SUPPORT_MARGIN_TOO_LOW",))
+                    else:
+                        self.assertEqual(row["reason_codes"], ())
+                        self.assertEqual(row["decision"], "RESEARCH_PICK")
+
+    def test_public_point_gap_boundary_is_inclusive_for_over_and_under(self) -> None:
+        """A one-run gap passes; the nearest float below one run receives POINT_GAP_TOO_SMALL."""
+        cases = (
+            ("OVER", 16, 9.0, 8.999999),
+            ("UNDER", 20, 9.0, 9.000001),
+        )
+        for direction, line_half_runs, passing_total, failing_total in cases:
+            for expected_total, expected_reasons in ((passing_total, ()), (failing_total, ("POINT_GAP_TOO_SMALL",))):
+                with self.subTest(direction=direction, expected_total=expected_total), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                    root = Path(temporary)
+                    samples = [9] * 764
+
+                    def raw_threshold(value: dict[str, object]) -> None:
+                        value["games"][0].update({
+                            "line_half_runs": line_half_runs,
+                            "over_american_odds": 100,
+                            "under_american_odds": 100,
+                        })
+
+                    def report_threshold(report: dict[str, object]) -> None:
+                        report["games"][0].update({
+                            "away_expected_runs": expected_total / 2,
+                            "home_expected_runs": expected_total / 2,
+                            "expected_total": expected_total,
+                            "residual_samples": samples,
+                            "residual_sha256": self._digest(samples),
+                            "interval_80": [9, 9],
+                        })
+
+                    _, _, built = self._build_public_case(root, raw_threshold, report_threshold)
+                    row = built.report["games"][0]
+                    self.assertEqual(row["selected_side"], direction)
+                    self.assertEqual(row["reason_codes"], expected_reasons)
+                    if not expected_reasons:
+                        self.assertEqual(row["decision"], "RESEARCH_PICK")
 
 
 class SchemaTests(unittest.TestCase):
