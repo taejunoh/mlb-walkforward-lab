@@ -22,7 +22,15 @@ class SourceFixture:
     live_payload: Path
 
 
-def _schedule(*, date: str, final: bool, game_type: str = "R", status: str | None = None) -> bytes:
+def _schedule(
+    *,
+    date: str,
+    final: bool,
+    game_type: str = "R",
+    status: str | None = None,
+    sport_id: object | None = None,
+    league_id: object | None = None,
+) -> bytes:
     status = status or ("Final" if final else "Pre-Game")
     away = {"team": {"id": 11, "name": "Away"}}
     home = {"team": {"id": 22, "name": "Home"}}
@@ -40,6 +48,10 @@ def _schedule(*, date: str, final: bool, game_type: str = "R", status: str | Non
         "doubleHeader": "N",
         "gameNumber": 1,
     }
+    if sport_id is not None:
+        game["sport"] = {"id": sport_id}
+    if league_id is not None:
+        game["league"] = {"id": league_id}
     return json.dumps({"dates": [{"date": date, "games": [game]}]}).encode()
 
 
@@ -232,6 +244,8 @@ def write_source_fixture(
     *,
     history_date: str = CUTOFF,
     history_game_type: str = "R",
+    history_sport_id: object | None = None,
+    history_league_id: object | None = None,
     live_game_type: str = "R",
     live_status: str | None = None,
     history_manifest_overrides: dict[str, object] | None = None,
@@ -239,7 +253,13 @@ def write_source_fixture(
 ) -> SourceFixture:
     from tests.test_live_top3_service import _build, _final_observer, _game, _slate
 
-    history_payload = _schedule(date=history_date, final=True, game_type=history_game_type)
+    history_payload = _schedule(
+        date=history_date,
+        final=True,
+        game_type=history_game_type,
+        sport_id=history_sport_id,
+        league_id=history_league_id,
+    )
     live_payload = _schedule(
         date=TARGET, final=False, game_type=live_game_type, status=live_status
     )
@@ -352,6 +372,22 @@ class TotalsSourcesTests(unittest.TestCase):
         fixture = write_source_fixture(self.root, history_date="2024-12-31")
 
         with self.assertRaisesRegex(ValueError, "history schedule date differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_boolean_optional_sport_id(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root, history_sport_id=True)
+
+        with self.assertRaisesRegex(ValueError, "schedule sport differs"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_float_optional_league_id(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root, history_league_id=103.0)
+
+        with self.assertRaisesRegex(ValueError, "schedule league differs"):
             load_totals_sources(self.root, fixture.report.relative_to(self.root))
 
     def test_loader_rejects_boolean_manifest_schema_version(self) -> None:

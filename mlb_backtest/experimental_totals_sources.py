@@ -243,11 +243,15 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
             if type(game_pk) is not int or game_pk <= 0:
                 raise ValueError("schedule gamePk differs")
             sport = game.get("sport")
-            if sport is not None and (not isinstance(sport, dict) or sport.get("id") != 1):
+            if sport is not None and (
+                not isinstance(sport, dict) or type(sport.get("id")) is not int
+                or sport["id"] != 1
+            ):
                 raise ValueError("schedule sport differs")
             league = game.get("league")
             if league is not None and (
-                not isinstance(league, dict) or league.get("id") not in _MLB_LEAGUE_IDS
+                not isinstance(league, dict) or type(league.get("id")) is not int
+                or league["id"] not in _MLB_LEAGUE_IDS
             ):
                 raise ValueError("schedule league differs")
             official_date = game.get("officialDate", date_entry.get("date"))
