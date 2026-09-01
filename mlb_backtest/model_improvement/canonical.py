@@ -52,7 +52,6 @@ def write_immutable_json(path: Path, value: object) -> bool:
             _require_regular(opened, str(path))
             _write_all(descriptor, contents, str(path))
             os.fsync(descriptor)
-            created_identity = _identity(os.fstat(descriptor))
         except OSError as exc:
             if staging_name is not None:
                 _unlink_staging(parent_fd, staging_name)
@@ -88,6 +87,9 @@ def write_immutable_json(path: Path, value: object) -> bool:
                 raise ValueError(f"unsafe immutable artifact: {path}") from exc
             _unlink_staging(parent_fd, staging_name)
             staging_name = None
+            published = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            _require_regular(published, str(path))
+            published_identity = _identity(published)
             os.fsync(parent_fd)
         finally:
             if staging_name is not None:
@@ -98,7 +100,7 @@ def write_immutable_json(path: Path, value: object) -> bool:
         reread = read_regular_bytes(path, str(path))
         if reread != contents:
             raise ValueError(f"immutable artifact differs: {path}")
-        _assert_path_identity(absolute, created_identity, str(path))
+        _assert_path_identity(absolute, published_identity, str(path))
         os.fsync(parent_fd)
         return True
 
@@ -364,9 +366,7 @@ def _assert_path_identity(
         with _open_parent(absolute, create=False) as (parent_fd, leaf, _):
             named = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             _require_regular(named, label)
-            # Hard-link publication changes ctime while the inode is staged;
-            # dev/inode and content metadata must remain bound.
-            if _identity(named)[:-1] != expected[:-1]:
+            if _identity(named) != expected:
                 raise ValueError(f"unsafe regular file changed after reading: {label}")
     except ValueError:
         raise

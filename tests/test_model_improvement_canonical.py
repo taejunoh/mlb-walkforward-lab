@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
+from mlb_backtest.model_improvement import canonical as canonical_module
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes,
     read_regular_bytes,
@@ -46,50 +47,90 @@ class CanonicalArtifactTests(unittest.TestCase):
     def test_concurrent_identical_writers_publish_one_complete_artifact(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "artifact.json"
-            value = {"payload": "x" * 50_000_000}
+            value = {"payload": "x" * 256}
             expected = canonical_json_bytes(value)
-            first_started = threading.Event()
-            first_finished = threading.Event()
+            first_blocked = threading.Event()
+            release_first = threading.Event()
+            first_ident = [None]
+            first_write_blocked = [False]
             outcomes = []
+            original_write = canonical_module.os.write
+
+            def synchronized_write(descriptor, data):
+                if (
+                    threading.get_ident() == first_ident[0]
+                    and not first_write_blocked[0]
+                ):
+                    first_write_blocked[0] = True
+                    first_blocked.set()
+                    self.assertTrue(release_first.wait(timeout=10))
+                return original_write(descriptor, data)
 
             def first_writer():
-                first_started.set()
+                first_ident[0] = threading.get_ident()
                 try:
                     outcomes.append(write_immutable_json(path, value))
                 except BaseException as exc:
                     outcomes.append(exc)
-                finally:
-                    first_finished.set()
 
             def second_writer():
                 try:
-                    self.assertTrue(first_started.wait(timeout=10))
-                    deadline = time.monotonic() + 20
-                    while time.monotonic() < deadline:
-                        if path.exists():
-                            if path.stat().st_size < len(expected) or first_finished.is_set():
-                                outcomes.append(write_immutable_json(path, value))
-                                return
-                        elif first_finished.is_set():
-                            outcomes.append(write_immutable_json(path, value))
-                            return
-                        time.sleep(0.0001)
-                    raise AssertionError("first writer did not publish in time")
+                    outcomes.append(write_immutable_json(path, value))
                 except BaseException as exc:
                     outcomes.append(exc)
 
+            canonical_module.os.write = synchronized_write
             first = threading.Thread(target=first_writer)
             second = threading.Thread(target=second_writer)
-            first.start()
-            second.start()
-            first.join(timeout=30)
-            second.join(timeout=30)
+            try:
+                first.start()
+                self.assertTrue(first_blocked.wait(timeout=10))
+                self.assertFalse(path.exists())
+                self.assertTrue(
+                    tuple(Path(directory).glob(".artifact.json.tmp-*"))
+                )
+                second.start()
+                second.join(timeout=10)
+                self.assertFalse(second.is_alive())
+            finally:
+                release_first.set()
+                first.join(timeout=10)
+                canonical_module.os.write = original_write
             self.assertFalse(first.is_alive())
-            self.assertFalse(second.is_alive())
             self.assertEqual(len(outcomes), 2)
-            self.assertFalse(any(isinstance(outcome, BaseException) for outcome in outcomes))
+            self.assertFalse(
+                any(isinstance(outcome, BaseException) for outcome in outcomes)
+            )
             self.assertEqual(sorted(outcomes), [False, True])
             self.assertEqual(path.read_bytes(), expected)
+
+    def test_post_reread_rejects_same_length_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "artifact.json"
+            value = {"payload": "x" * 256}
+            original_read = canonical_module.read_regular_bytes
+            replacement = b"!" * len(canonical_json_bytes(value))
+            tampered = threading.Event()
+
+            def reread_then_tamper(target, label):
+                contents = original_read(target, label)
+                if target == path and not tampered.is_set():
+                    before = path.stat()
+                    path.write_bytes(replacement)
+                    os.utime(
+                        path,
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                    )
+                    tampered.set()
+                return contents
+
+            canonical_module.read_regular_bytes = reread_then_tamper
+            try:
+                with self.assertRaises(ValueError):
+                    write_immutable_json(path, value)
+            finally:
+                canonical_module.read_regular_bytes = original_read
+            self.assertTrue(tampered.is_set())
 
     def test_staging_failure_cleans_private_file_without_final_poisoning(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
