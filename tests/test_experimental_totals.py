@@ -292,17 +292,18 @@ class ExperimentalTotalsTests(unittest.TestCase):
 
     def test_selection_requires_100_rows_and_uses_strict_tie_rules(self) -> None:
         game = validate_final_games((make_game("2026-06-01"),), cutoff_date="2026-06-01")[0]
+        games = tuple(replace(game, game_pk=index + 1) for index in range(100))
         baseline = tuple(
-            (game, TotalProjection("PROJECTED", "LEAGUE_30", 4.0, 4.0, 8.0))
-            for _ in range(100)
+            (actual, TotalProjection("PROJECTED", "LEAGUE_30", 4.0, 4.0, 8.0))
+            for actual in games
         )
         improved = tuple(
-            (game, TotalProjection("PROJECTED", "TEAM_30", 4.0, 5.0, 9.0))
-            for _ in range(100)
+            (actual, TotalProjection("PROJECTED", "TEAM_30", 4.0, 5.0, 9.0))
+            for actual in games
         )
         equally_improved = tuple(
-            (game, TotalProjection("PROJECTED", "TEAM_VENUE_30", 4.0, 5.0, 9.0))
-            for _ in range(100)
+            (actual, TotalProjection("PROJECTED", "TEAM_VENUE_30", 4.0, 5.0, 9.0))
+            for actual in games
         )
         with self.assertRaisesRegex(ValueError, "100"):
             select_candidate({"LEAGUE_30": baseline[:-1], "TEAM_30": improved[:-1], "TEAM_VENUE_30": equally_improved[:-1]})
@@ -317,7 +318,9 @@ class ExperimentalTotalsTests(unittest.TestCase):
             "TEAM_30",
         )
         with self.assertRaisesRegex(ValueError, "homogeneous"):
-            evaluate_predictions((baseline[0], improved[0]))
+            evaluate_predictions((baseline[0], improved[1]))
+        with self.assertRaisesRegex(ValueError, "duplicate game_pk"):
+            evaluate_predictions((baseline[0], baseline[0]))
         mismatched = {
             "LEAGUE_30": baseline,
             "TEAM_30": equally_improved,

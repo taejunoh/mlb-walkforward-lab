@@ -441,6 +441,8 @@ def _prediction_rows(
             abs_tol=1e-12,
         ):
             raise ValueError("expected_total must equal side means")
+    if len({actual.game_pk for actual, _ in rows}) != len(rows):
+        raise ValueError("duplicate game_pk")
     if len({projection.candidate_id for _, projection in rows}) != 1:
         raise ValueError("prediction rows must be homogeneous by candidate_id")
     return rows
