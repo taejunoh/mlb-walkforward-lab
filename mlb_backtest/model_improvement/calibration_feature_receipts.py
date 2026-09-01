@@ -193,9 +193,13 @@ class CalibrationFeatureReceiptV1:
             path.with_name("calibration_feature_rows.jsonl")
         ):
             raise ValueError("calibration feature receipt rows path differs")
-        if sha256(rows_raw).hexdigest() != value[
-            "feature_rows_sha256"
-        ] or not rows_raw.endswith(b"\n"):
+        if (
+            not rows_raw
+            or not rows_raw.endswith(b"\n")
+            or b"\r" in rows_raw
+            or b"\n\n" in rows_raw
+            or sha256(rows_raw).hexdigest() != value["feature_rows_sha256"]
+        ):
             raise ValueError("calibration feature rows digest differs")
         rows = []
         previous = None

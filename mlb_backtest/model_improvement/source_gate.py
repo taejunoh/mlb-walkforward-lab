@@ -338,29 +338,19 @@ def load_source_gate_receipt(path: Path, expected_sha256: str) -> SourceGateRece
     return receipt
 
 
-def load_bound_source_gate_receipt(
-    spec: ModelImprovementRunSpec, supplied_gate: SourceGateReceipt
-) -> SourceGateReceipt:
+def load_bound_source_gate_receipt(spec: ModelImprovementRunSpec) -> SourceGateReceipt:
     """Reload the sole activated gate without creating or replaying anything.
 
     This deliberately does *not* call :func:`require_source_gate`: calibration
     admission may only consume an already-published gate and must never turn a
     missing one into a verification/publication attempt.
     """
-    if not isinstance(supplied_gate, SourceGateReceipt):
-        raise ValueError("source gate descriptor differs")
     fresh = _revalidate_activated_spec(spec)
     root, paths = _bound_paths(fresh)
     _verify_bound_files(fresh, paths)
     path = _receipt_path(fresh)
     raw = read_regular_bytes(path, "source gate receipt")
     loaded = _load_bound_receipt(fresh, path, sha256(raw).hexdigest())
-    if (
-        loaded.as_mapping() != supplied_gate.as_mapping()
-        or loaded.artifact_sha256 != supplied_gate.artifact_sha256
-        or loaded.path != supplied_gate.path
-    ):
-        raise ValueError("source gate descriptor reload differs")
     # Recheck the activated bindings after the receipt read; a caller cannot
     # race a mutable source tree between the two observations.
     _verify_bound_files(fresh, paths)

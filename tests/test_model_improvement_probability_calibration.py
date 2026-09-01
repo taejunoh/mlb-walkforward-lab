@@ -132,7 +132,7 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
         )
 
         with self.assertRaises(CalibrationAuthorityBlockedError) as raised:
-            load_probability_calibration_card_v2(self.spec, None, "O19")
+            load_probability_calibration_card_v2(self.spec, "O19")
         self.assertEqual(raised.exception.code, "BLOCKED_CALIBRATION_AUTHORITY_MISSING")
         self.assertEqual(str(raised.exception), "BLOCKED_CALIBRATION_AUTHORITY_MISSING")
 
@@ -413,6 +413,8 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
             )
             source_root, source_digest = module._source_authority_digest(spec)
             source_root.mkdir()
+            for name in ("source.json", "contract.json", "checkpoint.json"):
+                (source_root / name).write_bytes(b"source")
             (source_root / "inventory.json").write_bytes(b"inventory")
             spec = replace(
                 spec,
@@ -425,6 +427,14 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                 ),
             )
             source_root, source_digest = module._source_authority_digest(spec)
+            gate_path = spec.output_path("source_gate", "source_gate_receipt.json")
+            gate_path.parent.mkdir(parents=True)
+            gate_path.write_bytes(canonical_json_bytes({"synthetic": True}))
+            gate_path.with_suffix(gate_path.suffix + ".sha256").write_bytes(
+                canonical_json_bytes(
+                    {"artifact_sha256": sha256(gate_path.read_bytes()).hexdigest()}
+                )
+            )
             rows_path = receipt_path.with_name("calibration_feature_rows.jsonl")
             rows_path.parent.mkdir(parents=True)
 
@@ -568,6 +578,7 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                     ]
                 },
             )
+            (source_root / "game.json").write_bytes(b"game")
             weights = SimpleNamespace(
                 model_id="v5.1",
                 path="tests/fixtures/model_improvement/v51_card.json",
@@ -592,14 +603,14 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                 ),
             ):
                 admitted_receipt = module.load_calibration_feature_receipt(spec, "O19")
-                expected, _ = module._derive_rows_v2(spec, admitted_receipt, gate)
+                expected, _ = module._derive_rows_v2(spec, admitted_receipt)
                 wrong_inventory = replace(
                     admitted_receipt,
                     payload=admitted_receipt.payload
                     | {"game_evidence_inventory_relative_path": "other.json"},
                 )
                 with self.assertRaises(ValueError):
-                    module._derive_rows_v2(spec, wrong_inventory, gate)
+                    module._derive_rows_v2(spec, wrong_inventory)
                 wrong_start_row = replace(
                     admitted_receipt.rows[0],
                     payload=admitted_receipt.rows[0].payload
@@ -612,7 +623,6 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                             admitted_receipt,
                             rows=(wrong_start_row, *admitted_receipt.rows[1:]),
                         ),
-                        gate,
                     )
                 paths = calibration_paths_v2(spec, ("v5.1", "baseline", "O19"))
                 paths.rows.parent.mkdir(parents=True)
@@ -662,7 +672,7 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                             {"artifact_sha256": sha256(bytes_).hexdigest()}
                         )
                     )
-                loaded = load_probability_calibration_card_v2(spec, gate, "O19")
+                loaded = load_probability_calibration_card_v2(spec, "O19")
                 self.assertEqual(loaded.alpha, alpha)
                 self.assertEqual(loaded.beta, beta)
                 original_derive = module._derive_rows_v2
@@ -682,7 +692,7 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                     side_effect=mutate_after_second_authority_pass,
                 ):
                     with self.assertRaises(ValueError):
-                        load_probability_calibration_card_v2(spec, gate, "O19")
+                        load_probability_calibration_card_v2(spec, "O19")
                 paths.rows.write_bytes(output_rows)
                 for field, value in (
                     ("target_year", 2020),
@@ -726,4 +736,4 @@ class ProbabilityCalibrationAdmissionTest(unittest.TestCase):
                 }
                 receipt_path.write_bytes(canonical_json_bytes(bad_receipt))
                 with self.assertRaises(ValueError):
-                    load_probability_calibration_card_v2(spec, gate, "O19")
+                    load_probability_calibration_card_v2(spec, "O19")

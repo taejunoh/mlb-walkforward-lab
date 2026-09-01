@@ -30,7 +30,7 @@ from .contracts import (
 )
 from .run_spec import ModelImprovementRunSpec, _repository_root, run_spec_sha256
 from .scoring_cards import resolve_prediction_weight_authority
-from .source_gate import SourceGateReceipt, load_bound_source_gate_receipt
+from .source_gate import load_bound_source_gate_receipt
 
 
 _SCHEMA = "MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1"
@@ -340,7 +340,13 @@ def _load_once(
     ):
         raise ValueError("source gate digest differs")
     rows_raw = read_regular_bytes(paths.rows, "calibration rows")
-    if sha256(rows_raw).hexdigest() != card.calibration_rows_sha256:
+    if (
+        not rows_raw
+        or not rows_raw.endswith(b"\n")
+        or b"\r" in rows_raw
+        or b"\n\n" in rows_raw
+        or sha256(rows_raw).hexdigest() != card.calibration_rows_sha256
+    ):
         raise ValueError("calibration rows digest differs")
     _sidecar(
         paths.rows_sidecar, card.calibration_rows_sha256, "calibration rows sidecar"
@@ -428,6 +434,19 @@ def _missing_v2(path: Path) -> bool:
     return _missing(path)
 
 
+def _preflight_pair(primary: Path, sidecar: Path) -> None:
+    """Classify absence before opening a required artifact pair."""
+    if _missing_v2(primary):
+        raise CalibrationAuthorityBlockedError()
+    if _missing_v2(sidecar):
+        raise ValueError("calibration authority sidecar is missing")
+
+
+def _preflight_primary(path: Path) -> None:
+    if _missing_v2(path):
+        raise CalibrationAuthorityBlockedError()
+
+
 def _source_authority_digest(spec: ModelImprovementRunSpec) -> tuple[Path, str]:
     activation = spec.verified_activation
     if activation is None:
@@ -503,10 +522,10 @@ def _iter_verified_calibration_games_v1(
 def _derive_rows_v2(
     spec: ModelImprovementRunSpec,
     receipt: CalibrationFeatureReceiptV1,
-    source_gate: SourceGateReceipt,
 ) -> tuple[list[dict[str, object]], object]:
-    bound = load_bound_source_gate_receipt(spec, source_gate)
+    bound = load_bound_source_gate_receipt(spec)
     root, authority_digest = _source_authority_digest(spec)
+    _preflight_primary(root / spec.source_authority.inventory.path)
     inv_raw = read_regular_bytes(
         root / spec.source_authority.inventory.path, "calibration source inventory"
     )
@@ -519,6 +538,7 @@ def _derive_rows_v2(
         or receipt.payload["game_evidence_inventory_sha256"] != game_binding.sha256
     ):
         raise ValueError("calibration receipt game inventory binding differs")
+    _preflight_primary(root / game_binding.path)
     verified = load_verified_game_evidence_inventory(
         root,
         read_only_progress=True,
@@ -623,34 +643,38 @@ _V2_ROW_FIELDS = frozenset(
 
 
 def _load_v2_once(
-    spec: ModelImprovementRunSpec, supplied_gate: SourceGateReceipt, fold_id: str
+    spec: ModelImprovementRunSpec, fold_id: str
 ) -> ProbabilityCalibrationCardV2:
     paths = calibration_paths_v2(spec, ("v5.1", "baseline", fold_id))
     receipt_pin = spec.probability_calibration_policy.calibration_feature_receipts[
         spec.probability_calibration_policy.fold_keys[fold_id]
     ]
-    # Only genuine absence of a primary blocks. A primary without an exact
-    # sidecar/sibling is evidence corruption, never a recoverable absence.
-    for path in (Path(receipt_pin.path), paths.card, paths.rows):
-        if _missing_v2(path):
-            raise CalibrationAuthorityBlockedError()
+    _preflight_pair(paths.card, paths.card_sidecar)
+    _preflight_pair(paths.rows, paths.rows_sidecar)
+    receipt_primary = Path(receipt_pin.path)
     receipt_sidecar = Path(receipt_pin.path).with_suffix(
         Path(receipt_pin.path).suffix + ".sha256"
     )
     receipt_rows = Path(receipt_pin.path).with_name("calibration_feature_rows.jsonl")
     receipt_rows_sidecar = receipt_rows.with_suffix(receipt_rows.suffix + ".sha256")
-    for path in (receipt_sidecar, receipt_rows, receipt_rows_sidecar):
-        if _missing_v2(path):
-            raise ValueError("calibration authority sidecar is missing")
+    _preflight_pair(receipt_primary, receipt_sidecar)
+    _preflight_pair(receipt_rows, receipt_rows_sidecar)
+    source_root, _ = _source_authority_digest(spec)
+    _preflight_pair(
+        spec.output_path("source_gate", "source_gate_receipt.json"),
+        spec.output_path("source_gate", "source_gate_receipt.json.sha256"),
+    )
+    for binding in (
+        spec.source_authority.source_run_spec,
+        spec.source_authority.acquisition_contract,
+        spec.source_authority.terminal_checkpoint,
+        spec.source_authority.inventory,
+    ):
+        _preflight_primary(source_root / binding.path)
+    _preflight_primary(_repository_root() / spec.baseline.card.path)
     receipt = load_calibration_feature_receipt(spec, fold_id)
     # Authenticate all source/feature/weight inputs before opening a V2 output.
-    try:
-        expected, chain = _derive_rows_v2(spec, receipt, supplied_gate)
-    except FileNotFoundError as exc:
-        raise CalibrationAuthorityBlockedError() from exc
-    for path in (paths.card_sidecar, paths.rows_sidecar):
-        if _missing_v2(path):
-            raise ValueError("calibration authority sidecar is missing")
+    expected, chain = _derive_rows_v2(spec, receipt)
     card_raw = read_regular_bytes(paths.card, "probability calibration V2 card")
     digest = sha256(card_raw).hexdigest()
     _sidecar(paths.card_sidecar, digest, "probability calibration V2 card sidecar")
@@ -741,12 +765,9 @@ def _load_v2_once(
     ):
         raise ValueError("calibration V2 fit differs")
     # Full second authority read detects source/receipt/gate drift before return.
-    try:
-        expected_after, chain_after = _derive_rows_v2(
-            spec, load_calibration_feature_receipt(spec, fold_id), supplied_gate
-        )
-    except FileNotFoundError as exc:
-        raise CalibrationAuthorityBlockedError() from exc
+    expected_after, chain_after = _derive_rows_v2(
+        spec, load_calibration_feature_receipt(spec, fold_id)
+    )
     if (
         canonical_json_bytes(expected_after) != canonical_json_bytes(expected)
         or chain_after != chain
@@ -768,15 +789,15 @@ def _load_v2_once(
 
 
 def load_probability_calibration_card_v2(
-    spec: ModelImprovementRunSpec, supplied_gate: SourceGateReceipt, fold_id: str
+    spec: ModelImprovementRunSpec, fold_id: str
 ) -> ProbabilityCalibrationCardV2:
-    return _load_v2_once(spec, supplied_gate, fold_id)
+    return _load_v2_once(spec, fold_id)
 
 
 def require_probability_calibration_card_v2(
-    spec: ModelImprovementRunSpec, supplied_gate: SourceGateReceipt, fold_id: str
+    spec: ModelImprovementRunSpec, fold_id: str
 ) -> ProbabilityCalibrationCardV2:
-    return load_probability_calibration_card_v2(spec, supplied_gate, fold_id)
+    return load_probability_calibration_card_v2(spec, fold_id)
 
 
 __all__ = [

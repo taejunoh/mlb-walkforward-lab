@@ -114,3 +114,45 @@ class CalibrationFeatureReceiptTest(unittest.TestCase):
                 CalibrationFeatureReceiptV1.from_bytes(
                     canonical_json_bytes(bad), primary, rows
                 )
+
+    def test_rows_require_exact_nonempty_lf_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "calibration_feature_receipt.json"
+            sibling = root / "calibration_feature_rows.jsonl"
+            row = self._row(1)
+            valid = canonical_json_bytes(row)
+            base = {
+                "schema": "MODEL_IMPROVEMENT_CALIBRATION_FEATURE_RECEIPT_V1",
+                "model_id": "v5.1",
+                "lane_id": "baseline",
+                "fold_id": "O19",
+                "calibration_key": "C19",
+                "target_year": 2019,
+                "training_start": "2018-01-01",
+                "training_end": "2018-12-31",
+                "source_authority_sha256": "a" * 64,
+                "source_inventory_sha256": "a" * 64,
+                "game_evidence_inventory_relative_path": "evidence.json",
+                "game_evidence_inventory_sha256": "a" * 64,
+                "feature_contract_sha256": "a" * 64,
+                "feature_code_revision": "abc",
+                "feature_rows_path": str(sibling),
+                "feature_population_sha256": sha256(
+                    canonical_json_bytes([1])
+                ).hexdigest(),
+            }
+            for invalid in (
+                b"",
+                valid.rstrip(b"\n"),
+                valid + b"\n",
+                valid.replace(b"\n", b"\r\n"),
+            ):
+                with self.subTest(invalid=invalid):
+                    receipt = base | {
+                        "feature_rows_sha256": sha256(invalid).hexdigest()
+                    }
+                    with self.assertRaises(ValueError):
+                        CalibrationFeatureReceiptV1.from_bytes(
+                            canonical_json_bytes(receipt), primary, invalid
+                        )
