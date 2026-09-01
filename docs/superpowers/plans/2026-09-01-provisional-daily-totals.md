@@ -191,7 +191,13 @@ Expose exactly:
 
 ```python
 def load_totals_sources(root: Path, report_path: Path) -> TotalsSourceBundle: ...
+def load_totals_sources_bound(root: Path, trusted: TrustedRoot, report_path: Path) -> TotalsSourceBundle: ...
 ```
+
+The public convenience loader opens one trusted root and delegates to the
+bound loader. Publication code that already holds a trusted root must call the
+bound loader so source admission and all output writes share the same root
+capability and final source rebind boundary.
 
 Normalize and bind `root` once with `open_trusted_root`. Securely read and
 rebind the report using `read_regular_snapshot`; validate its bytes with
