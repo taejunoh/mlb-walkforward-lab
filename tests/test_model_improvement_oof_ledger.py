@@ -602,6 +602,162 @@ class BaselineOofLedgerV2Test(unittest.TestCase):
                 "lane_a/A/H22", self.v2_rows,
             )
 
+    def test_v2_rejects_noniterable_or_string_rows_without_writing(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        for rows in (42, "not prediction rows"):
+            with self.subTest(rows=rows), patch.object(
+                oof_ledger_v2, "require_probability_calibration_card_v2",
+                return_value=self._calibration_card(),
+            ), patch.object(
+                oof_ledger_v2, "write_immutable_bytes", side_effect=AssertionError("write"),
+            ), self.assertRaises(ValueError):
+                oof_ledger_v2.seal_oof_predictions_v2(
+                    self.spec, self.gate, self.feature_seal, None,
+                    "baseline/v5.1/H22", rows,
+                )
+
+    def test_v2_loader_rereads_final_seal_sidecar_after_rows_validation(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        card = self._calibration_card()
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+        ):
+            seal = oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", self.v2_rows,
+            )
+            paths = oof_ledger_v2.prediction_paths_v2(self.spec, seal.ledger_id)
+            original = oof_ledger_v2._load_bound_prediction_rows
+            calls = 0
+
+            def mutate_after_first_rows_validation(*args):
+                nonlocal calls
+                result = original(*args)
+                calls += 1
+                if calls == 1:
+                    paths.seal_sidecar.write_bytes(
+                        canonical_json_bytes({"artifact_sha256": SHA})
+                    )
+                return result
+
+            with patch.object(
+                oof_ledger_v2, "_load_bound_prediction_rows",
+                side_effect=mutate_after_first_rows_validation,
+            ), self.assertRaises(ValueError):
+                oof_ledger_v2.load_prediction_seal_v2(
+                    self.spec, self.gate, self.feature_seal, None,
+                    seal.path, seal.artifact_sha256,
+                )
+
+    def test_v2_commit_point_revalidates_authority_and_leaves_no_final_seal(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        card = self._calibration_card()
+        original = oof_ledger_v2._authenticate_inputs
+        calls = 0
+
+        def drift_at_commit(*args):
+            nonlocal calls
+            result = original(*args)
+            calls += 1
+            if calls == 2:
+                return result[:-1] + ("b" * 64,)
+            return result
+
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+        ), patch.object(
+            oof_ledger_v2, "_authenticate_inputs", side_effect=drift_at_commit
+        ), self.assertRaises(ValueError):
+            oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", self.v2_rows,
+            )
+        paths = oof_ledger_v2.prediction_paths_v2(self.spec, "baseline/v5.1/H22")
+        self.assertFalse(paths.seal.exists())
+
+    def test_v2_crash_orphan_retries_exactly_and_is_not_loadable(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        card = self._calibration_card()
+        paths = oof_ledger_v2.prediction_paths_v2(self.spec, "baseline/v5.1/H22")
+        original = oof_ledger_v2.write_immutable_bytes
+        for crash_at in range(1, 5):
+            with self.subTest(crash_at=crash_at):
+                if paths.rows.parent.exists():
+                    for artifact in paths.rows.parent.iterdir():
+                        artifact.unlink()
+                calls = 0
+
+                def crash_once(path, contents):
+                    nonlocal calls
+                    calls += 1
+                    if calls == crash_at:
+                        raise ValueError("injected V2 crash")
+                    return original(path, contents)
+
+                with patch.object(
+                    oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+                ), patch.object(
+                    oof_ledger_v2, "write_immutable_bytes", side_effect=crash_once
+                ), self.assertRaisesRegex(ValueError, "injected V2 crash"):
+                    oof_ledger_v2.seal_oof_predictions_v2(
+                        self.spec, self.gate, self.feature_seal, None,
+                        "baseline/v5.1/H22", self.v2_rows,
+                    )
+                self.assertFalse(paths.seal.exists())
+                with patch.object(
+                    oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+                ), self.assertRaises(ValueError):
+                    oof_ledger_v2.load_prediction_seal_v2(
+                        self.spec, self.gate, self.feature_seal, None,
+                        paths.seal, SHA,
+                    )
+                with patch.object(
+                    oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+                ):
+                    seal = oof_ledger_v2.seal_oof_predictions_v2(
+                        self.spec, self.gate, self.feature_seal, None,
+                        "baseline/v5.1/H22", self.v2_rows,
+                    )
+                self.assertTrue(Path(seal.path).is_file())
+
+    def test_v2_loader_rejects_sidecar_tamper_and_alias_before_read(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        card = self._calibration_card()
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2", return_value=card
+        ):
+            seal = oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", self.v2_rows,
+            )
+            paths = oof_ledger_v2.prediction_paths_v2(self.spec, seal.ledger_id)
+            paths.rows_sidecar.write_bytes(canonical_json_bytes({"artifact_sha256": SHA}))
+            with self.assertRaises(ValueError):
+                oof_ledger_v2.load_prediction_seal_v2(
+                    self.spec, self.gate, self.feature_seal, None,
+                    seal.path, seal.artifact_sha256,
+                )
+        with patch.object(
+            oof_ledger_v2, "read_regular_bytes", side_effect=AssertionError("read")
+        ), self.assertRaises(ValueError):
+            oof_ledger_v2.load_prediction_seal_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                f"{Path(seal.path).parent}/./prediction_seal.json", seal.artifact_sha256,
+            )
+
+    def test_v2_paths_admit_each_of_the_seven_baseline_folds(self):
+        from mlb_backtest.model_improvement.oof_ledger_v2 import prediction_paths_v2
+
+        for fold_id in ("O19", "O20", "O21", "O22", "O23", "H22", "H23"):
+            with self.subTest(fold_id=fold_id):
+                paths = prediction_paths_v2(self.spec, f"baseline/v5.1/{fold_id}")
+                self.assertIn(f"/v5.1/{fold_id}/v2/", str(paths.rows))
+
     def test_package_exports_only_the_versioned_v2_prediction_surface(self):
         import mlb_backtest.model_improvement as package
 

@@ -242,7 +242,12 @@ def _validate_rows(
     spec: ModelImprovementRunSpec, fold_id: str, feature_rows: Sequence[object],
     rows: Sequence[PredictionRowV2], weight_sha256: str, calibration: ProbabilityCalibrationCardV2,
 ) -> tuple[PredictionRowV2, ...]:
-    materialized = tuple(rows)
+    if isinstance(rows, (str, bytes, bytearray)):
+        raise ValueError("V2 prediction rows require a row sequence")
+    try:
+        materialized = tuple(rows)
+    except TypeError as exc:
+        raise ValueError("V2 prediction rows require a row sequence") from exc
     if not materialized or not all(isinstance(row, PredictionRowV2) for row in materialized):
         raise ValueError("V2 prediction rows require a nonempty PredictionRowV2 population")
     if tuple(sorted(materialized, key=_row_key)) != materialized:
@@ -366,6 +371,31 @@ def seal_oof_predictions_v2(
     write_immutable_bytes(paths.rows_sidecar, canonical_json_bytes(_sidecar_payload(rows_digest)))
     write_immutable_bytes(paths.seal_sidecar, canonical_json_bytes(_sidecar_payload(seal_digest)))
     write_immutable_bytes(paths.rows, rows_bytes)
+    (
+        _, final_gate, final_feature, final_feature_rows,
+        final_calibration, final_weight_sha256,
+    ) = _authenticate_inputs(
+        spec, source_gate, feature_seal, baseline_replay, ledger_id
+    )
+    final_rows = _validate_rows(
+        spec, fold_id, final_feature_rows, rows, final_weight_sha256, final_calibration
+    )
+    final_rows_bytes = _rows_bytes(final_rows)
+    final_provisional = PredictionSealV2(
+        _SCHEMA, ledger_id, fold_id, "v5.1", run_spec_sha256(spec),
+        final_gate.artifact_sha256, final_feature.artifact_sha256,
+        spec.prediction_contract_sha256, final_weight_sha256,
+        final_calibration.artifact_sha256, _population_digest(final_rows), None,
+        sha256(final_rows_bytes).hexdigest(), "0" * 64, str(paths.seal),
+    )
+    final_payload_bytes = canonical_json_bytes(final_provisional.as_mapping())
+    if (
+        final_rows_bytes != rows_bytes
+        or final_provisional.as_mapping() != provisional.as_mapping()
+        or final_payload_bytes != payload_bytes
+        or sha256(final_payload_bytes).hexdigest() != seal_digest
+    ):
+        raise ValueError("V2 prediction authority changed before commit")
     write_immutable_bytes(paths.seal, payload_bytes)
     seal = load_prediction_seal_v2(spec, gate, feature, None, paths.seal, seal_digest)
     if seal.as_mapping() != provisional.as_mapping():
@@ -446,6 +476,12 @@ def load_prediction_seal_v2(
         spec, fold_id, feature_rows, calibration, weight_sha256, seal
     ):
         raise ValueError("V2 prediction rows changed while reading")
+    final_raw = read_regular_bytes(seal_path, "V2 prediction seal")
+    if final_raw != raw or sha256(final_raw).hexdigest() != expected:
+        raise ValueError("V2 prediction seal changed while reading")
+    _load_sidecar(paths.seal_sidecar, expected, "V2 prediction seal sidecar")
+    if read_regular_bytes(seal_path, "V2 prediction seal") != final_raw:
+        raise ValueError("V2 prediction seal changed while reading")
     return seal
 
 
