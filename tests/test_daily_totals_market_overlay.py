@@ -118,6 +118,17 @@ class PureMathTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     price_support(win_support, loss_support, 100)  # type: ignore[arg-type]
 
+    def test_price_support_rejects_exact_sum_above_one(self) -> None:
+        tiny = Fraction(1, 10**400)
+        with self.assertRaises(ValueError):
+            price_support(Fraction(1, 2), Fraction(1, 2) + tiny, 100)
+
+    def test_price_support_preserves_tiny_positive_nonpush(self) -> None:
+        tiny = Fraction(1, 10**400)
+        result = price_support(tiny, tiny, 100)
+        self.assertEqual(result.conditional_support, 0.5)
+        self.assertEqual(result.support_margin, 0.0)
+
     def test_price_support_rejects_invalid_price(self) -> None:
         with self.assertRaises(ValueError):
             price_support(0.5, 0.5, 99)

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from numbers import Real
+from fractions import Fraction
+from numbers import Rational, Real
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +87,7 @@ def compare_sample_support(
     return SupportRates(over / count, under / count, push / count)
 
 
-def _finite_probability(value: object, label: str) -> float:
+def _finite_probability(value: object, label: str) -> Real:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be a finite probability")
     if value < 0 or value > 1:
@@ -97,7 +98,13 @@ def _finite_probability(value: object, label: str) -> float:
         raise ValueError(f"{label} must be a finite probability") from exc
     if not math.isfinite(result):
         raise ValueError(f"{label} must be a finite probability between 0 and 1")
-    return result
+    return value
+
+
+def _exact_probability(value: Real) -> Fraction:
+    """Represent a validated Real without losing its support value."""
+
+    return Fraction(value)
 
 
 def price_support(win_support: float, loss_support: float, price: int) -> PriceSupport:
@@ -105,15 +112,27 @@ def price_support(win_support: float, loss_support: float, price: int) -> PriceS
 
     win_support = _finite_probability(win_support, "win_support")
     loss_support = _finite_probability(loss_support, "loss_support")
-    if win_support + loss_support > 1.0:
+    use_exact_arithmetic = isinstance(win_support, Rational) or isinstance(loss_support, Rational)
+    if use_exact_arithmetic:
+        exact_win = _exact_probability(win_support)
+        exact_loss = _exact_probability(loss_support)
+        directional_support = exact_win + exact_loss
+    else:
+        exact_win = None
+        directional_support = win_support + loss_support
+    if directional_support > 1:
         raise ValueError("win_support and loss_support must sum to at most 1")
     price = validate_american_price(price)
     break_even = quoted_break_even(price)
 
-    directional_support = win_support + loss_support
     if directional_support == 0.0:
         return PriceSupport(None, break_even, None)
-    conditional = win_support / directional_support
+    if use_exact_arithmetic:
+        conditional = float(exact_win / directional_support)
+    else:
+        conditional = float(win_support / directional_support)
+    if not math.isfinite(conditional):
+        raise ValueError("conditional support must be finite")
     return PriceSupport(conditional, break_even, conditional - break_even)
 
 
