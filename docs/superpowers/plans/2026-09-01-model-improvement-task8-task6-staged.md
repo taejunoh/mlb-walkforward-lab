@@ -3,9 +3,9 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Establish an immutable, source-derived and pre-target probability
-calibration authority, then persist authenticated label-free OOF predictions,
-baseline replay evidence, nonbaseline predictions, and one source-derived
-outcome/evaluation chain per fold.
+calibration authority, then persist authenticated label-free baseline OOF
+predictions, baseline replay evidence, and one source-derived baseline outcome
+chain per fold.
 
 **Architecture:** The executable work is deliberately staged as Task6P → Task8A V2 →
 Task6A → Task6B. Task8B is deferred and always blocks pending separate review.
@@ -123,8 +123,8 @@ outcome_receipt = load_outcome_receipt(
 )
 ```
 
-Do not add nonbaseline evaluation or reload APIs to the current plan. Delete
-all described labelled Task8 artefacts and all `JoinedLedger` imports.
+Do not add nonbaseline APIs to the current plan. Delete all described labelled
+Task8 artefacts and all `JoinedLedger` imports.
 
 - [ ] **Step 4: Run GREEN and diff validation.**
 
@@ -586,7 +586,7 @@ JSONL, and reject an uncommitted row-primary orphan.
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_oof_ledger tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("schemas/model_improvement/prediction_seal_v2.schema.json")))' && python3 -m ruff check mlb_backtest/model_improvement/oof_ledger_v2.py mlb_backtest/model_improvement/contracts.py mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/sealed_features.py tests/test_model_improvement_oof_ledger.py`
 
 Expected: PASS; the AST test confirms `oof_ledger_v2.py` imports neither
-`outcomes`, `evaluation`, a metric evaluator, nor a legacy top-level pipeline.
+`outcomes` nor a legacy top-level pipeline.
 The calibration loader is an explicit typed authority and does not expose raw
 label rows to Task8.
 
@@ -849,15 +849,14 @@ git commit -m "feat: seal authenticated model improvement outcomes"
 
 ### Future-only nonbaseline work
 
-Task8B/nonbaseline evaluation remains unadmitted; a separate reviewed design
-must define weight-selection authority, schemas, APIs, paths, and tests.
+Nonbaseline analysis remains unadmitted; a separate reviewed design must
+define weight-selection authority, schemas, APIs, paths, and tests.
 
 ### Task 8: Final focused package/export and downstream contract verification
 
 **Files:**
 - Modify: `mlb_backtest/model_improvement/__init__.py`
 - Modify: `tests/test_model_improvement_oof_ledger.py`
-- Modify: `tests/test_model_improvement_evaluation.py`
 
 - [ ] **Step 1: Write RED export and import-boundary assertions.**
 
@@ -872,7 +871,7 @@ def test_task8_exports_only_v2_label_free_prediction_surface(self):
 def test_task8_v2_module_has_no_outcome_or_metric_import(self):
     tree = ast.parse(Path(oof_ledger_v2.__file__).read_text(encoding="utf-8"))
     imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
-    self.assertFalse({".outcomes", ".evaluation"} & imported)
+    self.assertFalse({".outcomes"} & imported)
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -933,8 +932,8 @@ introduced in Tasks 2–3 and used in all later stages. Every Task8 caller uses
 `(spec, source_gate, feature_seal, baseline_replay, path_or_identity)`; the
 calibration loader derives its authority from that identity and accepts no
 caller path or outcomes. Task6B outcome loaders use the same authenticated
-prerequisite quartet. Evaluation is deferred with Task8B and has no current
-export. The Task8 target-year mapping is the only OOF-year authority, and
+prerequisite quartet. Nonbaseline analysis is deferred with Task8B and has no
+current export. The Task8 target-year mapping is the only OOF-year authority, and
 `ModelImprovementRunSpec.fold()` remains H22/H23/H24-only.
 
 **Known implementation dependency:** Task6B must call the typed

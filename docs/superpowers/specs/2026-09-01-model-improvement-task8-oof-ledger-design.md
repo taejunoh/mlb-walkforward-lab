@@ -14,8 +14,8 @@ the published V1 surface remains inspection-only.
 Task8 owns immutable **label-free** OOF prediction seals, prediction JSONL,
 their closed schema, and the one authoritative prediction-row loader. It owns
 no outcome mapping input, labelled JSONL, outcome reader, or metric. Those
-belong to the Common Task6 authenticated outcome/evaluation boundary. Task6
-must first design a
+belong to the Common Task6 authenticated baseline-outcome derivation and
+persistence boundary. Task6 must first design a
 source-gate-bound deterministic outcome authority and receipt, and must not
 accept arbitrary caller mappings as a proxy for outcomes. Task8 implements
 none of that producer or persistence.
@@ -34,7 +34,7 @@ Task6P  source-derived, pre-target CalibrationFeatureReceiptV1 and ProbabilityCa
 Task8A  Common OOF FeatureSeal admission + V2 baseline v5.1 label-free seals/loaders
 Task6A  baseline replay receipt, sealed only after the matching baseline seal
 Task8B  deferred: always blocked pending a separately approved candidate-selection authority design
-Task6B  authenticated outcome authority, outcome/evaluation join, and metrics
+Task6B  authenticated baseline `OutcomeReceipt`/`OutcomeRow` derivation and persistence
 ```
 
 This replaces the shorthand `Task7 -> Task8 -> Task6`. The current executable
@@ -55,8 +55,8 @@ calibration authority and never rewrites the audited v5.1 card.
 `ProbabilityCalibrationCardV2` is the only executable authority allowed to
 turn a sealed edge into `p_home`. It is not a Task8 artifact and it is the
 only permitted label-bearing artifact before Task6B: its labels are strictly
-*prior-target* outcomes used for fitting, never target-fold outcomes or
-evaluation labels. `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1`,
+*prior-target* outcomes used for fitting, never target-fold outcomes or future
+analysis labels. `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V1`,
 introduced by commit `2fa82cd`, is inspection-only and is never executable:
 it did not bind a typed source/evidence chain, authenticated weights, or a
 recomputed feature edge. Its loader must reject it for Task8/Task6A/Task8B
@@ -774,7 +774,8 @@ full-suite baseline.
 This appendix is a normative precondition for Task6B. It replaces every
 Common Task6 phrase that accepts raw outcome mappings, labels, or caller
 chosen outcome paths. Task6B owns its outcome schema, `OutcomeRow`,
-`OutcomeReceipt`, persistence, and evaluation; Task8 remains label-free.
+`OutcomeReceipt`, derivation, and persistence; Task8 remains label-free.
+Evaluation and metrics are unadmitted in the current executable scope.
 Every Task6B baseline `OutcomeReceipt` consuming a V2 prediction/replay is
 derived and persisted only beneath that identity's `/v2` namespace
 (`oof/baseline/v5.1/{fold}/v2/`); no V2 reader may read or overwrite a V1
