@@ -29,6 +29,13 @@ from .baseline_replay_v2 import (
     load_baseline_replay_v2,
     replay_v51_predictions_v2,
 )
+from .outcomes import (
+    OutcomeReceipt,
+    OutcomeRow,
+    load_outcome_receipt,
+    load_outcome_rows,
+    seal_outcome_receipt,
+)
 
 __all__ = [
     "canonical_json_bytes",
@@ -53,4 +60,9 @@ __all__ = [
     "BaselineReplayReceiptV2",
     "replay_v51_predictions_v2",
     "load_baseline_replay_v2",
+    "OutcomeReceipt",
+    "OutcomeRow",
+    "seal_outcome_receipt",
+    "load_outcome_receipt",
+    "load_outcome_rows",
 ]
