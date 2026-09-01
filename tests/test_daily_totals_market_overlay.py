@@ -75,7 +75,7 @@ class SchemaTests(unittest.TestCase):
     def _overlay_fixture(cls) -> dict[str, object]:
         rows = [{
             "game_pk": pk, "expected_total": 8.0, "residual_count": 764, "market_status": "QUOTED",
-            "line_half_runs": 17, "over_american_odds": -110, "under_american_odds": -110,
+            "line_half_runs": 17, "over_american_odds": 100, "under_american_odds": 100,
             "over_support": 0.5, "under_support": 0.5, "push_support": 0.0,
             "over_conditional_support": 0.5, "under_conditional_support": 0.5,
             "over_support_margin": 0.0, "under_support_margin": 0.0,
@@ -92,6 +92,37 @@ class SchemaTests(unittest.TestCase):
         }
         value["content_sha256"] = cls._digest(value)
         return value
+
+    @classmethod
+    def _pick_overlay_fixture(cls) -> dict[str, object]:
+        value = cls._overlay_fixture()
+        row = value["games"][0]
+        row.update({
+            "expected_total": 9.5, "over_american_odds": 100, "under_american_odds": -100,
+            "over_support": 0.55, "under_support": 0.45, "push_support": 0.0,
+            "decision": "RESEARCH_PICK", "reason_codes": [],
+        })
+        cls._set_supports(row, 0.55, 0.45)
+        value["content_sha256"] = cls._digest(value)
+        return value
+
+    @classmethod
+    def _redigest(cls, value: dict[str, object]) -> dict[str, object]:
+        value["content_sha256"] = cls._digest(value)
+        return value
+
+    @staticmethod
+    def _set_supports(row: dict[str, object], over: float, under: float, push: float = 0.0) -> None:
+        over_result = price_support(over, under, row["over_american_odds"])
+        under_result = price_support(under, over, row["under_american_odds"])
+        row.update({
+            "over_support": over, "under_support": under, "push_support": push,
+            "over_conditional_support": over_result.conditional_support,
+            "under_conditional_support": under_result.conditional_support,
+            "over_support_margin": over_result.support_margin,
+            "under_support_margin": under_result.support_margin,
+            "selected_side": select_direction(over_result, under_result)[0],
+        })
 
     def test_valid_instances_pass_their_json_schemas(self) -> None:
         root = Path(__file__).parents[1] / "schemas"
@@ -259,7 +290,7 @@ class SchemaTests(unittest.TestCase):
         rows = [{
             "game_pk": pk, "expected_total": 8.0, "residual_count": 764,
             "market_status": "QUOTED", "line_half_runs": 17,
-            "over_american_odds": -110, "under_american_odds": -110,
+            "over_american_odds": 100, "under_american_odds": 100,
             "over_support": 0.5, "under_support": 0.5, "push_support": 0.0,
             "over_conditional_support": 0.5, "under_conditional_support": 0.5,
             "over_support_margin": 0.0, "under_support_margin": 0.0,
@@ -315,6 +346,57 @@ class SchemaTests(unittest.TestCase):
             {**overlay, "unexpected": True},
         ):
             with self.subTest(overlay_keys=sorted(invalid)):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+
+    def test_overlay_rejects_forged_derived_claims_and_failed_pick_gates(self) -> None:
+        base = self._pick_overlay_fixture()
+        for field, value in (("over_conditional_support", 0.56), ("under_conditional_support", 0.44),
+                             ("over_support_margin", 0.06), ("under_support_margin", -0.06),
+                             ("selected_side", "UNDER")):
+            invalid = deepcopy(base)
+            invalid["games"][0][field] = value
+            self._redigest(invalid)
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+
+        cases = []
+        invalid = deepcopy(base)
+        invalid["games"][0]["residual_count"] = 763
+        cases.append(("residual_count", invalid))
+        invalid = deepcopy(base)
+        self._set_supports(invalid["games"][0], 0.4, 0.3, 0.3)
+        cases.append(("nonpush_support", invalid))
+        invalid = deepcopy(base)
+        invalid["games"][0]["expected_total"] = 9.49
+        cases.append(("point_gap", invalid))
+        invalid = deepcopy(base)
+        self._set_supports(invalid["games"][0], 0.54, 0.46)
+        cases.append(("support_margin", invalid))
+        for name, invalid in cases:
+            invalid["games"][0]["decision"] = "RESEARCH_PICK"
+            invalid["games"][0]["reason_codes"] = []
+            self._redigest(invalid)
+            with self.subTest(gate=name):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+
+    def test_overlay_accepts_exact_pick_thresholds_and_rejects_just_below(self) -> None:
+        exact = self._pick_overlay_fixture()
+        validate_overlay_report(exact)
+        for name, expected_total, over, under in (
+            ("margin", 9.5, 0.549999, 0.450001),
+            ("point_gap", 9.499999, 0.55, 0.45),
+        ):
+            invalid = deepcopy(exact)
+            row = invalid["games"][0]
+            row["expected_total"] = expected_total
+            self._set_supports(row, over, under)
+            row["decision"] = "RESEARCH_PICK"
+            row["reason_codes"] = []
+            self._redigest(invalid)
+            with self.subTest(gate=name):
                 with self.assertRaises(ValueError):
                     validate_overlay_report(invalid)
 

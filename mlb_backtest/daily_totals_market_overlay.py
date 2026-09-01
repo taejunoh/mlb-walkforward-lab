@@ -162,12 +162,6 @@ def _finite(value: object, label: str, *, low: float = 0.0, high: float = math.i
     return result
 
 
-def _positive_int(value: object, label: str) -> int:
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"{label} differs")
-    return value
-
-
 def _source_url(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("source_url differs")
@@ -296,15 +290,20 @@ def _overlay_game(value: object) -> dict[str, object]:
     rates = [_finite(game[field], f"overlay {field}", high=1.0) for field in ("over_support", "under_support", "push_support")]
     if not math.isclose(sum(rates), 1.0, rel_tol=1e-12, abs_tol=1e-12):
         raise ValueError("overlay support rates are incoherent")
+    over_result = price_support(rates[0], rates[1], game["over_american_odds"])
+    under_result = price_support(rates[1], rates[0], game["under_american_odds"])
     conditionals = ("over_conditional_support", "under_conditional_support")
     margins = ("over_support_margin", "under_support_margin")
-    for conditional, margin in zip(conditionals, margins):
+    computed = ((over_result.conditional_support, over_result.support_margin), (under_result.conditional_support, under_result.support_margin))
+    for (conditional, margin), (computed_conditional, computed_margin) in zip(zip(conditionals, margins), computed):
         c_value, m_value = game[conditional], game[margin]
         if (c_value is None) != (m_value is None):
             raise ValueError("overlay support availability differs")
         if c_value is not None:
             _finite(c_value, f"overlay {conditional}", high=1.0)
             _finite(m_value, f"overlay {margin}", low=-1.0, high=1.0)
+        if c_value != computed_conditional or m_value != computed_margin:
+            raise ValueError("overlay derived support differs")
     if (rates[0] + rates[1] == 0.0) != (game["over_conditional_support"] is None):
         raise ValueError("overlay conditional support availability differs")
     selected_side = game["selected_side"]
@@ -314,6 +313,13 @@ def _overlay_game(value: object) -> dict[str, object]:
     if not isinstance(decision, str) or decision not in {"RESEARCH_PICK", "PASS"}:
         raise ValueError("overlay decision differs")
     reasons = _reason_codes(game["reason_codes"])
+    selected, _ = select_direction(over_result, under_result)
+    if selected_side != selected:
+        raise ValueError("overlay selected side differs")
+    if selected is None and (decision != "PASS" or "AMBIGUOUS_DIRECTION" not in reasons):
+        raise ValueError("overlay ambiguous direction differs")
+    if selected is not None and "AMBIGUOUS_DIRECTION" in reasons:
+        raise ValueError("overlay ambiguous direction differs")
     if decision == "RESEARCH_PICK" and (selected_side not in {"OVER", "UNDER"} or reasons):
         raise ValueError("overlay research pick consistency differs")
     if decision == "PASS" and not reasons:
@@ -324,6 +330,32 @@ def _overlay_game(value: object) -> dict[str, object]:
         raise ValueError("ambiguous overlay selected side differs")
     if selected_side is None and decision == "RESEARCH_PICK":
         raise ValueError("overlay selected side differs")
+    nonpush_support = rates[0] + rates[1]
+    point_gap = abs(float(game["expected_total"]) - game["line_half_runs"] / 2.0)
+    selected_margin = over_result.support_margin if selected == "OVER" else under_result.support_margin
+    if decision == "RESEARCH_PICK":
+        if game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"]:
+            raise ValueError("overlay residual count gate differs")
+        if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+            raise ValueError("overlay nonpush support gate differs")
+        if point_gap < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+            raise ValueError("overlay point gap gate differs")
+        if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
+            raise ValueError("overlay support margin gate differs")
+    else:
+        contradictions = set()
+        if game["residual_count"] == _POLICY_AUTHORITY["required_residual_count"]:
+            contradictions.add("RESIDUAL_COUNT_MISMATCH")
+        if nonpush_support >= _POLICY_AUTHORITY["minimum_nonpush_support"]:
+            contradictions.add("NONPUSH_SUPPORT_TOO_LOW")
+        if point_gap >= _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+            contradictions.add("POINT_GAP_TOO_SMALL")
+        if selected_margin is not None and selected_margin >= _POLICY_AUTHORITY["minimum_support_margin"]:
+            contradictions.add("SUPPORT_MARGIN_TOO_LOW")
+        if selected is not None:
+            contradictions.add("AMBIGUOUS_DIRECTION")
+        if contradictions.intersection(reasons):
+            raise ValueError("overlay reason codes contradict derived facts")
     return game
 
 
