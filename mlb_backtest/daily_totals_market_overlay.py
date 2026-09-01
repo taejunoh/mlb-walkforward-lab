@@ -9,13 +9,27 @@ import hashlib
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Rational, Real
-from collections.abc import Mapping
-from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from .live_top3_contracts import canonical_json_bytes, validate_target_date
+from .daily_totals import (
+    REPORT_SCHEMA,
+    validate_totals_model_receipt,
+    validate_totals_report,
+    validate_totals_trace,
+)
+from .secure_fs import (
+    RegularFileSnapshot,
+    TrustedRoot,
+    open_trusted_root,
+    read_regular_snapshot,
+    rebind_regular_snapshot,
+    write_exclusive,
+)
 
 
 SNAPSHOT_SCHEMA = "PROVISIONAL_DAILY_TOTALS_DK_SNAPSHOT_V1"
@@ -78,6 +92,21 @@ _UTC_RE = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T"
     r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.[0-9]{0,5}[1-9])?Z$"
 )
+_MODEL_REPORT_ROOT = Path("reports/experimental_daily_totals")
+_MODEL_RECEIPT_ROOT = Path("audit/experimental_daily_totals/model")
+_RAW_ROOT = Path("data/experimental_daily_totals_market/raw")
+_SNAPSHOT_ROOT = Path("audit/experimental_daily_totals_market/draftkings")
+_OVERLAY_ROOT = Path("reports/experimental_daily_totals_overlay")
+_OVERLAY_TRACE_SCHEMA = "PROVISIONAL_DAILY_TOTALS_OVERLAY_TRACE_V1"
+_OVERLAY_TRACE_KEYS = frozenset({
+    "schema", "content_sha256", "target_date", "evaluated_at_utc",
+    "model_report_relative", "model_report_sha256", "model_report_sidecar_sha256",
+    "model_trace_relative", "model_trace_sha256", "model_receipt_relative",
+    "model_receipt_sha256", "model_receipt_sidecar_sha256",
+    "market_snapshot_relative", "market_snapshot_sha256", "market_snapshot_sidecar_sha256",
+    "policy_schema", "policy_sha256", "report_relative", "report_sha256",
+    "report_sidecar_sha256", "markdown_sha256",
+})
 
 
 def _canonical_mapping(value: object, label: str) -> dict[str, object]:
@@ -525,3 +554,431 @@ def select_direction(
     if under_margin is not None and (over_margin is None or under_margin > over_margin):
         return "UNDER", ()
     return None, ("AMBIGUOUS_DIRECTION",)
+
+
+def _sha_bytes(contents: bytes) -> str:
+    return hashlib.sha256(contents).hexdigest()
+
+
+def _sidecar(contents: bytes) -> bytes:
+    return f"{_sha_bytes(contents)}\n".encode("ascii")
+
+
+def _path(value: Path, label: str) -> Path:
+    """Accept only a lexical root-relative path suitable for ``secure_fs``."""
+    if not isinstance(value, Path) or value.is_absolute() or "\\" in str(value):
+        raise ValueError(f"{label} differs")
+    if not value.parts or any(part in {"", ".", ".."} for part in value.parts):
+        raise ValueError(f"{label} differs")
+    return value
+
+
+def _under(relative: Path, parent: Path, label: str) -> Path:
+    relative = _path(relative, label)
+    if relative.parts[:len(parent.parts)] != parent.parts:
+        raise ValueError(f"{label} differs")
+    return relative
+
+
+def _canonical_json(snapshot: RegularFileSnapshot, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(snapshot.contents)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} differs") from exc
+    if not isinstance(value, dict) or canonical_json_bytes(value) != snapshot.contents:
+        raise ValueError(f"{label} differs")
+    return value
+
+
+def _verify_sidecar(snapshot: RegularFileSnapshot, primary: RegularFileSnapshot, label: str) -> None:
+    if snapshot.contents != _sidecar(primary.contents):
+        raise ValueError(f"{label} differs")
+
+
+def _existing_or_write(
+    trusted: TrustedRoot, relative: Path, contents: bytes, label: str, *, rebind: Callable[[], None] | None = None,
+) -> RegularFileSnapshot:
+    existing = read_regular_snapshot(trusted, relative, label, missing_ok=True)
+    if existing is not None:
+        if existing.contents != contents:
+            raise FileExistsError(f"{label} identity conflicts")
+        return existing
+    return write_exclusive(trusted, relative, contents, label, final_rebind=rebind)
+
+
+def _clock(value: object, label: str) -> tuple[datetime, str]:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError(f"{label} differs")
+    normalized = value.astimezone(timezone.utc)
+    if normalized.microsecond:
+        text = normalized.strftime("%Y-%m-%dT%H:%M:%S.") + f"{normalized.microsecond:06d}".rstrip("0") + "Z"
+    else:
+        text = normalized.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return normalized, text
+
+
+def _frozen(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ModelAuthority:
+    """Fully rebound report/trace/receipt evidence used by the overlay."""
+
+    report: Mapping[str, object]
+    receipt: Mapping[str, object]
+    trace: Mapping[str, object]
+    snapshots: tuple[RegularFileSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltOverlay:
+    """Immutable validated overlay and all evidence required for trace commit."""
+
+    report: Mapping[str, object]
+    report_bytes: bytes
+    markdown_bytes: bytes
+    trace_bytes: bytes
+    input_snapshots: tuple[RegularFileSnapshot, ...]
+    report_relative: Path
+    report_sidecar_relative: Path
+    markdown_relative: Path
+    trace_relative: Path
+
+
+def _rebind_all(trusted: TrustedRoot, snapshots: tuple[RegularFileSnapshot, ...], label: str) -> None:
+    for snapshot in snapshots:
+        rebind_regular_snapshot(trusted, snapshot, f"{label}: {snapshot.relative.as_posix()}")
+
+
+def _fixed_model_gates(report: Mapping[str, object], receipt: Mapping[str, object]) -> None:
+    if (
+        report["schema"] != REPORT_SCHEMA
+        or report["target_date"] != TARGET_DATE
+        or report["cutoff_date"] != "2026-08-31"
+        or report["selected_candidate"] != "TEAM_VENUE_30"
+        or receipt["target_date"] != TARGET_DATE
+        or receipt["cutoff_date"] != "2026-08-31"
+        or receipt["selected_candidate"] != "TEAM_VENUE_30"
+    ):
+        raise ValueError("fixed model authority differs")
+    games = report["games"]
+    if not isinstance(games, list) or len(games) != len(FIXED_GAME_PKS):
+        raise ValueError("fixed model games differ")
+    if [game.get("game_pk") for game in games if isinstance(game, Mapping)] != list(FIXED_GAME_PKS):
+        raise ValueError("fixed model game ordering differs")
+    for game in games:
+        if not isinstance(game, Mapping) or game.get("status") != "PROJECTED":
+            raise ValueError("fixed model game projection differs")
+        samples = game.get("residual_samples")
+        if (
+            not isinstance(samples, list) or game.get("residual_count") != 764
+            or len(samples) != 764
+            or game.get("residual_sha256") != _sha_bytes(canonical_json_bytes(samples))
+        ):
+            raise ValueError("fixed model residual evidence differs")
+
+
+def load_and_validate_model_authority(root: Path, model_trace: Path) -> ModelAuthority:
+    """Securely load the sealed model chain without invoking the model pipeline."""
+    root_path = Path(root)
+    trace_relative = _under(model_trace, _MODEL_REPORT_ROOT, "model trace path")
+    if not trace_relative.name.endswith(".trace.json"):
+        raise ValueError("model trace path differs")
+    with open_trusted_root(root_path) as trusted:
+        trace_snapshot = read_regular_snapshot(trusted, trace_relative, "model trace")
+        if trace_snapshot is None:
+            raise ValueError("model trace differs")
+        trace = validate_totals_trace(_canonical_json(trace_snapshot, "model trace"))
+        report_relative = _under(Path(str(trace["report_relative"])), _MODEL_REPORT_ROOT, "model report path")
+        receipt_relative = _under(Path(str(trace["model_receipt_relative"])), _MODEL_RECEIPT_ROOT, "model receipt path")
+        if receipt_relative != _MODEL_RECEIPT_ROOT / f"{Path(receipt_relative).stem}.json":
+            raise ValueError("model receipt path differs")
+        report_snapshot = read_regular_snapshot(trusted, report_relative, "model report")
+        report_sidecar = read_regular_snapshot(trusted, report_relative.with_suffix(".sha256"), "model report sidecar")
+        receipt_snapshot = read_regular_snapshot(trusted, receipt_relative, "model receipt")
+        receipt_sidecar = read_regular_snapshot(trusted, receipt_relative.with_suffix(".sha256"), "model receipt sidecar")
+        if None in (report_snapshot, report_sidecar, receipt_snapshot, receipt_sidecar):
+            raise ValueError("model authority evidence differs")
+        report = validate_totals_report(_canonical_json(report_snapshot, "model report"))
+        receipt = validate_totals_model_receipt(_canonical_json(receipt_snapshot, "model receipt"))
+        _verify_sidecar(report_sidecar, report_snapshot, "model report sidecar")
+        _verify_sidecar(receipt_sidecar, receipt_snapshot, "model receipt sidecar")
+        if (
+            trace["report_relative"] != report_relative.as_posix()
+            or trace["report_sha256"] != _sha_bytes(report_snapshot.contents)
+            or trace["report_sidecar_sha256"] != _sha_bytes(report_sidecar.contents)
+            or trace["model_receipt_relative"] != receipt_relative.as_posix()
+            or trace["model_receipt_sha256"] != _sha_bytes(receipt_snapshot.contents)
+            or report["model_receipt_relative"] != receipt_relative.as_posix()
+            or report["model_receipt_sha256"] != _sha_bytes(receipt_snapshot.contents)
+            or receipt_relative.name != f"{receipt['content_sha256']}.json"
+        ):
+            raise ValueError("model authority binding differs")
+        _fixed_model_gates(report, receipt)
+        snapshots = (trace_snapshot, report_snapshot, report_sidecar, receipt_snapshot, receipt_sidecar)
+        _rebind_all(trusted, snapshots, "model authority")
+        trusted.assert_bound()
+    return ModelAuthority(_frozen(report), _frozen(receipt), _frozen(trace), snapshots)
+
+
+def _raw_capture(
+    trusted: TrustedRoot, raw_capture: Path, label: str,
+) -> tuple[RegularFileSnapshot, RegularFileSnapshot, dict[str, object]]:
+    raw_relative = _under(raw_capture, _RAW_ROOT, "raw capture path")
+    if raw_relative.parent != _RAW_ROOT or not re.fullmatch(r"[0-9a-f]{64}\.json", raw_relative.name):
+        raise ValueError("raw capture path differs")
+    raw = read_regular_snapshot(trusted, raw_relative, label)
+    sidecar = read_regular_snapshot(trusted, raw_relative.with_suffix(".sha256"), f"{label} sidecar")
+    if raw is None or sidecar is None:
+        raise ValueError("raw capture differs")
+    digest = _sha_bytes(raw.contents)
+    if raw_relative.stem != digest or sidecar.contents != f"{digest}\n".encode("ascii"):
+        raise ValueError("raw capture digest differs")
+    try:
+        value = json.loads(raw.contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("raw capture differs") from exc
+    if not isinstance(value, dict) or set(value) != {"captured_at_utc", "source_url", "games"}:
+        raise ValueError("raw capture fields differ")
+    _utc_timestamp(value["captured_at_utc"], "raw capture timestamp")
+    _source_url(value["source_url"])
+    games = value["games"]
+    if not isinstance(games, list) or len(games) != len(FIXED_GAME_PKS):
+        raise ValueError("raw capture games differ")
+    parsed = [_snapshot_game(game) for game in games]
+    if [game["game_pk"] for game in parsed] != list(FIXED_GAME_PKS):
+        raise ValueError("raw capture game ordering differs")
+    return raw, sidecar, {"captured_at_utc": value["captured_at_utc"], "source_url": value["source_url"], "games": parsed}
+
+
+def admit_draftkings_snapshot(
+    root: Path, model_trace: Path, raw_capture: Path, *, comparison_clock: Callable[[], datetime],
+) -> Path:
+    """Admit one manually captured DraftKings file into an append-only snapshot."""
+    authority = load_and_validate_model_authority(root, model_trace)
+    root_path = Path(root)
+    with open_trusted_root(root_path) as trusted:
+        _rebind_all(trusted, authority.snapshots, "model authority")
+        raw, raw_sidecar, payload = _raw_capture(trusted, raw_capture, "raw capture")
+        # The clock is deliberately the final operation before snapshot assembly.
+        comparison, comparison_text = _clock(comparison_clock(), "comparison clock")
+        captured = _utc_timestamp(payload["captured_at_utc"], "raw capture timestamp")
+        if captured > comparison:
+            raise ValueError("raw capture is after comparison bound")
+        report_games = authority.report["games"]
+        if not isinstance(report_games, tuple):
+            raise ValueError("model authority games differ")
+        if any(captured >= _utc_timestamp(game["scheduled_start_utc"], "model start") for game in report_games if isinstance(game, Mapping)):
+            raise ValueError("raw capture is after scheduled start")
+        report_snapshot = authority.snapshots[1]
+        trace_snapshot = authority.snapshots[0]
+        snapshot: dict[str, object] = {
+            "schema": SNAPSHOT_SCHEMA, "content_sha256": "", "target_date": TARGET_DATE,
+            "model_trace_relative": trace_snapshot.relative.as_posix(), "model_trace_sha256": _sha_bytes(trace_snapshot.contents),
+            "model_report_relative": report_snapshot.relative.as_posix(), "model_report_sha256": _sha_bytes(report_snapshot.contents),
+            "comparison_bound_at_utc": comparison_text, "source_name": "DraftKings", "book_id": "DRAFTKINGS",
+            "source_url": payload["source_url"], "capture_method": "EXTERNAL_MANUAL", "captured_at_utc": payload["captured_at_utc"],
+            "raw_capture_relative": raw.relative.as_posix(), "raw_capture_sha256": _sha_bytes(raw.contents),
+            "raw_capture_byte_length": len(raw.contents), "games": payload["games"],
+        }
+        snapshot["content_sha256"] = _content_digest(snapshot)
+        snapshot = validate_draftkings_snapshot(snapshot)
+        contents = canonical_json_bytes(snapshot)
+        relative = _SNAPSHOT_ROOT / f"{snapshot['content_sha256']}.json"
+        sidecar_contents = _sidecar(contents)
+        inputs = authority.snapshots + (raw, raw_sidecar)
+        _rebind_all(trusted, inputs, "snapshot admission inputs")
+        sidecar = _existing_or_write(trusted, relative.with_suffix(".sha256"), sidecar_contents, "market snapshot sidecar", rebind=lambda: _rebind_all(trusted, inputs, "snapshot admission inputs"))
+        output = _existing_or_write(trusted, relative, contents, "market snapshot", rebind=lambda: _rebind_all(trusted, inputs + (sidecar,), "snapshot admission inputs"))
+        _rebind_all(trusted, inputs + (sidecar, output), "snapshot admission")
+        trusted.assert_bound()
+    return relative
+
+
+def _load_snapshot(
+    trusted: TrustedRoot, market_snapshot: Path, authority: ModelAuthority,
+) -> tuple[RegularFileSnapshot, RegularFileSnapshot, dict[str, object], tuple[RegularFileSnapshot, ...]]:
+    relative = _under(market_snapshot, _SNAPSHOT_ROOT, "market snapshot path")
+    if relative.parent != _SNAPSHOT_ROOT or not re.fullmatch(r"[0-9a-f]{64}\.json", relative.name):
+        raise ValueError("market snapshot path differs")
+    primary = read_regular_snapshot(trusted, relative, "market snapshot")
+    sidecar = read_regular_snapshot(trusted, relative.with_suffix(".sha256"), "market snapshot sidecar")
+    if primary is None or sidecar is None:
+        raise ValueError("market snapshot differs")
+    value = validate_draftkings_snapshot(_canonical_json(primary, "market snapshot"))
+    _verify_sidecar(sidecar, primary, "market snapshot sidecar")
+    if relative.stem != value["content_sha256"] or value["content_sha256"] != _sha_bytes(canonical_json_bytes({key: item for key, item in value.items() if key != "content_sha256"})):
+        raise ValueError("market snapshot content path differs")
+    if (
+        value["model_trace_relative"] != authority.snapshots[0].relative.as_posix()
+        or value["model_trace_sha256"] != _sha_bytes(authority.snapshots[0].contents)
+        or value["model_report_relative"] != authority.snapshots[1].relative.as_posix()
+        or value["model_report_sha256"] != _sha_bytes(authority.snapshots[1].contents)
+    ):
+        raise ValueError("market snapshot model binding differs")
+    raw, raw_sidecar, raw_payload = _raw_capture(trusted, Path(str(value["raw_capture_relative"])), "raw capture")
+    if value["raw_capture_sha256"] != _sha_bytes(raw.contents) or value["raw_capture_byte_length"] != len(raw.contents):
+        raise ValueError("market snapshot raw binding differs")
+    if raw_payload["captured_at_utc"] != value["captured_at_utc"] or raw_payload["source_url"] != value["source_url"] or raw_payload["games"] != value["games"]:
+        raise ValueError("market snapshot raw content differs")
+    return primary, sidecar, value, (raw, raw_sidecar)
+
+
+def _overlay_trace(value: object) -> dict[str, object]:
+    safe = _canonical_mapping(value, "overlay trace")
+    if set(safe) != _OVERLAY_TRACE_KEYS or safe["schema"] != _OVERLAY_TRACE_SCHEMA:
+        raise ValueError("overlay trace fields differ")
+    _target(safe["target_date"], "overlay trace target date")
+    _utc_timestamp(safe["evaluated_at_utc"], "overlay trace evaluated time")
+    for field in ("model_report_relative", "model_trace_relative", "model_receipt_relative", "market_snapshot_relative", "report_relative"):
+        _relative(safe[field], f"overlay trace {field}")
+    for field in _OVERLAY_TRACE_KEYS:
+        if field.endswith("sha256") or field == "content_sha256":
+            _sha(safe[field], f"overlay trace {field}")
+    if safe["policy_schema"] != POLICY_SCHEMA or safe["policy_sha256"] != _content_digest(_POLICY_AUTHORITY):
+        raise ValueError("overlay trace policy differs")
+    if safe["content_sha256"] != _content_digest(safe):
+        raise ValueError("overlay trace content digest differs")
+    return safe
+
+
+def _render_overlay_markdown(report: Mapping[str, object]) -> bytes:
+    """Render the sealed research record without outcome or return claims."""
+    lines = [
+        "# Provisional Daily Totals Overlay",
+        "",
+        "> RESEARCH ONLY · ONE-SEASON PROVISIONAL · NOT BET-VALIDATED",
+        "",
+        f"- Target date: {report['target_date']}",
+        f"- Evaluated at: {report['evaluated_at_utc']}",
+        f"- Overlay content SHA-256: {report['content_sha256']}",
+        "",
+        "| Game | Market status | Research disposition | Reasons |",
+        "| --- | --- | --- | --- |",
+    ]
+    games = report["games"]
+    if not isinstance(games, list):
+        raise ValueError("overlay report games differ")
+    for game in games:
+        if not isinstance(game, Mapping):
+            raise ValueError("overlay report game differs")
+        reasons = ", ".join(str(reason) for reason in game["reason_codes"])
+        lines.append(
+            f"| {game['game_pk']} | {game['market_status']} | {game['decision']} | {reasons} |"
+        )
+    lines.extend(["", "This is a research record, not financial advice.", ""])
+    return "\n".join(lines).encode("utf-8")
+
+
+def build_overlay(
+    root: Path, model_trace: Path, market_snapshot: Path, *, evaluated_clock: Callable[[], datetime],
+) -> BuiltOverlay:
+    """Build a deterministic validated overlay; persistence is a separate commit step."""
+    authority = load_and_validate_model_authority(root, model_trace)
+    root_path = Path(root)
+    with open_trusted_root(root_path) as trusted:
+        _rebind_all(trusted, authority.snapshots, "model authority")
+        snapshot_file, snapshot_sidecar, snapshot, raw_snapshots = _load_snapshot(trusted, market_snapshot, authority)
+        captured = _utc_timestamp(snapshot["captured_at_utc"], "market snapshot capture")
+        comparison = _utc_timestamp(snapshot["comparison_bound_at_utc"], "market snapshot comparison")
+        report_games = authority.report["games"]
+        if not isinstance(report_games, tuple):
+            raise ValueError("model authority games differ")
+        if captured > comparison or any(captured >= _utc_timestamp(game["scheduled_start_utc"], "model start") for game in report_games if isinstance(game, Mapping)):
+            raise ValueError("market snapshot capture ordering differs")
+        evaluated, evaluated_text = _clock(evaluated_clock(), "evaluated clock")
+        if evaluated < comparison:
+            raise ValueError("evaluated clock is before comparison bound")
+        snapshot_rows = snapshot["games"]
+        if not isinstance(snapshot_rows, list):
+            raise ValueError("market snapshot games differ")
+        by_game = {row["game_pk"]: row for row in snapshot_rows if isinstance(row, dict)}
+        rows: list[dict[str, object]] = []
+        for model_game in report_games:
+            if not isinstance(model_game, Mapping):
+                raise ValueError("model authority game differs")
+            pk = model_game["game_pk"]
+            market = by_game.get(pk)
+            if market is None:
+                raise ValueError("market snapshot game differs")
+            base = {"game_pk": pk, "expected_total": model_game["expected_total"], "residual_count": model_game["residual_count"], "market_status": market["status"]}
+            if market["status"] == "NO_QUOTE":
+                rows.append({**base, "decision": "PASS", "reason_codes": ["NO_QUOTE"]})
+                continue
+            samples = model_game["residual_samples"]
+            if not isinstance(samples, tuple) or model_game["residual_sha256"] != _sha_bytes(canonical_json_bytes(samples)):
+                raise ValueError("model residual evidence differs")
+            rates = compare_sample_support(tuple(samples), market["line_half_runs"])
+            over = price_support(rates.over, rates.under, market["over_american_odds"])
+            under = price_support(rates.under, rates.over, market["under_american_odds"])
+            selected, _ = select_direction(over, under)
+            reasons: list[str] = []
+            start = _utc_timestamp(model_game["scheduled_start_utc"], "model start")
+            if evaluated >= start:
+                reasons.append("GAME_STARTED")
+            age = (evaluated - captured).total_seconds()
+            if age < 0:
+                raise ValueError("quote age differs")
+            if age > _POLICY_AUTHORITY["maximum_quote_age_seconds"]:
+                reasons.append("QUOTE_STALE")
+            if model_game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"] or len(samples) != _POLICY_AUTHORITY["required_residual_count"]:
+                reasons.append("RESIDUAL_COUNT_MISMATCH")
+            if rates.over + rates.under < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+                reasons.append("NONPUSH_SUPPORT_TOO_LOW")
+            if abs(float(model_game["expected_total"]) - market["line_half_runs"] / 2.0) < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+                reasons.append("POINT_GAP_TOO_SMALL")
+            selected_margin = over.support_margin if selected == "OVER" else under.support_margin if selected == "UNDER" else None
+            if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
+                reasons.append("SUPPORT_MARGIN_TOO_LOW")
+            if selected is None:
+                reasons.append("AMBIGUOUS_DIRECTION")
+            row = {**base, "line_half_runs": market["line_half_runs"], "over_american_odds": market["over_american_odds"], "under_american_odds": market["under_american_odds"], "over_support": rates.over, "under_support": rates.under, "push_support": rates.push, "over_conditional_support": over.conditional_support, "under_conditional_support": under.conditional_support, "over_support_margin": over.support_margin, "under_support_margin": under.support_margin, "selected_side": selected, "decision": "RESEARCH_PICK" if not reasons and selected is not None else "PASS", "reason_codes": reasons}
+            rows.append(row)
+        report_file = _OVERLAY_ROOT / TARGET_DATE / f"{evaluated.strftime('%Y%m%dT%H%M%S%fZ')}-"
+        report: dict[str, object] = {"schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": list(STATUS_LABELS), "target_date": TARGET_DATE, "model_report_relative": authority.snapshots[1].relative.as_posix(), "model_report_sha256": _sha_bytes(authority.snapshots[1].contents), "model_trace_relative": authority.snapshots[0].relative.as_posix(), "model_trace_sha256": _sha_bytes(authority.snapshots[0].contents), "market_snapshot_relative": snapshot_file.relative.as_posix(), "market_snapshot_sha256": _sha_bytes(snapshot_file.contents), "policy_schema": POLICY_SCHEMA, "policy_sha256": _content_digest(_POLICY_AUTHORITY), "evaluated_at_utc": evaluated_text, "games": rows}
+        report["content_sha256"] = _content_digest(report)
+        report = validate_overlay_report(report)
+        report_bytes = canonical_json_bytes(report)
+        report_relative = Path(str(report_file) + str(report["content_sha256"])[:16] + ".json")
+        markdown = _render_overlay_markdown(report)
+        trace_payload: dict[str, object] = {"schema": _OVERLAY_TRACE_SCHEMA, "content_sha256": "", "target_date": TARGET_DATE, "evaluated_at_utc": evaluated_text, "model_report_relative": authority.snapshots[1].relative.as_posix(), "model_report_sha256": _sha_bytes(authority.snapshots[1].contents), "model_report_sidecar_sha256": _sha_bytes(authority.snapshots[2].contents), "model_trace_relative": authority.snapshots[0].relative.as_posix(), "model_trace_sha256": _sha_bytes(authority.snapshots[0].contents), "model_receipt_relative": authority.snapshots[3].relative.as_posix(), "model_receipt_sha256": _sha_bytes(authority.snapshots[3].contents), "model_receipt_sidecar_sha256": _sha_bytes(authority.snapshots[4].contents), "market_snapshot_relative": snapshot_file.relative.as_posix(), "market_snapshot_sha256": _sha_bytes(snapshot_file.contents), "market_snapshot_sidecar_sha256": _sha_bytes(snapshot_sidecar.contents), "policy_schema": POLICY_SCHEMA, "policy_sha256": _content_digest(_POLICY_AUTHORITY), "report_relative": report_relative.as_posix(), "report_sha256": _sha_bytes(report_bytes), "report_sidecar_sha256": _sha_bytes(_sidecar(report_bytes)), "markdown_sha256": _sha_bytes(markdown)}
+        trace_payload["content_sha256"] = _content_digest(trace_payload)
+        trace_bytes = canonical_json_bytes(_overlay_trace(trace_payload))
+        inputs = authority.snapshots + (snapshot_file, snapshot_sidecar) + raw_snapshots
+        _rebind_all(trusted, inputs, "overlay build")
+        trusted.assert_bound()
+    return BuiltOverlay(_frozen(report), report_bytes, markdown, trace_bytes, inputs, report_relative, report_relative.with_suffix(".sha256"), report_relative.with_suffix(".md"), report_relative.with_suffix(".trace.json"))
+
+
+def persist_overlay(root: Path, built: BuiltOverlay) -> tuple[Path, Path, Path, Path]:
+    """Append sidecar, JSON, Markdown, then trace; trace publication is the commit."""
+    if not isinstance(built, BuiltOverlay):
+        raise ValueError("built overlay differs")
+    report = validate_overlay_report(json.loads(built.report_bytes))
+    if canonical_json_bytes(report) != built.report_bytes or _frozen(report) != built.report:
+        raise ValueError("built overlay report differs")
+    if (built.report_relative.parent != _OVERLAY_ROOT / TARGET_DATE or built.report_sidecar_relative != built.report_relative.with_suffix(".sha256") or built.markdown_relative != built.report_relative.with_suffix(".md") or built.trace_relative != built.report_relative.with_suffix(".trace.json")):
+        raise ValueError("built overlay paths differ")
+    trace = _overlay_trace(json.loads(built.trace_bytes))
+    if (trace["report_relative"] != built.report_relative.as_posix() or trace["report_sha256"] != _sha_bytes(built.report_bytes) or trace["report_sidecar_sha256"] != _sha_bytes(_sidecar(built.report_bytes)) or trace["markdown_sha256"] != _sha_bytes(built.markdown_bytes)):
+        raise ValueError("built overlay trace differs")
+    root_path = Path(root)
+    with open_trusted_root(root_path) as trusted:
+        _rebind_all(trusted, built.input_snapshots, "overlay persistence inputs")
+        sidecar = _existing_or_write(trusted, built.report_sidecar_relative, _sidecar(built.report_bytes), "overlay report sidecar", rebind=lambda: _rebind_all(trusted, built.input_snapshots, "overlay persistence inputs"))
+        primary = _existing_or_write(trusted, built.report_relative, built.report_bytes, "overlay report", rebind=lambda: _rebind_all(trusted, built.input_snapshots + (sidecar,), "overlay persistence inputs"))
+        markdown = _existing_or_write(trusted, built.markdown_relative, built.markdown_bytes, "overlay Markdown", rebind=lambda: _rebind_all(trusted, built.input_snapshots + (sidecar, primary), "overlay persistence inputs"))
+        before_trace = built.input_snapshots + (sidecar, primary, markdown)
+        _rebind_all(trusted, before_trace, "overlay pre-trace")
+        trace_snapshot = _existing_or_write(trusted, built.trace_relative, built.trace_bytes, "overlay trace", rebind=lambda: _rebind_all(trusted, before_trace, "overlay pre-trace"))
+        _rebind_all(trusted, before_trace + (trace_snapshot,), "overlay committed")
+        persisted = _overlay_trace(_canonical_json(trace_snapshot, "overlay trace"))
+        if persisted != trace:
+            raise ValueError("persisted overlay trace differs")
+        trusted.assert_bound()
+    return built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative

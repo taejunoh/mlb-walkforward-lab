@@ -6,8 +6,10 @@ import math
 from copy import deepcopy
 import unittest
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from jsonschema import Draft202012Validator
 
@@ -33,6 +35,137 @@ from mlb_backtest.daily_totals_market_overlay import (
     validate_overlay_report,
 )
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
+
+
+class SecurePersistenceTests(unittest.TestCase):
+    def test_public_secure_persistence_interfaces_exist(self) -> None:
+        """Catch removal of the admission/build/persistence public boundary."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for name in (
+            "admit_draftkings_snapshot",
+            "build_overlay",
+            "persist_overlay",
+            "load_and_validate_model_authority",
+            "BuiltOverlay",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(overlay, name))
+
+    @staticmethod
+    def _digest(value: object) -> str:
+        return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+    @classmethod
+    def _authority(cls, root: Path) -> tuple[Path, Path]:
+        """Create a complete local 15-game authority without model execution."""
+        from tests.test_daily_totals import make_valid_model_receipt
+
+        receipt = make_valid_model_receipt()
+        receipt["selected_candidate"] = "TEAM_VENUE_30"
+        receipt["content_sha256"] = cls._digest({key: item for key, item in receipt.items() if key != "content_sha256"})
+        receipt_bytes = canonical_json_bytes(receipt)
+        receipt_relative = Path("audit/experimental_daily_totals/model") / f"{receipt['content_sha256']}.json"
+        samples = [8] * 764
+        source = receipt["history_source"]
+        games = [{
+            "game_pk": pk, "official_date": TARGET_DATE,
+            "scheduled_start_utc": f"2026-09-01T{16 + index // 60:02d}:{index % 60:02d}:00Z",
+            "away_team_id": index + 1, "home_team_id": index + 101, "venue_id": index + 201,
+            "status": "PROJECTED", "candidate_id": "TEAM_VENUE_30",
+            "away_expected_runs": 5.0, "home_expected_runs": 5.0, "expected_total": 10.0,
+            "interval_80": [8, 8], "residual_samples": samples,
+            "residual_sha256": cls._digest(samples), "residual_count": 764,
+            "feature_cutoff": "2026-08-31", "source_digest": source["payload_sha256"],
+            "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"],
+        } for index, pk in enumerate(FIXED_GAME_PKS)]
+        report = {
+            "schema": "PROVISIONAL_DAILY_TOTALS_V1", "content_sha256": "",
+            "status_labels": receipt["status_labels"], "target_date": TARGET_DATE,
+            "cutoff_date": "2026-08-31", "model_receipt_relative": receipt_relative.as_posix(),
+            "model_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            "source_report_relative": receipt["source_report_relative"],
+            "source_report_sha256": receipt["source_report_sha256"],
+            "history_source": receipt["history_source"], "live_source": receipt["live_source"],
+            "selected_candidate": "TEAM_VENUE_30", "development_metrics": receipt["development_metrics"],
+            "final_metrics": receipt["final_metrics"], "games": games,
+        }
+        report["content_sha256"] = cls._digest({key: item for key, item in report.items() if key != "content_sha256"})
+        report_bytes = canonical_json_bytes(report)
+        report_relative = Path("reports/experimental_daily_totals/2026-09-01/model.json")
+        report_sidecar = hashlib.sha256(report_bytes).hexdigest().encode("ascii") + b"\n"
+        trace = {
+            "schema": "PROVISIONAL_DAILY_TOTALS_TRACE_V1", "content_sha256": "",
+            "model_receipt_relative": receipt_relative.as_posix(),
+            "model_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            "report_relative": report_relative.as_posix(), "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            "report_sidecar_sha256": hashlib.sha256(report_sidecar).hexdigest(), "markdown_sha256": "a" * 64,
+            "source_report_relative": report["source_report_relative"], "source_report_sha256": report["source_report_sha256"],
+            "history_source": report["history_source"], "live_source": report["live_source"],
+        }
+        trace["content_sha256"] = cls._digest({key: item for key, item in trace.items() if key != "content_sha256"})
+        trace_relative = Path("reports/experimental_daily_totals/2026-09-01/model.trace.json")
+        for relative, contents in (
+            (receipt_relative, receipt_bytes), (receipt_relative.with_suffix(".sha256"), hashlib.sha256(receipt_bytes).hexdigest().encode("ascii") + b"\n"),
+            (report_relative, report_bytes), (report_relative.with_suffix(".sha256"), report_sidecar),
+            (trace_relative, canonical_json_bytes(trace)),
+        ):
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(contents)
+        raw_value = {
+            "captured_at_utc": "2026-09-01T14:59:00Z",
+            "source_url": "https://sportsbook.draftkings.com/markets",
+            "games": [{"game_pk": pk, "status": "QUOTED", "draftkings_event_id": f"event-{pk}", "event_label": f"Game {pk}", "line_half_runs": 17, "over_american_odds": 100, "under_american_odds": 100} for pk in FIXED_GAME_PKS],
+        }
+        raw_bytes = json.dumps(raw_value, indent=1).encode("utf-8")
+        raw_digest = hashlib.sha256(raw_bytes).hexdigest()
+        raw_relative = Path("data/experimental_daily_totals_market/raw") / f"{raw_digest}.json"
+        (root / raw_relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / raw_relative).write_bytes(raw_bytes)
+        (root / raw_relative.with_suffix(".sha256")).write_bytes(raw_digest.encode("ascii") + b"\n")
+        return trace_relative, raw_relative
+
+    def test_admit_build_and_trace_commit_use_local_bound_evidence(self) -> None:
+        """Catch a write sequence that publishes before all model/raw evidence is bound."""
+        from mlb_backtest.daily_totals_market_overlay import (
+            admit_draftkings_snapshot, build_overlay, persist_overlay,
+        )
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            calls: list[str] = []
+            snapshot = admit_draftkings_snapshot(
+                root, trace, raw,
+                comparison_clock=lambda: calls.append("comparison") or datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc),
+            )
+            self.assertEqual(calls, ["comparison"])
+            self.assertEqual(snapshot.parent.as_posix(), "audit/experimental_daily_totals_market/draftkings")
+            built = build_overlay(
+                root, trace, snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual([row["game_pk"] for row in built.report["games"]], list(FIXED_GAME_PKS))
+            self.assertEqual({row["decision"] for row in built.report["games"]}, {"RESEARCH_PICK"})
+            for pk in FIXED_GAME_PKS:
+                self.assertIn(f"| {pk} |".encode("ascii"), built.markdown_bytes)
+            paths = persist_overlay(root, built)
+            self.assertEqual(paths, (built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative))
+            self.assertTrue((root / paths[-1]).is_file())
+            self.assertEqual(persist_overlay(root, built), paths)
+
+    def test_bad_raw_sidecar_rejects_before_any_snapshot_write(self) -> None:
+        """Catch acceptance of a capture whose separately bound digest was altered."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            (root / raw.with_suffix(".sha256")).write_bytes(b"0" * 64 + b"\n")
+            with self.assertRaises(ValueError):
+                admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+            self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
 
 
 class SchemaTests(unittest.TestCase):
