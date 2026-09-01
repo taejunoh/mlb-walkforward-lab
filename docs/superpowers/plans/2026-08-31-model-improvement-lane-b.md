@@ -13,6 +13,7 @@
 ## Global Constraints
 
 - Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal/load_sealed_feature_rows, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, JoinedLedger/load_joined_prediction_rows, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Import `LaneDisposition`, `LANE_IDS`, `LANE_DISPOSITION_STATES`, and disposition seal/load operations directly from `mlb_backtest.model_improvement.lane_disposition`; `contracts` owns no disposition alias.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
 - All artifact paths are CLI arguments. Do not modify config/v5_1_bt.json, scoring.py, config.py, locking.py, outcomes.py, live_model_card.py, or a v5_2 authority.
@@ -589,8 +590,12 @@ Expected: ModuleNotFoundError for lane_b_ledger.
 ~~~python
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json
 from mlb_backtest.model_improvement.contracts import seal_frozen_model_card
+from mlb_backtest.model_improvement.lane_b_candidates import Candidate, validate_candidate
 from mlb_backtest.model_improvement.evaluation import EvaluationReport
-from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
+from mlb_backtest.model_improvement.lane_disposition import (
+    LANE_DISPOSITION_STATES, LANE_IDS, LaneDisposition, load_lane_disposition,
+    seal_lane_disposition,
+)
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 
 
@@ -647,6 +652,11 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
         raise ValueError("selected H23 candidate differs")
     if lane_a_card.model_id != "A" or lane_a_card.state != "H23_FROZEN":
         raise ValueError("Lane A parent card is not H23_FROZEN")
+    selected_weights = dict(selected["weights_pp"])
+    validate_candidate(Candidate(selected["candidate_id"], selected_weights,
+                                 selected["shrinkage_multiplier"]))
+    if parameters.get("component_weights_pp", selected_weights) != selected_weights:
+        raise ValueError("selected candidate/card component weights differ")
     payload = {"model_id": "A+B", "state": "H23_FROZEN", "fold_id": "H23",
         "run_spec_sha256": run_spec_sha256(spec), "source_gate_sha256": source_gate.artifact_sha256,
         "baseline_replay_sha256": baseline_replay.artifact_sha256,
@@ -655,7 +665,8 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
         "prediction_contract_sha256": prediction_seal.artifact_sha256,
         "prediction_seal_sha256": prediction_seal.artifact_sha256,
         "evaluation_sha256": evaluation.artifact_sha256,
-        "parameters": {"candidate_id": selected["candidate_id"], **parameters}}
+        "parameters": {**parameters, "candidate_id": selected["candidate_id"],
+                       "component_weights_pp": selected_weights}}
     return seal_frozen_model_card(spec, "lane_b", "H23/frozen_model_card.json", payload)
 ~~~
 
@@ -673,7 +684,7 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_lane_b_ledger.LaneBLedgerTest -v
 
-Expected: PASS; non-frozen A ends before search, rejected B writes no card, and selection order is Brier, log loss, Top-1 delta descending, candidate ID.
+Expected: PASS; non-frozen A ends before search, rejected B writes no card, selected candidate/grid/card `component_weights_pp` are identical, and selection order is Brier, log loss, Top-1 delta descending, candidate ID.
 
 - [ ] **Step 5: Commit.**
 

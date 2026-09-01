@@ -18,8 +18,8 @@ The following names are owned by Common/Lane A and are dependencies, not new Lan
 
 ```python
 from mlb_backtest.model_improvement.contracts import (
-    FrozenModelCard, LaneDisposition, MetricPrimitive, PredictionSeal, SealedFeatureRow,
-    LANE_IDS, load_frozen_model_card, seal_frozen_model_card,
+    FrozenModelCard, MetricPrimitive, PredictionSeal, SealedFeatureRow,
+    load_frozen_model_card, seal_frozen_model_card,
 )
 from mlb_backtest.model_improvement.run_spec import (
     ModelImprovementRunSpec, load_verified_run_spec, run_spec_sha256,
@@ -31,7 +31,8 @@ from mlb_backtest.model_improvement.sealed_features import (
     FeatureSeal, load_sealed_feature_rows,
 )
 from mlb_backtest.model_improvement.lane_disposition import (
-    load_lane_disposition, seal_lane_disposition,
+    LANE_DISPOSITION_STATES, LANE_IDS, LaneDisposition, load_lane_disposition,
+    seal_lane_disposition,
 )
 from pathlib import Path
 ```
@@ -818,8 +819,8 @@ import math
 from dataclasses import dataclass
 
 from mlb_backtest.model_improvement.contracts import (
-    FrozenModelCard, LaneDisposition, PredictionSeal, SealedFeatureRow,
-    LANE_IDS, compute_feature_row_sha256, load_frozen_model_card,
+    FrozenModelCard, PredictionSeal, SealedFeatureRow,
+    compute_feature_row_sha256, load_frozen_model_card,
     seal_frozen_model_card, sealed_feature_row_payload,
 )
 from mlb_backtest.model_improvement.canonical import (
@@ -834,7 +835,7 @@ from mlb_backtest.model_improvement.lane_c_coverage import LaneCCoverageReport, 
 from mlb_backtest.model_improvement.lane_c_replay import (
     LaneCReplayReceipt, load_replay_receipt,
 )
-from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
+from mlb_backtest.model_improvement.lane_disposition import LANE_IDS, LaneDisposition, seal_lane_disposition
 from mlb_backtest.model_improvement.run_spec import ModelImprovementRunSpec, run_spec_sha256
 from mlb_backtest.model_improvement.sealed_features import (
     FeatureSeal, load_sealed_feature_rows, seal_feature_rows,
@@ -1146,6 +1147,11 @@ def seal_lane_c_card(
     evidence_sha256: Sequence[str],
     lane_c_evaluation: EvaluationReport,
 ) -> FrozenModelCard:
+    parent_weights = dict(parent_ab_card.parameters["component_weights_pp"])
+    if (set(parent_weights) != {"starter", "offense", "bullpen", "environment", "defense", "schedule"}
+            or any(type(value) is not int or value < 0 for value in parent_weights.values())
+            or sum(parent_weights.values()) != 100):
+        raise ValueError("A+B parent component weights differ")
     payload = {
         "model_id": "A+B+C",
         "state": "H23_FROZEN",
@@ -1159,6 +1165,7 @@ def seal_lane_c_card(
         "prediction_seal_sha256": lane_c_prediction.artifact_sha256,
         "evaluation_sha256": lane_c_evaluation.artifact_sha256,
         "parameters": {
+            "component_weights_pp": parent_weights,
             "coverage_sha256": coverage_sha256(coverage),
             "parent_prediction_sha256": parent_ab_prediction.artifact_sha256,
             "lane_c_h22_feature_seal_sha256": lane_c_feature_seals["H22"].artifact_sha256,
@@ -1169,7 +1176,7 @@ def seal_lane_c_card(
     return seal_frozen_model_card(spec, "lane_c", "H23/frozen_model_card.json", payload)
 ```
 
-Use the Common frozen-card schema and exact `seal_frozen_model_card` payload/sealer/loader contract; do not add a `lane_c_frozen_card.schema.json`, direct mapping write, fabricated descriptor, or C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, `prediction_contract_sha256 == lane_c_prediction.artifact_sha256`, Lane C H23 prediction seal, source-gate/feature-seal/RunSpec/baseline-replay/evaluation hashes, and no outcome fields. Before sealing, validate `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256`; never compare the seal contract digest to itself. Use the generic `seal_lane_disposition`/`load_lane_disposition(spec, path, expected_sha256)` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
+Use the Common frozen-card schema and exact `seal_frozen_model_card` payload/sealer/loader contract; do not add a `lane_c_frozen_card.schema.json`, direct mapping write, fabricated descriptor, or C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, `prediction_contract_sha256 == lane_c_prediction.artifact_sha256`, Lane C H23 prediction seal, source-gate/feature-seal/RunSpec/baseline-replay/evaluation hashes, and no outcome fields. `parameters.component_weights_pp` must be byte-for-byte equal to the A+B parent’s validated six-key weights; Lane C changes feature evidence only and never weights. Before sealing, validate `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256` and `lane_c_prediction.model_card_sha256 == parent_ab_card.artifact_sha256` until the new A+B+C descriptor is sealed; never compare the seal contract digest to itself. Use the generic `seal_lane_disposition`/`load_lane_disposition(spec, path, expected_sha256)` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
 
 The Common artifact-hash convention applies unchanged to the C card: `artifact_sha256` and `path` are runtime descriptor fields, excluded from the canonical frozen-card payload. `seal_frozen_model_card` writes/rereads the payload, hashes canonical persisted bytes before creating descriptor fields, and `load_frozen_model_card(spec, path, expected_sha256)` verifies the digest and the RunSpec-bound `lane_c` path.
 
@@ -1239,6 +1246,8 @@ class LaneCHandoffTest(unittest.TestCase):
         )
         self.assertEqual(card.state, "H23_FROZEN")
         self.assertEqual(card.parent_card_sha256, self.parent_ab_card.artifact_sha256)
+        self.assertEqual(card.parameters["component_weights_pp"],
+                         self.parent_ab_card.parameters["component_weights_pp"])
         self.assertNotEqual(card.prediction_seal_sha256, self.parent_ab_prediction.artifact_sha256)
 ```
 
