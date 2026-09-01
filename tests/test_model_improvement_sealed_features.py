@@ -301,6 +301,49 @@ class SealedFeatureTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_sealed_feature_rows(self.spec, self.gate, (2022,), seal)
 
+    def test_rows_parser_reaches_canonical_validation_with_matching_digest(self):
+        rows_path = self.spec.output_path("features", "common/H22/rows.jsonl")
+        unknown_outcome = self.rows[0].as_mapping() | {"home_win": 1}
+        cases = (
+            b"\n",
+            b'{"game_pk":100, "official_date":"2022-04-01"}\n',
+            canonical_json_bytes(unknown_outcome),
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                rows_path.parent.mkdir(parents=True, exist_ok=True)
+                rows_path.write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    sealed_features._load_rows_bytes(
+                        rows_path, sha256(raw).hexdigest()
+                    )
+
+    def test_empty_and_duplicate_game_population_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            seal_feature_rows(self.spec, self.gate, "common", "H22", ())
+        # A population key contains game_pk, so one duplicate row exercises both
+        # the duplicate-game and duplicate-population-key contracts.
+        with self.assertRaisesRegex(ValueError, "duplicate game_pk"):
+            seal_feature_rows(
+                self.spec, self.gate, "common", "H22", (self.rows[0], self.rows[0])
+            )
+
+    def test_persisted_seal_tamper_rejects_fresh_digest_when_sidecar_is_old(self):
+        seal = seal_feature_rows(self.spec, self.gate, "common", "H22", self.rows)
+        path = Path(seal.path)
+        payload = json.loads(path.read_bytes())
+        payload["source_gate_sha256"] = SHA
+        raw = canonical_json_bytes(payload)
+        path.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, "sidecar"):
+            load_feature_seal(path, sha256(raw).hexdigest())
+
+    def test_receipt_bound_loader_rejects_foreign_source_gate(self):
+        seal = seal_feature_rows(self.spec, self.gate, "common", "H22", self.rows)
+        foreign_gate = dataclasses.replace(self.gate, artifact_sha256="c" * 64)
+        with self.assertRaisesRegex(ValueError, "source gate"):
+            load_sealed_feature_rows(self.spec, foreign_gate, (2022,), seal)
+
     def test_post_final_commit_rows_sidecar_reread_detects_mutation(self):
         original = sealed_features.write_immutable_json
 
@@ -329,6 +372,15 @@ class SealedFeatureTest(unittest.TestCase):
         directory = self.spec.output_path("features", "common/H22/feature_seal.json").parent
         self.assertTrue((directory / "rows.jsonl").is_file())
         self.assertFalse((directory / "feature_seal.json").exists())
+        unavailable = FeatureSeal(
+            "MODEL_IMPROVEMENT_FEATURE_SEAL_V1", "common", "H22",
+            run_spec_sha256(self.spec), self.gate.artifact_sha256, SHA, SHA,
+            None, (), SHA, str(directory / "feature_seal.json"),
+        )
+        with self.assertRaises(ValueError):
+            load_feature_seal(Path(unavailable.path), unavailable.artifact_sha256)
+        with self.assertRaises(ValueError):
+            load_sealed_feature_rows(self.spec, self.gate, (2022,), unavailable)
         seal = seal_feature_rows(self.spec, self.gate, "common", "H22", self.rows)
         self.assertTrue(Path(seal.path).is_file())
 
