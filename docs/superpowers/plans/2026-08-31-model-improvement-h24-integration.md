@@ -281,15 +281,12 @@ def authorize_h24_outcome_open(
 - Create: `schemas/model_improvement/h24_comparison.schema.json`
 
 - [ ] Add failing controller tests for missing/extra/duplicate source-derived outcomes, postponement ambiguity, population mismatch, prediction digest mismatch, missing receipt, receipt path/digest mismatch, and a second outcome-open attempt. The H24 controller supplies authenticated SourceInventory → GameEvidence inputs to Common; it defines no H24 outcome-row type or raw outcome-row sequence.
-- [ ] Use only Common Task6B APIs: seal the typed receipt once with `seal_outcome_receipt`, securely reload it with `load_outcome_receipt`, and obtain immutable observations only with `load_outcome_rows`. All are bound to the verified RunSpec, SourceGateReceipt, matching FeatureSeal, and BaselineReplayReceipt; no H24 receipt wrapper or compatibility route is permitted.
+- [ ] Use only Common Task6B APIs: seal the typed receipt once with `seal_outcome_receipt`, securely reload it with `load_outcome_receipt`, and obtain immutable observations only with `load_outcome_rows`. All are bound to the verified RunSpec, SourceGateReceipt, matching FeatureSeal, and BaselineReplayReceipt; no H24 receipt wrapper or compatibility route is permitted. Common derives the authenticated SourceInventory → GameEvidence authorities internally from those verified inputs; callers never provide either inventory as a sealer argument.
 - [ ] Run the focused H24 controller tests and confirm RED.
 - [ ] Implement the H24 comparison handoff:
 
 ```python
-outcome_receipt = seal_outcome_receipt(
-    spec, source_gate, common_feature_seal, baseline_replay,
-    source_inventory, game_evidence_inventory,
-)
+outcome_receipt = seal_outcome_receipt(spec, source_gate, common_feature_seal, baseline_replay, baseline_prediction_seal)
 outcome_receipt = load_outcome_receipt(
     spec, source_gate, common_feature_seal, baseline_replay,
     outcome_receipt.path, outcome_receipt.artifact_sha256,

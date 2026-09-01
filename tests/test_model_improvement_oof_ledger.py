@@ -35,6 +35,9 @@ class OofLedgerDocumentationContractTest(unittest.TestCase):
         "evaluate_predictions(spec, candidate, baseline, outcome_receipt)",
         "load_evaluation_pair(spec, path, expected_sha256)",
     )
+    H24_CANONICAL_OUTCOME_SEAL_CALL = (
+        "seal_outcome_receipt(spec, source_gate, common_feature_seal, baseline_replay, baseline_prediction_seal)"
+    )
 
     def test_consumer_plans_name_only_the_receipt_bound_task8_task6_interfaces(self):
         texts = [path.read_text(encoding="utf-8") for path in PLAN_PATHS]
@@ -55,9 +58,14 @@ class OofLedgerDocumentationContractTest(unittest.TestCase):
             "outcome_rows: Sequence",
             "Sequence[H24OutcomeRow]",
             "Sequence[EvaluatedPredictionRow]",
+            "source_inventory, game_evidence_inventory",
+            "source_inventory: SourceInventory",
+            "game_evidence_inventory: GameEvidenceInventory",
         )
         for path, text in zip(PLAN_PATHS, texts):
             self.assertFalse(any(token in text for token in forbidden), path)
+            self.assertNotRegex(text, r"\bsource_inventory\s*(?::|=|,|\))", path)
+            self.assertNotRegex(text, r"\bgame_evidence_inventory\s*(?::|=|,|\))", path)
 
     def test_consumer_plans_preserve_the_staged_order_and_receipt_bindings(self):
         for path in PLAN_PATHS:
@@ -72,6 +80,10 @@ class OofLedgerDocumentationContractTest(unittest.TestCase):
             self.assertIn("outcome_receipt_path", text, path)
             self.assertIn("outcome_receipt_sha256", text, path)
             self.assertRegex(text, r"(?:never[^\n]*outcomes_sha256|outcomes_sha256[^\n]*never)", path)
+
+    def test_h24_uses_the_canonical_common_outcome_sealer_call(self):
+        text = " ".join(PLAN_PATHS[-1].read_text(encoding="utf-8").split())
+        self.assertIn(self.H24_CANONICAL_OUTCOME_SEAL_CALL, text)
 
 
 if __name__ == "__main__":
