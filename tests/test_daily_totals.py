@@ -11,6 +11,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from jsonschema import Draft202012Validator
+
 from mlb_backtest.daily_totals import (
     BuiltDailyTotals,
     MODEL_SCHEMA,
@@ -128,6 +130,24 @@ class DailyTotalsContractTests(unittest.TestCase):
         self.assertEqual(validate_totals_model_receipt(receipt), receipt)
         self.assertEqual(validate_totals_report(report), report)
 
+    def test_schemas_accept_canonical_payloads_and_reject_nested_invalid_variants(self) -> None:
+        schemas = {
+            "model": json.loads((Path.cwd() / "schemas/experimental_daily_totals_model.schema.json").read_text()),
+            "report": json.loads((Path.cwd() / "schemas/experimental_daily_totals_report.schema.json").read_text()),
+        }
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        self.assertEqual(list(Draft202012Validator(schemas["model"]).iter_errors(receipt)), [])
+        self.assertEqual(list(Draft202012Validator(schemas["report"]).iter_errors(report)), [])
+        report["history_source"]["unexpected"] = "no"
+        self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+        report = make_valid_report_payload()
+        report["games"][0]["source_digest"] = 1  # type: ignore[index]
+        self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+        report = make_valid_report_payload()
+        report["games"][0]["status"] = "UNPROJECTED"  # type: ignore[index]
+        self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+
     def test_report_rejects_nonfinite_bool_and_extra_values(self) -> None:
         for value in (True, math.nan, math.inf):
             report = make_valid_report_payload()
@@ -138,6 +158,18 @@ class DailyTotalsContractTests(unittest.TestCase):
         report["games"][0]["odds"] = 1  # type: ignore[index]
         with self.assertRaises(ValueError):
             validate_totals_report(report)
+
+    def test_receipt_requires_exact_windows_and_minimum_development_final_rows(self) -> None:
+        receipt = make_valid_model_receipt()
+        receipt["windows"]["warmup_end"] = "2026-05-30"  # type: ignore[index]
+        _recontent(receipt)
+        with self.assertRaises(ValueError):
+            validate_totals_model_receipt(receipt)
+        receipt = make_valid_model_receipt()
+        receipt["final_metrics"]["games"] = 99  # type: ignore[index]
+        _recontent(receipt)
+        with self.assertRaises(ValueError):
+            validate_totals_model_receipt(receipt)
 
     def test_unprojected_variant_is_closed(self) -> None:
         report = make_valid_report_payload()
@@ -208,11 +240,49 @@ class DailyTotalsContractTests(unittest.TestCase):
             _recontent(report)
             built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": source_sha, "model_receipt_relative": report["model_receipt_relative"]}))
             admitted = SimpleNamespace(target_date=report["target_date"], cutoff_date=report["cutoff_date"], history_identity=report["history_source"], live_identity=report["live_source"])
-            with patch("mlb_backtest.daily_totals.load_totals_sources", return_value=admitted), patch("mlb_backtest.daily_totals._source_identity", side_effect=lambda value: value):
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=admitted), patch("mlb_backtest.daily_totals._source_identity", side_effect=lambda value: value):
                 _receipt, _report, _markdown, trace_path = persist_daily_totals(root, built)
             trace = validate_totals_trace(json.loads(trace_path.read_text()))
             self.assertEqual(trace["history_source"], report["history_source"])
             self.assertEqual(trace["live_source"], report["live_source"])
+
+    def test_mismatched_receipt_path_creates_no_output_files(self) -> None:
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        report["model_receipt_relative"] = "audit/experimental_daily_totals/model/wrong.json"
+        _recontent(report)
+        built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": report["source_report_sha256"], "model_receipt_relative": report["model_receipt_relative"]}))
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            with self.assertRaises(ValueError):
+                persist_daily_totals(root, built)
+            self.assertFalse((root / "audit").exists())
+            self.assertFalse((root / "reports").exists())
+
+    def test_mismatched_re_admitted_identity_creates_no_output_files(self) -> None:
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / report["source_report_relative"]
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            source_sha = hashlib.sha256(b"source").hexdigest()
+            receipt["source_report_sha256"] = source_sha
+            _recontent(receipt)
+            report["source_report_sha256"] = source_sha
+            report["model_receipt_relative"] = f"audit/experimental_daily_totals/model/{receipt['content_sha256']}.json"
+            report["model_receipt_sha256"] = _sha(receipt)
+            _recontent(report)
+            built = BuiltDailyTotals(canonical_json_bytes(receipt), canonical_json_bytes(report), canonical_json_bytes({"source_report_relative": report["source_report_relative"], "source_report_sha256": source_sha, "model_receipt_relative": report["model_receipt_relative"]}))
+            wrong_history = dict(report["history_source"])
+            wrong_history["payload_sha256"] = "9" * 64
+            admitted = SimpleNamespace(target_date=report["target_date"], cutoff_date=report["cutoff_date"], history_identity=wrong_history, live_identity=report["live_source"])
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=admitted), patch("mlb_backtest.daily_totals._source_identity", side_effect=lambda value: value):
+                with self.assertRaises(ValueError):
+                    persist_daily_totals(root, built)
+            self.assertFalse((root / "audit").exists())
+            self.assertFalse((root / "reports/experimental_daily_totals").exists())
 
 
 if __name__ == "__main__":

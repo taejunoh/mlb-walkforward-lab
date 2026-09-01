@@ -24,7 +24,11 @@ from .experimental_totals import (
     select_candidate,
     walk_forward_predictions,
 )
-from .experimental_totals_sources import AdmittedSourceIdentity, load_totals_sources
+from .experimental_totals_sources import (
+    AdmittedSourceIdentity,
+    load_totals_sources,
+    load_totals_sources_bound,
+)
 from .live_top3_contracts import canonical_json_bytes, validate_target_date
 from .secure_fs import (
     TrustedRoot,
@@ -542,7 +546,7 @@ def persist_daily_totals(root: Path, built: BuiltDailyTotals) -> tuple[Path, Pat
         # Re-admit the full evidence chain before the first output write.  The
         # report bytes alone are insufficient because it only names the chain.
         source_relative = Path(str(report["source_report_relative"]))
-        admitted = load_totals_sources(root_path, source_relative)
+        admitted = load_totals_sources_bound(root_path, trusted, source_relative)
         if (
             admitted.target_date != report["target_date"]
             or admitted.cutoff_date != report["cutoff_date"]
