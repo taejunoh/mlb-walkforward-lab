@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import parse_qsl, urlsplit
@@ -523,7 +524,7 @@ def load_totals_sources_bound(
     root: Path, trusted: TrustedRoot, report_path: Path
 ) -> TotalsSourceBundle:
     """Admit schedule evidence through a caller-held trusted root capability."""
-    if Path(root).absolute() != trusted.path:
+    if Path(os.path.abspath(root)) != trusted.path:
         raise ValueError("trusted root differs from requested root")
     trusted.assert_bound()
     report_relative = _relative_below(trusted, report_path, "report path")

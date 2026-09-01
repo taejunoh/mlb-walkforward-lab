@@ -383,6 +383,18 @@ class TotalsSourcesTests(unittest.TestCase):
             self.assertEqual(bundle.target_date, TARGET)
             trusted.assert_bound()
 
+    def test_bound_loader_accepts_equivalent_parent_path(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources_bound
+
+        fixture = write_source_fixture(self.root)
+        equivalent_root = self.root / "unused" / ".."
+        with open_trusted_root(self.root) as trusted:
+            bundle = load_totals_sources_bound(
+                equivalent_root, trusted, fixture.report.relative_to(self.root)
+            )
+            self.assertEqual(bundle.target_date, TARGET)
+            trusted.assert_bound()
+
     def test_loader_rejects_history_before_authenticated_start_date(self) -> None:
         from mlb_backtest.experimental_totals_sources import load_totals_sources
 
