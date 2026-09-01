@@ -107,6 +107,12 @@ _OVERLAY_TRACE_KEYS = frozenset({
     "policy_schema", "policy_sha256", "report_relative", "report_sha256",
     "report_sidecar_sha256", "markdown_sha256",
 })
+_SIDECAR_MAX_BYTES = 65
+_RAW_MAX_BYTES = 256 * 1024
+_SNAPSHOT_MAX_BYTES = 256 * 1024
+_MODEL_MAX_BYTES = 2 * 1024 * 1024
+_TRACE_MAX_BYTES = 256 * 1024
+_MARKDOWN_MAX_BYTES = 256 * 1024
 
 
 def _canonical_mapping(value: object, label: str) -> dict[str, object]:
@@ -372,19 +378,20 @@ def _overlay_game(value: object) -> dict[str, object]:
         if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
             raise ValueError("overlay support margin gate differs")
     else:
-        contradictions = set()
-        if game["residual_count"] == _POLICY_AUTHORITY["required_residual_count"]:
-            contradictions.add("RESIDUAL_COUNT_MISMATCH")
-        if nonpush_support >= _POLICY_AUTHORITY["minimum_nonpush_support"]:
-            contradictions.add("NONPUSH_SUPPORT_TOO_LOW")
-        if point_gap >= _POLICY_AUTHORITY["minimum_point_gap_runs"]:
-            contradictions.add("POINT_GAP_TOO_SMALL")
-        if selected_margin is not None and selected_margin >= _POLICY_AUTHORITY["minimum_support_margin"]:
-            contradictions.add("SUPPORT_MARGIN_TOO_LOW")
-        if selected is not None:
-            contradictions.add("AMBIGUOUS_DIRECTION")
-        if contradictions.intersection(reasons):
-            raise ValueError("overlay reason codes contradict derived facts")
+        derived: list[str] = []
+        if game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"]:
+            derived.append("RESIDUAL_COUNT_MISMATCH")
+        if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+            derived.append("NONPUSH_SUPPORT_TOO_LOW")
+        if point_gap < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+            derived.append("POINT_GAP_TOO_SMALL")
+        if selected is not None and (selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]):
+            derived.append("SUPPORT_MARGIN_TOO_LOW")
+        if selected is None:
+            derived.append("AMBIGUOUS_DIRECTION")
+        non_temporal = [reason for reason in reasons if reason not in {"GAME_STARTED", "QUOTE_STALE"}]
+        if non_temporal != derived:
+            raise ValueError("overlay reason codes differ from derived facts")
     return game
 
 
@@ -598,7 +605,7 @@ def _verify_sidecar(snapshot: RegularFileSnapshot, primary: RegularFileSnapshot,
 def _existing_or_write(
     trusted: TrustedRoot, relative: Path, contents: bytes, label: str, *, rebind: Callable[[], None] | None = None,
 ) -> RegularFileSnapshot:
-    existing = read_regular_snapshot(trusted, relative, label, missing_ok=True)
+    existing = read_regular_snapshot(trusted, relative, label, max_bytes=len(contents), missing_ok=True)
     if existing is not None:
         if existing.contents != contents:
             raise FileExistsError(f"{label} identity conflicts")
@@ -652,7 +659,29 @@ class BuiltOverlay:
 
 def _rebind_all(trusted: TrustedRoot, snapshots: tuple[RegularFileSnapshot, ...], label: str) -> None:
     for snapshot in snapshots:
-        rebind_regular_snapshot(trusted, snapshot, f"{label}: {snapshot.relative.as_posix()}")
+        rebind_regular_snapshot(trusted, snapshot, f"{label}: {snapshot.relative.as_posix()}", max_bytes=_read_cap(snapshot.relative))
+
+
+def _read_cap(relative: Path) -> int:
+    """Bound every untrusted evidence read before parsing or comparison."""
+    if relative.suffix == ".sha256":
+        return _SIDECAR_MAX_BYTES
+    if relative.parts[:len(_RAW_ROOT.parts)] == _RAW_ROOT.parts:
+        return _RAW_MAX_BYTES
+    if relative.parts[:len(_SNAPSHOT_ROOT.parts)] == _SNAPSHOT_ROOT.parts:
+        return _SNAPSHOT_MAX_BYTES
+    if relative.name.endswith(".trace.json"):
+        return _TRACE_MAX_BYTES
+    if relative.suffix == ".md":
+        return _MARKDOWN_MAX_BYTES
+    return _MODEL_MAX_BYTES
+
+
+def _read_evidence(trusted: TrustedRoot, relative: Path, label: str) -> RegularFileSnapshot:
+    snapshot = read_regular_snapshot(trusted, relative, label, max_bytes=_read_cap(relative))
+    if snapshot is None:
+        raise ValueError(f"{label} differs")
+    return snapshot
 
 
 def _fixed_model_gates(report: Mapping[str, object], receipt: Mapping[str, object]) -> None:
@@ -690,20 +719,16 @@ def load_and_validate_model_authority(root: Path, model_trace: Path) -> ModelAut
     if not trace_relative.name.endswith(".trace.json"):
         raise ValueError("model trace path differs")
     with open_trusted_root(root_path) as trusted:
-        trace_snapshot = read_regular_snapshot(trusted, trace_relative, "model trace")
-        if trace_snapshot is None:
-            raise ValueError("model trace differs")
+        trace_snapshot = _read_evidence(trusted, trace_relative, "model trace")
         trace = validate_totals_trace(_canonical_json(trace_snapshot, "model trace"))
         report_relative = _under(Path(str(trace["report_relative"])), _MODEL_REPORT_ROOT, "model report path")
         receipt_relative = _under(Path(str(trace["model_receipt_relative"])), _MODEL_RECEIPT_ROOT, "model receipt path")
         if receipt_relative != _MODEL_RECEIPT_ROOT / f"{Path(receipt_relative).stem}.json":
             raise ValueError("model receipt path differs")
-        report_snapshot = read_regular_snapshot(trusted, report_relative, "model report")
-        report_sidecar = read_regular_snapshot(trusted, report_relative.with_suffix(".sha256"), "model report sidecar")
-        receipt_snapshot = read_regular_snapshot(trusted, receipt_relative, "model receipt")
-        receipt_sidecar = read_regular_snapshot(trusted, receipt_relative.with_suffix(".sha256"), "model receipt sidecar")
-        if None in (report_snapshot, report_sidecar, receipt_snapshot, receipt_sidecar):
-            raise ValueError("model authority evidence differs")
+        report_snapshot = _read_evidence(trusted, report_relative, "model report")
+        report_sidecar = _read_evidence(trusted, report_relative.with_suffix(".sha256"), "model report sidecar")
+        receipt_snapshot = _read_evidence(trusted, receipt_relative, "model receipt")
+        receipt_sidecar = _read_evidence(trusted, receipt_relative.with_suffix(".sha256"), "model receipt sidecar")
         report = validate_totals_report(_canonical_json(report_snapshot, "model report"))
         receipt = validate_totals_model_receipt(_canonical_json(receipt_snapshot, "model receipt"))
         _verify_sidecar(report_sidecar, report_snapshot, "model report sidecar")
@@ -732,10 +757,8 @@ def _raw_capture(
     raw_relative = _under(raw_capture, _RAW_ROOT, "raw capture path")
     if raw_relative.parent != _RAW_ROOT or not re.fullmatch(r"[0-9a-f]{64}\.json", raw_relative.name):
         raise ValueError("raw capture path differs")
-    raw = read_regular_snapshot(trusted, raw_relative, label)
-    sidecar = read_regular_snapshot(trusted, raw_relative.with_suffix(".sha256"), f"{label} sidecar")
-    if raw is None or sidecar is None:
-        raise ValueError("raw capture differs")
+    raw = _read_evidence(trusted, raw_relative, label)
+    sidecar = _read_evidence(trusted, raw_relative.with_suffix(".sha256"), f"{label} sidecar")
     digest = _sha_bytes(raw.contents)
     if raw_relative.stem != digest or sidecar.contents != f"{digest}\n".encode("ascii"):
         raise ValueError("raw capture digest differs")
@@ -806,10 +829,8 @@ def _load_snapshot(
     relative = _under(market_snapshot, _SNAPSHOT_ROOT, "market snapshot path")
     if relative.parent != _SNAPSHOT_ROOT or not re.fullmatch(r"[0-9a-f]{64}\.json", relative.name):
         raise ValueError("market snapshot path differs")
-    primary = read_regular_snapshot(trusted, relative, "market snapshot")
-    sidecar = read_regular_snapshot(trusted, relative.with_suffix(".sha256"), "market snapshot sidecar")
-    if primary is None or sidecar is None:
-        raise ValueError("market snapshot differs")
+    primary = _read_evidence(trusted, relative, "market snapshot")
+    sidecar = _read_evidence(trusted, relative.with_suffix(".sha256"), "market snapshot sidecar")
     value = validate_draftkings_snapshot(_canonical_json(primary, "market snapshot"))
     _verify_sidecar(sidecar, primary, "market snapshot sidecar")
     if relative.stem != value["content_sha256"] or value["content_sha256"] != _sha_bytes(canonical_json_bytes({key: item for key, item in value.items() if key != "content_sha256"})):
