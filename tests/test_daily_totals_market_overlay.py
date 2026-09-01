@@ -2585,6 +2585,38 @@ class IntegrationAcceptanceTests(unittest.TestCase):
                 for path in new_files
             ))
 
+    def test_reverse_order_raw_capture_is_admitted_and_overlay_keeps_sealed_order(self) -> None:
+        """Raw capture order is independent; comparison follows sealed report order."""
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = SecurePersistenceTests._authority(root)
+            raw_value = SecurePersistenceTests._raw_value(root, raw)
+            raw_value["games"] = list(reversed(raw_value["games"]))
+            reversed_raw = SecurePersistenceTests._write_raw(root, raw_value)
+            snapshot = admit_draftkings_snapshot(
+                root,
+                trace,
+                reversed_raw,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+            )
+            snapshot_value = json.loads((root / snapshot).read_bytes())
+            self.assertEqual(
+                [game["game_pk"] for game in snapshot_value["games"]],
+                list(reversed(FIXED_GAME_PKS)),
+            )
+            built = build_overlay(
+                root,
+                trace,
+                snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                [game["game_pk"] for game in built.report["games"]],
+                list(FIXED_GAME_PKS),
+            )
+
     def test_overlay_import_isolated_from_network_browser_and_model_runner(self) -> None:
         """The public module imports offline with network/browser imports denied."""
         script = """

@@ -783,8 +783,9 @@ def _raw_capture(
     if not isinstance(games, list) or len(games) != len(FIXED_GAME_PKS):
         raise ValueError("raw capture games differ")
     parsed = [_snapshot_game(game) for game in games]
-    if [game["game_pk"] for game in parsed] != list(FIXED_GAME_PKS):
-        raise ValueError("raw capture game ordering differs")
+    game_pks = [game["game_pk"] for game in parsed]
+    if len(set(game_pks)) != len(FIXED_GAME_PKS) or set(game_pks) != set(FIXED_GAME_PKS):
+        raise ValueError("raw capture game set differs")
     return raw, sidecar, {"captured_at_utc": value["captured_at_utc"], "source_url": value["source_url"], "games": parsed}
 
 
