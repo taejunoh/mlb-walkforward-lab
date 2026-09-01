@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -10,7 +11,14 @@ from typing import Mapping, Sequence
 
 from mlb_backtest import execution_registry, protocols, v52_verify_sources
 
-from .canonical import canonical_json_bytes, read_regular_bytes, write_immutable_json
+from .canonical import (
+    _identity,
+    _open_parent,
+    _read_regular_from_parent,
+    canonical_json_bytes,
+    read_regular_bytes,
+    write_immutable_json,
+)
 from .contracts import (
     _require_descriptor,
     _require_exact_mapping,
@@ -217,6 +225,43 @@ def _receipt_path(spec: ModelImprovementRunSpec) -> Path:
     return spec.output_path("source_gate", "source_gate_receipt.json")
 
 
+def _capture_new_primary_identity(path: Path, expected: bytes) -> tuple[int, ...]:
+    """Capture an exact newly-published primary before its sidecar is attempted."""
+    with _open_parent(path, create=False) as (parent_fd, leaf, _absolute):
+        contents, identity = _read_regular_from_parent(
+            parent_fd, leaf, "source gate primary"
+        )
+        if contents != expected:
+            raise ValueError("source gate primary differs after publication")
+        return identity
+
+
+def _remove_new_primary_if_unchanged(
+    path: Path, expected: bytes, expected_identity: tuple[int, ...]
+) -> None:
+    """Undo only this call's still-identical primary after sidecar failure.
+
+    This intentionally makes a failed cleanup non-destructive: if another
+    writer changed the name or inode, it leaves that evidence untouched.
+    """
+    try:
+        with _open_parent(path, create=False) as (parent_fd, leaf, _absolute):
+            contents, identity = _read_regular_from_parent(
+                parent_fd, leaf, "source gate primary"
+            )
+            named = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                contents != expected
+                or identity != expected_identity
+                or _identity(named) != expected_identity
+            ):
+                return
+            os.unlink(leaf, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    except (OSError, ValueError):
+        return
+
+
 def _load_bound_receipt(spec: ModelImprovementRunSpec, path: Path, digest: str) -> SourceGateReceipt:
     receipt = load_source_gate_receipt(path, digest)
     if receipt.run_spec_sha256 != run_spec_sha256(spec):
@@ -259,9 +304,22 @@ def verify_source_gate(spec: ModelImprovementRunSpec) -> SourceGateReceipt:
     )
     payload = provisional.as_mapping()
     path = _receipt_path(fresh)
-    write_immutable_json(path, payload)
-    digest = sha256(canonical_json_bytes(payload)).hexdigest()
-    write_immutable_json(path.with_suffix(path.suffix + ".sha256"), {"artifact_sha256": digest})
+    payload_bytes = canonical_json_bytes(payload)
+    primary_created = write_immutable_json(path, payload)
+    primary_identity = (
+        _capture_new_primary_identity(path, payload_bytes)
+        if primary_created
+        else None
+    )
+    digest = sha256(payload_bytes).hexdigest()
+    try:
+        write_immutable_json(
+            path.with_suffix(path.suffix + ".sha256"), {"artifact_sha256": digest}
+        )
+    except Exception:
+        if primary_identity is not None:
+            _remove_new_primary_if_unchanged(path, payload_bytes, primary_identity)
+        raise
     return _load_bound_receipt(fresh, path, digest)
 
 

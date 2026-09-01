@@ -16,6 +16,7 @@ from unittest.mock import patch
 from jsonschema import Draft202012Validator
 
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
+import mlb_backtest.model_improvement.source_gate as source_gate
 from mlb_backtest.model_improvement.run_spec import (
     VerifiedRunSpecActivation,
     build_run_spec,
@@ -241,6 +242,57 @@ class SourceGateTest(unittest.TestCase):
                 verify_source_gate(spec)
             self.assertIn("inputs", calls)
             self.assertFalse(spec.output_path("source_gate", "source_gate_receipt.json").exists())
+        finally:
+            temporary.cleanup()
+
+    def test_new_primary_is_removed_if_mandatory_sidecar_publish_fails(self):
+        temporary, _root, declaration, _authority = self.make_activation()
+        try:
+            spec = load_verified_run_spec(declaration)
+            primary = spec.output_path("source_gate", "source_gate_receipt.json")
+            sidecar = primary.with_suffix(primary.suffix + ".sha256")
+            real_writer = source_gate.write_immutable_json
+
+            def fail_sidecar(path, value):
+                if path == sidecar:
+                    raise ValueError("injected sidecar failure")
+                return real_writer(path, value)
+
+            patches = self.source_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                source_gate, "write_immutable_json", side_effect=fail_sidecar
+            ), self.assertRaisesRegex(ValueError, "injected sidecar failure"):
+                verify_source_gate(spec)
+            self.assertFalse(primary.exists())
+            self.assertFalse(sidecar.exists())
+        finally:
+            temporary.cleanup()
+
+    def test_preexisting_identical_primary_survives_sidecar_publish_failure(self):
+        temporary, _root, declaration, _authority = self.make_activation()
+        try:
+            spec = load_verified_run_spec(declaration)
+            patches = self.source_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                receipt = verify_source_gate(spec)
+            primary = Path(receipt.path)
+            sidecar = primary.with_suffix(primary.suffix + ".sha256")
+            expected_bytes = canonical_json_bytes(receipt.as_mapping())
+            sidecar.unlink()
+            real_writer = source_gate.write_immutable_json
+
+            def fail_sidecar(path, value):
+                if path == sidecar:
+                    raise ValueError("injected sidecar failure")
+                return real_writer(path, value)
+
+            patches = self.source_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                source_gate, "write_immutable_json", side_effect=fail_sidecar
+            ), self.assertRaisesRegex(ValueError, "injected sidecar failure"):
+                verify_source_gate(spec)
+            self.assertEqual(primary.read_bytes(), expected_bytes)
+            self.assertFalse(sidecar.exists())
         finally:
             temporary.cleanup()
 
