@@ -99,6 +99,19 @@ class RunSpecTest(unittest.TestCase):
             raw["prediction_contract_sha256"] = sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest()
             with self.assertRaisesRegex(ValueError, "prediction contract"):
                 build_run_spec(raw)
+        for index, confidence_range in enumerate(([False, 10.0], [0, 10], [0.0, 10.0])):
+            raw = self.raw()
+            raw["prediction_contract"]["confidence_range"] = confidence_range
+            raw["prediction_contract_sha256"] = sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest()
+            if index < 2:
+                with self.subTest(confidence_range=confidence_range):
+                    with self.assertRaisesRegex(ValueError, "prediction contract"):
+                        build_run_spec(raw)
+        raw = self.raw()
+        raw["prediction_contract"]["confidence_formula"] += " "
+        raw["prediction_contract_sha256"] = sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest()
+        with self.assertRaisesRegex(ValueError, "prediction contract"):
+            build_run_spec(raw)
 
     def test_all_nested_bindings_and_paths_fail_closed(self):
         raw = self.raw()

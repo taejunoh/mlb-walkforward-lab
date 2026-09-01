@@ -393,6 +393,8 @@ def build_run_spec(raw: Mapping[str, object]) -> ModelImprovementRunSpec:
     contract_mapping = _thaw_json(contract)
     if isinstance(contract_mapping, Mapping) and contract_mapping.get("component_weights_binding") != _CONTRACT["component_weights_binding"]:
         raise ValueError("component weights binding differs")
+    if canonical_json_bytes(values["prediction_contract"]) != canonical_json_bytes(_CONTRACT):
+        raise ValueError("prediction contract differs or contains noncanonical values")
     if contract_mapping != _CONTRACT:
         raise ValueError("prediction contract differs or contains unknown keys")
     outputs = _exact(values["outputs"], {"root", "namespaces"}, "outputs")
