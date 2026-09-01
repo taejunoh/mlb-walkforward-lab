@@ -151,6 +151,7 @@ payloads, manifests, receipts, and sidecars. Reject:
 - wrong report target/cutoff/model label;
 - absolute, `..`, backslash, alias, symlink, or outside-root paths;
 - payload byte count/hash mutation and receipt/binding mismatch;
+- report binding `game_pks` unequal to the canonical parsed source population;
 - historical duplicate gamePk, post-cutoff row, or malformed final score;
 - target row whose date differs or whose game is not pregame.
 
@@ -173,9 +174,13 @@ Expected: FAIL because the source adapter does not exist.
 - [ ] **Step 3: Implement one-root-capability admission**
 
 Create frozen `AdmittedSourceIdentity` and `TotalsSourceBundle`. Each source
-identity retains the relative claim, receipt, receipt-sidecar, completion,
-completion-sidecar, manifest, and manifest-sidecar paths plus each canonical
-byte digest, binding digest, payload relative path/digest/byte count, and query
+identity retains every role-defined immutable component and digest. History
+uses claim, receipt, receipt sidecar, completion, completion sidecar, manifest,
+manifest sidecar, and payload. Live uses the separately located observation
+claim, receipt, completion, completion sidecar, manifest, and payload; the
+existing live-observation contract has no claim, receipt, or manifest sidecar,
+so their absence is required rather than repaired or invented. Each identity
+also retains binding digest, payload relative path/digest/byte count, and query
 identity digest. The bundle retains both exact `HISTORY_SCHEDULE` and
 `LIVE_SCHEDULE` identities, `target_date`, `cutoff_date`, `history_games`, and
 `target_games`; no downstream layer may reduce these to payload digests alone.
@@ -189,15 +194,15 @@ def load_totals_sources(root: Path, report_path: Path) -> TotalsSourceBundle: ..
 Normalize and bind `root` once with `open_trusted_root`. Securely read and
 rebind the report using `read_regular_snapshot`; validate its bytes with
 `validate_run_payload`. Reconstruct and validate `SourceBinding` objects from
-the report mappings. Derive the exact claim, primary, primary sidecar,
-completion, and completion-sidecar paths from each binding's receipt prefix;
-securely read every component without calling a helper that can complete or
-repair a missing receipt. Require closed canonical claim and completion
-mappings, matching primary bytes and SHA-256 sidecars, and a completion that
-binds the same receipt digest. Derive the exact manifest filename from the
-binding's canonical query-identity digest and payload SHA-256; verify its
-canonical bytes, sidecar, source, query identity, payload digest, byte count,
-and row count. Reject missing, extra, or inconsistent receipt-chain pieces.
+the report mappings. Derive exact component paths from the role's existing
+receipt contract; securely read every component without calling a helper that
+can complete or repair missing evidence. Require closed canonical claim and
+completion mappings and a completion that binds the same receipt digest.
+Validate every sidecar that the role actually defines and require absence of
+sidecars the role does not define. Derive or bind the exact manifest filename
+from the canonical query identity and payload SHA-256; verify canonical source,
+request, payload digest, byte count, and row count fields. Reject missing,
+extra, or inconsistent role-defined receipt-chain pieces.
 
 For each selected binding, securely read its `payload_relative`, require exact
 `byte_length` and `payload_sha256`, and rebind after parsing. Use
@@ -205,18 +210,24 @@ For each selected binding, securely read its `payload_relative`, require exact
 `parse_live_schedule(..., requested_date=target_date)` for target games.
 Pass closed projections into Task 1 validators; never return raw JSON.
 Require sport ID 1, MLB league identity, regular-season game type `R`, and an
-unambiguous game type before admitting a historical or target row. Add fixtures
-that reject spring training, postseason, non-MLB sport/league, and missing or
-ambiguous game type before any rate calculation.
+unambiguous game type through the exact authenticated StatsAPI schedule request
+(`sportId=1`, `gameType=R`, fixed dates) before admitting rows. If game-level
+sport/league fields are present they must agree; StatsAPI payloads that omit
+those redundant fields remain admissible because the authenticated request is
+the authority. Add fixtures that reject a non-MLB request, spring/postseason
+request, and missing or ambiguous request type before any rate calculation.
+Raw schedule occurrences may repeat one `gamePk` across moved query dates;
+apply the existing official schedule parser first, then require the canonical
+parsed population to contain unique `game_pk`. Conflicting duplicates remain a
+parser integrity failure.
 
 - [ ] **Step 4: Add before/open/post mutation tests and run GREEN**
 
 Use existing test hooks or a narrow adapter hook to swap report/payload
 identity after the first read. The loader must hold or reread/rebind every
-claim, receipt, receipt sidecar, completion, completion sidecar, manifest,
-manifest sidecar, and payload after all dependent reads. Add mutation tests for
-each component class, not only report/payload, and require rejection before
-returning a bundle.
+role-defined claim, receipt, sidecar, completion, manifest, and payload after
+all dependent reads. Add mutation tests for each component class, not only
+report/payload, and require rejection before returning a bundle.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_experimental_totals_sources tests.test_experimental_totals -v
