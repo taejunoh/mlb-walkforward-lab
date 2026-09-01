@@ -1,9 +1,9 @@
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from mlb_backtest.model_improvement import canonical as canonical_module
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes,
     read_regular_bytes,
@@ -62,6 +62,20 @@ class CanonicalArtifactTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 write_immutable_json(link, {"version": 1})
 
+    def test_identical_regular_hardlink_is_admitted(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            directory_path = Path(directory)
+            target = directory_path / "target.json"
+            target.write_bytes(canonical_json_bytes({"version": 1}))
+            link = directory_path / "hardlink.json"
+            os.link(target, link)
+
+            self.assertEqual(
+                read_regular_bytes(link, "hard-linked artifact"),
+                canonical_json_bytes({"version": 1}),
+            )
+            self.assertFalse(write_immutable_json(link, {"version": 1}))
+
     def test_non_regular_path_is_denied(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "directory"
@@ -75,19 +89,33 @@ class CanonicalArtifactTests(unittest.TestCase):
     def test_reread_tamper_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "artifact.json"
-            value = {"payload": "x" * 2_000_000}
-            original_hook = canonical_module._canonical_test_hook
-
-            def tamper_before_reread(stage, hook_path):
-                if stage == "before_reread":
-                    hook_path.write_bytes(b"!" * len(canonical_json_bytes(value)))
-
-            canonical_module._canonical_test_hook = tamper_before_reread
+            value = {"payload": "x" * 2_000}
+            tampering_path = _TamperingPath(
+                path, b"!" * len(canonical_json_bytes(value))
+            )
             try:
                 with self.assertRaises(ValueError):
-                    write_immutable_json(path, value)
+                    write_immutable_json(tampering_path, value)
             finally:
-                canonical_module._canonical_test_hook = original_hook
+                path.unlink(missing_ok=True)
+
+
+class _TamperingPath:
+    """PathLike that changes a real file exactly before its second open."""
+
+    def __init__(self, path: Path, replacement: bytes) -> None:
+        self.path = path
+        self.replacement = replacement
+        self.calls = 0
+
+    def __fspath__(self) -> str:
+        self.calls += 1
+        if self.calls == 2:
+            self.path.write_bytes(self.replacement)
+        return os.fspath(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
 
 
 if __name__ == "__main__":

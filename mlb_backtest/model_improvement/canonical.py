@@ -77,17 +77,12 @@ def write_immutable_json(path: Path, value: object) -> bool:
 
         # The descriptor is deliberately closed before this path-based reread.
         # This proves that the published name still denotes the bytes we wrote.
-        _canonical_test_hook("before_reread", absolute)
         reread = read_regular_bytes(path, str(path))
         if reread != contents:
             raise ValueError(f"immutable artifact differs: {path}")
         _assert_path_identity(absolute, created_identity, str(path))
         os.fsync(parent_fd)
         return True
-
-
-def _canonical_test_hook(stage: str, path: Path) -> None:
-    """No-op seam for deterministic real-filesystem race tests."""
 
 
 @contextmanager
@@ -271,7 +266,7 @@ def _write_all(descriptor: int, contents: bytes, label: str) -> None:
 
 
 def _require_regular(result: os.stat_result, label: str) -> None:
-    if not stat.S_ISREG(result.st_mode) or result.st_nlink != 1:
+    if not stat.S_ISREG(result.st_mode):
         raise ValueError(f"unsafe regular file: {label}")
 
 
