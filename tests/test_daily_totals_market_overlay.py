@@ -39,9 +39,27 @@ from mlb_backtest.daily_totals_market_overlay import (
     validate_overlay_report,
 )
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
+import mlb_backtest.daily_totals_market_overlay as overlay_module
 
 
-class CliTests(unittest.TestCase):
+class HermeticAuthorityTestCase(unittest.TestCase):
+    """Confine synthetic sealed chains to an explicit patched test authority."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._authority_patch = patch.object(
+            overlay_module,
+            "_MODEL_AUTHORITY_SPEC",
+            overlay_module._PRODUCTION_MODEL_AUTHORITY_SPEC,
+        )
+        self._authority_patch.start()
+
+    def tearDown(self) -> None:
+        self._authority_patch.stop()
+        super().tearDown()
+
+
+class CliTests(HermeticAuthorityTestCase):
     def test_renderer_has_research_labels_and_all_quoted_details(self) -> None:
         from mlb_backtest.daily_totals_market_overlay import render_overlay_markdown
 
@@ -249,7 +267,7 @@ class CliTests(unittest.TestCase):
                 self.assertNotIn("raw.json", message)
 
 
-class SecurePersistenceTests(unittest.TestCase):
+class SecurePersistenceTests(HermeticAuthorityTestCase):
     def test_public_secure_persistence_interfaces_exist(self) -> None:
         """Catch removal of the admission/build/persistence public boundary."""
         import mlb_backtest.daily_totals_market_overlay as overlay
@@ -263,6 +281,31 @@ class SecurePersistenceTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertTrue(hasattr(overlay, name))
+
+    def test_production_authority_accepts_only_the_pinned_chain(self) -> None:
+        """A self-consistent fixture is never an authority under production defaults."""
+        production_trace = Path(
+            "reports/experimental_daily_totals/2026-09-01/"
+            "20260901T150649125495Z-9fd1b2a4bad5c3f9.trace.json"
+        )
+        with patch.object(
+            overlay_module,
+            "_MODEL_AUTHORITY_SPEC",
+            overlay_module._PRODUCTION_MODEL_AUTHORITY_SPEC,
+        ):
+            authority = overlay_module.load_and_validate_model_authority(
+                Path(__file__).parents[1], production_trace,
+            )
+        self.assertEqual(authority.snapshots[0].relative, production_trace)
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            trace, _ = self._authority(Path(temporary))
+            with patch.object(
+                overlay_module,
+                "_MODEL_AUTHORITY_SPEC",
+                overlay_module._PRODUCTION_MODEL_AUTHORITY_SPEC,
+            ), self.assertRaises(ValueError):
+                overlay_module.load_and_validate_model_authority(Path(temporary), trace)
 
     @staticmethod
     def _digest(value: object) -> str:
@@ -336,7 +379,26 @@ class SecurePersistenceTests(unittest.TestCase):
         (root / raw_relative).parent.mkdir(parents=True, exist_ok=True)
         (root / raw_relative).write_bytes(raw_bytes)
         (root / raw_relative.with_suffix(".sha256")).write_bytes(raw_digest.encode("ascii") + b"\n")
+        cls._pin_test_authority(root, trace_relative)
         return trace_relative, raw_relative
+
+    @staticmethod
+    def _pin_test_authority(root: Path, trace: Path) -> None:
+        """Replace the patched frozen authority with this fixture's exact bytes."""
+        trace_bytes = (root / trace).read_bytes()
+        trace_value = json.loads(trace_bytes)
+        report = Path(trace_value["report_relative"])
+        receipt = Path(trace_value["model_receipt_relative"])
+        overlay_module._MODEL_AUTHORITY_SPEC = overlay_module._ModelAuthoritySpec(
+            trace_relative=trace,
+            trace_sha256=hashlib.sha256(trace_bytes).hexdigest(),
+            report_relative=report,
+            report_sha256=hashlib.sha256((root / report).read_bytes()).hexdigest(),
+            report_sidecar_sha256=hashlib.sha256((root / report.with_suffix(".sha256")).read_bytes()).hexdigest(),
+            receipt_relative=receipt,
+            receipt_sha256=hashlib.sha256((root / receipt).read_bytes()).hexdigest(),
+            receipt_sidecar_sha256=hashlib.sha256((root / receipt.with_suffix(".sha256")).read_bytes()).hexdigest(),
+        )
 
     @staticmethod
     def _raw_value(root: Path, raw: Path) -> dict[str, object]:
@@ -383,6 +445,7 @@ class SecurePersistenceTests(unittest.TestCase):
         trace_value["report_sidecar_sha256"] = hashlib.sha256(report_sidecar).hexdigest()
         trace_value["content_sha256"] = cls._digest({key: item for key, item in trace_value.items() if key != "content_sha256"})
         trace_path.write_bytes(canonical_json_bytes(trace_value))
+        cls._pin_test_authority(root, trace)
 
     @classmethod
     def _alternate_model_report(cls, root: Path, trace: Path) -> tuple[Path, bytes, str]:
@@ -1905,7 +1968,7 @@ class SecurePersistenceTests(unittest.TestCase):
             self.assertEqual(row["decision"], "PASS")
             self.assertEqual(row["reason_codes"], (
                 "NONPUSH_SUPPORT_TOO_LOW", "POINT_GAP_TOO_SMALL",
-                "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION",
+                "AMBIGUOUS_DIRECTION",
             ))
             paths = persist_overlay(root, built)
             self.assertTrue((root / paths[-1]).is_file())
@@ -2066,6 +2129,56 @@ class SecurePersistenceTests(unittest.TestCase):
                     if not expected_reasons:
                         self.assertEqual(row["decision"], "RESEARCH_PICK")
 
+    def test_public_exact_five_point_margin_uses_count_and_price_rationals(self) -> None:
+        """191/764 at +400 is exactly .05 and must clear the margin gate."""
+        samples = [9] * 191 + [7] * 573
+
+        def raw_exact(value: dict[str, object]) -> None:
+            value["games"][0].update({
+                "line_half_runs": 17,
+                "over_american_odds": 400,
+                "under_american_odds": -10000,
+            })
+
+        def report_exact(report: dict[str, object]) -> None:
+            report["games"][0].update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [7, 9],
+            })
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            _, _, built = self._build_public_case(Path(temporary), raw_exact, report_exact)
+            row = built.report["games"][0]
+            self.assertEqual(row["selected_side"], "OVER")
+            self.assertEqual(row["decision"], "RESEARCH_PICK")
+            self.assertEqual(row["reason_codes"], ())
+
+    def test_public_exact_strong_margin_tie_is_ambiguous_without_low_margin_reason(self) -> None:
+        """Equal strong count-derived margins are ambiguous, not a low-margin pass."""
+        samples = [9] * 54 + [7] * 710
+
+        def raw_tie(value: dict[str, object]) -> None:
+            value["games"][0].update({
+                "line_half_runs": 17,
+                "over_american_odds": 6012,
+                "under_american_odds": -700,
+            })
+
+        def report_tie(report: dict[str, object]) -> None:
+            report["games"][0].update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [7, 7],
+            })
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            _, _, built = self._build_public_case(Path(temporary), raw_tie, report_tie)
+            row = built.report["games"][0]
+            self.assertIsNone(row["selected_side"])
+            self.assertEqual(row["decision"], "PASS")
+            self.assertEqual(row["reason_codes"], ("AMBIGUOUS_DIRECTION",))
+
 
 class SchemaTests(unittest.TestCase):
     def test_contract_schemas_are_draft_2020_12_closed_roots(self) -> None:
@@ -2132,10 +2245,10 @@ class SchemaTests(unittest.TestCase):
         row = value["games"][0]
         row.update({
             "expected_total": 9.5, "over_american_odds": 100, "under_american_odds": -100,
-            "over_support": 0.55, "under_support": 0.45, "push_support": 0.0,
+            "over_support": 421 / 764, "under_support": 343 / 764, "push_support": 0.0,
             "decision": "RESEARCH_PICK", "reason_codes": [],
         })
-        cls._set_supports(row, 0.55, 0.45)
+        cls._set_supports(row, 421 / 764, 343 / 764)
         value["content_sha256"] = cls._digest(value)
         return value
 
@@ -2146,15 +2259,33 @@ class SchemaTests(unittest.TestCase):
 
     @staticmethod
     def _set_supports(row: dict[str, object], over: float, under: float, push: float = 0.0) -> None:
-        over_result = price_support(over, under, row["over_american_odds"])
-        under_result = price_support(under, over, row["under_american_odds"])
+        total = row["residual_count"]
+        assert type(total) is int and total > 0
+        counts = [round(rate * total) for rate in (over, under, push)]
+        assert sum(counts) == total
+        over_count, under_count, push_count = counts
+        over_result = overlay_module._display_price_support(
+            overlay_module._price_support_from_counts(
+                over_count, under_count, total, row["over_american_odds"],
+            )
+        )
+        under_result = overlay_module._display_price_support(
+            overlay_module._price_support_from_counts(
+                under_count, over_count, total, row["under_american_odds"],
+            )
+        )
         row.update({
-            "over_support": over, "under_support": under, "push_support": push,
+            "over_support": over_count / total,
+            "under_support": under_count / total,
+            "push_support": push_count / total,
             "over_conditional_support": over_result.conditional_support,
             "under_conditional_support": under_result.conditional_support,
             "over_support_margin": over_result.support_margin,
             "under_support_margin": under_result.support_margin,
-            "selected_side": select_direction(over_result, under_result)[0],
+            "selected_side": overlay_module._select_exact_direction(
+                overlay_module._price_support_from_counts(over_count, under_count, total, row["over_american_odds"]),
+                overlay_module._price_support_from_counts(under_count, over_count, total, row["under_american_odds"]),
+            )[0],
         })
 
     def test_valid_instances_pass_their_json_schemas(self) -> None:
@@ -2465,7 +2596,7 @@ class SchemaTests(unittest.TestCase):
                     validate_overlay_report(invalid)
 
 
-class IntegrationAcceptanceTests(unittest.TestCase):
+class IntegrationAcceptanceTests(HermeticAuthorityTestCase):
     """Hermetic Task 5 acceptance checks across the public CLI boundary."""
 
     @classmethod
@@ -2524,27 +2655,32 @@ class IntegrationAcceptanceTests(unittest.TestCase):
                 if path.is_file()
             }
 
-            admitted = self._run_cli(
-                "admit-snapshot", "--root", str(root),
-                "--model-trace", trace.as_posix(), "--raw-capture", raw.as_posix(),
-                cwd=Path.cwd(),
-            )
-            self.assertEqual(admitted.returncode, 0, admitted.stderr)
-            self.assertEqual(admitted.stderr, "")
-            snapshot_relative = Path(admitted.stdout.strip())
-            self.assertEqual(admitted.stdout.count("\n"), 1)
+            clock = datetime.now(timezone.utc).replace(microsecond=0)
+            with patch.object(overlay_module, "utc_now", return_value=clock), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                self.assertEqual(overlay_module.main([
+                    "admit-snapshot", "--root", str(root),
+                    "--model-trace", trace.as_posix(), "--raw-capture", raw.as_posix(),
+                ]), 0)
+                admitted_stdout = "".join(call.args[0] for call in stdout.write.call_args_list)
+                self.assertEqual(stderr.write.call_args_list, [])
+            snapshot_relative = Path(admitted_stdout.strip())
+            self.assertEqual(admitted_stdout.count("\n"), 1)
             self.assertFalse(snapshot_relative.is_absolute())
             self.assertTrue(snapshot_relative.is_relative_to(Path("audit/experimental_daily_totals_market")))
 
-            compared = self._run_cli(
-                "compare", "--root", str(root),
-                "--model-trace", trace.as_posix(), "--market-snapshot", snapshot_relative.as_posix(),
-                cwd=Path.cwd(),
-            )
-            self.assertEqual(compared.returncode, 0, compared.stderr)
-            self.assertEqual(compared.stderr, "")
-            trace_relative = Path(compared.stdout.strip())
-            self.assertEqual(compared.stdout.count("\n"), 1)
+            with patch.object(overlay_module, "utc_now", return_value=clock), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                self.assertEqual(overlay_module.main([
+                    "compare", "--root", str(root),
+                    "--model-trace", trace.as_posix(), "--market-snapshot", snapshot_relative.as_posix(),
+                ]), 0)
+                compared_stdout = "".join(call.args[0] for call in stdout.write.call_args_list)
+                self.assertEqual(stderr.write.call_args_list, [])
+            trace_relative = Path(compared_stdout.strip())
+            self.assertEqual(compared_stdout.count("\n"), 1)
             self.assertFalse(trace_relative.is_absolute())
             self.assertTrue(trace_relative.is_relative_to(Path("reports/experimental_daily_totals_overlay/2026-09-01")))
 

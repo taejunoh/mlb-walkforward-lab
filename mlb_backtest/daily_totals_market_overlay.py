@@ -117,6 +117,43 @@ _TRACE_MAX_BYTES = 256 * 1024
 _MARKDOWN_MAX_BYTES = 256 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class _ModelAuthoritySpec:
+    """The one sealed model chain that production V1 may consume."""
+
+    trace_relative: Path
+    trace_sha256: str
+    report_relative: Path
+    report_sha256: str
+    report_sidecar_sha256: str
+    receipt_relative: Path
+    receipt_sha256: str
+    receipt_sidecar_sha256: str
+
+
+_PRODUCTION_MODEL_AUTHORITY_SPEC = _ModelAuthoritySpec(
+    trace_relative=Path(
+        "reports/experimental_daily_totals/2026-09-01/"
+        "20260901T150649125495Z-9fd1b2a4bad5c3f9.trace.json"
+    ),
+    trace_sha256="ca92083322fb6f0bc836f1c78ead0d60fd4e9f01c9e1e7eb14f46efc764749b6",
+    report_relative=Path(
+        "reports/experimental_daily_totals/2026-09-01/"
+        "20260901T150649125495Z-9fd1b2a4bad5c3f9.json"
+    ),
+    report_sha256="5f8e282b254fe0bdc74fb35bb1a5cd3da212990725bf4166a915dfc5ea745d06",
+    report_sidecar_sha256="a6862ab3446bd182af035f9ea0b4a71289794543dd159e151f3e723feeb53056",
+    receipt_relative=Path(
+        "audit/experimental_daily_totals/model/"
+        "e7cbc56c93ce4203d631a5f2ffb51d917331dddd8fb15244e0058b514c8dfee5.json"
+    ),
+    receipt_sha256="69543ea4c1163dfe6f57f482aabe031523b215e0549d1a5d99ac54156ad2f7d2",
+    receipt_sidecar_sha256="152a229927e01da7a9ca6b703cc2ef727e3bc7ff1101466655c329b87b8aa630",
+)
+# Tests may temporarily patch this private, frozen value for hermetic evidence.
+_MODEL_AUTHORITY_SPEC = _PRODUCTION_MODEL_AUTHORITY_SPEC
+
+
 def _canonical_mapping(value: object, label: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -331,11 +368,23 @@ def _overlay_game(value: object) -> dict[str, object]:
     validate_line_half_runs(game["line_half_runs"])
     validate_american_price(game["over_american_odds"])
     validate_american_price(game["under_american_odds"])
-    rates = [_finite(game[field], f"overlay {field}", high=1.0) for field in ("over_support", "under_support", "push_support")]
-    if not math.isclose(sum(rates), 1.0, rel_tol=1e-12, abs_tol=1e-12):
+    residual_count = game["residual_count"]
+    if type(residual_count) is not int:
+        raise ValueError("overlay residual count differs")
+    counts = _SupportCounts(
+        _count_from_display_rate(game["over_support"], residual_count, "overlay over_support"),
+        _count_from_display_rate(game["under_support"], residual_count, "overlay under_support"),
+        _count_from_display_rate(game["push_support"], residual_count, "overlay push_support"),
+    )
+    if counts.total != residual_count:
         raise ValueError("overlay support rates are incoherent")
-    over_result = price_support(rates[0], rates[1], game["over_american_odds"])
-    under_result = price_support(rates[1], rates[0], game["under_american_odds"])
+    rates = _support_rates(counts)
+    if (game["over_support"], game["under_support"], game["push_support"]) != (rates.over, rates.under, rates.push):
+        raise ValueError("overlay support rates are not canonical")
+    over_exact = _price_support_from_counts(counts.over, counts.under, counts.total, game["over_american_odds"])
+    under_exact = _price_support_from_counts(counts.under, counts.over, counts.total, game["under_american_odds"])
+    over_result = _display_price_support(over_exact)
+    under_result = _display_price_support(under_exact)
     conditionals = ("over_conditional_support", "under_conditional_support")
     margins = ("over_support_margin", "under_support_margin")
     computed = ((over_result.conditional_support, over_result.support_margin), (under_result.conditional_support, under_result.support_margin))
@@ -348,7 +397,7 @@ def _overlay_game(value: object) -> dict[str, object]:
             _finite(m_value, f"overlay {margin}", low=-1.0, high=1.0)
         if c_value != computed_conditional or m_value != computed_margin:
             raise ValueError("overlay derived support differs")
-    if (rates[0] + rates[1] == 0.0) != (game["over_conditional_support"] is None):
+    if (counts.over + counts.under == 0) != (game["over_conditional_support"] is None):
         raise ValueError("overlay conditional support availability differs")
     selected_side = game["selected_side"]
     if selected_side is not None and (not isinstance(selected_side, str) or selected_side not in {"OVER", "UNDER"}):
@@ -357,7 +406,7 @@ def _overlay_game(value: object) -> dict[str, object]:
     if not isinstance(decision, str) or decision not in {"RESEARCH_PICK", "PASS"}:
         raise ValueError("overlay decision differs")
     reasons = _reason_codes(game["reason_codes"])
-    selected, _ = select_direction(over_result, under_result)
+    selected, _ = _select_exact_direction(over_exact, under_exact)
     if selected_side != selected:
         raise ValueError("overlay selected side differs")
     if selected is None and (decision != "PASS" or "AMBIGUOUS_DIRECTION" not in reasons):
@@ -374,27 +423,27 @@ def _overlay_game(value: object) -> dict[str, object]:
         raise ValueError("ambiguous overlay selected side differs")
     if selected_side is None and decision == "RESEARCH_PICK":
         raise ValueError("overlay selected side differs")
-    nonpush_support = rates[0] + rates[1]
+    nonpush_support = Fraction(counts.over + counts.under, counts.total)
     point_gap = _point_gap_runs(game["expected_total"], game["line_half_runs"])
-    selected_margin = over_result.support_margin if selected == "OVER" else under_result.support_margin
+    selected_margin = _margin_for_gate(over_exact, under_exact, selected)
     if decision == "RESEARCH_PICK":
         if game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"]:
             raise ValueError("overlay residual count gate differs")
-        if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+        if nonpush_support < Fraction(str(_POLICY_AUTHORITY["minimum_nonpush_support"])):
             raise ValueError("overlay nonpush support gate differs")
         if point_gap < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
             raise ValueError("overlay point gap gate differs")
-        if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
+        if selected_margin is None or selected_margin < Fraction(str(_POLICY_AUTHORITY["minimum_support_margin"])):
             raise ValueError("overlay support margin gate differs")
     else:
         derived: list[str] = []
         if game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"]:
             derived.append("RESIDUAL_COUNT_MISMATCH")
-        if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+        if nonpush_support < Fraction(str(_POLICY_AUTHORITY["minimum_nonpush_support"])):
             derived.append("NONPUSH_SUPPORT_TOO_LOW")
         if point_gap < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
             derived.append("POINT_GAP_TOO_SMALL")
-        if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
+        if selected_margin is not None and selected_margin < Fraction(str(_POLICY_AUTHORITY["minimum_support_margin"])):
             derived.append("SUPPORT_MARGIN_TOO_LOW")
         if selected is None:
             derived.append("AMBIGUOUS_DIRECTION")
@@ -448,6 +497,24 @@ class PriceSupport:
     support_margin: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class _SupportCounts:
+    over: int
+    under: int
+    push: int
+
+    @property
+    def total(self) -> int:
+        return self.over + self.under + self.push
+
+
+@dataclass(frozen=True, slots=True)
+class _ExactPriceSupport:
+    conditional_support: Fraction | None
+    quoted_break_even: Fraction
+    support_margin: Fraction | None
+
+
 def validate_american_price(value: object) -> int:
     """Validate and return a DraftKings-style American price."""
 
@@ -480,21 +547,22 @@ def american_net_profit(price: int) -> float:
 def quoted_break_even(price: int) -> float:
     """Return the implied break-even probability for an American price."""
 
-    return 1.0 / (1.0 + american_net_profit(price))
+    return float(_quoted_break_even_fraction(price))
 
 
-def compare_sample_support(
-    samples: tuple[int, ...], line_half_runs: int
-) -> SupportRates:
-    """Classify sample totals against a half-run encoded totals line."""
+def _quoted_break_even_fraction(price: int) -> Fraction:
+    price = validate_american_price(price)
+    return Fraction(100, 100 + price) if price > 0 else Fraction(abs(price), 100 + abs(price))
 
+
+def _sample_support_counts(samples: tuple[int, ...], line_half_runs: int) -> _SupportCounts:
+    """Return the canonical integer partition before any display conversion."""
     if not isinstance(samples, tuple) or not samples:
         raise ValueError("samples must be a non-empty tuple")
     for sample in samples:
         if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
             raise ValueError("samples must contain nonnegative integers")
     line_half_runs = validate_line_half_runs(line_half_runs)
-
     over = under = push = 0
     for sample in samples:
         doubled_sample = sample * 2
@@ -504,9 +572,21 @@ def compare_sample_support(
             under += 1
         else:
             push += 1
+    return _SupportCounts(over, under, push)
 
-    count = len(samples)
-    return SupportRates(over / count, under / count, push / count)
+
+def _support_rates(counts: _SupportCounts) -> SupportRates:
+    if counts.total <= 0:
+        raise ValueError("support counts must be non-empty")
+    return SupportRates(counts.over / counts.total, counts.under / counts.total, counts.push / counts.total)
+
+
+def compare_sample_support(
+    samples: tuple[int, ...], line_half_runs: int
+) -> SupportRates:
+    """Classify sample totals against a half-run encoded totals line."""
+
+    return _support_rates(_sample_support_counts(samples, line_half_runs))
 
 
 def _finite_probability(value: object, label: str) -> Real:
@@ -549,13 +629,68 @@ def price_support(win_support: float, loss_support: float, price: int) -> PriceS
 
     if directional_support == 0.0:
         return PriceSupport(None, break_even, None)
-    if use_exact_arithmetic:
-        conditional = float(exact_win / directional_support)
-    else:
-        conditional = float(win_support / directional_support)
+    conditional = float(exact_win / directional_support) if use_exact_arithmetic else float(win_support / directional_support)
     if not math.isfinite(conditional):
         raise ValueError("conditional support must be finite")
     return PriceSupport(conditional, break_even, conditional - break_even)
+
+
+def _price_support_from_counts(win_count: int, loss_count: int, total_count: int, price: int) -> _ExactPriceSupport:
+    if any(type(value) is not int or value < 0 for value in (win_count, loss_count, total_count)):
+        raise ValueError("support counts differ")
+    if win_count + loss_count > total_count or total_count <= 0:
+        raise ValueError("support counts differ")
+    break_even = _quoted_break_even_fraction(price)
+    nonpush = win_count + loss_count
+    if nonpush == 0:
+        return _ExactPriceSupport(None, break_even, None)
+    conditional = Fraction(win_count, nonpush)
+    return _ExactPriceSupport(conditional, break_even, conditional - break_even)
+
+
+def _display_price_support(value: _ExactPriceSupport) -> PriceSupport:
+    return PriceSupport(
+        None if value.conditional_support is None else float(value.conditional_support),
+        float(value.quoted_break_even),
+        None if value.support_margin is None else float(value.support_margin),
+    )
+
+
+def _select_exact_direction(
+    over: _ExactPriceSupport, under: _ExactPriceSupport,
+) -> tuple[str | None, tuple[str, ...]]:
+    if over.support_margin is not None and (
+        under.support_margin is None or over.support_margin > under.support_margin
+    ):
+        return "OVER", ()
+    if under.support_margin is not None and (
+        over.support_margin is None or under.support_margin > over.support_margin
+    ):
+        return "UNDER", ()
+    return None, ("AMBIGUOUS_DIRECTION",)
+
+
+def _margin_for_gate(
+    over: _ExactPriceSupport, under: _ExactPriceSupport, selected: str | None,
+) -> Fraction | None:
+    if selected == "OVER":
+        return over.support_margin
+    if selected == "UNDER":
+        return under.support_margin
+    if over.support_margin is not None and over.support_margin == under.support_margin:
+        return over.support_margin
+    return None
+
+
+def _count_from_display_rate(value: object, total_count: int, label: str) -> int:
+    """Recover one integer count exactly by requiring the canonical float image."""
+    if total_count <= 0:
+        raise ValueError("overlay residual count differs")
+    rate = _finite(value, label, high=1.0)
+    count = round(rate * total_count)
+    if count < 0 or count > total_count or rate != count / total_count:
+        raise ValueError("overlay support rates are not count-derived")
+    return count
 
 
 def select_direction(
@@ -725,14 +860,17 @@ def load_and_validate_model_authority(root: Path, model_trace: Path) -> ModelAut
     """Securely load the sealed model chain without invoking the model pipeline."""
     root_path = Path(root)
     trace_relative = _under(model_trace, _MODEL_REPORT_ROOT, "model trace path")
-    if not trace_relative.name.endswith(".trace.json"):
+    authority_spec = _MODEL_AUTHORITY_SPEC
+    if trace_relative != authority_spec.trace_relative:
         raise ValueError("model trace path differs")
     with open_trusted_root(root_path) as trusted:
         trace_snapshot = _read_evidence(trusted, trace_relative, "model trace")
+        if _sha_bytes(trace_snapshot.contents) != authority_spec.trace_sha256:
+            raise ValueError("model trace authority differs")
         trace = validate_totals_trace(_canonical_json(trace_snapshot, "model trace"))
         report_relative = _under(Path(str(trace["report_relative"])), _MODEL_REPORT_ROOT, "model report path")
         receipt_relative = _under(Path(str(trace["model_receipt_relative"])), _MODEL_RECEIPT_ROOT, "model receipt path")
-        if receipt_relative != _MODEL_RECEIPT_ROOT / f"{Path(receipt_relative).stem}.json":
+        if report_relative != authority_spec.report_relative or receipt_relative != authority_spec.receipt_relative:
             raise ValueError("model receipt path differs")
         report_snapshot = _read_evidence(trusted, report_relative, "model report")
         report_sidecar = _read_evidence(trusted, report_relative.with_suffix(".sha256"), "model report sidecar")
@@ -744,13 +882,17 @@ def load_and_validate_model_authority(root: Path, model_trace: Path) -> ModelAut
         _verify_sidecar(receipt_sidecar, receipt_snapshot, "model receipt sidecar")
         if (
             trace["report_relative"] != report_relative.as_posix()
-            or trace["report_sha256"] != _sha_bytes(report_snapshot.contents)
-            or trace["report_sidecar_sha256"] != _sha_bytes(report_sidecar.contents)
+            or trace["report_sha256"] != authority_spec.report_sha256
+            or trace["report_sidecar_sha256"] != authority_spec.report_sidecar_sha256
             or trace["model_receipt_relative"] != receipt_relative.as_posix()
-            or trace["model_receipt_sha256"] != _sha_bytes(receipt_snapshot.contents)
+            or trace["model_receipt_sha256"] != authority_spec.receipt_sha256
             or report["model_receipt_relative"] != receipt_relative.as_posix()
-            or report["model_receipt_sha256"] != _sha_bytes(receipt_snapshot.contents)
+            or report["model_receipt_sha256"] != authority_spec.receipt_sha256
             or receipt_relative.name != f"{receipt['content_sha256']}.json"
+            or _sha_bytes(report_snapshot.contents) != authority_spec.report_sha256
+            or _sha_bytes(report_sidecar.contents) != authority_spec.report_sidecar_sha256
+            or _sha_bytes(receipt_snapshot.contents) != authority_spec.receipt_sha256
+            or _sha_bytes(receipt_sidecar.contents) != authority_spec.receipt_sidecar_sha256
         ):
             raise ValueError("model authority binding differs")
         _fixed_model_gates(report, receipt)
@@ -988,10 +1130,13 @@ def build_overlay(
             samples = model_game["residual_samples"]
             if not isinstance(samples, tuple) or model_game["residual_sha256"] != _sha_bytes(canonical_json_bytes(samples)):
                 raise ValueError("model residual evidence differs")
-            rates = compare_sample_support(tuple(samples), market["line_half_runs"])
-            over = price_support(rates.over, rates.under, market["over_american_odds"])
-            under = price_support(rates.under, rates.over, market["under_american_odds"])
-            selected, _ = select_direction(over, under)
+            counts = _sample_support_counts(tuple(samples), market["line_half_runs"])
+            rates = _support_rates(counts)
+            over_exact = _price_support_from_counts(counts.over, counts.under, counts.total, market["over_american_odds"])
+            under_exact = _price_support_from_counts(counts.under, counts.over, counts.total, market["under_american_odds"])
+            over = _display_price_support(over_exact)
+            under = _display_price_support(under_exact)
+            selected, _ = _select_exact_direction(over_exact, under_exact)
             reasons: list[str] = []
             start = _utc_timestamp(model_game["scheduled_start_utc"], "model start")
             if evaluated >= start:
@@ -1003,12 +1148,12 @@ def build_overlay(
                 reasons.append("QUOTE_STALE")
             if model_game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"] or len(samples) != _POLICY_AUTHORITY["required_residual_count"]:
                 reasons.append("RESIDUAL_COUNT_MISMATCH")
-            if rates.over + rates.under < _POLICY_AUTHORITY["minimum_nonpush_support"]:
+            if Fraction(counts.over + counts.under, counts.total) < Fraction(str(_POLICY_AUTHORITY["minimum_nonpush_support"])):
                 reasons.append("NONPUSH_SUPPORT_TOO_LOW")
             if _point_gap_runs(model_game["expected_total"], market["line_half_runs"]) < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
                 reasons.append("POINT_GAP_TOO_SMALL")
-            selected_margin = over.support_margin if selected == "OVER" else under.support_margin if selected == "UNDER" else None
-            if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
+            selected_margin = _margin_for_gate(over_exact, under_exact, selected)
+            if selected_margin is not None and selected_margin < Fraction(str(_POLICY_AUTHORITY["minimum_support_margin"])):
                 reasons.append("SUPPORT_MARGIN_TOO_LOW")
             if selected is None:
                 reasons.append("AMBIGUOUS_DIRECTION")
