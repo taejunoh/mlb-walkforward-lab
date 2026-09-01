@@ -25,7 +25,12 @@ from mlb_backtest.daily_totals import (
     validate_totals_report,
 )
 from mlb_backtest.daily_totals import _per_game_coverage
-from mlb_backtest.experimental_totals import FinalTotalGame, TargetTotalGame, TotalProjection
+from mlb_backtest.experimental_totals import (
+    FinalTotalGame,
+    TargetTotalGame,
+    TotalProjection,
+    UnprojectedTotal,
+)
 from mlb_backtest.experimental_totals import CANDIDATE_IDS
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
 
@@ -356,13 +361,20 @@ class DailyTotalsContractTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_bytes(b"source")
             projection = TotalProjection("PROJECTED", "LEAGUE_30", 3.0, 4.0, 7.0)
-            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=bundle), patch("mlb_backtest.daily_totals.walk_forward_predictions", side_effect=(development, final)) as walk, patch("mlb_backtest.daily_totals.select_candidate", return_value="LEAGUE_30") as select, patch("mlb_backtest.daily_totals.project_game", return_value=projection), patch("mlb_backtest.daily_totals._source_identity", side_effect=(_source("HISTORY_SCHEDULE"), _source("LIVE_SCHEDULE"))):
+            unprojected = UnprojectedTotal("UNPROJECTED", "UNKNOWN_TEAM")
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=bundle), patch("mlb_backtest.daily_totals.walk_forward_predictions", side_effect=(development, final)) as walk, patch("mlb_backtest.daily_totals.select_candidate", return_value="LEAGUE_30") as select, patch("mlb_backtest.daily_totals.project_game", side_effect=(projection, unprojected)), patch("mlb_backtest.daily_totals._source_identity", side_effect=(_source("HISTORY_SCHEDULE"), _source("LIVE_SCHEDULE"))):
                 built = build_daily_totals(root, "2026-09-01", Path("reports/experimental_daily/2026-09-01/source.json"))
             select.assert_called_once_with(development)
             self.assertEqual(len(walk.call_args_list), 2)
             self.assertEqual(walk.call_args_list[0].args[2:], ("2026-06-01", "2026-07-31"))
             self.assertEqual(walk.call_args_list[1].args[1:], (("LEAGUE_30",), "2026-08-01", "2026-08-31"))
             self.assertEqual([row["game_pk"] for row in built.report["games"]], [10, 20])
+            unknown = built.report["games"][0]
+            self.assertEqual(unknown["reason"], "UNKNOWN_TEAM")
+            self.assertEqual(unknown["feature_cutoff"], "2026-08-31")
+            self.assertEqual(unknown["source_digest"], "3" * 64)
+            self.assertEqual(unknown["data_quality_flags"], ["ADMITTED_SCHEDULE", "UNKNOWN_TEAM"])
+            self.assertEqual(set(unknown), {"game_pk", "official_date", "scheduled_start_utc", "away_team_id", "home_team_id", "venue_id", "status", "reason", "feature_cutoff", "source_digest", "data_quality_flags"})
 
 
 if __name__ == "__main__":
