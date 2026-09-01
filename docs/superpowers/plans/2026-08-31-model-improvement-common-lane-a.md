@@ -132,8 +132,8 @@ _COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "sched
 def make_fixed_quality_recipe(*, fixed_value=0.0):
     return QualityRecipe("fixed", "fixed", None, None, None, fixed_value, (), (), _D)
 
-def make_ratio_quality_recipe():
-    return QualityRecipe("ratio", "ratio", "starter", 1.0, 1.0, None, (), (), _D)
+def make_ratio_quality_recipe(*, numerator=1.0, baseline_constant=1.0):
+    return QualityRecipe("ratio", "ratio", "starter", numerator, baseline_constant, None, (), (), _D)
 
 def make_weighted_quality_recipe(*, child_weights=(0.4, 0.6)):
     children = (make_ratio_quality_recipe(), make_ratio_quality_recipe())
@@ -188,6 +188,12 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(weighted.child_weights, (0.4, 0.6))
         with self.assertRaisesRegex(ValueError, "child weights"):
             make_weighted_quality_recipe(child_weights=(1.0,))
+        with self.assertRaisesRegex(ValueError, "fixed value"):
+            make_fixed_quality_recipe(fixed_value=1.01)
+        with self.assertRaisesRegex(ValueError, "ratio numerator"):
+            make_ratio_quality_recipe(numerator=-0.01)
+        with self.assertRaisesRegex(ValueError, "baseline constant"):
+            make_ratio_quality_recipe(baseline_constant=0.0)
         with self.assertRaisesRegex(ValueError, "aggregation weights"):
             make_feature_row(game_pk=10, target_year=2022, starter_weights=(0.2, 0.7))
         with self.assertRaisesRegex(ValueError, "component keys differ"):
@@ -289,7 +295,7 @@ class LaneDisposition:
 
 Close these exact domains: `MODEL_IDS={"v5.1","A","A+B","A+B+C"}`, `FROZEN_CARD_MODEL_IDS={"A","A+B","A+B+C"}`, `FROZEN_CARD_STATES={"H23_FROZEN"}`, `LANE_IDS={"A","B","C"}`, `LANE_DISPOSITION_STATES={"QUALIFIED","ABSENT","REJECTED"}`, `LEDGER_IDS={"O19","O20","O21","O22","O23","H22","H23","H24"}`, `PICKED_SIDES={"away","home","none"}`, and `QUALITY_FAMILIES={None,"starter","hitter_split","recent_form","bullpen"}`. Enforce frozen-card model/state/fold compatibility, row model ID, picked side, and rank (`0` only for `none`; strictly positive otherwise), and recipe family. Lane-specific parameter keys remain open here but their JSON values are recursively immutable.
 
-Implement `_freeze_json(value)` and `_thaw_json(value)`: mapping inputs become recursive `MappingProxyType`, sequences become tuples, and scalars must be JSON scalars. Apply them to card parameters, feature-row maps, recipe children/weights, and disposition evidence/reasons; `as_mapping()` always returns fresh mutable JSON-compatible values. Validate exact `SIDES = ("away", "home")` and `COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")`, ISO dates/UTC strings, score and quality [0,100], probability [0,1], 64 lowercase hex digests, and the environment/defense recipe fallback of 50/0. `MetricPrimitive.normalized_score` is the pre-quality `normalize.metric_score(value, mean, sd, direction)` result in [0,100], never an already quality-shrunk score. Preserve ordered primitives and require their nonnegative aggregation weights to sum to exactly one under the documented `math.fsum` tolerance. Keep the fixed/ratio/weighted-sum/minimum recipe constraints in this task.
+Implement `_freeze_json(value)` and `_thaw_json(value)`: mapping inputs become recursive `MappingProxyType`, sequences become tuples, and scalars must be JSON scalars. Apply them to card parameters, feature-row maps, recipe children/weights, and disposition evidence/reasons; `as_mapping()` always returns fresh mutable JSON-compatible values. Validate exact `SIDES = ("away", "home")` and `COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")`, ISO dates/UTC strings, score and quality [0,100], probability [0,1], 64 lowercase hex digests, and the environment/defense recipe fallback of 50/0. `MetricPrimitive.normalized_score` is the pre-quality `normalize.metric_score(value, mean, sd, direction)` result in [0,100], never an already quality-shrunk score. Preserve ordered primitives and require their nonnegative aggregation weights to sum to exactly one under the documented `math.fsum` tolerance. A `fixed` recipe has a finite `fixed_value` in `[0,1]`; a `ratio` recipe has a finite `numerator >= 0` and finite `baseline_constant > 0`. Keep those exact fixed/ratio requirements plus the weighted-sum/minimum constraints in this task.
 
 Add `sealed_feature_row_payload(row: SealedFeatureRow | Mapping[str, object]) -> Mapping[str, object>` which projects every persisted row field except `feature_row_sha256` from an immutable row or a fresh JSON row mapping, and `compute_feature_row_sha256(payload: Mapping[str, object]) -> str`, using Task 1 canonical SHA-256. `SealedFeatureRow.__post_init__` must require `feature_row_sha256 == compute_feature_row_sha256(sealed_feature_row_payload(self))`. This digest is separate from `FeatureSeal.rows_sha256`, which remains a digest over fully materialized rows.
 
@@ -318,6 +324,15 @@ git commit -m "feat: define model improvement contracts"
 - [ ] **Step 1: Write table-driven RED tests for every immutable binding: code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall; and a dedicated disposition persistence round trip.**
 
 ```python
+import json
+import tempfile
+from hashlib import sha256
+from pathlib import Path
+
+from mlb_backtest.model_improvement.canonical import canonical_json_bytes
+from mlb_backtest.model_improvement.lane_disposition import load_lane_disposition, seal_lane_disposition
+from mlb_backtest.model_improvement.run_spec import build_run_spec, load_run_spec
+
 class RunSpecTest(unittest.TestCase):
     def test_exact_contract_is_available_to_sibling_lanes(self):
         spec = load_run_spec(SPEC_PATH)
@@ -329,27 +344,62 @@ class RunSpecTest(unittest.TestCase):
         self.assertTrue(str(spec.output_path("features", "lane_c/H24/feature_seal.json")).endswith("features/lane_c/H24/feature_seal.json"))
         self.assertTrue(spec.h24_firewall.forbid_outcomes_before_registry)
 
-    def test_lane_disposition_round_trips_only_after_runspec_exists(self):
-        spec = load_run_spec(SPEC_PATH)
-        disposition = seal_lane_disposition(
-            spec, "A", "REJECTED", None, ("a" * 64,), ("H23_GATE",))
+    def test_prediction_contract_digest_and_closed_mutations(self):
+        raw = json.loads(SPEC_PATH.read_text(encoding="utf-8"))
         self.assertEqual(
-            load_lane_disposition(spec, Path(disposition.path), disposition.artifact_sha256),
-            disposition,
+            raw["prediction_contract_sha256"],
+            sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest(),
         )
+        raw["prediction_contract"]["clip"]["min"] = 0.11
+        with self.assertRaisesRegex(ValueError, "prediction contract digest"):
+            build_run_spec(raw)
+        raw = json.loads(SPEC_PATH.read_text(encoding="utf-8"))
+        raw["prediction_contract"]["ranking"]["unknown"] = True
+        with self.assertRaisesRegex(ValueError, "prediction contract|unknown"):
+            build_run_spec(raw)
+
+    def test_lane_disposition_round_trips_in_a_temporary_synthetic_output_root(self):
+        raw = json.loads(SPEC_PATH.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            raw["outputs"]["root"] = directory
+            spec = build_run_spec(raw)
+            disposition = seal_lane_disposition(
+                spec, "A", "REJECTED", None, ("a" * 64,), ("H23_GATE",))
+            self.assertEqual(
+                load_lane_disposition(spec, Path(disposition.path), disposition.artifact_sha256),
+                disposition,
+            )
 ```
 
 - [ ] **Step 2: Run RED.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec tests.test_model_improvement_contracts -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec -v`
 
 Expected: FAIL with `ModuleNotFoundError` for `run_spec`.
 
-- [ ] **Step 3: Add a recursively closed schema, `build_run_spec(raw: Mapping[str, object])`, and a synthetic fixture declaration.** Require top-level fields `schema_version`, `run_id`, `code_revision`, `source_authority`, `cutoffs`, `exclusions`, `folds`, `baseline`, `metrics`, `prediction_contract_sha256`, `lane_b`, `lane_c`, `outputs`, and `h24_firewall`. `prediction_contract_sha256` is the canonical digest of the declared scoring/ranking/pick/clipping/tie-break contract. `source_authority` binds authority root, V5.2 SourceRunSpec, acquisition contract, terminal checkpoint, inventory, and every validation receipt by relative path plus digest. The declaration binds the v5.1 card/digest and every output namespace. The synthetic fixture must have only test fixture paths/digests and must be rejected by real source verification.
+- [ ] **Step 3: Add a recursively closed schema, `build_run_spec(raw: Mapping[str, object])`, and a synthetic fixture declaration.** Require top-level fields `schema_version`, `run_id`, `code_revision`, `source_authority`, `cutoffs`, `exclusions`, `folds`, `baseline`, `metrics`, `prediction_contract`, `prediction_contract_sha256`, `lane_b`, `lane_c`, `outputs`, and `h24_firewall`. Persist both the closed `prediction_contract` object and its digest; require `prediction_contract_sha256 == sha256(canonical_json_bytes(prediction_contract))`. `ModelImprovementRunSpec`, its raw payload, and `as_mapping()` each retain both fields. Add schema, fixture, and mutation tests for a missing object/digest, any unknown nested key, and each digest/content mismatch.
+
+`prediction_contract` has no extension keys at any level and contains exactly:
+
+```python
+{
+    "component_order": ["starter", "offense", "bullpen", "environment", "defense", "schedule"],
+    "component_weights": {"starter": 35, "offense": 25, "bullpen": 20,
+                          "environment": 10, "defense": 5, "schedule": 5},
+    "clip": {"min": 0.10, "max": 0.90},
+    "pick": {"home_if": "p_home > 0.5", "away_if": "p_home < 0.5", "none_if": "p_home == 0.5"},
+    "ranking": {"tie_order": ["pick_probability:desc", "confidence:desc",
+                                "starter_edge_abs:desc", "scheduled_start_utc:asc", "game_pk:asc"]},
+}
+```
+
+The schema closes `prediction_contract`, `component_weights`, `clip`, `pick`, and `ranking` with `additionalProperties: false`; require the six-component order and weights exactly as shown, clip `[0.10, 0.90]`, the exact pick rules, and the exact ranking tie order. `source_authority` binds authority root, V5.2 SourceRunSpec, acquisition contract, terminal checkpoint, inventory, and every validation receipt by relative path plus digest. The declaration binds the v5.1 card/digest and every output namespace. The synthetic fixture contains only test fixture paths/digests and is marked `SYNTHETIC_TEST_ONLY`; `load_verified_run_spec` rejects that marker before Task 4 source-gate work.
 
 For `lane_b`, declare the four baseline weights 35/25/20/5, fixed environment/defense 10/5, integer five-point grid bounded by ±10, nonnegative 85 total searched weight, multipliers `(0.75, 1.0, 1.25)`, exact 210 candidates, H22 `keep_h22_count` 12 ordered `(brier, log_loss, daily_top1_delta_desc, candidate_id)`, and H23 eligibility `(Brier/logloss no worse than A; positive paired Top-1 versus v5.1)` with the same final order. For `lane_c`, declare exactly `environment=(park, weather_roof)` and `defense=(oaa, framing, blocking_throwing)`, H22/H23 coverage with required 100% admitted-or-neutral disposition/replay, and prediction-only H24 feature coverage with no outcome access; every Lane C feature set has parent `A+B`. Metrics are all-game Brier/logloss and date-paired Top-1. H24 forbids outcome access before registry and all 2025 outcomes.
 
-- [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** `fold` accepts H22/H23/H24 only; `output_path` accepts ten declared namespaces and a normal relative name without `..`. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
+- [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** The dataclass/raw payload/`as_mapping()` all include both `prediction_contract` and `prediction_contract_sha256`; the parser closes and hashes the object before accepting its digest. `fold` accepts H22/H23/H24 only; `output_path` accepts exactly the ten declared namespaces and a normal relative name without `..`, always resolves beneath `outputs.root`, and rejects all other namespaces/paths. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
+
+`load_verified_run_spec(path)` is a stricter parser only: it rejects `schema_version == "SYNTHETIC_TEST_ONLY"`, requires `path.resolve()` to equal the checked-in real declaration `protocols/model_improvement/parallel_model_result_v1.json`, and requires `code_revision` to equal the checked-out full 40-lowercase-hex `HEAD`. It does not call `verify_source_gate` or inspect source evidence; Task 4 owns source verification.
 
 Add the only disposition persistence APIs after `run_spec.py` exists:
 
@@ -377,7 +427,7 @@ Expected: PASS; any unknown key or binding mutation fails closed.
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add schemas/model_improvement/parallel_model_result_run_spec.schema.json mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/lane_disposition.py tests/test_model_improvement_run_spec.py tests/test_model_improvement_contracts.py tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json
+git add schemas/model_improvement/parallel_model_result_run_spec.schema.json mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/lane_disposition.py tests/test_model_improvement_run_spec.py tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json
 git commit -m "feat: define model improvement run spec builder"
 ```
 
