@@ -1,0 +1,30 @@
+{
+  "schema_version": "SYNTHETIC_TEST_ONLY",
+  "run_id": "parallel-model-result-v1-synthetic",
+  "code_revision": "0000000000000000000000000000000000000000",
+  "source_authority": {
+    "authority_root": "tests/fixtures/model_improvement/v52-authority",
+    "source_run_spec": {"path": "source/source_run_spec.json", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "acquisition_contract": {"path": "source/acquisition_contract.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    "terminal_checkpoint": {"path": "source/terminal_checkpoint.json", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    "inventory": {"path": "source/inventory.json", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    "validation_receipts": [
+      {"path": "source/validation_receipt.json", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+    ]
+  },
+  "cutoffs": {"history": "D-1", "snapshot": "T-45"},
+  "exclusions": {"excluded_years": [2025], "forbidden_outcome_years": [2025], "forbid_h24_outcomes": true},
+  "folds": {
+    "H22": {"target_year": 2022, "normalization_years": [2018, 2019, 2020, 2021], "oof_calibration_years": [2019, 2020, 2021], "prediction_only": false},
+    "H23": {"target_year": 2023, "normalization_years": [2019, 2020, 2021, 2022], "oof_calibration_years": [2019, 2020, 2021, 2022], "prediction_only": false},
+    "H24": {"target_year": 2024, "normalization_years": [2020, 2021, 2022, 2023], "oof_calibration_years": [2019, 2020, 2021, 2022, 2023], "prediction_only": true}
+  },
+  "baseline": {"card": {"path": "tests/fixtures/model_improvement/v51_card.json", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "component_weights_pp": {"starter": 35, "offense": 25, "bullpen": 20, "environment": 10, "defense": 5, "schedule": 5}}},
+  "metrics": {"all_game": ["brier", "log_loss"], "daily": ["top1_date_paired"]},
+  "prediction_contract": {"component_order": ["starter", "offense", "bullpen", "environment", "defense", "schedule"], "edge_formula": "sum(component_weights_pp[c]/100 * (home_score[c]-away_score[c]) for c in component_order)", "completeness_formula": "sum(component_weights_pp[c]/100 * min(home_quality[c],away_quality[c]) for c in component_order)", "component_weights_binding": {"keys": ["starter", "offense", "bullpen", "environment", "defense", "schedule"], "value_type": "integer_nonnegative_pp", "sum": 100, "source": "closed_union:RunSpec.baseline.card.component_weights_pp|ScoringModelCard.parameters.component_weights_pp"}, "clip": {"min": 0.1, "max": 0.9}, "pick": {"home_if": "p_home > 0.5", "away_if": "p_home < 0.5", "none_if": "p_home == 0.5"}, "ranking": {"tie_order": ["pick_probability:desc", "confidence:desc", "starter_edge_abs:desc", "scheduled_start_utc:asc", "game_pk:asc"]}},
+  "prediction_contract_sha256": "9b5bd8733ebbd96315d9c53aec99fdb6bdbaadaf8aff094292e84d835fe01e97",
+  "lane_b": {"base_weights_pp": {"starter": 35, "offense": 25, "bullpen": 20, "environment": 10, "defense": 5, "schedule": 5}, "fixed_weights_pp": {"environment": 10, "defense": 5}, "grid": {"starter": [25, 30, 35, 40, 45], "offense": [15, 20, 25, 30, 35], "bullpen": [10, 15, 20, 25, 30], "schedule": [0, 5, 10, 15]}, "multipliers": [0.75, 1.0, 1.25], "candidate_count": 210, "keep_h22_count": 12, "h22_order": ["brier", "log_loss", "daily_top1_delta_desc", "candidate_id"], "h23_eligibility": {"brier_no_worse_than": "A", "log_loss_no_worse_than": "A", "daily_top1_delta_vs_v51": "positive"}, "h23_order": ["brier", "log_loss", "daily_top1_delta_desc", "candidate_id"]},
+  "lane_c": {"parent_model_id": "A+B", "slots": {"environment": ["park", "weather_roof"], "defense": ["oaa", "framing", "blocking_throwing"]}, "coverage": {"H22": "admitted_or_neutral_100pct", "H23": "admitted_or_neutral_100pct", "H24": "prediction_only_admitted_or_neutral_100pct"}},
+  "outputs": {"root": "tests/fixtures/model_improvement/output", "namespaces": ["source_gate", "features", "baseline", "oof", "lane_a", "lane_b", "lane_c", "registry", "h24_predictions", "h24_reports"]},
+  "h24_firewall": {"forbid_outcomes_before_registry": true, "forbidden_outcome_years": [2025], "prediction_only_year": 2024}
+}
