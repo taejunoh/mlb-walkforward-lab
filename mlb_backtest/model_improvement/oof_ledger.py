@@ -251,6 +251,27 @@ def _load_rows(path: Path, expected: str) -> tuple[PredictionRow, ...]:
     return tuple(rows)
 
 
+def _load_bound_prediction_rows(
+    spec: ModelImprovementRunSpec,
+    fold_id: str,
+    feature_rows: Sequence[object],
+    card_sha256: str,
+    seal: PredictionSeal,
+) -> tuple[PredictionRow, ...]:
+    """Read and fully bind the one row primary named by a loaded seal."""
+    rows_path, rows_sidecar, _, _ = prediction_paths(spec, seal.ledger_id)
+    _load_sidecar(rows_sidecar, seal.rows_sha256, "prediction rows sidecar")
+    rows = _load_rows(rows_path, seal.rows_sha256)
+    ordered = _validate_rows(spec, fold_id, feature_rows, rows, card_sha256)
+    if (
+        _rows_bytes(ordered) != _rows_bytes(rows)
+        or sha256(_rows_bytes(rows)).hexdigest() != seal.rows_sha256
+        or _population_digest(rows) != seal.population_sha256
+    ):
+        raise ValueError("prediction row population differs")
+    return rows
+
+
 def seal_oof_predictions(
     spec: ModelImprovementRunSpec,
     source_gate: SourceGateReceipt,
@@ -356,6 +377,9 @@ def load_prediction_seal(
     # so the authority cannot be optimized away from this loader.
     if not feature_rows:
         raise ValueError("prediction feature population differs")
+    _load_bound_prediction_rows(
+        spec, fold_id, feature_rows, card_digest, seal
+    )
     return seal
 
 
@@ -363,7 +387,7 @@ def load_prediction_rows(
     spec: ModelImprovementRunSpec,
     source_gate: SourceGateReceipt,
     feature_seal: FeatureSeal,
-    baseline_replay: object,
+    baseline_replay: BaselineReplayReceipt | None,
     seal: PredictionSeal,
 ) -> tuple[PredictionRow, ...]:
     """The sole Task8A accessor for the sealed, label-free prediction JSONL."""
@@ -386,12 +410,9 @@ def load_prediction_rows(
     _, gate, feature, feature_rows, card_digest = _authenticate_inputs(
         spec, source_gate, feature_seal, None, seal.ledger_id
     )
-    rows_path, rows_sidecar, _, _ = prediction_paths(spec, seal.ledger_id)
-    _load_sidecar(rows_sidecar, loaded.rows_sha256, "prediction rows sidecar")
-    rows = _load_rows(rows_path, loaded.rows_sha256)
-    ordered = _validate_rows(spec, fold_id, feature_rows, rows, card_digest)
-    if _rows_bytes(ordered) != _rows_bytes(rows) or _population_digest(rows) != loaded.population_sha256:
-        raise ValueError("prediction row population differs")
+    rows = _load_bound_prediction_rows(
+        spec, fold_id, feature_rows, card_digest, loaded
+    )
     if loaded.source_gate_sha256 != gate.artifact_sha256 or loaded.feature_seal_sha256 != feature.artifact_sha256:
         raise ValueError("prediction row binding differs")
     return rows

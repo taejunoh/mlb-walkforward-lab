@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import tempfile
 import unittest
@@ -372,6 +373,73 @@ class BaselineOofLedgerTest(unittest.TestCase):
                 oof_ledger.load_prediction_seal(
                     self.spec, self.gate, self.feature_seal, None, alias, seal.artifact_sha256
                 )
+
+    def test_seal_loader_rejects_missing_or_tampered_prediction_rows(self):
+        from mlb_backtest.model_improvement import oof_ledger
+
+        for corruption in ("missing rows", "missing sidecar", "tampered rows", "tampered sidecar"):
+            with self.subTest(corruption=corruption):
+                directory = self.spec.output_path(
+                    "oof", "baseline/v5.1/H22/prediction_seal.json"
+                ).parent
+                if directory.exists():
+                    for artifact in directory.iterdir():
+                        artifact.unlink()
+                seal = oof_ledger.seal_oof_predictions(
+                    self.spec, self.gate, self.feature_seal, None,
+                    "baseline/v5.1/H22", self.rows,
+                )
+                rows_path, rows_sidecar, _, _ = oof_ledger.prediction_paths(
+                    self.spec, seal.ledger_id
+                )
+                if corruption == "missing rows":
+                    rows_path.unlink()
+                elif corruption == "missing sidecar":
+                    rows_sidecar.unlink()
+                elif corruption == "tampered rows":
+                    rows_path.write_bytes(b"\n")
+                else:
+                    rows_sidecar.write_bytes(
+                        canonical_json_bytes({"artifact_sha256": SHA})
+                    )
+                with self.assertRaises(ValueError):
+                    oof_ledger.load_prediction_seal(
+                        self.spec, self.gate, self.feature_seal, None,
+                        seal.path, seal.artifact_sha256,
+                    )
+
+    def test_seal_loader_recomputes_prediction_population(self):
+        from mlb_backtest.model_improvement import oof_ledger
+
+        seal = oof_ledger.seal_oof_predictions(
+            self.spec, self.gate, self.feature_seal, None,
+            "baseline/v5.1/H22", self.rows,
+        )
+        path = Path(seal.path)
+        payload = json.loads(path.read_bytes())
+        payload["population_sha256"] = SHA
+        raw = canonical_json_bytes(payload)
+        digest = sha256(raw).hexdigest()
+        path.write_bytes(raw)
+        path.with_suffix(".json.sha256").write_bytes(
+            canonical_json_bytes({"artifact_sha256": digest})
+        )
+        with self.assertRaises(ValueError):
+            oof_ledger.load_prediction_seal(
+                self.spec, self.gate, self.feature_seal, None, path, digest
+            )
+
+    def test_all_task8_public_replay_parameters_are_typed_receipts(self):
+        from mlb_backtest.model_improvement import oof_ledger
+
+        for function in (
+            oof_ledger.seal_oof_predictions,
+            oof_ledger.load_prediction_seal,
+            oof_ledger.load_prediction_rows,
+        ):
+            annotation = inspect.signature(function).parameters["baseline_replay"].annotation
+            self.assertIn("BaselineReplayReceipt", str(annotation))
+            self.assertIn("None", str(annotation))
 
     def test_schema_is_closed_and_module_has_no_outcome_or_evaluation_imports(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
