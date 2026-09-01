@@ -259,23 +259,28 @@ git commit -m "feat: admit provisional totals sources"
 
 - [ ] **Step 1: Write RED contract and end-to-end tests**
 
-Freeze a `BuiltDailyTotals` value containing the selected-model receipt, daily
-report, and exact trace inputs so callers cannot substitute one independently.
+Freeze a deeply immutable `BuiltDailyTotals` value containing canonical bytes
+for the selected-model receipt, daily report, and exact trace inputs plus their
+fixed relative paths, so callers cannot mutate or substitute a nested mapping
+independently.
 Freeze the selected-model receipt keys and schema literal
 `PROVISIONAL_DAILY_TOTALS_MODEL_V1`, and the primary report keys and schema
 literal `PROVISIONAL_DAILY_TOTALS_V1`. The model receipt binds its model ID and
 status labels, source report path and byte digest, history binding/payload
 digests, cutoff, fixed windows, candidate-definition digest, all development
-metrics, selected candidate, one-time final metrics, and canonical development
-residual sample digest/count. Its required `.sha256` sidecar binds the exact
+metrics, selected candidate, one-time final metrics, and canonical raw signed
+development residual (`actual_total - predicted_total`) digest/count. Its
+required `.sha256` sidecar binds the exact
 receipt bytes. The model-receipt basename is selected during build, before
 either object is sealed, as `<model-content-sha256>.json` under
 `audit/experimental_daily_totals/model/`; its content digest is computed over
 the canonical receipt mapping with only that digest field omitted. The primary
 report binds this precommitted relative path and exact receipt byte digest. The
-model receipt, report, and final trace all cross-bind the
-complete immutable claim/receipt/completion/manifest/payload identity for both
-history and live sources, not only payload hashes.
+model receipt, report, and final trace all cross-bind the complete immutable
+claim/receipt/completion/manifest/payload identity for both history and live
+sources, not only payload hashes. Their `windows` object contains and validates
+all six exact bounds: warm-up `2026-03-25..2026-05-31`, development
+`2026-06-01..2026-07-31`, and final `2026-08-01..2026-08-31`.
 
 Test canonical content digests, chronological windows, selected candidate,
 development/final metrics, residual digest, source digests, projection rows,
@@ -327,9 +332,16 @@ every admitted target game. Unknown team/venue produces `UNPROJECTED` without
 affecting valid peers; any other projection failure rejects the run. Require at
 least 100 exact-window rows independently in development and final evaluation.
 Compute and report 80% interval coverage in addition to MAE, RMSE, and Poisson
-deviance; test exact window membership and threshold failures before any write.
-Bind the
-canonical development residual multiset and per-game samples by SHA-256.
+deviance. For each final or live row, apply the same frozen signed development
+residuals to that row's own predicted mean, then discretize and compute its
+10th/90th percentiles; final coverage is the fraction of final actual totals
+inside their own intervals. Test exact window membership, this independent
+coverage oracle, and threshold failures before any write. Bind the canonical
+raw residual multiset and each per-game discrete sample multiset by SHA-256.
+Order report rows by `(official_date, scheduled_start_utc, game_pk)`. Every row
+includes `feature_cutoff`, the bound history source digest, and closed
+data-quality flags; unprojected rows contain none of the numeric projection or
+sample fields.
 
 The CLI is:
 
@@ -354,8 +366,10 @@ with that one field omitted; it is not a self-referential raw-file digest.
 Reread and rebind every component before returning. An existing byte-identical
 component may be reused; any difference fails. The persist function validates
 the receipt/report cross-digests inside the single `BuiltDailyTotals` value
-before its first write and uses only the precommitted model-receipt path; tests
-substitute mismatched objects or paths and require zero created files.
+before its first write, rereads the source report and re-runs read-only source
+admission to compare the complete history/live identities, validates the trace,
+and uses only the precommitted model-receipt path. Tests substitute mismatched
+objects, identities, or paths and require zero created files.
 
 - [ ] **Step 5: Run focused, regression, schema, and formatting verification**
 
