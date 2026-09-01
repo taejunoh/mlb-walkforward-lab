@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from mlb_backtest.model_improvement.run_spec import (
     load_run_spec,
     load_verified_run_spec,
     run_spec_sha256,
+    VerifiedRunSpecActivation,
 )
 
 
@@ -33,6 +35,8 @@ class RunSpecTest(unittest.TestCase):
 
     def test_exact_contract_is_available_to_sibling_lanes(self):
         spec = load_run_spec(SPEC_PATH)
+        self.assertIsNone(spec.verified_activation)
+        self.assertIsNone(build_run_spec(self.raw()).verified_activation)
         self.assertEqual(spec.fold("H22").normalization_years, (2018, 2019, 2020, 2021))
         self.assertEqual(spec.fold("H24").oof_calibration_years, (2019, 2020, 2021, 2022, 2023))
         self.assertEqual(dict(spec.cutoffs), {"history": "D-1", "snapshot": "T-45"})
@@ -207,6 +211,14 @@ class RunSpecTest(unittest.TestCase):
             os.chdir(other_root)
             spec = load_verified_run_spec(declaration)
             self.assertEqual(spec.code_revision, self._git(root, "rev-parse", "HEAD^"))
+            self.assertEqual(
+                spec.verified_activation,
+                VerifiedRunSpecActivation(
+                    str(declaration.resolve()),
+                    sha256(declaration.read_bytes()).hexdigest(),
+                    run_spec_sha256(spec),
+                ),
+            )
         finally:
             os.chdir(original_cwd)
             other.cleanup()
@@ -219,6 +231,28 @@ class RunSpecTest(unittest.TestCase):
                 self.assertEqual(load_verified_run_spec(declaration).schema_version, "PARALLEL_MODEL_RESULT_RUN_SPEC_V1")
         finally:
             activation.cleanup()
+
+    def test_verified_activation_is_runtime_only_and_semantically_inert(self):
+        ordinary = load_run_spec(SPEC_PATH)
+        descriptor = VerifiedRunSpecActivation("/tmp/activation.json", "a" * 64, run_spec_sha256(ordinary))
+        presented = replace(ordinary, verified_activation=descriptor)
+        self.assertNotIn("verified_activation", ordinary.as_mapping())
+        self.assertNotIn("verified_activation", presented.as_mapping())
+        self.assertEqual(run_spec_sha256(ordinary), run_spec_sha256(presented))
+        self.assertEqual(run_spec_sha256(presented), descriptor.run_spec_sha256)
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("verified_activation", schema["properties"])
+
+    def test_verified_activation_descriptor_rejects_noncanonical_values(self):
+        for path, declaration_sha256, semantic_sha256 in (
+            ("relative.json", "a" * 64, "b" * 64),
+            ("/tmp/../activation.json", "a" * 64, "b" * 64),
+            ("/tmp/activation.json", "A" * 64, "b" * 64),
+            ("/tmp/activation.json", "a" * 64, "B" * 64),
+        ):
+            with self.subTest(path=path, declaration_sha256=declaration_sha256, semantic_sha256=semantic_sha256):
+                with self.assertRaises(ValueError):
+                    VerifiedRunSpecActivation(path, declaration_sha256, semantic_sha256)
 
     def test_verified_loader_rejects_activation_drift_and_non_declaration_commits(self):
         cases = (

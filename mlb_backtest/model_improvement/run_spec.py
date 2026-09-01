@@ -6,7 +6,7 @@ import json
 import math
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -62,6 +62,20 @@ def _normal_relative(value: object, label: str) -> str:
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"{label} must be a normal relative path")
     return path.as_posix()
+
+
+def _normal_absolute(value: object, label: str) -> str:
+    text = _text(value, label)
+    path = Path(text)
+    if (
+        "\\" in text
+        or not path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.as_posix() != text
+    ):
+        raise ValueError(f"{label} must be a normal absolute path")
+    return text
 
 
 def _output_root(value: object) -> str:
@@ -285,6 +299,18 @@ def _firewall(value: object) -> H24Firewall:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedRunSpecActivation:
+    declaration_path: str
+    declaration_sha256: str
+    run_spec_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "declaration_path", _normal_absolute(self.declaration_path, "verified activation declaration_path"))
+        object.__setattr__(self, "declaration_sha256", _digest(self.declaration_sha256, "verified activation declaration_sha256"))
+        object.__setattr__(self, "run_spec_sha256", _digest(self.run_spec_sha256, "verified activation run_spec_sha256"))
+
+
+@dataclass(frozen=True, slots=True)
 class ModelImprovementRunSpec:
     schema_version: str
     run_id: str
@@ -301,6 +327,7 @@ class ModelImprovementRunSpec:
     lane_c: LaneCSpec
     outputs: Mapping[str, object]
     h24_firewall: H24Firewall
+    verified_activation: VerifiedRunSpecActivation | None = None
 
     def fold(self, fold_id: str) -> FoldSpec:
         if fold_id not in _FOLD_EXPECTATIONS:
@@ -484,7 +511,14 @@ def load_verified_run_spec(path: Path) -> ModelImprovementRunSpec:
         raise ValueError("synthetic run spec cannot be verified")
     if spec.code_revision != parent:
         raise ValueError("run spec code_revision differs from activation parent")
-    return spec
+    return replace(
+        spec,
+        verified_activation=VerifiedRunSpecActivation(
+            str(path.resolve()),
+            sha256(tracked_bytes).hexdigest(),
+            run_spec_sha256(spec),
+        ),
+    )
 
 
 def run_spec_sha256(spec: ModelImprovementRunSpec) -> str:
