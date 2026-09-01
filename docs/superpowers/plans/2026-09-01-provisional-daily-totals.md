@@ -151,7 +151,9 @@ payloads, manifests, receipts, and sidecars. Reject:
 - wrong report target/cutoff/model label;
 - absolute, `..`, backslash, alias, symlink, or outside-root paths;
 - payload byte count/hash mutation and receipt/binding mismatch;
-- report binding `game_pks` unequal to the canonical parsed source population;
+- live report binding `game_pks` unequal to the canonical parsed live
+  population; the bulk-history binding instead requires its contract-defined
+  empty `game_pks` and derives the admitted population from authenticated raw;
 - historical duplicate gamePk, post-cutoff row, or malformed final score;
 - target row whose date differs or whose game is not pregame.
 
@@ -219,7 +221,10 @@ request, and missing or ambiguous request type before any rate calculation.
 Raw schedule occurrences may repeat one `gamePk` across moved query dates;
 apply the existing official schedule parser first, then require the canonical
 parsed population to contain unique `game_pk`. Conflicting duplicates remain a
-parser integrity failure.
+parser integrity failure. Exclude canonical rows after the cutoff before final
+validation. Treat source statuses `Final` and `Completed Early` as completed
+scored games and normalize both to the Task 1 internal `Final` status; reject
+all other statuses from model history.
 
 - [ ] **Step 4: Add before/open/post mutation tests and run GREEN**
 
