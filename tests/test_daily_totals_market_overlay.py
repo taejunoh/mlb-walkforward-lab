@@ -142,6 +142,50 @@ class SecurePersistenceTests(unittest.TestCase):
         return relative
 
     @classmethod
+    def _rewrite_model_report(cls, root: Path, trace: Path, mutate: object) -> None:
+        """Rewrite and rebind canonical model bytes for a policy fixture."""
+        trace_path = root / trace
+        trace_value = json.loads(trace_path.read_bytes())
+        report_path = root / Path(trace_value["report_relative"])
+        report = json.loads(report_path.read_bytes())
+        mutate(report)
+        report["content_sha256"] = cls._digest({key: item for key, item in report.items() if key != "content_sha256"})
+        report_bytes = canonical_json_bytes(report)
+        report_sidecar = hashlib.sha256(report_bytes).hexdigest().encode("ascii") + b"\n"
+        report_path.write_bytes(report_bytes)
+        report_path.with_suffix(".sha256").write_bytes(report_sidecar)
+        trace_value["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
+        trace_value["report_sidecar_sha256"] = hashlib.sha256(report_sidecar).hexdigest()
+        trace_value["content_sha256"] = cls._digest({key: item for key, item in trace_value.items() if key != "content_sha256"})
+        trace_path.write_bytes(canonical_json_bytes(trace_value))
+
+    @classmethod
+    def _build_public_case(
+        cls, root: Path, raw_mutator: object | None = None, mutate_report: object | None = None,
+    ):
+        """Create a fresh authority, admit one capture, and build one overlay."""
+        from mlb_backtest.daily_totals_market_overlay import (
+            admit_draftkings_snapshot, build_overlay,
+        )
+
+        trace, raw = cls._authority(root)
+        raw_value = cls._raw_value(root, raw)
+        if raw_mutator is not None:
+            raw_mutator(raw_value)
+        if mutate_report is not None:
+            cls._rewrite_model_report(root, trace, mutate_report)
+        candidate = cls._write_raw(root, raw_value)
+        snapshot = admit_draftkings_snapshot(
+            root, trace, candidate,
+            comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc),
+        )
+        built = build_overlay(
+            root, trace, snapshot,
+            evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+        )
+        return trace, snapshot, built
+
+    @classmethod
     def _admitted(cls, root: Path) -> tuple[Path, Path, Path]:
         from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot
 
@@ -467,6 +511,227 @@ class SecurePersistenceTests(unittest.TestCase):
                     with self.assertRaises(OSError):
                         overlay.persist_overlay(root, built)
                 self.assertFalse((root / built.trace_relative).exists())
+
+    def test_public_unique_over_pick_has_exact_support_and_margin(self) -> None:
+        """A fresh admitted capture can publish an exact OVER research pick."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        def report_over(report: dict[str, object]) -> None:
+            game = report["games"][0]
+            samples = [9] * 764
+            game.update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [9, 9],
+            })
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = self._build_public_case(root, mutate_report=report_over)
+            row = built.report["games"][0]
+            self.assertEqual(row["selected_side"], "OVER")
+            self.assertEqual(row["decision"], "RESEARCH_PICK")
+            self.assertEqual(row["reason_codes"], ())
+            self.assertEqual((row["over_support"], row["under_support"], row["push_support"]), (1.0, 0.0, 0.0))
+            self.assertEqual((row["over_conditional_support"], row["under_conditional_support"]), (1.0, 0.0))
+            self.assertEqual((row["over_support_margin"], row["under_support_margin"]), (0.5, -0.5))
+            paths = persist_overlay(root, built)
+            self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_unique_under_pick_has_exact_support_and_margin(self) -> None:
+        """A fresh admitted capture can publish an exact UNDER research pick."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = self._build_public_case(root)
+            row = built.report["games"][0]
+            self.assertEqual(row["selected_side"], "UNDER")
+            self.assertEqual(row["decision"], "RESEARCH_PICK")
+            self.assertEqual(row["reason_codes"], ())
+            self.assertEqual((row["over_support"], row["under_support"], row["push_support"]), (0.0, 1.0, 0.0))
+            self.assertEqual((row["over_conditional_support"], row["under_conditional_support"]), (0.0, 1.0))
+            self.assertEqual((row["over_support_margin"], row["under_support_margin"]), (-0.5, 0.5))
+            paths = persist_overlay(root, built)
+            self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_policy_reasons_are_isolated_when_attainable(self) -> None:
+        """Public builds expose each single policy failure with canonical ordering."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        cases = (
+            (
+                "NONPUSH_SUPPORT_TOO_LOW",
+                lambda value: value["games"][0].update({"line_half_runs": 16, "over_american_odds": 100, "under_american_odds": 100}),
+                lambda report: report["games"][0].update({
+                    "residual_samples": [9] * 600 + [7] * 4 + [8] * 160,
+                    "residual_sha256": self._digest([9] * 600 + [7] * 4 + [8] * 160),
+                    "interval_80": [8, 9],
+                }),
+                ("NONPUSH_SUPPORT_TOO_LOW",),
+            ),
+            (
+                "POINT_GAP_TOO_SMALL",
+                lambda value: value["games"][0].update({"line_half_runs": 19, "over_american_odds": 100, "under_american_odds": 100}),
+                None,
+                ("POINT_GAP_TOO_SMALL",),
+            ),
+            (
+                "SUPPORT_MARGIN_TOO_LOW",
+                lambda value: value["games"][0].update({"line_half_runs": 17, "over_american_odds": -110, "under_american_odds": -110}),
+                lambda report: report["games"][0].update({
+                    "residual_samples": [9] * 401 + [8] * 363,
+                    "residual_sha256": self._digest([9] * 401 + [8] * 363),
+                    "interval_80": [8, 9],
+                }),
+                ("SUPPORT_MARGIN_TOO_LOW",),
+            ),
+        )
+        for name, raw_mutator, report_mutator, expected_reasons in cases:
+            with self.subTest(name=name), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                _, _, built = self._build_public_case(root, raw_mutator, report_mutator)
+                row = built.report["games"][0]
+                self.assertEqual(row["decision"], "PASS")
+                self.assertEqual(row["reason_codes"], expected_reasons)
+                paths = persist_overlay(root, built)
+                self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_ambiguous_direction_reports_required_support_margin_companion(self) -> None:
+        """A tied public direction is ambiguous and has no selected margin to pass."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        samples = [9] * 382 + [8] * 382
+
+        def report_tied(report: dict[str, object]) -> None:
+            report["games"][0].update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [8, 9],
+            })
+
+        def raw_tied(value: dict[str, object]) -> None:
+            value["games"][0].update({"line_half_runs": 17, "over_american_odds": 100, "under_american_odds": 100})
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = self._build_public_case(root, raw_tied, report_tied)
+            row = built.report["games"][0]
+            self.assertEqual(row["selected_side"], None)
+            self.assertEqual(row["decision"], "PASS")
+            # Build's selected-margin gate necessarily accompanies ambiguity;
+            # the semantic validator also accepts AMBIGUOUS_DIRECTION alone.
+            self.assertEqual(row["reason_codes"], ("SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION"))
+            paths = persist_overlay(root, built)
+            self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_combined_policy_failures_use_canonical_reason_order(self) -> None:
+        """All attainable policy failures remain in the fixed reason-code order."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        def raw_combined(value: dict[str, object]) -> None:
+            value["games"][0].update({"line_half_runs": 20, "over_american_odds": 100, "under_american_odds": 100})
+
+        def report_combined(report: dict[str, object]) -> None:
+            samples = [10] * 764
+            report["games"][0].update({
+                "residual_samples": samples,
+                "residual_sha256": self._digest(samples),
+                "interval_80": [10, 10],
+            })
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = self._build_public_case(root, raw_combined, report_combined)
+            row = built.report["games"][0]
+            self.assertEqual(row["decision"], "PASS")
+            self.assertEqual(row["reason_codes"], (
+                "NONPUSH_SUPPORT_TOO_LOW", "POINT_GAP_TOO_SMALL",
+                "SUPPORT_MARGIN_TOO_LOW", "AMBIGUOUS_DIRECTION",
+            ))
+            paths = persist_overlay(root, built)
+            self.assertTrue((root / paths[-1]).is_file())
+
+    def test_public_zero_pick_persist_is_idempotent_without_new_filename(self) -> None:
+        """A no-quote overlay persists twice byte-identically at one path set."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        def raw_zero_pick(value: dict[str, object]) -> None:
+            value["games"] = [
+                {"game_pk": game["game_pk"], "status": "NO_QUOTE", "reason": "NOT_LISTED"}
+                for game in value["games"]
+            ]
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = self._build_public_case(root, raw_zero_pick)
+            self.assertEqual({row["decision"] for row in built.report["games"]}, {"PASS"})
+            self.assertTrue(all("selected_side" not in row for row in built.report["games"]))
+            first_paths = persist_overlay(root, built)
+            first_bytes = [path.read_bytes() for path in (root / p for p in first_paths)]
+            files_after_first = {path.relative_to(root) for path in root.rglob("*") if path.is_file()}
+            second_paths = persist_overlay(root, built)
+            second_bytes = [path.read_bytes() for path in (root / p for p in second_paths)]
+            files_after_second = {path.relative_to(root) for path in root.rglob("*") if path.is_file()}
+            self.assertEqual(second_paths, first_paths)
+            self.assertEqual(second_bytes, first_bytes)
+            self.assertEqual(files_after_second, files_after_first)
+
+    def test_model_residual_count_hash_corruption_rejects_before_evaluated_clock(self) -> None:
+        """Corrupt model residual authority is rejected before build's evaluated clock."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            candidate = self._write_raw(root, self._raw_value(root, raw))
+            snapshot = overlay.admit_draftkings_snapshot(
+                root, trace, candidate,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc),
+            )
+
+            def corrupt(report: dict[str, object]) -> None:
+                report["games"][0]["residual_count"] = 763
+                report["games"][0]["residual_sha256"] = "0" * 64
+
+            self._rewrite_model_report(root, trace, corrupt)
+            calls: list[object] = []
+            with self.assertRaises(ValueError):
+                overlay.build_overlay(
+                    root, trace, snapshot,
+                    evaluated_clock=lambda: calls.append(1) or datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+                )
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "reports/experimental_daily_totals_overlay").exists())
+
+    def test_public_nearest_attainable_nonpush_thresholds_are_distinct(self) -> None:
+        """With 764 samples, 611/764 is below .80 while 612/764 is above it."""
+        from mlb_backtest.daily_totals_market_overlay import persist_overlay
+
+        for nonpush, expected_reasons, under_count, push_count in (
+            (611, ("NONPUSH_SUPPORT_TOO_LOW",), 11, 153),
+            (612, (), 12, 152),
+        ):
+            with self.subTest(nonpush=nonpush), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                samples = [9] * 600 + [7] * under_count + [8] * push_count
+
+                def raw_threshold(value: dict[str, object]) -> None:
+                    value["games"][0].update({"line_half_runs": 16, "over_american_odds": 100, "under_american_odds": 100})
+
+                def report_threshold(report: dict[str, object]) -> None:
+                    report["games"][0].update({
+                        "residual_samples": samples,
+                        "residual_sha256": self._digest(samples),
+                        "interval_80": [8, 9],
+                    })
+
+                _, _, built = self._build_public_case(root, raw_threshold, report_threshold)
+                row = built.report["games"][0]
+                self.assertEqual(row["reason_codes"], tuple(expected_reasons))
+                self.assertEqual(row["selected_side"], "OVER")
+                paths = persist_overlay(root, built)
+                self.assertTrue((root / paths[-1]).is_file())
 
 
 class SchemaTests(unittest.TestCase):
