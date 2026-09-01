@@ -352,8 +352,8 @@ git commit -m "feat: score lane b candidates"
 
 **Interfaces:**
 
-- Consumes ModelImprovementRunSpec, FeatureSeal, completed PredictionSeal objects, Candidate.
-- Produces CandidateFoldCard and fit_candidate_fold_card(spec, feature_seal, joined_ledgers, candidate, fold_id) -> CandidateFoldCard.
+- Consumes ModelImprovementRunSpec, FeatureSeal, completed JoinedLedger objects, Candidate.
+- Produces CandidateFoldCard and `fit_candidate_fold_card(spec, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id) -> CandidateFoldCard`.
 
 - [ ] **Step 1: Write the failing chronology TestCase.**
 
@@ -378,11 +378,12 @@ Expected: ModuleNotFoundError for lane_b_calibration.
 - [ ] **Step 3: Implement strict OOF fitter.**
 
 ~~~python
+from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from mlb_backtest.normalize import fit_logistic
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes
-from mlb_backtest.model_improvement.oof_ledger import load_joined_prediction_rows
+from mlb_backtest.model_improvement.oof_ledger import JoinedLedger, load_joined_prediction_rows
 from mlb_backtest.model_improvement.sealed_features import load_sealed_feature_rows
 from .lane_b_scoring import score_candidate_rows
 
@@ -402,7 +403,9 @@ class CandidateFoldCard:
     calibration_input_sha256: str
 
 
-def fit_candidate_fold_card(spec, feature_seal, joined_ledgers, candidate, fold_id):
+def fit_candidate_fold_card(
+    spec, feature_seal, joined_ledgers: Sequence[JoinedLedger], candidate, fold_id,
+):
     years = _FOLD_YEARS.get(fold_id)
     if years is None or spec.fold(fold_id).target_year <= max(years):
         raise ValueError("fold chronology differs")
