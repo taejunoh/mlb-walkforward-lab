@@ -209,6 +209,20 @@ class RunSpecTest(unittest.TestCase):
                         load_verified_run_spec(declaration)
                 finally:
                     activation.cleanup()
+        activation, _root, declaration = self._activation_repository()
+        try:
+            declaration.write_bytes(declaration.read_bytes().replace(b"\n", b"\r\n"))
+            with self.assertRaisesRegex(ValueError, "tracked blob"):
+                load_verified_run_spec(declaration)
+        finally:
+            activation.cleanup()
+        activation, _root, declaration = self._activation_repository()
+        try:
+            declaration.write_bytes(b"\xff\n")
+            with self.assertRaisesRegex(ValueError, "tracked blob"):
+                load_verified_run_spec(declaration)
+        finally:
+            activation.cleanup()
         for name, kwargs, message in (
             ("extra", {"extra_file": True}, "declaration-only"),
             ("merge", {"merge": True}, "single-parent"),

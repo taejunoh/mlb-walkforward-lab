@@ -411,6 +411,19 @@ def _git_at(root: Path, *args: str) -> str:
     return completed.stdout
 
 
+def _git_bytes_at(root: Path, *args: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=False,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("could not read RunSpec owning repository") from exc
+    return completed.stdout
+
+
 def _owning_repository(path: Path) -> Path:
     root_text = _git_at(path.parent, "rev-parse", "--show-toplevel").strip()
     root = Path(root_text)
@@ -425,24 +438,26 @@ def load_verified_run_spec(path: Path) -> ModelImprovementRunSpec:
     expected = owning_root / relative
     if path.resolve() != expected:
         raise ValueError("verified run spec requires the expected production path")
-    spec = load_run_spec(path)
-    if spec.schema_version == "SYNTHETIC_TEST_ONLY":
-        raise ValueError("synthetic run spec cannot be verified")
     head = _git_at(owning_root, "rev-parse", "HEAD").strip()
     parents = _git_at(owning_root, "rev-list", "--parents", "-n", "1", "HEAD").split()
     if not _HEAD.fullmatch(head) or len(parents) != 2 or parents[0] != head or not _HEAD.fullmatch(parents[1]):
         raise ValueError("verified run spec requires a single-parent activation commit")
     parent = _git_at(owning_root, "rev-parse", "HEAD^").strip()
-    if parent != parents[1] or spec.code_revision != parent:
-        raise ValueError("run spec code_revision differs from activation parent")
+    if parent != parents[1]:
+        raise ValueError("activation parent differs")
     changed = _git_at(owning_root, "diff", "--name-only", f"{parent}..{head}").splitlines()
     if changed != [relative]:
         raise ValueError("activation commit is not declaration-only")
-    tracked_bytes = _git_at(owning_root, "show", f"{head}:{relative}").encode("utf-8")
+    tracked_bytes = _git_bytes_at(owning_root, "show", f"{head}:{relative}")
     if read_regular_bytes(path, "verified run spec") != tracked_bytes:
         raise ValueError("verified run spec differs from tracked blob")
     if _git_at(owning_root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise ValueError("verified run spec requires a clean worktree")
+    spec = load_run_spec(path)
+    if spec.schema_version == "SYNTHETIC_TEST_ONLY":
+        raise ValueError("synthetic run spec cannot be verified")
+    if spec.code_revision != parent:
+        raise ValueError("run spec code_revision differs from activation parent")
     return spec
 
 
