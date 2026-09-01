@@ -18,6 +18,7 @@ from mlb_backtest.daily_totals import (
     MODEL_SCHEMA,
     REPORT_SCHEMA,
     render_totals_markdown,
+    build_daily_totals,
     persist_daily_totals,
     validate_totals_trace,
     validate_totals_model_receipt,
@@ -25,6 +26,7 @@ from mlb_backtest.daily_totals import (
 )
 from mlb_backtest.daily_totals import _per_game_coverage
 from mlb_backtest.experimental_totals import FinalTotalGame, TotalProjection
+from mlb_backtest.experimental_totals import CANDIDATE_IDS
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
 
 
@@ -298,6 +300,26 @@ class DailyTotalsContractTests(unittest.TestCase):
         self.assertEqual(_per_game_coverage(rows, (-2.0, 2.0)), 0.5)
         # A single interval fixed around mean 3 would be [1, 5], covering neither.
         self.assertNotEqual(_per_game_coverage(rows, (-2.0, 2.0)), 0.0)
+
+    def test_build_uses_one_bound_loader_and_exact_development_window_before_selection(self) -> None:
+        game = FinalTotalGame(1, "2026-06-01", "2026-06-01T16:00:00Z", 2, 3, 4, 3, 4)
+        development = {
+            candidate: ((game, TotalProjection("PROJECTED", candidate, 3.0, 4.0, 7.0)),)
+            for candidate in CANDIDATE_IDS
+        }
+        bundle = SimpleNamespace(target_date="2026-09-01", cutoff_date="2026-08-31", history_games=(), target_games=(), history_identity=_source("HISTORY_SCHEDULE"), live_identity=_source("LIVE_SCHEDULE"))
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / "reports/experimental_daily/2026-09-01/source.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            with patch("mlb_backtest.daily_totals.load_totals_sources_bound", return_value=bundle) as loader, patch("mlb_backtest.daily_totals.walk_forward_predictions", return_value=development) as walk:
+                with self.assertRaisesRegex(ValueError, "at least 100"):
+                    build_daily_totals(root, "2026-09-01", Path("reports/experimental_daily/2026-09-01/source.json"))
+            loader.assert_called_once()
+            self.assertEqual(loader.call_args.args[0], root)
+            self.assertEqual(loader.call_args.args[2], Path("reports/experimental_daily/2026-09-01/source.json"))
+            self.assertEqual(walk.call_args.args[2:], ("2026-06-01", "2026-07-31"))
 
 
 if __name__ == "__main__":

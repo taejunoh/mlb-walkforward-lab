@@ -26,7 +26,6 @@ from .experimental_totals import (
 )
 from .experimental_totals_sources import (
     AdmittedSourceIdentity,
-    load_totals_sources,
     load_totals_sources_bound,
 )
 from .live_top3_contracts import canonical_json_bytes, validate_target_date
@@ -391,7 +390,7 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
         source_snapshot = read_regular_snapshot(trusted, source_relative, "daily totals source report")
         if source_snapshot is None:
             raise ValueError("daily totals source report differs")
-        bundle = load_totals_sources(Path(root), source_relative)
+        bundle = load_totals_sources_bound(trusted.path, trusted, source_relative)
         if bundle.target_date != target or bundle.cutoff_date != (date.fromisoformat(target) - timedelta(days=1)).isoformat():
             raise ValueError("admitted source dates differ")
         if target != "2026-09-01" or bundle.cutoff_date != "2026-08-31":
