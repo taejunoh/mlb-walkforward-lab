@@ -24,6 +24,11 @@ from .oof_ledger_v2 import (
     load_prediction_seal_v2,
     seal_oof_predictions_v2,
 )
+from .baseline_replay_v2 import (
+    BaselineReplayReceiptV2,
+    load_baseline_replay_v2,
+    replay_v51_predictions_v2,
+)
 
 __all__ = [
     "canonical_json_bytes",
@@ -45,4 +50,7 @@ __all__ = [
     "seal_oof_predictions_v2",
     "load_prediction_seal_v2",
     "load_prediction_rows_v2",
+    "BaselineReplayReceiptV2",
+    "replay_v51_predictions_v2",
+    "load_baseline_replay_v2",
 ]
