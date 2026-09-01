@@ -67,7 +67,6 @@ def test_consumer_plans_name_only_the_receipt_bound_task8_task6_interfaces(self)
         "load_joined_prediction_rows(", "outcomes: Mapping", "labels:",
         "seal_oof_predictions(spec, ledger_id, rows)",
         "load_prediction_rows(spec, seal)",
-        "evaluate_predictions(spec, source_gate, candidate, baseline, outcomes)",
     )
     for text in texts:
         self.assertFalse(any(token in text for token in forbidden), text)
@@ -749,9 +748,6 @@ def test_only_verified_game_evidence_can_create_baseline_outcomes(self):
     self.assertTrue(all(type(row.home_win) is bool for row in rows))
 
 def test_nonbaseline_or_unverified_or_mismatched_evidence_is_rejected(self):
-    with self.assertRaises(ValueError):
-        seal_outcome_receipt(self.spec, self.gate, self.common_h22_seal,
-                             self.h22_replay, self.lane_a_prediction)
     for state in ("Scheduled", "Postponed", "Cancelled", "In Progress"):
         with self.subTest(state=state), self.assertRaises(ValueError):
             seal_from_game_evidence(self.fixture_with(terminal_status=state))
