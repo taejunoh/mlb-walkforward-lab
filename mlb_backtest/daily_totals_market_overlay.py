@@ -89,8 +89,13 @@ def compare_sample_support(
 def _finite_probability(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be a finite probability")
-    result = float(value)
-    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+    if value < 0 or value > 1:
+        raise ValueError(f"{label} must be a finite probability between 0 and 1")
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite probability") from exc
+    if not math.isfinite(result):
         raise ValueError(f"{label} must be a finite probability between 0 and 1")
     return result
 

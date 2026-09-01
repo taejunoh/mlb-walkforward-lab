@@ -108,6 +108,16 @@ class PureMathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             price_support(0.6, 0.41, 100)
 
+    def test_price_support_rejects_overflowing_real_probabilities(self) -> None:
+        overflowing = Fraction(10**10_000, 1)
+        for side, (win_support, loss_support) in (
+            ("win", (overflowing, 0.0)),
+            ("loss", (0.0, overflowing)),
+        ):
+            with self.subTest(side=side):
+                with self.assertRaises(ValueError):
+                    price_support(win_support, loss_support, 100)  # type: ignore[arg-type]
+
     def test_price_support_rejects_invalid_price(self) -> None:
         with self.assertRaises(ValueError):
             price_support(0.5, 0.5, 99)
