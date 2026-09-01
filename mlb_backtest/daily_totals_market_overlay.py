@@ -959,15 +959,34 @@ def persist_overlay(root: Path, built: BuiltOverlay) -> tuple[Path, Path, Path, 
     """Append sidecar, JSON, Markdown, then trace; trace publication is the commit."""
     if not isinstance(built, BuiltOverlay):
         raise ValueError("built overlay differs")
-    report = validate_overlay_report(json.loads(built.report_bytes))
+    try:
+        report = validate_overlay_report(json.loads(built.report_bytes))
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("built overlay report differs") from exc
     if canonical_json_bytes(report) != built.report_bytes or _frozen(report) != built.report:
         raise ValueError("built overlay report differs")
-    if (built.report_relative.parent != _OVERLAY_ROOT / TARGET_DATE or built.report_sidecar_relative != built.report_relative.with_suffix(".sha256") or built.markdown_relative != built.report_relative.with_suffix(".md") or built.trace_relative != built.report_relative.with_suffix(".trace.json")):
-        raise ValueError("built overlay paths differ")
-    trace = _overlay_trace(json.loads(built.trace_bytes))
-    if (trace["report_relative"] != built.report_relative.as_posix() or trace["report_sha256"] != _sha_bytes(built.report_bytes) or trace["report_sidecar_sha256"] != _sha_bytes(_sidecar(built.report_bytes)) or trace["markdown_sha256"] != _sha_bytes(built.markdown_bytes)):
-        raise ValueError("built overlay trace differs")
+    try:
+        model_trace = _path(Path(str(report["model_trace_relative"])), "built model trace path")
+        market_snapshot = _path(Path(str(report["market_snapshot_relative"])), "built market snapshot path")
+        evaluated, _ = _clock(
+            _utc_timestamp(report["evaluated_at_utc"], "built evaluated time"),
+            "built evaluated time",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("built overlay input bindings differ") from exc
     root_path = Path(root)
+    # The public dataclass is deliberately treated as an untrusted transport.
+    # Rebuild its entire authority chain from filesystem evidence before writing.
+    expected = build_overlay(
+        root_path,
+        model_trace,
+        market_snapshot,
+        evaluated_clock=lambda: evaluated,
+    )
+    if built != expected:
+        raise ValueError("built overlay differs from rebound authority")
+    built = expected
+    trace = _overlay_trace(json.loads(built.trace_bytes))
     with open_trusted_root(root_path) as trusted:
         _rebind_all(trusted, built.input_snapshots, "overlay persistence inputs")
         sidecar = _existing_or_write(trusted, built.report_sidecar_relative, _sidecar(built.report_bytes), "overlay report sidecar", rebind=lambda: _rebind_all(trusted, built.input_snapshots, "overlay persistence inputs"))
@@ -980,5 +999,7 @@ def persist_overlay(root: Path, built: BuiltOverlay) -> tuple[Path, Path, Path, 
         persisted = _overlay_trace(_canonical_json(trace_snapshot, "overlay trace"))
         if persisted != trace:
             raise ValueError("persisted overlay trace differs")
+        # Rebind after parsing the commit too: parsing is not a stability proof.
+        _rebind_all(trusted, before_trace + (trace_snapshot,), "overlay post-trace")
         trusted.assert_bound()
     return built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative

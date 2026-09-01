@@ -5,11 +5,12 @@ import hashlib
 import math
 from copy import deepcopy
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
@@ -166,6 +167,77 @@ class SecurePersistenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
             self.assertFalse((root / "audit/experimental_daily_totals_market/draftkings").exists())
+
+    def test_persist_rejects_forged_bundle_without_rebound_evidence(self) -> None:
+        """Catch a caller-created bundle that omits the immutable input chain."""
+        from mlb_backtest.daily_totals_market_overlay import (
+            admit_draftkings_snapshot, build_overlay, persist_overlay,
+        )
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+            built = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            forged = replace(built, input_snapshots=())
+            with self.assertRaises(ValueError):
+                persist_overlay(root, forged)
+            self.assertFalse((root / built.trace_relative).exists())
+
+    def test_persist_rejects_tampered_bytes_and_noncanonical_paths_before_write(self) -> None:
+        """Catch a self-consistent caller trace that changes a non-authority field."""
+        from mlb_backtest.daily_totals_market_overlay import (
+            admit_draftkings_snapshot, build_overlay, persist_overlay,
+        )
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+            built = build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+
+            altered_markdown = b"altered markdown\n"
+            altered_trace = json.loads(built.trace_bytes)
+            altered_trace["markdown_sha256"] = hashlib.sha256(altered_markdown).hexdigest()
+            altered_trace["content_sha256"] = self._digest({key: item for key, item in altered_trace.items() if key != "content_sha256"})
+            basename = built.report_relative.with_name("alternate-" + built.report_relative.name)
+            basename_trace = json.loads(built.trace_bytes)
+            basename_trace["report_relative"] = basename.as_posix()
+            basename_trace["content_sha256"] = self._digest({key: item for key, item in basename_trace.items() if key != "content_sha256"})
+            cases = (
+                replace(built, markdown_bytes=altered_markdown, trace_bytes=canonical_json_bytes(altered_trace)),
+                replace(built, trace_bytes=b" " + built.trace_bytes),
+                replace(built, report_relative=basename, report_sidecar_relative=basename.with_suffix(".sha256"), markdown_relative=basename.with_suffix(".md"), trace_relative=basename.with_suffix(".trace.json"), trace_bytes=canonical_json_bytes(basename_trace)),
+            )
+            for forged in cases:
+                with self.subTest(kind=forged.report_relative.name):
+                    with self.assertRaises(ValueError):
+                        persist_overlay(root, forged)
+                    self.assertFalse((root / forged.trace_relative).exists())
+
+    def test_persist_rebinds_again_after_parsing_trace(self) -> None:
+        """Catch a post-parse replacement that the trace parse itself cannot observe."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            snapshot = overlay.admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            original = overlay.rebind_regular_snapshot
+            changed = False
+
+            def replace_after_parse(trusted: object, evidence: object, label: str, **kwargs: object) -> None:
+                nonlocal changed
+                original(trusted, evidence, label, **kwargs)  # type: ignore[arg-type]
+                if not changed and label.startswith("overlay post-trace"):
+                    (root / raw).write_bytes(b"changed after trace parse")
+                    changed = True
+
+            with patch.object(overlay, "rebind_regular_snapshot", side_effect=replace_after_parse):
+                with self.assertRaises(ValueError):
+                    overlay.persist_overlay(root, built)
+            self.assertTrue(changed)
 
 
 class SchemaTests(unittest.TestCase):
