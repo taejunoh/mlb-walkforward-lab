@@ -415,6 +415,59 @@ class SecurePersistenceTests(unittest.TestCase):
             persist_overlay(root, built)
             self.assertEqual([path.read_bytes() for path in authority_paths], before)
 
+    def test_public_api_rejects_symlink_and_directory_file_attacks(self) -> None:
+        """Exercise no-follow rejection at raw, snapshot, and all overlay writer leaves."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = self._authority(root)
+            raw_path = root / raw
+            raw_path.unlink()
+            os.symlink("/dev/null", raw_path)
+            with self.assertRaises(ValueError):
+                overlay.admit_draftkings_snapshot(root, trace, raw, comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc))
+        for leaf in ("snapshot", "snapshot_sidecar"):
+            with self.subTest(leaf=leaf), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                path = root / (snapshot if leaf == "snapshot" else snapshot.with_suffix(".sha256"))
+                path.unlink()
+                os.symlink("/dev/null", path)
+                with self.assertRaises(ValueError):
+                    overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _, snapshot = self._admitted(root)
+            built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+            for leaf in (built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative):
+                with self.subTest(leaf=leaf.name):
+                    path = root / leaf
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink("/dev/null", path)
+                    with self.assertRaises(ValueError):
+                        overlay.persist_overlay(root, built)
+                    path.unlink()
+
+    def test_write_failures_preserve_pretrace_evidence_and_never_return_success(self) -> None:
+        """Catch a writer fault that could publish a trace before its predecessors."""
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        for failing in ("overlay report sidecar", "overlay report", "overlay Markdown", "overlay trace"):
+            with self.subTest(failing=failing), TemporaryDirectory(dir=Path.cwd()) as temporary:
+                root = Path(temporary)
+                trace, _, snapshot = self._admitted(root)
+                built = overlay.build_overlay(root, trace, snapshot, evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc))
+                original = overlay._existing_or_write
+                def fail(*args: object, **kwargs: object) -> object:
+                    if args[3] == failing:
+                        raise OSError("injected")
+                    return original(*args, **kwargs)  # type: ignore[arg-type]
+                with patch.object(overlay, "_existing_or_write", side_effect=fail):
+                    with self.assertRaises(OSError):
+                        overlay.persist_overlay(root, built)
+                self.assertFalse((root / built.trace_relative).exists())
+
 
 class SchemaTests(unittest.TestCase):
     def test_contract_schemas_are_draft_2020_12_closed_roots(self) -> None:
