@@ -157,14 +157,18 @@ inventory: {path, sha256},
 terminal_checkpoint: {path, sha256}
 ```
 
-`authority_root` and every nested `path` are canonical absolute normal paths;
-each nested digest is lowercase SHA-256. This preimage contains no RunSpec
-digest, receipt digest, source-gate digest, weight, outcome, or target label.
-After RunSpec sealing, Task6P reconstructs this exact preimage from
-`RunSpec.source_authority`, then requires its digest to equal both the receipt
-and every row. It additionally compares each bound path/digest to the typed
-SourceGate/SourceInventory/VerifiedGameEvidence chain; disagreement is
-`ValueError` rather than an alternate source authority.
+The absolute preimage resolution is exact. The activation authority base is
+`Path(spec.verified_activation.declaration_path).parents[2]`; `authority_root`
+is that base joined to relative `spec.source_authority.authority_root`.
+Each nested path resolves beneath this authority root. The resulting canonical
+no-alias absolute strings and the existing lowercase SHA-256 values form the
+preimage above. The pre-RunSpec producer must use this identical declared
+activation base and source bindings. This preimage contains no RunSpec digest,
+receipt digest, source-gate digest, weight, outcome, or target label. After
+RunSpec sealing, Task6P reconstructs it from `RunSpec.source_authority`, then
+requires its digest to equal both receipt and every row and compares every
+bound path/digest to the typed SourceGate/SourceInventory/VerifiedGameEvidence
+chain; disagreement is `ValueError` rather than alternate authority.
 
 There is presently no source-to-feature producer/re-executor that can create
 such a receipt from the V5.2 authority. That producer is deliberately outside
@@ -207,9 +211,13 @@ once immediately before return/publication; any drift is `ValueError`.
 
 Task6P alone defines private
 `_iter_verified_calibration_games_v1(verified_inventory)`. It obtains no
-caller mapping: it reads only `verified_inventory.payload["games"]`, requires
-that value to be a mapping, and visits keys in ascending numeric `game_pk`
-order. Every value must be a closed mapping with exactly:
+caller mapping: it reads only the nonempty list
+`verified_inventory.payload["games"]`, which
+`load_verified_game_evidence_inventory` has already fully schema-validated.
+It iterates that list in its canonical stored order and requires selected
+positive integer `game_pk` values to be strictly increasing and unique. It
+does **not** impose an exact-key schema on each full game mapping. Instead it
+projects and runtime-validates only the fields required here:
 
 ```text
 game_pk, official_date, scheduled_start_utc, home_team_id, away_team_id,
@@ -217,12 +225,11 @@ winner_team_id, home_score, away_score, played, terminal_status,
 verification_status, source_game_sha256
 ```
 
-The key and `game_pk` must be the same positive integer; dates/timestamps,
-team IDs, scores, terminal/verification fields, and lowercase source digest
-must pass their closed runtime validators. No extra/missing key, bool-as-int,
-unordered sequence, alternate outcome mapping, or feature-supplied game field
-is accepted. The helper returns typed, immutable per-game values used for the
-team/date/source comparison and the internal `home_win` derivation below.
+Dates/timestamps, team IDs, scores, terminal/verification values and source
+digest must meet the existing typed rules; the typed inventory loader remains
+responsible for every other wire field. No caller-provided outcome/feature
+mapping is accepted. The helper returns immutable projections for the
+team/date/source comparison and internal `home_win` derivation below.
 
 For baseline, Task6P resolves weights only through
 `resolve_prediction_weight_authority(spec, "v5.1", None)`. It canonicalizes
@@ -307,13 +314,13 @@ template, default path, or derived digest is never authority:
     "C23H": {"target_year": 2023, "training_start": "2018-01-01", "training_end": "2022-12-31"}
   },
   "calibration_feature_receipts": {
-    "C19": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C20": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C21": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C22O": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C22H": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C23O": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"},
-    "C23H": {"path": "<canonical-repo-relative-receipt-primary>", "sha256": "<64-lowercase-hex>"}
+    "C19": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C20": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C21": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C22O": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C22H": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C23O": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"},
+    "C23H": {"path": "<canonical-absolute-calibration_feature_receipt.json>", "sha256": "<64-lowercase-hex>"}
   },
   "baseline_rows_relative_template": "baseline/v5.1/{fold_id}/v2/calibration_rows.jsonl",
   "baseline_card_relative_template": "baseline/v5.1/{fold_id}/v2/probability_calibration_card.json"

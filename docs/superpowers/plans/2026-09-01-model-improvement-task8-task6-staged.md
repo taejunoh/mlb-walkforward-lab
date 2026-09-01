@@ -202,6 +202,14 @@ path+SHA binding object. After sealing, the loader reconstructs that exact
 preimage from `RunSpec.source_authority` and compares it to the typed bound
 gate/inventory/GameEvidence chain.
 
+Resolve this preimage exactly as follows: activation base is
+`Path(spec.verified_activation.declaration_path).parents[2]`; authority root
+is that base joined with relative `spec.source_authority.authority_root`; and
+source-run-spec/acquisition-contract/inventory/terminal-checkpoint paths each
+resolve beneath authority root. Canonical no-alias absolute path strings plus
+existing SHA values are the preimage. The pre-RunSpec producer uses the same
+declared activation base/source bindings.
+
 Implement `CalibrationFeatureReceiptV1`,
 `load_calibration_feature_receipt(spec, fold_id)`, `ProbabilityCalibrationCardV2`,
 `load_probability_calibration_card_v2(spec, fold_id)`, and
@@ -226,7 +234,10 @@ recomputes the frozen fit. No source-to-feature producer, real receipt, or
 receipt publication is claimed by this task. Task6P adds private
 `_iter_verified_calibration_games_v1` for the only safe deterministic
 `VerifiedGameEvidenceInventory.payload["games"]` traversal described by the
-spec. Task8B is outside this executable plan: every nonbaseline call blocks
+spec: consume its already-validated nonempty `games` list in stored canonical
+order, require selected positive `game_pk` values strictly increasing/unique,
+and project only required date/start/team/status/played/verification/score/
+winner/source-digest fields from full rows. Task8B is outside this executable plan: every nonbaseline call blocks
 with `BLOCKED_WEIGHT_SELECTION_AUTHORITY_MISSING`; this plan defines no
 candidate-selection receipt/schema/API.
 
