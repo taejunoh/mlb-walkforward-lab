@@ -711,6 +711,21 @@ class PredictionRow:
             or self.rank < 0
         ):
             raise ValueError("rank must be zero iff picked_side is none")
+        if self.p_home > 0.5:
+            expected_side, expected_probability = "home", self.p_home
+        elif self.p_home < 0.5:
+            expected_side, expected_probability = "away", 1.0 - self.p_home
+        else:
+            expected_side, expected_probability = "none", 0.5
+        if self.picked_side != expected_side:
+            raise ValueError("picked_side must match p_home direction")
+        if not math.isclose(
+            self.pick_probability,
+            expected_probability,
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        ):
+            raise ValueError("pick_probability must match p_home")
         for field in (
             "feature_row_sha256",
             "prediction_contract_sha256",
@@ -958,6 +973,10 @@ class FrozenModelCard:
             "parent_card_sha256",
             _require_optional_sha256(self.parent_card_sha256, "parent_card_sha256"),
         )
+        if self.model_id == "A" and self.parent_card_sha256 is not None:
+            raise ValueError("A frozen cards must not have a parent card")
+        if self.model_id in {"A+B", "A+B+C"} and self.parent_card_sha256 is None:
+            raise ValueError("combined frozen cards require a parent card")
         object.__setattr__(
             self,
             "scoring_model_card_path",

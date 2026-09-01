@@ -277,18 +277,26 @@ class SealedFeatureRowTests(unittest.TestCase):
 
 
 class PredictionAndFrozenCardTests(unittest.TestCase):
-    def prediction_row(self, *, prediction_contract_sha256=SHA):
+    def prediction_row(
+        self,
+        *,
+        p_home=0.6,
+        picked_side="home",
+        pick_probability=0.6,
+        rank=1,
+        prediction_contract_sha256=SHA,
+    ):
         return PredictionRow(
-            "A", 123, "2024-04-01", 2024, 0.6, "home", 0.6, 0.2, 1.0,
-            "2024-04-01T19:10:00Z", 1, feature_row().feature_row_sha256,
+            "A", 123, "2024-04-01", 2024, p_home, picked_side, pick_probability,
+            0.2, 1.0, "2024-04-01T19:10:00Z", rank, feature_row().feature_row_sha256,
             prediction_contract_sha256, SHA_B,
         )
 
-    def frozen_card(self, *, parameters=None):
+    def frozen_card(self, *, model_id="A", parent_card_sha256=None, parameters=None):
         return FrozenModelCard(
-            model_id="A", state="H23_FROZEN", fold_id="H23",
+            model_id=model_id, state="H23_FROZEN", fold_id="H23",
             run_spec_sha256=SHA, source_gate_sha256=SHA,
-            baseline_replay_sha256=SHA, parent_card_sha256=None,
+            baseline_replay_sha256=SHA, parent_card_sha256=parent_card_sha256,
             feature_seal_sha256=SHA, prediction_contract_sha256=SHA,
             scoring_model_card_path="scoring.json", scoring_model_card_sha256=SHA_B,
             prediction_seal_sha256=SHA, evaluation_sha256=SHA,
@@ -303,6 +311,30 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
                 "A", 123, "2024-04-01", 2024, 1.1, "none", 0.0, 0.0, 0.0,
                 "2024-04-01T19:10:00Z", 0, feature_row().feature_row_sha256, SHA, SHA_B,
             )
+
+    def test_prediction_row_requires_pick_direction_and_probability_to_match_p_home(self):
+        self.assertEqual(self.prediction_row(), self.prediction_row())
+        self.assertEqual(
+            self.prediction_row(p_home=0.4, picked_side="away", pick_probability=0.6),
+            self.prediction_row(p_home=0.4, picked_side="away", pick_probability=0.6),
+        )
+        self.assertEqual(
+            self.prediction_row(p_home=0.5, picked_side="none", pick_probability=0.5, rank=0),
+            self.prediction_row(p_home=0.5, picked_side="none", pick_probability=0.5, rank=0),
+        )
+        for kwargs in (
+            {"p_home": 0.99, "picked_side": "away", "pick_probability": 0.01},
+            {"p_home": 0.6, "picked_side": "home", "pick_probability": 0.61},
+            {"p_home": 0.5, "picked_side": "home", "pick_probability": 0.5},
+            {"p_home": 0.5, "picked_side": "none", "pick_probability": 0.49, "rank": 0},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    self.prediction_row(**kwargs)
+        payload = self.prediction_row().as_mapping()
+        payload["picked_side"] = "away"
+        with self.assertRaises(ValueError):
+            PredictionRow.from_payload_mapping(payload)
         with self.assertRaises(ValueError):
             PredictionRow(
                 "A", 123, "2024-04-01", 2024, 0.5, "home", 0.5, 0.0, 0.0,
@@ -459,6 +491,18 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
                 scoring_model_card_sha256=SHA, prediction_seal_sha256=SHA,
                 evaluation_sha256=SHA, parameters={}, artifact_sha256=SHA_B, path="card.json",
             )
+
+    def test_frozen_card_requires_the_model_parent_hierarchy(self):
+        with self.assertRaises(ValueError):
+            self.frozen_card(parent_card_sha256=SHA)
+        for model_id in ("A+B", "A+B+C"):
+            with self.subTest(model_id=model_id):
+                with self.assertRaises(ValueError):
+                    self.frozen_card(model_id=model_id)
+                self.assertEqual(
+                    self.frozen_card(model_id=model_id, parent_card_sha256=SHA).parent_card_sha256,
+                    SHA,
+                )
 
     def test_frozen_card_rejects_cyclic_json_parameters(self):
         cyclic_mapping = {}
