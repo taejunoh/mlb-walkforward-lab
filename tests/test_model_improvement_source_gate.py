@@ -360,6 +360,45 @@ class SourceGateTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_foreign_inventory_receipt_is_structural_but_rejected_before_replay(self):
+        temporary, _root, declaration, _authority = self.make_activation()
+        try:
+            spec = load_verified_run_spec(declaration)
+            path = spec.output_path("source_gate", "source_gate_receipt.json")
+            foreign = SourceGateReceipt(
+                run_spec_sha256(spec),
+                spec.source_authority.source_run_spec.sha256,
+                spec.source_authority.acquisition_contract.sha256,
+                spec.source_authority.terminal_checkpoint.sha256,
+                "0" * 64,
+                tuple(item.sha256 for item in spec.source_authority.validation_receipts),
+                "1" * 64,
+                tuple(range(2018, 2025)),
+                "SOURCES_READY",
+                "2" * 64,
+                str(path),
+            )
+            payload = foreign.as_mapping()
+            raw = canonical_json_bytes(payload)
+            path.parent.mkdir(parents=True)
+            path.write_bytes(raw)
+            digest = sha256(raw).hexdigest()
+            path.with_suffix(path.suffix + ".sha256").write_bytes(
+                canonical_json_bytes({"artifact_sha256": digest})
+            )
+            self.assertEqual(
+                load_source_gate_receipt(path, digest).inventory_sha256, "0" * 64
+            )
+            calls = []
+            patches = self.source_patches(calls=calls)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], self.assertRaisesRegex(
+                ValueError, "inventory"
+            ):
+                require_source_gate(spec)
+            self.assertEqual(calls, [])
+        finally:
+            temporary.cleanup()
+
     def test_loader_rejects_wrong_digest_bad_path_and_sidecar(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             path = Path(directory) / "gate.json"

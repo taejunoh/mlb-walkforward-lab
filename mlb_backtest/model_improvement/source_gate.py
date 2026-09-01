@@ -221,6 +221,8 @@ def _load_bound_receipt(spec: ModelImprovementRunSpec, path: Path, digest: str) 
     receipt = load_source_gate_receipt(path, digest)
     if receipt.run_spec_sha256 != run_spec_sha256(spec):
         raise ValueError("source gate RunSpec binding differs")
+    if receipt.inventory_sha256 != spec.source_authority.inventory.sha256:
+        raise ValueError("source gate inventory binding differs")
     if path.resolve() != _receipt_path(spec).resolve():
         raise ValueError("source gate receipt path differs")
     return receipt

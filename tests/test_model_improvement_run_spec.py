@@ -40,6 +40,11 @@ class RunSpecTest(unittest.TestCase):
         self.assertEqual(spec.fold("H22").normalization_years, (2018, 2019, 2020, 2021))
         self.assertEqual(spec.fold("H24").oof_calibration_years, (2019, 2020, 2021, 2022, 2023))
         self.assertEqual(dict(spec.cutoffs), {"history": "D-1", "snapshot": "T-45"})
+        self.assertRegex(spec.source_authority.inventory.sha256, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            sha256(canonical_json_bytes(dict(spec.exclusions))).hexdigest(),
+            sha256(canonical_json_bytes(dict(build_run_spec(self.raw()).exclusions))).hexdigest(),
+        )
         self.assertEqual(spec.lane_b.keep_h22_count, 12)
         self.assertEqual(spec.lane_b.h23_order, ("brier", "log_loss", "daily_top1_delta_desc", "candidate_id"))
         self.assertRegex(spec.prediction_contract_sha256, r"^[0-9a-f]{64}$")
