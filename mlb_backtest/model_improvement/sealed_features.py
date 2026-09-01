@@ -6,7 +6,7 @@ import json
 import os
 import stat
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -143,6 +143,14 @@ def _feature_path(spec: ModelImprovementRunSpec, feature_set_id: str, fold_id: s
     return spec.output_path("features", f"{feature_set_id}/{fold_id}/{name}")
 
 
+def _lexical_absolute(path: Path) -> Path:
+    """Normalize ``.``/``..`` without dereferencing a symlink."""
+    try:
+        return Path(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("feature seal path differs") from exc
+
+
 def _row_key(row: SealedFeatureRow) -> tuple[str, str, int]:
     return row.official_date, row.scheduled_start_utc, row.game_pk
 
@@ -171,6 +179,8 @@ def _validate_rows(
     rows: Sequence[SealedFeatureRow],
 ) -> tuple[SealedFeatureRow, ...]:
     _validate_gate(spec, source_gate)
+    if dict(spec.cutoffs) != {"history": "D-1", "snapshot": "T-45"}:
+        raise ValueError("feature cutoff policy differs")
     if feature_set_id not in _FEATURE_SETS or fold_id not in _FOLDS:
         raise ValueError("feature set or fold differs")
     materialized = tuple(rows)
@@ -188,11 +198,14 @@ def _validate_rows(
     expected_year = spec.fold(fold_id).target_year
     exclusion = sha256(canonical_json_bytes(spec.as_mapping()["exclusions"])).hexdigest()
     for row in materialized:
-        if row.target_year != expected_year or row.target_year in spec.exclusions["excluded_years"]:
+        official_date = date.fromisoformat(row.official_date)
+        if (
+            row.target_year != expected_year
+            or official_date.year != row.target_year
+            or row.target_year in spec.exclusions["excluded_years"]
+        ):
             raise ValueError("feature row target year differs")
-        if row.official_date != row.scheduled_start_utc[:10]:
-            raise ValueError("feature row scheduled date differs")
-        if date.fromisoformat(row.max_history_date) >= date.fromisoformat(row.official_date):
+        if date.fromisoformat(row.max_history_date) != official_date - timedelta(days=1):
             raise ValueError("feature row history cutoff differs")
         if row.source_gate_sha256 != source_gate.artifact_sha256:
             raise ValueError("feature row source gate differs")
@@ -313,6 +326,7 @@ def seal_feature_rows(
     seal = load_feature_seal(seal_path, seal_digest)
     if seal.as_mapping() != payload:
         raise ValueError("feature seal reread differs")
+    _load_canonical_sidecar(rows_sidecar, rows_digest, "feature rows sidecar")
     loaded_rows = _load_rows_bytes(rows_path, rows_digest)
     _validate_rows(spec, source_gate, feature_set_id, fold_id, loaded_rows)
     if _rows_bytes(loaded_rows) != rows_bytes or _population_digest(loaded_rows) != seal.population_sha256:
@@ -329,17 +343,29 @@ def load_sealed_feature_rows(
     """Receipt-bound sole public reader for persisted feature rows."""
     if not isinstance(seal, FeatureSeal):
         raise ValueError("feature rows require a FeatureSeal")
-    loaded_seal = load_feature_seal(Path(seal.path), seal.artifact_sha256)
-    if loaded_seal != seal:
+    expected_seal_path = _feature_path(spec, seal.feature_set_id, seal.fold_id, "feature_seal.json")
+    if _lexical_absolute(Path(seal.path)) != _lexical_absolute(expected_seal_path):
+        raise ValueError("feature seal path differs")
+    loaded_seal = load_feature_seal(expected_seal_path, seal.artifact_sha256)
+    if (
+        loaded_seal.as_mapping() != seal.as_mapping()
+        or loaded_seal.artifact_sha256 != seal.artifact_sha256
+    ):
         raise ValueError("feature seal descriptor differs")
     if loaded_seal.run_spec_sha256 != run_spec_sha256(spec):
         raise ValueError("feature seal RunSpec binding differs")
     if loaded_seal.source_gate_sha256 != source_gate.artifact_sha256:
         raise ValueError("feature seal source gate differs")
     requested = tuple(years)
-    if not requested or any(type(year) is not int for year in requested):
+    if (
+        not requested
+        or any(type(year) is not int for year in requested)
+        or len(set(requested)) != len(requested)
+    ):
         raise ValueError("feature row years differ")
-    rows_path = Path(loaded_seal.path).with_name("rows.jsonl")
+    rows_path = _feature_path(
+        spec, loaded_seal.feature_set_id, loaded_seal.fold_id, "rows.jsonl"
+    )
     _load_canonical_sidecar(rows_path.with_suffix(rows_path.suffix + ".sha256"), loaded_seal.rows_sha256, "feature rows sidecar")
     rows = _load_rows_bytes(rows_path, loaded_seal.rows_sha256)
     _validate_rows(spec, source_gate, loaded_seal.feature_set_id, loaded_seal.fold_id, rows)

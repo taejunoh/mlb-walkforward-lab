@@ -56,6 +56,21 @@ class CanonicalArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "immutable artifact differs"):
                 write_immutable_bytes(path, b'{"game_pk":7}\n')
 
+    def test_write_immutable_bytes_rejects_symlink_and_nonregular_paths(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_bytes(b"target")
+            symlink = root / "rows.jsonl"
+            symlink.symlink_to(target)
+            directory_path = root / "directory"
+            directory_path.mkdir()
+
+            with self.assertRaises(ValueError):
+                write_immutable_bytes(symlink, b"rows\n")
+            with self.assertRaises(ValueError):
+                write_immutable_bytes(directory_path, b"rows\n")
+
     def test_concurrent_identical_writers_publish_one_complete_artifact(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "artifact.json"
