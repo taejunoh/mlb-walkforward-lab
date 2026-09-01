@@ -343,8 +343,8 @@ intentionally absent: Task8B is deferred. The sole executable identity is
 argument.
 
 The exact `outputs.namespaces` closed list additionally contains `calibration`:
-`["source_gate", "features", "baseline", "calibration", "oof", "lane_a",
-"lane_b", "lane_c", "registry", "h24_predictions", "h24_reports"]`.
+`["source_gate", "features", "baseline", "calibration", "oof", "registry",
+"h24_predictions", "h24_reports"]`.
 `calibration_paths_v2(spec, identity)` is the sole V2 output path helper. It
 validates the fixed identity mapping above, substitutes only its derived
 values into the policy templates, and calls only
@@ -483,9 +483,9 @@ features/common/O22/{feature_seal.json,rows.jsonl}
 features/common/O23/{feature_seal.json,rows.jsonl}
 ```
 
-No Lane-C OOF feature namespace is added. Existing Common H22/H23/H24 and
-Lane-C H22/H23/H24 feature admissions remain unchanged. Feature-row validation
-uses the Task8 map for Common OOF folds and the existing RunSpec fold mapping
+No candidate feature namespace is added to the executable plan. Existing Common
+H22/H23/H24 feature admissions remain unchanged. Feature-row validation uses
+the Task8 map for Common OOF folds and the existing RunSpec fold mapping
 for H22/H23/H24. Every row still proves D-1 history, its source-gate digest,
 `source_manifest_sha256 == spec.source_authority.inventory.sha256`, and its
 existing feature-row hash. H24 can remain a feature seal for the future
@@ -496,14 +496,9 @@ The only Task8 prediction identities and primary directories are:
 | model | ledger ID | permitted folds | exact directory |
 | --- | --- | --- | --- |
 | v5.1 | `baseline/v5.1/{fold}` | O19--O23, H22, H23 | `oof/baseline/v5.1/{fold}/v2` |
-| A | `lane_a/A/{fold}` | O19--O23, H22, H23 | `oof/lane_a/A/{fold}/v2` |
-| A+B | `lane_b/{candidate_id}/{fold}` | O19--O23, H22, H23 | `oof/lane_b/{candidate_id}/{fold}/v2` |
-| A+B+C | `lane_c/A+B+C/{fold}` | H22, H23 | `oof/lane_c/A+B+C/{fold}/v2` |
 
-`candidate_id` is required only for A+B and must remain the Task7 registered
-safe segment `[A-Za-z0-9][A-Za-z0-9._-]*`, excluding `.` and `..`; it is null
-for every other model. H24, a bare fold ID, another model/scope pairing, and a
-2025 target all fail before a path is calculated.
+H24, a bare fold ID, another model/scope pairing, and a 2025 target all fail
+before a path is calculated.
 
 For any accepted identity, `prediction_paths_v2(spec, ledger_id)` is the sole
 V2 identity-to-path function. It calls only `spec.output_path("oof",

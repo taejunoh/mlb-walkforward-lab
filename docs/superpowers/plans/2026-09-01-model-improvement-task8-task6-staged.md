@@ -260,7 +260,7 @@ opens a prediction output.
 Persist `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_CARD_V2` with exactly:
 
 ```text
-schema, model_id, lane_id, fold_id, candidate_id, calibration_key,
+schema, model_id, lane_id, fold_id, calibration_key,
 target_year, training_start, training_end,
 run_spec_sha256, source_gate_sha256, prediction_contract_sha256,
 calibration_feature_receipt_path, calibration_feature_receipt_sha256,
@@ -274,8 +274,8 @@ fit_spec, alpha, beta
 For baseline the only derived files are
 `baseline/v5.1/{fold_id}/v2/calibration_rows.jsonl` and
 `baseline/v5.1/{fold_id}/v2/probability_calibration_card.json`, both under the
-new `calibration` output namespace. Candidate files use exactly
-`{lane_id}/{candidate_segment}/{fold_id}/...` under that same namespace.
+new `calibration` output namespace. No candidate calibration file is in the
+current executable plan.
 Rows are canonical JSONL with exactly `game_pk`, `official_date`,
 `target_year`, `edge`, `home_win`, `feature_row_sha256`, and
 `source_game_sha256`; their labels never enter Task8.
@@ -283,19 +283,13 @@ Rows are canonical JSONL with exactly `game_pk`, `official_date`,
 Do not change `PredictionWeightAuthority.path` semantics. For the persisted
 card field, Task6P securely resolves/canonicalizes baseline's authenticated
 repository-relative weight path against the same repository root derivation as
-`run_spec._repository_root()` and the current authenticated loader; candidate
-Task7-card authority is already absolute. Compare `weight_authority_path` only
+`run_spec._repository_root()` and the current authenticated loader. Compare `weight_authority_path` only
 to this canonical absolute result, never to a raw descriptor `.path`.
 
-Freeze the card identity before any path lookup: `v5.1` uses literal
-`lane_id="baseline"` and null candidate; `A` uses literal `lane_id="A"` and
-null candidate; `A+B` uses literal `lane_id="B"` and a required Task7-safe
-candidate; and `A+B+C` uses literal `lane_id="C"` and null candidate. For
-each accepted identity, `calibration_key` is exactly
+Freeze the baseline card identity before any path lookup: `v5.1` uses literal
+`lane_id="baseline"`. Its `calibration_key` is exactly
 `spec.probability_calibration_policy.fold_keys[fold_id]`, never a parameter or
-caller choice. Candidate templates therefore use literal `A`, `B`, or `C`
-lane segments, plus the canonical `_none`/safe candidate segment, rather than
-the prediction-directory aliases.
+caller choice. Candidate identities/templates are future-only and absent.
 
 Implement exactly `load_calibration_feature_receipt(spec, fold_id)`,
 `load_probability_calibration_card_v2(spec, fold_id)`, and
@@ -331,22 +325,18 @@ existing `fit_logistic` only to verify immutable authority.
 The immutable RunSpec adds one closed canonical object named
 `probability_calibration_policy` with exact fields `schema`,
 `fold_keys`, `fit_spec`, `pools`, `calibration_feature_receipts`,
-`baseline_rows_relative_template`, `baseline_card_relative_template`,
-and `baseline_rows_relative_template`, `baseline_card_relative_template` only.
+`baseline_rows_relative_template`, and `baseline_card_relative_template`.
 `schema` is `MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_POLICY_V1`; the exact
 seven fold-key/date values, closed `fit_spec`, and templates are those in the
 normative design. The `fit_spec` is exactly
 `{schema: MODEL_IMPROVEMENT_PROBABILITY_CALIBRATION_FIT_SPEC_V1,
 algorithm: fit_logistic_v1, edge_divisor: 10.0, iterations: 100,
 l2: 1e-6, tolerance: 1e-10, min_rows: 2, required_classes: [0, 1]}`.
-Candidate templates use `{fold_id}` and canonical `{candidate_segment}`: null
-`candidate_id` maps to literal `_none`, otherwise it uses the existing safe
-single-segment candidate grammar. The RunSpec `outputs.namespaces` adds the
+The baseline templates use only `{fold_id}`. The RunSpec `outputs.namespaces` adds the
 literal `calibration`, and the schema, inline fixture, RunSpec parser, and
 RunSpec tests migrate together. `calibration_paths_v2(spec, identity)` is the
 only caller of `spec.output_path("calibration", relative_name)` and it enforces
-the exact baseline `baseline/v5.1/{fold_id}/v2/...` or candidate
-`{lane_id}/{candidate_segment}/{fold_id}/v2/...` shapes/leaves. The exact
+the exact baseline `baseline/v5.1/{fold_id}/v2/...` shapes/leaves. The exact
 seven-key receipt map pins pre-RunSpec `CalibrationFeatureReceiptV1` primaries
 by canonical absolute path and digest; a receipt must not bind the
 RunSpec or weights. The RunSpec must not contain a future card digest: binding
@@ -921,26 +911,22 @@ Export `CalibrationFeatureReceiptV1`, `load_calibration_feature_receipt`,
 `ProbabilityCalibrationCardV2`, `load_probability_calibration_card_v2`, and
 `require_probability_calibration_card_v2`; `PredictionSealV2`, Task8's three V2
 functions; `BaselineReplayReceiptV2` and its two V2 functions; `OutcomeRow`,
-`OutcomeReceipt` and three outcome functions; and `EvaluationReport`,
-`EvaluationPair`, `evaluate_predictions`, `load_evaluation_report`,
-`load_evaluation_pair`. Do not export internal path parsers, source inventory
+`OutcomeReceipt` and three baseline outcome functions. Do not export internal path parsers, source inventory
 parsers, raw JSONL readers, calibration-row writers, or any labelled ledger
 API. Keep the `TYPE_CHECKING` import from `baseline_replay_v2` out of Task8
 runtime imports.
 
 - [ ] **Step 4: Run the final focused validation.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_probability_calibration tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_outcomes tests.test_model_improvement_evaluation tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_scoring_cards tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement tests/test_model_improvement_probability_calibration.py tests/test_model_improvement_oof_ledger.py tests/test_model_improvement_baseline_replay.py tests/test_model_improvement_outcomes.py tests/test_model_improvement_evaluation.py && git diff --check`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_probability_calibration tests.test_model_improvement_oof_ledger tests.test_model_improvement_baseline_replay tests.test_model_improvement_outcomes tests.test_model_improvement_contracts tests.test_model_improvement_run_spec tests.test_model_improvement_sealed_features tests.test_model_improvement_source_gate tests.test_model_improvement_canonical -v && python3 -m ruff check mlb_backtest/model_improvement tests/test_model_improvement_probability_calibration.py tests/test_model_improvement_oof_ledger.py tests/test_model_improvement_baseline_replay.py tests/test_model_improvement_outcomes.py && git diff --check`
 
-Expected: PASS; Task6P plus all four Task8A/Task6A/Task8B/Task6B stages
-remain independently covered and no full suite is started.
+Expected: PASS; baseline Task6P/Task8A/Task6A/Task6B remains covered and no full suite is started.
 
 - [ ] **Step 5: Commit the final public API check.**
 
 ```bash
 git add mlb_backtest/model_improvement/__init__.py \
-  tests/test_model_improvement_oof_ledger.py \
-  tests/test_model_improvement_evaluation.py
+  tests/test_model_improvement_oof_ledger.py
 git commit -m "test: lock staged model improvement public boundaries"
 ```
 
