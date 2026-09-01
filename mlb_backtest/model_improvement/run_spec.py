@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from dataclasses import dataclass
@@ -60,6 +61,15 @@ def _normal_relative(value: object, label: str) -> str:
     path = Path(text)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"{label} must be a normal relative path")
+    return path.as_posix()
+
+
+def _output_root(value: object) -> str:
+    """Accept an absolute root or a lexical repository-relative root only."""
+    text = _text(value, "outputs.root")
+    path = Path(text)
+    if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("outputs.root must be a normal path")
     return path.as_posix()
 
 
@@ -211,6 +221,8 @@ def _lane_b(value: object) -> LaneBSpec:
     wanted = {"starter": (25, 30, 35, 40, 45), "offense": (15, 20, 25, 30, 35), "bullpen": (10, 15, 20, 25, 30), "schedule": (0, 5, 10, 15)}
     grid = {key: _exact_ints(grid_values[key], wanted[key], f"Lane B grid {key}") for key in wanted}
     multipliers = _array(values["multipliers"], "Lane B multipliers")
+    if any(type(item) is not float or not math.isfinite(item) for item in multipliers):
+        raise ValueError("Lane B multipliers must be canonical finite numbers")
     if multipliers != (0.75, 1.0, 1.25):
         raise ValueError("Lane B multipliers differ")
     candidate_count = values["candidate_count"]
@@ -304,8 +316,9 @@ class ModelImprovementRunSpec:
             allowed = {("common", fold) for fold in ("H22", "H23", "H24")} | {("lane_c", fold) for fold in ("H22", "H23", "H24")}
             if len(parts) != 3 or tuple(parts[:2]) not in allowed or parts[2] not in {"feature_seal.json", "rows.jsonl"}:
                 raise ValueError("feature output path differs")
-        root = Path(str(self.outputs["root"])).resolve(strict=False)
-        candidate = (root / namespace / relative).resolve(strict=False)
+        configured_root = Path(str(self.outputs["root"]))
+        root = configured_root if configured_root.is_absolute() else _repository_root() / configured_root
+        candidate = root / namespace / relative
         try:
             candidate.relative_to(root / namespace)
         except ValueError as exc:
@@ -354,7 +367,7 @@ def build_run_spec(raw: Mapping[str, object]) -> ModelImprovementRunSpec:
     if contract_mapping != _CONTRACT:
         raise ValueError("prediction contract differs or contains unknown keys")
     outputs = _exact(values["outputs"], {"root", "namespaces"}, "outputs")
-    root = _text(outputs["root"], "outputs.root")
+    root = _output_root(outputs["root"])
     if _array(outputs["namespaces"], "outputs.namespaces") != _NAMESPACES:
         raise ValueError("output namespaces differ")
     return ModelImprovementRunSpec(
@@ -385,19 +398,51 @@ def _repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _git_at(root: Path, *args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("could not read RunSpec owning repository") from exc
+    return completed.stdout
+
+
+def _owning_repository(path: Path) -> Path:
+    root_text = _git_at(path.parent, "rev-parse", "--show-toplevel").strip()
+    root = Path(root_text)
+    if not root.is_absolute():
+        raise ValueError("RunSpec owning repository root is not absolute")
+    return root
+
+
 def load_verified_run_spec(path: Path) -> ModelImprovementRunSpec:
-    expected = (_repository_root() / "protocols/model_improvement/parallel_model_result_v1.json").resolve()
+    owning_root = _owning_repository(path)
+    relative = "protocols/model_improvement/parallel_model_result_v1.json"
+    expected = owning_root / relative
     if path.resolve() != expected:
         raise ValueError("verified run spec requires the expected production path")
     spec = load_run_spec(path)
     if spec.schema_version == "SYNTHETIC_TEST_ONLY":
         raise ValueError("synthetic run spec cannot be verified")
-    try:
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_repository_root(), check=True, capture_output=True, text=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("could not read checked-out HEAD") from exc
-    if not _HEAD.fullmatch(head) or spec.code_revision != head:
-        raise ValueError("run spec code_revision differs from checked-out HEAD")
+    head = _git_at(owning_root, "rev-parse", "HEAD").strip()
+    parents = _git_at(owning_root, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    if not _HEAD.fullmatch(head) or len(parents) != 2 or parents[0] != head or not _HEAD.fullmatch(parents[1]):
+        raise ValueError("verified run spec requires a single-parent activation commit")
+    parent = _git_at(owning_root, "rev-parse", "HEAD^").strip()
+    if parent != parents[1] or spec.code_revision != parent:
+        raise ValueError("run spec code_revision differs from activation parent")
+    changed = _git_at(owning_root, "diff", "--name-only", f"{parent}..{head}").splitlines()
+    if changed != [relative]:
+        raise ValueError("activation commit is not declaration-only")
+    tracked_bytes = _git_at(owning_root, "show", f"{head}:{relative}").encode("utf-8")
+    if read_regular_bytes(path, "verified run spec") != tracked_bytes:
+        raise ValueError("verified run spec differs from tracked blob")
+    if _git_at(owning_root, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("verified run spec requires a clean worktree")
     return spec
 
 
