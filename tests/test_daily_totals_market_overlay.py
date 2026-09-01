@@ -57,6 +57,73 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(forbidden, text.lower())
         for game_pk in FIXED_GAME_PKS:
             self.assertIn(f"| {game_pk} |", text)
+        self.assertIn(f"| {FIXED_GAME_PKS[0]} | QUOTED | 10.000 | 8.5 |", text)
+
+    def test_build_preserves_unbounded_line_ticks_without_float_overflow(self) -> None:
+        from mlb_backtest.daily_totals_market_overlay import admit_draftkings_snapshot, build_overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = SecurePersistenceTests._authority(root)
+            raw_value = SecurePersistenceTests._raw_value(root, raw)
+            raw_value["games"][0]["line_half_runs"] = 10**1000
+            candidate = SecurePersistenceTests._write_raw(root, raw_value)
+            snapshot = admit_draftkings_snapshot(
+                root, trace, candidate,
+                comparison_clock=lambda: datetime(2026, 9, 1, 15, tzinfo=timezone.utc),
+            )
+            built = build_overlay(
+                root, trace, snapshot,
+                evaluated_clock=lambda: datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc),
+            )
+            row = built.report["games"][0]
+            self.assertEqual(row["line_half_runs"], 10**1000)
+
+    def test_renderer_preserves_unbounded_line_ticks_without_float_overflow(self) -> None:
+        from mlb_backtest.daily_totals_market_overlay import render_overlay_markdown
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = SecurePersistenceTests._build_public_case(root)
+            payload = json.loads(built.report_bytes)
+            payload["games"][0]["line_half_runs"] = 10**1000
+            payload["content_sha256"] = SecurePersistenceTests._digest(
+                {key: item for key, item in payload.items() if key != "content_sha256"}
+            )
+            text = render_overlay_markdown(payload)
+            self.assertIn(f"| {FIXED_GAME_PKS[0]} | QUOTED | 10.000 | {5 * 10**999} |", text)
+
+    def test_cli_handles_unbounded_line_ticks_without_traceback(self) -> None:
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = SecurePersistenceTests._authority(root)
+            raw_value = SecurePersistenceTests._raw_value(root, raw)
+            raw_value["games"][0]["line_half_runs"] = 10**1000
+            candidate = SecurePersistenceTests._write_raw(root, raw_value)
+            clock = datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc)
+            with patch.object(overlay, "utc_now", return_value=clock):
+                with patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                    stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    self.assertEqual(overlay.main([
+                        "admit-snapshot", "--root", str(root),
+                        "--model-trace", trace.as_posix(), "--raw-capture", candidate.as_posix(),
+                    ]), 0)
+                    snapshot = Path("".join(call.args[0] for call in stdout.write.call_args_list).strip())
+                with patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                    stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    self.assertEqual(overlay.main([
+                        "compare", "--root", str(root),
+                        "--model-trace", trace.as_posix(), "--market-snapshot", snapshot.as_posix(),
+                    ]), 0)
+                    printed = "".join(call.args[0] for call in stdout.write.call_args_list)
+                    self.assertTrue(Path(printed.strip()).is_relative_to(Path("reports/experimental_daily_totals_overlay")))
+                    self.assertEqual(stderr.write.call_args_list, [])
+                    message = "".join(call.args[0] for call in stderr.write.call_args_list)
+                    self.assertNotIn("Traceback", message)
 
     def test_renderer_keeps_no_quote_without_invented_matchup_data(self) -> None:
         from mlb_backtest.daily_totals_market_overlay import render_overlay_markdown

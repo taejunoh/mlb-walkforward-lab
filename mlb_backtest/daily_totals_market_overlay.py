@@ -311,6 +311,13 @@ def _overlay_common_game(game: Mapping[str, object]) -> None:
         raise ValueError("overlay residual count differs")
 
 
+def _point_gap_runs(expected_total: object, line_half_runs: object) -> Fraction:
+    """Compare a model total with half-run ticks without converting ticks to float."""
+    line_half_runs = validate_line_half_runs(line_half_runs)
+    expected = _finite(expected_total, "overlay expected total")
+    return abs(Fraction(expected) - Fraction(line_half_runs, 2))
+
+
 def _overlay_game(value: object) -> dict[str, object]:
     game = _canonical_mapping(value, "overlay game")
     status = game.get("market_status")
@@ -368,14 +375,14 @@ def _overlay_game(value: object) -> dict[str, object]:
     if selected_side is None and decision == "RESEARCH_PICK":
         raise ValueError("overlay selected side differs")
     nonpush_support = rates[0] + rates[1]
-    point_gap = abs(float(game["expected_total"]) - game["line_half_runs"] / 2.0)
+    point_gap = _point_gap_runs(game["expected_total"], game["line_half_runs"])
     selected_margin = over_result.support_margin if selected == "OVER" else under_result.support_margin
     if decision == "RESEARCH_PICK":
         if game["residual_count"] != _POLICY_AUTHORITY["required_residual_count"]:
             raise ValueError("overlay residual count gate differs")
         if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
             raise ValueError("overlay nonpush support gate differs")
-        if point_gap < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+        if point_gap < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
             raise ValueError("overlay point gap gate differs")
         if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
             raise ValueError("overlay support margin gate differs")
@@ -385,7 +392,7 @@ def _overlay_game(value: object) -> dict[str, object]:
             derived.append("RESIDUAL_COUNT_MISMATCH")
         if nonpush_support < _POLICY_AUTHORITY["minimum_nonpush_support"]:
             derived.append("NONPUSH_SUPPORT_TOO_LOW")
-        if point_gap < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+        if point_gap < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
             derived.append("POINT_GAP_TOO_SMALL")
         if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
             derived.append("SUPPORT_MARGIN_TOO_LOW")
@@ -870,6 +877,13 @@ def _overlay_trace(value: object) -> dict[str, object]:
     return safe
 
 
+def _format_half_run_line(value: object) -> str:
+    """Format positive half-run ticks exactly, including very large integers."""
+    ticks = validate_line_half_runs(value)
+    whole, remainder = divmod(ticks, 2)
+    return f"{whole}.5" if remainder else str(whole)
+
+
 def render_overlay_markdown(payload: object) -> str:
     """Render every game as a compact, research-only comparison table.
 
@@ -906,9 +920,9 @@ def render_overlay_markdown(payload: object) -> str:
         if not isinstance(game, Mapping):
             raise ValueError("overlay report game differs")
         reasons = ", ".join(str(reason) for reason in game["reason_codes"])
-        expected_total = f"{float(game['expected_total']):g}"
+        expected_total = f"{float(game['expected_total']):.3f}"
         if game["market_status"] == "QUOTED":
-            line = f"{float(game['line_half_runs']) / 2:g}"
+            line = _format_half_run_line(game["line_half_runs"])
             over_price = f"{int(game['over_american_odds']):+d}"
             under_price = f"{int(game['under_american_odds']):+d}"
             over_support = f"{float(game['over_support']):.4f}"
@@ -990,7 +1004,7 @@ def build_overlay(
                 reasons.append("RESIDUAL_COUNT_MISMATCH")
             if rates.over + rates.under < _POLICY_AUTHORITY["minimum_nonpush_support"]:
                 reasons.append("NONPUSH_SUPPORT_TOO_LOW")
-            if abs(float(model_game["expected_total"]) - market["line_half_runs"] / 2.0) < _POLICY_AUTHORITY["minimum_point_gap_runs"]:
+            if _point_gap_runs(model_game["expected_total"], market["line_half_runs"]) < Fraction(str(_POLICY_AUTHORITY["minimum_point_gap_runs"])):
                 reasons.append("POINT_GAP_TOO_SMALL")
             selected_margin = over.support_margin if selected == "OVER" else under.support_margin if selected == "UNDER" else None
             if selected_margin is None or selected_margin < _POLICY_AUTHORITY["minimum_support_margin"]:
