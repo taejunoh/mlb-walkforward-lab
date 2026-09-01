@@ -19,7 +19,7 @@ Only this plan creates `mlb_backtest/model_improvement/__init__.py`. Lane B/C mu
 ```python
 from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard, LaneDisposition, MetricPrimitive, PredictionRow, PredictionSeal,
-    QualityRecipe, SealedFeatureRow, load_frozen_model_card,
+    QualityRecipe, SealedFeatureRow, load_frozen_model_card, seal_frozen_model_card,
 )
 from mlb_backtest.model_improvement.baseline_replay import BaselineReplayReceipt, load_baseline_replay
 from mlb_backtest.model_improvement.run_spec import (
@@ -33,7 +33,7 @@ from mlb_backtest.model_improvement.sealed_features import (
 )
 from mlb_backtest.model_improvement.oof_ledger import (
     JoinedLedger, join_oof_outcomes, load_joined_ledger, load_prediction_seal,
-    seal_oof_predictions,
+    load_prediction_rows, seal_oof_predictions,
 )
 from mlb_backtest.model_improvement.lane_a import LaneAFoldResult, fit_lane_a_fold, load_lane_a_fold
 from mlb_backtest.model_improvement.evaluation import EvaluationReport, evaluate_predictions, load_evaluation_report
@@ -113,7 +113,7 @@ git add mlb_backtest/model_improvement/__init__.py mlb_backtest/model_improvemen
 git commit -m "feat: add immutable model improvement artifacts"
 ```
 
-### Task 2: Define the shared public types
+### Task 2A: Define pure shared immutable contracts
 
 **Files:**
 - Create: `mlb_backtest/model_improvement/contracts.py`
@@ -121,9 +121,59 @@ git commit -m "feat: add immutable model improvement artifacts"
 - Create: `schemas/model_improvement/lane_disposition.schema.json`
 - Create: `tests/test_model_improvement_contracts.py`
 
-- [ ] **Step 1: Write failing tests for a complete row, all six component/side keys, finite bounds, environment/defense neutral fallback, and card/seal canonical mapping round trips.**
+- [ ] **Step 1: Write failing, self-contained contract tests.** These tests have no RunSpec, artifact-path, filesystem, or synthetic-spec dependency. Define explicit local factories for fixed, ratio, and weighted recipes; a primitive; a feature-row payload and row; a prediction seal; and a lane disposition. Cover complete component/side maps, finite bounds, row digest recomputation, nested immutability, fresh JSON values from `as_mapping()`, and descriptor-free payload round trips.
 
 ```python
+_D = "a" * 64
+_SIDES = ("away", "home")
+_COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")
+
+def make_fixed_quality_recipe(*, fixed_value=0.0):
+    return QualityRecipe("fixed", "fixed", None, None, None, fixed_value, (), (), _D)
+
+def make_ratio_quality_recipe():
+    return QualityRecipe("ratio", "ratio", "starter", 1.0, 1.0, None, (), (), _D)
+
+def make_weighted_quality_recipe(*, child_weights=(0.4, 0.6)):
+    children = (make_ratio_quality_recipe(), make_ratio_quality_recipe())
+    return QualityRecipe("weighted", "weighted_sum", "recent_form", None, None, None,
+                         children, child_weights, _D)
+
+def make_primitive(recipe=None, *, weight=1.0):
+    return MetricPrimitive(60.0, weight, recipe or make_ratio_quality_recipe())
+
+def make_feature_row_payload(*, game_pk=7, target_year=2022, starter_weights=(1.0,), scores=None):
+    scores = scores or {side: {component: 60.0 for component in _COMPONENTS} for side in _SIDES}
+    qualities = {side: {component: 50.0 for component in _COMPONENTS} for side in _SIDES}
+    primitives = {
+        side: {component: tuple(make_primitive(weight=weight) for weight in starter_weights)
+               for component in _COMPONENTS}
+        for side in _SIDES
+    }
+    return {
+        "game_pk": game_pk, "official_date": f"{target_year}-04-01",
+        "scheduled_start_utc": f"{target_year}-04-01T19:00:00.000000Z", "target_year": target_year,
+        "max_history_date": f"{target_year - 1}-12-31", "source_gate_sha256": _D,
+        "source_manifest_sha256": _D, "exclusion_policy_sha256": _D,
+        "component_scores": scores, "component_qualities": qualities,
+        "baseline_component_scores": scores, "baseline_component_qualities": qualities,
+        "metric_primitives": primitives,
+        "component_inputs_sha256": {side: {component: _D for component in _COMPONENTS} for side in _SIDES},
+        "starter_edge_abs": 0.0,
+    }
+
+def make_feature_row(payload=None, **kwargs):
+    payload = dict(payload or make_feature_row_payload(**kwargs))
+    return SealedFeatureRow(**payload,
+        feature_row_sha256=compute_feature_row_sha256(payload))
+
+def make_seal():
+    return PredictionSeal("O19", _D, _D, _D, _D, _D, _D, _D, "test/prediction_seal.json")
+
+def make_lane_disposition():
+    return LaneDisposition("A", "REJECTED", _D, None, (_D,), ("H23_GATE",), _D,
+                           "test/lane_disposition.json")
+
 class ContractTest(unittest.TestCase):
     def test_feature_row_requires_complete_component_sides_and_rematerializable_primitives(self):
         row = make_feature_row(game_pk=7, target_year=2022)
@@ -142,31 +192,31 @@ class ContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "component keys differ"):
             make_feature_row(game_pk=8, target_year=2022, scores={"home": {}, "away": {}})
 
-    def test_card_and_prediction_seal_payload_round_trip(self):
-        card_payload = make_card().as_mapping()
+    def test_row_hash_and_recursive_immutability(self):
+        payload = make_feature_row_payload(game_pk=7, target_year=2022)
+        row = make_feature_row(payload)
+        self.assertEqual(row.feature_row_sha256, compute_feature_row_sha256(sealed_feature_row_payload(row)))
+        with self.assertRaises(TypeError):
+            row.component_scores["home"]["starter"] = 1.0
+        with self.assertRaises(TypeError):
+            row.metric_primitives["home"]["starter"] = ()
+        self.assertIsInstance(row.metric_primitives["home"]["starter"][0].quality_recipe.children, tuple)
+        self.assertIsInstance(row.metric_primitives["home"]["starter"][0].quality_recipe.child_weights, tuple)
+        exported = row.as_mapping()
+        exported["component_scores"]["home"]["starter"] = 1.0
+        self.assertEqual(row.component_scores["home"]["starter"], 60.0)
+
+    def test_prediction_seal_and_disposition_payload_round_trip(self):
         seal_payload = make_seal().as_mapping()
-        self.assertNotIn("artifact_sha256", card_payload)
-        self.assertNotIn("path", card_payload)
         self.assertNotIn("artifact_sha256", seal_payload)
         self.assertNotIn("path", seal_payload)
-        self.assertEqual(
-            FrozenModelCard.from_payload_mapping(card_payload, make_card().artifact_sha256, make_card().path).model_id,
-            make_card().model_id,
-        )
         self.assertEqual(
             PredictionSeal.from_payload_mapping(seal_payload, make_seal().artifact_sha256, make_seal().path).ledger_id,
             make_seal().ledger_id,
         )
-
-    def test_frozen_card_loader_rereads_regular_canonical_bound_path(self):
-        spec = load_run_spec(SYNTHETIC_SPEC_PATH)
-        card = write_frozen_card(spec, make_card())
-        self.assertEqual(load_frozen_model_card(spec, Path(card.path), card.artifact_sha256), card)
-
-    def test_lane_disposition_is_immutable_and_has_evidence(self):
-        spec = load_run_spec(SYNTHETIC_SPEC_PATH)
-        disposition = seal_lane_disposition(spec, "A", "REJECTED", None, ("a" * 64,), ("H23_GATE",))
-        self.assertEqual(load_lane_disposition(Path(disposition.path), disposition.artifact_sha256), disposition)
+        disposition = make_lane_disposition()
+        self.assertEqual(LaneDisposition.from_payload_mapping(
+            disposition.as_mapping(), disposition.artifact_sha256, disposition.path), disposition)
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -175,7 +225,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `contracts`.
 
-- [ ] **Step 3: Implement exactly these frozen dataclasses plus validated `as_mapping()` and `from_payload_mapping(payload, artifact_sha256, path)` methods.**
+- [ ] **Step 3: Implement exactly these frozen dataclasses, pure validation/projection helpers, and validated `as_mapping()`/`from_payload_mapping(payload, artifact_sha256, path)` methods.** This task is pure: it has no RunSpec or filesystem dependency and does not implement a card/disposition loader or sealer.
 
 ```python
 from collections.abc import Mapping, Sequence
@@ -236,13 +286,17 @@ class LaneDisposition:
     evidence_sha256: Sequence[str]; reason_codes: Sequence[str]; artifact_sha256: str; path: str
 ```
 
-Validate exact `SIDES = ("away", "home")` and `COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")`, ISO dates/UTC strings, score and quality [0,100], probability [0,1], 64 lowercase hex digests, and `environment`/`defense` recipe fallback of 50/0. `MetricPrimitive.normalized_score` is the pre-quality `normalize.metric_score(value, mean, sd, direction)` result in [0,100], never `scoring_prep`'s already quality-shrunk part score. `SealedFeatureRow.component_scores` and `component_qualities` are the multiplier=1 frozen replay targets. Every side/component contains ordered primitives with finite normalized score, finite nonnegative aggregation weight, and a recursively persisted `QualityRecipe` whose `kind` is one of `fixed`, `ratio`, `weighted_sum`, or `minimum`; whose `family` identifies the existing source family; and whose child recipes are complete. For each side/component, serialize primitive order exactly as used by the baseline aggregation and require `math.isclose(math.fsum(primitive.aggregation_weight for primitive in primitives), 1.0, rel_tol=0.0, abs_tol=1e-12)`; this is the sole canonical floating-point sum representation. `child_weights` is persisted and is an empty immutable sequence for `fixed`, `ratio`, and `minimum`. A `weighted_sum` recipe requires at least one child, `len(child_weights) == len(children)`, finite nonnegative weights, and a strictly positive finite sum. A `fixed` recipe requires a finite `fixed_value`, no children, and no numerator/baseline constant. A `ratio` recipe requires finite `numerator` and strictly positive finite `baseline_constant`, no children, and no fixed value. A `minimum` recipe requires at least one child and no numerator, baseline constant, or fixed value. `baseline_component_scores` and `baseline_component_qualities` preserve the unmodified v5.1 values. This lets Lane B rematerialize the permitted shared multiplier from sealed primitives without raw data or outcomes. Implement `load_frozen_model_card(spec: ModelImprovementRunSpec, path: Path, expected_sha256: str) -> FrozenModelCard`; it reads only a regular file, requires canonical JSON and the closed frozen-card payload schema, recomputes payload bytes, checks the caller-provided expected digest and optional sidecar, validates the exact normalized RunSpec lane namespace path for the card model/fold, then constructs the descriptor and rereads the bytes before return. H24 therefore consumes the path directly and never discovers a card by scanning. `LaneDisposition` accepts only `QUALIFIED`, `ABSENT`, or `REJECTED`, requires at least one evidence digest/reason, and has a canonical immutable writer/loader in `lane_disposition.py`. Implement `seal_lane_disposition(spec: ModelImprovementRunSpec, lane_id: str, state: str, parent_card_sha256: str | None, evidence_sha256: Sequence[str], reason_codes: Sequence[str]) -> LaneDisposition` and `load_lane_disposition(path: Path, expected_sha256: str) -> LaneDisposition`; the writer uses the declared lane namespace and returns a reread descriptor. Expose no mutable dictionary stored in a frozen type.
+Close these exact domains: `MODEL_IDS={"v5.1","A","A+B","A+B+C"}`, `FROZEN_CARD_MODEL_IDS={"A","A+B","A+B+C"}`, `FROZEN_CARD_STATES={"H23_FROZEN"}`, `LANE_IDS={"A","B","C"}`, `LANE_DISPOSITION_STATES={"QUALIFIED","ABSENT","REJECTED"}`, `LEDGER_IDS={"O19","O20","O21","O22","O23","H22","H23","H24"}`, `PICKED_SIDES={"away","home","none"}`, and `QUALITY_FAMILIES={None,"starter","hitter_split","recent_form","bullpen"}`. Enforce frozen-card model/state/fold compatibility, row model ID, picked side, and rank (`0` only for `none`; strictly positive otherwise), and recipe family. Lane-specific parameter keys remain open here but their JSON values are recursively immutable.
+
+Implement `_freeze_json(value)` and `_thaw_json(value)`: mapping inputs become recursive `MappingProxyType`, sequences become tuples, and scalars must be JSON scalars. Apply them to card parameters, feature-row maps, recipe children/weights, and disposition evidence/reasons; `as_mapping()` always returns fresh mutable JSON-compatible values. Validate exact `SIDES = ("away", "home")` and `COMPONENTS = ("starter", "offense", "bullpen", "environment", "defense", "schedule")`, ISO dates/UTC strings, score and quality [0,100], probability [0,1], 64 lowercase hex digests, and the environment/defense recipe fallback of 50/0. `MetricPrimitive.normalized_score` is the pre-quality `normalize.metric_score(value, mean, sd, direction)` result in [0,100], never an already quality-shrunk score. Preserve ordered primitives and require their nonnegative aggregation weights to sum to exactly one under the documented `math.fsum` tolerance. Keep the fixed/ratio/weighted-sum/minimum recipe constraints in this task.
+
+Add `sealed_feature_row_payload(row) -> Mapping[str, object>` which projects every persisted row field except `feature_row_sha256`, and `compute_feature_row_sha256(payload: Mapping[str, object]) -> str`, using Task 1 canonical SHA-256. `SealedFeatureRow.__post_init__` must require `feature_row_sha256 == compute_feature_row_sha256(sealed_feature_row_payload(self))`. This digest is separate from `FeatureSeal.rows_sha256`, which remains a digest over fully materialized rows.
 
 - [ ] **Step 4: Run GREEN.**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_contracts -v`
 
-Expected: PASS; malformed shared artifacts fail before lane code sees them.
+Expected: PASS; malformed or mutable shared payloads fail before lane code sees them.
 
 - [ ] **Step 5: Commit.**
 
@@ -251,15 +305,16 @@ git add mlb_backtest/model_improvement/contracts.py mlb_backtest/model_improveme
 git commit -m "feat: define model improvement contracts"
 ```
 
-### Task 3: Implement the complete RunSpec builder and synthetic contract fixture
+### Task 3: Implement the RunSpec builder and disposition persistence
 
 **Files:**
 - Create: `schemas/model_improvement/parallel_model_result_run_spec.schema.json`
 - Create: `mlb_backtest/model_improvement/run_spec.py`
+- Modify: `mlb_backtest/model_improvement/lane_disposition.py`
 - Create: `tests/test_model_improvement_run_spec.py`
 - Create: `tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json`
 
-- [ ] **Step 1: Write table-driven RED tests for every immutable binding: code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall.**
+- [ ] **Step 1: Write table-driven RED tests for every immutable binding: code revision; source authority paths/digests; D-1/T-45; exclusions; H22/H23/H24 chronology; v5.1 baseline; metrics; output namespaces; Lane B grid/keep/selection; Lane C slots/qualification; H24/2025 firewall; and a dedicated disposition persistence round trip.**
 
 ```python
 class RunSpecTest(unittest.TestCase):
@@ -272,11 +327,20 @@ class RunSpecTest(unittest.TestCase):
         self.assertRegex(spec.prediction_contract_sha256, r"^[0-9a-f]{64}$")
         self.assertTrue(str(spec.output_path("features", "lane_c/H24/feature_seal.json")).endswith("features/lane_c/H24/feature_seal.json"))
         self.assertTrue(spec.h24_firewall.forbid_outcomes_before_registry)
+
+    def test_lane_disposition_round_trips_only_after_runspec_exists(self):
+        spec = load_run_spec(SPEC_PATH)
+        disposition = seal_lane_disposition(
+            spec, "A", "REJECTED", None, ("a" * 64,), ("H23_GATE",))
+        self.assertEqual(
+            load_lane_disposition(spec, Path(disposition.path), disposition.artifact_sha256),
+            disposition,
+        )
 ```
 
 - [ ] **Step 2: Run RED.**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec -v`
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement_run_spec tests.test_model_improvement_contracts -v`
 
 Expected: FAIL with `ModuleNotFoundError` for `run_spec`.
 
@@ -285,6 +349,23 @@ Expected: FAIL with `ModuleNotFoundError` for `run_spec`.
 For `lane_b`, declare the four baseline weights 35/25/20/5, fixed environment/defense 10/5, integer five-point grid bounded by ±10, nonnegative 85 total searched weight, multipliers `(0.75, 1.0, 1.25)`, exact 210 candidates, H22 `keep_h22_count` 12 ordered `(brier, log_loss, daily_top1_delta_desc, candidate_id)`, and H23 eligibility `(Brier/logloss no worse than A; positive paired Top-1 versus v5.1)` with the same final order. For `lane_c`, declare exactly `environment=(park, weather_roof)` and `defense=(oaa, framing, blocking_throwing)`, H22/H23 coverage with required 100% admitted-or-neutral disposition/replay, and prediction-only H24 feature coverage with no outcome access; every Lane C feature set has parent `A+B`. Metrics are all-game Brier/logloss and date-paired Top-1. H24 forbids outcome access before registry and all 2025 outcomes.
 
 - [ ] **Step 4: Implement `ModelImprovementRunSpec`, `build_run_spec(raw: Mapping[str, object])`, `parse_run_spec(raw: object)`, `load_run_spec(path: Path)`, `load_verified_run_spec(path: Path)`, `run_spec_sha256(spec)`, `spec.fold(fold_id)`, and `spec.output_path(namespace, relative_name)`.** `fold` accepts H22/H23/H24 only; `output_path` accepts ten declared namespaces and a normal relative name without `..`. For `features`, it additionally accepts only `common/H22`, `common/H23`, `common/H24`, `lane_c/H22`, `lane_c/H23`, or prediction-only `lane_c/H24` followed by the expected `feature_seal.json` or `rows.jsonl` filename. Validation recomputes every fold’s rolling OOF chronology and exactly 210 Lane B candidates. The builder freezes all candidate/metric rules before any H22 outcome can be joined.
+
+Add the only disposition persistence APIs after `run_spec.py` exists:
+
+```python
+def seal_lane_disposition(
+    spec: ModelImprovementRunSpec, lane_id: Literal["A", "B", "C"],
+    state: Literal["QUALIFIED", "ABSENT", "REJECTED"],
+    parent_card_sha256: str | None, evidence_sha256: Sequence[str],
+    reason_codes: Sequence[str],
+) -> LaneDisposition
+
+def load_lane_disposition(
+    spec: ModelImprovementRunSpec, path: Path, expected_sha256: str,
+) -> LaneDisposition
+```
+
+`seal_lane_disposition` projects the pure contract payload, writes it under the declared `lane_{a,b,c}` namespace, rereads the regular canonical bytes, hashes those bytes before creating descriptor fields, and returns the loader result. `load_lane_disposition` verifies regular canonical bytes, expected digest/sidecar, the closed schema, exact RunSpec-bound namespace path, and excludes runtime `artifact_sha256`/`path` from its payload. It never accepts a fabricated descriptor.
 
 - [ ] **Step 5: Run GREEN.**
 
@@ -295,7 +376,7 @@ Expected: PASS; any unknown key or binding mutation fails closed.
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add schemas/model_improvement/parallel_model_result_run_spec.schema.json mlb_backtest/model_improvement/run_spec.py tests/test_model_improvement_run_spec.py tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json
+git add schemas/model_improvement/parallel_model_result_run_spec.schema.json mlb_backtest/model_improvement/run_spec.py mlb_backtest/model_improvement/lane_disposition.py tests/test_model_improvement_run_spec.py tests/test_model_improvement_contracts.py tests/fixtures/model_improvement/parallel_model_result_v1.synthetic.json
 git commit -m "feat: define model improvement run spec builder"
 ```
 
@@ -501,7 +582,7 @@ git commit -m "feat: replay baseline and evaluate common populations"
 - Create: `mlb_backtest/model_improvement/oof_ledger.py`
 - Create: `tests/test_model_improvement_oof_ledger.py`
 
-- [ ] **Step 1: Write RED tests denying labels in a prediction seal, missing/extra/duplicate joined labels, tampered persisted rows, non-O19-to-O23 IDs, and 2025 labels.**
+- [ ] **Step 1: Write RED tests denying labels in a prediction seal, missing/extra/duplicate joined labels, tampered persisted rows, non-O19-to-O23 IDs, 2025 labels, and a loader that rejects a seal-bound row path whose JSONL bytes, row digest, game uniqueness/order, RunSpec/source/prediction-contract/card binding differ.**
 
 ```python
 class OofLedgerTest(unittest.TestCase):
@@ -509,6 +590,10 @@ class OofLedgerTest(unittest.TestCase):
         prediction = seal_oof_predictions(spec, "O19", prediction_rows)
         joined = join_oof_outcomes(spec, load_prediction_seal(Path(prediction.path), prediction.artifact_sha256), outcomes)
         self.assertEqual(load_joined_ledger(Path(joined.path), joined.artifact_sha256), joined)
+
+    def test_authoritative_row_loader_rereads_the_bound_jsonl(self):
+        seal = seal_oof_predictions(spec, "O19", prediction_rows)
+        self.assertEqual(load_prediction_rows(spec, seal), tuple(prediction_rows))
 ```
 
 - [ ] **Step 2: Run RED.**
@@ -517,7 +602,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `oof_ledger`.
 
-- [ ] **Step 3: Implement `JoinedLedger`, `seal_oof_predictions(spec, ledger_id, rows)`, `load_prediction_seal(path, expected_sha256)`, `join_oof_outcomes(spec, prediction, outcomes)`, and `load_joined_ledger(path, expected_sha256)`.** Prediction rows are exactly `PredictionRow` and contain no labels. `join_oof_outcomes` rereads the seal and rows, validates one binary label per game, writes a separate immutable joined artifact under `oof`, and returns a digest/path descriptor computed from payload bytes rather than embedded in either prediction or joined payload.
+- [ ] **Step 3: Implement `JoinedLedger`, `seal_oof_predictions(spec, ledger_id, rows)`, `load_prediction_seal(path, expected_sha256)`, `load_prediction_rows(spec: ModelImprovementRunSpec, seal: PredictionSeal) -> tuple[PredictionRow, ...]`, `join_oof_outcomes(spec, prediction, outcomes)`, and `load_joined_ledger(path, expected_sha256)`.** `load_prediction_rows` is the sole public prediction-row loader: derive the row JSONL location from the seal’s declared artifact location, never from an assumption that the descriptor file contains rows; read only regular canonical JSONL bytes; verify `rows_sha256`, population digest, unique ordered game keys, and all RunSpec/source-gate/prediction-contract/model-card bindings before constructing immutable rows. Prediction rows contain no labels. `join_oof_outcomes` uses only this loader, validates one binary label per game, writes a separate immutable joined artifact under `oof`, and returns a digest/path descriptor computed from payload bytes rather than embedded in either prediction or joined payload. Export `load_prediction_rows` publicly; Lane B must use it rather than defining a local row reader.
 
 - [ ] **Step 4: Run GREEN.**
 
@@ -532,17 +617,22 @@ git add schemas/model_improvement/prediction_seal.schema.json mlb_backtest/model
 git commit -m "feat: seal model improvement OOF ledgers"
 ```
 
-### Task 8: Implement Lane A rolling-origin calibration and strict H23 freeze
+### Task 8: Implement frozen-card persistence and Lane A rolling-origin calibration
 
 **Files:**
 - Create: `schemas/model_improvement/frozen_model_card.schema.json`
+- Modify: `mlb_backtest/model_improvement/contracts.py`
 - Create: `mlb_backtest/model_improvement/lane_a.py`
 - Create: `tests/test_model_improvement_lane_a.py`
 
-- [ ] **Step 1: Write RED tests for H22 O19–O21 and H23 O19–O22 calibration, unchanged scores/weights/shrinkage/clipping/pick/rank, H22/H23 prediction seals, and strict H23 lower Brier plus lower logloss.**
+- [ ] **Step 1: Write RED tests for Common frozen-card schema/payload round trips and H22 O19–O21/H23 O19–O22 Lane A calibration, unchanged scores/weights/shrinkage/clipping/pick/rank, H22/H23 prediction seals, and strict H23 lower Brier plus lower logloss.**
 
 ```python
 class LaneATest(unittest.TestCase):
+    def test_common_card_sealer_loader_round_trip(self):
+        card = seal_frozen_model_card(spec, "lane_a", "H23/frozen_model_card.json", make_card_payload())
+        self.assertEqual(load_frozen_model_card(spec, Path(card.path), card.artifact_sha256), card)
+
     def test_h23_freezes_only_after_strict_identical_population_improvement(self):
         result = fit_lane_a_fold(spec, "H23", feature_seal, joined_ledgers, baseline_receipt)
         self.assertEqual(result.card.state, "H23_FROZEN")
@@ -564,7 +654,24 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL with `ModuleNotFoundError` for `lane_a`.
 
-- [ ] **Step 3: Implement `LaneAFoldResult` with fields `fold_id`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, fold_id, feature_seal, joined_ledgers, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** For every OOF target use only that fold’s declared prior-season pool, score frozen v5.1 structure, fit `normalize.fit_logistic` only on earlier joined OOF predictions, and seal H22/H23 per-game probabilities/ranks. The `PredictionSeal.prediction_contract_sha256` must equal `spec.prediction_contract_sha256`, never its artifact digest. Replay the v5.1 baseline on exactly those IDs, call `candidate_evaluation, baseline_evaluation = evaluate_predictions(candidate_prediction, baseline_prediction, outcomes)`, and retain those two reports in `LaneAFoldResult`. H22 emits an immutable `QUALIFIED` disposition with reason code `H22_EVALUATED`; H23 emits `QUALIFIED` and a card with state `H23_FROZEN` only when `candidate_evaluation.brier < baseline_evaluation.brier` and `candidate_evaluation.log_loss < baseline_evaluation.log_loss`. If either strict metric condition fails, it emits an immutable `REJECTED` disposition binding the prediction/evaluation evidence and reason codes `H23_BRIER_NOT_STRICTLY_LOWER` and/or `H23_LOG_LOSS_NOT_STRICTLY_LOWER`, and writes no `FrozenModelCard`. A frozen H23 card payload binds source gate, feature seal, all OOF ledgers, baseline replay, alpha/beta, evaluation, and the prediction artifact: both card `prediction_contract_sha256` and `prediction_seal_sha256` equal `PredictionSeal.artifact_sha256`. Its descriptor gets the exact `path` from `spec.output_path("lane_a", "H23/frozen_model_card.json")` and payload digest only after write/reread. It reads no H24 outcome/metric/parameter.
+- [ ] **Step 3: Implement the Common closed `frozen_model_card.schema.json`, card persistence, and `LaneAFoldResult` with fields `fold_id`, `card: FrozenModelCard | None`, `disposition: LaneDisposition`, `prediction: PredictionSeal`, `evaluation: EvaluationReport`, and `baseline_evaluation: EvaluationReport`; implement `fit_lane_a_fold(spec, fold_id, feature_seal, joined_ledgers, baseline_replay)` and `load_lane_a_fold(spec, fold_id)`.** The exact card APIs are:
+
+```python
+def seal_frozen_model_card(
+    spec: ModelImprovementRunSpec,
+    namespace: Literal["lane_a", "lane_b", "lane_c"],
+    relative_name: str,
+    payload: Mapping[str, object],
+) -> FrozenModelCard
+
+def load_frozen_model_card(
+    spec: ModelImprovementRunSpec, path: Path, expected_sha256: str,
+) -> FrozenModelCard
+```
+
+The sealer validates the closed model/state/fold schema and namespace/model compatibility, writes a canonical payload with no runtime `artifact_sha256`/`path`, rereads and hashes its persisted bytes before constructing descriptor fields, and returns the loader result. The loader validates the regular canonical bytes, expected/sidecar digest, exact RunSpec namespace/model/fold path, and payload schema before constructing an immutable card. It never discovers cards by scanning or accepts fabricated descriptors; H24 additionally requires the caller to supply its exact registry-pinned path/digest.
+
+For every OOF target use only that fold’s declared prior-season pool, score frozen v5.1 structure, fit `normalize.fit_logistic` only on earlier joined OOF predictions, and seal H22/H23 per-game probabilities/ranks. The `PredictionSeal.prediction_contract_sha256` must equal `spec.prediction_contract_sha256`, never its artifact digest. Replay the v5.1 baseline on exactly those IDs, call `candidate_evaluation, baseline_evaluation = evaluate_predictions(candidate_prediction, baseline_prediction, outcomes)`, and retain those two reports in `LaneAFoldResult`. H22 emits `QUALIFIED` with reason `H22_EVALUATED` and no card. H23 emits the sole `H23_FROZEN` card only when both strict metric comparisons pass; H23 failure emits `REJECTED`, reason code(s) `H23_BRIER_NOT_STRICTLY_LOWER` and/or `H23_LOG_LOSS_NOT_STRICTLY_LOWER`, and no card. A frozen H23 payload binds source gate, feature seal, all OOF ledgers, baseline replay, alpha/beta, evaluation, and the prediction artifact: both card `prediction_contract_sha256` and `prediction_seal_sha256` equal `PredictionSeal.artifact_sha256`. It reads no H24 outcome/metric/parameter.
 
 - [ ] **Step 4: Run GREEN plus existing scoring regressions.**
 
@@ -575,7 +682,7 @@ Expected: PASS; only OOF calibration is added to frozen scoring behavior.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add schemas/model_improvement/frozen_model_card.schema.json mlb_backtest/model_improvement/lane_a.py tests/test_model_improvement_lane_a.py
+git add schemas/model_improvement/frozen_model_card.schema.json mlb_backtest/model_improvement/contracts.py mlb_backtest/model_improvement/lane_a.py tests/test_model_improvement_lane_a.py tests/test_model_improvement_contracts.py
 git commit -m "feat: freeze rolling-origin lane a"
 ```
 
@@ -610,7 +717,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_model_improvement
 
 Expected: FAIL until all explicit exports are present.
 
-- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `load_baseline_replay`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_report`, `MetricPrimitive`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, and `load_frozen_model_card`; do not re-export legacy `RunSpec`, source acquisition, or outcome loaders.**
+- [ ] **Step 3: Export only the listed public types/functions from `__init__.py`, including `BaselineReplayReceipt`, `load_baseline_replay`, `EvaluationReport`, `evaluate_predictions`, `load_evaluation_report`, `MetricPrimitive`, `LaneDisposition`, `seal_lane_disposition`, `load_lane_disposition`, `seal_frozen_model_card`, `load_frozen_model_card`, and the authoritative `load_prediction_rows`; do not re-export legacy `RunSpec`, source acquisition, or outcome loaders.**
 
 - [ ] **Step 4: Run all Common/Lane A suites.**
 

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal, PredictionRow/PredictionSeal/load_prediction_seal, FrozenModelCard/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
+- Consume only ModelImprovementRunSpec/load_run_spec, SourceGateReceipt/load_source_gate_receipt, FeatureSeal/SealedFeatureRow/load_feature_seal, PredictionRow/PredictionSeal/load_prediction_seal/load_prediction_rows, FrozenModelCard/seal_frozen_model_card/load_frozen_model_card, LaneDisposition/seal_lane_disposition, canonical_json_bytes, and write_immutable_json.
 - Read every Common artifact digest from artifact_sha256 and its immutable location from path; never use a sha256 field. artifact_sha256 is computed from persisted payload bytes; both runtime artifact_sha256 and path are excluded from that payload. A LaneAFoldResult supplies evidence only as result.card, result.prediction, and result.evaluation, never as a digest field on result.
 - Do not create/import .common, scan directories, call spec.lane_root, create a registry, or import H24 outcomes.
 - All artifact paths are CLI arguments. Do not modify config/v5_1_bt.json, scoring.py, config.py, locking.py, outcomes.py, live_model_card.py, or a v5_2 authority.
@@ -544,7 +544,7 @@ git commit -m "feat: evaluate lane b metrics"
 
 **Interfaces:**
 
-- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_evaluation: EvaluationReport), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation: EvaluationReport, parameters), and a QUALIFIED LaneDisposition sealed after a successful card freeze.
+- Produces h22_order(row), reduce_h22(rows), write_candidate_entry(path, entry), select_h23(spec, rows, lane_a_evaluation: EvaluationReport), build_lane_b_disposition(spec, lane_a_result), freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, feature_seal, prediction_seal, evaluation: EvaluationReport, parameters), and a QUALIFIED LaneDisposition sealed after a successful Common card freeze.
 - H24 consumes only FrozenModelCard or LaneDisposition, not any Lane B registry entry.
 
 - [ ] **Step 1: Write failing H22/H23 TestCase methods.**
@@ -575,7 +575,7 @@ Expected: ModuleNotFoundError for lane_b_ledger.
 
 ~~~python
 from mlb_backtest.model_improvement.canonical import canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json
-from mlb_backtest.model_improvement.contracts import FrozenModelCard, load_frozen_model_card
+from mlb_backtest.model_improvement.contracts import seal_frozen_model_card
 from mlb_backtest.model_improvement.evaluation import EvaluationReport
 from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
@@ -634,7 +634,6 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
         raise ValueError("selected H23 candidate differs")
     if lane_a_card.model_id != "A" or lane_a_card.state != "H23_FROZEN":
         raise ValueError("Lane A parent card is not H23_FROZEN")
-    path = spec.output_path("lane_b", "H23/frozen_model_card.json")
     payload = {"model_id": "A+B", "state": "H23_FROZEN", "fold_id": "H23",
         "run_spec_sha256": run_spec_sha256(spec), "source_gate_sha256": source_gate.artifact_sha256,
         "baseline_replay_sha256": baseline_replay.artifact_sha256,
@@ -644,12 +643,7 @@ def freeze_ab_card(spec, selected, lane_a_card, source_gate, baseline_replay, fe
         "prediction_seal_sha256": prediction_seal.artifact_sha256,
         "evaluation_sha256": evaluation.artifact_sha256,
         "parameters": {"candidate_id": selected["candidate_id"], **parameters}}
-    digest = sha256_bytes(canonical_json_bytes(payload))
-    card = FrozenModelCard(**payload, artifact_sha256=digest, path=str(path))
-    if card.as_mapping() != payload:
-        raise RuntimeError("runtime card fields must not be persisted")
-    write_immutable_json(path, payload)
-    return load_frozen_model_card(spec, path, digest)
+    return seal_frozen_model_card(spec, "lane_b", "H23/frozen_model_card.json", payload)
 ~~~
 
 - [ ] **Step 4: Add no-qualifier, worse-than-Lane-A, card mutation, and parent-state tests then run GREEN.**
@@ -719,26 +713,15 @@ Expected: ModuleNotFoundError for lane_b_runner.
 
 ~~~python
 from pathlib import Path
-from mlb_backtest.model_improvement.contracts import PredictionRow, load_frozen_model_card
+from mlb_backtest.model_improvement.contracts import load_frozen_model_card
 from mlb_backtest.model_improvement.lane_b_ledger import build_lane_b_disposition, freeze_ab_card, select_h23
-from mlb_backtest.model_improvement.oof_ledger import load_prediction_seal
+from mlb_backtest.model_improvement.oof_ledger import load_prediction_rows, load_prediction_seal
 from mlb_backtest.model_improvement.run_spec import load_run_spec
 from mlb_backtest.model_improvement.sealed_features import load_feature_seal, load_sealed_feature_rows
 from mlb_backtest.model_improvement.source_gate import load_source_gate_receipt
-from mlb_backtest.model_improvement.canonical import canonical_json_bytes, read_regular_bytes, sha256_bytes
+from mlb_backtest.model_improvement.canonical import read_regular_bytes, sha256_bytes
 from mlb_backtest.model_improvement.run_spec import run_spec_sha256
 from mlb_backtest.model_improvement.lane_disposition import seal_lane_disposition
-import json
-
-
-def load_bound_prediction_rows(seal):
-    payload = json.loads(read_regular_bytes(Path(seal.path), "PredictionSeal rows"))
-    rows = tuple(PredictionRow.from_mapping(row) for row in payload["rows"])
-    if sha256_bytes(canonical_json_bytes([row.as_mapping() for row in rows])) != seal.rows_sha256:
-        raise RuntimeError("PredictionSeal rows digest differs")
-    return rows
-
-
 def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256, feature_seal_path,
                    feature_seal_expected_sha256, v51_h22_path, v51_h22_expected_sha256,
                    lane_a_h22_path, lane_a_h22_expected_sha256):
@@ -748,8 +731,8 @@ def run_lane_b_h22(run_spec_path, source_gate_path, source_gate_expected_sha256,
     feature_rows = load_sealed_feature_rows(spec, (2022,), features)
     v51 = load_prediction_seal(Path(v51_h22_path), v51_h22_expected_sha256)
     lane_a = load_prediction_seal(Path(lane_a_h22_path), lane_a_h22_expected_sha256)
-    v51_rows, lane_a_rows = load_bound_prediction_rows(v51), load_bound_prediction_rows(lane_a)
-    if gate.status != "SOURCES_READY":
+    v51_rows, lane_a_rows = load_prediction_rows(spec, v51), load_prediction_rows(spec, lane_a)
+    if gate.as_mapping()["status"] != "SOURCES_READY":
         raise RuntimeError("source gate is not SOURCES_READY")
     if tuple(spec.fold("H22").oof_calibration_years) != (2019, 2020, 2021):
         raise RuntimeError("H22 chronology differs")
@@ -824,6 +807,6 @@ git commit -m "feat: orchestrate lane b replay"
 - Exactly 70 legal weight tuples times three multipliers make 210.
 - H22 emits 210 immutable decisions; first 12 replay-valid candidates are ordered Brier asc, log loss asc, date-paired Top-1 delta desc, candidate ID asc. Invalid replay reason is H22_INVALID_REPLAY.
 - H23 requires Brier/log loss no worse than Lane A and positive paired Top-1 delta versus v5.1, then uses the same ordering.
-- Lane A not H23_FROZEN yields LaneDisposition ABSENT_DEPENDENCY with reason LANE_A_NOT_H23_FROZEN and does not search. No H23 qualifier yields LaneDisposition REJECTED with reason NO_H23_CANDIDATE_CLEARS_GATES and writes no A+B card.
+- Lane A not H23_FROZEN yields LaneDisposition `state="ABSENT"` with reason `LANE_A_NOT_H23_FROZEN` and does not search. No H23 qualifier yields LaneDisposition REJECTED with reason NO_H23_CANDIDATE_CLEARS_GATES and writes no A+B card.
 - Successful A+B has model_id A+B, state H23_FROZEN, Lane A parent-card SHA-256, and prediction-contract SHA-256. H24 registers it later.
 - Candidate calibration is O19–O21, O19–O22, O19–O23 for H22, H23, optional H24; exact p=.5 remains no-pick.

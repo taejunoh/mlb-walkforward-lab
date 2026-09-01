@@ -19,7 +19,7 @@ The following names are owned by Common/Lane A and are dependencies, not new Lan
 ```python
 from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard, LaneDisposition, MetricPrimitive, PredictionSeal, SealedFeatureRow,
-    load_frozen_model_card,
+    LANE_IDS, load_frozen_model_card, seal_frozen_model_card,
 )
 from mlb_backtest.model_improvement.run_spec import (
     ModelImprovementRunSpec, load_verified_run_spec, run_spec_sha256,
@@ -38,7 +38,7 @@ from pathlib import Path
 
 `LaneDisposition` is the generic Common disposition API. Lane C uses only states `QUALIFIED`, `ABSENT`, and `REJECTED`; it does not define a C-specific absence enum. `load_frozen_model_card(spec, path, expected_sha256)` and the Common `PredictionSeal` are the typed APIs consumed by this plan. Runtime artifact descriptors are compared with `.artifact_sha256`; that field is excluded from canonical payloads. If an upstream plan has not published one of these names, resolve that interface in the upstream plan before starting Lane C; do not add aliases here.
 
-Before Lane C starts, Common must publish `load_sealed_feature_rows(spec, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_feature_rows(spec, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. Lane C calls these APIs rather than recomputing or weakening upstream seals.
+Before Lane C starts, Common must publish `LANE_IDS`, `load_sealed_feature_rows(spec, years, seal)` for the separate H22/H23/H24 seals, `load_lane_disposition(spec, path, expected_sha256)`, `seal_lane_disposition(spec, lane_id, state, parent_card_sha256, evidence_sha256, reason_codes)`, `seal_frozen_model_card(spec, namespace, relative_name, payload)`, `load_frozen_model_card(spec, path, expected_sha256)`, `seal_feature_rows(spec, "lane_c", fold_id, rows, parent_feature_seal_sha256, evidence_sha256)`, and `run_spec_sha256(spec)`. Lane C calls these APIs rather than recomputing or weakening upstream seals. Validate `"C" in LANE_IDS` rather than declaring a local lane-ID domain.
 
 The Common `ModelImprovementRunSpec` is the only authority for fold membership, forbidden years, cutoffs, and artifact paths. `lane_c_output_path(spec, relative)` must be exactly:
 
@@ -820,7 +820,7 @@ from dataclasses import asdict, dataclass
 
 from mlb_backtest.model_improvement.contracts import (
     FrozenModelCard, LaneDisposition, PredictionSeal, SealedFeatureRow,
-    load_frozen_model_card,
+    LANE_IDS, load_frozen_model_card, seal_frozen_model_card,
 )
 from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes, read_regular_bytes, sha256_bytes, write_immutable_json,
@@ -994,7 +994,7 @@ def build_lane_c_candidate(
     return tuple(output)
 ```
 
-The production implementation uses the exact `CoverageKey(fold_id, row.target_year, row.game_pk, side, component, slot)` lookup and the existing score functions’ signatures. `make_lane_c_metric_primitives(parts: Sequence[LaneCTransformedPart]) -> tuple[MetricPrimitive, ...]` records each part’s normalized score, aggregation weight, quality recipe, and observation/source-contract/query/raw/manifest/sidecar binding in the Common `MetricPrimitive` tree. No outcome field is copied or introduced.
+The production implementation uses the exact `CoverageKey(fold_id, row.target_year, row.game_pk, side, component, slot)` lookup and the existing score functions’ signatures. `make_lane_c_metric_primitives(parts: Sequence[LaneCTransformedPart]) -> tuple[MetricPrimitive, ...]` records each part’s normalized score, aggregation weight, quality recipe, and observation/source-contract/query/raw/manifest/sidecar binding in the Common `MetricPrimitive` tree. The fixed environment and defense recipes must use `family=None` (never invent `"environment"` or `"defense"` as a Common quality family). No outcome field is copied or introduced.
 
 Seal the returned rows before any prediction materialization or handoff:
 
@@ -1054,6 +1054,8 @@ def build_lane_c_h23_result(
     evidence_sha256: Sequence[str],
     reason_codes: Sequence[str],
 ) -> tuple[FrozenModelCard | None, LaneDisposition]:
+    if "C" not in LANE_IDS:
+        raise RuntimeError("Common Lane C identifier is unavailable")
     parent_hash = parent_ab_card.artifact_sha256
     evidence = tuple(evidence_sha256)
     load_replay_receipt(spec, replay_receipt)
@@ -1123,7 +1125,7 @@ def build_lane_c_h23_result(
         lane_c_feature_seals[fold].artifact_sha256 for fold in required_folds
         if lane_c_feature_seals[fold].artifact_sha256 not in evidence
     )
-    card = freeze_lane_c_card(
+    card = seal_lane_c_card(
         spec, source_gate, lane_c_feature_seals, parent_ab_card, parent_ab_prediction,
         lane_c_prediction, coverage, evidence, lane_c_evaluation,
     )
@@ -1136,10 +1138,10 @@ def build_lane_c_h23_result(
 
 `build_lane_c_h23_result()` is the only qualification boundary and always calls `seal_lane_disposition`; it never directly constructs `LaneDisposition`. It requires H22, H23, and prediction-only H24 coverage/seals complete, at least one admitted row, replay success, a Lane C prediction artifact digest different from parent A+B, and a sealed H23 `EvaluationReport`; it never reads H24 outcomes. `ABSENT` and `REJECTED` never create a frozen card or candidate prediction artifact.
 
-- [ ] **Step 5: Add exact frozen-card and disposition writers.**
+- [ ] **Step 5: Use only exact Common frozen-card and disposition persistence APIs.**
 
 ```python
-def freeze_lane_c_card(
+def seal_lane_c_card(
     spec: ModelImprovementRunSpec,
     source_gate: SourceGateReceipt,
     lane_c_feature_seals: Mapping[str, FeatureSeal],
@@ -1150,7 +1152,6 @@ def freeze_lane_c_card(
     evidence_sha256: Sequence[str],
     lane_c_evaluation: EvaluationReport,
 ) -> FrozenModelCard:
-    output_path = lane_c_output_path(spec, "frozen/a_b_c_h23.json")
     payload = {
         "model_id": "A+B+C",
         "state": "H23_FROZEN",
@@ -1171,14 +1172,12 @@ def freeze_lane_c_card(
             "evidence_sha256": tuple(evidence_sha256),
         },
     }
-    write_immutable_json(output_path, payload)
-    digest = sha256_bytes(read_regular_bytes(output_path, "Lane C frozen card"))
-    return load_frozen_model_card(spec, output_path, digest)
+    return seal_frozen_model_card(spec, "lane_c", "H23/frozen_model_card.json", payload)
 ```
 
-Use the Common frozen-card schema and canonical immutable writer; do not add a `lane_c_frozen_card.schema.json` or any C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, `prediction_contract_sha256 == lane_c_prediction.artifact_sha256`, Lane C H23 prediction seal, source-gate/feature-seal/RunSpec/baseline-replay/evaluation hashes, and no outcome fields. Before writing, validate `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256`; never compare the seal contract digest to itself. Use the generic `seal_lane_disposition`/`load_lane_disposition` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
+Use the Common frozen-card schema and exact `seal_frozen_model_card` payload/sealer/loader contract; do not add a `lane_c_frozen_card.schema.json`, direct mapping write, fabricated descriptor, or C-specific card schema. The Common card must require `state == "H23_FROZEN"`, `model_id == "A+B+C"`, `fold_id == "H23"`, parent A+B card hash, `prediction_contract_sha256 == lane_c_prediction.artifact_sha256`, Lane C H23 prediction seal, source-gate/feature-seal/RunSpec/baseline-replay/evaluation hashes, and no outcome fields. Before sealing, validate `lane_c_prediction.prediction_contract_sha256 == spec.prediction_contract_sha256`; never compare the seal contract digest to itself. Use the generic `seal_lane_disposition`/`load_lane_disposition(spec, path, expected_sha256)` contract for all three states; do not add a `lane_c_disposition.schema.json`. H24 consumes the exact H24 lane_c `FeatureSeal` and remains outside this card/evaluation implementation.
 
-The Common artifact-hash convention applies unchanged to the C card: `artifact_sha256` and `path` are runtime descriptor fields, excluded from the canonical frozen-card payload. The immutable writer computes the payload digest after writing/rereading; `load_frozen_model_card(spec, path, expected_sha256)` verifies that digest and the RunSpec-bound `lane_c` path.
+The Common artifact-hash convention applies unchanged to the C card: `artifact_sha256` and `path` are runtime descriptor fields, excluded from the canonical frozen-card payload. `seal_frozen_model_card` writes/rereads the payload, hashes canonical persisted bytes before creating descriptor fields, and `load_frozen_model_card(spec, path, expected_sha256)` verifies the digest and the RunSpec-bound `lane_c` path.
 
 - [ ] **Step 6: Run candidate tests and commit.**
 
@@ -1239,7 +1238,7 @@ class LaneCHandoffTest(unittest.TestCase):
         self.assertEqual(disposition.reason_codes, ("COVERAGE_INCOMPLETE",))
 
     def test_qualified_card_is_h23_frozen_and_parent_bound(self):
-        card = freeze_lane_c_card(
+        card = seal_lane_c_card(
             self.spec, self.source_gate, self.lane_c_feature_seals, self.parent_ab_card,
             self.parent_ab_prediction, self.different_lane_c_prediction,
             self.qualified_report, self.evidence_sha256, self.evaluation,
@@ -1261,7 +1260,7 @@ Expected: `ERROR` until the generic disposition/card handoff is wired.
 
 - [ ] **Step 3: Add path-bound immutable writes through the Common card and disposition APIs.**
 
-Use `spec.output_path("lane_c", relative)` for every Lane C path. Reread the written canonical bytes and digest before returning; load dispositions with `load_lane_disposition(path, disposition.artifact_sha256)`. Do not call H24 outcome/evaluation or candidate-registry code. A `QUALIFIED` result writes one Common frozen card and generic qualified disposition; `ABSENT`/`REJECTED` writes only the generic disposition.
+Use `spec.output_path("lane_c", relative)` for every Lane C path. The Common sealers reread canonical bytes and compute the digest before returning; load dispositions only with `load_lane_disposition(spec, Path(disposition.path), disposition.artifact_sha256)`. Do not call H24 outcome/evaluation or candidate-registry code. A `QUALIFIED` result writes one Common frozen card and generic qualified disposition; `ABSENT`/`REJECTED` writes only the generic disposition.
 
 - [ ] **Step 4: Run all Lane C and adjacent offline regressions.**
 
