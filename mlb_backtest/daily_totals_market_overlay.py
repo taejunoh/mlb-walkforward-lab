@@ -6,10 +6,12 @@ import math
 import re
 import json
 import hashlib
+import argparse
+import sys
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Rational, Real
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -868,8 +870,23 @@ def _overlay_trace(value: object) -> dict[str, object]:
     return safe
 
 
-def _render_overlay_markdown(report: Mapping[str, object]) -> bytes:
-    """Render the sealed research record without outcome or return claims."""
+def render_overlay_markdown(payload: object) -> str:
+    """Render every game as a compact, research-only comparison table.
+
+    The renderer validates its input so callers cannot accidentally publish a
+    Markdown view that omits a sealed game or adds fields to a closed row.
+    ``NO_QUOTE`` rows intentionally display no matchup or market details.
+    """
+    # ``BuiltOverlay.report`` is intentionally frozen with mapping proxies and
+    # tuples; thaw that transport representation before canonical validation.
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: thaw(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [thaw(item) for item in value]
+        return value
+
+    report = validate_overlay_report(thaw(payload))
     lines = [
         "# Provisional Daily Totals Overlay",
         "",
@@ -879,8 +896,8 @@ def _render_overlay_markdown(report: Mapping[str, object]) -> bytes:
         f"- Evaluated at: {report['evaluated_at_utc']}",
         f"- Overlay content SHA-256: {report['content_sha256']}",
         "",
-        "| Game | Market status | Research disposition | Reasons |",
-        "| --- | --- | --- | --- |",
+        "| Game | Market status | Expected total | Market line | Over American | Under American | Over support | Under support | Push support | Over conditional | Under conditional | Over margin | Under margin | Selected side | Decision | Reasons |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     games = report["games"]
     if not isinstance(games, list):
@@ -889,11 +906,33 @@ def _render_overlay_markdown(report: Mapping[str, object]) -> bytes:
         if not isinstance(game, Mapping):
             raise ValueError("overlay report game differs")
         reasons = ", ".join(str(reason) for reason in game["reason_codes"])
+        expected_total = f"{float(game['expected_total']):g}"
+        if game["market_status"] == "QUOTED":
+            line = f"{float(game['line_half_runs']) / 2:g}"
+            over_price = f"{int(game['over_american_odds']):+d}"
+            under_price = f"{int(game['under_american_odds']):+d}"
+            over_support = f"{float(game['over_support']):.4f}"
+            under_support = f"{float(game['under_support']):.4f}"
+            push_support = f"{float(game['push_support']):.4f}"
+            over_conditional = "—" if game["over_conditional_support"] is None else f"{float(game['over_conditional_support']):.4f}"
+            under_conditional = "—" if game["under_conditional_support"] is None else f"{float(game['under_conditional_support']):.4f}"
+            over_margin = "—" if game["over_support_margin"] is None else f"{float(game['over_support_margin']):+.4f}"
+            under_margin = "—" if game["under_support_margin"] is None else f"{float(game['under_support_margin']):+.4f}"
+            selected_side = str(game["selected_side"] or "—")
+        else:
+            line = over_price = under_price = over_support = under_support = push_support = over_conditional = under_conditional = over_margin = under_margin = selected_side = "—"
         lines.append(
-            f"| {game['game_pk']} | {game['market_status']} | {game['decision']} | {reasons} |"
+            f"| {game['game_pk']} | {game['market_status']} | {expected_total} | {line} | {over_price} | {under_price} | "
+            f"{over_support} | {under_support} | {push_support} | {over_conditional} | {under_conditional} | "
+            f"{over_margin} | {under_margin} | {selected_side} | {game['decision']} | {reasons} |"
         )
-    lines.extend(["", "This is a research record, not financial advice.", ""])
-    return "\n".join(lines).encode("utf-8")
+    lines.extend(["", "This record is for research review only.", ""])
+    return "\n".join(lines)
+
+
+def _render_overlay_markdown(report: Mapping[str, object]) -> bytes:
+    """Return canonical UTF-8 Markdown bytes for the persisted report."""
+    return render_overlay_markdown(report).encode("utf-8")
 
 
 def build_overlay(
@@ -1024,3 +1063,78 @@ def persist_overlay(root: Path, built: BuiltOverlay) -> tuple[Path, Path, Path, 
         _rebind_all(trusted, before_trace + (trace_snapshot,), "overlay post-trace")
         trusted.assert_bound()
     return built.report_sidecar_relative, built.report_relative, built.markdown_relative, built.trace_relative
+
+
+def utc_now() -> datetime:
+    """Return the aware UTC instant used by the comparison CLI."""
+    return datetime.now(timezone.utc)
+
+
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m mlb_backtest.daily_totals_market_overlay",
+        description="Admit a local DraftKings capture or compare it with sealed totals evidence.",
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    admit = commands.add_parser("admit-snapshot", allow_abbrev=False)
+    admit.add_argument("--root", type=Path, required=True)
+    admit.add_argument("--model-trace", type=Path, required=True)
+    admit.add_argument("--raw-capture", type=Path, required=True)
+
+    compare = commands.add_parser("compare", allow_abbrev=False)
+    compare.add_argument("--root", type=Path, required=True)
+    compare.add_argument("--model-trace", type=Path, required=True)
+    compare.add_argument("--market-snapshot", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the two offline overlay commands.
+
+    Contract/integrity failures are reported with exit code 2, while local
+    operating-system failures use exit code 1.  A successful command emits
+    exactly one root-relative artifact path.
+    """
+    try:
+        args = _cli_parser().parse_args(argv)
+        if args.command == "admit-snapshot":
+            model_trace = _path(args.model_trace, "model trace path")
+            raw_capture = _path(args.raw_capture, "raw capture path")
+            result = admit_draftkings_snapshot(
+                args.root,
+                model_trace,
+                raw_capture,
+                comparison_clock=utc_now,
+            )
+        elif args.command == "compare":
+            model_trace = _path(args.model_trace, "model trace path")
+            market_snapshot = _path(args.market_snapshot, "market snapshot path")
+            built = build_overlay(
+                args.root,
+                model_trace,
+                market_snapshot,
+                evaluated_clock=utc_now,
+            )
+            result = persist_overlay(args.root, built)[-1]
+        else:  # pragma: no cover - argparse enforces the closed command set.
+            raise ValueError("command differs")
+        if not isinstance(result, Path) or result.is_absolute() or "\\" in result.as_posix():
+            raise ValueError("CLI result path differs")
+        print(result.as_posix())
+        return 0
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
+    except KeyboardInterrupt:
+        return 130
+    except (ValueError, FileExistsError, json.JSONDecodeError) as exc:
+        print(f"integrity/contract failure: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"operational failure: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

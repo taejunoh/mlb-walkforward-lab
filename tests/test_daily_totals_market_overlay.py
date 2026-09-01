@@ -39,6 +39,129 @@ from mlb_backtest.daily_totals_market_overlay import (
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
 
 
+class CliTests(unittest.TestCase):
+    def test_renderer_has_research_labels_and_all_quoted_details(self) -> None:
+        from mlb_backtest.daily_totals_market_overlay import render_overlay_markdown
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = SecurePersistenceTests._build_public_case(root)
+            payload = json.loads(built.report_bytes)
+            text = render_overlay_markdown(payload)
+
+        for label in ("RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED", "RESEARCH_PICK"):
+            self.assertIn(label, text)
+        for fragment in ("line", "over american", "under american", "support", "push", "conditional", "margin", "selected side", "decision", "reasons"):
+            self.assertIn(fragment, text.lower())
+        for forbidden in ("calibrated", "fair odds", "expected value", "return", "edge", "roi", "profitability", "wagering recommendation"):
+            self.assertNotIn(forbidden, text.lower())
+        for game_pk in FIXED_GAME_PKS:
+            self.assertIn(f"| {game_pk} |", text)
+
+    def test_renderer_keeps_no_quote_without_invented_matchup_data(self) -> None:
+        from mlb_backtest.daily_totals_market_overlay import render_overlay_markdown
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            _, _, built = SecurePersistenceTests._build_public_case(
+                root,
+                raw_mutator=lambda value: value["games"].__setitem__(
+                    0, {"game_pk": FIXED_GAME_PKS[0], "status": "NO_QUOTE", "reason": "NOT_LISTED"}
+                ),
+            )
+            text = render_overlay_markdown(json.loads(built.report_bytes))
+
+        self.assertIn(f"| {FIXED_GAME_PKS[0]} | NO_QUOTE |", text)
+        self.assertIn("| PASS | NO_QUOTE |", text)
+        self.assertNotIn("event-822929", text)
+        self.assertNotIn("Game 822929", text)
+
+    def test_cli_success_prints_only_relative_snapshot_and_trace_paths(self) -> None:
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, raw = SecurePersistenceTests._authority(root)
+            clock = datetime(2026, 9, 1, 15, 1, tzinfo=timezone.utc)
+            with patch.object(overlay, "utc_now", return_value=clock), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                self.assertEqual(
+                    overlay.main([
+                        "admit-snapshot", "--root", str(root),
+                        "--model-trace", trace.as_posix(), "--raw-capture", raw.as_posix(),
+                    ]),
+                    0,
+                )
+                printed = "".join(call.args[0] for call in stdout.write.call_args_list)
+                self.assertTrue(printed.endswith("\n"))
+                snapshot = Path(printed.strip())
+                self.assertFalse(snapshot.is_absolute())
+                self.assertEqual(stderr.write.call_args_list, [])
+
+            with patch.object(overlay, "utc_now", return_value=clock), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                self.assertEqual(
+                    overlay.main([
+                        "compare", "--root", str(root),
+                        "--model-trace", trace.as_posix(), "--market-snapshot", snapshot.as_posix(),
+                    ]),
+                    0,
+                )
+                printed = "".join(call.args[0] for call in stdout.write.call_args_list)
+                self.assertTrue(printed.endswith("\n"))
+                self.assertFalse(Path(printed.strip()).is_absolute())
+                self.assertEqual(stderr.write.call_args_list, [])
+
+    def test_cli_rejects_overrides_and_unsafe_input_paths_with_contract_code(self) -> None:
+        from mlb_backtest.daily_totals_market_overlay import main
+
+        cases = (
+            ("--line", "9.5"),
+            ("--price", "-110"),
+            ("--game", "822929"),
+            ("--url", "https://sportsbook.draftkings.com/markets"),
+            ("--threshold", "0.8"),
+            ("--clock", "2026-09-01T15:00:00Z"),
+        )
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for option, value in cases:
+                with self.subTest(option=option), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+                    stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
+                    code = main([
+                        "compare", "--root", str(root), "--model-trace", "trace.json",
+                        "--market-snapshot", "snapshot.json", option, value,
+                    ])
+                    self.assertEqual(code, 2)
+                    self.assertEqual(stdout.write.call_args_list, [])
+                    self.assertTrue(stderr.write.call_args_list)
+
+            unsafe = ("../trace.json", "/tmp/trace.json", "reports\\trace.json")
+            for supplied in unsafe:
+                with self.subTest(supplied=supplied):
+                    self.assertEqual(
+                        main([
+                            "compare", "--root", str(root), "--model-trace", supplied,
+                            "--market-snapshot", "snapshot.json",
+                        ]),
+                        2,
+                    )
+
+    def test_cli_maps_contract_and_operational_failures(self) -> None:
+        import mlb_backtest.daily_totals_market_overlay as overlay
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            args = ["admit-snapshot", "--root", str(root), "--model-trace", "trace.json", "--raw-capture", "raw.json"]
+            with patch.object(overlay, "admit_draftkings_snapshot", side_effect=ValueError("bad contract")):
+                self.assertEqual(overlay.main(args), 2)
+            with patch.object(overlay, "admit_draftkings_snapshot", side_effect=OSError("unavailable")):
+                self.assertEqual(overlay.main(args), 1)
+
+
 class SecurePersistenceTests(unittest.TestCase):
     def test_public_secure_persistence_interfaces_exist(self) -> None:
         """Catch removal of the admission/build/persistence public boundary."""
