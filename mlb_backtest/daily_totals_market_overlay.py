@@ -71,7 +71,7 @@ _REASON_CODES = (
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _UTC_RE = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T"
-    r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?Z$"
+    r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.[0-9]{0,5}[1-9])?Z$"
 )
 
 
@@ -120,6 +120,19 @@ def _utc_timestamp(value: object, label: str) -> datetime:
         raise ValueError(f"{label} differs") from exc
     if parsed.tzinfo != timezone.utc:
         raise ValueError(f"{label} differs")
+    if parsed.microsecond:
+        fractional = f"{parsed.microsecond:06d}".rstrip("0")
+        canonical = (
+            f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+            f"T{parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d}.{fractional}Z"
+        )
+    else:
+        canonical = (
+            f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+            f"T{parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d}Z"
+        )
+    if value != canonical:
+        raise ValueError(f"{label} differs")
     return parsed
 
 
@@ -164,6 +177,7 @@ def _source_url(value: object) -> str:
         raise ValueError("source_url differs") from exc
     if (
         parsed.scheme != "https" or hostname != "sportsbook.draftkings.com"
+        or parsed.netloc != "sportsbook.draftkings.com"
         or parsed.username is not None or parsed.password is not None
         or port is not None or ":" in parsed.netloc or "#" in value
         or not parsed.netloc
@@ -187,7 +201,8 @@ def _snapshot_game(value: object) -> dict[str, object]:
         validate_american_price(game["over_american_odds"])
         validate_american_price(game["under_american_odds"])
     elif status == "NO_QUOTE":
-        if set(game) != _NO_QUOTE_SNAPSHOT_KEYS or game["reason"] not in {"NOT_LISTED", "UNAVAILABLE"}:
+        reason = game.get("reason")
+        if set(game) != _NO_QUOTE_SNAPSHOT_KEYS or not isinstance(reason, str) or reason not in {"NOT_LISTED", "UNAVAILABLE"}:
             raise ValueError("no-quote snapshot game differs")
     else:
         raise ValueError("snapshot game status differs")
@@ -239,7 +254,7 @@ def validate_overlay_policy(value: object) -> dict[str, object]:
 
 
 def _reason_codes(value: object) -> list[str]:
-    if not isinstance(value, list) or any(code not in _REASON_CODES for code in value):
+    if not isinstance(value, list) or any(not isinstance(code, str) or code not in _REASON_CODES for code in value):
         raise ValueError("overlay reason codes differ")
     if len(set(value)) != len(value):
         raise ValueError("overlay reason codes are duplicated")
@@ -288,21 +303,22 @@ def _overlay_game(value: object) -> dict[str, object]:
             _finite(m_value, f"overlay {margin}", low=-1.0, high=1.0)
     if (rates[0] + rates[1] == 0.0) != (game["over_conditional_support"] is None):
         raise ValueError("overlay conditional support availability differs")
-    if game["selected_side"] not in {None, "OVER", "UNDER"}:
+    selected_side = game["selected_side"]
+    if selected_side is not None and (not isinstance(selected_side, str) or selected_side not in {"OVER", "UNDER"}):
         raise ValueError("overlay selected side differs")
     decision = game["decision"]
-    if decision not in {"RESEARCH_PICK", "PASS"}:
+    if not isinstance(decision, str) or decision not in {"RESEARCH_PICK", "PASS"}:
         raise ValueError("overlay decision differs")
     reasons = _reason_codes(game["reason_codes"])
-    if decision == "RESEARCH_PICK" and (game["selected_side"] not in {"OVER", "UNDER"} or reasons):
+    if decision == "RESEARCH_PICK" and (selected_side not in {"OVER", "UNDER"} or reasons):
         raise ValueError("overlay research pick consistency differs")
     if decision == "PASS" and not reasons:
         raise ValueError("overlay pass reason codes differ")
     if "NO_QUOTE" in reasons:
         raise ValueError("quoted overlay cannot use no-quote reason")
-    if "AMBIGUOUS_DIRECTION" in reasons and game["selected_side"] is not None:
+    if "AMBIGUOUS_DIRECTION" in reasons and selected_side is not None:
         raise ValueError("ambiguous overlay selected side differs")
-    if game["selected_side"] is None and decision == "RESEARCH_PICK":
+    if selected_side is None and decision == "RESEARCH_PICK":
         raise ValueError("overlay selected side differs")
     return game
 

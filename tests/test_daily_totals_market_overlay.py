@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+from copy import deepcopy
 import unittest
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
@@ -53,6 +54,181 @@ class SchemaTests(unittest.TestCase):
         unsigned = dict(value)
         unsigned.pop("content_sha256", None)
         return hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
+
+    @classmethod
+    def _snapshot_fixture(cls) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema": SNAPSHOT_SCHEMA, "content_sha256": "", "target_date": TARGET_DATE,
+            "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
+            "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
+            "comparison_bound_at_utc": "2026-09-01T15:00:00Z", "source_name": "DraftKings",
+            "book_id": "DRAFTKINGS", "source_url": "https://sportsbook.draftkings.com/markets",
+            "capture_method": "EXTERNAL_MANUAL", "captured_at_utc": "2026-09-01T14:59:00Z",
+            "raw_capture_relative": "data/raw.json", "raw_capture_sha256": "c" * 64,
+            "raw_capture_byte_length": 1,
+            "games": [{"game_pk": pk, "status": "NO_QUOTE", "reason": "NOT_LISTED"} for pk in FIXED_GAME_PKS],
+        }
+        value["content_sha256"] = cls._digest(value)
+        return value
+
+    @classmethod
+    def _overlay_fixture(cls) -> dict[str, object]:
+        rows = [{
+            "game_pk": pk, "expected_total": 8.0, "residual_count": 764, "market_status": "QUOTED",
+            "line_half_runs": 17, "over_american_odds": -110, "under_american_odds": -110,
+            "over_support": 0.5, "under_support": 0.5, "push_support": 0.0,
+            "over_conditional_support": 0.5, "under_conditional_support": 0.5,
+            "over_support_margin": 0.0, "under_support_margin": 0.0,
+            "selected_side": None, "decision": "PASS", "reason_codes": ["AMBIGUOUS_DIRECTION"],
+        } for pk in FIXED_GAME_PKS]
+        value: dict[str, object] = {
+            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
+            "target_date": TARGET_DATE, "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
+            "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
+            "market_snapshot_relative": "audit/snapshot.json", "market_snapshot_sha256": "c" * 64,
+            "policy_schema": POLICY_SCHEMA,
+            "policy_sha256": hashlib.sha256(canonical_json_bytes(POLICY)).hexdigest(),
+            "evaluated_at_utc": "2026-09-01T15:00:00Z", "games": rows,
+        }
+        value["content_sha256"] = cls._digest(value)
+        return value
+
+    def test_valid_instances_pass_their_json_schemas(self) -> None:
+        root = Path(__file__).parents[1] / "schemas"
+        snapshot = self._snapshot_fixture()
+        overlay = self._overlay_fixture()
+        Draft202012Validator(json.loads((root / "experimental_daily_totals_draftkings_snapshot.schema.json").read_text())).validate(snapshot)
+        Draft202012Validator(json.loads((root / "experimental_daily_totals_overlay_policy.schema.json").read_text())).validate(POLICY)
+        Draft202012Validator(json.loads((root / "experimental_daily_totals_overlay.schema.json").read_text())).validate(overlay)
+
+    def test_schema_population_and_order_rejections(self) -> None:
+        root = Path(__file__).parents[1] / "schemas"
+        snapshot_schema = json.loads((root / "experimental_daily_totals_draftkings_snapshot.schema.json").read_text())
+        overlay_schema = json.loads((root / "experimental_daily_totals_overlay.schema.json").read_text())
+        for value in (
+            {**self._snapshot_fixture(), "games": self._snapshot_fixture()["games"][:-1]},
+            {**self._snapshot_fixture(), "games": self._snapshot_fixture()["games"] + [self._snapshot_fixture()["games"][0]]},
+            {**self._snapshot_fixture(), "games": [{**self._snapshot_fixture()["games"][0], "game_pk": 1}] + self._snapshot_fixture()["games"][1:]},
+        ):
+            with self.subTest(kind="snapshot"):
+                with self.assertRaises(Exception):
+                    Draft202012Validator(snapshot_schema).validate(value)
+        overlay = self._overlay_fixture()
+        for games in (overlay["games"][:-1], overlay["games"] + [overlay["games"][0]]):
+            with self.subTest(kind="overlay_population"):
+                with self.assertRaises(Exception):
+                    Draft202012Validator(overlay_schema).validate({**overlay, "games": games})
+        reordered = deepcopy(overlay)
+        reordered["games"] = list(reversed(reordered["games"]))
+        with self.assertRaises(Exception):
+            Draft202012Validator(overlay_schema).validate(reordered)
+
+    def test_canonical_rfc3339_and_uniform_value_errors(self) -> None:
+        snapshot = self._snapshot_fixture()
+        for timestamp in ("2026-09-01T14:59:00.0Z", "2026-09-01T14:59:00.120Z", "2026-09-01T14:59:00+00:00", "2026-09-01T14:59:60Z"):
+            invalid = deepcopy(snapshot)
+            invalid["captured_at_utc"] = timestamp
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+        for reason in ({}, [], {"bad": 1}, ["NO_QUOTE"]):
+            invalid = deepcopy(snapshot)
+            invalid["games"][0]["reason"] = reason
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+        overlay = self._overlay_fixture()
+        for side in ({}, [], {"OVER": 1}, ["OVER"]):
+            invalid = deepcopy(overlay)
+            invalid["games"][0]["selected_side"] = side
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(side=side):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+
+    def test_snapshot_rejection_matrix(self) -> None:
+        base = self._snapshot_fixture()
+        for field, value in (("source_name", "Other"), ("book_id", "OTHER"), ("capture_method", "AUTOMATED"),
+                             ("target_date", "2026-08-31"), ("model_trace_sha256", "A" * 64),
+                             ("model_report_relative", "/absolute.json"), ("raw_capture_byte_length", True),
+                             ("raw_capture_byte_length", 0), ("model_trace_relative", "../trace.json"),
+                             ("comparison_bound_at_utc", "2026-09-01T15:00:00+00:00")):
+            invalid = deepcopy(base)
+            invalid[field] = value
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+        for url in ("http://sportsbook.draftkings.com", "https://sportsbook.draftkings.com.evil", "https://user@sportsbook.draftkings.com", "https://sportsbook.draftkings.com:443", "https://sportsbook.draftkings.com#frag", "https://SPORTSBOOK.DRAFTKINGS.COM"):
+            invalid = deepcopy(base)
+            invalid["source_url"] = url
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+        games = base["games"]
+        for replacement in (
+            games[:-1],
+            games[:-1] + [deepcopy(games[0])],
+            [deepcopy({**games[0], "game_pk": 1})] + games[1:],
+        ):
+            invalid = deepcopy(base)
+            invalid["games"] = replacement
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(games=replacement):
+                with self.assertRaises(ValueError):
+                    validate_draftkings_snapshot(invalid)
+        quoted = deepcopy(base)
+        quoted["games"][0] = {"game_pk": FIXED_GAME_PKS[0], "status": "QUOTED", "draftkings_event_id": "", "event_label": "e", "line_half_runs": 0, "over_american_odds": True, "under_american_odds": -110, "extra": 1}
+        quoted["content_sha256"] = self._digest(quoted)
+        with self.assertRaises(ValueError):
+            validate_draftkings_snapshot(quoted)
+
+    def test_policy_rejection_matrix(self) -> None:
+        for field, value in (("schema", "OTHER"), ("required_residual_count", 763), ("maximum_quote_age_seconds", True), ("minimum_nonpush_support", float("nan"))):
+            invalid = dict(POLICY)
+            invalid[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    validate_overlay_policy(invalid)
+        invalid = dict(POLICY)
+        invalid["extra"] = 1
+        with self.assertRaises(ValueError):
+            validate_overlay_policy(invalid)
+
+    def test_overlay_rejection_matrix(self) -> None:
+        base = self._overlay_fixture()
+        for field, value in (("status_labels", ["bad"]), ("policy_schema", "OTHER"), ("policy_sha256", "d" * 64),
+                             ("model_trace_relative", "../trace"), ("market_snapshot_sha256", "A" * 64),
+                             ("evaluated_at_utc", "2026-09-01T15:00:00.0Z")):
+            invalid = deepcopy(base)
+            invalid[field] = value
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+        for field, value in (("over_support", True), ("under_support", float("inf")), ("push_support", 0.2), ("expected_total", -1), ("residual_count", True)):
+            invalid = deepcopy(base)
+            invalid["games"][0][field] = value
+            if not (isinstance(value, float) and not math.isfinite(value)):
+                invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+        for field, value in (("reason_codes", ["AMBIGUOUS_DIRECTION", "GAME_STARTED"]), ("reason_codes", ["GAME_STARTED", "GAME_STARTED"]), ("reason_codes", [{}]), ("selected_side", []), ("decision", "RESEARCH_PICK")):
+            invalid = deepcopy(base)
+            invalid["games"][0][field] = value
+            invalid["content_sha256"] = self._digest(invalid)
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    validate_overlay_report(invalid)
+        no_quote = deepcopy(base)
+        no_quote["games"][0] = {"game_pk": FIXED_GAME_PKS[0], "expected_total": 8.0, "residual_count": 764, "market_status": "NO_QUOTE", "decision": "PASS", "reason_codes": ["NO_QUOTE"], "extra": 1}
+        no_quote["content_sha256"] = self._digest(no_quote)
+        with self.assertRaises(ValueError):
+            validate_overlay_report(no_quote)
 
     def test_valid_policy_and_snapshot_round_trip_are_defensive(self) -> None:
         policy = validate_overlay_policy(POLICY)
