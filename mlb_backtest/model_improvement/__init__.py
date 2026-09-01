@@ -19,6 +19,11 @@ from .oof_ledger import (
     load_prediction_seal,
     seal_oof_predictions,
 )
+from .oof_ledger_v2 import (
+    load_prediction_rows_v2,
+    load_prediction_seal_v2,
+    seal_oof_predictions_v2,
+)
 
 __all__ = [
     "canonical_json_bytes",
@@ -37,4 +42,7 @@ __all__ = [
     "seal_oof_predictions",
     "load_prediction_seal",
     "load_prediction_rows",
+    "seal_oof_predictions_v2",
+    "load_prediction_seal_v2",
+    "load_prediction_rows_v2",
 ]

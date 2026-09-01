@@ -19,6 +19,8 @@ from mlb_backtest.model_improvement.contracts import (
     COMPONENTS,
     MetricPrimitive,
     PredictionRow,
+    PredictionRowV2,
+    ProbabilityCalibrationCardV2,
     QualityRecipe,
     SealedFeatureRow,
     compute_feature_row_sha256,
@@ -507,6 +509,108 @@ class BaselineOofLedgerTest(unittest.TestCase):
         imports = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
         imports += [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
         self.assertFalse(any("outcome" in name or "evaluation" in name for name in imports))
+
+
+class BaselineOofLedgerV2Test(unittest.TestCase):
+    """V2 seals calibrated baseline rows without admitting V1 artifacts."""
+
+    def setUp(self):
+        BaselineOofLedgerTest.setUp(self)
+        self.v2_rows = tuple(
+            PredictionRowV2(
+                "v5.1", row.game_pk, row.official_date, row.target_year,
+                0.5, "none", 0.5, 0.0, row.starter_edge_abs,
+                row.scheduled_start_utc, 0, row.feature_row_sha256,
+                self.spec.prediction_contract_sha256, self.spec.baseline.card.sha256,
+                SHA,
+            )
+            for index, row in enumerate(self.rows, start=1)
+        )
+
+    def tearDown(self):
+        BaselineOofLedgerTest.tearDown(self)
+
+    def _calibration_card(self):
+        pool = self.spec.probability_calibration_policy.pools["C22H"]
+        return ProbabilityCalibrationCardV2(
+            "v5.1", "baseline", "H22", "C22H", pool.target_year,
+            pool.training_start, pool.training_end, run_spec_sha256(self.spec),
+            self.gate.artifact_sha256, self.spec.prediction_contract_sha256,
+            "/calibration/receipt.json", SHA, "/weights/card.json",
+            self.spec.baseline.card.sha256, "/calibration/rows.jsonl", SHA,
+            SHA, "inventory.json", self.spec.source_authority.inventory.sha256,
+            {"algorithm": "fit_logistic_v1"}, 0.0, 1.0, SHA,
+            "/calibration/probability_calibration_card.json",
+        )
+
+    def test_v2_seals_and_reloads_calibrated_baseline_rows(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2",
+            return_value=self._calibration_card(),
+        ):
+            seal = oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", self.v2_rows,
+            )
+            self.assertEqual(
+                oof_ledger_v2.load_prediction_seal_v2(
+                    self.spec, self.gate, self.feature_seal, None,
+                    seal.path, seal.artifact_sha256,
+                ),
+                seal,
+            )
+            self.assertEqual(
+                oof_ledger_v2.load_prediction_rows_v2(
+                    self.spec, self.gate, self.feature_seal, None, seal,
+                ),
+                self.v2_rows,
+            )
+        paths = oof_ledger_v2.prediction_paths_v2(self.spec, seal.ledger_id)
+        self.assertIn("/oof/baseline/v5.1/H22/v2/", str(paths.rows))
+        self.assertNotIn("label", paths.rows.read_text(encoding="utf-8"))
+        self.assertNotIn("outcome", paths.rows.read_text(encoding="utf-8"))
+
+    def test_v2_rejects_bad_calibration_before_output_io(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        bad = self._calibration_card()
+        object.__setattr__(bad, "fold_id", "H23")
+        with patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2",
+            return_value=bad,
+        ), patch.object(
+            oof_ledger_v2, "write_immutable_bytes", side_effect=AssertionError("write"),
+        ), self.assertRaises(ValueError):
+            oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "baseline/v5.1/H22", self.v2_rows,
+            )
+
+    def test_v2_rejects_nonbaseline_identity_before_any_artifact_read(self):
+        from mlb_backtest.model_improvement import oof_ledger_v2
+
+        with patch.object(
+            oof_ledger_v2, "read_regular_bytes", side_effect=AssertionError("read"),
+        ), patch.object(
+            oof_ledger_v2, "require_probability_calibration_card_v2",
+            side_effect=AssertionError("calibration"),
+        ), self.assertRaises(ValueError):
+            oof_ledger_v2.seal_oof_predictions_v2(
+                self.spec, self.gate, self.feature_seal, None,
+                "lane_a/A/H22", self.v2_rows,
+            )
+
+    def test_package_exports_only_the_versioned_v2_prediction_surface(self):
+        import mlb_backtest.model_improvement as package
+
+        for name in (
+            "seal_oof_predictions_v2",
+            "load_prediction_seal_v2",
+            "load_prediction_rows_v2",
+        ):
+            self.assertIn(name, package.__all__)
 
 
 if __name__ == "__main__":
