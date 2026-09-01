@@ -9,6 +9,7 @@ from mlb_backtest.model_improvement.contracts import (
     PredictionRow,
     PredictionSeal,
     QualityRecipe,
+    ScoringModelCard,
     SealedFeatureRow,
     compute_feature_row_sha256,
     sealed_feature_row_payload,
@@ -92,6 +93,26 @@ def row_values():
 
 def feature_row():
     return SealedFeatureRow(**row_values())
+
+
+def scoring_card(*, model_id="A", lane_id="A", fold_id="H23", candidate_id=None):
+    return ScoringModelCard(
+        model_id=model_id,
+        lane_id=lane_id,
+        fold_id=fold_id,
+        candidate_id=candidate_id,
+        run_spec_sha256=SHA,
+        source_gate_sha256=SHA,
+        baseline_replay_sha256=SHA,
+        parent_card_sha256=None,
+        feature_seal_sha256=SHA,
+        prediction_contract_sha256=SHA,
+        calibration_card_sha256=SHA,
+        candidate_payload_sha256=None,
+        parameters={"component_weights_pp": {"starter": 35}, "alpha": [1, {"x": True}]},
+        artifact_sha256=SHA_B,
+        path="scoring.json",
+    )
 
 
 class QualityRecipeTests(unittest.TestCase):
@@ -249,60 +270,52 @@ class SealedFeatureRowTests(unittest.TestCase):
 
 
 class PredictionAndFrozenCardTests(unittest.TestCase):
-    def test_prediction_row_domains_rank_and_probability(self):
-        row = feature_row()
-        prediction = PredictionRow(
-            "A",
-            123,
-            "2024-04-01",
-            2024,
-            0.6,
-            "home",
-            0.6,
-            0.2,
-            1.0,
-            "2024-04-01T19:10:00Z",
-            1,
-            row.feature_row_sha256,
-            SHA,
+    def prediction_row(self, *, prediction_contract_sha256=SHA):
+        return PredictionRow(
+            "A", 123, "2024-04-01", 2024, 0.6, "home", 0.6, 0.2, 1.0,
+            "2024-04-01T19:10:00Z", 1, feature_row().feature_row_sha256,
+            prediction_contract_sha256, SHA_B,
         )
-        self.assertEqual(prediction.picked_side, "home")
+
+    def frozen_card(self, *, parameters=None):
+        return FrozenModelCard(
+            model_id="A", state="H23_FROZEN", fold_id="H23",
+            run_spec_sha256=SHA, source_gate_sha256=SHA,
+            baseline_replay_sha256=SHA, parent_card_sha256=None,
+            feature_seal_sha256=SHA, prediction_contract_sha256=SHA,
+            scoring_model_card_path="scoring.json", scoring_model_card_sha256=SHA_B,
+            prediction_seal_sha256=SHA, evaluation_sha256=SHA,
+            parameters={"alpha": [1, {"nested": True}]} if parameters is None else parameters,
+            artifact_sha256=SHA_B, path="card.json",
+        )
+
+    def test_prediction_row_domains_rank_and_probability(self):
+        self.assertEqual(self.prediction_row().picked_side, "home")
         with self.assertRaises(ValueError):
             PredictionRow(
-                "A",
-                123,
-                "2024-04-01",
-                2024,
-                1.1,
-                "none",
-                0.0,
-                0.0,
-                0.0,
-                "2024-04-01T19:10:00Z",
-                0,
-                row.feature_row_sha256,
-                SHA,
+                "A", 123, "2024-04-01", 2024, 1.1, "none", 0.0, 0.0, 0.0,
+                "2024-04-01T19:10:00Z", 0, feature_row().feature_row_sha256, SHA, SHA_B,
             )
         with self.assertRaises(ValueError):
             PredictionRow(
-                "A",
-                123,
-                "2024-04-01",
-                2024,
-                0.5,
-                "home",
-                0.5,
-                0.0,
-                0.0,
-                "2024-04-01T19:10:00Z",
-                0,
-                row.feature_row_sha256,
-                SHA,
+                "A", 123, "2024-04-01", 2024, 0.5, "home", 0.5, 0.0, 0.0,
+                "2024-04-01T19:10:00Z", 0, feature_row().feature_row_sha256, SHA, SHA_B,
             )
+
+    def test_prediction_payload_rejects_legacy_model_card_key_and_bad_contract_digest(self):
+        row = self.prediction_row()
+        payload = row.as_mapping()
+        self.assertEqual(PredictionRow.from_payload_mapping(payload), row)
+        payload["model_card_sha256"] = payload.pop("scoring_model_card_sha256")
+        with self.assertRaises(ValueError):
+            PredictionRow.from_payload_mapping(payload)
+        with self.assertRaises(ValueError):
+            self.prediction_row(prediction_contract_sha256="A" * 64)
 
     def test_prediction_seal_descriptor_free_payload_round_trip(self):
         seal = PredictionSeal(
-            "H23", SHA, SHA, SHA, SHA, SHA, SHA, SHA_B, "predictions.json"
+            "lane_a/A/H23", "H23", "A", None, SHA, SHA, SHA, SHA_B, SHA,
+            None, SHA, SHA_B, "predictions.json",
         )
         payload = seal.as_mapping()
         self.assertNotIn("artifact_sha256", payload)
@@ -311,27 +324,77 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
             PredictionSeal.from_payload_mapping(payload, SHA_B, "predictions.json"),
             seal,
         )
+        payload["model_card_sha256"] = payload.pop("scoring_model_card_sha256")
+        with self.assertRaises(ValueError):
+            PredictionSeal.from_payload_mapping(payload, SHA_B, "predictions.json")
 
-    def test_frozen_card_payload_is_closed_and_parameters_are_immutable(self):
-        card = FrozenModelCard(
-            "A",
-            "H23_FROZEN",
-            "H23",
-            SHA,
-            SHA,
-            SHA,
-            None,
-            SHA,
-            SHA,
-            SHA,
-            SHA,
-            {"alpha": [1, {"nested": True}]},
-            SHA_B,
-            "card.json",
+    def test_scoring_card_round_trip_is_pre_prediction_and_recursively_immutable(self):
+        card = scoring_card()
+        payload = card.as_mapping()
+        self.assertNotIn("artifact_sha256", payload)
+        self.assertNotIn("path", payload)
+        self.assertNotIn("prediction_seal_sha256", payload)
+        self.assertNotIn("evaluation_sha256", payload)
+        self.assertEqual(
+            ScoringModelCard.from_payload_mapping(payload, SHA_B, "scoring.json"), card
+        )
+        with self.assertRaises(TypeError):
+            card.parameters["alpha"] = 0
+        exported = card.as_mapping()
+        exported["parameters"]["alpha"][1]["x"] = False
+        self.assertTrue(card.parameters["alpha"][1]["x"])
+
+    def test_scoring_card_rejects_baseline_and_incompatible_lane_fold_candidate(self):
+        for kwargs in (
+            {"model_id": "v5.1", "lane_id": "A"},
+            {"model_id": "A+B", "lane_id": "A", "candidate_id": "candidate"},
+            {"model_id": "A+B", "lane_id": "B", "candidate_id": None},
+            {"model_id": "A", "lane_id": "A", "fold_id": "O19"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    scoring_card(**kwargs)
+
+    def test_scoring_card_validates_optional_and_lane_b_candidate_digests(self):
+        lane_b = ScoringModelCard(
+            model_id="A+B", lane_id="B", fold_id="H22", candidate_id="b-s35",
+            run_spec_sha256=SHA, source_gate_sha256=SHA, baseline_replay_sha256=SHA,
+            parent_card_sha256=SHA, feature_seal_sha256=SHA,
+            prediction_contract_sha256=SHA, calibration_card_sha256=None,
+            candidate_payload_sha256=SHA, parameters={"component_weights_pp": {}},
+            artifact_sha256=SHA_B, path="lane-b-scoring.json",
         )
         self.assertEqual(
-            FrozenModelCard.from_payload_mapping(card.as_mapping(), SHA_B, "card.json"),
-            card,
+            ScoringModelCard.from_payload_mapping(
+                lane_b.as_mapping(), SHA_B, "lane-b-scoring.json"
+            ),
+            lane_b,
+        )
+        with self.assertRaises(ValueError):
+            ScoringModelCard(
+                model_id="A", lane_id="A", fold_id="H23", candidate_id=None,
+                run_spec_sha256=SHA, source_gate_sha256=SHA, baseline_replay_sha256=SHA,
+                parent_card_sha256="bad", feature_seal_sha256=SHA,
+                prediction_contract_sha256=SHA, calibration_card_sha256=None,
+                candidate_payload_sha256=None, parameters={}, artifact_sha256=SHA_B,
+                path="scoring.json",
+            )
+
+    def test_final_card_points_back_to_pre_prediction_scoring_card_without_cycle(self):
+        scoring = scoring_card()
+        seal = PredictionSeal(
+            "lane_a/A/H23", "H23", "A", None, SHA, SHA, SHA,
+            scoring.artifact_sha256, SHA, None, SHA, SHA_B, "predictions.json",
+        )
+        final = self.frozen_card()
+        self.assertIsNone(seal.frozen_model_card_sha256)
+        self.assertEqual(final.scoring_model_card_sha256, scoring.artifact_sha256)
+        self.assertNotIn("prediction_seal_sha256", scoring.as_mapping())
+
+    def test_frozen_card_payload_is_closed_and_parameters_are_immutable(self):
+        card = self.frozen_card()
+        self.assertEqual(
+            FrozenModelCard.from_payload_mapping(card.as_mapping(), SHA_B, "card.json"), card
         )
         with self.assertRaises(TypeError):
             card.parameters["alpha"] = 1
@@ -340,20 +403,12 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         self.assertTrue(card.parameters["alpha"][1]["nested"])
         with self.assertRaises(ValueError):
             FrozenModelCard(
-                "v5.1",
-                "H23_FROZEN",
-                "H23",
-                SHA,
-                SHA,
-                SHA,
-                None,
-                SHA,
-                SHA,
-                SHA,
-                SHA,
-                {},
-                SHA_B,
-                "card.json",
+                model_id="v5.1", state="H23_FROZEN", fold_id="H23",
+                run_spec_sha256=SHA, source_gate_sha256=SHA, baseline_replay_sha256=SHA,
+                parent_card_sha256=None, feature_seal_sha256=SHA,
+                prediction_contract_sha256=SHA, scoring_model_card_path="scoring.json",
+                scoring_model_card_sha256=SHA, prediction_seal_sha256=SHA,
+                evaluation_sha256=SHA, parameters={}, artifact_sha256=SHA_B, path="card.json",
             )
 
     def test_frozen_card_rejects_cyclic_json_parameters(self):
@@ -364,22 +419,7 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         for parameters in (cyclic_mapping, {"loop": cyclic_sequence}):
             with self.subTest(parameters=type(parameters).__name__):
                 with self.assertRaises(ValueError):
-                    FrozenModelCard(
-                        "A",
-                        "H23_FROZEN",
-                        "H23",
-                        SHA,
-                        SHA,
-                        SHA,
-                        None,
-                        SHA,
-                        SHA,
-                        SHA,
-                        SHA,
-                        parameters,
-                        SHA_B,
-                        "card.json",
-                    )
+                    self.frozen_card(parameters=parameters)
 
 
 class LaneDispositionTests(unittest.TestCase):

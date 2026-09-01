@@ -16,7 +16,7 @@ from .canonical import canonical_json_bytes
 MODEL_IDS = frozenset({"v5.1", "A", "A+B", "A+B+C"})
 FROZEN_CARD_MODEL_IDS = frozenset({"A", "A+B", "A+B+C"})
 FROZEN_CARD_STATES = frozenset({"H23_FROZEN"})
-LEDGER_IDS = frozenset({"O19", "O20", "O21", "O22", "O23", "H22", "H23", "H24"})
+FOLD_IDS = frozenset({"O19", "O20", "O21", "O22", "O23", "H22", "H23", "H24"})
 PICKED_SIDES = frozenset({"away", "home", "none"})
 QUALITY_FAMILIES = frozenset(
     {None, "starter", "hitter_split", "recent_form", "bullpen"}
@@ -30,6 +30,8 @@ _UTC_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{6})?Z$"
 )
 _MULTIPLIER_FAMILIES = QUALITY_FAMILIES - {None}
+_SCORING_MODEL_LANES = {"A": "A", "B": "A+B", "C": "A+B+C"}
+_SCORING_CARD_FOLDS = frozenset({"H22", "H23", "H24"})
 
 
 def _require_exact_mapping(
@@ -664,7 +666,8 @@ class PredictionRow:
     scheduled_start_utc: str
     rank: int
     feature_row_sha256: str
-    model_card_sha256: str
+    prediction_contract_sha256: str
+    scoring_model_card_sha256: str
 
     def __post_init__(self) -> None:
         if self.model_id not in MODEL_IDS:
@@ -708,7 +711,11 @@ class PredictionRow:
             or self.rank < 0
         ):
             raise ValueError("rank must be zero iff picked_side is none")
-        for field in ("feature_row_sha256", "model_card_sha256"):
+        for field in (
+            "feature_row_sha256",
+            "prediction_contract_sha256",
+            "scoring_model_card_sha256",
+        ):
             object.__setattr__(
                 self, field, _require_sha256(getattr(self, field), field)
             )
@@ -730,34 +737,148 @@ class PredictionRow:
 
 
 @dataclass(frozen=True, slots=True)
+class ScoringModelCard:
+    """The immutable pre-prediction scoring authority for one candidate/fold."""
+
+    model_id: str
+    lane_id: str
+    fold_id: str
+    candidate_id: str | None
+    run_spec_sha256: str
+    source_gate_sha256: str
+    baseline_replay_sha256: str
+    parent_card_sha256: str | None
+    feature_seal_sha256: str
+    prediction_contract_sha256: str
+    calibration_card_sha256: str | None
+    candidate_payload_sha256: str | None
+    parameters: Mapping[str, object]
+    artifact_sha256: str
+    path: str
+
+    def __post_init__(self) -> None:
+        if self.lane_id not in _SCORING_MODEL_LANES:
+            raise ValueError("unknown scoring card lane_id")
+        if self.model_id != _SCORING_MODEL_LANES[self.lane_id]:
+            raise ValueError("scoring card model_id and lane_id differ")
+        if self.fold_id not in _SCORING_CARD_FOLDS:
+            raise ValueError("scoring card fold_id must be H22, H23, or H24")
+        if self.lane_id == "B":
+            object.__setattr__(
+                self, "candidate_id", _require_text(self.candidate_id, "candidate_id")
+            )
+            object.__setattr__(
+                self,
+                "candidate_payload_sha256",
+                _require_sha256(
+                    self.candidate_payload_sha256, "candidate_payload_sha256"
+                ),
+            )
+        elif self.candidate_id is not None or self.candidate_payload_sha256 is not None:
+            raise ValueError("only Lane B scoring cards carry candidate identity")
+        for field in (
+            "run_spec_sha256",
+            "source_gate_sha256",
+            "baseline_replay_sha256",
+            "feature_seal_sha256",
+            "prediction_contract_sha256",
+        ):
+            object.__setattr__(
+                self, field, _require_sha256(getattr(self, field), field)
+            )
+        for field in ("parent_card_sha256", "calibration_card_sha256"):
+            object.__setattr__(
+                self, field, _require_optional_sha256(getattr(self, field), field)
+            )
+        object.__setattr__(
+            self, "parameters", _require_json_mapping(self.parameters, "parameters")
+        )
+        artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
+        object.__setattr__(self, "artifact_sha256", artifact_sha256)
+        object.__setattr__(self, "path", path)
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            field: (
+                _thaw_json(self.parameters)
+                if field == "parameters"
+                else getattr(self, field)
+            )
+            for field in self.__dataclass_fields__
+            if field not in {"artifact_sha256", "path"}
+        }
+
+    @classmethod
+    def from_payload_mapping(
+        cls, payload: Mapping[str, object], artifact_sha256: str, path: str
+    ) -> "ScoringModelCard":
+        fields = frozenset(cls.__dataclass_fields__) - {"artifact_sha256", "path"}
+        return cls(
+            **dict(_require_exact_mapping(payload, fields, "scoring model card payload")),
+            artifact_sha256=artifact_sha256,
+            path=path,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PredictionSeal:
     ledger_id: str
+    fold_id: str
+    model_id: str
+    candidate_id: str | None
     run_spec_sha256: str
     source_gate_sha256: str
     prediction_contract_sha256: str
-    model_card_sha256: str
+    scoring_model_card_sha256: str
     population_sha256: str
+    frozen_model_card_sha256: str | None
     rows_sha256: str
     artifact_sha256: str
     path: str
 
     def __post_init__(self) -> None:
-        if self.ledger_id not in LEDGER_IDS:
-            raise ValueError("unknown ledger_id")
+        if self.fold_id not in FOLD_IDS or self.model_id not in MODEL_IDS:
+            raise ValueError("unknown prediction seal fold_id or model_id")
+        self._validate_scoped_identity()
         for field in (
             "run_spec_sha256",
             "source_gate_sha256",
             "prediction_contract_sha256",
-            "model_card_sha256",
+            "scoring_model_card_sha256",
             "population_sha256",
             "rows_sha256",
         ):
             object.__setattr__(
                 self, field, _require_sha256(getattr(self, field), field)
             )
+        object.__setattr__(
+            self,
+            "frozen_model_card_sha256",
+            _require_optional_sha256(
+                self.frozen_model_card_sha256, "frozen_model_card_sha256"
+            ),
+        )
+        if self.fold_id in {"H22", "H23"} and self.frozen_model_card_sha256 is not None:
+            raise ValueError("H22/H23 prediction seals cannot bind a frozen card")
         artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
         object.__setattr__(self, "path", path)
+
+    def _validate_scoped_identity(self) -> None:
+        parts = self.ledger_id.split("/")
+        expected: tuple[str, str, str] | None = None
+        if self.model_id == "v5.1" and self.candidate_id is None:
+            expected = ("baseline", "v5.1", self.fold_id)
+        elif self.model_id == "A" and self.candidate_id is None:
+            expected = ("lane_a", "A", self.fold_id)
+        elif self.model_id == "A+B" and isinstance(self.candidate_id, str) and self.candidate_id:
+            expected = ("lane_b", self.candidate_id, self.fold_id)
+        elif self.model_id == "A+B+C" and self.candidate_id is None:
+            expected = ("lane_c", "A+B+C", self.fold_id)
+        if self.fold_id == "H24" and self.candidate_id is None and self.model_id in FROZEN_CARD_MODEL_IDS:
+            expected = ("h24", self.model_id, self.fold_id)
+        if expected is None or tuple(parts) != expected:
+            raise ValueError("prediction seal ledger_id scope differs")
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -789,6 +910,8 @@ class FrozenModelCard:
     parent_card_sha256: str | None
     feature_seal_sha256: str
     prediction_contract_sha256: str
+    scoring_model_card_path: str
+    scoring_model_card_sha256: str
     prediction_seal_sha256: str
     evaluation_sha256: str
     parameters: Mapping[str, object]
@@ -810,6 +933,7 @@ class FrozenModelCard:
             "baseline_replay_sha256",
             "feature_seal_sha256",
             "prediction_contract_sha256",
+            "scoring_model_card_sha256",
             "prediction_seal_sha256",
             "evaluation_sha256",
         ):
@@ -820,6 +944,11 @@ class FrozenModelCard:
             self,
             "parent_card_sha256",
             _require_optional_sha256(self.parent_card_sha256, "parent_card_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "scoring_model_card_path",
+            _require_text(self.scoring_model_card_path, "scoring_model_card_path"),
         )
         object.__setattr__(
             self, "parameters", _require_json_mapping(self.parameters, "parameters")
