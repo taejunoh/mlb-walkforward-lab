@@ -171,6 +171,17 @@ class DailyTotalsContractTests(unittest.TestCase):
         report["games"][0]["status"] = "UNPROJECTED"  # type: ignore[index]
         self.assertTrue(list(Draft202012Validator(schema).iter_errors(report)))
 
+    def test_schemas_reject_null_manifest_sidecars(self) -> None:
+        model_schema = json.loads((Path.cwd() / "schemas/experimental_daily_totals_model.schema.json").read_text())
+        report_schema = json.loads((Path.cwd() / "schemas/experimental_daily_totals_report.schema.json").read_text())
+        receipt = make_valid_model_receipt()
+        report = make_valid_report_payload()
+        for identity in (receipt["history_source"], report["history_source"]):
+            identity["manifest_sidecar_relative"] = None
+            identity["manifest_sidecar_sha256"] = None
+        self.assertTrue(list(Draft202012Validator(model_schema).iter_errors(receipt)))
+        self.assertTrue(list(Draft202012Validator(report_schema).iter_errors(report)))
+
     def test_report_rejects_nonfinite_bool_and_extra_values(self) -> None:
         for value in (True, math.nan, math.inf):
             report = make_valid_report_payload()
