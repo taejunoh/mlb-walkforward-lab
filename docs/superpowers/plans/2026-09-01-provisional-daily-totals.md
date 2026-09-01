@@ -179,9 +179,9 @@ Create frozen `AdmittedSourceIdentity` and `TotalsSourceBundle`. Each source
 identity retains every role-defined immutable component and digest. History
 uses claim, receipt, receipt sidecar, completion, completion sidecar, manifest,
 manifest sidecar, and payload. Live uses the separately located observation
-claim, receipt, completion, completion sidecar, manifest, and payload; the
-existing live-observation contract has no claim, receipt, or manifest sidecar,
-so their absence is required rather than repaired or invented. Each identity
+claim, receipt, completion, completion sidecar, manifest, manifest sidecar,
+and payload; the existing live-observation contract has no claim or receipt
+sidecar, so their absence is required rather than repaired or invented. Each identity
 also retains binding digest, payload relative path/digest/byte count, and query
 identity digest. The bundle retains both exact `HISTORY_SCHEDULE` and
 `LIVE_SCHEDULE` identities, `target_date`, `cutoff_date`, `history_games`, and
