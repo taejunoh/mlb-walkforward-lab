@@ -86,6 +86,8 @@ class BaselineReplayReceiptV2:
             raise ValueError("V2 baseline replay schema differs")
         if self.model_id != "v5.1":
             raise ValueError("V2 baseline replay model differs")
+        if not isinstance(self.fold_id, str):
+            raise ValueError("V2 baseline replay fold differs")
         try:
             task8_target_year(self.fold_id)
         except ValueError as exc:
@@ -149,6 +151,8 @@ def _canonical_absolute(path: Path | str, label: str) -> Path:
 def _fold_from_feature_seal(feature_seal: object) -> str:
     if not isinstance(feature_seal, FeatureSeal) or feature_seal.feature_set_id != "common":
         raise ValueError("V2 baseline replay requires a Common FeatureSeal")
+    if not isinstance(feature_seal.fold_id, str):
+        raise ValueError("V2 baseline replay fold differs")
     try:
         task8_target_year(feature_seal.fold_id)
     except ValueError as exc:
@@ -329,14 +333,20 @@ def _materialize_v51_rows(
             qualities["environment"], qualities["schedule"],
         )
         draft.append((feature, p_home, picked_side, pick_probability, confidence))
-    ordered_indices = sorted(
-        (index for index, value in enumerate(draft) if value[2] != "none"),
-        key=lambda index: (
-            -draft[index][3], -draft[index][4], -draft[index][0].starter_edge_abs,
-            draft[index][0].scheduled_start_utc, draft[index][0].game_pk,
-        ),
-    )
-    ranks = {index: rank for rank, index in enumerate(ordered_indices, start=1)}
+    rank_groups: dict[str, list[int]] = {}
+    for index, value in enumerate(draft):
+        if value[2] != "none":
+            rank_groups.setdefault(value[0].official_date, []).append(index)
+    ranks: dict[int, int] = {}
+    for indices in rank_groups.values():
+        ordered_indices = sorted(
+            indices,
+            key=lambda index: (
+                -draft[index][3], -draft[index][4], -draft[index][0].starter_edge_abs,
+                draft[index][0].scheduled_start_utc, draft[index][0].game_pk,
+            ),
+        )
+        ranks.update({index: rank for rank, index in enumerate(ordered_indices, start=1)})
     return tuple(
         PredictionRowV2(
             "v5.1", feature.game_pk, feature.official_date, feature.target_year,
@@ -415,6 +425,19 @@ def replay_v51_predictions_v2(
         or final_authority.sha256 != authority.sha256
     ):
         raise ValueError("V2 baseline replay authority changed before receipt")
+    committed_seal = load_prediction_seal_v2(
+        spec, final_gate, final_feature, None, paths.seal, seal.artifact_sha256
+    )
+    committed_rows = load_prediction_rows_v2(
+        spec, final_gate, final_feature, None, committed_seal
+    )
+    if (
+        committed_seal.as_mapping() != seal.as_mapping()
+        or committed_seal.artifact_sha256 != seal.artifact_sha256
+        or committed_seal.path != seal.path
+        or committed_rows != replay_one
+    ):
+        raise ValueError("V2 baseline replay prediction changed before receipt")
     receipt_path = _receipt_path(spec, fold_id)
     provisional = BaselineReplayReceiptV2(
         _SCHEMA, ledger_id, fold_id, "v5.1", run_spec_sha256(spec), gate.artifact_sha256,
