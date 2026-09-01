@@ -71,6 +71,13 @@ class RunSpecTest(unittest.TestCase):
     def test_prediction_contract_digest_and_closed_mutations(self):
         raw = self.raw()
         self.assertEqual(raw["prediction_contract_sha256"], sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest())
+        contract = raw["prediction_contract"]
+        self.assertEqual(
+            contract["confidence_formula"],
+            "scoring.confidence_score(completeness, starter_quality, offense_quality, bullpen_quality, component_agreement(starter_edge,offense_edge,bullpen_edge,picked_side), environment_quality, schedule_quality)",
+        )
+        self.assertEqual(contract["confidence_range"], [0.0, 10.0])
+        self.assertEqual(raw["prediction_contract_sha256"], "eda2b44aae29b8936136d0043bd4cea2811da37de1e37e3a1672a48c88e5b155")
         raw["prediction_contract"]["clip"]["min"] = 0.11
         with self.assertRaisesRegex(ValueError, "prediction contract digest"):
             build_run_spec(raw)
@@ -83,6 +90,15 @@ class RunSpecTest(unittest.TestCase):
         raw["prediction_contract_sha256"] = sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest()
         with self.assertRaisesRegex(ValueError, "component weights binding"):
             build_run_spec(raw)
+        for mutation in ("delete", "change"):
+            raw = self.raw()
+            if mutation == "delete":
+                del raw["prediction_contract"]["confidence_formula"]
+            else:
+                raw["prediction_contract"]["confidence_range"] = [0.0, 1.0]
+            raw["prediction_contract_sha256"] = sha256(canonical_json_bytes(raw["prediction_contract"])).hexdigest()
+            with self.assertRaisesRegex(ValueError, "prediction contract"):
+                build_run_spec(raw)
 
     def test_all_nested_bindings_and_paths_fail_closed(self):
         raw = self.raw()
@@ -154,6 +170,12 @@ class RunSpecTest(unittest.TestCase):
         attacks.append(raw)
         raw = self.raw()
         raw["lane_b"]["multipliers"] = [0.75, True, 1.25]
+        attacks.append(raw)
+        raw = self.raw()
+        del raw["prediction_contract"]["confidence_formula"]
+        attacks.append(raw)
+        raw = self.raw()
+        raw["prediction_contract"]["confidence_range"] = [0.0, 1.0]
         attacks.append(raw)
         for attack in attacks:
             with self.subTest(attack=attack):

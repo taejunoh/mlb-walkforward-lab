@@ -28,6 +28,8 @@ _CONTRACT = {
     "component_order": list(COMPONENTS),
     "edge_formula": "sum(component_weights_pp[c]/100 * (home_score[c]-away_score[c]) for c in component_order)",
     "completeness_formula": "sum(component_weights_pp[c]/100 * min(home_quality[c],away_quality[c]) for c in component_order)",
+    "confidence_formula": "scoring.confidence_score(completeness, starter_quality, offense_quality, bullpen_quality, component_agreement(starter_edge,offense_edge,bullpen_edge,picked_side), environment_quality, schedule_quality)",
+    "confidence_range": [0.0, 10.0],
     "component_weights_binding": {
         "keys": list(COMPONENTS), "value_type": "integer_nonnegative_pp", "sum": 100,
         "source": "closed_union:RunSpec.baseline.card.component_weights_pp|ScoringModelCard.parameters.component_weights_pp",

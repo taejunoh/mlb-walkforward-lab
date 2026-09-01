@@ -208,6 +208,30 @@ class SealedFeatureRowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SealedFeatureRow(**invalid)
 
+    def test_row_rejects_quality_and_score_values_outside_their_distinct_ranges(self):
+        for field, value in (
+            ("component_qualities", 1.0001),
+            ("baseline_component_qualities", -0.0001),
+            ("component_scores", 100.0001),
+            ("baseline_component_scores", -0.0001),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = row_values()
+                invalid[field]["home"]["offense"] = value
+                invalid["feature_row_sha256"] = compute_feature_row_sha256(
+                    {key: item for key, item in invalid.items() if key != "feature_row_sha256"}
+                )
+                with self.assertRaises(ValueError):
+                    SealedFeatureRow(**invalid)
+        for field in ("component_qualities", "baseline_component_qualities"):
+            invalid = row_values()
+            invalid[field]["home"]["offense"] = True
+            invalid["feature_row_sha256"] = compute_feature_row_sha256(
+                {key: item for key, item in invalid.items() if key != "feature_row_sha256"}
+            )
+            with self.assertRaises(ValueError):
+                SealedFeatureRow(**invalid)
+
     def test_row_payload_rejects_malformed_metric_primitive_nesting(self):
         payloads = []
         root_none = feature_row().as_mapping()
@@ -283,12 +307,13 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         p_home=0.6,
         picked_side="home",
         pick_probability=0.6,
+        confidence=0.2,
         rank=1,
         prediction_contract_sha256=SHA,
     ):
         return PredictionRow(
             "A", 123, "2024-04-01", 2024, p_home, picked_side, pick_probability,
-            0.2, 1.0, "2024-04-01T19:10:00Z", rank, feature_row().feature_row_sha256,
+            confidence, 1.0, "2024-04-01T19:10:00Z", rank, feature_row().feature_row_sha256,
             prediction_contract_sha256, SHA_B,
         )
 
@@ -311,6 +336,14 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
                 "A", 123, "2024-04-01", 2024, 1.1, "none", 0.0, 0.0, 0.0,
                 "2024-04-01T19:10:00Z", 0, feature_row().feature_row_sha256, SHA, SHA_B,
             )
+
+    def test_prediction_row_confidence_is_a_finite_score_inclusive_of_ten(self):
+        for value in (0.0, 10.0):
+            self.assertEqual(self.prediction_row(confidence=value).confidence, value)
+        for value in (-0.001, 10.001, True, math.nan, math.inf, -math.inf):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    self.prediction_row(confidence=value)
 
     def test_prediction_row_requires_pick_direction_and_probability_to_match_p_home(self):
         self.assertEqual(self.prediction_row(), self.prediction_row())

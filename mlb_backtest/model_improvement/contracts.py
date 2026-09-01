@@ -340,7 +340,10 @@ class MetricPrimitive:
 
 
 def _freeze_component_numbers(
-    value: object, label: str
+    value: object,
+    label: str,
+    minimum: float,
+    maximum: float,
 ) -> Mapping[str, Mapping[str, float]]:
     sides = _require_exact_mapping(value, frozenset(SIDES), label)
     frozen: dict[str, Mapping[str, float]] = {}
@@ -351,7 +354,7 @@ def _freeze_component_numbers(
         frozen[side] = MappingProxyType(
             {
                 component: _require_number(
-                    components[component], f"{label}.{side}.{component}", 0.0, 100.0
+                    components[component], f"{label}.{side}.{component}", minimum, maximum
                 )
                 for component in COMPONENTS
             }
@@ -488,7 +491,11 @@ class SealedFeatureRow:
             "baseline_component_qualities",
         ):
             object.__setattr__(
-                self, field, _freeze_component_numbers(getattr(self, field), field)
+                self,
+                field,
+                _freeze_component_numbers(
+                    getattr(self, field), field, 0.0, 1.0 if "qualities" in field else 100.0
+                ),
             )
         object.__setattr__(
             self, "metric_primitives", _freeze_metric_primitives(self.metric_primitives)
@@ -692,7 +699,7 @@ class PredictionRow:
             _require_number(self.pick_probability, "pick_probability", 0.0, 1.0),
         )
         object.__setattr__(
-            self, "confidence", _require_number(self.confidence, "confidence", 0.0, 1.0)
+            self, "confidence", _require_number(self.confidence, "confidence", 0.0, 10.0)
         )
         object.__setattr__(
             self,
