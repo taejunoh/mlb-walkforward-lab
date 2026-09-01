@@ -11,6 +11,7 @@ from mlb_backtest.model_improvement.canonical import (
     canonical_json_bytes,
     read_regular_bytes,
     sha256_bytes,
+    write_immutable_bytes,
     write_immutable_json,
 )
 
@@ -43,6 +44,17 @@ class CanonicalArtifactTests(unittest.TestCase):
             self.assertTrue(write_immutable_json(path, {"version": 1}))
             self.assertFalse(write_immutable_json(path, {"version": 1}))
             self.assertEqual(path.read_bytes(), b'{"version":1}\n')
+
+    def test_write_immutable_bytes_preserves_exact_jsonl_bytes(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "rows.jsonl"
+            contents = b'{"game_pk":2}\n{"game_pk":7}\n'
+
+            self.assertTrue(write_immutable_bytes(path, contents))
+            self.assertFalse(write_immutable_bytes(path, contents))
+            self.assertEqual(read_regular_bytes(path, "rows"), contents)
+            with self.assertRaisesRegex(ValueError, "immutable artifact differs"):
+                write_immutable_bytes(path, b'{"game_pk":7}\n')
 
     def test_concurrent_identical_writers_publish_one_complete_artifact(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:

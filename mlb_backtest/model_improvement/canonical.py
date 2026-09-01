@@ -36,13 +36,14 @@ def read_regular_bytes(path: Path, label: str) -> bytes:
         return contents
 
 
-def write_immutable_json(path: Path, value: object) -> bool:
-    """Create a durable JSON artifact once, or verify an existing one exactly.
+def write_immutable_bytes(path: Path, contents: bytes) -> bool:
+    """Create a durable byte artifact once, or verify an existing one exactly.
 
     ``True`` means this call created the artifact.  ``False`` means an existing
-    regular file already contained the exact canonical bytes.
+    regular file already contained the exact bytes.
     """
-    contents = canonical_json_bytes(value)
+    if not isinstance(contents, bytes):
+        raise ValueError("immutable artifact contents must be bytes")
     with _open_parent(path, create=True) as (parent_fd, leaf, absolute):
         descriptor = -1
         staging_name: str | None = None
@@ -103,6 +104,11 @@ def write_immutable_json(path: Path, value: object) -> bool:
         _assert_path_identity(absolute, published_identity, str(path))
         os.fsync(parent_fd)
         return True
+
+
+def write_immutable_json(path: Path, value: object) -> bool:
+    """Create a durable canonical JSON artifact, or verify it exactly."""
+    return write_immutable_bytes(path, canonical_json_bytes(value))
 
 
 def _open_staging(parent_fd: int, leaf: str, label: str) -> tuple[int, str]:
