@@ -202,7 +202,9 @@ class QualityRecipe:
             ):
                 raise ValueError("fixed recipe has incompatible fields")
             object.__setattr__(
-                self, "fixed_value", _require_number(self.fixed_value, "fixed_value")
+                self,
+                "fixed_value",
+                _require_number(self.fixed_value, "fixed_value", 0.0, 1.0),
             )
         elif self.kind == "ratio":
             if (
@@ -213,7 +215,9 @@ class QualityRecipe:
             ):
                 raise ValueError("ratio recipe has incompatible fields")
             object.__setattr__(
-                self, "numerator", _require_number(self.numerator, "numerator")
+                self,
+                "numerator",
+                _require_number(self.numerator, "numerator", 0.0),
             )
             object.__setattr__(
                 self,

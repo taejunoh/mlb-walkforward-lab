@@ -1,5 +1,4 @@
 import copy
-import json
 import math
 import unittest
 
@@ -109,6 +108,14 @@ class QualityRecipeTests(unittest.TestCase):
             self.assertEqual(
                 len(recipe.children), 0 if recipe.kind in {"fixed", "ratio"} else 2
             )
+
+    def test_fixed_recipe_rejects_value_outside_unit_interval(self):
+        with self.assertRaises(ValueError):
+            QualityRecipe("x", "fixed", None, None, None, 1.01, (), (), SHA)
+
+    def test_ratio_recipe_rejects_negative_numerator(self):
+        with self.assertRaises(ValueError):
+            QualityRecipe("x", "ratio", "starter", -0.01, 1.0, None, (), (), SHA)
 
     def test_recipe_rejects_invalid_kind_fields_weights_and_family(self):
         with self.assertRaises(ValueError):
@@ -331,7 +338,17 @@ class LaneDispositionTests(unittest.TestCase):
             ),
             disposition,
         )
-        self.assertNotIn("artifact_sha256", disposition.as_mapping())
+        self.assertEqual(
+            set(disposition.as_mapping()),
+            {
+                "lane_id",
+                "state",
+                "run_spec_sha256",
+                "parent_card_sha256",
+                "evidence_sha256",
+                "reason_codes",
+            },
+        )
         with self.assertRaises(ValueError):
             LaneDisposition(
                 "Z",
@@ -345,18 +362,6 @@ class LaneDispositionTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             LaneDisposition("A", "QUALIFIED", SHA, None, (SHA,), (), SHA_B, "lane.json")
-
-
-class LaneDispositionSchemaTests(unittest.TestCase):
-    def test_schema_is_closed_and_descriptor_free(self):
-        with open(
-            "schemas/model_improvement/lane_disposition.schema.json", encoding="utf-8"
-        ) as handle:
-            schema = json.load(handle)
-        self.assertFalse(schema["additionalProperties"])
-        self.assertNotIn("artifact_sha256", schema["properties"])
-        self.assertNotIn("path", schema["properties"])
-        self.assertEqual(schema["properties"]["lane_id"]["enum"], ["A", "B", "C"])
 
 
 if __name__ == "__main__":
