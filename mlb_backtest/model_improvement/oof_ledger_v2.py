@@ -8,12 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from .run_spec import task8_target_year
-
-if TYPE_CHECKING:
-    from .run_spec import ModelImprovementRunSpec
+from .run_spec import ModelImprovementRunSpec, task8_target_year
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +42,8 @@ def prediction_paths_v2(
     spec: ModelImprovementRunSpec, ledger_id: str
 ) -> PredictionPaths:
     """Derive the only V2 artifact locations without observing the filesystem."""
+    if not isinstance(spec, ModelImprovementRunSpec):
+        raise ValueError("V2 prediction paths require ModelImprovementRunSpec")
     fold_id = _baseline_fold_from_ledger_id(ledger_id)
     base = f"baseline/v5.1/{fold_id}/v2"
     rows = spec.output_path("oof", f"{base}/prediction_rows.jsonl")

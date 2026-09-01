@@ -206,6 +206,21 @@ class PredictionV2PathContractTest(unittest.TestCase):
         self.assertIn("feature_seal_sha256", schema["required"])
         self.assertIn("calibration_card_sha256", schema["required"])
 
+    def test_v2_paths_reject_a_forged_spec_before_any_output_path_call(self):
+        from mlb_backtest.model_improvement.oof_ledger_v2 import prediction_paths_v2
+
+        class ForgedSpec:
+            calls = 0
+
+            def output_path(self, namespace, relative_name):
+                self.calls += 1
+                raise AssertionError("forged spec reached output_path")
+
+        forged = ForgedSpec()
+        with self.assertRaises(ValueError):
+            prediction_paths_v2(forged, "baseline/v5.1/O22")
+        self.assertEqual(forged.calls, 0)
+
 
 def _component_map(value):
     return {

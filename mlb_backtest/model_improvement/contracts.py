@@ -820,7 +820,7 @@ class PredictionRowV2:
         object.__setattr__(
             self, "p_home", _require_number(self.p_home, "p_home", 0.0, 1.0)
         )
-        if self.picked_side not in PICKED_SIDES:
+        if not isinstance(self.picked_side, str) or self.picked_side not in PICKED_SIDES:
             raise ValueError("unknown picked_side")
         object.__setattr__(
             self,
@@ -1139,6 +1139,8 @@ class PredictionSealV2:
     path: str
 
     def __post_init__(self) -> None:
+        for field in ("schema", "ledger_id", "fold_id", "model_id"):
+            object.__setattr__(self, field, _require_text(getattr(self, field), field))
         if self.schema != "MODEL_IMPROVEMENT_PREDICTION_SEAL_V2":
             raise ValueError("unknown V2 prediction seal schema")
         if self.fold_id not in FOLD_IDS - {"H24"} or self.model_id != "v5.1":

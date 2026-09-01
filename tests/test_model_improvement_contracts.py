@@ -652,6 +652,8 @@ class PredictionV2ContractTests(unittest.TestCase):
             self.prediction_row(calibration_card_sha256="not-a-digest")
         with self.assertRaises(ValueError):
             PredictionRowV2.from_payload_mapping(row.as_mapping() | {"label": 1})
+        with self.assertRaises(ValueError):
+            self.prediction_row(picked_side=[])
 
     def test_v2_seal_is_baseline_only_and_binds_feature_and_calibration_cards(self):
         seal = self.prediction_seal()
@@ -669,6 +671,9 @@ class PredictionV2ContractTests(unittest.TestCase):
             {"feature_seal_sha256": "not-a-digest"},
             {"calibration_card_sha256": "not-a-digest"},
             {"frozen_model_card_sha256": SHA},
+            {"ledger_id": []},
+            {"fold_id": []},
+            {"model_id": []},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 self.prediction_seal(**overrides)
