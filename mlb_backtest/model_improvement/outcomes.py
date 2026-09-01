@@ -429,6 +429,25 @@ def load_outcome_receipt(spec: ModelImprovementRunSpec, source_gate: SourceGateR
         or baseline_replay.ledger_id != f"baseline/v5.1/{fold_id}"
     ):
         raise ValueError("outcome receipt baseline binding differs")
+    # Do not let a receipt or outcome-row artifact choose when authority is
+    # checked.  Establish the full typed source/feature/replay/prediction
+    # chain before opening any artifact in the outcome quartet.
+    pre_gate = _authenticate_gate(spec, source_gate)
+    pre_feature_path = spec.output_path("features", f"common/{fold_id}/feature_seal.json")
+    pre_feature = load_feature_seal(pre_feature_path, feature_seal.artifact_sha256)
+    if pre_feature != feature_seal:
+        raise ValueError("outcome receipt feature descriptor differs")
+    pre_replay = load_baseline_replay_v2(
+        spec, pre_gate, pre_feature, baseline_replay.path, baseline_replay.artifact_sha256
+    )
+    if pre_replay != baseline_replay:
+        raise ValueError("outcome receipt replay descriptor differs")
+    prediction = load_prediction_seal_v2(
+        spec, pre_gate, pre_feature, None,
+        pre_replay.prediction_seal_path, pre_replay.prediction_seal_sha256,
+    )
+    _validate_supplied_types(spec, pre_gate, pre_feature, pre_replay, prediction)
+    before = _materialize(spec, pre_gate, pre_feature, pre_replay, prediction)
     raw = read_regular_bytes(receipt_path, "outcome receipt")
     actual = sha256(raw).hexdigest()
     if actual != expected:
@@ -441,9 +460,7 @@ def load_outcome_receipt(spec: ModelImprovementRunSpec, source_gate: SourceGateR
         raise ValueError("outcome receipt is not canonical JSON")
     _load_sidecar(receipt_path.with_suffix(receipt_path.suffix + ".sha256"), actual, "outcome receipt sidecar")
     receipt = OutcomeReceipt.from_payload_mapping(payload, actual, str(receipt_path))
-    prediction = load_prediction_seal_v2(spec, source_gate, feature_seal, None, baseline_replay.prediction_seal_path, baseline_replay.prediction_seal_sha256)
-    _validate_supplied_types(spec, source_gate, feature_seal, baseline_replay, prediction)
-    gate, feature, replay, seal, outcomes, relative, evidence_digest = _materialize(spec, source_gate, feature_seal, baseline_replay, prediction)
+    gate, feature, replay, seal, outcomes, relative, evidence_digest = before
     paths = _paths(spec, fold_id)
     rows_bytes = _rows_bytes(outcomes)
     if (
@@ -466,8 +483,15 @@ def load_outcome_receipt(spec: ModelImprovementRunSpec, source_gate: SourceGateR
     _load_sidecar(paths.rows_sidecar, receipt.outcomes_sha256, "outcome rows sidecar")
     if _load_rows_bytes(paths.rows, receipt.outcomes_sha256) != outcomes:
         raise ValueError("outcome rows differ")
+    after = _materialize(spec, source_gate, feature_seal, baseline_replay, prediction)
+    if after != before:
+        raise ValueError("outcome authority changed while reading")
     if read_regular_bytes(receipt_path, "outcome receipt") != raw:
         raise ValueError("outcome receipt changed while reading")
+    _load_sidecar(receipt_path.with_suffix(receipt_path.suffix + ".sha256"), actual, "outcome receipt sidecar")
+    _load_sidecar(paths.rows_sidecar, receipt.outcomes_sha256, "outcome rows sidecar")
+    if _load_rows_bytes(paths.rows, receipt.outcomes_sha256) != outcomes:
+        raise ValueError("outcome rows changed while reading")
     return receipt
 
 
@@ -482,6 +506,12 @@ def load_outcome_rows(spec: ModelImprovementRunSpec, source_gate: SourceGateRece
     rows = _load_rows_bytes(paths.rows, receipt.outcomes_sha256)
     if _population_digest(rows) != receipt.population_sha256:
         raise ValueError("outcome row population differs")
+    reread = load_outcome_receipt(
+        spec, source_gate, feature_seal, baseline_replay,
+        receipt.path, receipt.artifact_sha256,
+    )
+    if reread != receipt or _load_rows_bytes(paths.rows, receipt.outcomes_sha256) != rows:
+        raise ValueError("outcome rows changed while reading")
     return rows
 
 

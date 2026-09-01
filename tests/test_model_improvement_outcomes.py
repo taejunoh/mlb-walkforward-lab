@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import tempfile
 import unittest
 from hashlib import sha256
 from dataclasses import replace
@@ -109,6 +110,57 @@ class OutcomeContractTest(unittest.TestCase):
         with self.assertRaises(Exception):
             Draft202012Validator(schema).validate(payload | {"artifact_sha256": "a" * 64})
 
+    def test_authenticated_games_parses_real_source_inventory_and_rejects_derived_binding_substitution(self) -> None:
+        """Only the game-evidence path and digest parsed from inventory are admitted."""
+        from mlb_backtest.model_improvement import outcomes
+        from mlb_backtest.v52_snapshot_store import build_inventory, inventory_bytes, parse_inventory
+        from tests.v52_snapshot_store_fixture import patched_store_replay, store_inputs
+
+        with patched_store_replay():
+            inventory_bytes_value = inventory_bytes(build_inventory(store_inputs()))
+        inventory = parse_inventory(inventory_bytes_value)
+        binding = inventory.game_evidence_inventory
+        digest = sha256(inventory_bytes_value).hexdigest()
+        spec = SimpleNamespace(
+            source_authority=SimpleNamespace(
+                inventory=SimpleNamespace(path="inventory.json", sha256=digest),
+                source_run_spec=SimpleNamespace(path="protocols/run.json"),
+                acquisition_contract=SimpleNamespace(path="protocols/contract.json"),
+            )
+        )
+        gate = SimpleNamespace(inventory_sha256=digest)
+        game = {
+            "game_pk": 1, "official_date": "2022-04-01", "scheduled_start_utc": "2022-04-01T17:00:00Z",
+            "season": 2022, "home_team_id": 1, "away_team_id": 2, "winner_team_id": 1,
+            "home_score": 1, "away_score": 0, "played": True, "terminal_status": "Final",
+            "verification_status": "VERIFIED", "source_game_sha256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+
+            def read(path, _label):
+                if path == root / "inventory.json":
+                    return inventory_bytes_value
+                if path == root / binding.path:
+                    return b"verified inventory bytes"
+                raise AssertionError(path)
+
+            verified = SimpleNamespace(path=root / binding.path, sha256=binding.sha256, payload={"games": [game]})
+            with patch.object(outcomes, "_source_root", return_value=root), patch.object(
+                outcomes, "read_regular_bytes", side_effect=read
+            ), patch.object(outcomes, "load_verified_game_evidence_inventory", return_value=verified):
+                relative, observed_sha, games = outcomes._authenticated_games(spec, gate)
+            self.assertEqual((relative, observed_sha, games[1]), (binding.path, binding.sha256, game))
+            for changed in (
+                SimpleNamespace(path=root / "elsewhere.json", sha256=binding.sha256, payload={"games": [game]}),
+                SimpleNamespace(path=root / binding.path, sha256="f" * 64, payload={"games": [game]}),
+                SimpleNamespace(path=root / binding.path, sha256=binding.sha256, payload={"games": [game, game]}),
+            ):
+                with self.subTest(changed=changed.sha256), patch.object(outcomes, "_source_root", return_value=root), patch.object(
+                    outcomes, "read_regular_bytes", side_effect=read
+                ), patch.object(outcomes, "load_verified_game_evidence_inventory", return_value=changed), self.assertRaises(ValueError):
+                    outcomes._authenticated_games(spec, gate)
+
 
 class OutcomePublishProtocolTest(unittest.TestCase):
     """Exercise the four-file commit protocol without inventing source labels."""
@@ -162,6 +214,9 @@ class OutcomePublishProtocolTest(unittest.TestCase):
 
         return patch.multiple(
             outcomes,
+            _authenticate_gate=lambda *_args: self.gate,
+            load_feature_seal=lambda *_args: self.feature,
+            load_baseline_replay_v2=lambda *_args: self.replay,
             _materialize=lambda *_args: self.materialized,
             load_prediction_seal_v2=lambda *_args: self.prediction,
         )
@@ -219,3 +274,62 @@ class OutcomePublishProtocolTest(unittest.TestCase):
                 outcomes, "read_regular_bytes", side_effect=AssertionError("read")
             ), self.assertRaises(ValueError):
                 outcomes.seal_outcome_receipt(self.spec, self.gate, feature, replay, prediction)
+
+    def test_loader_reauthenticates_before_any_outcome_quartet_read(self) -> None:
+        from mlb_backtest.model_improvement import outcomes
+
+        with self._patch_authority():
+            receipt = outcomes.seal_outcome_receipt(
+                self.spec, self.gate, self.feature, self.replay, self.prediction
+            )
+        with patch.multiple(
+            outcomes,
+            _authenticate_gate=lambda *_args: self.gate,
+            load_feature_seal=lambda *_args: self.feature,
+            load_baseline_replay_v2=lambda *_args: self.replay,
+            load_prediction_seal_v2=lambda *_args: self.prediction,
+            _materialize=lambda *_args: (_ for _ in ()).throw(ValueError("authority first")),
+        ), patch.object(outcomes, "read_regular_bytes", side_effect=AssertionError("outcome read")), self.assertRaisesRegex(ValueError, "authority first"):
+            outcomes.load_outcome_receipt(
+                self.spec, self.gate, self.feature, self.replay,
+                receipt.path, receipt.artifact_sha256,
+            )
+
+    def test_loader_detects_authority_mutation_after_rows_read(self) -> None:
+        from mlb_backtest.model_improvement import outcomes
+
+        with self._patch_authority():
+            receipt = outcomes.seal_outcome_receipt(
+                self.spec, self.gate, self.feature, self.replay, self.prediction
+            )
+        drifted = self.materialized[:-1] + ("4" * 64,)
+        with patch.multiple(
+            outcomes,
+            _authenticate_gate=lambda *_args: self.gate,
+            load_feature_seal=lambda *_args: self.feature,
+            load_baseline_replay_v2=lambda *_args: self.replay,
+            load_prediction_seal_v2=lambda *_args: self.prediction,
+            _materialize=lambda *_args: self.materialized,
+        ):
+            original = outcomes._materialize
+            with patch.object(outcomes, "_materialize", side_effect=(self.materialized, drifted)), self.assertRaisesRegex(ValueError, "authority changed"):
+                outcomes.load_outcome_receipt(
+                    self.spec, self.gate, self.feature, self.replay,
+                    receipt.path, receipt.artifact_sha256,
+                )
+            self.assertIsNotNone(original)
+
+    def test_mutation_between_independent_seal_passes_writes_nothing(self) -> None:
+        from mlb_backtest.model_improvement import outcomes
+
+        drifted = self.materialized[:-1] + ("4" * 64,)
+        with patch.multiple(
+            outcomes,
+            _materialize=lambda *_args: self.materialized,
+        ):
+            with patch.object(outcomes, "_materialize", side_effect=(self.materialized, drifted)), patch.object(
+                outcomes, "write_immutable_bytes", side_effect=AssertionError("write")
+            ), self.assertRaisesRegex(ValueError, "independent materialization"):
+                outcomes.seal_outcome_receipt(
+                    self.spec, self.gate, self.feature, self.replay, self.prediction
+                )
