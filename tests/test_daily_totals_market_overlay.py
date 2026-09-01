@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import json
+import hashlib
 import math
 import unittest
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
+from pathlib import Path
+
+from jsonschema import Draft202012Validator
 
 from mlb_backtest.daily_totals_market_overlay import (
+    FIXED_GAME_PKS,
+    OVERLAY_SCHEMA,
+    POLICY,
+    POLICY_SCHEMA,
     PriceSupport,
+    SNAPSHOT_SCHEMA,
+    STATUS_LABELS,
+    TARGET_DATE,
     SupportRates,
     american_net_profit,
     compare_sample_support,
@@ -15,7 +27,82 @@ from mlb_backtest.daily_totals_market_overlay import (
     select_direction,
     validate_american_price,
     validate_line_half_runs,
+    validate_draftkings_snapshot,
+    validate_overlay_policy,
+    validate_overlay_report,
 )
+from mlb_backtest.live_top3_contracts import canonical_json_bytes
+
+
+class SchemaTests(unittest.TestCase):
+    def test_contract_schemas_are_draft_2020_12_closed_roots(self) -> None:
+        schema_root = Path(__file__).parents[1] / "schemas"
+        names = (
+            "experimental_daily_totals_draftkings_snapshot.schema.json",
+            "experimental_daily_totals_overlay_policy.schema.json",
+            "experimental_daily_totals_overlay.schema.json",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                schema = json.loads((schema_root / name).read_text())
+                Draft202012Validator.check_schema(schema)
+                self.assertIs(schema.get("additionalProperties"), False)
+
+    @staticmethod
+    def _digest(value: dict[str, object]) -> str:
+        unsigned = dict(value)
+        unsigned.pop("content_sha256", None)
+        return hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
+
+    def test_valid_policy_and_snapshot_round_trip_are_defensive(self) -> None:
+        policy = validate_overlay_policy(POLICY)
+        self.assertEqual(policy, POLICY)
+        self.assertIsNot(policy, POLICY)
+        snapshot = {
+            "schema": SNAPSHOT_SCHEMA, "content_sha256": "",
+            "target_date": TARGET_DATE,
+            "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
+            "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
+            "comparison_bound_at_utc": "2026-09-01T15:00:00Z",
+            "source_name": "DraftKings", "book_id": "DRAFTKINGS",
+            "source_url": "https://sportsbook.draftkings.com/markets",
+            "capture_method": "EXTERNAL_MANUAL", "captured_at_utc": "2026-09-01T14:59:00Z",
+            "raw_capture_relative": "data/raw.json", "raw_capture_sha256": "c" * 64,
+            "raw_capture_byte_length": 1,
+            "games": [{"game_pk": pk, "status": "NO_QUOTE", "reason": "NOT_LISTED"} for pk in FIXED_GAME_PKS],
+        }
+        snapshot["content_sha256"] = self._digest(snapshot)
+        copied = validate_draftkings_snapshot(snapshot)
+        self.assertEqual(copied, snapshot)
+        self.assertIsNot(copied, snapshot)
+        self.assertIsNot(copied["games"], snapshot["games"])
+        snapshot["games"][0]["reason"] = "UNAVAILABLE"
+        self.assertEqual(copied["games"][0]["reason"], "NOT_LISTED")
+
+    def test_valid_overlay_round_trip_uses_sealed_game_order(self) -> None:
+        rows = [{
+            "game_pk": pk, "expected_total": 8.0, "residual_count": 764,
+            "market_status": "QUOTED", "line_half_runs": 17,
+            "over_american_odds": -110, "under_american_odds": -110,
+            "over_support": 0.5, "under_support": 0.5, "push_support": 0.0,
+            "over_conditional_support": 0.5, "under_conditional_support": 0.5,
+            "over_support_margin": 0.0, "under_support_margin": 0.0,
+            "selected_side": None, "decision": "PASS",
+            "reason_codes": ["AMBIGUOUS_DIRECTION"],
+        } for pk in FIXED_GAME_PKS]
+        report = {
+            "schema": OVERLAY_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
+            "target_date": TARGET_DATE, "model_report_relative": "reports/model.json", "model_report_sha256": "b" * 64,
+            "model_trace_relative": "reports/model.trace.json", "model_trace_sha256": "a" * 64,
+            "market_snapshot_relative": "audit/snapshot.json", "market_snapshot_sha256": "c" * 64,
+            "policy_schema": POLICY_SCHEMA,
+            "policy_sha256": hashlib.sha256(canonical_json_bytes(POLICY)).hexdigest(),
+            "evaluated_at_utc": "2026-09-01T15:00:00Z", "games": rows,
+        }
+        report["content_sha256"] = self._digest(report)
+        copied = validate_overlay_report(report)
+        self.assertEqual(copied, report)
+        self.assertIsNot(copied, report)
 
 
 class PureMathTests(unittest.TestCase):

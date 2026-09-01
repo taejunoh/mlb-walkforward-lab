@@ -3,9 +3,334 @@
 from __future__ import annotations
 
 import math
+import re
+import json
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Rational, Real
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from pathlib import PurePosixPath
+from urllib.parse import urlsplit
+
+from .live_top3_contracts import canonical_json_bytes, validate_target_date
+
+
+SNAPSHOT_SCHEMA = "PROVISIONAL_DAILY_TOTALS_DK_SNAPSHOT_V1"
+POLICY_SCHEMA = "PROVISIONAL_DAILY_TOTALS_OVERLAY_POLICY_V1"
+OVERLAY_SCHEMA = "PROVISIONAL_DAILY_TOTALS_OVERLAY_V1"
+TARGET_DATE = "2026-09-01"
+STATUS_LABELS = ["RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED"]
+FIXED_GAME_PKS = (
+    822929, 823340, 824391, 824472, 822687, 824716, 823661, 824070,
+    824633, 822854, 824148, 824313, 823984, 825038, 823908,
+)
+POLICY = {
+    "schema": POLICY_SCHEMA,
+    "required_residual_count": 764,
+    "maximum_quote_age_seconds": 900,
+    "minimum_nonpush_support": 0.80,
+    "minimum_point_gap_runs": 1.00,
+    "minimum_support_margin": 0.05,
+}
+_SNAPSHOT_KEYS = frozenset({
+    "schema", "content_sha256", "target_date", "model_trace_relative",
+    "model_trace_sha256", "model_report_relative", "model_report_sha256",
+    "comparison_bound_at_utc", "source_name", "book_id", "source_url",
+    "capture_method", "captured_at_utc", "raw_capture_relative",
+    "raw_capture_sha256", "raw_capture_byte_length", "games",
+})
+_QUOTED_SNAPSHOT_KEYS = frozenset({
+    "game_pk", "status", "draftkings_event_id", "event_label",
+    "line_half_runs", "over_american_odds", "under_american_odds",
+})
+_NO_QUOTE_SNAPSHOT_KEYS = frozenset({"game_pk", "status", "reason"})
+_OVERLAY_KEYS = frozenset({
+    "schema", "content_sha256", "status_labels", "target_date",
+    "model_report_relative", "model_report_sha256", "model_trace_relative",
+    "model_trace_sha256", "market_snapshot_relative", "market_snapshot_sha256",
+    "policy_schema", "policy_sha256", "evaluated_at_utc", "games",
+})
+_QUOTED_OVERLAY_KEYS = frozenset({
+    "game_pk", "expected_total", "residual_count", "market_status",
+    "line_half_runs", "over_american_odds", "under_american_odds",
+    "over_support", "under_support", "push_support",
+    "over_conditional_support", "under_conditional_support",
+    "over_support_margin", "under_support_margin", "selected_side",
+    "decision", "reason_codes",
+})
+_NO_QUOTE_OVERLAY_KEYS = frozenset({
+    "game_pk", "expected_total", "residual_count", "market_status",
+    "decision", "reason_codes",
+})
+_REASON_CODES = (
+    "NO_QUOTE", "GAME_STARTED", "QUOTE_STALE", "RESIDUAL_COUNT_MISMATCH",
+    "NONPUSH_SUPPORT_TOO_LOW", "POINT_GAP_TOO_SMALL", "SUPPORT_MARGIN_TOO_LOW",
+    "AMBIGUOUS_DIRECTION",
+)
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_UTC_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T"
+    r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?Z$"
+)
+
+
+def _canonical_mapping(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    try:
+        copied = json.loads(canonical_json_bytes(value))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be finite canonical JSON") from exc
+    if not isinstance(copied, dict):
+        raise ValueError(f"{label} must be an object")
+    return copied
+
+
+def _sha(value: object, label: str) -> str:
+    if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} differs")
+    return value
+
+
+def _content_digest(value: Mapping[str, object]) -> str:
+    without = dict(value)
+    without.pop("content_sha256", None)
+    import hashlib
+    return hashlib.sha256(canonical_json_bytes(without)).hexdigest()
+
+
+def _relative(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or value.startswith("/") or "\\" in value:
+        raise ValueError(f"{label} differs")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{label} differs")
+    if PurePosixPath(value).is_absolute():
+        raise ValueError(f"{label} differs")
+    return value
+
+
+def _utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or _UTC_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} differs")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"{label} differs") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError(f"{label} differs")
+    return parsed
+
+
+def _target(value: object, label: str) -> str:
+    try:
+        result = validate_target_date(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} differs") from exc
+    if result != TARGET_DATE:
+        raise ValueError(f"{label} differs")
+    return result
+
+
+def _finite(value: object, label: str, *, low: float = 0.0, high: float = math.inf) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a finite number")
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite number") from exc
+    if not math.isfinite(result) or not low <= result <= high:
+        raise ValueError(f"{label} is out of range")
+    return result
+
+
+def _positive_int(value: object, label: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{label} differs")
+    return value
+
+
+def _source_url(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("source_url differs")
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("source_url differs")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("source_url differs") from exc
+    if (
+        parsed.scheme != "https" or hostname != "sportsbook.draftkings.com"
+        or parsed.username is not None or parsed.password is not None
+        or port is not None or ":" in parsed.netloc or "#" in value
+        or not parsed.netloc
+    ):
+        raise ValueError("source_url differs")
+    return value
+
+
+def _snapshot_game(value: object) -> dict[str, object]:
+    game = _canonical_mapping(value, "snapshot game")
+    if type(game.get("game_pk")) is not int or game["game_pk"] not in FIXED_GAME_PKS:
+        raise ValueError("snapshot game key differs")
+    status = game.get("status")
+    if status == "QUOTED":
+        if set(game) != _QUOTED_SNAPSHOT_KEYS:
+            raise ValueError("quoted snapshot game fields differ")
+        for field in ("draftkings_event_id", "event_label"):
+            if not isinstance(game[field], str) or not game[field] or len(game[field]) > 512:
+                raise ValueError(f"snapshot game {field} differs")
+        validate_line_half_runs(game["line_half_runs"])
+        validate_american_price(game["over_american_odds"])
+        validate_american_price(game["under_american_odds"])
+    elif status == "NO_QUOTE":
+        if set(game) != _NO_QUOTE_SNAPSHOT_KEYS or game["reason"] not in {"NOT_LISTED", "UNAVAILABLE"}:
+            raise ValueError("no-quote snapshot game differs")
+    else:
+        raise ValueError("snapshot game status differs")
+    return game
+
+
+def validate_draftkings_snapshot(value: object) -> dict[str, object]:
+    """Validate and defensively copy a closed DraftKings market snapshot."""
+    safe = _canonical_mapping(value, "DraftKings snapshot")
+    if set(safe) != _SNAPSHOT_KEYS or safe["schema"] != SNAPSHOT_SCHEMA:
+        raise ValueError("snapshot fields differ")
+    _target(safe["target_date"], "snapshot target date")
+    for field in ("model_trace_relative", "model_report_relative", "raw_capture_relative"):
+        _relative(safe[field], f"snapshot {field}")
+    for field in ("model_trace_sha256", "model_report_sha256", "raw_capture_sha256"):
+        _sha(safe[field], f"snapshot {field}")
+    comparison = _utc_timestamp(safe["comparison_bound_at_utc"], "snapshot comparison bound")
+    captured = _utc_timestamp(safe["captured_at_utc"], "snapshot captured at")
+    if captured > comparison:
+        raise ValueError("snapshot capture is after comparison bound")
+    if safe["source_name"] != "DraftKings" or safe["book_id"] != "DRAFTKINGS" or safe["capture_method"] != "EXTERNAL_MANUAL":
+        raise ValueError("snapshot source identity differs")
+    _source_url(safe["source_url"])
+    if type(safe["raw_capture_byte_length"]) is not int or safe["raw_capture_byte_length"] <= 0:
+        raise ValueError("snapshot raw capture byte length differs")
+    games = safe["games"]
+    if not isinstance(games, list) or len(games) != len(FIXED_GAME_PKS):
+        raise ValueError("snapshot games differ")
+    validated_games = [_snapshot_game(game) for game in games]
+    game_pks = [game["game_pk"] for game in validated_games]
+    if len(set(game_pks)) != len(FIXED_GAME_PKS) or set(game_pks) != set(FIXED_GAME_PKS):
+        raise ValueError("snapshot game set differs")
+    if _sha(safe["content_sha256"], "snapshot content") != _content_digest(safe):
+        raise ValueError("snapshot content digest differs")
+    return safe
+
+
+def validate_overlay_policy(value: object) -> dict[str, object]:
+    """Validate and defensively copy the immutable V1 overlay policy."""
+    safe = _canonical_mapping(value, "overlay policy")
+    if set(safe) != set(POLICY) or safe != POLICY:
+        raise ValueError("overlay policy differs")
+    for field in ("required_residual_count", "maximum_quote_age_seconds"):
+        if type(safe[field]) is not int:
+            raise ValueError("overlay policy integer differs")
+    for field in ("minimum_nonpush_support", "minimum_point_gap_runs", "minimum_support_margin"):
+        _finite(safe[field], f"overlay policy {field}", low=0.0)
+    return safe
+
+
+def _reason_codes(value: object) -> list[str]:
+    if not isinstance(value, list) or any(code not in _REASON_CODES for code in value):
+        raise ValueError("overlay reason codes differ")
+    if len(set(value)) != len(value):
+        raise ValueError("overlay reason codes are duplicated")
+    positions = [_REASON_CODES.index(code) for code in value]
+    if positions != sorted(positions):
+        raise ValueError("overlay reason codes are out of order")
+    return value
+
+
+def _overlay_common_game(game: Mapping[str, object]) -> None:
+    game_pk = game.get("game_pk")
+    if type(game_pk) is not int or game_pk not in FIXED_GAME_PKS:
+        raise ValueError("overlay game key differs")
+    if "expected_total" not in game:
+        raise ValueError("overlay expected total differs")
+    _finite(game["expected_total"], "overlay expected total")
+    residual_count = game.get("residual_count")
+    if type(residual_count) is not int or residual_count < 0:
+        raise ValueError("overlay residual count differs")
+
+
+def _overlay_game(value: object) -> dict[str, object]:
+    game = _canonical_mapping(value, "overlay game")
+    status = game.get("market_status")
+    _overlay_common_game(game)
+    if status == "NO_QUOTE":
+        if set(game) != _NO_QUOTE_OVERLAY_KEYS or game["decision"] != "PASS" or game["reason_codes"] != ["NO_QUOTE"]:
+            raise ValueError("no-quote overlay game differs")
+        return game
+    if status != "QUOTED" or set(game) != _QUOTED_OVERLAY_KEYS:
+        raise ValueError("quoted overlay game fields differ")
+    validate_line_half_runs(game["line_half_runs"])
+    validate_american_price(game["over_american_odds"])
+    validate_american_price(game["under_american_odds"])
+    rates = [_finite(game[field], f"overlay {field}", high=1.0) for field in ("over_support", "under_support", "push_support")]
+    if not math.isclose(sum(rates), 1.0, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("overlay support rates are incoherent")
+    conditionals = ("over_conditional_support", "under_conditional_support")
+    margins = ("over_support_margin", "under_support_margin")
+    for conditional, margin in zip(conditionals, margins):
+        c_value, m_value = game[conditional], game[margin]
+        if (c_value is None) != (m_value is None):
+            raise ValueError("overlay support availability differs")
+        if c_value is not None:
+            _finite(c_value, f"overlay {conditional}", high=1.0)
+            _finite(m_value, f"overlay {margin}", low=-1.0, high=1.0)
+    if (rates[0] + rates[1] == 0.0) != (game["over_conditional_support"] is None):
+        raise ValueError("overlay conditional support availability differs")
+    if game["selected_side"] not in {None, "OVER", "UNDER"}:
+        raise ValueError("overlay selected side differs")
+    decision = game["decision"]
+    if decision not in {"RESEARCH_PICK", "PASS"}:
+        raise ValueError("overlay decision differs")
+    reasons = _reason_codes(game["reason_codes"])
+    if decision == "RESEARCH_PICK" and (game["selected_side"] not in {"OVER", "UNDER"} or reasons):
+        raise ValueError("overlay research pick consistency differs")
+    if decision == "PASS" and not reasons:
+        raise ValueError("overlay pass reason codes differ")
+    if "NO_QUOTE" in reasons:
+        raise ValueError("quoted overlay cannot use no-quote reason")
+    if "AMBIGUOUS_DIRECTION" in reasons and game["selected_side"] is not None:
+        raise ValueError("ambiguous overlay selected side differs")
+    if game["selected_side"] is None and decision == "RESEARCH_PICK":
+        raise ValueError("overlay selected side differs")
+    return game
+
+
+def validate_overlay_report(value: object) -> dict[str, object]:
+    """Validate and defensively copy the closed V1 overlay report."""
+    safe = _canonical_mapping(value, "overlay report")
+    if set(safe) != _OVERLAY_KEYS or safe["schema"] != OVERLAY_SCHEMA:
+        raise ValueError("overlay report fields differ")
+    if safe["status_labels"] != STATUS_LABELS:
+        raise ValueError("overlay status labels differ")
+    _target(safe["target_date"], "overlay target date")
+    for field in ("model_report_relative", "model_trace_relative", "market_snapshot_relative"):
+        _relative(safe[field], f"overlay {field}")
+    for field in ("model_report_sha256", "model_trace_sha256", "market_snapshot_sha256", "policy_sha256"):
+        _sha(safe[field], f"overlay {field}")
+    if safe["policy_schema"] != POLICY_SCHEMA or safe["policy_sha256"] != _content_digest(POLICY):
+        raise ValueError("overlay policy binding differs")
+    _utc_timestamp(safe["evaluated_at_utc"], "overlay evaluated at")
+    games = safe["games"]
+    if not isinstance(games, list) or len(games) != len(FIXED_GAME_PKS):
+        raise ValueError("overlay games differ")
+    validated_games = [_overlay_game(game) for game in games]
+    if [game["game_pk"] for game in validated_games] != list(FIXED_GAME_PKS):
+        raise ValueError("overlay game ordering differs")
+    if _sha(safe["content_sha256"], "overlay content") != _content_digest(safe):
+        raise ValueError("overlay content digest differs")
+    return safe
 
 
 @dataclass(frozen=True, slots=True)
