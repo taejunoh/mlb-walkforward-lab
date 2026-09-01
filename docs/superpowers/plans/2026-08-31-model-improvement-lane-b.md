@@ -23,6 +23,13 @@
 - H22 outcome receipts cover O19–O21; H23 outcome receipts cover O19–O22; optional H24 card inputs cover O19–O23. H24 outcomes are inaccessible until Task6B.
 - Brier/log loss include every eligible game. Daily Top-1 pairs by official date. Canonical JSON has exactly one trailing newline.
 
+Task6B receipt operations are `OutcomeReceipt`, `seal_outcome_receipt`,
+`load_outcome_receipt`, and `load_outcome_rows`. Lane B obtains the complete comparison through
+`load_evaluation_pair(spec, path, expected_sha256)` before reading either named
+report and invokes `evaluate_predictions(spec, candidate, baseline,
+outcome_receipt)` only with a typed receipt. It checks both
+`outcome_receipt_path` and `outcome_receipt_sha256`; `outcomes_sha256` alone is never sufficient provenance.
+
 ---
 
 ## Files and DAG

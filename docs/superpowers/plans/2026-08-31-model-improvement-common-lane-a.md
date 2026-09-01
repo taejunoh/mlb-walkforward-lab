@@ -1182,6 +1182,10 @@ def load_evaluation_report(
 ) -> EvaluationReport
 ```
 
+Every downstream consumer obtains the complete pair through
+`load_evaluation_pair(spec, path, expected_sha256)` before reading either
+named report.
+
 The evaluator calls only `load_prediction_rows(spec, source_gate, feature_seal,
 baseline_replay, seal)` and requires an
 identical ordered `(official_date, scheduled_start_utc, game_pk)` population,
@@ -1204,7 +1208,8 @@ concatenation, sorted by ascending official date, of
 
 `EvaluationReport` is closed as `MODEL_IMPROVEMENT_EVALUATION_REPORT_V1` with
 exactly `schema`, `ledger_id`, `candidate_id`, `model_id`, `baseline_model_id`,
-`fold_id`, `run_spec_sha256`, `source_gate_sha256`, `prediction_seal_sha256`,
+`fold_id`, `run_spec_sha256`, `source_gate_sha256`, `outcome_receipt_path`,
+`outcome_receipt_sha256`, `prediction_seal_sha256`,
 `baseline_prediction_seal_sha256`, `population_sha256`, `outcomes_sha256`,
 `all_games_count`, `brier`, `log_loss`, `daily_top1_count`,
 `daily_top1_correct`, `daily_top1_delta_vs_baseline`, `max_losing_streak`,
@@ -1213,7 +1218,8 @@ exactly `schema`, `ledger_id`, `candidate_id`, `model_id`, `baseline_model_id`,
 candidate-minus-baseline correctness delta.  `EvaluationPair` is closed as
 `MODEL_IMPROVEMENT_EVALUATION_PAIR_V1` with exactly `schema`, `ledger_id`,
 `candidate_id`, `candidate_model_id`, `baseline_model_id="v5.1"`, `fold_id`,
-`run_spec_sha256`, `source_gate_sha256`, candidate/baseline prediction-seal
+`run_spec_sha256`, `source_gate_sha256`, `outcome_receipt_path`,
+`outcome_receipt_sha256`, candidate/baseline prediction-seal
 paths and digests, `population_sha256`, `outcomes_sha256`, `paired_days_sha256`,
 `neutral_days_sha256`, candidate/baseline report paths and digests.  Descriptors
 again add only runtime path/digest.

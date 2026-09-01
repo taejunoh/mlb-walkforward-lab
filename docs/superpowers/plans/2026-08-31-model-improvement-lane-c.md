@@ -14,6 +14,11 @@
 
 Lane C follows the canonical staged order **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. Its prediction boundary uses `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Evaluation uses the typed `OutcomeReceipt` and `evaluate_predictions(spec, candidate, baseline, outcome_receipt)` only.
 
+Task6B receipt operations are `seal_outcome_receipt`, `load_outcome_receipt`,
+and `load_outcome_rows`. Lane C obtains the complete comparison through
+`load_evaluation_pair(spec, path, expected_sha256)` before reading either named
+report.
+
 The approved design is `docs/superpowers/specs/2026-08-31-parallel-model-result-improvement-design.md`. H22 (2022) is development, H23 (2023) is selection, and H24 (2024) is prediction-only here. Lane C cannot read any outcomes, H24 outcomes, odds, final-state substitutions, or production/live paths.
 
 The following names are owned by Common/Lane A and are dependencies, not new Lane C types:

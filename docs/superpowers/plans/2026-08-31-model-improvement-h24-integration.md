@@ -10,6 +10,11 @@
 
 H24 consumes the shared staged contract in this order: **Task8A Common OOF FeatureSeal admission + baseline label-free seals/loaders → Task6A baseline replay receipt after its matching baseline seal → Task8B nonbaseline label-free seals/loaders after same-fold replay receipt → Task6B SourceInventory → GameEvidence outcomes, reports, and final pair**. Prediction seals are created and loaded only through `seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)`, `load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)`, and `load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)`. Task6B supplies typed `OutcomeReceipt` values; common evaluation is exactly `evaluate_predictions(spec, candidate, baseline, outcome_receipt)`.
 
+Task6B receipt operations are `seal_outcome_receipt`, `load_outcome_receipt`,
+and `load_outcome_rows`. H24 obtains the complete comparison through
+`load_evaluation_pair(spec, path, expected_sha256)` before reading either named
+report.
+
 ---
 
 ## Coordination contract and dependency DAG

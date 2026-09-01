@@ -11,12 +11,8 @@ Lane A never creates an outcome-bearing prediction artifact. Its prediction
 producer and loaders must use the canonical receipt-bound APIs:
 
 ```python
-seal_oof_predictions(
-    spec, source_gate, feature_seal, baseline_replay, ledger_id, rows,
-)
-load_prediction_seal(
-    spec, source_gate, feature_seal, baseline_replay, path, expected_sha256,
-)
+seal_oof_predictions(spec, source_gate, feature_seal, baseline_replay, ledger_id, rows)
+load_prediction_seal(spec, source_gate, feature_seal, baseline_replay, path, expected_sha256)
 load_prediction_rows(spec, source_gate, feature_seal, baseline_replay, seal)
 ```
 
@@ -30,15 +26,21 @@ securely reloaded.
 Task6B alone derives a typed `OutcomeReceipt` from the authenticated
 `SourceInventory → GameEvidence` chain. Lane A calls exactly:
 
+The receipt boundary is `seal_outcome_receipt`, `load_outcome_receipt`, and
+`load_outcome_rows`; no raw outcome mapping is accepted.
+
 ```python
 pair = evaluate_predictions(spec, candidate, baseline, outcome_receipt)
 ```
 
+Lane A obtains the complete pair only through
+`load_evaluation_pair(spec, path, expected_sha256)`; the returned pair is the
+sole authority for its named candidate and baseline reports.
+
 The downstream frozen-card boundary securely loads the resulting
 `EvaluationPair` and consumes its named candidate and baseline reports. It
 must check `outcome_receipt_path` and `outcome_receipt_sha256` on the loaded
-pair and reports; `outcomes_sha256` is an observation-content digest and is
-never sufficient outcome provenance. Lane A does not accept a raw outcome
+pair and reports; `outcomes_sha256` is an observation-content digest and is never sufficient outcome provenance. Lane A does not accept a raw outcome
 mapping, an ad hoc label collection, or a local evaluator.
 
 H22 remains development-only. H23 may emit `H23_FROZEN` only after strict
