@@ -70,13 +70,14 @@ def _require_number(
     minimum: float | None = None,
     maximum: float | None = None,
 ) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be finite")
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be finite") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{label} must be finite")
     if minimum is not None and numeric < minimum:
         raise ValueError(f"{label} must be at least {minimum}")
     if maximum is not None and numeric > maximum:
@@ -120,7 +121,7 @@ def _require_utc(value: object, label: str) -> str:
     return value
 
 
-def _freeze_json(value: object) -> object:
+def _freeze_json(value: object, active_container_ids: set[int] | None = None) -> object:
     """Recursively freeze JSON-compatible values at a public boundary."""
     if value is None or isinstance(value, (str, bool)):
         return value
@@ -130,15 +131,31 @@ def _freeze_json(value: object) -> object:
         if not math.isfinite(value):
             raise ValueError("JSON numbers must be finite")
         return value
+    if active_container_ids is None:
+        active_container_ids = set()
     if isinstance(value, Mapping):
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise ValueError("JSON values must not be cyclic")
+        active_container_ids.add(container_id)
         frozen: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError("JSON object keys must be strings")
-            frozen[key] = _freeze_json(item)
-        return MappingProxyType(frozen)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("JSON object keys must be strings")
+                frozen[key] = _freeze_json(item, active_container_ids)
+            return MappingProxyType(frozen)
+        finally:
+            active_container_ids.remove(container_id)
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item) for item in value)
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise ValueError("JSON values must not be cyclic")
+        active_container_ids.add(container_id)
+        try:
+            return tuple(_freeze_json(item, active_container_ids) for item in value)
+        finally:
+            active_container_ids.remove(container_id)
     raise ValueError("value is not JSON-compatible")
 
 
@@ -553,19 +570,25 @@ class SealedFeatureRow:
             payload, _FEATURE_FIELDS, "sealed feature row payload"
         )
         data = dict(values)
-        metric_values = data["metric_primitives"]
-        if not isinstance(metric_values, Mapping):
-            raise ValueError("metric_primitives must be an object")
-        data["metric_primitives"] = {
-            side: {
-                component: tuple(
+        metric_values = _require_exact_mapping(
+            data["metric_primitives"], frozenset(SIDES), "metric_primitives"
+        )
+        materialized: dict[str, dict[str, tuple[MetricPrimitive, ...]]] = {}
+        for side in SIDES:
+            components = _require_exact_mapping(
+                metric_values[side],
+                frozenset(COMPONENTS),
+                f"metric_primitives.{side}",
+            )
+            materialized[side] = {}
+            for component in COMPONENTS:
+                primitives = _require_sequence(
+                    components[component], f"metric_primitives.{side}.{component}"
+                )
+                materialized[side][component] = tuple(
                     MetricPrimitive.from_payload_mapping(item) for item in primitives
                 )
-                for component, primitives in components.items()
-            }
-            for side, components in metric_values.items()
-            if isinstance(components, Mapping)
-        }
+        data["metric_primitives"] = materialized
         return cls(**data)
 
 

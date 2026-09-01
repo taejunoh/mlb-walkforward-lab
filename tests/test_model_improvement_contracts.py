@@ -113,6 +113,12 @@ class QualityRecipeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             QualityRecipe("x", "fixed", None, None, None, 1.01, (), (), SHA)
 
+    def test_recipe_numeric_values_fail_closed(self):
+        for value in (True, math.nan, math.inf, -math.inf, 10**400):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    QualityRecipe("x", "fixed", None, None, None, value, (), (), SHA)
+
     def test_ratio_recipe_rejects_negative_numerator(self):
         with self.assertRaises(ValueError):
             QualityRecipe("x", "ratio", "starter", -0.01, 1.0, None, (), (), SHA)
@@ -173,6 +179,37 @@ class SealedFeatureRowTests(unittest.TestCase):
         invalid["component_qualities"]["home"]["offense"] = math.inf
         with self.assertRaises(ValueError):
             SealedFeatureRow(**invalid)
+
+    def test_row_payload_rejects_malformed_metric_primitive_nesting(self):
+        payloads = []
+        root_none = feature_row().as_mapping()
+        root_none["metric_primitives"] = None
+        payloads.append(root_none)
+        side_none = feature_row().as_mapping()
+        side_none["metric_primitives"]["away"] = None
+        payloads.append(side_none)
+        collection_none = feature_row().as_mapping()
+        collection_none["metric_primitives"]["away"]["starter"] = None
+        payloads.append(collection_none)
+        collection_scalar = feature_row().as_mapping()
+        collection_scalar["metric_primitives"]["away"]["starter"] = 1
+        payloads.append(collection_scalar)
+        missing_side = feature_row().as_mapping()
+        del missing_side["metric_primitives"]["away"]
+        payloads.append(missing_side)
+        extra_side = feature_row().as_mapping()
+        extra_side["metric_primitives"]["neutral"] = {}
+        payloads.append(extra_side)
+        missing_component = feature_row().as_mapping()
+        del missing_component["metric_primitives"]["away"]["starter"]
+        payloads.append(missing_component)
+        extra_component = feature_row().as_mapping()
+        extra_component["metric_primitives"]["away"]["unknown"] = []
+        payloads.append(extra_component)
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    SealedFeatureRow.from_payload_mapping(payload)
 
     def test_row_requires_normalized_metric_weights_and_allows_neutral_fallback(self):
         invalid = row_values()
@@ -318,6 +355,31 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
                 SHA_B,
                 "card.json",
             )
+
+    def test_frozen_card_rejects_cyclic_json_parameters(self):
+        cyclic_mapping = {}
+        cyclic_mapping["self"] = cyclic_mapping
+        cyclic_sequence = []
+        cyclic_sequence.append(cyclic_sequence)
+        for parameters in (cyclic_mapping, {"loop": cyclic_sequence}):
+            with self.subTest(parameters=type(parameters).__name__):
+                with self.assertRaises(ValueError):
+                    FrozenModelCard(
+                        "A",
+                        "H23_FROZEN",
+                        "H23",
+                        SHA,
+                        SHA,
+                        SHA,
+                        None,
+                        SHA,
+                        SHA,
+                        SHA,
+                        SHA,
+                        parameters,
+                        SHA_B,
+                        "card.json",
+                    )
 
 
 class LaneDispositionTests(unittest.TestCase):
