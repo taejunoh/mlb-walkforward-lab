@@ -22,7 +22,6 @@ from .contracts import (
 )
 from .run_spec import (
     ModelImprovementRunSpec,
-    TASK8_FOLD_IDS,
     run_spec_sha256,
     task8_target_year,
 )
@@ -32,7 +31,7 @@ from .source_gate import SourceGateReceipt
 _SCHEMA = "MODEL_IMPROVEMENT_FEATURE_SEAL_V1"
 _FEATURE_SETS = frozenset({"common", "lane_c"})
 _FOLDS = frozenset({"H22", "H23", "H24"})
-_COMMON_FOLDS = frozenset(TASK8_FOLD_IDS)
+_COMMON_FOLDS = frozenset({"O19", "O20", "O21", "O22", "O23"})
 _FIELDS = frozenset({
     "schema", "feature_set_id", "fold_id", "run_spec_sha256",
     "source_gate_sha256", "population_sha256", "rows_sha256",

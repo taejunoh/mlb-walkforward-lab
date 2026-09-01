@@ -213,6 +213,46 @@ class SealedFeatureTest(unittest.TestCase):
             load_sealed_feature_rows(self.spec, self.gate, (2024,), seal), (h24_row,)
         )
 
+    def test_common_historical_folds_use_run_spec_fold_targets(self):
+        for fold_id, target_year in (("H22", 2022), ("H23", 2023), ("H24", 2024)):
+            with self.subTest(fold_id=fold_id):
+                row = feature_row(
+                    self.spec, self.gate, target_year * 10,
+                    f"{target_year}-04-01", f"{target_year}-04-01T17:00:00Z",
+                )
+                with patch(
+                    "mlb_backtest.model_improvement.sealed_features.task8_target_year",
+                    side_effect=AssertionError("historical fold used Task8 map"),
+                ):
+                    seal = seal_feature_rows(self.spec, self.gate, "common", fold_id, (row,))
+                self.assertEqual(
+                    load_sealed_feature_rows(self.spec, self.gate, (target_year,), seal),
+                    (row,),
+                )
+
+    def test_common_oof_folds_reject_wrong_target_and_official_date_year(self):
+        for fold_id, target_year in (
+            ("O19", 2019), ("O20", 2020), ("O21", 2021),
+            ("O22", 2022), ("O23", 2023),
+        ):
+            with self.subTest(fold_id=fold_id, mismatch="target_year"):
+                row = feature_row(
+                    self.spec, self.gate, target_year * 10,
+                    f"{target_year}-04-01", f"{target_year}-04-01T17:00:00Z",
+                    target_year=target_year + 1,
+                )
+                with self.assertRaisesRegex(ValueError, "target year"):
+                    seal_feature_rows(self.spec, self.gate, "common", fold_id, (row,))
+            with self.subTest(fold_id=fold_id, mismatch="official_date"):
+                wrong_date_year = target_year + 1
+                row = feature_row(
+                    self.spec, self.gate, target_year * 10 + 1,
+                    f"{wrong_date_year}-04-01", f"{wrong_date_year}-04-01T17:00:00Z",
+                    target_year=target_year,
+                )
+                with self.assertRaisesRegex(ValueError, "target year"):
+                    seal_feature_rows(self.spec, self.gate, "common", fold_id, (row,))
+
     def test_missing_or_different_sidecar_rejects_the_artifact(self):
         seal = seal_feature_rows(self.spec, self.gate, "common", "H22", self.rows)
         sidecar = Path(seal.path).with_suffix(".json.sha256")
