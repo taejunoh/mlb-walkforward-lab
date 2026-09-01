@@ -514,6 +514,11 @@ def _derive_rows_v2(
         raise ValueError("calibration source inventory digest differs")
     inventory = parse_inventory(inv_raw)
     game_binding = inventory.game_evidence_inventory
+    if (
+        receipt.payload["game_evidence_inventory_relative_path"] != game_binding.path
+        or receipt.payload["game_evidence_inventory_sha256"] != game_binding.sha256
+    ):
+        raise ValueError("calibration receipt game inventory binding differs")
     verified = load_verified_game_evidence_inventory(
         root,
         read_only_progress=True,
@@ -548,6 +553,7 @@ def _derive_rows_v2(
         if (
             row["source_authority_sha256"] != authority_digest
             or row["official_date"] != game["official_date"]
+            or row["scheduled_start_utc"] != game["scheduled_start_utc"]
             or row["home_team_id"] != game["home_team_id"]
             or row["away_team_id"] != game["away_team_id"]
         ):
@@ -746,6 +752,18 @@ def _load_v2_once(
         or chain_after != chain
     ):
         raise ValueError("calibration authority changed while reading")
+    # The derived sources are not the only raceable inputs: reread both V2
+    # artifact pairs after the final typed-source pass and require byte-for-byte
+    # identity with the descriptors we already validated.
+    if (
+        read_regular_bytes(paths.card, "probability calibration V2 card") != card_raw
+        or read_regular_bytes(paths.rows, "calibration rows") != rows_raw
+    ):
+        raise ValueError("calibration V2 artifact changed while reading")
+    _sidecar(paths.card_sidecar, digest, "probability calibration V2 card sidecar")
+    _sidecar(
+        paths.rows_sidecar, card.calibration_rows_sha256, "calibration rows sidecar"
+    )
     return card
 
 
