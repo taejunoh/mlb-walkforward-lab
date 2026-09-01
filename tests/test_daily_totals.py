@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 from mlb_backtest.daily_totals import (
     BuiltDailyTotals,
@@ -157,12 +157,19 @@ class DailyTotalsContractTests(unittest.TestCase):
         self.assertEqual(list(Draft202012Validator(schemas["report"]).iter_errors(report)), [])
         report["history_source"]["unexpected"] = "no"
         self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+
+    def test_report_schema_rejects_non_utc_rfc3339_starts(self) -> None:
+        schema = json.loads((Path.cwd() / "schemas/experimental_daily_totals_report.schema.json").read_text())
+        for start in ("not-a-timeZ", "2026-09-01T16:00:00+00:00"):
+            report = make_valid_report_payload()
+            report["games"][0]["scheduled_start_utc"] = start  # type: ignore[index]
+            self.assertTrue(list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(report)))
         report = make_valid_report_payload()
         report["games"][0]["source_digest"] = 1  # type: ignore[index]
-        self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+        self.assertTrue(list(Draft202012Validator(schema).iter_errors(report)))
         report = make_valid_report_payload()
         report["games"][0]["status"] = "UNPROJECTED"  # type: ignore[index]
-        self.assertTrue(list(Draft202012Validator(schemas["report"]).iter_errors(report)))
+        self.assertTrue(list(Draft202012Validator(schema).iter_errors(report)))
 
     def test_report_rejects_nonfinite_bool_and_extra_values(self) -> None:
         for value in (True, math.nan, math.inf):
