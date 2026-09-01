@@ -23,6 +23,8 @@ from mlb_backtest.daily_totals import (
     validate_totals_model_receipt,
     validate_totals_report,
 )
+from mlb_backtest.daily_totals import _per_game_coverage
+from mlb_backtest.experimental_totals import FinalTotalGame, TotalProjection
 from mlb_backtest.live_top3_contracts import canonical_json_bytes
 
 
@@ -283,6 +285,19 @@ class DailyTotalsContractTests(unittest.TestCase):
                     persist_daily_totals(root, built)
             self.assertFalse((root / "audit").exists())
             self.assertFalse((root / "reports/experimental_daily_totals").exists())
+
+    def test_final_coverage_uses_each_prediction_mean_not_one_fixed_interval(self) -> None:
+        first = FinalTotalGame(1, "2026-08-01", "2026-08-01T16:00:00Z", 2, 3, 4, 3, 3)
+        second = FinalTotalGame(2, "2026-08-02", "2026-08-02T16:00:00Z", 2, 3, 4, 5, 6)
+        rows = (
+            (first, TotalProjection("PROJECTED", "LEAGUE_30", 1.5, 1.5, 3.0)),
+            (second, TotalProjection("PROJECTED", "LEAGUE_30", 5.0, 5.0, 10.0)),
+        )
+        # Residuals (-2, +2) yield [1, 5] around mean 3 and [8, 12]
+        # around mean 10.  Totals 6 and 11 therefore cover 0/1 and 1/1.
+        self.assertEqual(_per_game_coverage(rows, (-2.0, 2.0)), 0.5)
+        # A single interval fixed around mean 3 would be [1, 5], covering neither.
+        self.assertNotEqual(_per_game_coverage(rows, (-2.0, 2.0)), 0.0)
 
 
 if __name__ == "__main__":
