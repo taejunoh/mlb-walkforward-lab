@@ -325,6 +325,8 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
         for kwargs in (
             {"p_home": 0.99, "picked_side": "away", "pick_probability": 0.01},
             {"p_home": 0.6, "picked_side": "home", "pick_probability": 0.61},
+            {"p_home": 0.6, "picked_side": "home", "pick_probability": 0.60000000005},
+            {"p_home": 0.4, "picked_side": "away", "pick_probability": 0.60000000005},
             {"p_home": 0.5, "picked_side": "home", "pick_probability": 0.5},
             {"p_home": 0.5, "picked_side": "none", "pick_probability": 0.49, "rank": 0},
         ):

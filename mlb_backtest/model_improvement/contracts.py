@@ -719,12 +719,7 @@ class PredictionRow:
             expected_side, expected_probability = "none", 0.5
         if self.picked_side != expected_side:
             raise ValueError("picked_side must match p_home direction")
-        if not math.isclose(
-            self.pick_probability,
-            expected_probability,
-            rel_tol=0.0,
-            abs_tol=1e-10,
-        ):
+        if self.pick_probability != expected_probability:
             raise ValueError("pick_probability must match p_home")
         for field in (
             "feature_row_sha256",
