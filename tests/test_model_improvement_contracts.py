@@ -19,6 +19,14 @@ from mlb_backtest.model_improvement.lane_disposition import LaneDisposition
 
 SHA = "a" * 64
 SHA_B = "b" * 64
+V51_WEIGHTS = {
+    "starter": 35,
+    "offense": 25,
+    "bullpen": 20,
+    "environment": 10,
+    "defense": 5,
+    "schedule": 5,
+}
 
 
 def fixed_recipe():
@@ -101,6 +109,7 @@ def scoring_card(
     lane_id="A",
     fold_id="H23",
     candidate_id=None,
+    candidate_payload_sha256=None,
     parent_card_sha256=None,
 ):
     return ScoringModelCard(
@@ -115,8 +124,8 @@ def scoring_card(
         feature_seal_sha256=SHA,
         prediction_contract_sha256=SHA,
         calibration_card_sha256=SHA,
-        candidate_payload_sha256=None,
-        parameters={"component_weights_pp": {"starter": 35}, "alpha": [1, {"x": True}]},
+        candidate_payload_sha256=candidate_payload_sha256,
+        parameters={"component_weights_pp": V51_WEIGHTS, "alpha": [1, {"x": True}]},
         artifact_sha256=SHA_B,
         path="scoring.json",
     )
@@ -445,7 +454,7 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
             {"model_id": "v5.1", "lane_id": "A"},
             {"model_id": "A+B", "lane_id": "A", "candidate_id": "candidate"},
             {"model_id": "A+B", "lane_id": "B", "candidate_id": None},
-            {"model_id": "A", "lane_id": "A", "fold_id": "O19"},
+            {"model_id": "A+B", "lane_id": "A", "fold_id": "O19"},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
@@ -461,23 +470,26 @@ class PredictionAndFrozenCardTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     scoring_card(**kwargs)
         self.assertEqual(
-            scoring_card(fold_id="H24", parent_card_sha256=SHA).parent_card_sha256,
+            scoring_card(
+                model_id="A", lane_id="H24", fold_id="H24", parent_card_sha256=SHA
+            ).parent_card_sha256,
             SHA,
         )
         self.assertEqual(
             scoring_card(
-                model_id="A+B+C", lane_id="C", fold_id="H23", parent_card_sha256=SHA
+                model_id="A+B+C", lane_id="C", fold_id="H23",
+                parent_card_sha256=SHA, candidate_payload_sha256=SHA,
             ).parent_card_sha256,
             SHA,
         )
 
     def test_scoring_card_validates_optional_and_lane_b_candidate_digests(self):
         lane_b = ScoringModelCard(
-            model_id="A+B", lane_id="B", fold_id="H22", candidate_id="b-s35",
+            model_id="A+B", lane_id="B", fold_id="O19", candidate_id="b-s35",
             run_spec_sha256=SHA, source_gate_sha256=SHA, baseline_replay_sha256=SHA,
             parent_card_sha256=SHA, feature_seal_sha256=SHA,
             prediction_contract_sha256=SHA, calibration_card_sha256=None,
-            candidate_payload_sha256=SHA, parameters={"component_weights_pp": {}},
+            candidate_payload_sha256=SHA, parameters={"component_weights_pp": V51_WEIGHTS},
             artifact_sha256=SHA_B, path="lane-b-scoring.json",
         )
         self.assertEqual(

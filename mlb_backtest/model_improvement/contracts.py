@@ -31,7 +31,16 @@ _UTC_RE = re.compile(
 )
 _MULTIPLIER_FAMILIES = QUALITY_FAMILIES - {None}
 _SCORING_MODEL_LANES = {"A": "A", "B": "A+B", "C": "A+B+C"}
-_SCORING_CARD_FOLDS = frozenset({"H22", "H23", "H24"})
+_SCORING_CARD_FOLDS = frozenset({"O19", "O20", "O21", "O22", "O23", "H22", "H23"})
+_LANE_A_SCORING_WEIGHTS = {
+    "starter": 35,
+    "offense": 25,
+    "bullpen": 20,
+    "environment": 10,
+    "defense": 5,
+    "schedule": 5,
+}
+_CANDIDATE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _require_exact_mapping(
@@ -175,6 +184,21 @@ def _require_json_mapping(value: object, label: str) -> Mapping[str, object]:
     frozen = _freeze_json(value)
     assert isinstance(frozen, Mapping)
     return frozen
+
+
+def _require_component_weights_pp(value: object, label: str) -> Mapping[str, int]:
+    """Validate the one closed, pre-prediction component-weight authority."""
+    if not isinstance(value, Mapping) or set(value) != set(COMPONENTS):
+        raise ValueError(f"{label} must contain exactly {list(COMPONENTS)}")
+    weights: dict[str, int] = {}
+    for component in COMPONENTS:
+        weight = value[component]
+        if isinstance(weight, bool) or not isinstance(weight, int) or weight < 0:
+            raise ValueError(f"{label} must contain nonnegative integer pp")
+        weights[component] = weight
+    if sum(weights.values()) != 100:
+        raise ValueError(f"{label} must total 100 pp")
+    return MappingProxyType(weights)
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,16 +798,38 @@ class ScoringModelCard:
     path: str
 
     def __post_init__(self) -> None:
-        if self.lane_id not in _SCORING_MODEL_LANES:
-            raise ValueError("unknown scoring card lane_id")
-        if self.model_id != _SCORING_MODEL_LANES[self.lane_id]:
-            raise ValueError("scoring card model_id and lane_id differ")
-        if self.fold_id not in _SCORING_CARD_FOLDS:
-            raise ValueError("scoring card fold_id must be H22, H23, or H24")
-        if self.lane_id == "B":
+        if self.model_id == "v5.1":
+            raise ValueError("v5.1 cannot have a scoring card")
+        if self.lane_id == "H24":
+            if self.model_id not in FROZEN_CARD_MODEL_IDS or self.fold_id != "H24":
+                raise ValueError("H24 scoring card model or fold differs")
+        else:
+            if self.lane_id not in _SCORING_MODEL_LANES:
+                raise ValueError("unknown scoring card lane_id")
+            if self.model_id != _SCORING_MODEL_LANES[self.lane_id]:
+                raise ValueError("scoring card model_id and lane_id differ")
+            if self.fold_id not in _SCORING_CARD_FOLDS:
+                raise ValueError("scoring card fold differs")
+            if self.lane_id == "C" and self.fold_id not in {"H22", "H23"}:
+                raise ValueError("Lane C scoring card fold differs")
+        candidate_required = self.lane_id == "B" or (
+            self.lane_id == "H24" and self.model_id == "A+B"
+        )
+        candidate_forbidden = self.lane_id == "A" or (
+            self.lane_id == "C"
+        ) or (self.lane_id == "H24" and self.model_id in {"A", "A+B+C"})
+        payload_required = self.lane_id in {"B", "C"} or (
+            self.lane_id == "H24" and self.model_id in {"A+B", "A+B+C"}
+        )
+        if candidate_required:
             object.__setattr__(
                 self, "candidate_id", _require_text(self.candidate_id, "candidate_id")
             )
+            if not _CANDIDATE_SEGMENT_RE.fullmatch(self.candidate_id) or self.candidate_id in {".", ".."}:
+                raise ValueError("candidate_id must be a safe candidate_id segment")
+        elif candidate_forbidden and self.candidate_id is not None:
+            raise ValueError("scoring card candidate_id differs")
+        if payload_required:
             object.__setattr__(
                 self,
                 "candidate_payload_sha256",
@@ -791,8 +837,8 @@ class ScoringModelCard:
                     self.candidate_payload_sha256, "candidate_payload_sha256"
                 ),
             )
-        elif self.candidate_id is not None or self.candidate_payload_sha256 is not None:
-            raise ValueError("only Lane B scoring cards carry candidate identity")
+        elif self.candidate_payload_sha256 is not None:
+            raise ValueError("scoring card candidate payload differs")
         for field in (
             "run_spec_sha256",
             "source_gate_sha256",
@@ -807,7 +853,7 @@ class ScoringModelCard:
             object.__setattr__(
                 self, field, _require_optional_sha256(getattr(self, field), field)
             )
-        if self.fold_id == "H24" and self.parent_card_sha256 is None:
+        if self.lane_id == "H24" and self.parent_card_sha256 is None:
             raise ValueError("H24 scoring cards require a parent card digest")
         if (
             self.model_id == "A+B+C"
@@ -815,8 +861,21 @@ class ScoringModelCard:
             and self.parent_card_sha256 is None
         ):
             raise ValueError("Lane C scoring cards require an A+B parent card digest")
+        parameters = _require_json_mapping(self.parameters, "parameters")
+        if "component_weights_pp" not in parameters:
+            raise ValueError("parameters must include component_weights_pp")
+        weights = _require_component_weights_pp(
+            parameters["component_weights_pp"], "parameters.component_weights_pp"
+        )
+        if self.lane_id == "A" and dict(weights) != _LANE_A_SCORING_WEIGHTS:
+            raise ValueError("Lane A scoring card weights differ from baseline")
         object.__setattr__(
-            self, "parameters", _require_json_mapping(self.parameters, "parameters")
+            self,
+            "parameters",
+            MappingProxyType({
+                **parameters,
+                "component_weights_pp": weights,
+            }),
         )
         artifact_sha256, path = _require_descriptor(self.artifact_sha256, self.path)
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
