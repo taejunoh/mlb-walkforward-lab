@@ -58,6 +58,15 @@ class MultibookMarketPlaysCliTests(unittest.TestCase):
         status, _, _ = self._invoke(board.main, argv)
         self.assertEqual(status, 2)
 
+    def test_board_cli_rejects_repeated_outcome_option(self) -> None:
+        argv = [
+            "admit-board", "--root", ".", "--schedule-receipt", "input/schedule.json",
+            "--capture-outcome", "a", "b", "c", "d", "e",
+            "--capture-outcome", "f", "g", "h", "i", "j",
+        ]
+        status, _, _ = self._invoke(board.main, argv)
+        self.assertEqual(status, 2)
+
     def test_evaluator_import_has_no_network_or_browser_dependency(self) -> None:
         script = """
 import builtins
