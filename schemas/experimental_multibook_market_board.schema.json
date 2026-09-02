@@ -3,14 +3,53 @@
   "title": "Normalized multibook MLB market board",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "content_sha256", "target_date", "schedule_receipt_relative", "schedule_receipt_sha256", "capture_outcomes", "games"],
+  "required": [
+    "schema",
+    "content_sha256",
+    "target_date",
+    "schedule_receipt_relative",
+    "schedule_receipt_sha256",
+    "capture_outcomes",
+    "games"
+  ],
   "properties": {
     "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V1"},
     "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "target_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
-    "schedule_receipt_relative": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+    "schedule_receipt_relative": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
     "schedule_receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "capture_outcomes": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "object"}},
-    "games": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["game_pk", "away_team", "home_team", "scheduled_start_utc", "moneylines", "totals"], "properties": {"game_pk": {"type": "integer", "minimum": 1}, "away_team": {"type": "string", "minLength": 1}, "home_team": {"type": "string", "minLength": 1}, "scheduled_start_utc": {"type": "string"}, "moneylines": {"type": "array", "items": {"type": "object"}}, "totals": {"type": "array", "items": {"type": "object"}}}}
+    "capture_outcomes": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {"type": "object"}
+    },
+    "games": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "game_pk",
+          "away_team",
+          "home_team",
+          "scheduled_start_utc",
+          "moneylines",
+          "totals"
+        ],
+        "properties": {
+          "game_pk": {"type": "integer", "minimum": 1},
+          "away_team": {"type": "string", "minLength": 1},
+          "home_team": {"type": "string", "minLength": 1},
+          "scheduled_start_utc": {"type": "string"},
+          "moneylines": {"type": "array", "items": {"type": "object"}},
+          "totals": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    }
   }
 }
