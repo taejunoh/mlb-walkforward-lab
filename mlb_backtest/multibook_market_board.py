@@ -394,14 +394,16 @@ def main(argv: list[str] | None = None) -> int:
     admit = sub.add_parser("admit-board")
     admit.add_argument("--root", type=Path, required=True)
     admit.add_argument("--schedule-receipt", type=Path, required=True)
-    admit.add_argument("--capture-outcome", type=Path, required=True, nargs=5)
+    admit.add_argument("--capture-outcome", type=Path, required=True, nargs=5, action="append")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
     try:
+        if len(args.capture_outcome) != 1:
+            raise ValueError("exactly one capture-outcome option is required")
         schedule = validate_relative_path(args.schedule_receipt)
-        outcomes = tuple(validate_relative_path(path) for path in args.capture_outcome)
+        outcomes = tuple(validate_relative_path(path) for path in args.capture_outcome[0])
         built = normalize_market_board(args.root, schedule, outcomes)
         board_relative, _ = persist_market_board(args.root, built)
     except (TypeError, ValueError, json.JSONDecodeError):
