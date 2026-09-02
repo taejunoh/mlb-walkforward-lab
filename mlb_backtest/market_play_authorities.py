@@ -82,7 +82,7 @@ class TotalsGameAuthority:
     away_team: str
     home_team: str
     expected_total: Fraction | None
-    residual_samples: tuple[float, ...]
+    residual_samples: tuple[int, ...]
     status: Literal["PROJECTED", "UNPROJECTED"]
 
 
@@ -539,6 +539,8 @@ def load_totals_authority(root: Path, totals_trace: Path) -> TotalsAuthority:
                     raise ValueError("totals residual authority count differs")
                 if not isinstance(samples, list) or len(samples) != 764:
                     raise ValueError("totals residual authority differs")
+                if any(type(value) is not int or value < 0 for value in samples):
+                    raise ValueError("totals residual samples must be integer runs")
             games.append(
                 TotalsGameAuthority(
                     int(raw["game_pk"]),
@@ -546,7 +548,7 @@ def load_totals_authority(root: Path, totals_trace: Path) -> TotalsAuthority:
                     str(raw.get("away_team_id", "")),
                     str(raw.get("home_team_id", "")),
                     None if raw["status"] != "PROJECTED" else Fraction(str(raw["expected_total"])),
-                    tuple(float(value) for value in samples),
+                    tuple(samples),
                     raw["status"],
                 )
             )
