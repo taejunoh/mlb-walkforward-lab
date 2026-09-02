@@ -545,6 +545,22 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertIn("EXCLUDED \\(not ranked\\)", readiness)
             self.assertIn("MISSING\\_HOME\\_LINEUP", readiness)
             self.assertIn("PREGAME\\_STATUS\\_NOT\\_ACCEPTED", readiness)
+            self.assertIn("- 판정:", readiness)
+            self.assertIn("- 근거:", readiness)
+            self.assertIn("- 리스크/보류 이유:", readiness)
+            self.assertEqual(readiness.count("- 판정:"), 7)
+            self.assertEqual(readiness.count("- 근거:"), 7)
+            self.assertEqual(readiness.count("- 리스크/보류 이유:"), 7)
+            self.assertIn(
+                "내부 모델은 배당·O/U 입력을 지원하지 않으며, 이 판정은 연구용 "
+                "사전 상태이지 베팅 추천이나 수익 보장이 아닙니다.",
+                readiness,
+            )
+            self.assertEqual(readiness.count("내부 모델은 배당·O/U 입력을 지원하지 않으며"), 7)
+            unscored_block = readiness[readiness.index("### 880006 · "):]
+            self.assertIn("- 판정: `UNSCORED \\(not ranked\\)`", unscored_block)
+            self.assertIn("확률을 산출하지 않음", unscored_block)
+            self.assertNotIn("승리 확률", unscored_block)
             self.assertIn("Validated away lineup count: `9`", readiness)
             self.assertIn("Validated home lineup count: `0`", readiness)
             self.assertIn("Validated away lineup count: `unknown`", readiness)
