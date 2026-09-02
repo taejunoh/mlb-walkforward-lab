@@ -409,6 +409,7 @@ def load_capture_outcome(trusted: TrustedRoot, relative: Path) -> LoadedCaptureO
             raw_payload["source_book"] != payload["source_book"]
             or hashlib.sha256(raw_snapshot.contents).hexdigest()
             != payload["raw_capture_sha256"]
+            or raw_payload["captured_at_utc"] != payload["captured_at_utc"]
         ):
             raise ValueError("available outcome is not bound to its raw capture")
         if len(raw_payload["events"]) != payload["event_count"]:
