@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
-from .market_play_authorities import MlAuthority, MlGameAuthority
+if TYPE_CHECKING:
+    from .market_play_authorities import MlAuthority, MlGameAuthority
+
 from .market_play_contracts import (
     EXPECTED_BOOKS,
     REASON_ORDER,
@@ -165,6 +168,8 @@ def evaluate_moneylines(
     evaluated_at: str,
 ) -> tuple[Mapping[str, object], ...]:
     """Evaluate every official game without a fixed play quota."""
+    from .market_play_authorities import MlAuthority
+
     if not isinstance(ml, MlAuthority) or not isinstance(board, MarketBoardAuthority):
         raise TypeError("ML authority and market board types differ")
     evaluated_at_ns = canonical_utc_ns(evaluated_at)

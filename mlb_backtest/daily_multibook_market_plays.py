@@ -5,16 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import argparse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from .market_play_authorities import (
-    load_ml_authority,
-    load_totals_authority,
-    rebind_authorities,
-)
 from .market_play_contracts import (
     POLICY,
     REASON_ORDER,
@@ -27,8 +23,6 @@ from .market_play_contracts import (
 )
 from .live_top3_contracts import validate_target_date
 from .multibook_market_board import load_market_board, load_schedule_authority
-from .multibook_ml_evaluator import evaluate_moneylines
-from .multibook_totals_evaluator import evaluate_totals
 from .secure_fs import open_trusted_root, read_regular_snapshot, write_exclusive
 
 
@@ -205,6 +199,10 @@ def build_market_plays(
     evaluated_clock: Callable[[], str],
 ) -> BuiltMarketPlays:
     """Load sealed authorities once and build immutable report/trace bytes."""
+    from .market_play_authorities import load_ml_authority, load_totals_authority
+    from .multibook_ml_evaluator import evaluate_moneylines
+    from .multibook_totals_evaluator import evaluate_totals
+
     root = Path(root)
     ml = load_ml_authority(root, ml_trace)
     totals = load_totals_authority(root, totals_trace)
@@ -280,6 +278,8 @@ def _write_or_reuse(trusted, relative: Path, contents: bytes, label: str):
 
 
 def persist_market_plays(root: Path, built: BuiltMarketPlays) -> tuple[Path, Path, Path, Path]:
+    from .market_play_authorities import rebind_authorities
+
     if not isinstance(built, BuiltMarketPlays):
         raise TypeError("built market plays differs")
     report = validate_market_plays_report(built.report)
@@ -373,3 +373,48 @@ __all__ = [
     "validate_market_plays_report",
     "validate_market_plays_trace",
 ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Evaluate sealed local evidence; never collect prices or run a model."""
+    parser = argparse.ArgumentParser(description="evaluate offline multibook market plays")
+    sub = parser.add_subparsers(dest="command", required=True)
+    evaluate = sub.add_parser("evaluate")
+    evaluate.add_argument("--root", type=Path, required=True)
+    evaluate.add_argument("--ml-trace", type=Path, required=True)
+    evaluate.add_argument("--totals-trace", type=Path, required=True)
+    evaluate.add_argument("--market-board", type=Path, required=True)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    try:
+        ml_trace = validate_relative_path(args.ml_trace)
+        totals_trace = validate_relative_path(args.totals_trace)
+        board = validate_relative_path(args.market_board)
+        built = build_market_plays(
+            args.root,
+            ml_trace,
+            totals_trace,
+            board,
+            evaluated_clock=lambda: _now_utc(),
+        )
+        _, _, _, trace_relative = persist_market_plays(args.root, built)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 2
+    except KeyboardInterrupt:
+        return 1
+    except OSError:
+        return 1
+    print(trace_relative.as_posix())
+    return 0
+
+
+def _now_utc() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

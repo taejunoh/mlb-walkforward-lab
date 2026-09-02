@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -384,3 +385,34 @@ def load_market_board(root: Path, board_path: Path, schedule: ScheduleAuthority)
         rebind_regular_snapshot(trusted, schedule.receipt_snapshot, "schedule receipt")
         rebind_regular_snapshot(trusted, schedule.receipt_sidecar_snapshot, "schedule receipt sidecar")
         return MarketBoardAuthority(str(payload["target_date"]), tuple(games), relative, snapshot, sidecar)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Admit a normalized board from five already-admitted local outcomes."""
+    parser = argparse.ArgumentParser(description="admit an offline multibook market board")
+    sub = parser.add_subparsers(dest="command", required=True)
+    admit = sub.add_parser("admit-board")
+    admit.add_argument("--root", type=Path, required=True)
+    admit.add_argument("--schedule-receipt", type=Path, required=True)
+    admit.add_argument("--capture-outcome", type=Path, required=True, nargs=5)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    try:
+        schedule = validate_relative_path(args.schedule_receipt)
+        outcomes = tuple(validate_relative_path(path) for path in args.capture_outcome)
+        built = normalize_market_board(args.root, schedule, outcomes)
+        board_relative, _ = persist_market_board(args.root, built)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 2
+    except KeyboardInterrupt:
+        return 1
+    except OSError:
+        return 1
+    print(board_relative.as_posix())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

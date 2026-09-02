@@ -428,11 +428,24 @@ def main(argv: list[str] | None = None) -> int:
     unavailable = sub.add_parser("unavailable")
     unavailable.add_argument("--root", type=Path, required=True)
     unavailable.add_argument("--record", type=Path, required=True)
-    args = parser.parse_args(argv)
     try:
-        result = admit_raw_market_capture(args.root, args.raw_capture) if args.command == "admit" else record_unavailable_book(args.root, args.record)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    try:
+        evidence = args.raw_capture if args.command == "admit" else args.record
+        validate_relative_path(evidence)
+        result = (
+            admit_raw_market_capture(args.root, evidence)
+            if args.command == "admit"
+            else record_unavailable_book(args.root, evidence)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
         return 2
+    except KeyboardInterrupt:
+        return 1
+    except OSError:
+        return 1
     print(result.as_posix())
     return 0
 

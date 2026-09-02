@@ -99,3 +99,14 @@ official-starter verification, and formal T-45 admission are outside this MVP.
 Task 9 implementation is ready, but the first successful live report is still
 pending external Savant publication. No successful report has yet been
 generated, and this guide does not claim live-smoke completion.
+
+## Relationship to the multi-book market layer
+
+This V1 Top 3 report remains a preserved model authority. It is not replaced
+by, and does not itself contain, sportsbook prices. The separate
+`experimental_multibook_market_plays` evaluator consumes this report's sealed
+ML trace together with the sealed totals trace, participant evidence, and a
+five-book normalized board. Its output is full-slate `PLAY`/`PASS` research
+evidence, with no fixed Top 3 quota and no wagering guarantee. See
+`docs/experimental_multibook_market_plays.md` for the offline collector
+handoff and runbook.

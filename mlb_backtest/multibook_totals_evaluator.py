@@ -7,12 +7,11 @@ from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
-from .market_play_authorities import (
-    ParticipantGateEvidence,
-    TotalsAuthority,
-    TotalsGameAuthority,
-)
+if TYPE_CHECKING:
+    from .market_play_authorities import ParticipantGateEvidence, TotalsAuthority, TotalsGameAuthority
+
 from .market_play_contracts import (
     EXPECTED_BOOKS,
     REASON_ORDER,
@@ -89,9 +88,11 @@ def _sample_counts(game: TotalsGameAuthority) -> tuple[int, ...]:
 
 
 def evaluate_total_candidate(
-    game: TotalsGameAuthority, quote: TotalQuote, direction: str
+    game, quote: TotalQuote, direction: str
 ) -> TotalCandidate:
     """Evaluate one exact (book, line, direction, price) combination."""
+    from .market_play_authorities import TotalsGameAuthority
+
     if not isinstance(game, TotalsGameAuthority) or not isinstance(quote, TotalQuote):
         raise TypeError("totals game and quote types differ")
     if direction not in {"OVER", "UNDER"}:
@@ -227,12 +228,14 @@ def _row(
 
 def evaluate_totals(
     totals: TotalsAuthority,
-    participants: Mapping[int, ParticipantGateEvidence],
+    participants: Mapping[int, object],
     board: MarketBoardAuthority,
     *,
     evaluated_at: str,
 ) -> tuple[Mapping[str, object], ...]:
     """Evaluate every official game and emit at most one total PLAY each."""
+    from .market_play_authorities import ParticipantGateEvidence, TotalsAuthority
+
     if not isinstance(totals, TotalsAuthority) or not isinstance(board, MarketBoardAuthority):
         raise TypeError("totals authority and board types differ")
     if not isinstance(participants, Mapping):
