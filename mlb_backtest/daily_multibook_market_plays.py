@@ -23,7 +23,12 @@ from .market_play_contracts import (
 )
 from .live_top3_contracts import validate_target_date
 from .multibook_market_board import load_market_board, load_schedule_authority
-from .secure_fs import open_trusted_root, read_regular_snapshot, write_exclusive
+from .secure_fs import (
+    open_trusted_root,
+    read_regular_snapshot,
+    rebind_regular_snapshot,
+    write_exclusive,
+)
 
 
 REPORT_SCHEMA = "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_V1"
@@ -323,6 +328,7 @@ def persist_market_plays(root: Path, built: BuiltMarketPlays) -> tuple[Path, Pat
     if markdown_bytes != rebuilt.markdown_bytes:
         raise ValueError("built market-play markdown bytes differ")
     with open_trusted_root(root) as trusted:
+        input_snapshots = []
         for field, label in (
             ("ml_trace_relative", "ML trace"),
             ("totals_trace_relative", "totals trace"),
@@ -333,14 +339,30 @@ def persist_market_plays(root: Path, built: BuiltMarketPlays) -> tuple[Path, Pat
             )
             if snapshot is None or _sha(snapshot.contents) != report[field.replace("_relative", "_sha256")]:
                 raise ValueError(f"{label} binding differs")
-        _write_or_reuse(trusted, report_relative.with_suffix(".sha256"), rebuilt.sidecar_bytes, "market-play report sidecar")
-        _write_or_reuse(trusted, report_relative, rebuilt.report_bytes, "market-play report")
-        _write_or_reuse(trusted, report_relative.with_suffix(".md"), rebuilt.markdown_bytes, "market-play markdown")
+            input_snapshots.append((snapshot, label))
+        output_snapshots = []
+        output_snapshots.append((
+            _write_or_reuse(trusted, report_relative.with_suffix(".sha256"), rebuilt.sidecar_bytes, "market-play report sidecar"),
+            "market-play report sidecar",
+        ))
+        output_snapshots.append((
+            _write_or_reuse(trusted, report_relative, rebuilt.report_bytes, "market-play report"),
+            "market-play report",
+        ))
+        output_snapshots.append((
+            _write_or_reuse(trusted, report_relative.with_suffix(".md"), rebuilt.markdown_bytes, "market-play markdown"),
+            "market-play markdown",
+        ))
         trace_relative = report_relative.with_suffix(".trace.json")
-        _write_or_reuse(trusted, trace_relative, trace_bytes, "market-play trace")
+        output_snapshots.append((
+            _write_or_reuse(trusted, trace_relative, trace_bytes, "market-play trace"),
+            "market-play trace",
+        ))
         # The trace is the sole success artifact.  Rebind every authority and
         # then reread all four outputs and their exact sidecar/digest links.
         rebind_authorities(*rebuilt.authorities)
+        for snapshot, label in (*input_snapshots, *output_snapshots):
+            rebind_regular_snapshot(trusted, snapshot, label)
         expected_outputs = (
             (report_relative.with_suffix(".sha256"), rebuilt.sidecar_bytes, "market-play report sidecar"),
             (report_relative, rebuilt.report_bytes, "market-play report"),
