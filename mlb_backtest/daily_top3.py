@@ -308,6 +308,70 @@ def _schedule_quality_flags_text(row: Mapping[str, object]) -> str:
     )
 
 
+_REASON_EXPLANATIONS = {
+    "PROBABLE_CONSISTENT": "예상 선발과 관측 선발이 일치",
+    "MISSING_AWAY_LINEUP": "원정 라인업 누락",
+    "MISSING_HOME_LINEUP": "홈 라인업 누락",
+    "MISSING_AWAY_PITCHER_LIST": "원정 선발 관측 누락",
+    "MISSING_HOME_PITCHER_LIST": "홈 선발 관측 누락",
+    "MISSING_SCHEDULE_PROBABLE": "공식 예상 선발 누락",
+}
+_FLAG_EXPLANATIONS = {
+    "doubleheader_unsupported": "더블헤더 특성 미지원",
+}
+_MODEL_DISCLAIMER = (
+    "내부 모델은 배당·O/U 입력을 지원하지 않으며, 이 판정은 연구용 "
+    "사전 상태이지 베팅 추천이나 수익 보장이 아닙니다."
+)
+
+
+def _decision_explanation_lines(
+    game: Mapping[str, object],
+    row: Mapping[str, object] | None,
+    participant: object,
+) -> tuple[str, ...]:
+    """Render deterministic, evidence-only Korean decision explanations."""
+    classification = _readiness_classification(row)
+    reasons = tuple(str(code) for code in (row or {}).get("reason_codes", ()))
+    reason_text = tuple(
+        _REASON_EXPLANATIONS.get(code, f"원본 코드: {code}")
+        for code in reasons
+    )
+    flag_text: list[str] = []
+    if row is not None:
+        raw_flags = row.get("schedule_quality_flags") or {}
+        if isinstance(raw_flags, Mapping):
+            for side in ("away", "home"):
+                for code in raw_flags.get(side, ()):
+                    flag_text.append(
+                        _FLAG_EXPLANATIONS.get(str(code), f"원본 코드: {code}")
+                    )
+    if row is None or row.get("state") in {"UNSCORED", "EXCLUDED"}:
+        evidence = "확률을 산출하지 않음"
+        risks = (*reason_text, *flag_text) or ("필수 입력 부족",)
+    else:
+        probability = float(row["pick_probability"])
+        away_count = _readiness_observed(participant, "away")[1]
+        home_count = _readiness_observed(participant, "home")[1]
+        evidence = (
+            f'{row["predicted_winner"]} 승리 확률 {probability:.1%}; '
+            f"검증된 라인업 {away_count}명/{home_count}명"
+        )
+        if "PROBABLE_CONSISTENT" in reasons:
+            evidence += "; 선발 예상 일치"
+        risks = (
+            f'데이터 완전성 {float(row["data_completeness"]):.1%}',
+            *reason_text,
+            *flag_text,
+        )
+    return (
+        f"- 판정: `{_escape_table(classification)}`",
+        f"- 근거: {_escape_table(evidence)}",
+        f"- 리스크/보류 이유: {_escape_table('; '.join(risks) or 'none')}",
+        f"- {_MODEL_DISCLAIMER}",
+    )
+
+
 def _ranked_table(rows: Sequence[Mapping[str, object]]) -> str:
     return _markdown_table(
         ("Rank", "Game", "Pick", "Probability", "Completeness", "Start (UTC)", "Reasons", "Schedule quality flags"),
@@ -553,6 +617,13 @@ def render_live_pregame_readiness_markdown(
         )
         sections.extend(_readiness_binding_lines("Participant", participant_binding))
         sections.extend(_readiness_binding_lines("Later final-schedule recheck", final_binding))
+        sections.extend(
+            _decision_explanation_lines(
+                game,
+                row,
+                participant if participant_binding else None,
+            )
+        )
     sections.append("")
     return "\n".join(sections)
 

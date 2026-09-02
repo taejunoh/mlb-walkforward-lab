@@ -69,10 +69,10 @@ class DailyTop3Tests(unittest.TestCase):
             readiness_slate, payload
         )
 
-        self.assertEqual(rendered.count("UNSCORED \\(not ranked\\)"), 2)
-        self.assertEqual(rendered.count("EXCLUDED \\(not ranked\\)"), 2)
+        self.assertEqual(rendered.count("UNSCORED \\(not ranked\\)"), 3)
+        self.assertEqual(rendered.count("EXCLUDED \\(not ranked\\)"), 3)
         self.assertIn("MISSING\\_HOME\\_LINEUP", rendered)
-        self.assertEqual(rendered.count("not listed in ranked output"), 2)
+        self.assertEqual(rendered.count("not listed in ranked output"), 3)
 
     def test_readiness_renderer_binds_observations_without_inventing_values(self):
         from mlb_backtest import daily_top3
@@ -684,6 +684,90 @@ class DailyTop3Tests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
                     self.assertEqual(daily_top3.main(["--json-only"]), 0)
                 self.assertEqual(json.loads(stdout.getvalue()), payload)
+
+
+class DecisionExplanationTests(unittest.TestCase):
+    @staticmethod
+    def _block(rendered: str, game_pk: int) -> str:
+        marker = f"### {game_pk} ·"
+        start = rendered.index(marker)
+        end = rendered.find("\n### ", start + len(marker))
+        return rendered[start:] if end == -1 else rendered[start:end]
+
+    def test_ranked_row_explains_evidence_and_risk(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+
+        block = self._block(
+            daily_top3.render_live_pregame_readiness_markdown(slate, payload), 1
+        )
+
+        self.assertIn("판정: `PRELIMINARY \\(rank 1\\)`", block)
+        self.assertIn("근거: Home 승리 확률 54.1%", block)
+        self.assertIn("검증된 라인업 9명/9명", block)
+        self.assertIn("선발 예상 일치", block)
+        self.assertIn("리스크/보류 이유: 데이터 완전성 90.0%", block)
+        self.assertIn("내부 모델은 배당·O/U 입력을 지원하지 않으며", block)
+
+    def test_unscored_row_explains_missing_inputs_without_probability(self):
+        from dataclasses import replace
+
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import (
+            _build,
+            _final_observer,
+            _game,
+            _participants,
+            _slate,
+        )
+
+        game = _game(1)
+        participant = replace(
+            _participants(
+                1,
+                complete=False,
+                reasons=("MISSING_AWAY_LINEUP", "MISSING_AWAY_PITCHER_LIST"),
+            ),
+            away_pitcher_list_id=None,
+            away_lineup=(),
+        )
+        slate = _slate((game,), participants={1: participant})
+        payload = _build(slate, _final_observer((game,)))
+        block = self._block(
+            daily_top3.render_live_pregame_readiness_markdown(slate, payload), 1
+        )
+
+        self.assertIn("판정: `UNSCORED \\(not ranked\\)`", block)
+        self.assertIn("확률을 산출하지 않음", block)
+        self.assertIn("원정 라인업 누락", block)
+        self.assertIn("원정 선발 관측 누락", block)
+        self.assertNotIn("승리 확률", block)
+        self.assertNotIn("예상 승자", block)
+
+    def test_unknown_reason_and_flag_use_stable_fallback_and_render_is_deterministic(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _game
+
+        game = _game(1)
+        row = {
+            "state": "UNSCORED",
+            "reason_codes": ("UNKNOWN_REASON",),
+            "schedule_quality_flags": {
+                "away": ("UNKNOWN_FLAG",),
+                "home": (),
+            },
+        }
+
+        first = daily_top3._decision_explanation_lines(game, row, None)
+        second = daily_top3._decision_explanation_lines(game, row, None)
+        self.assertEqual(first, second)
+        rendered = "\n".join(first)
+        self.assertIn("원본 코드: UNKNOWN\\_REASON", rendered)
+        self.assertIn("원본 코드: UNKNOWN\\_FLAG", rendered)
 
 
 if __name__ == "__main__":
