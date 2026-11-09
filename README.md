@@ -1,12 +1,10 @@
 # MLB Walk-Forward Lab
 
-[한국어 README](README.ko.md)
-
 A research project for timestamped MLB pregame forecasts and auditable settlement. The September 2026 operating period ended on September 30 at 16:18 EDT. Recurring checks remain paused. This repository preserves the code, reports, and evidence from that period.
 
 The official record is **24 pregame claims, 23 settlements, and 10 correct picks (43.5%)**. The sample covers three regular-season slates. It does not establish predictive improvement or a betting edge.
 
-- [Operations closeout](reports/daily_review/2026-09-30/operations-closeout-2026-09.en.md) · [한국어 종료 보고서](reports/daily_review/2026-09-30/operations-closeout-2026-09.md)
+- [Operations closeout](reports/daily_review/2026-09-30/operations-closeout-2026-09.en.md)
 - [Post-closeout verification record](reports/daily_review/2026-09-30/post-closeout-verification-2026-11-09.json)
 - [Recorded time and token accounting](reports/daily_review/2026-09-30/operations-effort-2026-09.en.md) · [Report index](reports/english-index.md)
 

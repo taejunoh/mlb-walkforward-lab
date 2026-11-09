@@ -1,14 +1,12 @@
 # MLB Walk-Forward Lab
 
-[English README](README.md)
-
 MLB 경기 시작 전에 예측을 기록하고, 공식 결과가 나오면 같은 기록으로 정산하는 연구 프로젝트입니다. 2026년 9월 운영은 9월 30일 16:18 EDT에 종료했고, 정기 점검은 계속 일시정지 상태입니다. 이 저장소에는 당시 코드와 보고서, 검증 근거를 보존합니다.
 
 공식 기록은 **사전 등록 24건, 공식 정산 23건, 적중 10건(43.5%)**입니다. 정규시즌 세 경기일의 소표본으로, 모델 개선이나 베팅 우위를 입증하지는 못했습니다.
 
-- [운영 종료 보고서](reports/daily_review/2026-09-30/operations-closeout-2026-09.md) · [English closeout](reports/daily_review/2026-09-30/operations-closeout-2026-09.en.md)
-- [종료 후 검증 기록](reports/daily_review/2026-09-30/post-closeout-verification-2026-11-09.json)
-- [기록된 시간·토큰 집계](reports/daily_review/2026-09-30/operations-effort-2026-09.ko.md) · [보고서 색인](reports/english-index.md)
+- [운영 종료 보고서](reports/daily_review/2026-09-30/operations-closeout-2026-09.md)
+- [9월 경기별 분석 현황](reports/daily_review/2026-09-30/september-analysis-coverage-20260930.md)
+- [기록된 시간·토큰 집계](reports/daily_review/2026-09-30/operations-effort-2026-09.ko.md)
 
 ## 무엇을 했나
 
@@ -44,8 +42,8 @@ Python 워크플로는 예측과 그 근거를 정산과 분리해 저장합니�
 
 ## 저장소 안내
 
-- [`mlb_backtest/`](mlb_backtest) — 예측, 증빙, 정산 코드.
-- [`reports/daily_review/`](reports/daily_review) — 운영 점검, 종료 보고서, 정산 기록.
-- [`audit/prospective_ml_daily_flow/`](audit/prospective_ml_daily_flow) — 보존한 워크플로 영수증.
-- [`data/experimental_daily/history_cache/`](data/experimental_daily/history_cache) — 운영 기간의 원본 응답 캐시.
-- [`tests/`](tests)와 [포스트시즌 연구 절차](docs/postseason_ml_research.md) — 재현과 운영 범위. 절차에 나온 실데이터 명령은 문서화 예시입니다.
+- [연구 코드](mlb_backtest) — 예측, 증빙, 정산 코드.
+- [일일 검토 기록](reports/daily_review) — 운영 점검, 종료 보고서, 정산 기록.
+- [워크플로 영수증](audit/prospective_ml_daily_flow) — 보존한 사전 등록·정산 증빙.
+- [원본 입력 캐시](data/experimental_daily/history_cache) — 운영 기간에 수집한 원본 응답.
+- [재현 테스트](tests) — 검증 시나리오와 회귀 테스트.
