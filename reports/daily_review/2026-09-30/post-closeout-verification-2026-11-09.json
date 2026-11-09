@@ -1,0 +1,73 @@
+{
+  "verification_date_eastern": "2026-11-09",
+  "source_revision": "14975e1500cee99e6da4485a2d82c8ace7e7ad1a",
+  "recurring_operations": "PAUSED",
+  "official_input_reconciliation": {
+    "status": "PASSED",
+    "first_played_date": "2026-03-25",
+    "coverage_cutoff_eastern": "2026-11-08",
+    "game_types": ["R", "F", "D", "L", "W"],
+    "canonical_schedule_games": 2470,
+    "cancelled_games_excluded": 1,
+    "played_games": 2469,
+    "played_regular_season_games": 2429,
+    "played_postseason_games": 40,
+    "statcast_games": 2469,
+    "unique_pitch_rows": 728343,
+    "pitch_rows_by_type": {
+      "R": 716792,
+      "F": 2604,
+      "D": 4641,
+      "L": 2785,
+      "W": 1521
+    },
+    "missing_game_ids": [],
+    "extra_game_ids": [],
+    "date_or_type_mismatch_game_ids": [],
+    "duplicate_pitch_keys": 0,
+    "verified_schedule_receipts": 1,
+    "verified_statcast_receipts": 46,
+    "reused_march_shards": 1,
+    "new_april_onward_shards": 45,
+    "new_shard_max_calendar_days": 5,
+    "statcast_row_cap": 25000,
+    "method": "Isolated master research-history loader with a date-partition override only; the existing source, admission, identity and coverage checks were retained. An independent comparison checked raw hashes, date coverage and pitch keys.",
+    "official_schedule_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R%2CF%2CD%2CL%2CW&startDate=2026-01-01&endDate=2026-11-08&hydrate=probablePitcher%2Cvenue%2Clinescore",
+    "official_statcast_endpoint": "https://baseballsavant.mlb.com/statcast_search/csv",
+    "raw_schedule_sha256": "64678be10387b02664fe0cfc15c7a57b15f398cf02b09aceffe6c99b1f5adf27"
+  },
+  "offline_pregame_settlement": {
+    "status": "PASSED",
+    "network_access": "BLOCKED",
+    "test_modules": [
+      "tests/test_postseason_research_flow.py",
+      "tests/test_postseason_research_prospective.py",
+      "tests/test_postseason_research_settlement.py"
+    ],
+    "tests_passed": 33,
+    "subtests_passed": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "elapsed_seconds": 114.841
+  },
+  "live_single_game": {
+    "status": "NOT_RUN",
+    "reason": "No future F/D/L/W game was listed in the November 9, 2026 official query through December 31, 2027.",
+    "official_future_schedule_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=F%2CD%2CL%2CW&startDate=2026-11-09&endDate=2027-12-31",
+    "listed_games": 0,
+    "live_primary_claims_created": 0,
+    "live_settlements_created": 0,
+    "follow_up_scheduled": false
+  },
+  "evidence_retention": {
+    "note": "This file is a closeout summary. Raw November observations, native receipts, and original test output were retained separately in the local isolated verification directories; they are not embedded in this repository record.",
+    "sha256": {
+      "research_loader_result_json": "7a4cf5ab4361051beaaa41af3b4571cd9ff272b8869b69fa1cd5c1ace2cc7b3c",
+      "independent_comparison_json": "b3e7a160bddfa2ed02f9837526e83a789d68fb50d25103f0ced1c8248a5cb73a",
+      "accepted_native_artifacts_json": "9f366d7b103671e3b69788bf5e0efbacf4e013b7da9004d3f42498a358cefa78",
+      "offline_junit_xml": "d5a83b94199704280dd7064ce41fdf573ec2cd28716b87a1795f27109df361eb"
+    }
+  },
+  "interpretation": "Input and fixture verification do not establish postseason predictive performance or authorize resumption."
+}
