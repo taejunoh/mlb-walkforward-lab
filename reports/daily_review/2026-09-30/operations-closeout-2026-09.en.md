@@ -84,5 +84,6 @@ The user requested an operational pause. Before that request, the postseason wor
 | Operations logs and settlement reviews | [Daily review directory](..) · [Final status JSON](operations-status.json) |
 | Pregame and postgame workflow receipts and immutable settlement heads | [Workflow receipts](../../../audit/prospective_ml_daily_flow) · [Settlement heads](../../../audit/prospective_ml_observation/settlement_heads) |
 | Model runs, traces, and source inputs | [ML reports](../../experimental_daily) · [Totals reports](../../experimental_daily_totals) · [Raw input cache](../../../data/experimental_daily/history_cache) |
-| Post-closeout checks | [Verification record and evidence fingerprints](post-closeout-verification-2026-11-09.json) |
+| Post-closeout checks | [Verification record and evidence fingerprints](post-closeout-verification-2026-11-09.json) · [November verification evidence index](november-verification/README.md) · [Evidence archive](november-verification) |
+| License scope | [MIT License](../../../LICENSE) for original project code and documentation; [third-party notices](../../../THIRD_PARTY_NOTICES.md) exclude MLB/Statcast and other external materials |
 | GitHub archive | [Master merge snapshot](https://github.com/taejunoh/mlb-walkforward-lab/tree/ef4930b1996f247da91e5574d4305392b494008a) |

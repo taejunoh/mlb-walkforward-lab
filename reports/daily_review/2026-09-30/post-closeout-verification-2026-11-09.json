@@ -61,7 +61,7 @@
     "follow_up_scheduled": false
   },
   "evidence_retention": {
-    "note": "This file is a closeout summary. Raw November observations, native receipts, and original test output were retained separately in the local isolated verification directories; they are not embedded in this repository record.",
+    "note": "This file is a closeout summary. The November evidence index and archived metadata, receipts, network observations, and test output are in november-verification/ relative to this record. Historical absolute payload paths in manifests identify original provenance locations and are not portable links. External MLB/Statcast .raw and .csv payloads are intentionally excluded; this evidence archive alone cannot rerun the raw-data reconciliation. Archiving evidence does not add validation beyond the results recorded here.",
     "sha256": {
       "research_loader_result_json": "7a4cf5ab4361051beaaa41af3b4571cd9ff272b8869b69fa1cd5c1ace2cc7b3c",
       "independent_comparison_json": "b3e7a160bddfa2ed02f9837526e83a789d68fb50d25103f0ced1c8248a5cb73a",

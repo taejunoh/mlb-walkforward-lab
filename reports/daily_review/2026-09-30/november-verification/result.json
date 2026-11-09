@@ -1,0 +1,19 @@
+{
+  "elapsed_seconds": 151.33704833313823,
+  "full_range_game_set_gate": "passed",
+  "game_types": {
+    "D": 4641,
+    "F": 2604,
+    "L": 2785,
+    "R": 716792,
+    "W": 1521
+  },
+  "pitch_rows": 728343,
+  "played_games": 2469,
+  "schedule_bindings": 1,
+  "schedule_games": 2470,
+  "statcast_bindings": 46,
+  "statcast_games": 2469,
+  "status": "passed",
+  "strict_game_identity_gate": "passed"
+}

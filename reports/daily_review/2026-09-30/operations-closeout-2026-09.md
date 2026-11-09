@@ -87,5 +87,6 @@
 | 운영 점검 로그와 정산 검토서 | [일일 검토 디렉터리](..) · [마지막 상태 JSON](operations-status.json) |
 | 경기 전·후 워크플로 영수증 및 영구 정산 기록 | [워크플로 영수증](../../../audit/prospective_ml_daily_flow) · [경기별 정산 기록](../../../audit/prospective_ml_observation/settlement_heads) |
 | 모델 실행 결과·trace 및 입력 캐시 | [ML 보고서](../../experimental_daily) · [총점 보고서](../../experimental_daily_totals) · [원본 입력 캐시](../../../data/experimental_daily/history_cache) |
-| 종료 후 검증 | [검증 결과 및 증빙 해시](post-closeout-verification-2026-11-09.json) |
+| 종료 후 검증 | [검증 결과 및 증빙 해시](post-closeout-verification-2026-11-09.json) · [11월 검증 증빙 안내](november-verification/README.ko.md) · [증빙 보관 자료](november-verification) |
+| 라이선스 범위 | 프로젝트에서 직접 작성한 코드·문서에 적용되는 [MIT License](../../../LICENSE); MLB/Statcast 등 외부 자료를 제외하는 [제3자 고지](../../../THIRD_PARTY_NOTICES.md) |
 | GitHub 보존 기준점 | [`master` 병합 시점 스냅샷](https://github.com/taejunoh/mlb-walkforward-lab/tree/ef4930b1996f247da91e5574d4305392b494008a) |

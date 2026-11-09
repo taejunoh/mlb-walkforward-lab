@@ -1,0 +1,278 @@
+[
+  {
+    "end": "2026-03-31",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/9d1d4559a66cfe5bae3c38751f193905074798933182c6b3d0fea384d53464a2.raw",
+    "sha256": "9d1d4559a66cfe5bae3c38751f193905074798933182c6b3d0fea384d53464a2",
+    "start": "2026-03-25"
+  },
+  {
+    "end": "2026-04-05",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/6493e048878361756dc75de6483205850a38eaf917f9d5d51f0b433b9421b987.raw",
+    "sha256": "6493e048878361756dc75de6483205850a38eaf917f9d5d51f0b433b9421b987",
+    "start": "2026-04-01"
+  },
+  {
+    "end": "2026-04-10",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/d16f6eec39627524b219b85ebabb00b3ba75ffbe209a2fe63396e3ec4698d0f0.raw",
+    "sha256": "d16f6eec39627524b219b85ebabb00b3ba75ffbe209a2fe63396e3ec4698d0f0",
+    "start": "2026-04-06"
+  },
+  {
+    "end": "2026-04-15",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/376c9eb659daf19a354bdba786cff4420b53f58a11d015184166d7608eb8b21f.raw",
+    "sha256": "376c9eb659daf19a354bdba786cff4420b53f58a11d015184166d7608eb8b21f",
+    "start": "2026-04-11"
+  },
+  {
+    "end": "2026-04-20",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/081a326fa0c56f766bd7bf63b77414be2ad7e328e3a91b4bc422e89c112337c9.raw",
+    "sha256": "081a326fa0c56f766bd7bf63b77414be2ad7e328e3a91b4bc422e89c112337c9",
+    "start": "2026-04-16"
+  },
+  {
+    "end": "2026-04-25",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/ccde1f9b88bc02905c5b3beb3202bca6d9f351b0847603a7a03622b333eb8271.raw",
+    "sha256": "ccde1f9b88bc02905c5b3beb3202bca6d9f351b0847603a7a03622b333eb8271",
+    "start": "2026-04-21"
+  },
+  {
+    "end": "2026-04-30",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/a34175432d1f626d26053227d83e1e0edbbade8529eb1452c23ed8ac550968ba.raw",
+    "sha256": "a34175432d1f626d26053227d83e1e0edbbade8529eb1452c23ed8ac550968ba",
+    "start": "2026-04-26"
+  },
+  {
+    "end": "2026-05-05",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/a23a6d767d01557983f8c05c270683151263ce61a61f81ea0b0c2b50daeb0e89.raw",
+    "sha256": "a23a6d767d01557983f8c05c270683151263ce61a61f81ea0b0c2b50daeb0e89",
+    "start": "2026-05-01"
+  },
+  {
+    "end": "2026-05-10",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/f8339cf3640964e1c5c1270a2b033b71e8c6f8d08d636d4b36085b7b4ab66055.raw",
+    "sha256": "f8339cf3640964e1c5c1270a2b033b71e8c6f8d08d636d4b36085b7b4ab66055",
+    "start": "2026-05-06"
+  },
+  {
+    "end": "2026-05-15",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/6d0b854eaabb7ae63b019ba682d42c5cf60eccedbb9ee57fb9ec160f2d871c09.raw",
+    "sha256": "6d0b854eaabb7ae63b019ba682d42c5cf60eccedbb9ee57fb9ec160f2d871c09",
+    "start": "2026-05-11"
+  },
+  {
+    "end": "2026-05-20",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/f95185423d9004805b9c3f9c1d9e1d31230814195ce3a36927e2021988de5d27.raw",
+    "sha256": "f95185423d9004805b9c3f9c1d9e1d31230814195ce3a36927e2021988de5d27",
+    "start": "2026-05-16"
+  },
+  {
+    "end": "2026-05-25",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/1a89964c8f2bfe56e2f0312439fb59396f95a3a433cf9aa3edc4d287732f0ceb.raw",
+    "sha256": "1a89964c8f2bfe56e2f0312439fb59396f95a3a433cf9aa3edc4d287732f0ceb",
+    "start": "2026-05-21"
+  },
+  {
+    "end": "2026-05-30",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/bf5ef3b2f0e34b7a7ace47a32d17f966ed9e8d27dedf27a782d9c5ad65c93c05.raw",
+    "sha256": "bf5ef3b2f0e34b7a7ace47a32d17f966ed9e8d27dedf27a782d9c5ad65c93c05",
+    "start": "2026-05-26"
+  },
+  {
+    "end": "2026-06-04",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/f0af79dbe7ca71a334314a17cd7e24b384f752ced37879eb9776d59e7e7da85b.raw",
+    "sha256": "f0af79dbe7ca71a334314a17cd7e24b384f752ced37879eb9776d59e7e7da85b",
+    "start": "2026-05-31"
+  },
+  {
+    "end": "2026-06-09",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/33e3158e92fad903b411138d14c94c0cd85f076f150db1275339cd1d5ae9225f.raw",
+    "sha256": "33e3158e92fad903b411138d14c94c0cd85f076f150db1275339cd1d5ae9225f",
+    "start": "2026-06-05"
+  },
+  {
+    "end": "2026-06-14",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/3afb8e00ce6fec84ed27ab35a0ed1c68e418247a5aee0f3c54bb30f5e3254a64.raw",
+    "sha256": "3afb8e00ce6fec84ed27ab35a0ed1c68e418247a5aee0f3c54bb30f5e3254a64",
+    "start": "2026-06-10"
+  },
+  {
+    "end": "2026-06-19",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/0bce6735f498e593fcd4ee9443a49de67bb913d1ddb6cfb538710b5273d5fe21.raw",
+    "sha256": "0bce6735f498e593fcd4ee9443a49de67bb913d1ddb6cfb538710b5273d5fe21",
+    "start": "2026-06-15"
+  },
+  {
+    "end": "2026-06-24",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/c58227c68cd4a923c9401c262922d706363c7c7a746af639d86c04072b7510ad.raw",
+    "sha256": "c58227c68cd4a923c9401c262922d706363c7c7a746af639d86c04072b7510ad",
+    "start": "2026-06-20"
+  },
+  {
+    "end": "2026-06-29",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/db8af37d2afebeeff169ac7f1f526c134585ac7d18c754c7e17ec9cad7af595e.raw",
+    "sha256": "db8af37d2afebeeff169ac7f1f526c134585ac7d18c754c7e17ec9cad7af595e",
+    "start": "2026-06-25"
+  },
+  {
+    "end": "2026-07-04",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/9387d96bf6c507578b706bbbc00583eaa21dab0227eb6049b19914a313a4117e.raw",
+    "sha256": "9387d96bf6c507578b706bbbc00583eaa21dab0227eb6049b19914a313a4117e",
+    "start": "2026-06-30"
+  },
+  {
+    "end": "2026-07-09",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/25b59a0de900cbc43bfbab5235f44c599108420941cde11ee89a7a2f4722e266.raw",
+    "sha256": "25b59a0de900cbc43bfbab5235f44c599108420941cde11ee89a7a2f4722e266",
+    "start": "2026-07-05"
+  },
+  {
+    "end": "2026-07-14",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/9f28f4cd668577d40956dc765fc4bcb8a42dc541ead902d9ef95c6fc45d17578.raw",
+    "sha256": "9f28f4cd668577d40956dc765fc4bcb8a42dc541ead902d9ef95c6fc45d17578",
+    "start": "2026-07-10"
+  },
+  {
+    "end": "2026-07-19",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/6781509d2699552d13521b9b18f3796352d20bbdf39ae6fba5164c73378bd9ec.raw",
+    "sha256": "6781509d2699552d13521b9b18f3796352d20bbdf39ae6fba5164c73378bd9ec",
+    "start": "2026-07-15"
+  },
+  {
+    "end": "2026-07-24",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/2630dabaed9cd962e792af01a81f1bf4afa83334c8decf1c4b8b1382da697ba1.raw",
+    "sha256": "2630dabaed9cd962e792af01a81f1bf4afa83334c8decf1c4b8b1382da697ba1",
+    "start": "2026-07-20"
+  },
+  {
+    "end": "2026-07-29",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/30a80420097afb5b544836e7a3ce4cb298d503076d762c4799fb4577531f50bc.raw",
+    "sha256": "30a80420097afb5b544836e7a3ce4cb298d503076d762c4799fb4577531f50bc",
+    "start": "2026-07-25"
+  },
+  {
+    "end": "2026-08-03",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/be9ede76891242f774710efd292072cdccd07b650daffe49dcdbb86f412d36d0.raw",
+    "sha256": "be9ede76891242f774710efd292072cdccd07b650daffe49dcdbb86f412d36d0",
+    "start": "2026-07-30"
+  },
+  {
+    "end": "2026-08-08",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/2cb7ac12ea291c475aa1a53b2ca04ba87b14d8ba35313702a700edd16c9c86ce.raw",
+    "sha256": "2cb7ac12ea291c475aa1a53b2ca04ba87b14d8ba35313702a700edd16c9c86ce",
+    "start": "2026-08-04"
+  },
+  {
+    "end": "2026-08-13",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/f09156b9a3cd7a471858252bda90ea28bf7d3655b01e586e234ae2d2841455b9.raw",
+    "sha256": "f09156b9a3cd7a471858252bda90ea28bf7d3655b01e586e234ae2d2841455b9",
+    "start": "2026-08-09"
+  },
+  {
+    "end": "2026-08-18",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/7d8f14b8ec5f77abc02154efd4134b0c02b45d75c076247d35b153e986a86ef2.raw",
+    "sha256": "7d8f14b8ec5f77abc02154efd4134b0c02b45d75c076247d35b153e986a86ef2",
+    "start": "2026-08-14"
+  },
+  {
+    "end": "2026-08-23",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/13b66b6e638c7f9f37c39508b3146f05a459a1bc3e1a18b55ccb0c7535c69f43.raw",
+    "sha256": "13b66b6e638c7f9f37c39508b3146f05a459a1bc3e1a18b55ccb0c7535c69f43",
+    "start": "2026-08-19"
+  },
+  {
+    "end": "2026-08-28",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/1247d476863460d70d6360cd1a66d284c0adaaf0e3e342aa9531b0675f6b4cdd.raw",
+    "sha256": "1247d476863460d70d6360cd1a66d284c0adaaf0e3e342aa9531b0675f6b4cdd",
+    "start": "2026-08-24"
+  },
+  {
+    "end": "2026-09-02",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/15bdb04b657988b399be3a788fd0fdd5f657e682822bd710eb8374b0e43fbf79.raw",
+    "sha256": "15bdb04b657988b399be3a788fd0fdd5f657e682822bd710eb8374b0e43fbf79",
+    "start": "2026-08-29"
+  },
+  {
+    "end": "2026-09-07",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/d6acfd95243e1d6027df4dc2bfa51799a2f9978ad55c17ec75c61d8c1d36602c.raw",
+    "sha256": "d6acfd95243e1d6027df4dc2bfa51799a2f9978ad55c17ec75c61d8c1d36602c",
+    "start": "2026-09-03"
+  },
+  {
+    "end": "2026-09-12",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/b5ef763978b31b5af77f9bc7c05114066e0a18f183aa83f3db32bd81b952c438.raw",
+    "sha256": "b5ef763978b31b5af77f9bc7c05114066e0a18f183aa83f3db32bd81b952c438",
+    "start": "2026-09-08"
+  },
+  {
+    "end": "2026-09-17",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/e5d354dfdad1a75a04eea207d1f71acda747c1f93e8c34055268e98c1c70828f.raw",
+    "sha256": "e5d354dfdad1a75a04eea207d1f71acda747c1f93e8c34055268e98c1c70828f",
+    "start": "2026-09-13"
+  },
+  {
+    "end": "2026-09-22",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/f83739a091f14a669aa72fa6251615320210ad1012124174fa404c94f320ab08.raw",
+    "sha256": "f83739a091f14a669aa72fa6251615320210ad1012124174fa404c94f320ab08",
+    "start": "2026-09-18"
+  },
+  {
+    "end": "2026-09-27",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/25800d5a6e1f79724e572cde70be9384e00b8ff10095756abcada9b1e2475ab5.raw",
+    "sha256": "25800d5a6e1f79724e572cde70be9384e00b8ff10095756abcada9b1e2475ab5",
+    "start": "2026-09-23"
+  },
+  {
+    "end": "2026-10-02",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/587055bc322ac578703d9314c0e195373114526c077ab3be7e93a1fff9262bcd.raw",
+    "sha256": "587055bc322ac578703d9314c0e195373114526c077ab3be7e93a1fff9262bcd",
+    "start": "2026-09-28"
+  },
+  {
+    "end": "2026-10-07",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/6003dae230b98d02b81fdcbdfb120fe33896bf9f8f4185cf37a9aacec5187574.raw",
+    "sha256": "6003dae230b98d02b81fdcbdfb120fe33896bf9f8f4185cf37a9aacec5187574",
+    "start": "2026-10-03"
+  },
+  {
+    "end": "2026-10-12",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/a77d7db2b872df84f403b33b6bcda549d3236a13c0adb535a056073bd86ebb04.raw",
+    "sha256": "a77d7db2b872df84f403b33b6bcda549d3236a13c0adb535a056073bd86ebb04",
+    "start": "2026-10-08"
+  },
+  {
+    "end": "2026-10-17",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/245bab1ddb35becb0c60ea45f2d6705ee0af9d5f0831175a89ed4e322607b3ad.raw",
+    "sha256": "245bab1ddb35becb0c60ea45f2d6705ee0af9d5f0831175a89ed4e322607b3ad",
+    "start": "2026-10-13"
+  },
+  {
+    "end": "2026-10-22",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/9a14033d9ffffafd234c6b7e7eb0ebcfefb22e41e12ebf070acca3784b6734bb.raw",
+    "sha256": "9a14033d9ffffafd234c6b7e7eb0ebcfefb22e41e12ebf070acca3784b6734bb",
+    "start": "2026-10-18"
+  },
+  {
+    "end": "2026-10-27",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/b397dc5e02325d234a89cb8da98164b27581af8d0fa8573f8fca61bd31b295c3.raw",
+    "sha256": "b397dc5e02325d234a89cb8da98164b27581af8d0fa8573f8fca61bd31b295c3",
+    "start": "2026-10-23"
+  },
+  {
+    "end": "2026-11-01",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/c4e80b363a6fb81bab5977108fff050edc02228cbaed3bf3222ed36b26d52cbf.raw",
+    "sha256": "c4e80b363a6fb81bab5977108fff050edc02228cbaed3bf3222ed36b26d52cbf",
+    "start": "2026-10-28"
+  },
+  {
+    "end": "2026-11-06",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/c1703bd38919ac5304ed7f1e0f3eb225f385b969203db316cde88adc409462e3.raw",
+    "sha256": "c1703bd38919ac5304ed7f1e0f3eb225f385b969203db316cde88adc409462e3",
+    "start": "2026-11-02"
+  },
+  {
+    "end": "2026-11-08",
+    "payload_path": "/private/tmp/mlb-full-research-master-ZNvdjx/partitioned/isolated_store/data/experimental_daily/history_cache/baseball_savant_statcast_postseason_research_v1/c1703bd38919ac5304ed7f1e0f3eb225f385b969203db316cde88adc409462e3.raw",
+    "sha256": "c1703bd38919ac5304ed7f1e0f3eb225f385b969203db316cde88adc409462e3",
+    "start": "2026-11-07"
+  }
+]

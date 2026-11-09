@@ -2,11 +2,17 @@
 
 [English README](README.md)
 
+프로젝트에서 직접 작성한 코드와 문서는 [MIT License](LICENSE)로 제공됩니다.
+외부 MLB·Statcast 데이터와 제3자 자료는 적용 대상에서 제외되며,
+[제3자 고지](THIRD_PARTY_NOTICES.md)를 확인해 주세요. 이 라이선스는 외부
+데이터의 접근이나 재배포 권한을 주장하지 않습니다.
+
 MLB 경기 시작 전에 예측을 기록하고, 공식 결과가 나오면 같은 기록으로 정산하는 연구 프로젝트입니다. 2026년 9월 운영은 9월 30일 16:18 EDT에 종료했고, 정기 점검은 계속 일시정지 상태입니다. 이 저장소에는 당시 코드와 보고서, 검증 근거를 보존합니다.
 
 공식 기록은 **사전 등록 24건, 공식 정산 23건, 적중 10건(43.5%)**입니다. 정규시즌 세 경기일의 소표본으로, 모델 개선이나 베팅 우위를 입증하지는 못했습니다.
 
 - [운영 종료 보고서](reports/daily_review/2026-09-30/operations-closeout-2026-09.md)
+- [11월 검증 증빙 안내](reports/daily_review/2026-09-30/november-verification/README.ko.md) · [증빙 파일](reports/daily_review/2026-09-30/november-verification)
 - [9월 경기별 분석 현황](reports/daily_review/2026-09-30/september-analysis-coverage-20260930.md)
 - [기록된 시간·토큰 집계](reports/daily_review/2026-09-30/operations-effort-2026-09.ko.md)
 

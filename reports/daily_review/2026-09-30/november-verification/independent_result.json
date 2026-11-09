@@ -1,0 +1,20 @@
+{
+  "expected_played": 2469,
+  "extra_ids": [],
+  "identity_mismatch_ids": [],
+  "missing_ids": [],
+  "observed_played": 2469,
+  "pitch_rows_by_type": {
+    "D": 4641,
+    "F": 2604,
+    "L": 2785,
+    "R": 716792,
+    "W": 1521
+  },
+  "raw_duplicate_pitch_rows": 0,
+  "raw_pitch_rows": 728343,
+  "schedule_games": 2470,
+  "shards": 46,
+  "through": "2026-11-08",
+  "unique_pitch_rows": 728343
+}

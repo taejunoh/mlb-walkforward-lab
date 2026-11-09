@@ -1,0 +1,13 @@
+{
+  "attempts": 1,
+  "byte_length": 370604,
+  "content_type": "application/download; charset=utf-8",
+  "etag": null,
+  "final_url": "https://baseballsavant.mlb.com/statcast_search/csv?all=true&type=details&player_type=batter&game_date_gt=2026-10-18&game_date_lt=2026-10-22&hfGT=R%7CF%7CD%7CL%7CW%7C&group_by=name-year&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&min_pitches=0",
+  "http_status": 200,
+  "last_modified": "Mon, 09 Nov 2026 21:46:02 GMT",
+  "requested_url": "https://baseballsavant.mlb.com/statcast_search/csv?all=true&type=details&player_type=batter&game_date_gt=2026-10-18&game_date_lt=2026-10-22&hfGT=R%7CF%7CD%7CL%7CW%7C&group_by=name-year&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&min_pitches=0",
+  "response_completed_at_utc": "2026-11-09T21:46:02.450523Z",
+  "sha256": "9a14033d9ffffafd234c6b7e7eb0ebcfefb22e41e12ebf070acca3784b6734bb",
+  "started_at_utc": "2026-11-09T21:46:00.8121Z"
+}
