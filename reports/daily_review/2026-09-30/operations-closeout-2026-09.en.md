@@ -67,6 +67,8 @@ The user requested an operational pause. Before that request, the postseason wor
 | Reconstruction of missing forecasts | The evaluator required four evidence bindings, one per role. The verified collection example carried 91 (55 Statcast, 34 venue, one schedule, and one ERA). Preparation code was saved. The unresolved input contract prevented a pilot or any new reconstructed forecast. [Blocker](reconstruction-preparation/input-contract-blocker.md) |
 | Final September 30 coverage | The last check shows one elapsed cutoff and three still ahead. Later game states fall outside the recorded observation window. [Final check](operations-check-20260930T195003Z.json) |
 
+**Resumption criteria.** First, validate the postseason schedule by reconciling game IDs repeated across postponed and rescheduled dates into one verified game per ID. Confirm that game IDs, dates, and competition types agree between the official schedule and Statcast. Then use a new postseason game whose outcome is still unknown. Verify the official starters, lineups, and model inputs, and save the first eligible forecast as the primary claim before the scheduled start, together with its source trace and pregame receipt. After the game, match the official final result by game ID, date, and participating teams, then save and verify retrieval of the formal settlement record and receipt linked to that same claim. Resume operations after documenting one game that passes this full sequence. If any step fails, retain the evidence and keep resumption on hold.
+
 ## Preserved materials
 
 | Material | Location |
